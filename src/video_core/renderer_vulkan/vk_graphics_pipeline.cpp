@@ -38,7 +38,7 @@ GraphicsPipeline::GraphicsPipeline(
       fetch_shader{std::move(fetch_shader_)} {
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
-    BuildDescSetLayout(preloading);
+    BuildDescSetLayout(sdata, preloading);
     const auto debug_str = GetDebugString();
 
     const vk::PushConstantRange push_constants = {
@@ -446,9 +446,15 @@ template void GraphicsPipeline::GetVertexInputs(
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
     VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1) const;
 
-void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
+void GraphicsPipeline::BuildDescSetLayout(SerializationSupport& sdata, bool preloading) {
     boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32> bindings;
     u32 binding{};
+    // Image descriptor counts cannot be recomputed while preloading, so they are carried in
+    // sdata. Populated on first creation, replayed on preload.
+    u32 image_idx{};
+    if (!preloading) {
+        sdata.image_binding_counts.clear();
+    }
 
     for (const auto* stage : stages) {
         if (!stage) {
@@ -468,7 +474,21 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
             });
         }
         for (const auto& image : stage->images) {
-            const u32 num_bindings = image.NumBindings(*stage);
+            const bool have_cached = image_idx < sdata.image_binding_counts.size();
+            if (preloading && !have_cached) {
+                // Only reachable from a cache written before this field existed, which the
+                // version bump should already have rejected.
+                LOG_ERROR(Render_Vulkan,
+                          "Preloaded pipeline is missing image binding counts, descriptor set "
+                          "layout will be wrong");
+            }
+            const u32 num_bindings = (preloading && have_cached)
+                                         ? sdata.image_binding_counts[image_idx]
+                                         : image.NumBindings(*stage);
+            if (!preloading) {
+                sdata.image_binding_counts.push_back(num_bindings);
+            }
+            ++image_idx;
             bindings.push_back({
                 .binding = binding,
                 .descriptorType = image.is_written ? vk::DescriptorType::eStorageImage

@@ -47,8 +47,21 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
             .stageFlags = vk::ShaderStageFlagBits::eCompute,
         });
     }
+    if (!preloading) {
+        sdata.image_binding_counts.clear();
+    }
+    u32 image_idx{};
     for (const auto& image : info->images) {
-        const u32 num_bindings = image.NumBindings(*info);
+        // Image descriptor counts need the user data, which is unavailable while preloading, so
+        // they are carried in sdata. Getting them wrong shifts every later binding index.
+        const bool have_cached = image_idx < sdata.image_binding_counts.size();
+        const u32 num_bindings =
+            (preloading && have_cached) ? sdata.image_binding_counts[image_idx]
+                                        : image.NumBindings(*info);
+        if (!preloading) {
+            sdata.image_binding_counts.push_back(num_bindings);
+        }
+        ++image_idx;
         bindings.push_back({
             .binding = binding,
             .descriptorType = image.is_written ? vk::DescriptorType::eStorageImage

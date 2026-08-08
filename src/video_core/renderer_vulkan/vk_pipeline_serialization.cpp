@@ -14,7 +14,7 @@ namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 static constexpr u32 ShaderBinaryVersion = 3u;
 static constexpr u32 ShaderMetaVersion = 4u; // ImageSpecialization gained is_block_1d
-static constexpr u32 PipelineKeyVersion = 3u;
+static constexpr u32 PipelineKeyVersion = 4u; // SerializationSupport gained image_binding_counts
 } // namespace Serialization
 
 namespace Vulkan {
@@ -131,12 +131,15 @@ bool ComputePipelineKey::Deserialize(Serialization::Archive& ar) {
 }
 
 void ComputePipeline::SerializationSupport::Serialize(Serialization::Archive& ar) const {
-    // Nothing here yet
-    return;
+    Serialization::Writer sdata{ar};
+
+    sdata.Write(image_binding_counts);
 }
 
 bool ComputePipeline::SerializationSupport::Deserialize(Serialization::Archive& ar) {
-    // Nothing here yet
+    Serialization::Reader sdata{ar};
+
+    sdata.Read(image_binding_counts);
     return true;
 }
 
@@ -194,6 +197,7 @@ void GraphicsPipeline::SerializationSupport::Serialize(Serialization::Archive& a
     sdata.Write(multisampling);
     sdata.Write(tcs);
     sdata.Write(tes);
+    sdata.Write(image_binding_counts);
 }
 
 bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive& ar) {
@@ -205,6 +209,7 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
     sdata.Read(multisampling);
     sdata.Read(tcs);
     sdata.Read(tes);
+    sdata.Read(image_binding_counts);
     return true;
 }
 

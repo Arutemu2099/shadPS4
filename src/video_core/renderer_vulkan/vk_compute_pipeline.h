@@ -39,6 +39,8 @@ class ComputePipeline : public Pipeline {
 public:
     struct SerializationSupport {
         u32 dummy{};
+        // See the comment on the graphics pipeline's copy of this field.
+        std::vector<u32> image_binding_counts{};
 
         void Serialize(Serialization::Archive& ar) const;
         bool Deserialize(Serialization::Archive& ar);

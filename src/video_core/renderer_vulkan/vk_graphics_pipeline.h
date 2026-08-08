@@ -78,6 +78,10 @@ public:
         std::vector<u32> tcs{};
         std::vector<u32> tes{};
         std::vector<u32> fragment{};
+        // Descriptor count per image, in stage then declaration order. Recomputing these at
+        // preload would need the user data, which is not available during deserialization, and
+        // getting them wrong shifts every later binding index. See BuildDescSetLayout.
+        std::vector<u32> image_binding_counts{};
 
         void Serialize(Serialization::Archive& ar) const;
         bool Deserialize(Serialization::Archive& ar);
@@ -109,7 +113,7 @@ public:
                          u32 step_rate_1) const;
 
 private:
-    void BuildDescSetLayout(bool preloading);
+    void BuildDescSetLayout(SerializationSupport& sdata, bool preloading);
 
 private:
     GraphicsPipelineKey key;
