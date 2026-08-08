@@ -907,6 +907,10 @@ void PatchImageSampleArgs(IR::Block& block, IR::Inst& inst, Info& info,
     IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
     const auto inst_info = inst.Flags<IR::TextureInstInfo>();
     const auto view_type = image.GetViewType(image_res.is_array);
+    // A block-compressed 1D image is created on the host as a 2D image one block row tall, so the
+    // sampler is declared Dim2D. Address VGPRs are still decoded as 1D (that is what the guest
+    // instruction encodes); the missing y component is appended as a constant zero below.
+    const bool promote_1d = image.IsBlockCoded1D();
 
     IR::Inst* body1 = inst.Arg(2).InstRecursive();
     IR::Inst* body2 = inst.Arg(3).InstRecursive();
@@ -956,7 +960,7 @@ void PatchImageSampleArgs(IR::Block& block, IR::Inst& inst, Info& info,
         switch (view_type) {
         case AmdGpu::ImageType::Color1D:
         case AmdGpu::ImageType::Color1DArray:
-            return read(0);
+            return promote_1d ? ir.CompositeConstruct(read(0), ir.Imm32(0u)) : IR::Value{read(0)};
         case AmdGpu::ImageType::Color2D:
         case AmdGpu::ImageType::Color2DMsaa:
         case AmdGpu::ImageType::Color2DArray:
@@ -978,6 +982,11 @@ void PatchImageSampleArgs(IR::Block& block, IR::Inst& inst, Info& info,
         case AmdGpu::ImageType::Color1DArray:
             // du/dx, du/dy
             addr_reg = addr_reg + 2;
+            if (promote_1d) {
+                // (du/dx, 0), (du/dy, 0) - the emulated y axis is constant.
+                return {ir.CompositeConstruct(get_addr_reg(addr_reg - 2), ir.Imm32(0.f)),
+                        ir.CompositeConstruct(get_addr_reg(addr_reg - 1), ir.Imm32(0.f))};
+            }
             return {get_addr_reg(addr_reg - 2), get_addr_reg(addr_reg - 1)};
         case AmdGpu::ImageType::Color2D:
         case AmdGpu::ImageType::Color2DMsaa:
@@ -1031,10 +1040,20 @@ void PatchImageSampleArgs(IR::Block& block, IR::Inst& inst, Info& info,
         switch (view_type) {
         case AmdGpu::ImageType::Color1D: // x
             addr_reg = addr_reg + 1;
+            if (promote_1d) {
+                return ir.CompositeConstruct(get_coord(addr_reg - 1, 0), ir.Imm32(0.f));
+            }
             return get_coord(addr_reg - 1, 0);
         case AmdGpu::ImageType::Color1DArray: // x, slice
-        case AmdGpu::ImageType::Color2D:      // x, y
-        case AmdGpu::ImageType::Color2DMsaa:  // x, y
+            addr_reg = addr_reg + 2;
+            if (promote_1d) {
+                // x, y, slice. The layer moves to dimension index 2 along with the image.
+                return ir.CompositeConstruct(get_coord(addr_reg - 2, 0), ir.Imm32(0.f),
+                                             get_coord(addr_reg - 1, 2));
+            }
+            return ir.CompositeConstruct(get_coord(addr_reg - 2, 0), get_coord(addr_reg - 1, 1));
+        case AmdGpu::ImageType::Color2D:     // x, y
+        case AmdGpu::ImageType::Color2DMsaa: // x, y
             addr_reg = addr_reg + 2;
             return ir.CompositeConstruct(get_coord(addr_reg - 2, 0), get_coord(addr_reg - 1, 1));
         case AmdGpu::ImageType::Color2DArray: // x, y, slice
@@ -1110,15 +1129,26 @@ void PatchImageArgs(IR::Block& block, IR::Inst& inst, Info& info) {
     IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
     auto inst_info = inst.Flags<IR::TextureInstInfo>();
     const auto view_type = image.GetViewType(image_res.is_array);
+    // See PatchImageSampleArgs: block-compressed 1D images are 2D on the host, so an integer zero
+    // is appended for the emulated y axis while VGPRs stay decoded as 1D.
+    const bool promote_1d = image.IsBlockCoded1D();
 
     // Now that we know the image type, adjust texture coordinate vector.
     IR::Inst* body = inst.Arg(1).InstRecursive();
     const auto [coords, arg] = [&] -> std::pair<IR::Value, IR::Value> {
         switch (view_type) {
         case AmdGpu::ImageType::Color1D: // x, [lod]
+            if (promote_1d) {
+                return {ir.CompositeConstruct(body->Arg(0), ir.Imm32(0u)), body->Arg(1)};
+            }
             return {body->Arg(0), body->Arg(1)};
         case AmdGpu::ImageType::Color1DArray: // x, slice, [lod]
-        case AmdGpu::ImageType::Color2D:      // x, y, [lod]
+            if (promote_1d) {
+                return {ir.CompositeConstruct(body->Arg(0), ir.Imm32(0u), body->Arg(1)),
+                        body->Arg(2)};
+            }
+            [[fallthrough]];
+        case AmdGpu::ImageType::Color2D: // x, y, [lod]
             return {ir.CompositeConstruct(body->Arg(0), body->Arg(1)), body->Arg(2)};
         case AmdGpu::ImageType::Color2DMsaa: // x, y. (sample is passed on different argument)
         {

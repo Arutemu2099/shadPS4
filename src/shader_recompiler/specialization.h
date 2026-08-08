@@ -50,6 +50,9 @@ struct ImageSpecialization {
     bool is_storage = false;
     bool is_cube = false;
     bool is_srgb = false;
+    // Guest type stays in `type` because it decides address VGPR decoding; this decides the host
+    // image dimensionality, which differs for block-compressed 1D. Both are part of the key.
+    bool is_block_1d = false;
     AmdGpu::CompMapping dst_select{};
     AmdGpu::NumberConversion num_conversion{};
     // FIXME any pipeline cache changes needed?
@@ -138,6 +141,7 @@ struct StageSpecialization {
                          spec.is_integer = AmdGpu::IsInteger(sharp.GetNumberFmt());
                          spec.is_storage = desc.is_written;
                          spec.is_cube = sharp.IsCube();
+                         spec.is_block_1d = sharp.IsBlockCoded1D();
                          if (spec.is_storage) {
                              spec.dst_select = sharp.DstSelect();
                          } else {

@@ -307,6 +307,15 @@ struct Image {
         return base_type;
     }
 
+    /// Block-compressed 1D images are legal on GCN but not on Vulkan hosts, which require a
+    /// compressed image to be 2D or 3D. They are emulated as 2D images a single block row tall,
+    /// which is a faithful representation: a 1D BC texture is one row of 4x4 blocks.
+    bool IsBlockCoded1D() const noexcept {
+        const auto base_type = GetType();
+        return (base_type == ImageType::Color1D || base_type == ImageType::Color1DArray) &&
+               IsBlockCoded(GetDataFmt());
+    }
+
     ImageType GetViewType(const bool is_array) const noexcept {
         const auto base_type = GetType();
         if (IsCube()) {
@@ -323,6 +332,33 @@ struct Image {
             return ImageType::Color2DMsaa;
         }
         return base_type;
+    }
+
+    /// GetBaseType/GetViewType describe the guest image, and are what the shader recompiler must
+    /// use to decode address VGPRs. The Host variants below describe the resource actually created
+    /// on the host, and must be used by anything that talks to Vulkan: the image, the image view,
+    /// and the SPIR-V image declaration. All three have to agree.
+    ImageType GetHostBaseType() const noexcept {
+        const auto base_type = GetBaseType();
+        if (base_type == ImageType::Color1D && IsBlockCoded(GetDataFmt())) {
+            return ImageType::Color2D;
+        }
+        return base_type;
+    }
+
+    ImageType GetHostViewType(const bool is_array) const noexcept {
+        const auto view_type = GetViewType(is_array);
+        if (!IsBlockCoded(GetDataFmt())) {
+            return view_type;
+        }
+        switch (view_type) {
+        case ImageType::Color1D:
+            return ImageType::Color2D;
+        case ImageType::Color1DArray:
+            return ImageType::Color2DArray;
+        default:
+            return view_type;
+        }
     }
 
     [[nodiscard]] u32 NumViewLevels(const bool is_array) const noexcept {
