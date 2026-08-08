@@ -83,6 +83,10 @@ void Linker::Execute(const std::vector<std::string>& args) {
     if (std::filesystem::exists(libc_internal_path)) {
         LoadModule(libc_internal_path);
         has_libcinternal = true;
+    } else if (std::getenv("SHADPS4_NO_HLE_LIBC") != nullptr) {
+        // Diagnostic A/B switch: reproduce the pre-#4660 behaviour where nothing was registered
+        // and every libSceLibcInternal import fell through to an aerolib stub.
+        LOG_WARNING(Core_Linker, "SHADPS4_NO_HLE_LIBC set: skipping HLE libSceLibcInternal");
     } else {
         // Need to load HLE, LLE isn't present
         LOG_INFO(Core_Linker, "Can't Load libSceLibcInternal.sprx switching to HLE");
@@ -413,6 +417,10 @@ bool Linker::Resolve(const std::string& name, Loader::SymbolType sym_type, Modul
     const auto* record = m_hle_symbols.FindSymbol(sr);
     if (record) {
         *return_info = *record;
+        if (sr.library == "libSceLibcInternal") {
+            LOG_INFO(Core_Linker, "libc import HLE   {} -> {} @ {:#x}", sr.name, record->name,
+                     record->virtual_address);
+        }
         Core::Devtools::Widget::ModuleList::AddModule(sr.library);
         return true;
     }
@@ -443,6 +451,9 @@ bool Linker::Resolve(const std::string& name, Loader::SymbolType sym_type, Modul
     } else {
         return_info->virtual_address = AeroLib::GetStub(sr.name.c_str());
         return_info->name = "Unknown !!!";
+    }
+    if (library->name == "libSceLibcInternal") {
+        LOG_INFO(Core_Linker, "libc import STUB  {} -> {}", sr.name, return_info->name);
     }
     if (library->name != "libc" && library->name != "libSceFios2") {
         LOG_WARNING(Core_Linker, "Linker: Stub resolved {} as {} (lib: {}, mod: {})", sr.name,

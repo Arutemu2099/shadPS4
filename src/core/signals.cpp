@@ -365,6 +365,40 @@ static void LogGuestRegisters(const CONTEXT* context) noexcept {
                  context->R13, context->R14, context->R15);
 }
 
+// Every exception the emulator *handles* and resumes from still went through Windows exception
+// dispatch, which builds its machine frame and CONTEXT below the interrupted rsp - i.e. straight
+// through the guest's SysV red zone. A guest leaf function keeping live values in [rsp-0x38] would
+// see them come back as garbage. Record the handled faults per thread so the crash report can say
+// whether one actually landed near the frame that later faulted, instead of assuming it did.
+namespace {
+struct HandledFault {
+    u64 rsp;
+    u64 rip;
+    u64 fault_address;
+    u32 code;
+};
+constexpr size_t HandledFaultHistory = 12;
+thread_local std::array<HandledFault, HandledFaultHistory> handled_faults{};
+thread_local u64 handled_fault_count = 0;
+} // namespace
+
+static void LogHandledFaultHistory(u64 crash_rsp) noexcept {
+    LOG_CRITICAL(Debug, "Handled (resumed) exceptions on this thread: {}", handled_fault_count);
+    const u64 shown = std::min<u64>(handled_fault_count, HandledFaultHistory);
+    for (u64 i = 0; i < shown; i++) {
+        // Walk newest-first.
+        const auto& f = handled_faults[(handled_fault_count - 1 - i) % HandledFaultHistory];
+        // Windows dispatch writes below the interrupted rsp. If that rsp sat at or below the
+        // crashing frame's rsp, this fault's dispatch overlapped the crashing red zone.
+        const s64 delta = static_cast<s64>(f.rsp) - static_cast<s64>(crash_rsp);
+        LOG_CRITICAL(Debug,
+                     "  [-{}] code={:#x} rip={:#018x} ({}) rsp={:#018x} (crash_rsp{:+#x}) data={:#018x}{}",
+                     i + 1, f.code, f.rip, ResolveGuestAddress(f.rip), f.rsp, delta,
+                     f.fault_address,
+                     (delta >= 0 && delta <= 0x200) ? "  <== OVERLAPS CRASHING RED ZONE" : "");
+    }
+}
+
 static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     const auto* signals = Signals::Instance();
     // Windows static guest red-zone protection
@@ -408,6 +442,17 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     }
 
     if (handled) {
+        if (pExp != nullptr && pExp->ContextRecord != nullptr) {
+            auto& rec = handled_faults[handled_fault_count % HandledFaultHistory];
+            rec.rsp = pExp->ContextRecord->Rsp;
+            rec.rip = pExp->ContextRecord->Rip;
+            rec.code = code;
+            rec.fault_address = (pExp->ExceptionRecord != nullptr &&
+                                 pExp->ExceptionRecord->NumberParameters >= 2)
+                                    ? pExp->ExceptionRecord->ExceptionInformation[1]
+                                    : 0;
+        }
+        handled_fault_count++;
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
@@ -440,6 +485,9 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
             LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
         }
         LogGuestRegisters(pExp != nullptr ? pExp->ContextRecord : nullptr);
+        LogHandledFaultHistory(pExp != nullptr && pExp->ContextRecord != nullptr
+                                   ? pExp->ContextRecord->Rsp
+                                   : 0);
         const auto frames = LogGuestBacktrace(pExp != nullptr ? pExp->ContextRecord : nullptr);
         DumpGuestCodeAroundFault(address);
         LogDisassemblyWindow(reinterpret_cast<VAddr>(address), 24, 4, "Guest code at fault");
