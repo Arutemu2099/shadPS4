@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <string>
+#include <unordered_set>
+
 #include "common/debug.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -971,6 +974,61 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
 
     if (state.num_layers == std::numeric_limits<u16>::max()) {
         state.num_layers = 1;
+    }
+
+    // Diagnostic: a render pass with no usable attachment at all.
+    // A null color attachment on its own is normal - MRT gaps, or the guest disabling colour
+    // writes - but a pass where every colour attachment is null AND there is no depth/stencil
+    // attachment renders into nothing. That is legal Vulkan and raises no validation error, so
+    // it is invisible unless we say so here. Deduplicated by signature; each distinct case is
+    // reported once per run.
+    {
+        bool any_color = false;
+        for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
+            if (state.color_attachments[cb].image_view) {
+                any_color = true;
+                break;
+            }
+        }
+        if (!any_color && !state.depth_stencil_attachment.image_view) {
+            u64 sig = u64(key.mrt_mask) << 1;
+            for (const auto h : key.stage_hashes) {
+                sig = sig * 0x100000001b3ULL ^ u64(h);
+            }
+            static std::unordered_set<u64> reported;
+            if (reported.insert(sig).second) {
+                const bool cb_disabled =
+                    regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable;
+                std::string detail;
+                for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
+                    const auto& col_buf = regs.color_buffers[cb];
+                    detail += fmt::format(
+                        " [cb{} valid={} addr={:#x} dfmt={} nfmt={} write_mask={:#x} in_mrt={}]",
+                        cb, bool(col_buf), col_buf.Address(), u32(col_buf.GetDataFmt()),
+                        u32(col_buf.GetNumberFmt()), regs.color_target_mask.GetMask(cb),
+                        (key.mrt_mask >> cb) & 1);
+                }
+                std::string stages;
+                for (u32 i = 0; i < key.stage_hashes.size(); ++i) {
+                    if (key.stage_hashes[i] != 0) {
+                        stages += fmt::format(" stage{}={:#x}", i, key.stage_hashes[i]);
+                    }
+                }
+                // NOTE: this is usually the guest's intent, not a fault - Second Son issues
+                // these with color_writes_disabled=true and write_mask=0. Reported so the case
+                // stays visible, but do NOT read it as an error on its own. See
+                // notes/renderdoc-capture-01-timbers.md.
+                LOG_WARNING(Render_Vulkan,
+                            "Attachment-less draw (usually guest intent, see notes): "
+                            "mrt_mask={:#x} "
+                            "color_writes_disabled={} depth_en={} depth_valid={} stencil_en={} "
+                            "stencil_valid={}{} shaders:{}",
+                            key.mrt_mask, cb_disabled, bool(regs.depth_control.depth_enable),
+                            regs.depth_buffer.DepthValid(),
+                            bool(regs.depth_control.stencil_enable),
+                            regs.depth_buffer.StencilValid(), detail, stages);
+            }
+        }
     }
 
     return state;
