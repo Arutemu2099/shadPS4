@@ -21,6 +21,10 @@ void EndCapture();
 /// Triggers capturing process.
 void TriggerCapture();
 
+/// Drives the capture state machine at a frame boundary. Call once per real flip, after present:
+/// an armed capture starts here and ends at the next boundary, bracketing one displayed frame.
+void OnFrameBoundary();
+
 /// Sets output directory for captures
 void SetOutputDir(const std::filesystem::path& path, const std::string& prefix);
 

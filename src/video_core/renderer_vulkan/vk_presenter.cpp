@@ -1105,6 +1105,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
 
     free_frame();
     if (!is_reusing_frame) {
+        // Drive the RenderDoc capture state machine on real flips only, so a capture starts just
+        // after one present and ends at the next: exactly one displayed frame.
+        VideoCore::OnFrameBoundary();
         DebugState.IncFlipFrameNum();
     }
 }

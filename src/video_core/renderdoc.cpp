@@ -24,7 +24,9 @@ enum class CaptureState {
     Triggered,
     InProgress,
 };
-static CaptureState capture_state{CaptureState::Idle};
+// Atomic: StartCapture runs on the GPU command processor thread, EndCapture on the presenting
+// thread, and TriggerCapture on the input thread.
+static std::atomic<CaptureState> capture_state{CaptureState::Idle};
 static std::atomic<u32> screenshot_game_only_count{0};
 static std::atomic<u32> screenshot_with_overlays_count{0};
 
@@ -98,9 +100,9 @@ void StartCapture() {
         return;
     }
 
-    if (capture_state == CaptureState::Triggered) {
+    if (capture_state.load() == CaptureState::Triggered) {
         rdoc_api->StartFrameCapture(nullptr, nullptr);
-        capture_state = CaptureState::InProgress;
+        capture_state.store(CaptureState::InProgress);
     }
 }
 
@@ -109,15 +111,36 @@ void EndCapture() {
         return;
     }
 
-    if (capture_state == CaptureState::InProgress) {
+    if (capture_state.load() == CaptureState::InProgress) {
         rdoc_api->EndFrameCapture(nullptr, nullptr);
-        capture_state = CaptureState::Idle;
+        capture_state.store(CaptureState::Idle);
     }
 }
 
 void TriggerCapture() {
-    if (capture_state == CaptureState::Idle) {
-        capture_state = CaptureState::Triggered;
+    auto expected = CaptureState::Idle;
+    capture_state.compare_exchange_strong(expected, CaptureState::Triggered);
+}
+
+void OnFrameBoundary() {
+    if (!rdoc_api) {
+        return;
+    }
+
+    // Both boundaries of a capture must be presents, otherwise the recorded range is an arbitrary
+    // slice of a frame: starting when the GPU thread happens to wake mid-frame yields only the
+    // tail, and a range that misses the final composite presents a black image.
+    switch (capture_state.load()) {
+    case CaptureState::InProgress:
+        rdoc_api->EndFrameCapture(nullptr, nullptr);
+        capture_state.store(CaptureState::Idle);
+        break;
+    case CaptureState::Triggered:
+        rdoc_api->StartFrameCapture(nullptr, nullptr);
+        capture_state.store(CaptureState::InProgress);
+        break;
+    default:
+        break;
     }
 }
 

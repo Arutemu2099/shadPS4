@@ -103,7 +103,9 @@ void Liverpool::Process(std::stop_token stoken) {
             break;
         }
 
-        VideoCore::StartCapture();
+        // NOTE: StartCapture() used to be called here, when this thread woke with work. Combined
+        // with ending at the first completed submit, that recorded an arbitrary slice of a frame.
+        // Both capture boundaries now sit at present, in Presenter::Present.
 
         curr_qid = -1;
 
@@ -137,7 +139,11 @@ void Liverpool::Process(std::stop_token stoken) {
         }
 
         if (submit_done) {
-            VideoCore::EndCapture();
+            // NOTE: EndCapture() used to live here, which ended the RenderDoc capture at the first
+            // completed submit. A title splits one displayed frame across several submits, so that
+            // recorded an arbitrary batch rather than a frame: captures had wildly varying content
+            // and any batch that missed the final composite presented a black image. The capture
+            // now ends after present, in Presenter::Present.
             if (rasterizer) {
                 rasterizer->OnSubmit();
                 rasterizer->Flush();
