@@ -20,6 +20,7 @@
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/decoder.h"
+#include "common/fault_monitor.h"
 #include "common/signal_context.h"
 #include "common/types.h"
 #include "core/signals.h"
@@ -2155,7 +2156,10 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64, u64, std::span<const uint
 // ============================================================================
 
 static bool PatchesAccessViolationHandler(void* context, void* /* fault_address */) {
-    return TryPatchJit(Common::GetRip(context));
+    const auto start = Common::FaultMonitor::Now();
+    const bool handled = TryPatchJit(Common::GetRip(context));
+    Common::FaultMonitor::CountJitPatchFault(Common::FaultMonitor::SinceNs(start));
+    return handled;
 }
 
 static bool PatchesIllegalInstructionHandler(void* context) {

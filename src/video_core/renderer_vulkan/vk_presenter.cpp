@@ -3,6 +3,7 @@
 
 #include "common/debug.h"
 #include "common/elf_info.h"
+#include "common/fault_monitor.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
 #include "common/singleton.h"
@@ -1108,6 +1109,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
         // Drive the RenderDoc capture state machine on real flips only, so a capture starts just
         // after one present and ends at the next: exactly one displayed frame.
         VideoCore::OnFrameBoundary();
+        Common::FaultMonitor::CountPresentedFrame();
         DebugState.IncFlipFrameNum();
     }
 }

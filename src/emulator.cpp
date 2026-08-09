@@ -13,6 +13,7 @@
 #include <hwinfo/hwinfo.h>
 
 #include "common/debug.h"
+#include "common/fault_monitor.h"
 #include "common/logging/log.h"
 #include "common/string_util.h"
 #include "common/thread.h"
@@ -484,6 +485,8 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 #endif
     LOG_INFO(Config, "GPU isNullGpu: {}", EmulatorSettings.IsNullGPU());
     LOG_INFO(Config, "GPU readbacksMode: {}", EmulatorSettings.GetReadbacksMode());
+    // Periodic handled-fault vs. presented-frame reporting; see common/fault_monitor.h.
+    Common::FaultMonitor::Start();
     LOG_INFO(Config, "GPU readbackLinearImages: {}",
              EmulatorSettings.IsReadbackLinearImagesEnabled());
     LOG_INFO(Config, "GPU directMemoryAccess: {}", EmulatorSettings.IsDirectMemoryAccessEnabled());

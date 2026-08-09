@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
+#include "common/fault_monitor.h"
 #include "common/range_lock.h"
 #include "common/signal_context.h"
 #include "core/memory.h"
@@ -209,12 +210,20 @@ struct PageManager::Impl {
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
+        const auto start = Common::FaultMonitor::Now();
         if (Common::IsWriteError(context)) {
-            return rasterizer->InvalidateMemory(addr, 8);
+            const bool handled = rasterizer->InvalidateMemory(addr, 8);
+            Common::FaultMonitor::CountGuestWriteFault(handled,
+                                                       Common::FaultMonitor::SinceNs(start));
+            return handled;
         } else {
-            return rasterizer->ReadMemory(addr, 8);
+            // Read faults only exist under Precise readbacks - it is the only mode that
+            // read-protects guest pages holding GPU-modified data.
+            const bool handled = rasterizer->ReadMemory(addr, 8);
+            Common::FaultMonitor::CountGuestReadFault(handled,
+                                                      Common::FaultMonitor::SinceNs(start));
+            return handled;
         }
-        return false;
     }
 #endif
 
