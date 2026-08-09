@@ -1132,6 +1132,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
 Frame* Presenter::GetRenderFrame() {
     // Wait for free presentation frames
     Frame* frame;
+    const auto queue_start = Common::FaultMonitor::Now();
     {
         std::unique_lock lock{free_mutex};
         free_cv.wait(lock, [this] { return !free_queue.empty(); });
@@ -1141,6 +1142,7 @@ Frame* Presenter::GetRenderFrame() {
         frame = free_queue.front();
         free_queue.pop();
     }
+    const u64 queue_ns = Common::FaultMonitor::SinceNs(queue_start);
 
     const vk::Device device = instance.GetDevice();
     vk::Result result{};
@@ -1151,6 +1153,7 @@ Frame* Presenter::GetRenderFrame() {
     };
 
     // Wait for the presentation to be finished so all frame resources are free
+    const auto fence_start = Common::FaultMonitor::Now();
     while (wait() != vk::Result::eSuccess) {
         ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
                    "Device lost during waiting for a frame");
@@ -1159,6 +1162,7 @@ Frame* Presenter::GetRenderFrame() {
             continue;
         }
     }
+    Common::FaultMonitor::CountRenderFrame(queue_ns, Common::FaultMonitor::SinceNs(fence_start));
 
     if (frame->width != expected_frame_width || frame->height != expected_frame_height ||
         frame->is_hdr != swapchain.GetHDR()) {

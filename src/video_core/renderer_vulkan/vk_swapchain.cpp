@@ -235,11 +235,18 @@ void Swapchain::SetSurfaceProperties() {
                                  std::min(capabilities.maxImageExtent.height, height));
     }
 
-    // Select number of images in swap chain, we prefer one buffer in the background to work on
+    // Select number of images in swap chain, we prefer one buffer in the background to work on.
+    //
+    // Tested on the infamous branch: raising this to minImageCount + 3 (3 -> 5 images here) had
+    // no effect at all on the Precise-readbacks decay. Swapchain image starvation is not the
+    // mechanism, so this stays at upstream's value. The log line below is kept - knowing the
+    // driver's actual min/max was worth having.
     image_count = capabilities.minImageCount + 1;
     if (capabilities.maxImageCount > 0) {
         image_count = std::min(image_count, capabilities.maxImageCount);
     }
+    LOG_INFO(Render_Vulkan, "Swapchain: minImageCount={} maxImageCount={} using image_count={}",
+             capabilities.minImageCount, capabilities.maxImageCount, image_count);
 
     // Prefer identity transform if possible
     transform = vk::SurfaceTransformFlagBitsKHR::eIdentity;

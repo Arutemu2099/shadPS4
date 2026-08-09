@@ -113,6 +113,23 @@ extern std::atomic<u64> present_lock_ns;
 extern std::atomic<u64> present_khr_ns;
 
 /**
+ * The other end of the same pipeline. `Presenter::Present` runs on the flip thread; the frame is
+ * produced on the GPU thread, which first calls `GetRenderFrame()` and blocks there twice:
+ *
+ *   rf_queue - `free_cv.wait` for a Frame to come back from the flip thread
+ *   rf_fence - `waitForFences(frame->present_done)`, i.e. the GPU finishing that frame's work
+ *
+ * Measured early in a run the frame time is ~38 ms with acquire at ~0, and late in the same run
+ * it is ~78 ms with acquire at ~70 - so the block may simply be migrating between the two ends
+ * rather than appearing from nowhere. Timing both ends is the only way to tell a growing total
+ * stall from a stall that moved. If rf_fence carries the early cost and stays flat while acquire
+ * grows, the GPU is not the thing getting slower.
+ */
+extern std::atomic<u64> renderframe_queue_ns;
+extern std::atomic<u64> renderframe_fence_ns;
+extern std::atomic<u64> renderframe_count;
+
+/**
  * Time spent inside the handler is measured as well as the number of entries, because the two
  * answer different questions. If the framerate decays while faults-per-frame stays flat, then
  * either each fault got more expensive (handler nanoseconds per fault rises) or the slowdown is
@@ -188,6 +205,12 @@ inline void CountPresentPhases(u64 acquire, u64 flush, u64 lock, u64 khr) {
     present_flush_ns.fetch_add(flush, std::memory_order_relaxed);
     present_lock_ns.fetch_add(lock, std::memory_order_relaxed);
     present_khr_ns.fetch_add(khr, std::memory_order_relaxed);
+}
+
+inline void CountRenderFrame(u64 queue_ns, u64 fence_ns) {
+    renderframe_count.fetch_add(1, std::memory_order_relaxed);
+    renderframe_queue_ns.fetch_add(queue_ns, std::memory_order_relaxed);
+    renderframe_fence_ns.fetch_add(fence_ns, std::memory_order_relaxed);
 }
 
 inline void CountPresent(u64 ns, u64 pending) {

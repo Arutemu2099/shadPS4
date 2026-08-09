@@ -46,6 +46,9 @@ std::atomic<u64> present_acquire_ns{0};
 std::atomic<u64> present_flush_ns{0};
 std::atomic<u64> present_lock_ns{0};
 std::atomic<u64> present_khr_ns{0};
+std::atomic<u64> renderframe_queue_ns{0};
+std::atomic<u64> renderframe_fence_ns{0};
+std::atomic<u64> renderframe_count{0};
 
 namespace {
 
@@ -128,6 +131,9 @@ struct Sample {
     u64 flush_ns;
     u64 lock_ns;
     u64 khr_ns;
+    u64 rf_count;
+    u64 rf_queue_ns;
+    u64 rf_fence_ns;
 };
 
 Sample Read() {
@@ -158,6 +164,9 @@ Sample Read() {
         present_flush_ns.load(std::memory_order_relaxed),
         present_lock_ns.load(std::memory_order_relaxed),
         present_khr_ns.load(std::memory_order_relaxed),
+        renderframe_count.load(std::memory_order_relaxed),
+        renderframe_queue_ns.load(std::memory_order_relaxed),
+        renderframe_fence_ns.load(std::memory_order_relaxed),
     };
 }
 
@@ -182,7 +191,8 @@ std::ofstream OpenCsv() {
                "submits_per_frame,waits_per_frame,gpu_wait_ms_per_frame,"
                "waitregmem_per_frame,waitregmem_ms_per_frame,volabel_per_frame,"
                "volabel_ms_per_frame,present_ms_each,present_ms_per_frame,avg_flip_pending,"
-               "acquire_ms,flush_ms,submitlock_ms,presentkhr_ms\n";
+               "acquire_ms,flush_ms,submitlock_ms,presentkhr_ms,"
+               "rf_queue_ms,rf_fence_ms\n";
         csv.flush();
         LOG_INFO(Render, "FaultMonitor: rate CSV at {}", FS::PathToUTF8String(path));
     } else {
@@ -267,6 +277,13 @@ void ReportLoop() {
         const double lock_ms = per_present(cur.lock_ns, prev.lock_ns);
         const double khr_ms = per_present(cur.khr_ns, prev.khr_ns);
 
+        const u64 d_rf = cur.rf_count - prev.rf_count;
+        const auto per_rf = [&](u64 now, u64 before) {
+            return d_rf ? static_cast<double>(now - before) / d_rf / 1e6 : 0.0;
+        };
+        const double rf_queue_ms = per_rf(cur.rf_queue_ns, prev.rf_queue_ns);
+        const double rf_fence_ms = per_rf(cur.rf_fence_ns, prev.rf_fence_ns);
+
         const double read_rate = static_cast<double>(d_read) / dt;
         const double write_rate = static_cast<double>(d_write) / dt;
         const double jit_rate = static_cast<double>(d_jit) / dt;
@@ -290,14 +307,15 @@ void ReportLoop() {
                  "| waitregmem {:.1f}/frame {:.1f}ms/frame volabel {:.1f}/frame {:.1f}ms/frame "
                  "| present {:.2f}ms each {:.1f}ms/frame pending={:.2f} "
                  "| acquire={:.2f}ms flush={:.2f}ms submitlock={:.2f}ms presentKHR={:.2f}ms "
+                 "| renderframe queue={:.2f}ms fence={:.2f}ms "
                  "| totals read={} write={} jit={} frames={} unhandled(r/w)={}/{}",
                  elapsed, fps, read_rate, write_rate, jit_rate, per_frame, read_us, write_us,
                  handler_pct, cur.fragments, static_cast<double>(d_adds) / dt,
                  static_cast<double>(d_subs) / dt, submits_per_frame, waits_per_frame,
                  wait_ms_per_frame, wrm_per_frame, wrm_ms_per_frame, vo_per_frame, vo_ms_per_frame,
                  present_ms_each, present_ms_per_frame, avg_pending, acq_ms, flush_ms, lock_ms,
-                 khr_ms, cur.read, cur.write, cur.jit, cur.frames, cur.read_unhandled,
-                 cur.write_unhandled);
+                 khr_ms, rf_queue_ms, rf_fence_ms, cur.read, cur.write, cur.jit, cur.frames,
+                 cur.read_unhandled, cur.write_unhandled);
 
         if (d_read > 0) {
             LOG_INFO(Render, "FaultPages: {}", TopReadFaultPages(6));
@@ -307,14 +325,14 @@ void ReportLoop() {
             csv << fmt::format(
                 "{:.1f},{:.2f},{:.1f},{:.1f},{:.1f},{:.1f},{:.4f},{:.4f},{:.2f},{},{},{},{},{},{},"
                 "{},{:.1f},{:.1f},{:.2f},{:.2f},{:.3f},{:.2f},{:.3f},{:.2f},{:.3f},"
-                "{:.3f},{:.3f},{:.2f},{:.3f},{:.3f},{:.3f},{:.3f}\n",
+                "{:.3f},{:.3f},{:.2f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f}\n",
                 elapsed, fps, read_rate, write_rate, jit_rate, per_frame, read_us, write_us,
                 handler_pct, cur.read, cur.read_unhandled, cur.write, cur.write_unhandled, cur.jit,
                 cur.frames, cur.fragments, static_cast<double>(d_adds) / dt,
                 static_cast<double>(d_subs) / dt, submits_per_frame, waits_per_frame,
                 wait_ms_per_frame, wrm_per_frame, wrm_ms_per_frame, vo_per_frame, vo_ms_per_frame,
                 present_ms_each, present_ms_per_frame, avg_pending, acq_ms, flush_ms, lock_ms,
-                khr_ms);
+                khr_ms, rf_queue_ms, rf_fence_ms);
             csv.flush(); // a killed process must not lose the curve
         }
 
