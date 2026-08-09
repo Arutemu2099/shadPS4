@@ -5,6 +5,7 @@
 #include <unordered_set>
 
 #include "common/debug.h"
+#include "common/fault_monitor.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -199,16 +200,26 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
 
     const auto& regs = liverpool->regs;
+    // Scoped timers: the stack scanner reports inclusive frequencies with false positives and
+    // cannot apportion cost here. See Common::FaultMonitor for why these exist.
+    const auto t_pipeline = Common::FaultMonitor::Now();
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
+    const auto pipeline_ns = Common::FaultMonitor::SinceNs(t_pipeline);
     if (!pipeline) {
         return;
     }
 
     PrepareRenderState(pipeline);
-    if (!BindResources(pipeline)) {
+    const auto t_bindres = Common::FaultMonitor::Now();
+    const bool bound = BindResources(pipeline);
+    const auto bindres_ns = Common::FaultMonitor::SinceNs(t_bindres);
+    if (!bound) {
         return;
     }
+    const auto t_begin = Common::FaultMonitor::Now();
     const auto state = BeginRendering(pipeline);
+    Common::FaultMonitor::CountDraw(pipeline_ns, bindres_ns,
+                                    Common::FaultMonitor::SinceNs(t_begin));
 
     buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers);
     if (is_indexed) {
@@ -428,8 +439,14 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         set_writes.resize(set_writes.size() + stage->buffers.size() + stage->images.size() +
                           stage->samplers.size());
         stage->PushUd(binding, push_data);
+        // Split measured because BindResources is 6.8 us of the 8.0 us spent per draw - 85% - and
+        // a stack scan could not tell these two apart from anything else.
+        const auto t_buf = Common::FaultMonitor::Now();
         BindBuffers(*stage, binding, push_data);
+        const auto t_tex = Common::FaultMonitor::Now();
         BindTextures(*stage, binding);
+        Common::FaultMonitor::CountBindSplit(Common::FaultMonitor::DiffNs(t_buf, t_tex),
+                                             Common::FaultMonitor::SinceNs(t_tex));
         uses_dma |= stage->uses_dma;
     }
 
@@ -919,7 +936,9 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     if (auto image_id = db_desc.first; image_id) {
         auto& desc = db_desc.second;
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
+        const auto t_fd = Common::FaultMonitor::Now();
         const auto& image_view = texture_cache.FindDepthTarget(image_id, desc);
+        Common::FaultMonitor::CountFindDepthTarget(Common::FaultMonitor::SinceNs(t_fd));
         auto& image = texture_cache.GetImage(image_id);
 
         const auto slice = image_view.info.range.base.layer;

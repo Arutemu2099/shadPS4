@@ -79,6 +79,31 @@ extern std::atomic<u64> download_calls;
 extern std::atomic<u64> download_bytes;
 
 /**
+ * Per-draw CPU cost, measured directly instead of inferred from a stack scan.
+ *
+ * `thread-stack-profile.ps1` reports INCLUSIVE frequencies from scanning the stack for return
+ * addresses, and it has known false positives. In the prologue forest it put
+ * `GetGraphicsPipeline` at 36% and `GraphicsPipelineKey::operator==` at 32% - but that key is
+ * hashed with XXH3 over a few hundred bytes, which at 7,686 draws/frame is ~0.4 ms of an 88 ms
+ * frame. The percentages cannot be cost shares, and an optimisation was nearly built on them.
+ *
+ * These are real scoped timers on the four things `Rasterizer::Draw` does per draw, plus the
+ * texture-cache call inside `BeginRendering` that a stack scan blamed and a fix failed to move.
+ * Overhead is 8 clock reads per draw, ~1.5 ms/frame at 7,700 draws - about 2%, which inflates the
+ * measured total slightly and is worth remembering when the columns are summed.
+ */
+extern std::atomic<u64> draw_count;
+extern std::atomic<u64> draw_pipeline_ns;   ///< PipelineCache::GetGraphicsPipeline (key rebuild + lookup)
+extern std::atomic<u64> draw_bindres_ns;    ///< Rasterizer::BindResources
+extern std::atomic<u64> draw_beginrender_ns;///< Rasterizer::BeginRendering (includes find_depth)
+extern std::atomic<u64> draw_finddepth_ns;  ///< TextureCache::FindDepthTarget, nested in the above
+
+/// Split of BindResources, which measured 6.8 us of the 8.0 us spent per draw. Accumulated per
+/// shader stage, so these sum to more than one call's worth - divide by draws for us/draw.
+extern std::atomic<u64> draw_bindbuf_ns;
+extern std::atomic<u64> draw_bindtex_ns;
+
+/**
  * The two places the GPU command-processor thread can park inside the guest command stream.
  *
  * A symbolized stack profile at the framerate floor put that thread 93.7% blocked in a system DLL
@@ -160,6 +185,13 @@ inline u64 SinceNs(Clock::time_point start) {
         std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
 }
 
+/// Elapsed between two already-taken timestamps, so a split measurement costs one clock read at
+/// the boundary instead of two.
+inline u64 DiffNs(Clock::time_point start, Clock::time_point end) {
+    return static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+}
+
 /**
  * Records which guest page a read fault hit.
  *
@@ -235,6 +267,22 @@ inline void CountPresent(u64 ns, u64 pending) {
 inline void CountVoLabelWait(u64 ns) {
     volabel_count.fetch_add(1, std::memory_order_relaxed);
     volabel_ns.fetch_add(ns, std::memory_order_relaxed);
+}
+
+inline void CountDraw(u64 pipeline_ns, u64 bindres_ns, u64 beginrender_ns) {
+    draw_count.fetch_add(1, std::memory_order_relaxed);
+    draw_pipeline_ns.fetch_add(pipeline_ns, std::memory_order_relaxed);
+    draw_bindres_ns.fetch_add(bindres_ns, std::memory_order_relaxed);
+    draw_beginrender_ns.fetch_add(beginrender_ns, std::memory_order_relaxed);
+}
+
+inline void CountFindDepthTarget(u64 ns) {
+    draw_finddepth_ns.fetch_add(ns, std::memory_order_relaxed);
+}
+
+inline void CountBindSplit(u64 buffers_ns, u64 textures_ns) {
+    draw_bindbuf_ns.fetch_add(buffers_ns, std::memory_order_relaxed);
+    draw_bindtex_ns.fetch_add(textures_ns, std::memory_order_relaxed);
 }
 
 /// `bytes` is the size actually staged for copy, i.e. after clipping to what is GPU-modified.
