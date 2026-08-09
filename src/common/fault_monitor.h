@@ -37,6 +37,35 @@ extern std::atomic<u64> jit_patch_ns;
 extern std::atomic<u64> presented_frames;
 
 /**
+ * Fragmentation of `BufferCache::gpu_modified_ranges`.
+ *
+ * That interval set is Added to on every written buffer binding (GPU thread, per draw) and
+ * Subtracted from on every readback download. A subtract of a small range inside a larger
+ * interval splits it in two, so the fragment count can climb without bound while the Adds that
+ * would coalesce it get slower. Unlike the fault handlers, this cost is paid on the GPU
+ * command-processor thread, outside any handler - which is where the measured per-frame growth
+ * has to be.
+ */
+extern std::atomic<u64> range_fragments;
+extern std::atomic<u64> range_adds;
+extern std::atomic<u64> range_subtracts;
+
+/**
+ * GPU submission and completion-wait accounting.
+ *
+ * Every quantity that can be counted per frame - faults, range operations, handler time, GPU
+ * thread CPU - is flat while wall time per frame doubles, and the guest thread was measured
+ * spinning on a GPU fence. That means the growth is latency waiting for the GPU to complete
+ * work, so the thing to measure is how long `Scheduler::Wait` actually blocks and how many
+ * submits it takes per frame. `BufferCache::ReadMemory` forces a full submit-and-wait per read
+ * fault, so submits per frame should be large; if wait time per frame grows while the submit
+ * count stays flat, the GPU side is getting slower rather than being asked to do more.
+ */
+extern std::atomic<u64> gpu_submits;
+extern std::atomic<u64> gpu_waits;
+extern std::atomic<u64> gpu_wait_ns;
+
+/**
  * Time spent inside the handler is measured as well as the number of entries, because the two
  * answer different questions. If the framerate decays while faults-per-frame stays flat, then
  * either each fault got more expensive (handler nanoseconds per fault rises) or the slowdown is
@@ -54,12 +83,24 @@ inline u64 SinceNs(Clock::time_point start) {
         std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
 }
 
-inline void CountGuestReadFault(bool handled, u64 ns) {
+/**
+ * Records which guest page a read fault hit.
+ *
+ * The guest thread was measured spinning on a GPU fence label in guest memory. Under Precise that
+ * page is read-protected, so every poll of the label should trap and force a full download. If
+ * that is what is happening, read faults will be concentrated on a very small number of pages
+ * rather than spread over the address space - and a targeted fix becomes possible. Cheap enough
+ * to leave on: read faults run ~1100/s, and this is a hash insert under a mutex.
+ */
+void RecordReadFaultPage(u64 addr);
+
+inline void CountGuestReadFault(bool handled, u64 ns, u64 addr) {
     guest_read_faults.fetch_add(1, std::memory_order_relaxed);
     guest_read_ns.fetch_add(ns, std::memory_order_relaxed);
     if (!handled) {
         guest_read_unhandled.fetch_add(1, std::memory_order_relaxed);
     }
+    RecordReadFaultPage(addr);
 }
 
 inline void CountGuestWriteFault(bool handled, u64 ns) {
@@ -77,6 +118,27 @@ inline void CountJitPatchFault(u64 ns) {
 
 inline void CountPresentedFrame() {
     presented_frames.fetch_add(1, std::memory_order_relaxed);
+}
+
+/// `fragments` is the interval count after the operation. Cheap: interval_set::iterative_size()
+/// is the underlying node count, O(1).
+inline void CountRangeAdd(u64 fragments) {
+    range_adds.fetch_add(1, std::memory_order_relaxed);
+    range_fragments.store(fragments, std::memory_order_relaxed);
+}
+
+inline void CountGpuSubmit() {
+    gpu_submits.fetch_add(1, std::memory_order_relaxed);
+}
+
+inline void CountGpuWait(u64 ns) {
+    gpu_waits.fetch_add(1, std::memory_order_relaxed);
+    gpu_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+}
+
+inline void CountRangeSubtract(u64 fragments) {
+    range_subtracts.fetch_add(1, std::memory_order_relaxed);
+    range_fragments.store(fragments, std::memory_order_relaxed);
 }
 
 /// Starts the reporter thread. Safe to call more than once; only the first call has an effect.

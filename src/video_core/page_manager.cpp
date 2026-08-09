@@ -220,8 +220,8 @@ struct PageManager::Impl {
             // Read faults only exist under Precise readbacks - it is the only mode that
             // read-protects guest pages holding GPU-modified data.
             const bool handled = rasterizer->ReadMemory(addr, 8);
-            Common::FaultMonitor::CountGuestReadFault(handled,
-                                                      Common::FaultMonitor::SinceNs(start));
+            Common::FaultMonitor::CountGuestReadFault(handled, Common::FaultMonitor::SinceNs(start),
+                                                      addr);
             return handled;
         }
     }

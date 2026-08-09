@@ -4,6 +4,7 @@
 #include <algorithm>
 #include "common/alignment.h"
 #include "common/debug.h"
+#include "common/fault_monitor.h"
 #include "common/scope_exit.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -103,6 +104,8 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
             };
             gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, add_download);
             gpu_modified_ranges.Subtract(device_addr_out, range_size);
+            Common::FaultMonitor::CountRangeSubtract(
+                gpu_modified_ranges.m_ranges_set.iterative_size());
         });
     if (total_size_bytes == 0) {
         return;
@@ -317,6 +320,7 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         auto& buffer = slot_buffers[buffer_id];
         SynchronizeBuffer(buffer, dst, num_bytes, true, true);
         gpu_modified_ranges.Add(dst, num_bytes);
+        Common::FaultMonitor::CountRangeAdd(gpu_modified_ranges.m_ranges_set.iterative_size());
         return buffer;
     }();
     const vk::BufferCopy region = {
@@ -393,6 +397,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer);
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
+        Common::FaultMonitor::CountRangeAdd(gpu_modified_ranges.m_ranges_set.iterative_size());
     }
     return {&buffer, buffer.Offset(device_addr)};
 }

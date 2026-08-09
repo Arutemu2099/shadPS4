@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/fault_monitor.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -115,7 +116,9 @@ void Scheduler::Wait(u64 tick) {
         SubmitInfo info{};
         Flush(info);
     }
+    const auto start = Common::FaultMonitor::Now();
     master_semaphore.Wait(tick);
+    Common::FaultMonitor::CountGpuWait(Common::FaultMonitor::SinceNs(start));
 }
 
 void Scheduler::PopPendingOperations() {
@@ -150,6 +153,7 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
     std::scoped_lock lk{submit_mutex};
+    Common::FaultMonitor::CountGpuSubmit();
     const u64 signal_value = master_semaphore.NextTick();
 
 #if TRACY_GPU_ENABLED
