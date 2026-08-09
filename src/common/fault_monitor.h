@@ -103,6 +103,14 @@ extern std::atomic<u64> draw_finddepth_ns;  ///< TextureCache::FindDepthTarget, 
 extern std::atomic<u64> draw_bindbuf_ns;
 extern std::atomic<u64> draw_bindtex_ns;
 
+/// Split of BindBuffers, which is 5.00 us/draw - 62% of all per-draw cost. Two passes over the
+/// stage's buffer descriptors: the first resolves each sharp to a cached buffer (FindBuffer, a
+/// page-table lookup), the second synchronizes it (ObtainBuffer -> SynchronizeBuffer ->
+/// ForEachUploadRange, which takes a per-region spinlock and scans a page bitset). A stack scan
+/// pointed at the second; that is exactly the kind of claim that has been wrong twice, so measure.
+extern std::atomic<u64> bindbuf_find_ns;
+extern std::atomic<u64> bindbuf_obtain_ns;
+
 /**
  * The two places the GPU command-processor thread can park inside the guest command stream.
  *
@@ -283,6 +291,11 @@ inline void CountFindDepthTarget(u64 ns) {
 inline void CountBindSplit(u64 buffers_ns, u64 textures_ns) {
     draw_bindbuf_ns.fetch_add(buffers_ns, std::memory_order_relaxed);
     draw_bindtex_ns.fetch_add(textures_ns, std::memory_order_relaxed);
+}
+
+inline void CountBindBufferPass(u64 find_ns, u64 obtain_ns) {
+    bindbuf_find_ns.fetch_add(find_ns, std::memory_order_relaxed);
+    bindbuf_obtain_ns.fetch_add(obtain_ns, std::memory_order_relaxed);
 }
 
 /// `bytes` is the size actually staged for copy, i.e. after clipping to what is GPU-modified.

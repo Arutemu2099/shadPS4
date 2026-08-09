@@ -44,6 +44,8 @@ std::atomic<u64> draw_beginrender_ns{0};
 std::atomic<u64> draw_finddepth_ns{0};
 std::atomic<u64> draw_bindbuf_ns{0};
 std::atomic<u64> draw_bindtex_ns{0};
+std::atomic<u64> bindbuf_find_ns{0};
+std::atomic<u64> bindbuf_obtain_ns{0};
 std::atomic<u64> waitregmem_count{0};
 std::atomic<u64> waitregmem_ns{0};
 std::atomic<u64> volabel_count{0};
@@ -152,6 +154,8 @@ struct Sample {
     u64 d_finddepth_ns;
     u64 d_bindbuf_ns;
     u64 d_bindtex_ns;
+    u64 bb_find_ns;
+    u64 bb_obtain_ns;
 };
 
 Sample Read() {
@@ -194,6 +198,8 @@ Sample Read() {
         draw_finddepth_ns.load(std::memory_order_relaxed),
         draw_bindbuf_ns.load(std::memory_order_relaxed),
         draw_bindtex_ns.load(std::memory_order_relaxed),
+        bindbuf_find_ns.load(std::memory_order_relaxed),
+        bindbuf_obtain_ns.load(std::memory_order_relaxed),
     };
 }
 
@@ -221,7 +227,8 @@ std::ofstream OpenCsv() {
                "acquire_ms,flush_ms,submitlock_ms,presentkhr_ms,"
                "rf_queue_ms,rf_fence_ms,download_per_frame,download_kb_per_frame,"
                "draws_per_frame,pipeline_us_each,bindres_us_each,beginrender_us_each,"
-               "finddepth_us_each,draw_ms_per_frame,bindbuf_us_each,bindtex_us_each\n";
+               "finddepth_us_each,draw_ms_per_frame,bindbuf_us_each,bindtex_us_each,"
+               "bb_find_us_each,bb_obtain_us_each\n";
         csv.flush();
         LOG_INFO(Render, "FaultMonitor: rate CSV at {}", FS::PathToUTF8String(path));
     } else {
@@ -341,6 +348,8 @@ void ReportLoop() {
         const double finddepth_us = per_draw_us(d_fdepth);
         const double bindbuf_us = per_draw_us(cur.d_bindbuf_ns - prev.d_bindbuf_ns);
         const double bindtex_us = per_draw_us(cur.d_bindtex_ns - prev.d_bindtex_ns);
+        const double bb_find_us = per_draw_us(cur.bb_find_ns - prev.bb_find_ns);
+        const double bb_obtain_us = per_draw_us(cur.bb_obtain_ns - prev.bb_obtain_ns);
         const double draw_ms_per_frame =
             d_frames ? static_cast<double>(d_pipe + d_bind + d_begin) /
                            static_cast<double>(d_frames) / 1e6
@@ -372,7 +381,7 @@ void ReportLoop() {
                  "| renderframe queue={:.2f}ms fence={:.2f}ms "
                  "| downloads {:.1f}/frame {:.1f}kB/frame "
                  "| draws {:.0f}/frame pipeline={:.2f}us bindres={:.2f}us begin={:.2f}us "
-                 "(finddepth={:.2f}us bindbuf={:.2f}us bindtex={:.2f}us) = {:.1f}ms/frame "
+                 "(finddepth={:.2f}us bindbuf={:.2f}us [find={:.2f} obtain={:.2f}] bindtex={:.2f}us) = {:.1f}ms/frame "
                  "| totals read={} write={} jit={} frames={} unhandled(r/w)={}/{}",
                  elapsed, fps, read_rate, write_rate, jit_rate, per_frame, read_us, write_us,
                  handler_pct, cur.fragments, static_cast<double>(d_adds) / dt,
@@ -380,7 +389,8 @@ void ReportLoop() {
                  wait_ms_per_frame, wrm_per_frame, wrm_ms_per_frame, vo_per_frame, vo_ms_per_frame,
                  present_ms_each, present_ms_per_frame, avg_pending, acq_ms, flush_ms, lock_ms,
                  khr_ms, rf_queue_ms, rf_fence_ms, dl_per_frame, dl_kb_per_frame, draws_per_frame,
-                 pipeline_us, bindres_us, beginrender_us, finddepth_us, bindbuf_us, bindtex_us,
+                 pipeline_us, bindres_us, beginrender_us, finddepth_us, bindbuf_us, bb_find_us,
+                 bb_obtain_us, bindtex_us,
                  draw_ms_per_frame, cur.read,
                  cur.write, cur.jit, cur.frames, cur.read_unhandled, cur.write_unhandled);
 
@@ -393,7 +403,7 @@ void ReportLoop() {
                 "{:.1f},{:.2f},{:.1f},{:.1f},{:.1f},{:.1f},{:.4f},{:.4f},{:.2f},{},{},{},{},{},{},"
                 "{},{:.1f},{:.1f},{:.2f},{:.2f},{:.3f},{:.2f},{:.3f},{:.2f},{:.3f},"
                 "{:.3f},{:.3f},{:.2f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},"
-                "{:.2f},{:.1f},{:.1f},{:.3f},{:.3f},{:.3f},{:.3f},{:.2f},{:.3f},{:.3f}\n",
+                "{:.2f},{:.1f},{:.1f},{:.3f},{:.3f},{:.3f},{:.3f},{:.2f},{:.3f},{:.3f},{:.3f},{:.3f}\n",
                 elapsed, fps, read_rate, write_rate, jit_rate, per_frame, read_us, write_us,
                 handler_pct, cur.read, cur.read_unhandled, cur.write, cur.write_unhandled, cur.jit,
                 cur.frames, cur.fragments, static_cast<double>(d_adds) / dt,
@@ -402,7 +412,7 @@ void ReportLoop() {
                 present_ms_each, present_ms_per_frame, avg_pending, acq_ms, flush_ms, lock_ms,
                 khr_ms, rf_queue_ms, rf_fence_ms, dl_per_frame, dl_kb_per_frame, draws_per_frame,
                 pipeline_us, bindres_us, beginrender_us, finddepth_us, draw_ms_per_frame, bindbuf_us,
-                bindtex_us);
+                bindtex_us, bb_find_us, bb_obtain_us);
             csv.flush(); // a killed process must not lose the curve
         }
 
