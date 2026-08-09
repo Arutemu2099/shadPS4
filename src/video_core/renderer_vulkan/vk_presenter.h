@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <condition_variable>
 
 #include "core/libraries/videoout/buffer.h"
@@ -82,7 +83,11 @@ public:
 
     VideoCore::Image& RegisterVideoOutSurface(
         const Libraries::VideoOut::BufferAttributeGroup& attribute, VAddr cpu_address) {
-        vo_buffers_addr.emplace_back(cpu_address);
+        // Registering the same address twice would grow this vector without bound; it is only
+        // ever linear-scanned by IsVideoOutSurface and nothing removes entries from it.
+        if (std::ranges::find(vo_buffers_addr, cpu_address) == vo_buffers_addr.cend()) {
+            vo_buffers_addr.emplace_back(cpu_address);
+        }
         auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
         const auto image_id = texture_cache.FindImage(desc);
         auto& image = texture_cache.GetImage(image_id);
