@@ -5,6 +5,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/fault_monitor.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
@@ -825,12 +826,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
                 if (vo_port->IsVoLabel(wait_addr) &&
                     num_submits == mapped_queues[GfxQueueId].submits.size()) {
+                    const auto vo_start = Common::FaultMonitor::Now();
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
+                    Common::FaultMonitor::CountVoLabelWait(
+                        Common::FaultMonitor::SinceNs(vo_start));
                     break;
                 }
+                const auto wrm_start = Common::FaultMonitor::Now();
                 while (!wait_reg_mem->Test(regs.reg_array)) {
                     YIELD_GFX();
                 }
+                Common::FaultMonitor::CountWaitRegMem(Common::FaultMonitor::SinceNs(wrm_start));
                 break;
             }
             case PM4ItOpcode::IndirectBuffer: {
@@ -1142,9 +1148,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+            const auto wrm_start = Common::FaultMonitor::Now();
             while (!wait_reg_mem->Test(regs.reg_array)) {
                 YIELD_ASC(vqid);
             }
+            Common::FaultMonitor::CountWaitRegMem(Common::FaultMonitor::SinceNs(wrm_start));
             break;
         }
         case PM4ItOpcode::ReleaseMem: {

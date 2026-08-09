@@ -35,6 +35,17 @@ std::atomic<u64> range_subtracts{0};
 std::atomic<u64> gpu_submits{0};
 std::atomic<u64> gpu_waits{0};
 std::atomic<u64> gpu_wait_ns{0};
+std::atomic<u64> waitregmem_count{0};
+std::atomic<u64> waitregmem_ns{0};
+std::atomic<u64> volabel_count{0};
+std::atomic<u64> volabel_ns{0};
+std::atomic<u64> present_count{0};
+std::atomic<u64> present_ns{0};
+std::atomic<u64> flip_pending_total{0};
+std::atomic<u64> present_acquire_ns{0};
+std::atomic<u64> present_flush_ns{0};
+std::atomic<u64> present_lock_ns{0};
+std::atomic<u64> present_khr_ns{0};
 
 namespace {
 
@@ -106,6 +117,17 @@ struct Sample {
     u64 submits;
     u64 waits;
     u64 wait_ns;
+    u64 wrm_count;
+    u64 wrm_ns;
+    u64 vo_count;
+    u64 vo_ns;
+    u64 pres_count;
+    u64 pres_ns;
+    u64 pending;
+    u64 acq_ns;
+    u64 flush_ns;
+    u64 lock_ns;
+    u64 khr_ns;
 };
 
 Sample Read() {
@@ -125,6 +147,17 @@ Sample Read() {
         gpu_submits.load(std::memory_order_relaxed),
         gpu_waits.load(std::memory_order_relaxed),
         gpu_wait_ns.load(std::memory_order_relaxed),
+        waitregmem_count.load(std::memory_order_relaxed),
+        waitregmem_ns.load(std::memory_order_relaxed),
+        volabel_count.load(std::memory_order_relaxed),
+        volabel_ns.load(std::memory_order_relaxed),
+        present_count.load(std::memory_order_relaxed),
+        present_ns.load(std::memory_order_relaxed),
+        flip_pending_total.load(std::memory_order_relaxed),
+        present_acquire_ns.load(std::memory_order_relaxed),
+        present_flush_ns.load(std::memory_order_relaxed),
+        present_lock_ns.load(std::memory_order_relaxed),
+        present_khr_ns.load(std::memory_order_relaxed),
     };
 }
 
@@ -146,7 +179,10 @@ std::ofstream OpenCsv() {
                "faults_per_frame,read_us_each,write_us_each,handler_pct_of_wall,"
                "read_total,read_unhandled,write_total,write_unhandled,jit_total,frames_total,"
                "range_fragments,range_adds_per_s,range_subs_per_s,"
-               "submits_per_frame,waits_per_frame,gpu_wait_ms_per_frame\n";
+               "submits_per_frame,waits_per_frame,gpu_wait_ms_per_frame,"
+               "waitregmem_per_frame,waitregmem_ms_per_frame,volabel_per_frame,"
+               "volabel_ms_per_frame,present_ms_each,present_ms_per_frame,avg_flip_pending,"
+               "acquire_ms,flush_ms,submitlock_ms,presentkhr_ms\n";
         csv.flush();
         LOG_INFO(Render, "FaultMonitor: rate CSV at {}", FS::PathToUTF8String(path));
     } else {
@@ -201,6 +237,36 @@ void ReportLoop() {
         const double wait_ms_per_frame =
             d_frames ? static_cast<double>(d_wait_ns) / static_cast<double>(d_frames) / 1e6 : 0.0;
 
+        const u64 d_wrm = cur.wrm_count - prev.wrm_count;
+        const u64 d_wrm_ns = cur.wrm_ns - prev.wrm_ns;
+        const u64 d_vo = cur.vo_count - prev.vo_count;
+        const u64 d_vo_ns = cur.vo_ns - prev.vo_ns;
+        const double wrm_per_frame =
+            d_frames ? static_cast<double>(d_wrm) / static_cast<double>(d_frames) : 0.0;
+        const double wrm_ms_per_frame =
+            d_frames ? static_cast<double>(d_wrm_ns) / static_cast<double>(d_frames) / 1e6 : 0.0;
+        const double vo_per_frame =
+            d_frames ? static_cast<double>(d_vo) / static_cast<double>(d_frames) : 0.0;
+        const double vo_ms_per_frame =
+            d_frames ? static_cast<double>(d_vo_ns) / static_cast<double>(d_frames) / 1e6 : 0.0;
+
+        const u64 d_pres = cur.pres_count - prev.pres_count;
+        const u64 d_pres_ns = cur.pres_ns - prev.pres_ns;
+        const u64 d_pending = cur.pending - prev.pending;
+        const double present_ms_each = d_pres ? static_cast<double>(d_pres_ns) / d_pres / 1e6 : 0.0;
+        const double present_ms_per_frame =
+            d_frames ? static_cast<double>(d_pres_ns) / static_cast<double>(d_frames) / 1e6 : 0.0;
+        const double avg_pending =
+            d_pres ? static_cast<double>(d_pending) / static_cast<double>(d_pres) : 0.0;
+
+        const auto per_present = [&](u64 now, u64 before) {
+            return d_pres ? static_cast<double>(now - before) / d_pres / 1e6 : 0.0;
+        };
+        const double acq_ms = per_present(cur.acq_ns, prev.acq_ns);
+        const double flush_ms = per_present(cur.flush_ns, prev.flush_ns);
+        const double lock_ms = per_present(cur.lock_ns, prev.lock_ns);
+        const double khr_ms = per_present(cur.khr_ns, prev.khr_ns);
+
         const double read_rate = static_cast<double>(d_read) / dt;
         const double write_rate = static_cast<double>(d_write) / dt;
         const double jit_rate = static_cast<double>(d_jit) / dt;
@@ -221,11 +287,16 @@ void ReportLoop() {
                  "| per_frame={:.0f} read={:.2f}us write={:.2f}us handler={:.1f}% of wall "
                  "| ranges frags={} add={:.0f}/s sub={:.0f}/s "
                  "| gpu submits/frame={:.1f} waits/frame={:.1f} wait={:.1f}ms/frame "
+                 "| waitregmem {:.1f}/frame {:.1f}ms/frame volabel {:.1f}/frame {:.1f}ms/frame "
+                 "| present {:.2f}ms each {:.1f}ms/frame pending={:.2f} "
+                 "| acquire={:.2f}ms flush={:.2f}ms submitlock={:.2f}ms presentKHR={:.2f}ms "
                  "| totals read={} write={} jit={} frames={} unhandled(r/w)={}/{}",
                  elapsed, fps, read_rate, write_rate, jit_rate, per_frame, read_us, write_us,
                  handler_pct, cur.fragments, static_cast<double>(d_adds) / dt,
                  static_cast<double>(d_subs) / dt, submits_per_frame, waits_per_frame,
-                 wait_ms_per_frame, cur.read, cur.write, cur.jit, cur.frames, cur.read_unhandled,
+                 wait_ms_per_frame, wrm_per_frame, wrm_ms_per_frame, vo_per_frame, vo_ms_per_frame,
+                 present_ms_each, present_ms_per_frame, avg_pending, acq_ms, flush_ms, lock_ms,
+                 khr_ms, cur.read, cur.write, cur.jit, cur.frames, cur.read_unhandled,
                  cur.write_unhandled);
 
         if (d_read > 0) {
@@ -235,12 +306,15 @@ void ReportLoop() {
         if (csv) {
             csv << fmt::format(
                 "{:.1f},{:.2f},{:.1f},{:.1f},{:.1f},{:.1f},{:.4f},{:.4f},{:.2f},{},{},{},{},{},{},"
-                "{},{:.1f},{:.1f},{:.2f},{:.2f},{:.3f}\n",
+                "{},{:.1f},{:.1f},{:.2f},{:.2f},{:.3f},{:.2f},{:.3f},{:.2f},{:.3f},"
+                "{:.3f},{:.3f},{:.2f},{:.3f},{:.3f},{:.3f},{:.3f}\n",
                 elapsed, fps, read_rate, write_rate, jit_rate, per_frame, read_us, write_us,
                 handler_pct, cur.read, cur.read_unhandled, cur.write, cur.write_unhandled, cur.jit,
                 cur.frames, cur.fragments, static_cast<double>(d_adds) / dt,
                 static_cast<double>(d_subs) / dt, submits_per_frame, waits_per_frame,
-                wait_ms_per_frame);
+                wait_ms_per_frame, wrm_per_frame, wrm_ms_per_frame, vo_per_frame, vo_ms_per_frame,
+                present_ms_each, present_ms_per_frame, avg_pending, acq_ms, flush_ms, lock_ms,
+                khr_ms);
             csv.flush(); // a killed process must not lose the curve
         }
 

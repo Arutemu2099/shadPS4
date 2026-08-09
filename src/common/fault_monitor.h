@@ -66,6 +66,53 @@ extern std::atomic<u64> gpu_waits;
 extern std::atomic<u64> gpu_wait_ns;
 
 /**
+ * The two places the GPU command-processor thread can park inside the guest command stream.
+ *
+ * A symbolized stack profile at the framerate floor put that thread 93.7% blocked in a system DLL
+ * with the readback path accounting for only ~9-13%, and `Liverpool::Process`'s inner loop does no
+ * blocking of its own - so the wait is inside a resumed task. `WaitRegMem` spins on a guest memory
+ * value (`while (!Test()) YIELD;`) and the video-out label wait blocks on a condition variable.
+ * `ReleaseMem`, which signals the per-frame fence the guest busy-waits on, sits immediately after
+ * the ASC `WaitRegMem`. If wait time per frame grows here while the count stays flat, this is the
+ * decay; if both are flat, it is not.
+ */
+extern std::atomic<u64> waitregmem_count;
+extern std::atomic<u64> waitregmem_ns;
+extern std::atomic<u64> volabel_count;
+extern std::atomic<u64> volabel_ns;
+
+/**
+ * Time inside `Presenter::Present`, and the flip backlog at the time of each flip.
+ *
+ * Measured: frame time minus the VO-label wait is a constant ~40 ms across the whole decay, and
+ * the wait itself grows 0 -> 106 ms then collapses to 14 ms on a settings toggle. The guest is
+ * blocked waiting for a display buffer, which `VideoOutDriver::Flip` releases after
+ * `presenter->Present`. This splits the two remaining explanations: presentation genuinely
+ * getting slower (present_ms_per_frame grows) versus the flip queue / buffer-label bookkeeping
+ * being in a bad state (present stays fast, pending flips climb).
+ */
+extern std::atomic<u64> present_count;
+extern std::atomic<u64> present_ns;
+extern std::atomic<u64> flip_pending_total;
+
+/**
+ * Breakdown of `Presenter::Present`, which measurement shows IS the decay: frame time minus
+ * Present is a constant ~8.5 ms from 19 fps down to 7 fps, while Present itself grows 0.8 -> 139 ms.
+ * Only four things in it can block, so time all four:
+ *
+ *   acquire   - `swapchain.AcquireNextImage()`, i.e. waiting on the display/compositor
+ *   flush     - `scheduler.Flush(info)` -> SubmitExecution (which itself takes submit_mutex)
+ *   lock      - the bare `std::scoped_lock{Scheduler::submit_mutex}` before presenting. That
+ *               mutex is STATIC and every one of the ~208 submits/frame from the readback path
+ *               takes it, so the presenter may simply be starved of it.
+ *   present   - `swapchain.Present()` -> vkQueuePresentKHR
+ */
+extern std::atomic<u64> present_acquire_ns;
+extern std::atomic<u64> present_flush_ns;
+extern std::atomic<u64> present_lock_ns;
+extern std::atomic<u64> present_khr_ns;
+
+/**
  * Time spent inside the handler is measured as well as the number of entries, because the two
  * answer different questions. If the framerate decays while faults-per-frame stays flat, then
  * either each fault got more expensive (handler nanoseconds per fault rises) or the slowdown is
@@ -129,6 +176,29 @@ inline void CountRangeAdd(u64 fragments) {
 
 inline void CountGpuSubmit() {
     gpu_submits.fetch_add(1, std::memory_order_relaxed);
+}
+
+inline void CountWaitRegMem(u64 ns) {
+    waitregmem_count.fetch_add(1, std::memory_order_relaxed);
+    waitregmem_ns.fetch_add(ns, std::memory_order_relaxed);
+}
+
+inline void CountPresentPhases(u64 acquire, u64 flush, u64 lock, u64 khr) {
+    present_acquire_ns.fetch_add(acquire, std::memory_order_relaxed);
+    present_flush_ns.fetch_add(flush, std::memory_order_relaxed);
+    present_lock_ns.fetch_add(lock, std::memory_order_relaxed);
+    present_khr_ns.fetch_add(khr, std::memory_order_relaxed);
+}
+
+inline void CountPresent(u64 ns, u64 pending) {
+    present_count.fetch_add(1, std::memory_order_relaxed);
+    present_ns.fetch_add(ns, std::memory_order_relaxed);
+    flip_pending_total.fetch_add(pending, std::memory_order_relaxed);
+}
+
+inline void CountVoLabelWait(u64 ns) {
+    volabel_count.fetch_add(1, std::memory_order_relaxed);
+    volabel_ns.fetch_add(ns, std::memory_order_relaxed);
 }
 
 inline void CountGpuWait(u64 ns) {

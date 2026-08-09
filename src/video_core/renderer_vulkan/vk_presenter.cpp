@@ -874,6 +874,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
     }
 
+    const auto acquire_start = Common::FaultMonitor::Now();
     if (!swapchain.AcquireNextImage()) {
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
         if (!swapchain.AcquireNextImage()) {
@@ -883,6 +884,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
             return;
         }
     }
+
+    const u64 acquire_ns = Common::FaultMonitor::SinceNs(acquire_start);
 
     // Reset fence for queue submission. Do it here instead of GetRenderFrame() because we may
     // skip frame because of slow swapchain recreation. If a frame skip occurs, we skip signal
@@ -1094,15 +1097,27 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
     info.AddWait(frame->ready_semaphore, frame->ready_tick);
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     info.AddSignal(frame->present_done);
+    const auto flush_start = Common::FaultMonitor::Now();
     scheduler.Flush(info);
+    const u64 flush_ns = Common::FaultMonitor::SinceNs(flush_start);
 
     // Present to swapchain.
+    u64 lock_ns = 0;
+    u64 khr_ns = 0;
     {
+        // submit_mutex is static and every one of the ~208 submits/frame the readback path makes
+        // takes it too, so time the acquisition separately from the present itself.
+        const auto lock_start = Common::FaultMonitor::Now();
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
+        lock_ns = Common::FaultMonitor::SinceNs(lock_start);
+
+        const auto khr_start = Common::FaultMonitor::Now();
         if (!swapchain.Present()) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
+        khr_ns = Common::FaultMonitor::SinceNs(khr_start);
     }
+    Common::FaultMonitor::CountPresentPhases(acquire_ns, flush_ns, lock_ns, khr_ns);
 
     free_frame();
     if (!is_reusing_frame) {

@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/fault_monitor.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -238,13 +239,16 @@ void VideoOutDriver::Flip(const Request& req) {
     presenter->SetHDR(req.port->is_hdr);
 
     // Present the frame.
+    const auto present_start = Common::FaultMonitor::Now();
     presenter->Present(req.frame);
+    const auto present_ns = Common::FaultMonitor::SinceNs(present_start);
 
     // Update flip status.
     auto* port = req.port;
     {
         std::unique_lock lock{port->port_mutex};
         auto& flip_status = port->flip_status;
+        Common::FaultMonitor::CountPresent(present_ns, flip_status.flip_pending_num);
         flip_status.count++;
         flip_status.process_time = Libraries::Kernel::sceKernelGetProcessTime();
         flip_status.tsc = Libraries::Kernel::sceKernelReadTsc();
