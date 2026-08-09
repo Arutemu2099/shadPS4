@@ -23,6 +23,36 @@ static constexpr size_t DownloadBufferSize = 32_MB;
 static constexpr size_t UboStreamBufferSize = 64_MB;
 static constexpr size_t DeviceBufferSize = 128_MB;
 
+/**
+ * Alignment a guest read fault is widened to before downloading.
+ *
+ * A read fault reports 8 bytes, but the protection being unwound is 4K granular and every
+ * download costs a full submit-and-fence-wait, so one fault buys one page at the price of a
+ * queue drain. On inFAMOUS: Second Son under Precise readbacks that is ~167 read faults and
+ * ~208 GPU submits per frame against a stable ~2.5 MB read set that is re-read every frame.
+ *
+ * Widening is safe because everything downstream is already page granular and clipped:
+ * `ForEachDownloadRange` only visits pages whose GPU bit is set, `gpu_modified_ranges` only
+ * copies byte ranges actually written by the GPU, and `UpdateProtection` only touches pages
+ * whose protection state changes. So a wider window copies data that was going to be faulted
+ * on anyway - it just folds many faults into one submit instead of one each.
+ */
+static constexpr u64 ReadFaultWidenSize = 64_KB;
+
+/// Expands a read fault to `ReadFaultWidenSize`, clipped to the buffer that already covers it.
+/// The clip is what keeps this safe: `FindBuffer` has already run on the original range, so
+/// buffer creation and merging behaviour is unchanged by the wider download.
+static std::pair<VAddr, u64> WidenReadFault(const Buffer& buffer, VAddr device_addr, u64 size) {
+    if (!buffer.IsInBounds(device_addr, size)) {
+        return {device_addr, size};
+    }
+    const VAddr begin =
+        std::max(Common::AlignDown(device_addr, ReadFaultWidenSize), buffer.CpuAddr());
+    const VAddr end = std::min(Common::AlignUp(device_addr + size, ReadFaultWidenSize),
+                               buffer.CpuAddr() + buffer.SizeBytes());
+    return {begin, end - begin};
+}
+
 BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                          AmdGpu::Liverpool* liverpool_, TextureCache& texture_cache_,
                          PageManager& tracker)
@@ -78,7 +108,14 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
     liverpool->SendCommand<true>([this, device_addr, size, is_write] {
         Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
-        DownloadBufferMemory<false>(buffer, device_addr, size, is_write);
+        if (is_write) {
+            // Invalidation path. The caller picked this exact range and is about to mark it CPU
+            // modified, so it must not be widened.
+            DownloadBufferMemory<false>(buffer, device_addr, size, true);
+            return;
+        }
+        const auto [wide_addr, wide_size] = WidenReadFault(buffer, device_addr, size);
+        DownloadBufferMemory<false>(buffer, wide_addr, wide_size, false);
     });
 }
 
@@ -110,6 +147,7 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     if (total_size_bytes == 0) {
         return;
     }
+    Common::FaultMonitor::CountReadbackDownload(total_size_bytes);
     const auto [download, offset] = download_buffer.Map(total_size_bytes);
     for (auto& copy : copies) {
         // Modify copies to have the staging offset in mind

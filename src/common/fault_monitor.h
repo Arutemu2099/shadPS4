@@ -66,6 +66,19 @@ extern std::atomic<u64> gpu_waits;
 extern std::atomic<u64> gpu_wait_ns;
 
 /**
+ * Readback download volume, so cutting the submit count can be judged instead of assumed.
+ *
+ * `BufferCache::ReadMemory` serviced one 8-byte read fault per full submit-and-fence-wait, while
+ * the page protection it is unwinding is 4K granular - ~167 read faults/frame produced ~208 GPU
+ * submits/frame on this title. Widening each download to an aligned window trades bytes copied
+ * for submits issued, and that trade can go the wrong way if the read set is sparse inside the
+ * window. These two columns are how to tell which way it went: `download_per_frame` should fall
+ * with the submit count, `download_kb_per_frame` should stay near where it was.
+ */
+extern std::atomic<u64> download_calls;
+extern std::atomic<u64> download_bytes;
+
+/**
  * The two places the GPU command-processor thread can park inside the guest command stream.
  *
  * A symbolized stack profile at the framerate floor put that thread 93.7% blocked in a system DLL
@@ -222,6 +235,12 @@ inline void CountPresent(u64 ns, u64 pending) {
 inline void CountVoLabelWait(u64 ns) {
     volabel_count.fetch_add(1, std::memory_order_relaxed);
     volabel_ns.fetch_add(ns, std::memory_order_relaxed);
+}
+
+/// `bytes` is the size actually staged for copy, i.e. after clipping to what is GPU-modified.
+inline void CountReadbackDownload(u64 bytes) {
+    download_calls.fetch_add(1, std::memory_order_relaxed);
+    download_bytes.fetch_add(bytes, std::memory_order_relaxed);
 }
 
 inline void CountGpuWait(u64 ns) {
