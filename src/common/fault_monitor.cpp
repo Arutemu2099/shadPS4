@@ -4,7 +4,6 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
-#include <cstdlib>
 #include <ctime>
 #include <fstream>
 #include <mutex>
@@ -62,36 +61,9 @@ std::atomic<u64> renderframe_count{0};
 
 namespace {
 
-/**
- * Reporting cadence, overridable per run with `SHADPS4_FAULT_INTERVAL_MS`.
- *
- * The 15 s default is sized for unattended multi-hour decay runs - 240 lines per hour. It is far
- * too coarse for a scene-comparison A/B, where the playtester holds a camera direction for a few
- * seconds and switches: a 15 s bucket smears the transition across both sides. Set it low (2000-
- * 3000 ms) for those and leave it alone for long runs. Clamped so a typo cannot produce a reporter
- * that spins or never fires.
- */
-std::chrono::milliseconds ReportInterval() {
-    constexpr u64 DefaultMs = 15000;
-    constexpr u64 MinMs = 250;
-    constexpr u64 MaxMs = 600000;
-    u64 ms = DefaultMs;
-#ifdef _WIN32
-    size_t len = 0;
-    char buf[32]{};
-    if (getenv_s(&len, buf, sizeof(buf), "SHADPS4_FAULT_INTERVAL_MS") == 0 && len > 1) {
-        const char* env = buf;
-#else
-    if (const char* env = std::getenv("SHADPS4_FAULT_INTERVAL_MS")) {
-#endif
-        char* end = nullptr;
-        const unsigned long long parsed = std::strtoull(env, &end, 10);
-        if (end != env && parsed >= MinMs && parsed <= MaxMs) {
-            ms = static_cast<u64>(parsed);
-        }
-    }
-    return std::chrono::milliseconds(ms);
-}
+// Short enough to see when the decay starts, long enough that a multi-hour run stays small:
+// 240 lines per hour.
+constexpr auto REPORT_INTERVAL = std::chrono::seconds(15);
 
 std::mutex page_mutex;
 std::unordered_map<u64, u64> read_fault_pages;
@@ -262,16 +234,13 @@ void ReportLoop() {
     Common::SetCurrentThreadName("shadPS4:FaultMonitor");
 
     std::ofstream csv = OpenCsv();
-    const auto interval = ReportInterval();
-    LOG_INFO(Render, "FaultMonitor: reporting every {} ms (SHADPS4_FAULT_INTERVAL_MS to override)",
-             interval.count());
     const auto started = std::chrono::steady_clock::now();
     auto prev_time = started;
     Sample prev = Read();
 
     while (true) {
         std::unique_lock lk(stop_mutex);
-        if (stop_cv.wait_for(lk, interval, [] { return stop_requested; })) {
+        if (stop_cv.wait_for(lk, REPORT_INTERVAL, [] { return stop_requested; })) {
             break;
         }
         lk.unlock();

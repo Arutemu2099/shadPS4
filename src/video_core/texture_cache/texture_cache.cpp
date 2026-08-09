@@ -674,30 +674,21 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 
     // If there is a stencil attachment, link depth and stencil.
     if (desc.info.stencil_addr != 0) {
-        // This runs on every draw (Rasterizer::Draw -> BeginRendering -> here), and the answer is
-        // the same one almost every time: the stencil buffer paired with this depth target does not
-        // change between draws of a pass. Resolving it with a ForEachImageInRegion page-table walk
-        // each time showed up as 40% of GPU-thread stacks in a draw-heavy scene, so cache it and
-        // only walk when the cache misses.
-        ImageId stencil_id = GetAssociatedStencil(image, desc.info.stencil_addr);
+        ImageId stencil_id{};
+        ForEachImageInRegion(desc.info.stencil_addr, desc.info.stencil_size,
+                             [&](ImageId image_id, Image& image) {
+                                 if (image.info.guest_address == desc.info.stencil_addr) {
+                                     stencil_id = image_id;
+                                 }
+                             });
         if (!stencil_id) {
-            ForEachImageInRegion(desc.info.stencil_addr, desc.info.stencil_size,
-                                 [&](ImageId image_id, Image& image) {
-                                     if (image.info.guest_address == desc.info.stencil_addr) {
-                                         stencil_id = image_id;
-                                     }
-                                 });
-            if (!stencil_id) {
-                ImageInfo info{};
-                info.guest_address = desc.info.stencil_addr;
-                info.guest_size = desc.info.stencil_size;
-                info.size = desc.info.size;
-                stencil_id =
-                    slot_images.insert(instance, scheduler, blit_helper, slot_image_views, info);
-                RegisterImage(stencil_id);
-            }
-            image.AssociateStencil(stencil_id, slot_images[stencil_id].image_uid,
-                                   desc.info.stencil_addr);
+            ImageInfo info{};
+            info.guest_address = desc.info.stencil_addr;
+            info.guest_size = desc.info.stencil_size;
+            info.size = desc.info.size;
+            stencil_id =
+                slot_images.insert(instance, scheduler, blit_helper, slot_image_views, info);
+            RegisterImage(stencil_id);
         }
         Image& stencil_image = slot_images[stencil_id];
         TouchImage(stencil_image);

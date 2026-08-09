@@ -120,22 +120,6 @@ struct Image {
         depth_uid = {};
     }
 
-    /// Caches the stencil image this depth target was last linked to. `FindDepthTarget` runs on
-    /// every draw (Rasterizer::Draw -> BeginRendering), and resolving the stencil image did a full
-    /// ForEachImageInRegion page-table walk each time. Measured on inFAMOUS: Second Son, prologue
-    /// forest - 7,686 draws/frame with a stencil attached on 249 of 525 passes.
-    void AssociateStencil(ImageId stencil_image_id, u64 stencil_image_uid, VAddr addr) {
-        stencil_id = stencil_image_id;
-        stencil_uid = stencil_image_uid;
-        stencil_addr = addr;
-    }
-
-    void DisassociateStencil() {
-        stencil_id = {};
-        stencil_uid = {};
-        stencil_addr = 0;
-    }
-
     ImageView& FindView(const ImageViewInfo& view_info, bool ensure_guest_samples = true);
 
     using Barriers = boost::container::small_vector<vk::ImageMemoryBarrier2, 32>;
@@ -171,9 +155,6 @@ public:
     VAddr track_addr_end = 0;
     ImageId depth_id{};
     u64 depth_uid{};
-    ImageId stencil_id{};
-    u64 stencil_uid{};
-    VAddr stencil_addr{};
 
     // Resource state tracking
     vk::ImageUsageFlags usage_flags;

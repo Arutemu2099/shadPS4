@@ -169,26 +169,6 @@ public:
         return {};
     }
 
-    /// Returns the cached stencil image for a depth target, or a null id if the cache is stale.
-    /// Validated exactly like GetAssociatedDepth, plus the guest address it was resolved for -
-    /// a different stencil_addr must re-resolve. Lets FindDepthTarget skip a page-table walk it
-    /// otherwise pays on every draw.
-    ImageId GetAssociatedStencil(Image& image, VAddr stencil_addr) {
-        if (!image.stencil_id || image.stencil_addr != stencil_addr) {
-            return {};
-        }
-        if (slot_images.is_allocated(image.stencil_id)) {
-            auto& stencil_image = slot_images[image.stencil_id];
-            if (stencil_image.image_uid == image.stencil_uid &&
-                True(stencil_image.flags & ImageFlagBits::Registered) &&
-                stencil_image.info.guest_address == stencil_addr) {
-                return image.stencil_id;
-            }
-        }
-        image.DisassociateStencil();
-        return {};
-    }
-
     /// Returns true if the specified address is a metadata surface.
     bool IsMeta(VAddr address) const {
         return surface_metas.contains(address);
