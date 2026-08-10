@@ -348,8 +348,33 @@ void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
             ? vk::PipelineStageFlagBits2::eTransfer
             : vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
 
+    // MEASUREMENT (perf-forest): bt_transit is 11.5 ms/frame, the biggest single leaf, and has never
+    // been split into its three parts: GetBarriers (the subresource loop), EndRendering (the
+    // render-pass break, only when a barrier is actually emitted), and pipelineBarrier2 (submit).
+    // Which dominates decides whether there is any lever left here.
+    static u64 tr_calls = 0, tr_empty = 0, tr_getbar_ns = 0, tr_endr_ns = 0, tr_submit_ns = 0;
+    const auto tr_t0 = Common::FaultMonitor::Now();
     const auto barriers = GetBarriers(dst_layout, dst_mask, dst_pl_stage, range);
+    const auto tr_t1 = Common::FaultMonitor::Now();
+    ++tr_calls;
+    tr_getbar_ns += Common::FaultMonitor::DiffNs(tr_t0, tr_t1);
+    const auto tr_report = [&] {
+        if (tr_calls < 500000) {
+            return;
+        }
+        const auto nonempty = tr_calls - tr_empty;
+        LOG_INFO(Render_Vulkan,
+                 "TransitSplit: calls={} empty={:.1f}% getbarriers={:.3f}us/call "
+                 "endrender={:.3f}us/emit submit={:.3f}us/emit",
+                 tr_calls, 100.0 * static_cast<double>(tr_empty) / tr_calls,
+                 static_cast<double>(tr_getbar_ns) / 1e3 / tr_calls,
+                 nonempty ? static_cast<double>(tr_endr_ns) / 1e3 / nonempty : 0.0,
+                 nonempty ? static_cast<double>(tr_submit_ns) / 1e3 / nonempty : 0.0);
+        tr_calls = tr_empty = tr_getbar_ns = tr_endr_ns = tr_submit_ns = 0;
+    };
     if (barriers.empty()) {
+        ++tr_empty;
+        tr_report();
         return;
     }
 
@@ -358,10 +383,14 @@ void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
         scheduler->EndRendering();
         cmdbuf = scheduler->CommandBuffer();
     }
+    const auto tr_t2 = Common::FaultMonitor::Now();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
         .pImageMemoryBarriers = barriers.data(),
     });
+    tr_endr_ns += Common::FaultMonitor::DiffNs(tr_t1, tr_t2);
+    tr_submit_ns += Common::FaultMonitor::DiffNs(tr_t2, Common::FaultMonitor::Now());
+    tr_report();
 }
 
 void Image::Upload(std::span<const vk::BufferImageCopy> upload_copies, vk::Buffer buffer,
