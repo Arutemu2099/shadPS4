@@ -112,6 +112,64 @@ extern std::atomic<u64> bindbuf_find_ns;
 extern std::atomic<u64> bindbuf_obtain_ns;
 
 /**
+ * Split of the ObtainBuffer pass itself, which measured 4.93 us/draw.
+ *
+ * `BufferCache::ObtainBuffer` has two halves that share nothing, and only one of them is the page
+ * tracker. Small read-only bindings that are not GPU-modified take an early exit that runs
+ * `IsRegionGpuModified` and then MEMCPIES the guest data into the stream buffer; everything else
+ * falls through to `SynchronizeBuffer` -> `ForEachUploadRange`. A stack scan attributed the whole
+ * 4.93 us to the second half. Stack scans on this thread have been wrong by ~65x once already, so
+ * the split is measured before anything is cut.
+ *
+ *   query  - `IsRegionGpuModified` in the early-exit test (locks a region, copies a 1024-bit mask)
+ *   stream - `stream_buffer.Copy`, i.e. the guest-memory memcpy on the early-exit path
+ *   sync   - `SynchronizeBuffer` on the fall-through path
+ */
+extern std::atomic<u64> obtain_query_ns;
+extern std::atomic<u64> obtain_stream_ns;
+extern std::atomic<u64> obtain_stream_calls;
+extern std::atomic<u64> obtain_stream_bytes;
+extern std::atomic<u64> obtain_sync_ns;
+extern std::atomic<u64> obtain_sync_calls;
+
+/**
+ * Inside the sync half: the three phases of `MemoryTracker::ForEachUploadRange`, plus the page
+ * protection calls it triggers.
+ *
+ * Measured 2026-08-09: the sync half is 2.86 us per CALL, which is ~9,000 cycles. Nothing in a
+ * 128-byte bitset can cost that, so the specified `AnyInRange` early-out would be aimed at the
+ * wrong line if shipped on that number alone. The two candidates that CAN cost microseconds are
+ * both in here and neither is a bitset op:
+ *
+ *   scan  - phase 1, the CPU-modified walk (the part the early-out would skip)
+ *   copy  - `on_upload()` -> UploadCopies, and in SynchronizeBuffer a non-empty copy list also
+ *           forces `scheduler.EndRendering()`, i.e. a render-pass break mid-draw-stream
+ *   mark  - phase 2, `ChangeRegionState<GPU, true>` on written bindings, which under Precise
+ *           read-protects the pages through `UpdatePageWatchersForRegion` -> `Protect` -> a
+ *           VirtualProtect SYSCALL
+ *
+ * `protect_*` counts how often protection changes actually reach the syscall and what they cost,
+ * separated by direction because write-protection happens in every readbacks mode and
+ * read-protection only under Precise.
+ */
+extern std::atomic<u64> upload_scan_ns;
+extern std::atomic<u64> upload_copy_ns;
+extern std::atomic<u64> upload_mark_ns;
+extern std::atomic<u64> upload_written_calls;
+extern std::atomic<u64> protect_write_calls;
+extern std::atomic<u64> protect_write_ns;
+extern std::atomic<u64> protect_read_calls;
+extern std::atomic<u64> protect_read_ns;
+
+/// Split of `StreamBuffer::Copy`, the ObtainBuffer early-exit path. Four phases: reserving space
+/// in the stream buffer, the `IsValidMapping` guest-address check, the copy itself (which for a
+/// guest address goes through `CopySparseMemory` - shared lock plus a VMA tree walk), and Commit.
+extern std::atomic<u64> stream_map_ns;
+extern std::atomic<u64> stream_valid_ns;
+extern std::atomic<u64> stream_copy_ns;
+extern std::atomic<u64> stream_commit_ns;
+
+/**
  * The two places the GPU command-processor thread can park inside the guest command stream.
  *
  * A symbolized stack profile at the framerate floor put that thread 93.7% blocked in a system DLL
@@ -296,6 +354,49 @@ inline void CountBindSplit(u64 buffers_ns, u64 textures_ns) {
 inline void CountBindBufferPass(u64 find_ns, u64 obtain_ns) {
     bindbuf_find_ns.fetch_add(find_ns, std::memory_order_relaxed);
     bindbuf_obtain_ns.fetch_add(obtain_ns, std::memory_order_relaxed);
+}
+
+/// Early-exit path of ObtainBuffer: the GPU-modified query, then the guest-memory copy.
+inline void CountObtainStream(u64 query_ns, u64 copy_ns, u64 bytes) {
+    obtain_query_ns.fetch_add(query_ns, std::memory_order_relaxed);
+    obtain_stream_ns.fetch_add(copy_ns, std::memory_order_relaxed);
+    obtain_stream_calls.fetch_add(1, std::memory_order_relaxed);
+    obtain_stream_bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+/// Fall-through path of ObtainBuffer. `query_ns` is 0 when the early-exit test was skipped
+/// outright (written or oversized binding), so query time stays comparable across both paths.
+inline void CountStreamCopy(u64 map_ns, u64 valid_ns, u64 copy_ns, u64 commit_ns) {
+    stream_map_ns.fetch_add(map_ns, std::memory_order_relaxed);
+    stream_valid_ns.fetch_add(valid_ns, std::memory_order_relaxed);
+    stream_copy_ns.fetch_add(copy_ns, std::memory_order_relaxed);
+    stream_commit_ns.fetch_add(commit_ns, std::memory_order_relaxed);
+}
+
+inline void CountUploadPhases(u64 scan_ns, u64 copy_ns, u64 mark_ns, bool is_written) {
+    upload_scan_ns.fetch_add(scan_ns, std::memory_order_relaxed);
+    upload_copy_ns.fetch_add(copy_ns, std::memory_order_relaxed);
+    upload_mark_ns.fetch_add(mark_ns, std::memory_order_relaxed);
+    if (is_written) {
+        upload_written_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+template <bool is_read>
+inline void CountProtect(u64 ns) {
+    if constexpr (is_read) {
+        protect_read_calls.fetch_add(1, std::memory_order_relaxed);
+        protect_read_ns.fetch_add(ns, std::memory_order_relaxed);
+    } else {
+        protect_write_calls.fetch_add(1, std::memory_order_relaxed);
+        protect_write_ns.fetch_add(ns, std::memory_order_relaxed);
+    }
+}
+
+inline void CountObtainSync(u64 query_ns, u64 sync_ns) {
+    obtain_query_ns.fetch_add(query_ns, std::memory_order_relaxed);
+    obtain_sync_ns.fetch_add(sync_ns, std::memory_order_relaxed);
+    obtain_sync_calls.fetch_add(1, std::memory_order_relaxed);
 }
 
 /// `bytes` is the size actually staged for copy, i.e. after clipping to what is GPU-modified.

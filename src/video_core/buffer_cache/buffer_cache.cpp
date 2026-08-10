@@ -423,16 +423,32 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
 
 std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
                                                   bool is_texel_buffer, BufferId buffer_id) {
+    // This function is 4.93 us/draw, 61% of all per-draw CPU cost, and it has two halves that
+    // share no code: the early exit below (a tracker query plus a guest-memory memcpy) and the
+    // SynchronizeBuffer fall-through. Time them separately - the split decides which is worth
+    // cutting, and it has never actually been measured.
+    const auto t_entry = Common::FaultMonitor::Now();
+    u64 query_ns = 0;
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
-    if (!is_written && size <= CACHING_PAGESIZE && !IsRegionGpuModified(device_addr, size)) {
-        const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
-        return {&stream_buffer, offset};
+    if (!is_written && size <= CACHING_PAGESIZE) {
+        const bool gpu_modified = IsRegionGpuModified(device_addr, size);
+        const auto t_query = Common::FaultMonitor::Now();
+        query_ns = Common::FaultMonitor::DiffNs(t_entry, t_query);
+        if (!gpu_modified) {
+            const u64 offset =
+                stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
+            Common::FaultMonitor::CountObtainStream(query_ns,
+                                                    Common::FaultMonitor::SinceNs(t_query), size);
+            return {&stream_buffer, offset};
+        }
     }
     if (IsBufferInvalid(buffer_id)) {
         buffer_id = FindBuffer(device_addr, size);
     }
     Buffer& buffer = slot_buffers[buffer_id];
+    const auto t_sync = Common::FaultMonitor::Now();
     SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer);
+    Common::FaultMonitor::CountObtainSync(query_ns, Common::FaultMonitor::SinceNs(t_sync));
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
         Common::FaultMonitor::CountRangeAdd(gpu_modified_ranges.m_ranges_set.iterative_size());

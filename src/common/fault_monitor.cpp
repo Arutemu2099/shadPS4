@@ -46,6 +46,24 @@ std::atomic<u64> draw_bindbuf_ns{0};
 std::atomic<u64> draw_bindtex_ns{0};
 std::atomic<u64> bindbuf_find_ns{0};
 std::atomic<u64> bindbuf_obtain_ns{0};
+std::atomic<u64> obtain_query_ns{0};
+std::atomic<u64> obtain_stream_ns{0};
+std::atomic<u64> obtain_stream_calls{0};
+std::atomic<u64> obtain_stream_bytes{0};
+std::atomic<u64> obtain_sync_ns{0};
+std::atomic<u64> obtain_sync_calls{0};
+std::atomic<u64> upload_scan_ns{0};
+std::atomic<u64> upload_copy_ns{0};
+std::atomic<u64> upload_mark_ns{0};
+std::atomic<u64> upload_written_calls{0};
+std::atomic<u64> protect_write_calls{0};
+std::atomic<u64> protect_write_ns{0};
+std::atomic<u64> protect_read_calls{0};
+std::atomic<u64> protect_read_ns{0};
+std::atomic<u64> stream_map_ns{0};
+std::atomic<u64> stream_valid_ns{0};
+std::atomic<u64> stream_copy_ns{0};
+std::atomic<u64> stream_commit_ns{0};
 std::atomic<u64> waitregmem_count{0};
 std::atomic<u64> waitregmem_ns{0};
 std::atomic<u64> volabel_count{0};
@@ -156,6 +174,24 @@ struct Sample {
     u64 d_bindtex_ns;
     u64 bb_find_ns;
     u64 bb_obtain_ns;
+    u64 ob_query_ns;
+    u64 ob_stream_ns;
+    u64 ob_stream_calls;
+    u64 ob_stream_bytes;
+    u64 ob_sync_ns;
+    u64 ob_sync_calls;
+    u64 up_scan_ns;
+    u64 up_copy_ns;
+    u64 up_mark_ns;
+    u64 up_written_calls;
+    u64 prot_w_calls;
+    u64 prot_w_ns;
+    u64 prot_r_calls;
+    u64 prot_r_ns;
+    u64 sc_map_ns;
+    u64 sc_valid_ns;
+    u64 sc_copy_ns;
+    u64 sc_commit_ns;
 };
 
 Sample Read() {
@@ -200,6 +236,24 @@ Sample Read() {
         draw_bindtex_ns.load(std::memory_order_relaxed),
         bindbuf_find_ns.load(std::memory_order_relaxed),
         bindbuf_obtain_ns.load(std::memory_order_relaxed),
+        obtain_query_ns.load(std::memory_order_relaxed),
+        obtain_stream_ns.load(std::memory_order_relaxed),
+        obtain_stream_calls.load(std::memory_order_relaxed),
+        obtain_stream_bytes.load(std::memory_order_relaxed),
+        obtain_sync_ns.load(std::memory_order_relaxed),
+        obtain_sync_calls.load(std::memory_order_relaxed),
+        upload_scan_ns.load(std::memory_order_relaxed),
+        upload_copy_ns.load(std::memory_order_relaxed),
+        upload_mark_ns.load(std::memory_order_relaxed),
+        upload_written_calls.load(std::memory_order_relaxed),
+        protect_write_calls.load(std::memory_order_relaxed),
+        protect_write_ns.load(std::memory_order_relaxed),
+        protect_read_calls.load(std::memory_order_relaxed),
+        protect_read_ns.load(std::memory_order_relaxed),
+        stream_map_ns.load(std::memory_order_relaxed),
+        stream_valid_ns.load(std::memory_order_relaxed),
+        stream_copy_ns.load(std::memory_order_relaxed),
+        stream_commit_ns.load(std::memory_order_relaxed),
     };
 }
 
@@ -228,7 +282,12 @@ std::ofstream OpenCsv() {
                "rf_queue_ms,rf_fence_ms,download_per_frame,download_kb_per_frame,"
                "draws_per_frame,pipeline_us_each,bindres_us_each,beginrender_us_each,"
                "finddepth_us_each,draw_ms_per_frame,bindbuf_us_each,bindtex_us_each,"
-               "bb_find_us_each,bb_obtain_us_each\n";
+               "bb_find_us_each,bb_obtain_us_each,"
+               "ob_query_us_each,ob_stream_us_each,ob_sync_us_each,"
+               "ob_stream_per_draw,ob_sync_per_draw,ob_stream_kb_per_draw,"
+               "up_scan_us_each,up_copy_us_each,up_mark_us_each,up_written_per_draw,"
+               "protw_per_draw,protw_us_each,protr_per_draw,protr_us_each,"
+               "sc_map_us_each,sc_valid_us_each,sc_copy_us_each,sc_commit_us_each\n";
         csv.flush();
         LOG_INFO(Render, "FaultMonitor: rate CSV at {}", FS::PathToUTF8String(path));
     } else {
@@ -350,6 +409,48 @@ void ReportLoop() {
         const double bindtex_us = per_draw_us(cur.d_bindtex_ns - prev.d_bindtex_ns);
         const double bb_find_us = per_draw_us(cur.bb_find_ns - prev.bb_find_ns);
         const double bb_obtain_us = per_draw_us(cur.bb_obtain_ns - prev.bb_obtain_ns);
+        // All six are normalised per DRAW, not per call, so they add up against bb_obtain_us_each
+        // directly. ob_stream_per_draw / ob_sync_per_draw say how the bindings split between the
+        // two halves, which is what decides where a cut is worth making.
+        const double ob_query_us = per_draw_us(cur.ob_query_ns - prev.ob_query_ns);
+        const double ob_stream_us = per_draw_us(cur.ob_stream_ns - prev.ob_stream_ns);
+        const double ob_sync_us = per_draw_us(cur.ob_sync_ns - prev.ob_sync_ns);
+        const double ob_stream_per_draw =
+            d_draws ? static_cast<double>(cur.ob_stream_calls - prev.ob_stream_calls) /
+                          static_cast<double>(d_draws)
+                    : 0.0;
+        const double ob_sync_per_draw =
+            d_draws ? static_cast<double>(cur.ob_sync_calls - prev.ob_sync_calls) /
+                          static_cast<double>(d_draws)
+                    : 0.0;
+        const double ob_stream_kb_per_draw =
+            d_draws ? static_cast<double>(cur.ob_stream_bytes - prev.ob_stream_bytes) /
+                          static_cast<double>(d_draws) / 1024.0
+                    : 0.0;
+        // Phases of ForEachUploadRange, per draw, so they add against ob_sync_us_each.
+        const double up_scan_us = per_draw_us(cur.up_scan_ns - prev.up_scan_ns);
+        const double up_copy_us = per_draw_us(cur.up_copy_ns - prev.up_copy_ns);
+        const double up_mark_us = per_draw_us(cur.up_mark_ns - prev.up_mark_ns);
+        const double up_written_per_draw =
+            d_draws ? static_cast<double>(cur.up_written_calls - prev.up_written_calls) /
+                          static_cast<double>(d_draws)
+                    : 0.0;
+        // Protection changes are per draw for rate, but per CALL for cost - a VirtualProtect is
+        // a syscall and its individual cost is the thing worth knowing.
+        const u64 d_protw = cur.prot_w_calls - prev.prot_w_calls;
+        const u64 d_protr = cur.prot_r_calls - prev.prot_r_calls;
+        const double protw_per_draw =
+            d_draws ? static_cast<double>(d_protw) / static_cast<double>(d_draws) : 0.0;
+        const double protr_per_draw =
+            d_draws ? static_cast<double>(d_protr) / static_cast<double>(d_draws) : 0.0;
+        const double protw_us =
+            d_protw ? static_cast<double>(cur.prot_w_ns - prev.prot_w_ns) / d_protw / 1000.0 : 0.0;
+        const double protr_us =
+            d_protr ? static_cast<double>(cur.prot_r_ns - prev.prot_r_ns) / d_protr / 1000.0 : 0.0;
+        const double sc_map_us = per_draw_us(cur.sc_map_ns - prev.sc_map_ns);
+        const double sc_valid_us = per_draw_us(cur.sc_valid_ns - prev.sc_valid_ns);
+        const double sc_copy_us = per_draw_us(cur.sc_copy_ns - prev.sc_copy_ns);
+        const double sc_commit_us = per_draw_us(cur.sc_commit_ns - prev.sc_commit_ns);
         const double draw_ms_per_frame =
             d_frames ? static_cast<double>(d_pipe + d_bind + d_begin) /
                            static_cast<double>(d_frames) / 1e6
@@ -382,6 +483,11 @@ void ReportLoop() {
                  "| downloads {:.1f}/frame {:.1f}kB/frame "
                  "| draws {:.0f}/frame pipeline={:.2f}us bindres={:.2f}us begin={:.2f}us "
                  "(finddepth={:.2f}us bindbuf={:.2f}us [find={:.2f} obtain={:.2f}] bindtex={:.2f}us) = {:.1f}ms/frame "
+                 "| obtain query={:.2f}us stream={:.2f}us sync={:.2f}us "
+                 "({:.2f} stream + {:.2f} sync per draw, {:.1f}kB/draw copied) "
+                 "| upload scan={:.2f}us copy={:.2f}us mark={:.2f}us ({:.2f} written/draw) "
+                 "| protect w={:.3f}/draw {:.2f}us each r={:.3f}/draw {:.2f}us each "
+                 "| streamcopy map={:.2f}us valid={:.2f}us copy={:.2f}us commit={:.2f}us "
                  "| totals read={} write={} jit={} frames={} unhandled(r/w)={}/{}",
                  elapsed, fps, read_rate, write_rate, jit_rate, per_frame, read_us, write_us,
                  handler_pct, cur.fragments, static_cast<double>(d_adds) / dt,
@@ -391,7 +497,10 @@ void ReportLoop() {
                  khr_ms, rf_queue_ms, rf_fence_ms, dl_per_frame, dl_kb_per_frame, draws_per_frame,
                  pipeline_us, bindres_us, beginrender_us, finddepth_us, bindbuf_us, bb_find_us,
                  bb_obtain_us, bindtex_us,
-                 draw_ms_per_frame, cur.read,
+                 draw_ms_per_frame, ob_query_us, ob_stream_us, ob_sync_us, ob_stream_per_draw,
+                 ob_sync_per_draw, ob_stream_kb_per_draw, up_scan_us, up_copy_us, up_mark_us,
+                 up_written_per_draw, protw_per_draw, protw_us, protr_per_draw, protr_us, sc_map_us,
+                 sc_valid_us, sc_copy_us, sc_commit_us, cur.read,
                  cur.write, cur.jit, cur.frames, cur.read_unhandled, cur.write_unhandled);
 
         if (d_read > 0) {
@@ -403,7 +512,10 @@ void ReportLoop() {
                 "{:.1f},{:.2f},{:.1f},{:.1f},{:.1f},{:.1f},{:.4f},{:.4f},{:.2f},{},{},{},{},{},{},"
                 "{},{:.1f},{:.1f},{:.2f},{:.2f},{:.3f},{:.2f},{:.3f},{:.2f},{:.3f},"
                 "{:.3f},{:.3f},{:.2f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},"
-                "{:.2f},{:.1f},{:.1f},{:.3f},{:.3f},{:.3f},{:.3f},{:.2f},{:.3f},{:.3f},{:.3f},{:.3f}\n",
+                "{:.2f},{:.1f},{:.1f},{:.3f},{:.3f},{:.3f},{:.3f},{:.2f},{:.3f},{:.3f},{:.3f},{:.3f},"
+                "{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},"
+                "{:.3f},{:.3f},{:.3f},{:.3f},{:.4f},{:.3f},{:.4f},{:.3f},"
+                "{:.3f},{:.3f},{:.3f},{:.3f}\n",
                 elapsed, fps, read_rate, write_rate, jit_rate, per_frame, read_us, write_us,
                 handler_pct, cur.read, cur.read_unhandled, cur.write, cur.write_unhandled, cur.jit,
                 cur.frames, cur.fragments, static_cast<double>(d_adds) / dt,
@@ -412,7 +524,10 @@ void ReportLoop() {
                 present_ms_each, present_ms_per_frame, avg_pending, acq_ms, flush_ms, lock_ms,
                 khr_ms, rf_queue_ms, rf_fence_ms, dl_per_frame, dl_kb_per_frame, draws_per_frame,
                 pipeline_us, bindres_us, beginrender_us, finddepth_us, draw_ms_per_frame, bindbuf_us,
-                bindtex_us, bb_find_us, bb_obtain_us);
+                bindtex_us, bb_find_us, bb_obtain_us, ob_query_us, ob_stream_us, ob_sync_us,
+                ob_stream_per_draw, ob_sync_per_draw, ob_stream_kb_per_draw, up_scan_us, up_copy_us,
+                up_mark_us, up_written_per_draw, protw_per_draw, protw_us, protr_per_draw, protr_us,
+                sc_map_us, sc_valid_us, sc_copy_us, sc_commit_us);
             csv.flush(); // a killed process must not lose the curve
         }
 

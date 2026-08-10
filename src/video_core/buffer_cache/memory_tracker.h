@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "common/debug.h"
+#include "common/fault_monitor.h"
 #include "common/types.h"
 #include "core/emulator_settings.h"
 #include "video_core/buffer_cache/region_manager.h"
@@ -91,6 +92,9 @@ public:
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
     void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, bool is_written, auto&& func,
                             auto&& on_upload) {
+        // Three phases with very different costs - scan is bitset work, mark can reach a
+        // VirtualProtect syscall. Timed separately so a fix is aimed at the one that is expensive.
+        const auto t_scan = Common::FaultMonitor::Now();
         IteratePages<true>(query_cpu_range, query_size,
                            [&func, is_written](RegionManager* manager, u64 offset, size_t size) {
                                manager->lock.lock();
@@ -100,8 +104,13 @@ public:
                                    manager->lock.unlock();
                                }
                            });
+        const auto t_copy = Common::FaultMonitor::Now();
         on_upload();
+        const auto t_mark = Common::FaultMonitor::Now();
         if (!is_written) {
+            Common::FaultMonitor::CountUploadPhases(Common::FaultMonitor::DiffNs(t_scan, t_copy),
+                                                    Common::FaultMonitor::DiffNs(t_copy, t_mark), 0,
+                                                    false);
             return;
         }
         IteratePages<false>(query_cpu_range, query_size,
@@ -110,6 +119,9 @@ public:
                                     manager->GetCpuAddr() + offset, size);
                                 manager->lock.unlock();
                             });
+        Common::FaultMonitor::CountUploadPhases(Common::FaultMonitor::DiffNs(t_scan, t_copy),
+                                                Common::FaultMonitor::DiffNs(t_copy, t_mark),
+                                                Common::FaultMonitor::SinceNs(t_mark), true);
     }
 
     /// Call 'func' for each GPU modified range and unmark those pages as GPU modified
