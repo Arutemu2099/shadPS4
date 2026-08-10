@@ -6,6 +6,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
+#include "common/fault_monitor.h"
 #include "common/scope_exit.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -507,10 +508,23 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     const auto& info = desc.info;
     ASSERT(info.guest_address != 0);
 
+    // FINDIMAGE SPLIT PROBE (tier-2 leaf): is the 3.18 ms/frame bt_findimage an obvious waste (like
+    // FindImageFromRange) or mandatory cache work? Split lock-acquire / ForEachImageInRegion walk /
+    // match+resolve, and count perfect-hit% + pages walked + new-image(miss)%. Strip before ship.
+    static u64 fi_calls = 0, fi_lock_ns = 0, fi_walk_ns = 0, fi_rest_ns = 0, fi_pages = 0,
+               fi_hit = 0, fi_new = 0, fi_cands = 0;
+    const auto fi_t0 = Common::FaultMonitor::Now();
     std::scoped_lock lock{mutex};
+    const auto fi_t1 = Common::FaultMonitor::Now();
     ImageIds image_ids;
     ForEachImageInRegion(info.guest_address, info.guest_size,
                          [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
+    const auto fi_t2 = Common::FaultMonitor::Now();
+    ++fi_calls;
+    fi_lock_ns += Common::FaultMonitor::DiffNs(fi_t0, fi_t1);
+    fi_walk_ns += Common::FaultMonitor::DiffNs(fi_t1, fi_t2);
+    fi_pages += ((info.guest_address + info.guest_size - 1) >> 20) - (info.guest_address >> 20) + 1;
+    fi_cands += image_ids.size();
 
     ImageId image_id{};
 
@@ -535,6 +549,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         }
         image_id = cache_id;
     }
+
+    const bool fi_perfect = static_cast<bool>(image_id);
 
     // Try to resolve overlaps (if any)
     int view_mip{-1};
@@ -569,6 +585,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
     // Create and register a new image
     if (!image_id) {
+        ++fi_new;
         image_id = slot_images.insert(instance, scheduler, blit_helper, slot_image_views, info);
         RegisterImage(image_id);
     }
@@ -583,6 +600,23 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
     if (view_slice > 0) {
         desc.view_info.range.base.layer = view_slice;
+    }
+
+    if (fi_perfect) {
+        ++fi_hit;
+    }
+    fi_rest_ns += Common::FaultMonitor::SinceNs(fi_t2);
+    if (fi_calls >= 500000) {
+        LOG_INFO(Render, "FiSplit: calls={} lock={:.3f} walk={:.3f} rest={:.3f}us/call "
+                         "perfect={:.1f}% new={:.1f}% pages={:.2f} cands={:.2f}",
+                 fi_calls, static_cast<double>(fi_lock_ns) / 1e3 / fi_calls,
+                 static_cast<double>(fi_walk_ns) / 1e3 / fi_calls,
+                 static_cast<double>(fi_rest_ns) / 1e3 / fi_calls,
+                 100.0 * static_cast<double>(fi_hit) / fi_calls,
+                 100.0 * static_cast<double>(fi_new) / fi_calls,
+                 static_cast<double>(fi_pages) / fi_calls,
+                 static_cast<double>(fi_cands) / fi_calls);
+        fi_calls = fi_lock_ns = fi_walk_ns = fi_rest_ns = fi_pages = fi_hit = fi_new = fi_cands = 0;
     }
 
     return image_id;
