@@ -13,6 +13,7 @@
 #include "common/spin_lock.h"
 #endif
 #include "common/debug.h"
+#include "common/fault_monitor.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/page_manager.h"
@@ -120,6 +121,25 @@ public:
         }
 
         RegionBits& bits = GetRegionBits<type>();
+
+        // Nothing modified in the queried range means there is no work in this call at all, and
+        // the common case by a wide margin: measured on the per-draw upload path, ~76% of calls
+        // find no CPU-modified page. Without this the call still materialises a 1024-bit masked
+        // copy, runs UnsetRange over it, and diffs the whole 4 MB region's protection state.
+        //
+        // Only Type::CPU. The skip is sound because `writeable` is re-synced to `cpu` on every
+        // path that mutates `cpu` (ChangeRegionState<CPU> and this function, both under the
+        // region lock), so with no bit set in range the UnsetRange is a no-op and
+        // UpdateProtection's `cpu ^ writeable` diff is necessarily empty. The GPU side has no
+        // such invariant: ChangeRegionState<GPU> only touches `readable` under Precise, while
+        // this function updates it whenever readbacks are not Disabled, so under Relaxed `gpu`
+        // and `readable` legitimately diverge and the diff must still be taken.
+        if constexpr (type == Type::CPU) {
+            if (!bits.AnyInRange(start_page, end_page)) {
+                return;
+            }
+        }
+
         RegionBits mask(bits, start_page, end_page);
 
         if constexpr (clear) {
@@ -181,7 +201,12 @@ private:
         } else {
             writeable = cpu;
         }
+        // This is the only path out of the tracker that reaches a VirtualProtect syscall. Count
+        // and time it: it is the one candidate in the per-draw sync path that can plausibly cost
+        // microseconds, and bitset arithmetic cannot.
+        const auto t_protect = Common::FaultMonitor::Now();
         tracker->UpdatePageWatchersForRegion<track, is_read>(cpu_addr, mask);
+        Common::FaultMonitor::CountProtect<is_read>(Common::FaultMonitor::SinceNs(t_protect));
     }
 
     PageManager* tracker;

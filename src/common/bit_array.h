@@ -207,6 +207,33 @@ public:
         return !None();
     }
 
+    /// True if any bit in [start, end) is set. Same masking as UnsetRange, but it only reads and
+    /// stops at the first set word - so a caller that just wants to know whether a range is dirty
+    /// does not have to materialise a masked copy of the whole array to ask.
+    inline bool AnyInRange(size_t start, size_t end) const {
+        if (start >= end || end > N) {
+            return false;
+        }
+        const size_t first_word = start / BITS_PER_WORD;
+        const size_t last_word = (end - 1) / BITS_PER_WORD;
+        const size_t start_bit = start % BITS_PER_WORD;
+        const size_t end_bit = (end - 1) % BITS_PER_WORD;
+        const u64 start_mask = ~((1ULL << start_bit) - 1);
+        const u64 end_mask = end_bit == BITS_PER_WORD - 1 ? ~0ULL : (1ULL << (end_bit + 1)) - 1;
+        if (first_word == last_word) {
+            return (data[first_word] & start_mask & end_mask) != 0;
+        }
+        if ((data[first_word] & start_mask) != 0) {
+            return true;
+        }
+        for (size_t i = first_word + 1; i < last_word; ++i) {
+            if (data[i] != 0) {
+                return true;
+            }
+        }
+        return (data[last_word] & end_mask) != 0;
+    }
+
     Range FirstRangeFrom(size_t start) const {
         if (start >= N) {
             return {N, N};
