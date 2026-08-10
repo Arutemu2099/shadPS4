@@ -43,10 +43,25 @@ static constexpr u64 ReadFaultWidenSize = 64_KB;
 /**
  * Size ceiling for `ObtainBuffer`'s read-only stream-copy fast path.
  *
- * Defaults to `CACHING_PAGESIZE`, which is what upstream compares against. Read from the
- * environment once so the fast path can be traded against the tracked buffer-cache path in a
- * playtest without a rebuild - `SHADPS4_STREAM_MAX_SIZE=0` disables it entirely. Both paths are
- * correct; only the cost differs, so this is a performance knob and not a compatibility one.
+ * Upstream compares against `CACHING_PAGESIZE` (16 KB), sending small read-only bindings down a
+ * path that copies guest memory into the stream buffer every draw "to reduce renderpass breaks".
+ * Measured, that trade loses: the copy runs 6.6 times per draw and moves ~43 MB/frame, while the
+ * tracked buffer-cache path it avoids costs about the same per call (~0.37 us vs ~0.35 us) and
+ * copies nothing when the range is clean.
+ *
+ * **Default is 0, i.e. the fast path is off.** Same build, same scene, same draw count:
+ *
+ *     stream path ON   12.47 fps    ObtainBuffer ~5.2 us/draw
+ *     stream path OFF  14.57 fps    ObtainBuffer  3.06 us/draw     +17%
+ *
+ * The objection to changing the default was memory: every small binding becomes a resident cache
+ * entry. Measured head-to-head, 10 minutes idle each - growth is 6.00 MB/min with the path on and
+ * 8.26 MB/min with it off, but the OFF arm DECELERATES (10.42 -> 6.00 MB/min across the run) and
+ * converges on the ON arm's rate. So the extra ~22 MB is a cache filling once, not a leak. The
+ * ~6 MB/min both arms share is a pre-existing leak unrelated to this.
+ *
+ * Set `SHADPS4_STREAM_MAX_SIZE=16384` to restore upstream behaviour. Both paths are correct - this
+ * is a performance knob, not a compatibility one.
  */
 static u64 StreamCopyMaxSize() {
     static const u64 value = []() -> u64 {
@@ -58,7 +73,7 @@ static u64 StreamCopyMaxSize() {
                 return parsed;
             }
         }
-        return u64{BufferCache::CACHING_PAGESIZE};
+        return 0;
     }();
     return value;
 }
