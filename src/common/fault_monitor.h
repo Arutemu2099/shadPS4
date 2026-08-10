@@ -185,6 +185,10 @@ extern std::atomic<u64> protect_read_ns;
 extern std::atomic<u64> bindtex_findimage_ns;
 extern std::atomic<u64> bindtex_view_ns;
 extern std::atomic<u64> bindtex_sampler_ns;
+/// Split of the `view` phase, which is 72% of BindTextures: the image-view lookup vs the layout
+/// transition and its barrier bookkeeping.
+extern std::atomic<u64> bindtex_findtex_ns;
+extern std::atomic<u64> bindtex_transit_ns;
 
 /**
  * The rest of `Rasterizer::Draw` - the third of the frame no timer ever covered.
@@ -460,6 +464,11 @@ inline void CountDrawTail(u64 pre_ns, u64 vtxbuf_ns, u64 descwrite_ns, u64 dynst
     draw_dynstate_ns.fetch_add(dynstate_ns, std::memory_order_relaxed);
     draw_schedbegin_ns.fetch_add(schedbegin_ns, std::memory_order_relaxed);
     draw_emit_ns.fetch_add(emit_ns, std::memory_order_relaxed);
+}
+
+inline void CountBindTexView(u64 findtex_ns, u64 transit_ns) {
+    bindtex_findtex_ns.fetch_add(findtex_ns, std::memory_order_relaxed);
+    bindtex_transit_ns.fetch_add(transit_ns, std::memory_order_relaxed);
 }
 
 inline void CountBindTexSplit(u64 findimage_ns, u64 view_ns, u64 sampler_ns) {

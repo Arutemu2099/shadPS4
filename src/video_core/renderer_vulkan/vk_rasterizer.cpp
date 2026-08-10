@@ -817,6 +817,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     }
 
     const auto t_view = Common::FaultMonitor::Now();
+    u64 findtex_ns = 0;
+    u64 transit_ns = 0;
 
     // Second pass to re-bind images that were updated after binding
     for (auto& [image_id, desc] : image_bindings) {
@@ -833,7 +835,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             bound_images.emplace_back(image_id);
 
             auto& image = texture_cache.GetImage(image_id);
+            const auto t_ft = Common::FaultMonitor::Now();
             auto& image_view = texture_cache.FindTexture(image_id, desc);
+            const auto t_tr = Common::FaultMonitor::Now();
+            findtex_ns += Common::FaultMonitor::DiffNs(t_ft, t_tr);
 
             // The image is either bound as storage in a separate descriptor or bound as render
             // target in feedback loop. Depth images are excluded because they can't be bound as
@@ -864,6 +869,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                                   desc.view_info.range);
                 }
             }
+            transit_ns += Common::FaultMonitor::SinceNs(t_tr);
             image.usage.storage |= is_storage;
             image.usage.texture |= !is_storage;
 
@@ -872,6 +878,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         }
     }
 
+    Common::FaultMonitor::CountBindTexView(findtex_ns, transit_ns);
     const auto t_sampler_start = Common::FaultMonitor::Now();
 
     u32 image_info_idx = first_image_idx;

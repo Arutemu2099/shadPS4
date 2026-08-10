@@ -288,6 +288,12 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
             }
         }
 
+        // TRIED AND REVERTED 2026-08-10: clearing `subresource_states` when every entry has
+        // converged on the destination state, to return the image to the cheap full-resource path.
+        // Reasoning was sound - the table only carries information while subresources DIVERGE - but
+        // it measured WORSE (`view` 1.87 -> 2.09 us/draw). Convergence almost never happens here, so
+        // the `all_of` scan was added to every partial transition and saved nothing. Do not retry
+        // without first measuring how often the states actually converge.
         if (!needs_partial_transition) {
             subresource_states.clear();
         }
