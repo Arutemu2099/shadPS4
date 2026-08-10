@@ -187,6 +187,14 @@ extern std::atomic<u64> bindtex_view_ns;
 extern std::atomic<u64> bindtex_sampler_ns;
 /// Split of the `view` phase, which is 72% of BindTextures: the image-view lookup vs the layout
 /// transition and its barrier bookkeeping.
+/// Why Transit costs what it does. It is 1.73 us/draw and a fix aimed at it failed because the
+/// shape of the work inside was never measured: how often the per-subresource path is taken, how
+/// many mip x layer slots it iterates, and how often it actually emits a barrier rather than
+/// walking the table to discover there is nothing to do.
+extern std::atomic<u64> barrier_calls;
+extern std::atomic<u64> barrier_partial_calls;
+extern std::atomic<u64> barrier_subres_iters;
+extern std::atomic<u64> barrier_emitted;
 extern std::atomic<u64> bindtex_findtex_ns;
 extern std::atomic<u64> bindtex_transit_ns;
 
@@ -464,6 +472,15 @@ inline void CountDrawTail(u64 pre_ns, u64 vtxbuf_ns, u64 descwrite_ns, u64 dynst
     draw_dynstate_ns.fetch_add(dynstate_ns, std::memory_order_relaxed);
     draw_schedbegin_ns.fetch_add(schedbegin_ns, std::memory_order_relaxed);
     draw_emit_ns.fetch_add(emit_ns, std::memory_order_relaxed);
+}
+
+inline void CountBarriers(bool partial, u64 iters, u64 emitted) {
+    barrier_calls.fetch_add(1, std::memory_order_relaxed);
+    if (partial) {
+        barrier_partial_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+    barrier_subres_iters.fetch_add(iters, std::memory_order_relaxed);
+    barrier_emitted.fetch_add(emitted, std::memory_order_relaxed);
 }
 
 inline void CountBindTexView(u64 findtex_ns, u64 transit_ns) {

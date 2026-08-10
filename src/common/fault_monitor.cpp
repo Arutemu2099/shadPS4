@@ -63,6 +63,10 @@ std::atomic<u64> protect_read_ns{0};
 std::atomic<u64> bindtex_findimage_ns{0};
 std::atomic<u64> bindtex_view_ns{0};
 std::atomic<u64> bindtex_sampler_ns{0};
+std::atomic<u64> barrier_calls{0};
+std::atomic<u64> barrier_partial_calls{0};
+std::atomic<u64> barrier_subres_iters{0};
+std::atomic<u64> barrier_emitted{0};
 std::atomic<u64> bindtex_findtex_ns{0};
 std::atomic<u64> bindtex_transit_ns{0};
 std::atomic<u64> cp_wait_ns{0};
@@ -206,6 +210,10 @@ struct Sample {
     u64 bt_findimage_ns;
     u64 bt_view_ns;
     u64 bt_sampler_ns;
+    u64 bar_calls;
+    u64 bar_partial;
+    u64 bar_iters;
+    u64 bar_emitted;
     u64 bt_findtex_ns;
     u64 bt_transit_ns;
     u64 cp_wait_ns_v;
@@ -283,6 +291,10 @@ Sample Read() {
         bindtex_findimage_ns.load(std::memory_order_relaxed),
         bindtex_view_ns.load(std::memory_order_relaxed),
         bindtex_sampler_ns.load(std::memory_order_relaxed),
+        barrier_calls.load(std::memory_order_relaxed),
+        barrier_partial_calls.load(std::memory_order_relaxed),
+        barrier_subres_iters.load(std::memory_order_relaxed),
+        barrier_emitted.load(std::memory_order_relaxed),
         bindtex_findtex_ns.load(std::memory_order_relaxed),
         bindtex_transit_ns.load(std::memory_order_relaxed),
         cp_wait_ns.load(std::memory_order_relaxed),
@@ -337,7 +349,8 @@ std::ofstream OpenCsv() {
                "d_pre_us_each,d_vtxbuf_us_each,d_descwrite_us_each,d_dynstate_us_each,"
                "d_schedbegin_us_each,d_emit_us_each,"
                "cp_wait_ms_per_frame,cp_active_ms_per_frame,disp_per_frame,disp_us_each,"
-               "bt_findtex_us_each,bt_transit_us_each\n";
+               "bt_findtex_us_each,bt_transit_us_each,"
+               "bar_calls_per_draw,bar_partial_pct,bar_iters_per_call,bar_emitted_per_call\n";
         csv.flush();
         LOG_INFO(Render, "FaultMonitor: rate CSV at {}", FS::PathToUTF8String(path));
     } else {
@@ -500,6 +513,15 @@ void ReportLoop() {
         const double bt_findimage_us = per_draw_us(cur.bt_findimage_ns - prev.bt_findimage_ns);
         const double bt_view_us = per_draw_us(cur.bt_view_ns - prev.bt_view_ns);
         const double bt_sampler_us = per_draw_us(cur.bt_sampler_ns - prev.bt_sampler_ns);
+        const u64 d_bar = cur.bar_calls - prev.bar_calls;
+        const double bar_per_draw =
+            d_draws ? static_cast<double>(d_bar) / static_cast<double>(d_draws) : 0.0;
+        const double bar_partial_pct =
+            d_bar ? static_cast<double>(cur.bar_partial - prev.bar_partial) / d_bar * 100.0 : 0.0;
+        const double bar_iters_per_call =
+            d_bar ? static_cast<double>(cur.bar_iters - prev.bar_iters) / d_bar : 0.0;
+        const double bar_emitted_per_call =
+            d_bar ? static_cast<double>(cur.bar_emitted - prev.bar_emitted) / d_bar : 0.0;
         const double bt_findtex_us = per_draw_us(cur.bt_findtex_ns - prev.bt_findtex_ns);
         const double bt_transit_us = per_draw_us(cur.bt_transit_ns - prev.bt_transit_ns);
         const double d_pre_us = per_draw_us(cur.d_pre_ns - prev.d_pre_ns);
@@ -565,6 +587,7 @@ void ReportLoop() {
                  "schedbegin={:.2f} emit={:.2f}us "
                  "| CP wait={:.1f}ms/frame active={:.1f}ms/frame dispatch {:.0f}/frame {:.2f}us each "
                  "| view split findtex={:.2f}us transit={:.2f}us "
+                 "| barriers {:.2f}/draw {:.0f}% partial, {:.1f} iters {:.2f} emitted per call "
                  "| totals read={} write={} jit={} frames={} unhandled(r/w)={}/{}",
                  elapsed, fps, read_rate, write_rate, jit_rate, per_frame, read_us, write_us,
                  handler_pct, cur.fragments, static_cast<double>(d_adds) / dt,
@@ -580,6 +603,7 @@ void ReportLoop() {
                  sc_valid_us, sc_copy_us, sc_commit_us, bt_findimage_us, bt_view_us, bt_sampler_us,
                  d_pre_us, d_vtxbuf_us, d_descwrite_us, d_dynstate_us, d_schedbegin_us, d_emit_us,
                  cp_wait_ms, cp_active_ms, disp_per_frame, disp_us, bt_findtex_us, bt_transit_us,
+                 bar_per_draw, bar_partial_pct, bar_iters_per_call, bar_emitted_per_call,
                  cur.read,
                  cur.write, cur.jit, cur.frames, cur.read_unhandled, cur.write_unhandled);
 
@@ -597,7 +621,7 @@ void ReportLoop() {
                 "{:.3f},{:.3f},{:.3f},{:.3f},{:.4f},{:.3f},{:.4f},{:.3f},"
                 "{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},"
                 "{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},"
-                "{:.2f},{:.2f},{:.1f},{:.3f},{:.3f},{:.3f}\n",
+                "{:.2f},{:.2f},{:.1f},{:.3f},{:.3f},{:.3f},{:.3f},{:.1f},{:.2f},{:.3f}\n",
                 elapsed, fps, read_rate, write_rate, jit_rate, per_frame, read_us, write_us,
                 handler_pct, cur.read, cur.read_unhandled, cur.write, cur.write_unhandled, cur.jit,
                 cur.frames, cur.fragments, static_cast<double>(d_adds) / dt,
@@ -612,7 +636,8 @@ void ReportLoop() {
                 sc_map_us, sc_valid_us, sc_copy_us, sc_commit_us, bt_findimage_us, bt_view_us,
                 bt_sampler_us, d_pre_us, d_vtxbuf_us, d_descwrite_us, d_dynstate_us,
                 d_schedbegin_us, d_emit_us, cp_wait_ms, cp_active_ms, disp_per_frame, disp_us,
-                bt_findtex_us, bt_transit_us);
+                bt_findtex_us, bt_transit_us, bar_per_draw, bar_partial_pct, bar_iters_per_call,
+                bar_emitted_per_call);
             csv.flush(); // a killed process must not lose the curve
         }
 
