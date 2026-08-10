@@ -6,6 +6,7 @@
 
 #include "common/debug.h"
 #include "common/fault_monitor.h"
+#include "common/scope_exit.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -193,6 +194,7 @@ void Rasterizer::EliminateFastClear() {
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
 
+    const auto t_entry = Common::FaultMonitor::Now();
     scheduler.PopPendingOperations();
 
     if (!FilterDraw()) {
@@ -209,6 +211,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
 
+    const auto t_prepare = Common::FaultMonitor::Now();
     PrepareRenderState(pipeline);
     const auto t_bindres = Common::FaultMonitor::Now();
     const bool bound = BindResources(pipeline);
@@ -218,17 +221,22 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
     const auto t_begin = Common::FaultMonitor::Now();
     const auto state = BeginRendering(pipeline);
+    const auto t_vtxbuf = Common::FaultMonitor::Now();
     Common::FaultMonitor::CountDraw(pipeline_ns, bindres_ns,
-                                    Common::FaultMonitor::SinceNs(t_begin));
+                                    Common::FaultMonitor::DiffNs(t_begin, t_vtxbuf));
 
     buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers);
     if (is_indexed) {
         buffer_cache.BindIndexBuffer(index_offset, buffer_barriers);
     }
+    const auto t_descwrite = Common::FaultMonitor::Now();
 
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
+    const auto t_dynstate = Common::FaultMonitor::Now();
     UpdateDynamicState(pipeline, is_indexed);
+    const auto t_schedbegin = Common::FaultMonitor::Now();
     scheduler.BeginRendering(state);
+    const auto t_emit = Common::FaultMonitor::Now();
 
     const auto& vs_info = pipeline->GetStage(Shader::LogicalStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
@@ -247,6 +255,15 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     DebugState.IncDrawCall();
 
     ResetBindings();
+
+    Common::FaultMonitor::CountDrawTail(
+        Common::FaultMonitor::DiffNs(t_entry, t_pipeline) +
+            Common::FaultMonitor::DiffNs(t_prepare, t_bindres),
+        Common::FaultMonitor::DiffNs(t_vtxbuf, t_descwrite),
+        Common::FaultMonitor::DiffNs(t_descwrite, t_dynstate),
+        Common::FaultMonitor::DiffNs(t_dynstate, t_schedbegin),
+        Common::FaultMonitor::DiffNs(t_schedbegin, t_emit),
+        Common::FaultMonitor::SinceNs(t_emit));
 }
 
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
@@ -333,6 +350,13 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
 
+    // 526 dispatches per forest frame, and they sit in the 27% of the frame that Draw's timers do
+    // not cover. SCOPE_EXIT so the several early returns below are still counted.
+    const auto t_dispatch = Common::FaultMonitor::Now();
+    SCOPE_EXIT {
+        Common::FaultMonitor::CountDispatch(Common::FaultMonitor::SinceNs(t_dispatch));
+    };
+
     scheduler.PopPendingOperations();
 
     const auto& cs_program = liverpool->GetCsRegs();
@@ -363,6 +387,11 @@ void Rasterizer::DispatchDirect() {
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     RENDERER_TRACE;
+
+    const auto t_dispatch = Common::FaultMonitor::Now();
+    SCOPE_EXIT {
+        Common::FaultMonitor::CountDispatch(Common::FaultMonitor::SinceNs(t_dispatch));
+    };
 
     scheduler.PopPendingOperations();
 

@@ -96,9 +96,14 @@ void Liverpool::Process(std::stop_token stoken) {
 
     while (!stoken.stop_requested()) {
         {
+            // Idle here is the CP thread waiting on the GUEST, not emulator cost. Splitting it out
+            // is what says whether parallel command recording can pay off - see
+            // notes\parallel-command-recording-plan.md.
+            const auto t_wait = Common::FaultMonitor::Now();
             std::unique_lock lk{submit_mutex};
             Common::CondvarWait(submit_cv, lk, stoken,
                                 [this] { return num_commands || num_submits || submit_done; });
+            Common::FaultMonitor::CountCpWait(Common::FaultMonitor::SinceNs(t_wait));
         }
         if (stoken.stop_requested()) {
             break;
@@ -110,6 +115,7 @@ void Liverpool::Process(std::stop_token stoken) {
 
         curr_qid = -1;
 
+        const auto t_active = Common::FaultMonitor::Now();
         while (num_submits || num_commands) {
             ProcessCommands();
 
@@ -138,6 +144,7 @@ void Liverpool::Process(std::stop_token stoken) {
                 submit_cv.notify_all();
             }
         }
+        Common::FaultMonitor::CountCpActive(Common::FaultMonitor::SinceNs(t_active));
 
         if (submit_done) {
             // NOTE: EndCapture() used to live here, which ended the RenderDoc capture at the first

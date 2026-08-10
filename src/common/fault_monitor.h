@@ -186,6 +186,57 @@ extern std::atomic<u64> bindtex_findimage_ns;
 extern std::atomic<u64> bindtex_view_ns;
 extern std::atomic<u64> bindtex_sampler_ns;
 
+/**
+ * The rest of `Rasterizer::Draw` - the third of the frame no timer ever covered.
+ *
+ * Measured 2026-08-09 in the forest: frame time is 10.68 us/draw while the timed spans
+ * (GetGraphicsPipeline 1.03 + BindResources 5.98 + BeginRendering 0.22) account for 7.23. The
+ * missing **3.45 us/draw is ~33% of a 76.9 ms frame** and had never been looked at, because the
+ * original instrumentation timed "the three things Draw does" and Draw in fact does eleven.
+ *
+ *   pre       - PopPendingOperations + FilterDraw + PrepareRenderState
+ *   vtxbuf    - BindVertexBuffers + BindIndexBuffer. A SECOND buffer-cache pass per draw;
+ *               bindbuf_us_each only ever covered the shader-stage buffers.
+ *   descwrite - pipeline->BindResources: the descriptor writes (~10 bindings/draw) and the
+ *               collected buffer barriers actually reaching Vulkan
+ *   dynstate  - UpdateDynamicState
+ *   schedbegin- scheduler.BeginRendering (distinct from Rasterizer::BeginRendering, which is
+ *               already timed as beginrender_us_each)
+ *   emit      - bindPipeline + drawIndexed/draw + ResetBindings
+ *
+ * Adds ~5 clock reads/draw over the previous instrumentation, ~0.8% at this frame time.
+ */
+/**
+ * The command-processor thread's own frame budget, which decides whether parallel recording is
+ * even the right lever.
+ *
+ * Measured 2026-08-09: `Rasterizer::Draw` accounts for 51.5 ms of a 70.4 ms forest frame. The other
+ * 18.9 ms has never been split, and "µs per draw" hides it because that figure is frame time
+ * divided by draws - work that is per-FRAME gets silently amortised into a per-draw column.
+ *
+ *   cp_wait   - the outer condvar wait in `Liverpool::Process`, i.e. the CP thread IDLE waiting for
+ *               the guest to submit. This is NOT emulator cost, and it is the number that matters
+ *               most: if a large share of the frame is spent here, the guest thread is a co-
+ *               bottleneck and parallelising command recording cannot buy the full amount.
+ *   cp_active - the inner submit loop: ProcessCommands plus every resumed task
+ *   dispatch  - compute dispatches (526 per forest frame) - inside cp_active, alongside Draw
+ *
+ * cp_active minus draw minus dispatch is PM4 parsing, register writes, WaitRegMem/ReleaseMem and
+ * render-pass transitions. Timed per submit batch rather than per draw, so the overhead is
+ * negligible.
+ */
+extern std::atomic<u64> cp_wait_ns;
+extern std::atomic<u64> cp_active_ns;
+extern std::atomic<u64> dispatch_count;
+extern std::atomic<u64> dispatch_ns;
+
+extern std::atomic<u64> draw_pre_ns;
+extern std::atomic<u64> draw_vtxbuf_ns;
+extern std::atomic<u64> draw_descwrite_ns;
+extern std::atomic<u64> draw_dynstate_ns;
+extern std::atomic<u64> draw_schedbegin_ns;
+extern std::atomic<u64> draw_emit_ns;
+
 extern std::atomic<u64> stream_map_ns;
 extern std::atomic<u64> stream_valid_ns;
 extern std::atomic<u64> stream_copy_ns;
@@ -388,6 +439,29 @@ inline void CountObtainStream(u64 query_ns, u64 copy_ns, u64 bytes) {
 
 /// Fall-through path of ObtainBuffer. `query_ns` is 0 when the early-exit test was skipped
 /// outright (written or oversized binding), so query time stays comparable across both paths.
+inline void CountCpWait(u64 ns) {
+    cp_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+}
+
+inline void CountCpActive(u64 ns) {
+    cp_active_ns.fetch_add(ns, std::memory_order_relaxed);
+}
+
+inline void CountDispatch(u64 ns) {
+    dispatch_count.fetch_add(1, std::memory_order_relaxed);
+    dispatch_ns.fetch_add(ns, std::memory_order_relaxed);
+}
+
+inline void CountDrawTail(u64 pre_ns, u64 vtxbuf_ns, u64 descwrite_ns, u64 dynstate_ns,
+                          u64 schedbegin_ns, u64 emit_ns) {
+    draw_pre_ns.fetch_add(pre_ns, std::memory_order_relaxed);
+    draw_vtxbuf_ns.fetch_add(vtxbuf_ns, std::memory_order_relaxed);
+    draw_descwrite_ns.fetch_add(descwrite_ns, std::memory_order_relaxed);
+    draw_dynstate_ns.fetch_add(dynstate_ns, std::memory_order_relaxed);
+    draw_schedbegin_ns.fetch_add(schedbegin_ns, std::memory_order_relaxed);
+    draw_emit_ns.fetch_add(emit_ns, std::memory_order_relaxed);
+}
+
 inline void CountBindTexSplit(u64 findimage_ns, u64 view_ns, u64 sampler_ns) {
     bindtex_findimage_ns.fetch_add(findimage_ns, std::memory_order_relaxed);
     bindtex_view_ns.fetch_add(view_ns, std::memory_order_relaxed);
