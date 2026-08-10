@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <condition_variable>
 #include <ctime>
 #include <fstream>
@@ -101,8 +102,28 @@ std::atomic<u64> renderframe_count{0};
 namespace {
 
 // Short enough to see when the decay starts, long enough that a multi-hour run stays small:
-// 240 lines per hour.
-constexpr auto REPORT_INTERVAL = std::chrono::seconds(15);
+// 240 lines per hour at the default.
+//
+// Overridable per run with SHADPS4_FAULT_INTERVAL_MS, clamped to [250, 600000]. Both REFERENCE.md
+// and PLAN.md documented this override for a while before it existed - a run that set the variable
+// silently got 15 s anyway. The startup log line is what makes the override checkable rather than
+// assumed.
+constexpr long DEFAULT_REPORT_MS = 15000;
+
+std::chrono::milliseconds ReportInterval() {
+    static const std::chrono::milliseconds value = [] {
+        long ms = DEFAULT_REPORT_MS;
+        if (const char* env = std::getenv("SHADPS4_FAULT_INTERVAL_MS")) {
+            char* end = nullptr;
+            const long parsed = std::strtol(env, &end, 10);
+            if (end != env && parsed > 0) {
+                ms = std::clamp(parsed, 250L, 600000L);
+            }
+        }
+        return std::chrono::milliseconds(ms);
+    }();
+    return value;
+}
 
 std::mutex page_mutex;
 std::unordered_map<u64, u64> read_fault_pages;
@@ -361,6 +382,8 @@ std::ofstream OpenCsv() {
 
 void ReportLoop() {
     Common::SetCurrentThreadName("shadPS4:FaultMonitor");
+    LOG_INFO(Render, "FaultMonitor: reporting every {} ms",
+             static_cast<long long>(ReportInterval().count()));
 
     std::ofstream csv = OpenCsv();
     const auto started = std::chrono::steady_clock::now();
@@ -369,7 +392,7 @@ void ReportLoop() {
 
     while (true) {
         std::unique_lock lk(stop_mutex);
-        if (stop_cv.wait_for(lk, REPORT_INTERVAL, [] { return stop_requested; })) {
+        if (stop_cv.wait_for(lk, ReportInterval(), [] { return stop_requested; })) {
             break;
         }
         lk.unlock();
