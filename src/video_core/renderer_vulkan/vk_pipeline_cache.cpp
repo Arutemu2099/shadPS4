@@ -344,7 +344,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
         static bool probe_have_last = false;
         static u64 probe_calls = 0, probe_same = 0, probe_gen_unchanged = 0, probe_gen_mismatch = 0,
                    probe_refresh_ns = 0, probe_lookup_ns = 0;
-        const u64 gen = liverpool->regs_generation;
+        const u64 gen = liverpool->regs_generation_ctx; // context/uconfig/config/clear only, no SH
         const bool key_same = probe_have_last && graphics_key == probe_last_key;
         const bool gen_same = probe_have_last && gen == probe_last_gen;
         if (key_same) {
@@ -367,8 +367,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
         probe_lookup_ns += Common::FaultMonitor::DiffNs(t_probe1, t_probe2);
         if (probe_calls >= 200000) {
             LOG_INFO(Render_Vulkan,
-                     "PipelineProbe: calls={} same_key={:.1f}% gen_unchanged={:.1f}% "
-                     "gen_mismatch={} refresh={:.3f}us/call lookup={:.3f}us/call",
+                     "PipelineProbe: calls={} same_key={:.1f}% vctxgen_unchanged={:.1f}% "
+                     "vctxgen_mismatch={} refresh={:.3f}us/call lookup={:.3f}us/call",
                      probe_calls, 100.0 * static_cast<double>(probe_same) / probe_calls,
                      100.0 * static_cast<double>(probe_gen_unchanged) / probe_calls,
                      probe_gen_mismatch,

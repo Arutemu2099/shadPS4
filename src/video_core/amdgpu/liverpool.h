@@ -70,6 +70,11 @@ struct Liverpool {
     // needs key-relevant-range dirty tracking; see notes/perf-forest.md. Behaviorally inert - only
     // the pipeline probe reads it. Kept as a documented negative result.
     u64 regs_generation{0};
+    // Same idea but bumped ONLY on context/uconfig/config regs + ClearState, i.e. excluding the SH
+    // per-draw user_data churn that made regs_generation useless. If THIS one is often unchanged
+    // across draws, a pipeline-key dirty flag on the context regs is viable; the probe's mismatch
+    // count then says whether excluding SH program-address writes is safe. Measurement only.
+    u64 regs_generation_ctx{0};
 
 public:
     explicit Liverpool();

@@ -319,13 +319,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::ClearState: {
                 regs.SetDefaults();
                 ++regs_generation;
+                ++regs_generation_ctx;
                 break;
             }
             case PM4ItOpcode::SetConfigReg: {
                 const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
                 const auto reg_addr = Regs::ConfigRegWordOffset + set_data->reg_offset;
                 const auto* payload = reinterpret_cast<const u32*>(header + 2);
-                std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
+                const auto sz = (count - 1) * sizeof(u32);
+                if (std::memcmp(&regs.reg_array[reg_addr], payload, sz) != 0) {
+                    ++regs_generation_ctx; // value-aware: only a real change dirties the key
+                }
+                std::memcpy(&regs.reg_array[reg_addr], payload, sz);
                 ++regs_generation;
                 break;
             }
@@ -334,7 +339,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto reg_addr = Regs::ContextRegWordOffset + set_data->reg_offset;
                 const auto* payload = reinterpret_cast<const u32*>(header + 2);
 
-                std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
+                const auto ctx_sz = (count - 1) * sizeof(u32);
+                if (std::memcmp(&regs.reg_array[reg_addr], payload, ctx_sz) != 0) {
+                    ++regs_generation_ctx; // value-aware: only a real change dirties the key
+                }
+                std::memcpy(&regs.reg_array[reg_addr], payload, ctx_sz);
                 ++regs_generation;
 
                 // In the case of HW, render target memory has alignment as color block operates on
@@ -422,8 +431,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::SetUconfigReg: {
                 const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-                std::memcpy(&regs.reg_array[Regs::UconfigRegWordOffset + set_data->reg_offset],
-                            header + 2, (count - 1) * sizeof(u32));
+                const auto uc_addr = Regs::UconfigRegWordOffset + set_data->reg_offset;
+                const auto uc_sz = (count - 1) * sizeof(u32);
+                if (std::memcmp(&regs.reg_array[uc_addr], header + 2, uc_sz) != 0) {
+                    ++regs_generation_ctx; // value-aware: only a real change dirties the key
+                }
+                std::memcpy(&regs.reg_array[uc_addr], header + 2, uc_sz);
                 ++regs_generation;
                 break;
             }
