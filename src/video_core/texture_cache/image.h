@@ -163,11 +163,21 @@ public:
         vk::PipelineStageFlags2 pl_stage = vk::PipelineStageFlagBits2::eAllCommands;
         vk::AccessFlags2 access_mask = vk::AccessFlagBits2::eNone;
         vk::ImageLayout layout = vk::ImageLayout::eUndefined;
+
+        bool operator==(const State&) const = default;
+    };
+    // Piecewise-constant map of subresource index (mip * layers + layer) -> State, kept as a
+    // coalesced list of contiguous [begin, end) runs. Empty == "not promoted": the whole image
+    // shares `state`. Replaces a flat one-entry-per-subresource vector; see image.cpp GetBarriers.
+    struct StateRun {
+        u32 begin;
+        u32 end;
+        State state;
     };
     struct BackingImage {
         UniqueImage image;
         State state;
-        std::vector<State> subresource_states;
+        boost::container::small_vector<StateRun, 8> subresource_runs;
         boost::container::small_vector<ImageViewInfo, 4> image_view_infos;
         boost::container::small_vector<ImageViewId, 4> image_view_ids;
         u32 num_samples;
