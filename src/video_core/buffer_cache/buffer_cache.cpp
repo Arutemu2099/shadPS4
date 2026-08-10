@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include "common/alignment.h"
 #include "common/debug.h"
 #include "common/fault_monitor.h"
@@ -38,6 +39,29 @@ static constexpr size_t DeviceBufferSize = 128_MB;
  * on anyway - it just folds many faults into one submit instead of one each.
  */
 static constexpr u64 ReadFaultWidenSize = 64_KB;
+
+/**
+ * Size ceiling for `ObtainBuffer`'s read-only stream-copy fast path.
+ *
+ * Defaults to `CACHING_PAGESIZE`, which is what upstream compares against. Read from the
+ * environment once so the fast path can be traded against the tracked buffer-cache path in a
+ * playtest without a rebuild - `SHADPS4_STREAM_MAX_SIZE=0` disables it entirely. Both paths are
+ * correct; only the cost differs, so this is a performance knob and not a compatibility one.
+ */
+static u64 StreamCopyMaxSize() {
+    static const u64 value = []() -> u64 {
+        if (const char* env = std::getenv("SHADPS4_STREAM_MAX_SIZE")) {
+            char* end = nullptr;
+            const u64 parsed = std::strtoull(env, &end, 0);
+            if (end != env) {
+                LOG_INFO(Render, "BufferCache: stream-copy max size overridden to {}", parsed);
+                return parsed;
+            }
+        }
+        return u64{BufferCache::CACHING_PAGESIZE};
+    }();
+    return value;
+}
 
 /// Expands a read fault to `ReadFaultWidenSize`, clipped to the buffer that already covers it.
 /// The clip is what keeps this safe: `FindBuffer` has already run on the original range, so
@@ -430,7 +454,14 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     const auto t_entry = Common::FaultMonitor::Now();
     u64 query_ns = 0;
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
-    if (!is_written && size <= CACHING_PAGESIZE) {
+    //
+    // That trade is unmeasured. The fast path costs a guest->staging memcpy per binding per draw
+    // (6.6 calls/draw, ~43 MB/frame, 2.3 us/draw measured) and cannot be memoised, because it
+    // never clears the range's CPU-modified bits and so never write-protects the pages - there is
+    // no invalidation signal to hang a cache on. The fall-through is the fully tracked path, so
+    // lowering this threshold can only cost performance, never correctness. Overridable to A/B it
+    // without a rebuild; 0 disables the fast path entirely.
+    if (!is_written && size <= StreamCopyMaxSize()) {
         const bool gpu_modified = IsRegionGpuModified(device_addr, size);
         const auto t_query = Common::FaultMonitor::Now();
         query_ns = Common::FaultMonitor::DiffNs(t_entry, t_query);
