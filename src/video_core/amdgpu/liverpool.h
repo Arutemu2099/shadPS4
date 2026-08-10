@@ -62,6 +62,14 @@ struct Liverpool {
     Regs regs{};
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> last_cb_extent{};
     CbDbExtent last_db_extent{};
+    // Bumped on every write into regs.reg_array (all GFX SET_*_REG handlers + ClearState). Tried as
+    // a cheap "did any register change since the last draw" signal for memoizing GetGraphicsPipeline
+    // (RefreshGraphicsKey is 0.955 us/draw = 96% of its cost). MEASURED 2026-08-10: gen_unchanged is
+    // 0.0% - the guest re-emits a register before every single draw (per-draw SH user_data), so this
+    // coarse signal never fires even though 85.7% of draws rebuild an identical key. A working memo
+    // needs key-relevant-range dirty tracking; see notes/perf-forest.md. Behaviorally inert - only
+    // the pipeline probe reads it. Kept as a documented negative result.
+    u64 regs_generation{0};
 
 public:
     explicit Liverpool();

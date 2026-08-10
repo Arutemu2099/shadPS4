@@ -318,6 +318,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::ClearState: {
                 regs.SetDefaults();
+                ++regs_generation;
                 break;
             }
             case PM4ItOpcode::SetConfigReg: {
@@ -325,6 +326,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto reg_addr = Regs::ConfigRegWordOffset + set_data->reg_offset;
                 const auto* payload = reinterpret_cast<const u32*>(header + 2);
                 std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
+                ++regs_generation;
                 break;
             }
             case PM4ItOpcode::SetContextReg: {
@@ -333,6 +335,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* payload = reinterpret_cast<const u32*>(header + 2);
 
                 std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
+                ++regs_generation;
 
                 // In the case of HW, render target memory has alignment as color block operates on
                 // tiles. There is no information of actual resource extents stored in CB context
@@ -413,6 +416,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 } else {
                     std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
                                 header + 2, set_size);
+                    ++regs_generation;
                 }
                 break;
             }
@@ -420,6 +424,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
                 std::memcpy(&regs.reg_array[Regs::UconfigRegWordOffset + set_data->reg_offset],
                             header + 2, (count - 1) * sizeof(u32));
+                ++regs_generation;
                 break;
             }
             case PM4ItOpcode::SetPredication: {

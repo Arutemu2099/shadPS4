@@ -3,6 +3,7 @@
 
 #include <ranges>
 
+#include "common/fault_monitor.h"
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
@@ -325,10 +326,58 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 PipelineCache::~PipelineCache() = default;
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
+    // MEASUREMENT (perf-forest): GetGraphicsPipeline is 0.99 us/draw = 6.3 ms/frame and never split.
+    // Before designing a memo, learn (a) how the cost divides between RefreshGraphicsKey (memset +
+    // wide reg read + stage resolve) and the robin_map lookup, and (b) how often the freshly built
+    // key equals the previous draw's - the hit rate a memo would ride on. Windowed so a stable-scene
+    // line is not diluted by boot. ~3 clock reads + one key compare per draw, the memo's own cost.
+    const auto t_probe0 = Common::FaultMonitor::Now();
     if (!RefreshGraphicsKey()) {
         return nullptr;
     }
+    const auto t_probe1 = Common::FaultMonitor::Now();
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
+    const auto t_probe2 = Common::FaultMonitor::Now();
+    {
+        static GraphicsPipelineKey probe_last_key{};
+        static u64 probe_last_gen = 0;
+        static bool probe_have_last = false;
+        static u64 probe_calls = 0, probe_same = 0, probe_gen_unchanged = 0, probe_gen_mismatch = 0,
+                   probe_refresh_ns = 0, probe_lookup_ns = 0;
+        const u64 gen = liverpool->regs_generation;
+        const bool key_same = probe_have_last && graphics_key == probe_last_key;
+        const bool gen_same = probe_have_last && gen == probe_last_gen;
+        if (key_same) {
+            ++probe_same;
+        }
+        if (gen_same) {
+            // gen_unchanged is the memo's real hit rate; a mismatch (gen unchanged yet key differs)
+            // means the generation signal misses a register the key reads - it MUST stay 0 before
+            // any build is allowed to actually skip RefreshGraphicsKey on this signal.
+            ++probe_gen_unchanged;
+            if (!key_same) {
+                ++probe_gen_mismatch;
+            }
+        }
+        probe_last_key = graphics_key;
+        probe_last_gen = gen;
+        probe_have_last = true;
+        ++probe_calls;
+        probe_refresh_ns += Common::FaultMonitor::DiffNs(t_probe0, t_probe1);
+        probe_lookup_ns += Common::FaultMonitor::DiffNs(t_probe1, t_probe2);
+        if (probe_calls >= 200000) {
+            LOG_INFO(Render_Vulkan,
+                     "PipelineProbe: calls={} same_key={:.1f}% gen_unchanged={:.1f}% "
+                     "gen_mismatch={} refresh={:.3f}us/call lookup={:.3f}us/call",
+                     probe_calls, 100.0 * static_cast<double>(probe_same) / probe_calls,
+                     100.0 * static_cast<double>(probe_gen_unchanged) / probe_calls,
+                     probe_gen_mismatch,
+                     static_cast<double>(probe_refresh_ns) / 1e3 / probe_calls,
+                     static_cast<double>(probe_lookup_ns) / 1e3 / probe_calls);
+            probe_calls = probe_same = probe_gen_unchanged = probe_gen_mismatch = probe_refresh_ns =
+                probe_lookup_ns = 0;
+        }
+    }
     if (is_new) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
