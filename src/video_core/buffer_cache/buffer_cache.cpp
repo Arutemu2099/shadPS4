@@ -834,10 +834,31 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 }
 
 bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, u32 size) {
+    // TIER-2 SPLIT PROBE: the ob_sync gap (ob_sync - scan/copy/mark = ~7.7 ms/frame) is untimed and
+    // was GUESSED to be lock/framing. This path (read-only texel buffers) is the prime suspect.
+    // Split it: FindImageFromRange (texture-cache lookup under TextureCache::mutex) vs TileImage (the
+    // real work, only when an image actually aliases). Strip before ship.
+    static u64 sfi_calls = 0, sfi_found = 0, sfi_find_ns = 0, sfi_tile_ns = 0;
+    const auto sfi_t0 = Common::FaultMonitor::Now();
     const ImageId image_id = texture_cache.FindImageFromRange(device_addr, size);
+    sfi_find_ns += Common::FaultMonitor::SinceNs(sfi_t0);
+    ++sfi_calls;
+    const auto sfi_report = [&] {
+        if (sfi_calls < 300000) {
+            return;
+        }
+        LOG_INFO(Render,
+                 "SfiSplit: calls={} found={:.1f}% find={:.3f}us/call tile={:.3f}us/found",
+                 sfi_calls, 100.0 * static_cast<double>(sfi_found) / sfi_calls,
+                 static_cast<double>(sfi_find_ns) / 1e3 / sfi_calls,
+                 sfi_found ? static_cast<double>(sfi_tile_ns) / 1e3 / sfi_found : 0.0);
+        sfi_calls = sfi_found = sfi_find_ns = sfi_tile_ns = 0;
+    };
     if (!image_id) {
+        sfi_report();
         return false;
     }
+    ++sfi_found;
     Image& image = texture_cache.GetImage(image_id);
     ASSERT_MSG(device_addr == image.info.guest_address,
                "Texel buffer aliases image subresources {:x} : {:x}", device_addr,
@@ -869,10 +890,14 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, 
         copy_size += mip_info.size;
     }
     if (copy_size == 0) {
+        sfi_report();
         return false;
     }
     auto& tile_manager = texture_cache.GetTileManager();
+    const auto sfi_t1 = Common::FaultMonitor::Now();
     tile_manager.TileImage(image, buffer_copies, buffer.Handle(), buf_offset, copy_size);
+    sfi_tile_ns += Common::FaultMonitor::SinceNs(sfi_t1);
+    sfi_report();
     return true;
 }
 
