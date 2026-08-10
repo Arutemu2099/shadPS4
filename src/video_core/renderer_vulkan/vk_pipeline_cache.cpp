@@ -428,6 +428,11 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
 }
 
 bool PipelineCache::RefreshGraphicsKey() {
+    // MEASUREMENT (perf-forest): split the 0.955 us into the SKIPPABLE key assembly (pre+post: memset
+    // + register reads + color-buffer loops) vs the MANDATORY stage resolution (RefreshGraphicsStages
+    // -> GetProgram, which refreshes per-draw user_data that BindResources consumes and cannot be
+    // skipped). Only pre+post is reclaimable by a memo; this sizes it before any is written.
+    const auto rgk_t0 = Common::FaultMonitor::Now();
     std::memset(&graphics_key, 0, sizeof(GraphicsPipelineKey));
     const auto& regs = liverpool->regs;
     auto& key = graphics_key;
@@ -473,9 +478,11 @@ bool PipelineCache::RefreshGraphicsKey() {
     }
 
     // Compile and bind shader stages
+    const auto rgk_t1 = Common::FaultMonitor::Now();
     if (!RefreshGraphicsStages()) {
         return false;
     }
+    const auto rgk_t2 = Common::FaultMonitor::Now();
 
     // Second pass to mask out render targets not written by shader and fill remaining info
     u8 color_samples = 0;
@@ -517,6 +524,22 @@ bool PipelineCache::RefreshGraphicsKey() {
         }
     }
 
+    {
+        static u64 rgk_calls = 0, rgk_pre = 0, rgk_stages = 0, rgk_post = 0;
+        const auto rgk_t3 = Common::FaultMonitor::Now();
+        rgk_pre += Common::FaultMonitor::DiffNs(rgk_t0, rgk_t1);
+        rgk_stages += Common::FaultMonitor::DiffNs(rgk_t1, rgk_t2);
+        rgk_post += Common::FaultMonitor::DiffNs(rgk_t2, rgk_t3);
+        if (++rgk_calls >= 200000) {
+            LOG_INFO(Render_Vulkan,
+                     "RgkSplit: pre={:.3f}us stages={:.3f}us post={:.3f}us skippable(pre+post)={:.3f}us",
+                     static_cast<double>(rgk_pre) / 1e3 / rgk_calls,
+                     static_cast<double>(rgk_stages) / 1e3 / rgk_calls,
+                     static_cast<double>(rgk_post) / 1e3 / rgk_calls,
+                     static_cast<double>(rgk_pre + rgk_post) / 1e3 / rgk_calls);
+            rgk_calls = rgk_pre = rgk_stages = rgk_post = 0;
+        }
+    }
     return true;
 }
 
