@@ -164,6 +164,28 @@ extern std::atomic<u64> protect_read_ns;
 /// Split of `StreamBuffer::Copy`, the ObtainBuffer early-exit path. Four phases: reserving space
 /// in the stream buffer, the `IsValidMapping` guest-address check, the copy itself (which for a
 /// guest address goes through `CopySparseMemory` - shared lock plus a VMA tree walk), and Commit.
+/**
+ * Split of `Rasterizer::BindTextures`, 2.39 us/draw and never examined.
+ *
+ * MEASURED 2026-08-09, forest, 7,040 draws/frame - and it corrected a wrong guess immediately:
+ *
+ *   findimage  0.49 us/draw   21%   FindImage + GetAssociatedDepth
+ *   view       1.65 us/draw   72%   FindTexture + Transit + layout bookkeeping  <- the cost
+ *   sampler    0.07 us/draw    3%   the sampler loop
+ *
+ * A last-value memo over `GetSampler` was written against an estimate of 0.3-0.6 us/draw for that
+ * loop, on the reasoning that it hashes the S# with XXH3 and takes a global mutex once per binding
+ * per draw. The real figure is **0.07 us/draw**, over by 5-8x, and the memo measured a 75.6% miss
+ * rate. It was reverted unbuilt-on. Shipping this split in the same build is what caught it in one
+ * run instead of a playtest cycle.
+ *
+ * `Image::GetBarriers` inside `Transit` was also the top SELF-time leaf in an old stack profile -
+ * the one entry in it that was self time rather than inclusive frequency. Two instruments agree.
+ */
+extern std::atomic<u64> bindtex_findimage_ns;
+extern std::atomic<u64> bindtex_view_ns;
+extern std::atomic<u64> bindtex_sampler_ns;
+
 extern std::atomic<u64> stream_map_ns;
 extern std::atomic<u64> stream_valid_ns;
 extern std::atomic<u64> stream_copy_ns;
@@ -366,6 +388,12 @@ inline void CountObtainStream(u64 query_ns, u64 copy_ns, u64 bytes) {
 
 /// Fall-through path of ObtainBuffer. `query_ns` is 0 when the early-exit test was skipped
 /// outright (written or oversized binding), so query time stays comparable across both paths.
+inline void CountBindTexSplit(u64 findimage_ns, u64 view_ns, u64 sampler_ns) {
+    bindtex_findimage_ns.fetch_add(findimage_ns, std::memory_order_relaxed);
+    bindtex_view_ns.fetch_add(view_ns, std::memory_order_relaxed);
+    bindtex_sampler_ns.fetch_add(sampler_ns, std::memory_order_relaxed);
+}
+
 inline void CountStreamCopy(u64 map_ns, u64 valid_ns, u64 copy_ns, u64 commit_ns) {
     stream_map_ns.fetch_add(map_ns, std::memory_order_relaxed);
     stream_valid_ns.fetch_add(valid_ns, std::memory_order_relaxed);

@@ -738,6 +738,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     // This is currently always 1 for anything other than mip fallback arrays.
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
 
+    const auto t_findimage = Common::FaultMonitor::Now();
+
     for (const auto& image_desc : stage.images) {
         const auto tsharp = image_desc.GetSharp(stage);
         if (texture_cache.IsMeta(tsharp.Address())) {
@@ -784,6 +786,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
         image_descriptor_array_sizes.push_back(num_bindings);
     }
+
+    const auto t_view = Common::FaultMonitor::Now();
 
     // Second pass to re-bind images that were updated after binding
     for (auto& [image_id, desc] : image_bindings) {
@@ -839,6 +843,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         }
     }
 
+    const auto t_sampler_start = Common::FaultMonitor::Now();
+
     u32 image_info_idx = first_image_idx;
     u32 image_binding_idx = 0;
     for (u32 array_size : image_descriptor_array_sizes) {
@@ -876,6 +882,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         set_write.descriptorType = vk::DescriptorType::eSampler;
         set_write.pImageInfo = &image_infos.back();
     }
+
+    // The descriptor-write loop between t_view's end and t_sampler_start is bookkeeping only and
+    // is folded into the sampler span; if sampler time looks large with a high memo hit rate, that
+    // loop is where to look next rather than GetSampler.
+    Common::FaultMonitor::CountBindTexSplit(
+        Common::FaultMonitor::DiffNs(t_findimage, t_view),
+        Common::FaultMonitor::DiffNs(t_view, t_sampler_start),
+        Common::FaultMonitor::SinceNs(t_sampler_start));
 }
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {

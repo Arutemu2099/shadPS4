@@ -60,6 +60,9 @@ std::atomic<u64> protect_write_calls{0};
 std::atomic<u64> protect_write_ns{0};
 std::atomic<u64> protect_read_calls{0};
 std::atomic<u64> protect_read_ns{0};
+std::atomic<u64> bindtex_findimage_ns{0};
+std::atomic<u64> bindtex_view_ns{0};
+std::atomic<u64> bindtex_sampler_ns{0};
 std::atomic<u64> stream_map_ns{0};
 std::atomic<u64> stream_valid_ns{0};
 std::atomic<u64> stream_copy_ns{0};
@@ -188,6 +191,9 @@ struct Sample {
     u64 prot_w_ns;
     u64 prot_r_calls;
     u64 prot_r_ns;
+    u64 bt_findimage_ns;
+    u64 bt_view_ns;
+    u64 bt_sampler_ns;
     u64 sc_map_ns;
     u64 sc_valid_ns;
     u64 sc_copy_ns;
@@ -250,6 +256,9 @@ Sample Read() {
         protect_write_ns.load(std::memory_order_relaxed),
         protect_read_calls.load(std::memory_order_relaxed),
         protect_read_ns.load(std::memory_order_relaxed),
+        bindtex_findimage_ns.load(std::memory_order_relaxed),
+        bindtex_view_ns.load(std::memory_order_relaxed),
+        bindtex_sampler_ns.load(std::memory_order_relaxed),
         stream_map_ns.load(std::memory_order_relaxed),
         stream_valid_ns.load(std::memory_order_relaxed),
         stream_copy_ns.load(std::memory_order_relaxed),
@@ -287,7 +296,8 @@ std::ofstream OpenCsv() {
                "ob_stream_per_draw,ob_sync_per_draw,ob_stream_kb_per_draw,"
                "up_scan_us_each,up_copy_us_each,up_mark_us_each,up_written_per_draw,"
                "protw_per_draw,protw_us_each,protr_per_draw,protr_us_each,"
-               "sc_map_us_each,sc_valid_us_each,sc_copy_us_each,sc_commit_us_each\n";
+               "sc_map_us_each,sc_valid_us_each,sc_copy_us_each,sc_commit_us_each,"
+               "bt_findimage_us_each,bt_view_us_each,bt_sampler_us_each\n";
         csv.flush();
         LOG_INFO(Render, "FaultMonitor: rate CSV at {}", FS::PathToUTF8String(path));
     } else {
@@ -447,6 +457,9 @@ void ReportLoop() {
             d_protw ? static_cast<double>(cur.prot_w_ns - prev.prot_w_ns) / d_protw / 1000.0 : 0.0;
         const double protr_us =
             d_protr ? static_cast<double>(cur.prot_r_ns - prev.prot_r_ns) / d_protr / 1000.0 : 0.0;
+        const double bt_findimage_us = per_draw_us(cur.bt_findimage_ns - prev.bt_findimage_ns);
+        const double bt_view_us = per_draw_us(cur.bt_view_ns - prev.bt_view_ns);
+        const double bt_sampler_us = per_draw_us(cur.bt_sampler_ns - prev.bt_sampler_ns);
         const double sc_map_us = per_draw_us(cur.sc_map_ns - prev.sc_map_ns);
         const double sc_valid_us = per_draw_us(cur.sc_valid_ns - prev.sc_valid_ns);
         const double sc_copy_us = per_draw_us(cur.sc_copy_ns - prev.sc_copy_ns);
@@ -488,6 +501,7 @@ void ReportLoop() {
                  "| upload scan={:.2f}us copy={:.2f}us mark={:.2f}us ({:.2f} written/draw) "
                  "| protect w={:.3f}/draw {:.2f}us each r={:.3f}/draw {:.2f}us each "
                  "| streamcopy map={:.2f}us valid={:.2f}us copy={:.2f}us commit={:.2f}us "
+                 "| bindtex findimage={:.2f}us view={:.2f}us sampler={:.2f}us "
                  "| totals read={} write={} jit={} frames={} unhandled(r/w)={}/{}",
                  elapsed, fps, read_rate, write_rate, jit_rate, per_frame, read_us, write_us,
                  handler_pct, cur.fragments, static_cast<double>(d_adds) / dt,
@@ -500,7 +514,8 @@ void ReportLoop() {
                  draw_ms_per_frame, ob_query_us, ob_stream_us, ob_sync_us, ob_stream_per_draw,
                  ob_sync_per_draw, ob_stream_kb_per_draw, up_scan_us, up_copy_us, up_mark_us,
                  up_written_per_draw, protw_per_draw, protw_us, protr_per_draw, protr_us, sc_map_us,
-                 sc_valid_us, sc_copy_us, sc_commit_us, cur.read,
+                 sc_valid_us, sc_copy_us, sc_commit_us, bt_findimage_us, bt_view_us, bt_sampler_us,
+                 cur.read,
                  cur.write, cur.jit, cur.frames, cur.read_unhandled, cur.write_unhandled);
 
         if (d_read > 0) {
@@ -515,7 +530,7 @@ void ReportLoop() {
                 "{:.2f},{:.1f},{:.1f},{:.3f},{:.3f},{:.3f},{:.3f},{:.2f},{:.3f},{:.3f},{:.3f},{:.3f},"
                 "{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},"
                 "{:.3f},{:.3f},{:.3f},{:.3f},{:.4f},{:.3f},{:.4f},{:.3f},"
-                "{:.3f},{:.3f},{:.3f},{:.3f}\n",
+                "{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f}\n",
                 elapsed, fps, read_rate, write_rate, jit_rate, per_frame, read_us, write_us,
                 handler_pct, cur.read, cur.read_unhandled, cur.write, cur.write_unhandled, cur.jit,
                 cur.frames, cur.fragments, static_cast<double>(d_adds) / dt,
@@ -527,7 +542,8 @@ void ReportLoop() {
                 bindtex_us, bb_find_us, bb_obtain_us, ob_query_us, ob_stream_us, ob_sync_us,
                 ob_stream_per_draw, ob_sync_per_draw, ob_stream_kb_per_draw, up_scan_us, up_copy_us,
                 up_mark_us, up_written_per_draw, protw_per_draw, protw_us, protr_per_draw, protr_us,
-                sc_map_us, sc_valid_us, sc_copy_us, sc_commit_us);
+                sc_map_us, sc_valid_us, sc_copy_us, sc_commit_us, bt_findimage_us, bt_view_us,
+                bt_sampler_us);
             csv.flush(); // a killed process must not lose the curve
         }
 
