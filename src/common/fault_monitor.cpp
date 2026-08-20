@@ -77,6 +77,10 @@ std::atomic<u64> cp_read_faults{0};
 std::atomic<u64> cp_read_ns{0};
 std::atomic<u64> cp_write_faults{0};
 std::atomic<u64> cp_write_ns{0};
+std::atomic<u64> upload_calls{0};
+std::atomic<u64> upload_empty_calls{0};
+std::atomic<u64> upload_managers{0};
+std::atomic<u64> upload_ranges{0};
 std::atomic<u64> dispatch_ns{0};
 std::atomic<u64> draw_pre_ns{0};
 std::atomic<u64> draw_vtxbuf_ns{0};
@@ -259,6 +263,10 @@ struct Sample {
     u64 cp_read_ns_v;
     u64 cp_write;
     u64 cp_write_ns_v;
+    u64 up_calls;
+    u64 up_empty;
+    u64 up_managers;
+    u64 up_ranges;
 };
 
 Sample Read() {
@@ -344,6 +352,10 @@ Sample Read() {
         cp_read_ns.load(std::memory_order_relaxed),
         cp_write_faults.load(std::memory_order_relaxed),
         cp_write_ns.load(std::memory_order_relaxed),
+        upload_calls.load(std::memory_order_relaxed),
+        upload_empty_calls.load(std::memory_order_relaxed),
+        upload_managers.load(std::memory_order_relaxed),
+        upload_ranges.load(std::memory_order_relaxed),
     };
 }
 
@@ -384,7 +396,8 @@ std::ofstream OpenCsv() {
                "cp_wait_ms_per_frame,cp_active_ms_per_frame,disp_per_frame,disp_us_each,"
                "bt_findtex_us_each,bt_transit_us_each,"
                "bar_calls_per_draw,bar_partial_pct,bar_iters_per_call,bar_emitted_per_call,"
-               "cpfault_ms_per_frame,cpfault_pct_of_handler\n";
+               "cpfault_ms_per_frame,cpfault_pct_of_handler,"
+               "up_empty_pct,up_managers_per_call,up_ranges_per_call\n";
         csv.flush();
         LOG_INFO(Render, "FaultMonitor: rate CSV at {}", FS::PathToUTF8String(path));
     } else {
@@ -612,6 +625,21 @@ void ReportLoop() {
         const double cpfault_pct =
             d_all_ns ? static_cast<double>(d_cp_ns) / static_cast<double>(d_all_ns) * 100.0 : 0.0;
 
+        // Shape of the upload scan: is it walking structure to find nothing?
+        const u64 d_up_calls = cur.up_calls - prev.up_calls;
+        const double up_empty_pct =
+            d_up_calls ? static_cast<double>(cur.up_empty - prev.up_empty) /
+                             static_cast<double>(d_up_calls) * 100.0
+                       : 0.0;
+        const double up_managers_per_call =
+            d_up_calls ? static_cast<double>(cur.up_managers - prev.up_managers) /
+                             static_cast<double>(d_up_calls)
+                       : 0.0;
+        const double up_ranges_per_call =
+            d_up_calls ? static_cast<double>(cur.up_ranges - prev.up_ranges) /
+                             static_cast<double>(d_up_calls)
+                       : 0.0;
+
         LOG_INFO(Render,
                  "FaultRate: t={:.0f}s fps={:.1f} read={:.0f}/s write={:.0f}/s jit={:.0f}/s "
                  "| per_frame={:.0f} read={:.2f}us write={:.2f}us handler={:.1f}% of wall "
@@ -668,7 +696,7 @@ void ReportLoop() {
                 "{:.3f},{:.3f},{:.3f},{:.3f},{:.4f},{:.3f},{:.4f},{:.3f},"
                 "{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},"
                 "{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},"
-                "{:.2f},{:.2f},{:.1f},{:.3f},{:.3f},{:.3f},{:.3f},{:.1f},{:.2f},{:.3f},{:.3f},{:.1f}\n",
+                "{:.2f},{:.2f},{:.1f},{:.3f},{:.3f},{:.3f},{:.3f},{:.1f},{:.2f},{:.3f},{:.3f},{:.1f},{:.2f},{:.3f},{:.3f}\n",
                 elapsed, fps, read_rate, write_rate, jit_rate, per_frame, read_us, write_us,
                 handler_pct, cur.read, cur.read_unhandled, cur.write, cur.write_unhandled, cur.jit,
                 cur.frames, cur.fragments, static_cast<double>(d_adds) / dt,
@@ -684,7 +712,8 @@ void ReportLoop() {
                 bt_sampler_us, d_pre_us, d_vtxbuf_us, d_descwrite_us, d_dynstate_us,
                 d_schedbegin_us, d_emit_us, cp_wait_ms, cp_active_ms, disp_per_frame, disp_us,
                 bt_findtex_us, bt_transit_us, bar_per_draw, bar_partial_pct, bar_iters_per_call,
-                bar_emitted_per_call, cpfault_ms_per_frame, cpfault_pct);
+                bar_emitted_per_call, cpfault_ms_per_frame, cpfault_pct, up_empty_pct,
+                up_managers_per_call, up_ranges_per_call);
             csv.flush(); // a killed process must not lose the curve
         }
 

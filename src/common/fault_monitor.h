@@ -180,6 +180,38 @@ extern std::atomic<u64> upload_scan_ns;
 extern std::atomic<u64> upload_copy_ns;
 extern std::atomic<u64> upload_mark_ns;
 extern std::atomic<u64> upload_written_calls;
+
+/**
+ * The SHAPE of the upload scan, not just its cost.
+ *
+ * `up_scan` is the single biggest leaf in the frame - 8.29 ms of 51.89, entered 7.87 times per
+ * draw (~49,400 calls/frame). It is `IteratePages` + a SpinLock per region manager +
+ * `ForEachModifiedRange`. What is unknown is how much of that finds anything.
+ *
+ * This project's two shipped wins were both the same shape: `Image::GetBarriers` walked 4,600
+ * slots per call to emit 0.02 barriers, and `FindImageFromRange` ran once per draw to find an
+ * aliasing image 0.0% of the time. If the upload scan is a third instance - most calls walking
+ * structure to discover nothing is dirty - the fix is an early-out and it is worth real fps. If
+ * instead most calls find genuine modified ranges, the work is mandatory and the frame budget
+ * has to be attacked somewhere else entirely.
+ *
+ * Counted, not timed, on purpose: three `Clock::now()` calls per invocation already cost this
+ * path a few ms/frame, and adding timers inside a 49,400-per-frame loop would change the number
+ * being measured. Inner loops bump plain locals; one atomic add per call at the end.
+ */
+extern std::atomic<u64> upload_calls;
+extern std::atomic<u64> upload_empty_calls;
+extern std::atomic<u64> upload_managers;
+extern std::atomic<u64> upload_ranges;
+
+inline void CountUploadShape(u64 managers, u64 ranges) {
+    upload_calls.fetch_add(1, std::memory_order_relaxed);
+    upload_managers.fetch_add(managers, std::memory_order_relaxed);
+    upload_ranges.fetch_add(ranges, std::memory_order_relaxed);
+    if (ranges == 0) {
+        upload_empty_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+}
 extern std::atomic<u64> protect_write_calls;
 extern std::atomic<u64> protect_write_ns;
 extern std::atomic<u64> protect_read_calls;

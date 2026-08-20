@@ -95,15 +95,26 @@ public:
         // Three phases with very different costs - scan is bitset work, mark can reach a
         // VirtualProtect syscall. Timed separately so a fix is aimed at the one that is expensive.
         const auto t_scan = Common::FaultMonitor::Now();
+        // Shape counters: plain locals in the hot loop, one atomic add at the end. See
+        // CountUploadShape in fault_monitor.h for why this is counted and not timed.
+        u64 shape_managers = 0;
+        u64 shape_ranges = 0;
+        const auto counting_func = [&func, &shape_ranges](u64 addr, u64 size) {
+            ++shape_ranges;
+            func(addr, size);
+        };
         IteratePages<true>(query_cpu_range, query_size,
-                           [&func, is_written](RegionManager* manager, u64 offset, size_t size) {
+                           [&counting_func, &shape_managers, is_written](RegionManager* manager,
+                                                                        u64 offset, size_t size) {
+                               ++shape_managers;
                                manager->lock.lock();
                                manager->template ForEachModifiedRange<Type::CPU, true>(
-                                   manager->GetCpuAddr() + offset, size, func);
+                                   manager->GetCpuAddr() + offset, size, counting_func);
                                if (!is_written) {
                                    manager->lock.unlock();
                                }
                            });
+        Common::FaultMonitor::CountUploadShape(shape_managers, shape_ranges);
         const auto t_copy = Common::FaultMonitor::Now();
         on_upload();
         const auto t_mark = Common::FaultMonitor::Now();
