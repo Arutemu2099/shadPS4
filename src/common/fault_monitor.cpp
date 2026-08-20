@@ -73,6 +73,10 @@ std::atomic<u64> bindtex_transit_ns{0};
 std::atomic<u64> cp_wait_ns{0};
 std::atomic<u64> cp_active_ns{0};
 std::atomic<u64> dispatch_count{0};
+std::atomic<u64> cp_read_faults{0};
+std::atomic<u64> cp_read_ns{0};
+std::atomic<u64> cp_write_faults{0};
+std::atomic<u64> cp_write_ns{0};
 std::atomic<u64> dispatch_ns{0};
 std::atomic<u64> draw_pre_ns{0};
 std::atomic<u64> draw_vtxbuf_ns{0};
@@ -251,6 +255,10 @@ struct Sample {
     u64 sc_valid_ns;
     u64 sc_copy_ns;
     u64 sc_commit_ns;
+    u64 cp_read;
+    u64 cp_read_ns_v;
+    u64 cp_write;
+    u64 cp_write_ns_v;
 };
 
 Sample Read() {
@@ -332,6 +340,10 @@ Sample Read() {
         stream_valid_ns.load(std::memory_order_relaxed),
         stream_copy_ns.load(std::memory_order_relaxed),
         stream_commit_ns.load(std::memory_order_relaxed),
+        cp_read_faults.load(std::memory_order_relaxed),
+        cp_read_ns.load(std::memory_order_relaxed),
+        cp_write_faults.load(std::memory_order_relaxed),
+        cp_write_ns.load(std::memory_order_relaxed),
     };
 }
 
@@ -371,7 +383,8 @@ std::ofstream OpenCsv() {
                "d_schedbegin_us_each,d_emit_us_each,"
                "cp_wait_ms_per_frame,cp_active_ms_per_frame,disp_per_frame,disp_us_each,"
                "bt_findtex_us_each,bt_transit_us_each,"
-               "bar_calls_per_draw,bar_partial_pct,bar_iters_per_call,bar_emitted_per_call\n";
+               "bar_calls_per_draw,bar_partial_pct,bar_iters_per_call,bar_emitted_per_call,"
+               "cpfault_ms_per_frame,cpfault_pct_of_handler\n";
         csv.flush();
         LOG_INFO(Render, "FaultMonitor: rate CSV at {}", FS::PathToUTF8String(path));
     } else {
@@ -588,6 +601,17 @@ void ReportLoop() {
         const double handler_pct =
             static_cast<double>(d_read_ns + d_write_ns + d_jit_ns) / (dt * 1e9) * 100.0;
 
+        // Of that handler time, how much was billed to the command-processor thread - the one
+        // whose activity IS the frame. CP nanoseconds come off the frame; guest-thread
+        // nanoseconds run concurrently and cost nothing.
+        const u64 d_cp_ns = (cur.cp_read_ns_v - prev.cp_read_ns_v) +
+                            (cur.cp_write_ns_v - prev.cp_write_ns_v);
+        const u64 d_all_ns = d_read_ns + d_write_ns + d_jit_ns;
+        const double cpfault_ms_per_frame =
+            d_frames ? static_cast<double>(d_cp_ns) / static_cast<double>(d_frames) / 1e6 : 0.0;
+        const double cpfault_pct =
+            d_all_ns ? static_cast<double>(d_cp_ns) / static_cast<double>(d_all_ns) * 100.0 : 0.0;
+
         LOG_INFO(Render,
                  "FaultRate: t={:.0f}s fps={:.1f} read={:.0f}/s write={:.0f}/s jit={:.0f}/s "
                  "| per_frame={:.0f} read={:.2f}us write={:.2f}us handler={:.1f}% of wall "
@@ -644,7 +668,7 @@ void ReportLoop() {
                 "{:.3f},{:.3f},{:.3f},{:.3f},{:.4f},{:.3f},{:.4f},{:.3f},"
                 "{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},"
                 "{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},"
-                "{:.2f},{:.2f},{:.1f},{:.3f},{:.3f},{:.3f},{:.3f},{:.1f},{:.2f},{:.3f}\n",
+                "{:.2f},{:.2f},{:.1f},{:.3f},{:.3f},{:.3f},{:.3f},{:.1f},{:.2f},{:.3f},{:.3f},{:.1f}\n",
                 elapsed, fps, read_rate, write_rate, jit_rate, per_frame, read_us, write_us,
                 handler_pct, cur.read, cur.read_unhandled, cur.write, cur.write_unhandled, cur.jit,
                 cur.frames, cur.fragments, static_cast<double>(d_adds) / dt,
@@ -660,7 +684,7 @@ void ReportLoop() {
                 bt_sampler_us, d_pre_us, d_vtxbuf_us, d_descwrite_us, d_dynstate_us,
                 d_schedbegin_us, d_emit_us, cp_wait_ms, cp_active_ms, disp_per_frame, disp_us,
                 bt_findtex_us, bt_transit_us, bar_per_draw, bar_partial_pct, bar_iters_per_call,
-                bar_emitted_per_call);
+                bar_emitted_per_call, cpfault_ms_per_frame, cpfault_pct);
             csv.flush(); // a killed process must not lose the curve
         }
 

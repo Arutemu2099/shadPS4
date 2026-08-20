@@ -93,6 +93,8 @@ void Liverpool::ProcessCommands() {
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
     gpu_id = std::this_thread::get_id();
+    // Bill page faults taken on this thread separately: this thread's activity IS the frame.
+    Common::FaultMonitor::MarkCpThread();
 
     while (!stoken.stop_requested()) {
         {

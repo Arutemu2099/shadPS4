@@ -37,6 +37,30 @@ extern std::atomic<u64> jit_patch_ns;
 extern std::atomic<u64> presented_frames;
 
 /**
+ * Which thread pays for fault handling.
+ *
+ * Measured 2026-08-19 on the autosave scene: 54,704 write faults/s at 4.86 us each is 13.8 ms
+ * per frame, plus 4.3 ms of read faults - 18.1 ms of handler time against a 51.9 ms frame. But
+ * `handler_pct_of_wall` sums every thread, and the frame IS the command-processor thread
+ * (cp_active 51.95 of a 51.89 ms frame, cp_wait ~0). So handler time taken on the GUEST thread
+ * is concurrent and costs nothing, while the same nanoseconds on the CP thread come straight
+ * off the frame. Those two cases are indistinguishable in the aggregate and the difference
+ * decides whether attacking write faults is worth anything at all.
+ *
+ * `t_is_cp_thread` is set once by `Liverpool::Process` after it names itself. The fault handlers
+ * then bill to the CP counters or not. One TLS read on a path that already costs microseconds.
+ */
+extern std::atomic<u64> cp_read_faults;
+extern std::atomic<u64> cp_read_ns;
+extern std::atomic<u64> cp_write_faults;
+extern std::atomic<u64> cp_write_ns;
+
+inline thread_local bool t_is_cp_thread = false;
+inline void MarkCpThread() {
+    t_is_cp_thread = true;
+}
+
+/**
  * Fragmentation of `BufferCache::gpu_modified_ranges`.
  *
  * That interval set is Added to on every written buffer binding (GPU thread, per draw) and
@@ -357,6 +381,10 @@ void RecordReadFaultPage(u64 addr);
 inline void CountGuestReadFault(bool handled, u64 ns, u64 addr) {
     guest_read_faults.fetch_add(1, std::memory_order_relaxed);
     guest_read_ns.fetch_add(ns, std::memory_order_relaxed);
+    if (t_is_cp_thread) {
+        cp_read_faults.fetch_add(1, std::memory_order_relaxed);
+        cp_read_ns.fetch_add(ns, std::memory_order_relaxed);
+    }
     if (!handled) {
         guest_read_unhandled.fetch_add(1, std::memory_order_relaxed);
     }
@@ -366,6 +394,10 @@ inline void CountGuestReadFault(bool handled, u64 ns, u64 addr) {
 inline void CountGuestWriteFault(bool handled, u64 ns) {
     guest_write_faults.fetch_add(1, std::memory_order_relaxed);
     guest_write_ns.fetch_add(ns, std::memory_order_relaxed);
+    if (t_is_cp_thread) {
+        cp_write_faults.fetch_add(1, std::memory_order_relaxed);
+        cp_write_ns.fetch_add(ns, std::memory_order_relaxed);
+    }
     if (!handled) {
         guest_write_unhandled.fetch_add(1, std::memory_order_relaxed);
     }
