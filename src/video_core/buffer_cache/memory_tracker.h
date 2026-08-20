@@ -101,6 +101,41 @@ public:
         return enabled;
     }
 
+    /**
+     * Direct-mapped memo of "this exact range was entirely clean at epoch E".
+     *
+     * SynchronizeBuffer runs 7.87x per draw - ~49,400 times a frame - and the same bindings repeat
+     * across draws, so the same question is asked over and over. 99.6% of the answers are "nothing
+     * modified". g_dirty_epoch makes caching that answer sound: it is bumped whenever ANY region is
+     * marked dirty, so an unchanged epoch proves no page anywhere became dirty since the check.
+     *
+     * Direct-mapped and fixed size so a lookup is a hash and one compare - a map would cost more
+     * than the scan it replaces. A collision or a stale entry costs only a redundant scan; it can
+     * never produce a false "clean", because the epoch is compared on every hit.
+     */
+    static constexpr size_t CLEAN_MEMO_SIZE = 8192;
+    struct CleanMemoEntry {
+        VAddr addr;
+        u64 size;
+        u64 epoch;
+    };
+
+    bool MemoSaysClean(VAddr addr, u64 size, u64 epoch) const {
+        const auto& e = clean_memo[MemoSlot(addr, size)];
+        return e.epoch == epoch && e.addr == addr && e.size == size;
+    }
+
+    void MemoRecordClean(VAddr addr, u64 size, u64 epoch) {
+        clean_memo[MemoSlot(addr, size)] = {addr, size, epoch};
+    }
+
+    static size_t MemoSlot(VAddr addr, u64 size) {
+        u64 h = addr * 0x9E3779B97F4A7C15ULL;
+        h ^= size * 0xC2B2AE3D27D4EB4FULL;
+        h ^= h >> 29;
+        return static_cast<size_t>(h % CLEAN_MEMO_SIZE);
+    }
+
     void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, bool is_written, auto&& func,
                             auto&& on_upload) {
         // Three phases with very different costs - scan is bitset work, mark can reach a
@@ -129,7 +164,15 @@ public:
         // instead of 11 pointer chases. Measured 2026-08-19: queries average 41 MB and 99.6% of
         // them find nothing, so this is the common case by a wide margin. !is_written only, for
         // the same lock-pairing reason as below.
+        const u64 epoch = g_dirty_epoch.load(std::memory_order_acquire);
+        if (clean_skip && MemoSaysClean(query_cpu_range, query_size, epoch)) {
+            on_upload();
+            Common::FaultMonitor::CountUploadShape(0, 0, 0, query_size);
+            Common::FaultMonitor::CountUploadMemoHit();
+            return;
+        }
         if (clean_skip && AllRegionsSkippable(query_cpu_range, query_size)) {
+            MemoRecordClean(query_cpu_range, query_size, epoch);
             on_upload();
             Common::FaultMonitor::CountUploadShape(0, 0, 0, query_size);
             Common::FaultMonitor::CountUploadFastPath();
@@ -150,6 +193,16 @@ public:
                                    manager->lock.unlock();
                                }
                            });
+        // A walk that found nothing is exactly as memoisable as the fast path, and this is where
+        // the cost actually is: up_ranges_per_call is 0.008, so the walking calls almost always
+        // find nothing either. A region is flagged dirty when ANY page in its 4 MB is dirty, while
+        // the query may not touch that page - so a call can walk 11 regions, take a lock, and
+        // still find zero modified ranges in its own range. Sound for the same reason as above:
+        // no ranges found, and the epoch read BEFORE the walk still current, means still clean.
+        // If dirt landed mid-walk the epoch has moved and the record simply never hits.
+        if (clean_skip && shape_ranges == 0) {
+            MemoRecordClean(query_cpu_range, query_size, epoch);
+        }
         Common::FaultMonitor::CountUploadShape(shape_managers, shape_ranges, shape_skipped,
                                                query_size);
         const auto t_copy = Common::FaultMonitor::Now();
@@ -275,6 +328,7 @@ private:
     /// One bit per 4 MB region: set means "exists and entirely clean", i.e. skippable. 32 KB for
     /// the whole 40-bit space. Maintained by RegionManager under its lock, read without it.
     std::array<std::atomic<u64>, NUM_HIGH_PAGES / 64> skippable{};
+    std::array<CleanMemoEntry, CLEAN_MEMO_SIZE> clean_memo{};
 };
 
 } // namespace VideoCore

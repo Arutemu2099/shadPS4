@@ -207,9 +207,16 @@ extern std::atomic<u64> upload_skipped;
 extern std::atomic<u64> upload_bytes;
 extern std::atomic<u64> upload_fastpath;
 
+extern std::atomic<u64> upload_memohit;
+
 /// Calls that skipped the whole scan on the coarse skippable bitmap, touching no RegionManager.
 inline void CountUploadFastPath() {
     upload_fastpath.fetch_add(1, std::memory_order_relaxed);
+}
+
+/// Calls answered straight out of the clean memo - no bitmap read, no region walk at all.
+inline void CountUploadMemoHit() {
+    upload_memohit.fetch_add(1, std::memory_order_relaxed);
 }
 
 inline void CountUploadShape(u64 managers, u64 ranges, u64 skipped, u64 bytes) {
@@ -393,13 +400,37 @@ extern std::atomic<u64> renderframe_count;
  */
 using Clock = std::chrono::steady_clock;
 
+/**
+ * Compile the phase timers out. Every number in the 2026-08-19 session came from a build carrying
+ * these, and ForEachUploadRange alone does three Clock::now() calls x ~49,400 invocations per
+ * frame - ~148,000 clock reads, before the draw-path timers on top. steady_clock::now() on Windows
+ * is a QueryPerformanceCounter, tens of nanoseconds each.
+ *
+ * With this at 0 the timers become no-ops and the phase columns read zero, but the COUNTERS stay
+ * live - fps, draws, faults, and the shape counters still report, because those are increments
+ * rather than clock reads. So a stripped build is still measurable for framerate, just not for the
+ * breakdown. This is what a build handed over for actually playing should use.
+ */
+#ifndef SHADPS4_FAULT_TIMERS
+#define SHADPS4_FAULT_TIMERS 0
+#endif
+
 inline Clock::time_point Now() {
+#if SHADPS4_FAULT_TIMERS
     return Clock::now();
+#else
+    return Clock::time_point{};
+#endif
 }
 
 inline u64 SinceNs(Clock::time_point start) {
+#if SHADPS4_FAULT_TIMERS
     return static_cast<u64>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
+#else
+    (void)start;
+    return 0;
+#endif
 }
 
 /// Elapsed between two already-taken timestamps, so a split measurement costs one clock read at

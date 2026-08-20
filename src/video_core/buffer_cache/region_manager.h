@@ -32,6 +32,17 @@ using LockType = Common::SpinLock;
  * Allows tracking CPU and GPU modification of pages in a contigious 16MB virtual address region.
  * Information is stored in bitsets for spacial locality and fast update of single pages.
  */
+/**
+ * Bumped whenever ANY region transitions to possibly-dirty. This is the invalidation signal that
+ * makes a clean-result memo sound: if a range was verified clean at epoch E and the epoch still
+ * reads E, nothing anywhere has been marked dirty since, so that range is still clean.
+ *
+ * Deliberately global and therefore conservative - dirt in an unrelated region invalidates every
+ * memo. A per-region epoch would hit more often and is the obvious next step if the hit rate
+ * measures poorly, but it costs a range-max lookup per query, which is the thing being avoided.
+ */
+inline std::atomic<u64> g_dirty_epoch{1};
+
 class RegionManager {
 public:
     explicit RegionManager(PageManager* tracker_, VAddr cpu_addr_)
@@ -261,6 +272,7 @@ private:
     /// coarse bit must stop advertising skippability before the fine flag admits dirt, and both
     /// must precede the bits themselves.
     void MarkDirty() {
+        g_dirty_epoch.fetch_add(1, std::memory_order_release);
         if (summary_word) {
             summary_word->fetch_and(~summary_mask, std::memory_order_release);
         }
