@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdlib>
 #include <deque>
 #include <mutex>
 #include <type_traits>
@@ -90,6 +91,16 @@ public:
     }
 
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
+    /// SHADPS4_UPLOAD_CLEAN_SKIP=0 disables the pre-lock skip, so the fix can be A/B'd against
+    /// itself in one binary. Default on.
+    static bool CleanSkipEnabled() {
+        static const bool enabled = [] {
+            const char* env = std::getenv("SHADPS4_UPLOAD_CLEAN_SKIP");
+            return env == nullptr || std::atoi(env) != 0;
+        }();
+        return enabled;
+    }
+
     void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, bool is_written, auto&& func,
                             auto&& on_upload) {
         // Three phases with very different costs - scan is bitset work, mark can reach a
@@ -99,14 +110,29 @@ public:
         // CountUploadShape in fault_monitor.h for why this is counted and not timed.
         u64 shape_managers = 0;
         u64 shape_ranges = 0;
+        u64 shape_skipped = 0;
         const auto counting_func = [&func, &shape_ranges](u64 addr, u64 size) {
             ++shape_ranges;
             func(addr, size);
         };
+        // Measured 2026-08-19: 99.63% of these calls find zero modified ranges while visiting
+        // 11.24 region managers each - ~555,000 lock-and-scan visits per frame to find ~400
+        // ranges, 9.5 ms of a 52 ms frame. The AnyInRange early-out from ed9979cb sits INSIDE
+        // ForEachModifiedRange, after the lock is already taken, so it cannot remove the lock.
+        // The summary flag can, and is read without it - see RegionManager::MayHaveCpuModified.
+        //
+        // Only on the !is_written path: when is_written the lock is taken here and released in
+        // the second IteratePages below, so skipping would unbalance it. That costs almost
+        // nothing - is_written is 4.5% of calls.
+        const bool clean_skip = CleanSkipEnabled() && !is_written;
         IteratePages<true>(query_cpu_range, query_size,
-                           [&counting_func, &shape_managers, is_written](RegionManager* manager,
-                                                                        u64 offset, size_t size) {
+                           [&counting_func, &shape_managers, &shape_skipped, clean_skip,
+                            is_written](RegionManager* manager, u64 offset, size_t size) {
                                ++shape_managers;
+                               if (clean_skip && !manager->MayHaveCpuModified()) {
+                                   ++shape_skipped;
+                                   return;
+                               }
                                manager->lock.lock();
                                manager->template ForEachModifiedRange<Type::CPU, true>(
                                    manager->GetCpuAddr() + offset, size, counting_func);
@@ -114,7 +140,8 @@ public:
                                    manager->lock.unlock();
                                }
                            });
-        Common::FaultMonitor::CountUploadShape(shape_managers, shape_ranges);
+        Common::FaultMonitor::CountUploadShape(shape_managers, shape_ranges, shape_skipped,
+                                               query_size);
         const auto t_copy = Common::FaultMonitor::Now();
         on_upload();
         const auto t_mark = Common::FaultMonitor::Now();

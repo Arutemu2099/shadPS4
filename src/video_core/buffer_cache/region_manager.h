@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "common/div_ceil.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
@@ -40,6 +42,23 @@ public:
         readable.Fill();
     }
     explicit RegionManager() = default;
+
+    /**
+     * True if this region may have any CPU-modified page. Read WITHOUT the region lock, so it is
+     * deliberately conservative: a stale `true` only costs the caller the work it would have done
+     * anyway, while a stale `false` would skip a real upload and render stale geometry.
+     *
+     * False therefore has to imply "the cpu bitset was empty". That holds because the bitset has
+     * exactly two mutators, `ChangeRegionState<Type::CPU>` and `ForEachModifiedRange`, both under
+     * the region lock, and both maintain this flag: it is raised BEFORE bits are set (so a reader
+     * seeing false cannot be racing a set that already happened), and lowered only after observing
+     * `None()` on the whole region.
+     *
+     * Starts true because the constructor does `cpu.Fill()` - a fresh region is entirely dirty.
+     */
+    bool MayHaveCpuModified() const noexcept {
+        return any_cpu.load(std::memory_order_acquire);
+    }
 
     void SetCpuAddress(VAddr new_cpu_addr) {
         cpu_addr = new_cpu_addr;
@@ -90,9 +109,19 @@ public:
 
         RegionBits& bits = GetRegionBits<type>();
         if constexpr (enable) {
+            if constexpr (type == Type::CPU) {
+                // Raise the summary BEFORE the bits, so a lock-free reader can never observe
+                // false while a set that precedes it in program order has already landed.
+                any_cpu.store(true, std::memory_order_release);
+            }
             bits.SetRange(start_page, end_page);
         } else {
             bits.UnsetRange(start_page, end_page);
+            if constexpr (type == Type::CPU) {
+                if (bits.None()) {
+                    any_cpu.store(false, std::memory_order_release);
+                }
+            }
         }
         if constexpr (type == Type::CPU) {
             UpdateProtection<!enable, false>();
@@ -145,6 +174,9 @@ public:
         if constexpr (clear) {
             bits.UnsetRange(start_page, end_page);
             if constexpr (type == Type::CPU) {
+                if (bits.None()) {
+                    any_cpu.store(false, std::memory_order_release);
+                }
                 UpdateProtection<true, false>();
             } else if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled) {
                 UpdateProtection<false, true>();
@@ -211,6 +243,8 @@ private:
 
     PageManager* tracker;
     VAddr cpu_addr = 0;
+    // Conservative summary of `cpu`, readable without the lock. See MayHaveCpuModified().
+    std::atomic<bool> any_cpu{true};
     RegionBits cpu;
     RegionBits gpu;
     RegionBits writeable;

@@ -203,11 +203,15 @@ extern std::atomic<u64> upload_calls;
 extern std::atomic<u64> upload_empty_calls;
 extern std::atomic<u64> upload_managers;
 extern std::atomic<u64> upload_ranges;
+extern std::atomic<u64> upload_skipped;
+extern std::atomic<u64> upload_bytes;
 
-inline void CountUploadShape(u64 managers, u64 ranges) {
+inline void CountUploadShape(u64 managers, u64 ranges, u64 skipped, u64 bytes) {
     upload_calls.fetch_add(1, std::memory_order_relaxed);
     upload_managers.fetch_add(managers, std::memory_order_relaxed);
     upload_ranges.fetch_add(ranges, std::memory_order_relaxed);
+    upload_skipped.fetch_add(skipped, std::memory_order_relaxed);
+    upload_bytes.fetch_add(bytes, std::memory_order_relaxed);
     if (ranges == 0) {
         upload_empty_calls.fetch_add(1, std::memory_order_relaxed);
     }
