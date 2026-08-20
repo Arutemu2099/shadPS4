@@ -205,6 +205,12 @@ extern std::atomic<u64> upload_managers;
 extern std::atomic<u64> upload_ranges;
 extern std::atomic<u64> upload_skipped;
 extern std::atomic<u64> upload_bytes;
+extern std::atomic<u64> upload_fastpath;
+
+/// Calls that skipped the whole scan on the coarse skippable bitmap, touching no RegionManager.
+inline void CountUploadFastPath() {
+    upload_fastpath.fetch_add(1, std::memory_order_relaxed);
+}
 
 inline void CountUploadShape(u64 managers, u64 ranges, u64 skipped, u64 bytes) {
     upload_calls.fetch_add(1, std::memory_order_relaxed);

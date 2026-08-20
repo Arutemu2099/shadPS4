@@ -83,6 +83,7 @@ std::atomic<u64> upload_managers{0};
 std::atomic<u64> upload_ranges{0};
 std::atomic<u64> upload_skipped{0};
 std::atomic<u64> upload_bytes{0};
+std::atomic<u64> upload_fastpath{0};
 std::atomic<u64> dispatch_ns{0};
 std::atomic<u64> draw_pre_ns{0};
 std::atomic<u64> draw_vtxbuf_ns{0};
@@ -271,6 +272,7 @@ struct Sample {
     u64 up_ranges;
     u64 up_skipped;
     u64 up_bytes;
+    u64 up_fastpath;
 };
 
 Sample Read() {
@@ -362,6 +364,7 @@ Sample Read() {
         upload_ranges.load(std::memory_order_relaxed),
         upload_skipped.load(std::memory_order_relaxed),
         upload_bytes.load(std::memory_order_relaxed),
+        upload_fastpath.load(std::memory_order_relaxed),
     };
 }
 
@@ -404,7 +407,8 @@ std::ofstream OpenCsv() {
                "bar_calls_per_draw,bar_partial_pct,bar_iters_per_call,bar_emitted_per_call,"
                "cpfault_ms_per_frame,cpfault_pct_of_handler,"
                "up_empty_pct,up_managers_per_call,up_ranges_per_call,"
-               "up_skipped_pct,up_kb_per_call\n";
+               "up_skipped_pct,up_kb_per_call,"
+               "up_fastpath_pct\n";
         csv.flush();
         LOG_INFO(Render, "FaultMonitor: rate CSV at {}", FS::PathToUTF8String(path));
     } else {
@@ -655,6 +659,11 @@ void ReportLoop() {
             d_up_calls ? static_cast<double>(cur.up_bytes - prev.up_bytes) /
                              static_cast<double>(d_up_calls) / 1024.0
                        : 0.0;
+        const u64 d_up_fast = cur.up_fastpath - prev.up_fastpath;
+        const double up_fastpath_pct =
+            (d_up_calls + d_up_fast) ? static_cast<double>(d_up_fast) /
+                                           static_cast<double>(d_up_calls + d_up_fast) * 100.0
+                                     : 0.0;
 
         LOG_INFO(Render,
                  "FaultRate: t={:.0f}s fps={:.1f} read={:.0f}/s write={:.0f}/s jit={:.0f}/s "
@@ -712,7 +721,7 @@ void ReportLoop() {
                 "{:.3f},{:.3f},{:.3f},{:.3f},{:.4f},{:.3f},{:.4f},{:.3f},"
                 "{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},"
                 "{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},"
-                "{:.2f},{:.2f},{:.1f},{:.3f},{:.3f},{:.3f},{:.3f},{:.1f},{:.2f},{:.3f},{:.3f},{:.1f},{:.2f},{:.3f},{:.3f},{:.2f},{:.1f}\n",
+                "{:.2f},{:.2f},{:.1f},{:.3f},{:.3f},{:.3f},{:.3f},{:.1f},{:.2f},{:.3f},{:.3f},{:.1f},{:.2f},{:.3f},{:.3f},{:.2f},{:.1f},{:.2f}\n",
                 elapsed, fps, read_rate, write_rate, jit_rate, per_frame, read_us, write_us,
                 handler_pct, cur.read, cur.read_unhandled, cur.write, cur.write_unhandled, cur.jit,
                 cur.frames, cur.fragments, static_cast<double>(d_adds) / dt,
@@ -729,7 +738,7 @@ void ReportLoop() {
                 d_schedbegin_us, d_emit_us, cp_wait_ms, cp_active_ms, disp_per_frame, disp_us,
                 bt_findtex_us, bt_transit_us, bar_per_draw, bar_partial_pct, bar_iters_per_call,
                 bar_emitted_per_call, cpfault_ms_per_frame, cpfault_pct, up_empty_pct,
-                up_managers_per_call, up_ranges_per_call, up_skipped_pct, up_kb_per_call);
+                up_managers_per_call, up_ranges_per_call, up_skipped_pct, up_kb_per_call, up_fastpath_pct);
             csv.flush(); // a killed process must not lose the curve
         }
 

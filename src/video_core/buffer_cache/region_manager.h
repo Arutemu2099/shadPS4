@@ -60,6 +60,20 @@ public:
         return any_cpu.load(std::memory_order_acquire);
     }
 
+    /**
+     * Point this region at its bit in the tracker's skippable-region summary. The bit means
+     * "this region exists AND its cpu bitset is empty", so it is only ever SET from a state we
+     * have just observed clean, and CLEARED before any bit is set - same ordering discipline as
+     * any_cpu, one level up. A region with no manager has no bit, which reads as not-skippable,
+     * which is the safe default (that page still has to be visited so it can be created).
+     */
+    void SetSummarySlot(std::atomic<u64>* word, u64 mask) {
+        summary_word = word;
+        summary_mask = mask;
+        // A fresh region is entirely dirty (cpu.Fill()), so it starts not-skippable.
+        summary_word->fetch_and(~summary_mask, std::memory_order_release);
+    }
+
     void SetCpuAddress(VAddr new_cpu_addr) {
         cpu_addr = new_cpu_addr;
     }
@@ -112,14 +126,14 @@ public:
             if constexpr (type == Type::CPU) {
                 // Raise the summary BEFORE the bits, so a lock-free reader can never observe
                 // false while a set that precedes it in program order has already landed.
-                any_cpu.store(true, std::memory_order_release);
+                MarkDirty();
             }
             bits.SetRange(start_page, end_page);
         } else {
             bits.UnsetRange(start_page, end_page);
             if constexpr (type == Type::CPU) {
                 if (bits.None()) {
-                    any_cpu.store(false, std::memory_order_release);
+                    MarkClean();
                 }
             }
         }
@@ -175,7 +189,7 @@ public:
             bits.UnsetRange(start_page, end_page);
             if constexpr (type == Type::CPU) {
                 if (bits.None()) {
-                    any_cpu.store(false, std::memory_order_release);
+                    MarkClean();
                 }
                 UpdateProtection<true, false>();
             } else if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled) {
@@ -243,6 +257,26 @@ private:
 
     PageManager* tracker;
     VAddr cpu_addr = 0;
+    /// Raise the per-region flag and drop the tracker-wide skippable bit. Order matters: the
+    /// coarse bit must stop advertising skippability before the fine flag admits dirt, and both
+    /// must precede the bits themselves.
+    void MarkDirty() {
+        if (summary_word) {
+            summary_word->fetch_and(~summary_mask, std::memory_order_release);
+        }
+        any_cpu.store(true, std::memory_order_release);
+    }
+
+    /// Called only after observing None() over the whole region, under the region lock.
+    void MarkClean() {
+        any_cpu.store(false, std::memory_order_release);
+        if (summary_word) {
+            summary_word->fetch_or(summary_mask, std::memory_order_release);
+        }
+    }
+
+    std::atomic<u64>* summary_word{nullptr};
+    u64 summary_mask{0};
     // Conservative summary of `cpu`, readable without the lock. See MayHaveCpuModified().
     std::atomic<bool> any_cpu{true};
     RegionBits cpu;
