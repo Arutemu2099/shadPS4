@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <string>
 #include <unordered_set>
 
@@ -25,6 +26,74 @@
 #endif
 
 namespace Vulkan {
+
+// Shape-only diagnostic; enable for one run, then compile it out for FPS comparisons.
+#ifndef SHADPS4_BINDING_PROBE
+#define SHADPS4_BINDING_PROBE 0
+#endif
+#if SHADPS4_BINDING_PROBE
+static void ProbeBindingChanges(const Pipeline* pipeline) {
+    if (pipeline->IsCompute()) {
+        return;
+    }
+    struct PreviousStage {
+        const Shader::Info* info{};
+        size_t num_buffers{}, num_images{};
+        std::array<AmdGpu::Buffer, Shader::NUM_BUFFERS> buffers{};
+        std::array<AmdGpu::Image, Shader::NUM_IMAGES> images{};
+    };
+    static std::array<PreviousStage, Shader::MaxStageTypes> previous{};
+    static u64 draws{}, stages{}, same_program{}, buffers{}, same_buffers{}, special{}, images{},
+        same_images{}, written{};
+    ++draws;
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        auto& prev = previous[static_cast<u32>(stage->l_stage)];
+        ++stages;
+        same_program += prev.info == stage;
+        size_t i = 0;
+        for (const auto& desc : stage->buffers) {
+            const auto sharp = desc.GetSharp(*stage);
+            if (desc.IsSpecial()) {
+                ++special;
+            } else {
+                ++buffers;
+                written += desc.is_written;
+                same_buffers += prev.info && i < prev.num_buffers &&
+                                std::memcmp(&sharp, &prev.buffers[i], sizeof(sharp)) == 0;
+            }
+            prev.buffers[i++] = sharp;
+        }
+        prev.num_buffers = i;
+        i = 0;
+        for (const auto& desc : stage->images) {
+            const auto sharp = desc.GetSharp(*stage);
+            ++images;
+            same_images += prev.info && i < prev.num_images &&
+                           std::memcmp(&sharp, &prev.images[i], sizeof(sharp)) == 0;
+            prev.images[i++] = sharp;
+        }
+        prev.num_images = i;
+        prev.info = stage;
+    }
+    if (draws >= 200000) {
+        LOG_INFO(Render_Vulkan,
+                 "BindingChanges: draws={} buffers/draw={:.2f} raw_same_buffers={:.1f}% "
+                 "special/draw={:.2f} written_buffers={:.1f}% images/draw={:.2f} "
+                 "raw_same_images={:.1f}% same_stage_program={:.1f}%",
+                 draws, double(buffers) / draws, buffers ? 100.0 * same_buffers / buffers : 0.0,
+                 double(special) / draws, buffers ? 100.0 * written / buffers : 0.0,
+                 double(images) / draws, images ? 100.0 * same_images / images : 0.0,
+                 stages ? 100.0 * same_program / stages : 0.0);
+        draws = stages = same_program = buffers = same_buffers = special = images = same_images =
+            written = 0;
+    }
+    // Equal descriptors do not prove equal contents or cache state. This probe
+    // never skips synchronization, resource lookup, barriers, or descriptor writes.
+}
+#endif
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -450,6 +519,10 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         return false;
     }
 
+#if SHADPS4_BINDING_PROBE
+    ProbeBindingChanges(pipeline);
+#endif
+
     set_write_index = 0;
     set_writes.clear();
     buffer_barriers.clear();
@@ -769,7 +842,16 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
     const auto t_findimage = Common::FaultMonitor::Now();
 
-    for (const auto& image_desc : stage.images) {
+    static const bool cache_decoded_images = [] {
+        const char* value = std::getenv("SHADPS4_DECODE_IMAGE_CACHE");
+        return !value || value[0] != '0';
+    }();
+    static const bool verify_decoded_images = [] {
+        const char* value = std::getenv("SHADPS4_DECODE_IMAGE_VERIFY");
+        return value && value[0] == '1';
+    }();
+    for (size_t image_slot = 0; image_slot < stage.images.size(); ++image_slot) {
+        const auto& image_desc = stage.images[image_slot];
         const auto tsharp = image_desc.GetSharp(stage);
         if (texture_cache.IsMeta(tsharp.Address())) {
             LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
@@ -784,9 +866,58 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
         const u32 num_bindings = image_desc.NumBindings(stage);
 
+        const VideoCore::TextureCache::ImageDesc* decoded = nullptr;
+        if (cache_decoded_images) {
+            auto& entry = decoded_image_descs[static_cast<u32>(stage.l_stage)][image_slot];
+            // These are the only ImageResource fields read by the ImageInfo and
+            // ImageViewInfo constructors. Neo mode is fixed for the guest process.
+            // Cache only the pure descriptor decode, before FindImage modifies its
+            // view range. Image IDs, contents, bindings and barriers remain live.
+            const u8 flags =
+                image_desc.is_depth | (image_desc.is_array << 1) | (image_desc.is_written << 2);
+            const bool hit = entry.valid && entry.flags == flags &&
+                             std::memcmp(&entry.sharp, &tsharp, sizeof(tsharp)) == 0;
+            if (!hit) {
+                entry.sharp = tsharp;
+                entry.flags = flags;
+                entry.value = VideoCore::TextureCache::ImageDesc{tsharp, image_desc};
+                entry.valid = true;
+            }
+            decoded = &entry.value;
+            if (verify_decoded_images) {
+                const VideoCore::TextureCache::ImageDesc reference{tsharp, image_desc};
+                const auto& a = entry.value.info;
+                const auto& b = reference.info;
+                ASSERT(entry.value.type == reference.type &&
+                       entry.value.view_info == reference.view_info &&
+                       a.pixel_format == b.pixel_format && a.type == b.type &&
+                       a.resources == b.resources && a.size == b.size && a.num_bits == b.num_bits &&
+                       a.num_samples == b.num_samples && a.pitch == b.pitch &&
+                       a.tile_mode == b.tile_mode && a.array_mode == b.array_mode &&
+                       a.guest_address == b.guest_address && a.guest_size == b.guest_size &&
+                       a.bank_swizzle == b.bank_swizzle && a.alt_tile == b.alt_tile &&
+                       a.props.is_depth == b.props.is_depth &&
+                       a.props.is_block == b.props.is_block && a.props.is_pow2 == b.props.is_pow2 &&
+                       a.props.is_volume == b.props.is_volume &&
+                       a.props.is_tiled == b.props.is_tiled);
+                ASSERT(std::memcmp(a.mips_layout.data(), b.mips_layout.data(),
+                                   a.resources.levels * sizeof(VideoCore::ImageInfo::MipInfo)) ==
+                       0);
+                static u64 calls{}, hits{};
+                hits += hit;
+                if (++calls >= 500000) {
+                    LOG_INFO(Render_Vulkan, "DecodeImageVerify: calls={} hits={} ({:.1f}%)", calls,
+                             hits, 100.0 * hits / calls);
+                    calls = hits = 0;
+                }
+            }
+        }
+
         for (auto i = 0; i < num_bindings; i++) {
-            auto& [image_id, desc] = image_bindings.emplace_back(
-                std::piecewise_construct, std::tuple{}, std::tuple{tsharp, image_desc});
+            auto& [image_id, desc] =
+                decoded ? image_bindings.emplace_back(VideoCore::ImageId{}, *decoded)
+                        : image_bindings.emplace_back(std::piecewise_construct, std::tuple{},
+                                                      std::tuple{tsharp, image_desc});
 
             if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
                 ASSERT(num_bindings == 1);

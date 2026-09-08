@@ -145,6 +145,14 @@ private:
     boost::container::static_vector<BufferBindingInfo, Shader::NUM_BUFFERS> buffer_bindings;
     using ImageBindingInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
+    struct DecodedImageDesc {
+        AmdGpu::Image sharp{};
+        u8 flags{};
+        bool valid{};
+        VideoCore::TextureCache::ImageDesc value{};
+    };
+    std::array<std::array<DecodedImageDesc, Shader::NUM_IMAGES>, Shader::MaxStageTypes>
+        decoded_image_descs{};
     bool fault_process_pending{};
     bool attachment_feedback_loop{};
 
