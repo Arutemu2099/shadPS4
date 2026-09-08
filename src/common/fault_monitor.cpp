@@ -758,7 +758,10 @@ void ReportLoop() {
 
 // Joined at static destruction, which requests the stop and wakes the thread immediately.
 struct Reporter {
-    Reporter() : thread(ReportLoop) {}
+    Reporter() : thread(ReportLoop) {
+        LOG_INFO(Render, "FaultMonitor: timers={} details={} (disabled columns are unavailable)",
+                 SHADPS4_FAULT_TIMERS != 0, DetailCountersEnabled);
+    }
     ~Reporter() {
         {
             std::scoped_lock lk(stop_mutex);

@@ -320,8 +320,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::ClearState: {
                 regs.SetDefaults();
-                ++regs_generation;
-                ++regs_generation_ctx;
+                if constexpr (Common::FaultMonitor::DetailCountersEnabled) {
+                    ++regs_generation;
+                    ++regs_generation_ctx;
+                }
                 break;
             }
             case PM4ItOpcode::SetConfigReg: {
@@ -329,11 +331,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto reg_addr = Regs::ConfigRegWordOffset + set_data->reg_offset;
                 const auto* payload = reinterpret_cast<const u32*>(header + 2);
                 const auto sz = (count - 1) * sizeof(u32);
-                if (std::memcmp(&regs.reg_array[reg_addr], payload, sz) != 0) {
+                if (Common::FaultMonitor::DetailCountersEnabled &&
+                    std::memcmp(&regs.reg_array[reg_addr], payload, sz) != 0) {
                     ++regs_generation_ctx; // value-aware: only a real change dirties the key
                 }
                 std::memcpy(&regs.reg_array[reg_addr], payload, sz);
-                ++regs_generation;
+                if constexpr (Common::FaultMonitor::DetailCountersEnabled) { ++regs_generation; }
                 break;
             }
             case PM4ItOpcode::SetContextReg: {
@@ -342,11 +345,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* payload = reinterpret_cast<const u32*>(header + 2);
 
                 const auto ctx_sz = (count - 1) * sizeof(u32);
-                if (std::memcmp(&regs.reg_array[reg_addr], payload, ctx_sz) != 0) {
+                if (Common::FaultMonitor::DetailCountersEnabled &&
+                    std::memcmp(&regs.reg_array[reg_addr], payload, ctx_sz) != 0) {
                     ++regs_generation_ctx; // value-aware: only a real change dirties the key
                 }
                 std::memcpy(&regs.reg_array[reg_addr], payload, ctx_sz);
-                ++regs_generation;
+                if constexpr (Common::FaultMonitor::DetailCountersEnabled) { ++regs_generation; }
 
                 // In the case of HW, render target memory has alignment as color block operates on
                 // tiles. There is no information of actual resource extents stored in CB context
@@ -427,7 +431,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 } else {
                     std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
                                 header + 2, set_size);
-                    ++regs_generation;
+                    if constexpr (Common::FaultMonitor::DetailCountersEnabled) { ++regs_generation; }
                 }
                 break;
             }
@@ -435,11 +439,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
                 const auto uc_addr = Regs::UconfigRegWordOffset + set_data->reg_offset;
                 const auto uc_sz = (count - 1) * sizeof(u32);
-                if (std::memcmp(&regs.reg_array[uc_addr], header + 2, uc_sz) != 0) {
+                if (Common::FaultMonitor::DetailCountersEnabled &&
+                    std::memcmp(&regs.reg_array[uc_addr], header + 2, uc_sz) != 0) {
                     ++regs_generation_ctx; // value-aware: only a real change dirties the key
                 }
                 std::memcpy(&regs.reg_array[uc_addr], header + 2, uc_sz);
-                ++regs_generation;
+                if constexpr (Common::FaultMonitor::DetailCountersEnabled) { ++regs_generation; }
                 break;
             }
             case PM4ItOpcode::SetPredication: {

@@ -338,7 +338,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     const auto t_probe1 = Common::FaultMonitor::Now();
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     const auto t_probe2 = Common::FaultMonitor::Now();
-    {
+    if constexpr (Common::FaultMonitor::DetailCountersEnabled) {
         static GraphicsPipelineKey probe_last_key{};
         static u64 probe_last_gen = 0;
         static bool probe_have_last = false;
@@ -524,7 +524,7 @@ bool PipelineCache::RefreshGraphicsKey() {
         }
     }
 
-    {
+    if constexpr (Common::FaultMonitor::DetailCountersEnabled || SHADPS4_FAULT_TIMERS) {
         static u64 rgk_calls = 0, rgk_pre = 0, rgk_stages = 0, rgk_post = 0;
         const auto rgk_t3 = Common::FaultMonitor::Now();
         rgk_pre += Common::FaultMonitor::DiffNs(rgk_t0, rgk_t1);

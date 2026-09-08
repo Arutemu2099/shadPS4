@@ -7,6 +7,13 @@
 #include <chrono>
 #include "common/types.h"
 
+#ifndef SHADPS4_FAULT_TIMERS
+#define SHADPS4_FAULT_TIMERS 0
+#endif
+#ifndef SHADPS4_FAULT_DETAILS
+#define SHADPS4_FAULT_DETAILS SHADPS4_FAULT_TIMERS
+#endif
+
 /**
  * Periodic reporting of handled-fault rates against presented frames.
  *
@@ -24,6 +31,11 @@
  * single readable line rather than a correlation across two instruments.
  */
 namespace Common::FaultMonitor {
+
+// Detailed binding/barrier probes can perform several atomic operations per
+// resource. Keep FPS, draw, dispatch and fault counts available in play builds,
+// but make the high-frequency diagnostic work opt-in, independently of timers.
+inline constexpr bool DetailCountersEnabled = SHADPS4_FAULT_DETAILS != 0;
 
 // Incremented on the faulting thread; relaxed ordering, never read there.
 extern std::atomic<u64> guest_read_faults;
@@ -211,15 +223,24 @@ extern std::atomic<u64> upload_memohit;
 
 /// Calls that skipped the whole scan on the coarse skippable bitmap, touching no RegionManager.
 inline void CountUploadFastPath() {
+    if constexpr (!DetailCountersEnabled) {
+        return;
+    }
     upload_fastpath.fetch_add(1, std::memory_order_relaxed);
 }
 
 /// Calls answered straight out of the clean memo - no bitmap read, no region walk at all.
 inline void CountUploadMemoHit() {
+    if constexpr (!DetailCountersEnabled) {
+        return;
+    }
     upload_memohit.fetch_add(1, std::memory_order_relaxed);
 }
 
 inline void CountUploadShape(u64 managers, u64 ranges, u64 skipped, u64 bytes) {
+    if constexpr (!DetailCountersEnabled) {
+        return;
+    }
     upload_calls.fetch_add(1, std::memory_order_relaxed);
     upload_managers.fetch_add(managers, std::memory_order_relaxed);
     upload_ranges.fetch_add(ranges, std::memory_order_relaxed);
@@ -406,14 +427,22 @@ using Clock = std::chrono::steady_clock;
  * frame - ~148,000 clock reads, before the draw-path timers on top. steady_clock::now() on Windows
  * is a QueryPerformanceCounter, tens of nanoseconds each.
  *
- * With this at 0 the timers become no-ops and the phase columns read zero, but the COUNTERS stay
- * live - fps, draws, faults, and the shape counters still report, because those are increments
- * rather than clock reads. So a stripped build is still measurable for framerate, just not for the
- * breakdown. This is what a build handed over for actually playing should use.
+ * With timers at 0, both clock reads and atomic time accumulation compile out. FPS, draws,
+ * dispatches and faults remain live. Detailed upload/barrier/obtain counters are controlled by
+ * SHADPS4_FAULT_DETAILS (defaults to the timer setting); use DETAILS=1, TIMERS=0 for a shape-only
+ * diagnostic build. Disabled columns are unavailable, not measurements of zero work.
  */
-#ifndef SHADPS4_FAULT_TIMERS
-#define SHADPS4_FAULT_TIMERS 0
+// An atomic fetch_add(0) is still a read-modify-write operation. Disabling the
+// clock reads alone leaves these operations in every binding's hot path.
+// Compile out time accumulation too; event and shape counters remain live.
+inline void AddTime(std::atomic<u64>& counter, u64 ns) {
+#if SHADPS4_FAULT_TIMERS
+    counter.fetch_add(ns, std::memory_order_relaxed);
+#else
+    (void)counter;
+    (void)ns;
 #endif
+}
 
 inline Clock::time_point Now() {
 #if SHADPS4_FAULT_TIMERS
@@ -453,10 +482,10 @@ void RecordReadFaultPage(u64 addr);
 
 inline void CountGuestReadFault(bool handled, u64 ns, u64 addr) {
     guest_read_faults.fetch_add(1, std::memory_order_relaxed);
-    guest_read_ns.fetch_add(ns, std::memory_order_relaxed);
+    AddTime(guest_read_ns, ns);
     if (t_is_cp_thread) {
         cp_read_faults.fetch_add(1, std::memory_order_relaxed);
-        cp_read_ns.fetch_add(ns, std::memory_order_relaxed);
+        AddTime(cp_read_ns, ns);
     }
     if (!handled) {
         guest_read_unhandled.fetch_add(1, std::memory_order_relaxed);
@@ -466,10 +495,10 @@ inline void CountGuestReadFault(bool handled, u64 ns, u64 addr) {
 
 inline void CountGuestWriteFault(bool handled, u64 ns) {
     guest_write_faults.fetch_add(1, std::memory_order_relaxed);
-    guest_write_ns.fetch_add(ns, std::memory_order_relaxed);
+    AddTime(guest_write_ns, ns);
     if (t_is_cp_thread) {
         cp_write_faults.fetch_add(1, std::memory_order_relaxed);
-        cp_write_ns.fetch_add(ns, std::memory_order_relaxed);
+        AddTime(cp_write_ns, ns);
     }
     if (!handled) {
         guest_write_unhandled.fetch_add(1, std::memory_order_relaxed);
@@ -478,7 +507,7 @@ inline void CountGuestWriteFault(bool handled, u64 ns) {
 
 inline void CountJitPatchFault(u64 ns) {
     jit_patch_faults.fetch_add(1, std::memory_order_relaxed);
-    jit_patch_ns.fetch_add(ns, std::memory_order_relaxed);
+    AddTime(jit_patch_ns, ns);
 }
 
 inline void CountPresentedFrame() {
@@ -498,58 +527,61 @@ inline void CountGpuSubmit() {
 
 inline void CountWaitRegMem(u64 ns) {
     waitregmem_count.fetch_add(1, std::memory_order_relaxed);
-    waitregmem_ns.fetch_add(ns, std::memory_order_relaxed);
+    AddTime(waitregmem_ns, ns);
 }
 
 inline void CountPresentPhases(u64 acquire, u64 flush, u64 lock, u64 khr) {
-    present_acquire_ns.fetch_add(acquire, std::memory_order_relaxed);
-    present_flush_ns.fetch_add(flush, std::memory_order_relaxed);
-    present_lock_ns.fetch_add(lock, std::memory_order_relaxed);
-    present_khr_ns.fetch_add(khr, std::memory_order_relaxed);
+    AddTime(present_acquire_ns, acquire);
+    AddTime(present_flush_ns, flush);
+    AddTime(present_lock_ns, lock);
+    AddTime(present_khr_ns, khr);
 }
 
 inline void CountRenderFrame(u64 queue_ns, u64 fence_ns) {
     renderframe_count.fetch_add(1, std::memory_order_relaxed);
-    renderframe_queue_ns.fetch_add(queue_ns, std::memory_order_relaxed);
-    renderframe_fence_ns.fetch_add(fence_ns, std::memory_order_relaxed);
+    AddTime(renderframe_queue_ns, queue_ns);
+    AddTime(renderframe_fence_ns, fence_ns);
 }
 
 inline void CountPresent(u64 ns, u64 pending) {
     present_count.fetch_add(1, std::memory_order_relaxed);
-    present_ns.fetch_add(ns, std::memory_order_relaxed);
+    AddTime(present_ns, ns);
     flip_pending_total.fetch_add(pending, std::memory_order_relaxed);
 }
 
 inline void CountVoLabelWait(u64 ns) {
     volabel_count.fetch_add(1, std::memory_order_relaxed);
-    volabel_ns.fetch_add(ns, std::memory_order_relaxed);
+    AddTime(volabel_ns, ns);
 }
 
 inline void CountDraw(u64 pipeline_ns, u64 bindres_ns, u64 beginrender_ns) {
     draw_count.fetch_add(1, std::memory_order_relaxed);
-    draw_pipeline_ns.fetch_add(pipeline_ns, std::memory_order_relaxed);
-    draw_bindres_ns.fetch_add(bindres_ns, std::memory_order_relaxed);
-    draw_beginrender_ns.fetch_add(beginrender_ns, std::memory_order_relaxed);
+    AddTime(draw_pipeline_ns, pipeline_ns);
+    AddTime(draw_bindres_ns, bindres_ns);
+    AddTime(draw_beginrender_ns, beginrender_ns);
 }
 
 inline void CountFindDepthTarget(u64 ns) {
-    draw_finddepth_ns.fetch_add(ns, std::memory_order_relaxed);
+    AddTime(draw_finddepth_ns, ns);
 }
 
 inline void CountBindSplit(u64 buffers_ns, u64 textures_ns) {
-    draw_bindbuf_ns.fetch_add(buffers_ns, std::memory_order_relaxed);
-    draw_bindtex_ns.fetch_add(textures_ns, std::memory_order_relaxed);
+    AddTime(draw_bindbuf_ns, buffers_ns);
+    AddTime(draw_bindtex_ns, textures_ns);
 }
 
 inline void CountBindBufferPass(u64 find_ns, u64 obtain_ns) {
-    bindbuf_find_ns.fetch_add(find_ns, std::memory_order_relaxed);
-    bindbuf_obtain_ns.fetch_add(obtain_ns, std::memory_order_relaxed);
+    AddTime(bindbuf_find_ns, find_ns);
+    AddTime(bindbuf_obtain_ns, obtain_ns);
 }
 
 /// Early-exit path of ObtainBuffer: the GPU-modified query, then the guest-memory copy.
 inline void CountObtainStream(u64 query_ns, u64 copy_ns, u64 bytes) {
-    obtain_query_ns.fetch_add(query_ns, std::memory_order_relaxed);
-    obtain_stream_ns.fetch_add(copy_ns, std::memory_order_relaxed);
+    if constexpr (!DetailCountersEnabled && !SHADPS4_FAULT_TIMERS) {
+        return;
+    }
+    AddTime(obtain_query_ns, query_ns);
+    AddTime(obtain_stream_ns, copy_ns);
     obtain_stream_calls.fetch_add(1, std::memory_order_relaxed);
     obtain_stream_bytes.fetch_add(bytes, std::memory_order_relaxed);
 }
@@ -557,29 +589,32 @@ inline void CountObtainStream(u64 query_ns, u64 copy_ns, u64 bytes) {
 /// Fall-through path of ObtainBuffer. `query_ns` is 0 when the early-exit test was skipped
 /// outright (written or oversized binding), so query time stays comparable across both paths.
 inline void CountCpWait(u64 ns) {
-    cp_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+    AddTime(cp_wait_ns, ns);
 }
 
 inline void CountCpActive(u64 ns) {
-    cp_active_ns.fetch_add(ns, std::memory_order_relaxed);
+    AddTime(cp_active_ns, ns);
 }
 
 inline void CountDispatch(u64 ns) {
     dispatch_count.fetch_add(1, std::memory_order_relaxed);
-    dispatch_ns.fetch_add(ns, std::memory_order_relaxed);
+    AddTime(dispatch_ns, ns);
 }
 
 inline void CountDrawTail(u64 pre_ns, u64 vtxbuf_ns, u64 descwrite_ns, u64 dynstate_ns,
                           u64 schedbegin_ns, u64 emit_ns) {
-    draw_pre_ns.fetch_add(pre_ns, std::memory_order_relaxed);
-    draw_vtxbuf_ns.fetch_add(vtxbuf_ns, std::memory_order_relaxed);
-    draw_descwrite_ns.fetch_add(descwrite_ns, std::memory_order_relaxed);
-    draw_dynstate_ns.fetch_add(dynstate_ns, std::memory_order_relaxed);
-    draw_schedbegin_ns.fetch_add(schedbegin_ns, std::memory_order_relaxed);
-    draw_emit_ns.fetch_add(emit_ns, std::memory_order_relaxed);
+    AddTime(draw_pre_ns, pre_ns);
+    AddTime(draw_vtxbuf_ns, vtxbuf_ns);
+    AddTime(draw_descwrite_ns, descwrite_ns);
+    AddTime(draw_dynstate_ns, dynstate_ns);
+    AddTime(draw_schedbegin_ns, schedbegin_ns);
+    AddTime(draw_emit_ns, emit_ns);
 }
 
 inline void CountBarriers(bool partial, u64 iters, u64 emitted) {
+    if constexpr (!DetailCountersEnabled) {
+        return;
+    }
     barrier_calls.fetch_add(1, std::memory_order_relaxed);
     if (partial) {
         barrier_partial_calls.fetch_add(1, std::memory_order_relaxed);
@@ -589,46 +624,47 @@ inline void CountBarriers(bool partial, u64 iters, u64 emitted) {
 }
 
 inline void CountBindTexView(u64 findtex_ns, u64 transit_ns) {
-    bindtex_findtex_ns.fetch_add(findtex_ns, std::memory_order_relaxed);
-    bindtex_transit_ns.fetch_add(transit_ns, std::memory_order_relaxed);
+    AddTime(bindtex_findtex_ns, findtex_ns);
+    AddTime(bindtex_transit_ns, transit_ns);
 }
 
 inline void CountBindTexSplit(u64 findimage_ns, u64 view_ns, u64 sampler_ns) {
-    bindtex_findimage_ns.fetch_add(findimage_ns, std::memory_order_relaxed);
-    bindtex_view_ns.fetch_add(view_ns, std::memory_order_relaxed);
-    bindtex_sampler_ns.fetch_add(sampler_ns, std::memory_order_relaxed);
+    AddTime(bindtex_findimage_ns, findimage_ns);
+    AddTime(bindtex_view_ns, view_ns);
+    AddTime(bindtex_sampler_ns, sampler_ns);
 }
 
 inline void CountStreamCopy(u64 map_ns, u64 valid_ns, u64 copy_ns, u64 commit_ns) {
-    stream_map_ns.fetch_add(map_ns, std::memory_order_relaxed);
-    stream_valid_ns.fetch_add(valid_ns, std::memory_order_relaxed);
-    stream_copy_ns.fetch_add(copy_ns, std::memory_order_relaxed);
-    stream_commit_ns.fetch_add(commit_ns, std::memory_order_relaxed);
+    AddTime(stream_map_ns, map_ns);
+    AddTime(stream_valid_ns, valid_ns);
+    AddTime(stream_copy_ns, copy_ns);
+    AddTime(stream_commit_ns, commit_ns);
 }
 
 inline void CountUploadPhases(u64 scan_ns, u64 copy_ns, u64 mark_ns, bool is_written) {
-    upload_scan_ns.fetch_add(scan_ns, std::memory_order_relaxed);
-    upload_copy_ns.fetch_add(copy_ns, std::memory_order_relaxed);
-    upload_mark_ns.fetch_add(mark_ns, std::memory_order_relaxed);
+    if constexpr (!DetailCountersEnabled && !SHADPS4_FAULT_TIMERS) { return; }
+    AddTime(upload_scan_ns, scan_ns);
+    AddTime(upload_copy_ns, copy_ns);
+    AddTime(upload_mark_ns, mark_ns);
     if (is_written) {
         upload_written_calls.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
-template <bool is_read>
-inline void CountProtect(u64 ns) {
+template <bool is_read> inline void CountProtect(u64 ns) {
     if constexpr (is_read) {
         protect_read_calls.fetch_add(1, std::memory_order_relaxed);
-        protect_read_ns.fetch_add(ns, std::memory_order_relaxed);
+        AddTime(protect_read_ns, ns);
     } else {
         protect_write_calls.fetch_add(1, std::memory_order_relaxed);
-        protect_write_ns.fetch_add(ns, std::memory_order_relaxed);
+        AddTime(protect_write_ns, ns);
     }
 }
 
 inline void CountObtainSync(u64 query_ns, u64 sync_ns) {
-    obtain_query_ns.fetch_add(query_ns, std::memory_order_relaxed);
-    obtain_sync_ns.fetch_add(sync_ns, std::memory_order_relaxed);
+    if constexpr (!DetailCountersEnabled && !SHADPS4_FAULT_TIMERS) { return; }
+    AddTime(obtain_query_ns, query_ns);
+    AddTime(obtain_sync_ns, sync_ns);
     obtain_sync_calls.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -640,7 +676,7 @@ inline void CountReadbackDownload(u64 bytes) {
 
 inline void CountGpuWait(u64 ns) {
     gpu_waits.fetch_add(1, std::memory_order_relaxed);
-    gpu_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+    AddTime(gpu_wait_ns, ns);
 }
 
 inline void CountRangeSubtract(u64 fragments) {
