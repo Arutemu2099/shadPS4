@@ -27,18 +27,32 @@ static constexpr size_t DeviceBufferSize = 128_MB;
 /**
  * Alignment a guest read fault is widened to before downloading.
  *
- * A read fault reports 8 bytes, but the protection being unwound is 4K granular and every
- * download costs a full submit-and-fence-wait, so one fault buys one page at the price of a
- * queue drain. On inFAMOUS: Second Son under Precise readbacks that is ~167 read faults and
- * ~208 GPU submits per frame against a stable ~2.5 MB read set that is re-read every frame.
+ * Windows faults report 8 bytes, while protection is page granular and a nonempty buffer
+ * download submits and waits. Combining nearby read faults can reduce those queue drains.
  *
- * Widening is safe because everything downstream is already page granular and clipped:
- * `ForEachDownloadRange` only visits pages whose GPU bit is set, `gpu_modified_ranges` only
- * copies byte ranges actually written by the GPU, and `UpdateProtection` only touches pages
- * whose protection state changes. So a wider window copies data that was going to be faulted
- * on anyway - it just folds many faults into one submit instead of one each.
+ * Widening stays within the existing buffer and selects only tracked GPU-dirty pages/bytes.
+ * Extra bytes are speculative: the guest may not read them. Enlarged windows also preflight
+ * staging capacity before dirty-state mutation. Keep the default for unmeasured workloads.
  */
-static constexpr u64 ReadFaultWidenSize = 64_KB;
+static constexpr u64 DefaultReadFaultWidenSize = 64_KB;
+
+static u64 ReadFaultWidenSize(u64 original_size) {
+    static const u64 value = []() -> u64 {
+        if (const char* env = std::getenv("SHADPS4_READ_FAULT_WIDEN_SIZE")) {
+            char* end = nullptr;
+            const u64 parsed = std::strtoull(env, &end, 0);
+            if (end != env && *end == '\0' &&
+                (parsed == 64_KB || parsed == 256_KB || parsed == 1_MB)) {
+                LOG_INFO(Render, "BufferCache: read-fault window overridden to {} bytes", parsed);
+                return parsed;
+            }
+            LOG_WARNING(Render, "Invalid read-fault window override; retaining 64 KiB");
+        }
+        return DefaultReadFaultWidenSize;
+    }();
+    // Only tune small read faults. Preserve baseline handling of larger explicit reads.
+    return original_size > 0 && original_size <= 4_KB ? value : DefaultReadFaultWidenSize;
+}
 
 /**
  * Size ceiling for `ObtainBuffer`'s read-only stream-copy fast path.
@@ -78,17 +92,17 @@ static u64 StreamCopyMaxSize() {
     return value;
 }
 
-/// Expands a read fault to `ReadFaultWidenSize`, clipped to the buffer that already covers it.
+/// Expands a read fault to the selected window, clipped to the buffer that already covers it.
 /// The clip is what keeps this safe: `FindBuffer` has already run on the original range, so
 /// buffer creation and merging behaviour is unchanged by the wider download.
-static std::pair<VAddr, u64> WidenReadFault(const Buffer& buffer, VAddr device_addr, u64 size) {
+static std::pair<VAddr, u64> WidenReadFault(const Buffer& buffer, VAddr device_addr, u64 size,
+                                          u64 window) {
     if (!buffer.IsInBounds(device_addr, size)) {
         return {device_addr, size};
     }
-    const VAddr begin =
-        std::max(Common::AlignDown(device_addr, ReadFaultWidenSize), buffer.CpuAddr());
-    const VAddr end = std::min(Common::AlignUp(device_addr + size, ReadFaultWidenSize),
-                               buffer.CpuAddr() + buffer.SizeBytes());
+    const VAddr begin = std::max(Common::AlignDown(device_addr, window), buffer.CpuAddr());
+    const VAddr end = std::min(Common::AlignUp(device_addr + size, window),
+                              buffer.CpuAddr() + buffer.SizeBytes());
     return {begin, end - begin};
 }
 
@@ -153,7 +167,44 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
             DownloadBufferMemory<false>(buffer, device_addr, size, true);
             return;
         }
-        const auto [wide_addr, wide_size] = WidenReadFault(buffer, device_addr, size);
+        const u64 window = ReadFaultWidenSize(size);
+        auto [wide_addr, wide_size] = WidenReadFault(buffer, device_addr, size, window);
+        if (window != DefaultReadFaultWidenSize) {
+            // Preflight the SAME page/byte intersections and 64-byte padding used
+            // by DownloadBufferMemory, before it subtracts any GPU-dirty ranges.
+            // Both passes run in this CP callback; GPU range additions are owned
+            // by that thread. Never turn an oversized speculative transfer into
+            // a dropped download or a null staging pointer.
+            u64 padded_bytes = 0;
+            bool fits = true;
+            memory_tracker->ForEachDownloadRange<false>(
+                wide_addr, wide_size, [&](u64 range_addr, u64 range_size) {
+                    gpu_modified_ranges.ForEachInRange(
+                        range_addr, range_size, [&](VAddr begin, VAddr end) {
+                            if (!fits) {
+                                return;
+                            }
+                            const u64 bytes = end - begin;
+                            if (bytes > DownloadBufferSize) {
+                                fits = false;
+                                return;
+                            }
+                            const u64 padded = (bytes + 63) & ~63ULL;
+                            if (padded > DownloadBufferSize - padded_bytes) {
+                                fits = false;
+                            } else {
+                                padded_bytes += padded;
+                            }
+                        });
+                });
+            if (!fits) {
+                LOG_INFO(Render, "Read-fault window exceeded staging capacity; using 64 KiB");
+                const auto fallback =
+                    WidenReadFault(buffer, device_addr, size, DefaultReadFaultWidenSize);
+                wide_addr = fallback.first;
+                wide_size = fallback.second;
+            }
+        }
         DownloadBufferMemory<false>(buffer, wide_addr, wide_size, false);
     });
 }
