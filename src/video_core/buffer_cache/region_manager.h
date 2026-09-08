@@ -17,6 +17,7 @@
 #include "common/debug.h"
 #include "common/fault_monitor.h"
 #include "common/types.h"
+#include "video_core/buffer_cache/dirty_epoch.h"
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/page_manager.h"
 
@@ -41,7 +42,6 @@ using LockType = Common::SpinLock;
  * memo. A per-region epoch would hit more often and is the obvious next step if the hit rate
  * measures poorly, but it costs a range-max lookup per query, which is the thing being avoided.
  */
-inline std::atomic<u64> g_dirty_epoch{1};
 
 class RegionManager {
 public:
@@ -137,9 +137,13 @@ public:
             if constexpr (type == Type::CPU) {
                 // Raise the summary BEFORE the bits, so a lock-free reader can never observe
                 // false while a set that precedes it in program order has already landed.
-                MarkDirty();
+                PublishCpuDirty([&] {
+                    MarkDirty();
+                    bits.SetRange(start_page, end_page);
+                });
+            } else {
+                bits.SetRange(start_page, end_page);
             }
-            bits.SetRange(start_page, end_page);
         } else {
             bits.UnsetRange(start_page, end_page);
             if constexpr (type == Type::CPU) {
@@ -272,7 +276,6 @@ private:
     /// coarse bit must stop advertising skippability before the fine flag admits dirt, and both
     /// must precede the bits themselves.
     void MarkDirty() {
-        g_dirty_epoch.fetch_add(1, std::memory_order_release);
         if (summary_word) {
             summary_word->fetch_and(~summary_mask, std::memory_order_release);
         }
