@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstdlib>
+#include <limits>
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -31,6 +32,15 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
       buffer_cache{buffer_cache_}, tracker{tracker_}, blit_helper{instance, scheduler},
       tile_manager{instance, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)},
       readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()} {
+
+    const auto enabled = [](const char* name) {
+        const auto* value = std::getenv(name);
+        return value && value[0] == '1' && value[1] == '\0';
+    };
+    if (enabled("SHADPS4_PREPARED_IMAGES")) {
+        prepared_images = std::make_unique<PreparedImages>();
+        prepared_images->verify = enabled("SHADPS4_PREPARED_IMAGES_VERIFY");
+    }
 
     u32 max_samplers = instance.GetMaxSamplerAllocationCount();
     trigger_gc_samplers = max_samplers * 3 / 4;
@@ -556,19 +566,66 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     const auto fi_t0 = Common::FaultMonitor::Now();
     std::scoped_lock lock{mutex};
     const auto fi_t1 = Common::FaultMonitor::Now();
+
+    PreparedImage* memo = nullptr;
+    PreparedImageKey key{};
+    ImageId memo_id{};
+    u64 memo_uid{};
+    u64 lookup_generation{};
+    const auto input_range = desc.view_info.range;
+    if (prepared_images) {
+        ++prepared_images->calls;
+        lookup_generation = prepared_images->generation.load(std::memory_order_acquire);
+        constexpr u64 address_limit = u64{1} << Traits::AddressSpaceBits;
+        if (info.guest_address && info.guest_address < address_limit && info.guest_size &&
+            info.guest_size <= address_limit - info.guest_address &&
+            info.pixel_format != vk::Format::eUndefined) {
+            key = {info.guest_address, info.guest_size, info.size, info.type, info.pixel_format,
+                   info.resources, desc.type, exact_fmt};
+            // Address/format select a bounded slot; full field equality resolves collisions.
+            const u64 address_hash = (info.guest_address >> 8) ^ (info.guest_address >> 25);
+            const u64 index = (address_hash ^ (u64(info.pixel_format) << 3)) &
+                              (PreparedImages::Capacity - 1);
+            memo = &prepared_images->entries[index];
+            if (memo->generation == lookup_generation && memo->key == key && memo->id &&
+                slot_images.is_allocated(memo->id)) {
+                const auto& cached = slot_images[memo->id];
+                // SlotId has no generation. Undefined-format stencil placeholders have no UID
+                // and are never eligible. No Image pointer or Vulkan backing/view is retained.
+                if (memo->uid && cached.image_uid == memo->uid &&
+                    True(cached.flags & ImageFlagBits::Registered) &&
+                    False(cached.flags & ImageFlagBits::Picked)) {
+                    memo_id = memo->id;
+                    memo_uid = memo->uid;
+                }
+            }
+        }
+        if (memo_id) {
+            ++prepared_images->hits;
+        } else {
+            ++prepared_images->fallbacks;
+        }
+    }
+    const bool reuse = memo_id && !prepared_images->verify;
     ImageIds image_ids;
-    ForEachImageInRegion(info.guest_address, info.guest_size,
-                         [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
+    if (!reuse) {
+        // Verification runs this original lookup once, not a second mutating resolve pass.
+        ForEachImageInRegion(info.guest_address, info.guest_size,
+                             [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
+    }
     const auto fi_t2 = Common::FaultMonitor::Now();
     ++fi_calls;
     fi_lock_ns += Common::FaultMonitor::DiffNs(fi_t0, fi_t1);
     fi_walk_ns += Common::FaultMonitor::DiffNs(fi_t1, fi_t2);
-    fi_pages += ((info.guest_address + info.guest_size - 1) >> 20) - (info.guest_address >> 20) + 1;
+    if (!reuse) {
+        fi_pages += ((info.guest_address + info.guest_size - 1) >> 20) - (info.guest_address >> 20) + 1;
+    }
     fi_cands += image_ids.size();
 
-    ImageId image_id{};
+    ImageId image_id = reuse ? memo_id : ImageId{};
 
-    // Check for a perfect match first
+    // Check for a perfect match first. Last qualifying candidate wins; registration/removal
+    // invalidates ALL memos so reuse preserves this ordering, including overlapping aliases.
     for (const auto& cache_id : image_ids) {
         auto& cache_image = slot_images[cache_id];
         if (cache_image.info.guest_address != info.guest_address) {
@@ -591,6 +648,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
 
     const bool fi_perfect = static_cast<bool>(image_id);
+    const ImageId perfect_image_id = image_id;
 
     // Try to resolve overlaps (if any)
     int view_mip{-1};
@@ -640,6 +698,32 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
     if (view_slice > 0) {
         desc.view_info.range.base.layer = view_slice;
+    }
+
+    if (prepared_images) {
+        if (memo_id && prepared_images->verify) {
+            ASSERT_MSG(image_id == memo_id && image.image_uid == memo_uid &&
+                           desc.view_info.range == input_range,
+                       "PreparedImages mismatch: cached={} actual={} cached_uid={} actual_uid={}",
+                       memo_id.index, image_id.index, memo_uid, image.image_uid);
+            ++prepared_images->verified;
+        }
+        const u64 final_generation = prepared_images->generation.load(std::memory_order_acquire);
+        // Creation and overlap resolution are intentionally not memoized. Even an initial
+        // perfect match can be freed/recreated by the resource check; don't publish that result.
+        // CMASK/FMASK/HTILE metadata mutations do not enter any perfect-match predicate.
+        if (memo && !memo_id && perfect_image_id && image_id == perfect_image_id && image.image_uid &&
+            True(image.flags & ImageFlagBits::Registered) &&
+            !(image.info.resources < info.resources) && final_generation == lookup_generation) {
+            *memo = {key, image_id, image.image_uid, final_generation};
+        }
+        if ((prepared_images->calls & 0x3ffff) == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "PreparedImages: calls={} hit={} invalidation={} fallback={} verified={} "
+                     "(cumulative; invalidation=structural changes)",
+                     prepared_images->calls, prepared_images->hits, final_generation - 1,
+                     prepared_images->fallbacks, prepared_images->verified);
+        }
     }
 
     if (fi_perfect) {
@@ -756,6 +840,10 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 
     // If there is a stencil attachment, link depth and stencil.
     if (desc.info.stencil_addr != 0) {
+        // Serialize the traversal's temporary Picked flags with FindImage, including
+        // their cleanup. Also publish any new stencil mapping under that same lock.
+        // UpdateImage above acquires/releases the mutex itself; do not cover it here.
+        std::scoped_lock lock{mutex};
         ImageId stencil_id{};
         ForEachImageInRegion(desc.info.stencil_addr, desc.info.stencil_size,
                              [&](ImageId image_id, Image& image) {
@@ -774,10 +862,12 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
         }
         Image& stencil_image = slot_images[stencil_id];
         TouchImage(stencil_image);
-        stencil_image.AssociateDepth(image_id, image.image_uid);
+        // Inserting the placeholder can relocate SlotVector's storage, invalidating
+        // the depth reference acquired above. Reacquire through its stable slot ID.
+        stencil_image.AssociateDepth(image_id, slot_images[image_id].image_uid);
     }
 
-    return image.FindView(desc.view_info, false);
+    return slot_images[image_id].FindView(desc.view_info, false);
 }
 
 void TextureCache::RefreshImage(Image& image) {
@@ -890,6 +980,17 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
     return it->second.Handle();
 }
 
+void TextureCache::InvalidatePreparedImages() {
+    if (prepared_images) {
+        // Publish after mapping changes; invalidation also covers a competing candidate, not
+        // just the selected ID. Retain the original caller locking / CP ownership contracts.
+        const u64 previous = prepared_images->generation.fetch_add(1, std::memory_order_release);
+        if (previous == std::numeric_limits<u64>::max()) {
+            UNREACHABLE_MSG("PreparedImages generation exhausted");
+        }
+    }
+}
+
 void TextureCache::RegisterImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
@@ -899,6 +1000,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
     ForEachPage(image.info.guest_address, image.info.guest_size,
                 [this, image_id](u64 page) { page_table[page].push_back(image_id); });
+    InvalidatePreparedImages();
 }
 
 void TextureCache::UnregisterImage(ImageId image_id) {
@@ -922,6 +1024,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
         }
         image_ids.erase(vector_it);
     });
+    InvalidatePreparedImages();
 }
 
 void TextureCache::TrackImage(ImageId image_id) {
@@ -1153,6 +1256,7 @@ void TextureCache::DeleteImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     ASSERT_MSG(!image.IsTracked(), "Image was not untracked");
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered), "Image was not unregistered");
+    InvalidatePreparedImages();
 
     // Remove any registered meta areas.
     const auto& meta_info = image.info.meta_info;
@@ -1182,6 +1286,7 @@ void TextureCache::DeleteImage(ImageId image_id) {
             }
         }
         slot_images.erase(image_id);
+        InvalidatePreparedImages();
     });
 }
 

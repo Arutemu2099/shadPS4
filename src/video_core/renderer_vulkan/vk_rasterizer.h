@@ -5,6 +5,8 @@
 
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
+#include "video_core/amdgpu/cb_db_extent.h"
+#include "video_core/amdgpu/regs_color.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -132,6 +134,25 @@ private:
     using RenderTargetInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     std::array<RenderTargetInfo, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc> db_desc;
+    // Pure preparation inputs/results only. Live image identities, uploads and layouts
+    // are resolved separately; FindImage may mutate the working descriptor's view range.
+    struct PreparedColorTarget {
+        AmdGpu::ColorBuffer buffer{};
+        AmdGpu::CbDbExtent extent{};
+        VideoCore::TextureCache::ImageDesc value{};
+        bool valid{};
+    };
+    struct PreparedDepthTarget {
+        AmdGpu::DepthBuffer buffer{};
+        AmdGpu::DepthView view{};
+        AmdGpu::DepthControl control{};
+        AmdGpu::CbDbExtent extent{};
+        VAddr htile_address{};
+        VideoCore::TextureCache::ImageDesc value{};
+        bool valid{};
+    };
+    std::array<PreparedColorTarget, AmdGpu::NUM_COLOR_BUFFERS> prepared_color_targets{};
+    PreparedDepthTarget prepared_depth_target{};
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
     boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;

@@ -182,7 +182,54 @@ bool Rasterizer::FilterDraw() {
     return true;
 }
 
+static bool SamePreparedTarget(const VideoCore::TextureCache::ImageDesc& a,
+                               const VideoCore::TextureCache::ImageDesc& b) {
+    const auto& x = a.info;
+    const auto& y = b.info;
+    if (a.type != b.type || a.view_info != b.view_info || x.pixel_format != y.pixel_format ||
+        x.type != y.type || x.resources != y.resources || x.size != y.size ||
+        x.num_bits != y.num_bits || x.num_samples != y.num_samples || x.pitch != y.pitch ||
+        x.tile_mode != y.tile_mode || x.array_mode != y.array_mode ||
+        x.guest_address != y.guest_address || x.guest_size != y.guest_size ||
+        x.bank_swizzle != y.bank_swizzle || x.alt_tile != y.alt_tile ||
+        x.stencil_addr != y.stencil_addr || x.stencil_size != y.stencil_size ||
+        x.meta_info.cmask_addr != y.meta_info.cmask_addr ||
+        x.meta_info.fmask_addr != y.meta_info.fmask_addr ||
+        x.meta_info.htile_addr != y.meta_info.htile_addr ||
+        x.meta_info.htile_clear_mask != y.meta_info.htile_clear_mask ||
+        x.props.is_volume != y.props.is_volume || x.props.is_tiled != y.props.is_tiled ||
+        x.props.is_pow2 != y.props.is_pow2 || x.props.is_block != y.props.is_block ||
+        x.props.is_depth != y.props.is_depth || x.props.has_stencil != y.props.has_stencil) {
+        return false;
+    }
+    for (u32 mip = 0; mip < x.resources.levels; ++mip) {
+        const auto& xm = x.mips_layout[mip];
+        const auto& ym = y.mips_layout[mip];
+        if (xm.size != ym.size || xm.pitch != ym.pitch || xm.height != ym.height ||
+            xm.offset != ym.offset) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
+    static const bool prepared_targets = [] {
+        const char* value = std::getenv("SHADPS4_PREPARED_TARGETS");
+        return value && value[0] == '1';
+    }();
+    static const bool verify_targets = [] {
+        const char* value = std::getenv("SHADPS4_PREPARED_TARGETS_VERIFY");
+        return value && value[0] == '1';
+    }();
+    const auto verify = [](bool hit, const auto& prepared, const auto& reference) {
+        ASSERT(SamePreparedTarget(prepared, reference));
+        static thread_local u64 calls{}, hits{};
+        hits += hit;
+        if (++calls % 500000 == 0) {
+            LOG_INFO(Render_Vulkan, "PreparedTargetVerify: calls={} hits={}", calls, hits);
+        }
+    };
     // Prefetch render targets to handle overlaps with bound textures (e.g. mipgen)
     const auto& key = pipeline->GetGraphicsKey();
     const auto& regs = liverpool->regs;
@@ -201,7 +248,24 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             continue;
         }
         const auto& hint = liverpool->last_cb_extent[cb];
-        std::construct_at(&desc, col_buf, hint);
+        if (prepared_targets) {
+            auto& entry = prepared_color_targets[cb];
+            const bool hit = entry.valid &&
+                             std::memcmp(&entry.buffer, &col_buf, sizeof(col_buf)) == 0 &&
+                             std::memcmp(&entry.extent, &hint, sizeof(hint)) == 0;
+            if (!hit) {
+                entry.buffer = col_buf;
+                entry.extent = hint;
+                std::construct_at(&entry.value, col_buf, hint);
+                entry.valid = true;
+            }
+            if (verify_targets) {
+                verify(hit, entry.value, VideoCore::TextureCache::ImageDesc{col_buf, hint});
+            }
+            desc = entry.value;
+        } else {
+            std::construct_at(&desc, col_buf, hint);
+        }
         image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
         auto& image = texture_cache.GetImage(image_id);
         image.binding.is_target = 1u;
@@ -212,8 +276,34 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
         const auto& hint = liverpool->last_db_extent;
         auto& [image_id, desc] = db_desc;
-        std::construct_at(&desc, regs.depth_buffer, regs.depth_view, regs.depth_control,
-                          htile_address, hint);
+        if (prepared_targets) {
+            auto& entry = prepared_depth_target;
+            const bool hit =
+                entry.valid && entry.htile_address == htile_address &&
+                std::memcmp(&entry.buffer, &regs.depth_buffer, sizeof(entry.buffer)) == 0 &&
+                std::memcmp(&entry.view, &regs.depth_view, sizeof(entry.view)) == 0 &&
+                std::memcmp(&entry.control, &regs.depth_control, sizeof(entry.control)) == 0 &&
+                std::memcmp(&entry.extent, &hint, sizeof(hint)) == 0;
+            if (!hit) {
+                entry.buffer = regs.depth_buffer;
+                entry.view = regs.depth_view;
+                entry.control = regs.depth_control;
+                entry.extent = hint;
+                entry.htile_address = htile_address;
+                std::construct_at(&entry.value, regs.depth_buffer, regs.depth_view,
+                                  regs.depth_control, htile_address, hint);
+                entry.valid = true;
+            }
+            if (verify_targets) {
+                verify(hit, entry.value,
+                       VideoCore::TextureCache::ImageDesc{regs.depth_buffer, regs.depth_view,
+                                                         regs.depth_control, htile_address, hint});
+            }
+            desc = entry.value;
+        } else {
+            std::construct_at(&desc, regs.depth_buffer, regs.depth_view, regs.depth_control,
+                              htile_address, hint);
+        }
         image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
         auto& image = texture_cache.GetImage(image_id);
         image.binding.is_target = 1u;

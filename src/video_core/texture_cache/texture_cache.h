@@ -3,7 +3,10 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
@@ -310,6 +313,41 @@ private:
     void GarbageCollectImages();
     void GarbageCollectSamplers();
 
+    // Only the surviving perfect-match path is memoized. These are all its selection inputs;
+    // view_info is left live (that path never changes its range). Binding type is conservative.
+    struct PreparedImageKey {
+        VAddr address{};
+        u32 guest_size{};
+        Extent3D size{};
+        AmdGpu::ImageType type{};
+        vk::Format format{};
+        SubresourceExtent resources{};
+        BindingType binding{};
+        bool exact_fmt{};
+
+        bool operator==(const PreparedImageKey&) const = default;
+    };
+    struct PreparedImage {
+        PreparedImageKey key{};
+        ImageId id{};
+        u64 uid{};
+        u64 generation{};
+    };
+    struct PreparedImages {
+        static constexpr size_t Capacity = 1024;
+        std::array<PreparedImage, Capacity> entries{};
+        // Atomic because deferred slot reclamation does not take the lookup mutex. This does
+        // not replace the existing page-table/slot synchronization or authorize concurrent use.
+        std::atomic<u64> generation{1};
+        bool verify{};
+        u64 calls{}, hits{}, fallbacks{}, verified{}; // FindImage mutex protects entries/counters.
+    };
+
+    // Any future in-place change of guest range, size, type, format or resources must invalidate
+    // here under the same synchronization as the mapping change. Currently those are immutable:
+    // expansion/depth replacement creates and registers a new Image instead.
+    void InvalidatePreparedImages();
+
 private:
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
@@ -338,6 +376,7 @@ private:
     std::mutex mutex;
     std::mutex samplers_mutex;
     std::mutex download_images_mutex;
+    std::unique_ptr<PreparedImages> prepared_images; // Allocated only when explicitly enabled.
     struct MetaDataInfo {
         enum class Type {
             CMask,
