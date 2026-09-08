@@ -6,6 +6,7 @@
 #include <unordered_set>
 
 #include "common/debug.h"
+#include "common/draw_sample_probe.h"
 #include "common/fault_monitor.h"
 #include "common/scope_exit.h"
 #include "core/debug_state.h"
@@ -263,6 +264,7 @@ void Rasterizer::EliminateFastClear() {
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
 
+    auto sample = Common::DrawSampleProbe::Begin();
     const auto t_entry = Common::FaultMonitor::Now();
     scheduler.PopPendingOperations();
 
@@ -274,39 +276,56 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     // Scoped timers: the stack scanner reports inclusive frequencies with false positives and
     // cannot apportion cost here. See Common::FaultMonitor for why these exist.
     const auto t_pipeline = Common::FaultMonitor::Now();
+    sample.BeginPhase(Common::DrawSampleProbe::Phase::Pipeline);
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
+    sample.EndPhase(Common::DrawSampleProbe::Phase::Pipeline);
     const auto pipeline_ns = Common::FaultMonitor::SinceNs(t_pipeline);
     if (!pipeline) {
         return;
     }
 
     const auto t_prepare = Common::FaultMonitor::Now();
+    sample.BeginPhase(Common::DrawSampleProbe::Phase::Prepare);
     PrepareRenderState(pipeline);
+    sample.EndPhase(Common::DrawSampleProbe::Phase::Prepare);
     const auto t_bindres = Common::FaultMonitor::Now();
+    sample.BeginPhase(Common::DrawSampleProbe::Phase::BindResources);
     const bool bound = BindResources(pipeline);
+    sample.EndPhase(Common::DrawSampleProbe::Phase::BindResources);
     const auto bindres_ns = Common::FaultMonitor::SinceNs(t_bindres);
     if (!bound) {
         return;
     }
     const auto t_begin = Common::FaultMonitor::Now();
+    sample.BeginPhase(Common::DrawSampleProbe::Phase::BuildRenderingState);
     const auto state = BeginRendering(pipeline);
+    sample.EndPhase(Common::DrawSampleProbe::Phase::BuildRenderingState);
     const auto t_vtxbuf = Common::FaultMonitor::Now();
     Common::FaultMonitor::CountDraw(pipeline_ns, bindres_ns,
                                     Common::FaultMonitor::DiffNs(t_begin, t_vtxbuf));
 
+    sample.BeginPhase(Common::DrawSampleProbe::Phase::VertexIndexBuffers);
     buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers);
     if (is_indexed) {
         buffer_cache.BindIndexBuffer(index_offset, buffer_barriers);
     }
+    sample.EndPhase(Common::DrawSampleProbe::Phase::VertexIndexBuffers);
     const auto t_descwrite = Common::FaultMonitor::Now();
 
+    sample.BeginPhase(Common::DrawSampleProbe::Phase::PipelineResources);
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
+    sample.EndPhase(Common::DrawSampleProbe::Phase::PipelineResources);
     const auto t_dynstate = Common::FaultMonitor::Now();
+    sample.BeginPhase(Common::DrawSampleProbe::Phase::DynamicState);
     UpdateDynamicState(pipeline, is_indexed);
+    sample.EndPhase(Common::DrawSampleProbe::Phase::DynamicState);
     const auto t_schedbegin = Common::FaultMonitor::Now();
+    sample.BeginPhase(Common::DrawSampleProbe::Phase::SchedulerBeginRendering);
     scheduler.BeginRendering(state);
+    sample.EndPhase(Common::DrawSampleProbe::Phase::SchedulerBeginRendering);
     const auto t_emit = Common::FaultMonitor::Now();
 
+    sample.BeginPhase(Common::DrawSampleProbe::Phase::ActualDraw);
     const auto& vs_info = pipeline->GetStage(Shader::LogicalStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
     const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
@@ -323,7 +342,11 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
     DebugState.IncDrawCall();
 
+    sample.EndPhase(Common::DrawSampleProbe::Phase::ActualDraw);
+    sample.BeginPhase(Common::DrawSampleProbe::Phase::ResetImageBindings);
     ResetBindings();
+    sample.EndPhase(Common::DrawSampleProbe::Phase::ResetImageBindings);
+    sample.Finish();
 
     Common::FaultMonitor::CountDrawTail(
         Common::FaultMonitor::DiffNs(t_entry, t_pipeline) +
