@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <ranges>
 
 #include "common/fault_monitor.h"
@@ -326,11 +327,12 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 PipelineCache::~PipelineCache() = default;
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
-    // MEASUREMENT (perf-forest): GetGraphicsPipeline is 0.99 us/draw = 6.3 ms/frame and never split.
-    // Before designing a memo, learn (a) how the cost divides between RefreshGraphicsKey (memset +
-    // wide reg read + stage resolve) and the robin_map lookup, and (b) how often the freshly built
-    // key equals the previous draw's - the hit rate a memo would ride on. Windowed so a stable-scene
-    // line is not diluted by boot. ~3 clock reads + one key compare per draw, the memo's own cost.
+    // MEASUREMENT (perf-forest): GetGraphicsPipeline is 0.99 us/draw = 6.3 ms/frame and never
+    // split. Before designing a memo, learn (a) how the cost divides between RefreshGraphicsKey
+    // (memset + wide reg read + stage resolve) and the robin_map lookup, and (b) how often the
+    // freshly built key equals the previous draw's - the hit rate a memo would ride on. Windowed so
+    // a stable-scene line is not diluted by boot. ~3 clock reads + one key compare per draw, the
+    // memo's own cost.
     const auto t_probe0 = Common::FaultMonitor::Now();
     if (!RefreshGraphicsKey()) {
         return nullptr;
@@ -371,8 +373,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
                      "vctxgen_mismatch={} refresh={:.3f}us/call lookup={:.3f}us/call",
                      probe_calls, 100.0 * static_cast<double>(probe_same) / probe_calls,
                      100.0 * static_cast<double>(probe_gen_unchanged) / probe_calls,
-                     probe_gen_mismatch,
-                     static_cast<double>(probe_refresh_ns) / 1e3 / probe_calls,
+                     probe_gen_mismatch, static_cast<double>(probe_refresh_ns) / 1e3 / probe_calls,
                      static_cast<double>(probe_lookup_ns) / 1e3 / probe_calls);
             probe_calls = probe_same = probe_gen_unchanged = probe_gen_mismatch = probe_refresh_ns =
                 probe_lookup_ns = 0;
@@ -428,8 +429,10 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
 }
 
 bool PipelineCache::RefreshGraphicsKey() {
-    // MEASUREMENT (perf-forest): split the 0.955 us into the SKIPPABLE key assembly (pre+post: memset
-    // + register reads + color-buffer loops) vs the MANDATORY stage resolution (RefreshGraphicsStages
+    // MEASUREMENT (perf-forest): split the 0.955 us into the SKIPPABLE key assembly (pre+post:
+    // memset
+    // + register reads + color-buffer loops) vs the MANDATORY stage resolution
+    // (RefreshGraphicsStages
     // -> GetProgram, which refreshes per-draw user_data that BindResources consumes and cannot be
     // skipped). Only pre+post is reclaimable by a memo; this sizes it before any is written.
     const auto rgk_t0 = Common::FaultMonitor::Now();
@@ -531,12 +534,13 @@ bool PipelineCache::RefreshGraphicsKey() {
         rgk_stages += Common::FaultMonitor::DiffNs(rgk_t1, rgk_t2);
         rgk_post += Common::FaultMonitor::DiffNs(rgk_t2, rgk_t3);
         if (++rgk_calls >= 200000) {
-            LOG_INFO(Render_Vulkan,
-                     "RgkSplit: pre={:.3f}us stages={:.3f}us post={:.3f}us skippable(pre+post)={:.3f}us",
-                     static_cast<double>(rgk_pre) / 1e3 / rgk_calls,
-                     static_cast<double>(rgk_stages) / 1e3 / rgk_calls,
-                     static_cast<double>(rgk_post) / 1e3 / rgk_calls,
-                     static_cast<double>(rgk_pre + rgk_post) / 1e3 / rgk_calls);
+            LOG_INFO(
+                Render_Vulkan,
+                "RgkSplit: pre={:.3f}us stages={:.3f}us post={:.3f}us skippable(pre+post)={:.3f}us",
+                static_cast<double>(rgk_pre) / 1e3 / rgk_calls,
+                static_cast<double>(rgk_stages) / 1e3 / rgk_calls,
+                static_cast<double>(rgk_post) / 1e3 / rgk_calls,
+                static_cast<double>(rgk_pre + rgk_post) / 1e3 / rgk_calls);
             rgk_calls = rgk_pre = rgk_stages = rgk_post = 0;
         }
     }
@@ -732,6 +736,53 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
     info.RefreshFlatBuf();
+    static const bool prepared_enabled = [] {
+        const char* value = std::getenv("SHADPS4_PREPARED_PROGRAMS");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    static const bool prepared_verify = [] {
+        const char* value = std::getenv("SHADPS4_PREPARED_PROGRAMS_VERIFY");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    const bool eligible =
+        prepared_enabled && Shader::PreparedSpecialization::Eligible(info, stage, l_stage);
+    const auto start = binding;
+    if (eligible) {
+        if (!program->prepared) {
+            program->prepared = std::make_unique<Shader::PreparedSpecialization>();
+        }
+        const auto& prepared = *program->prepared;
+        const bool hit = prepared.permutation < program->modules.size() &&
+                         prepared.Matches(info, runtime_info, binding);
+        static std::array<u64, 2> calls{}, hits{}, verified{};
+        const size_t counter = stage == Stage::Vertex;
+        ++calls[counter];
+        if (hit) {
+            ++hits[counter];
+            if (prepared_verify) {
+                const auto fresh =
+                    Shader::StageSpecialization(info, runtime_info, profile, binding);
+                const auto found =
+                    std::ranges::find(program->modules, fresh, &Program::Module::spec);
+                ASSERT_MSG(found != program->modules.end() &&
+                               size_t(std::distance(program->modules.begin(), found)) ==
+                                   prepared.permutation,
+                           "PreparedPrograms selected a different permutation: stage={} hash={:#x}",
+                           stage, params.hash);
+                ++verified[counter];
+            }
+        }
+        if ((calls[counter] & 0x3ffff) == 0) {
+            LOG_INFO(Render_Vulkan, "PreparedPrograms: stage={} calls={} hit={} verified={}", stage,
+                     calls[counter], hits[counter], verified[counter]);
+        }
+        if (hit) {
+            info.AddBindings(binding);
+            const auto& selected = program->modules[prepared.permutation];
+            return std::make_tuple(&info, selected.module, selected.spec.fetch_shader_data,
+                                   HashCombine(params.hash, prepared.permutation));
+        }
+    }
     auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
 
     size_t perm_idx = program->modules.size();
@@ -751,6 +802,11 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         module = it->module;
         perm_idx = std::distance(program->modules.begin(), it);
         perm_hash = HashCombine(params.hash, perm_idx);
+        if (eligible) {
+            // Seed only a successful ordinary first-match selection. New or
+            // inserted permutations invalidate the guard before the next use.
+            program->prepared->Capture(info, runtime_info, start, spec, perm_idx);
+        }
     }
     return std::make_tuple(&program->info, module,
                            program->modules[perm_idx].spec.fetch_shader_data, perm_hash);
@@ -762,6 +818,9 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
     for (const auto& [_, program] : program_cache) {
         for (auto& m : program->modules) {
             if (m.module == module) {
+                if (program->prepared) {
+                    program->prepared->valid = false;
+                }
                 const auto& d = instance.GetDevice();
                 d.destroyShaderModule(m.module);
                 m.module = CompileSPV(spv_code, d);

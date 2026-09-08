@@ -5,6 +5,7 @@
 
 #include <variant>
 #include <tsl/robin_map.h>
+#include "shader_recompiler/prepared_specialization.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/specialization.h"
@@ -47,17 +48,24 @@ struct Program {
 
     Shader::Info info;
     ModuleList modules{};
+    std::unique_ptr<Shader::PreparedSpecialization> prepared;
 
     Program() = default;
     Program(Shader::Stage stage, Shader::LogicalStage l_stage, Shader::ShaderParams params)
         : info{stage, l_stage, params} {}
 
     void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec) {
+        if (prepared) {
+            prepared->valid = false;
+        }
         modules.emplace_back(module, std::move(spec));
     }
 
     void InsertPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
                       size_t perm_idx) {
+        if (prepared) {
+            prepared->valid = false;
+        }
         modules.resize(std::max(modules.size(), perm_idx + 1)); // <-- beware of realloc
         modules[perm_idx] = {module, std::move(spec)};
     }
