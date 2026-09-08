@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -63,6 +64,45 @@ TextureCache::~TextureCache() = default;
 
 void TextureCache::ProcessDownloadImages() {
     std::unique_lock lk{download_images_mutex};
+    static const bool probe_enabled = [] {
+        const auto* value = std::getenv("SHADPS4_IMAGE_DOWNLOAD_PROBE");
+        return value && value[0] == '1';
+    }();
+    if (probe_enabled && !download_images.empty()) {
+        // Infrequent batch-shape reporting only. No per-draw clocks or atomics.
+        static u64 calls{}, copies{}, bytes{}, multi{}, fits{}, max_copies{}, max_bytes{};
+        u64 batch_copies{}, batch_bytes{};
+        for (const ImageId id : download_images) {
+            const auto& image = slot_images[id];
+            if (False(image.flags & ImageFlagBits::GpuModified)) {
+                continue;
+            }
+            const u64 size = u64(image.info.pitch) * image.info.size.height * image.info.size.depth *
+                             image.info.resources.layers * (image.info.num_bits / 8);
+            ++batch_copies;
+            batch_bytes += (size + 15) & ~u64{15};
+        }
+        ++calls;
+        copies += batch_copies;
+        bytes += batch_bytes;
+        multi += batch_copies > 1;
+        fits += batch_copies > 1 &&
+                batch_bytes <= buffer_cache.GetUtilityBuffer(MemoryUsage::Download).SizeBytes();
+        max_copies = std::max(max_copies, batch_copies);
+        max_bytes = std::max(max_bytes, batch_bytes);
+        if ((calls & 1023) == 0) {
+            const auto& sample = slot_images[*download_images.begin()];
+            LOG_INFO(Render_Vulkan,
+                     "ImageDownloadProbe: calls={} copies={} padded_bytes={} multi={} fits={} "
+                     "max_copies={} max_bytes={} first_uid={} addr={:#x} size={}x{}x{} pitch={} "
+                     "layers={} bits={} tiled={} block={} format={}",
+                     calls, copies, bytes, multi, fits, max_copies, max_bytes, sample.image_uid,
+                     sample.info.guest_address, sample.info.size.width, sample.info.size.height,
+                     sample.info.size.depth, sample.info.pitch, sample.info.resources.layers,
+                     sample.info.num_bits, u32(sample.info.props.is_tiled),
+                     u32(sample.info.props.is_block), u32(sample.info.pixel_format));
+        }
+    }
     for (const ImageId image_id : download_images) {
         DownloadImageMemory(image_id, true);
     }
