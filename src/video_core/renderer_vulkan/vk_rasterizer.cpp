@@ -503,31 +503,29 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     // We can safely ignore both SGPR UD indices and results of fetch shader parsing, as vertex and
     // instance offsets will be automatically applied by Vulkan from indirect args buffer.
 
-    auto command_access = scheduler.AcquireCommandBuffer();
-    const auto cmdbuf = command_access.Handle();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
-
-    if (is_indexed) {
-        ASSERT(sizeof(VkDrawIndexedIndirectCommand) == stride);
-
-        if (count_address != 0) {
-            cmdbuf.drawIndexedIndirectCount(buffer->Handle(), base, count_buffer->Handle(),
-                                            count_base, max_count, stride);
+    ASSERT((is_indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand)) ==
+           stride);
+    scheduler.Record([handle = pipeline->Handle(), buffer = buffer->Handle(), base,
+                      count_handle = count_buffer ? count_buffer->Handle() : vk::Buffer{},
+                      has_count = count_address != 0, count_base, max_count, stride,
+                      is_indexed](vk::CommandBuffer cmdbuf) {
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+        if (is_indexed) {
+            if (has_count) {
+                cmdbuf.drawIndexedIndirectCount(buffer, base, count_handle, count_base, max_count,
+                                                stride);
+            } else {
+                cmdbuf.drawIndexedIndirect(buffer, base, max_count, stride);
+            }
         } else {
-            cmdbuf.drawIndexedIndirect(buffer->Handle(), base, max_count, stride);
+            if (has_count) {
+                cmdbuf.drawIndirectCount(buffer, base, count_handle, count_base, max_count, stride);
+            } else {
+                cmdbuf.drawIndirect(buffer, base, max_count, stride);
+            }
         }
-        DebugState.IncDrawCall();
-    } else {
-        ASSERT(sizeof(VkDrawIndirectCommand) == stride);
-
-        if (count_address != 0) {
-            cmdbuf.drawIndirectCount(buffer->Handle(), base, count_buffer->Handle(), count_base,
-                                     max_count, stride);
-        } else {
-            cmdbuf.drawIndirect(buffer->Handle(), base, max_count, stride);
-        }
-        DebugState.IncDrawCall();
-    }
+    });
+    DebugState.IncDrawCall();
 
     ResetBindings();
 }

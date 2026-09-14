@@ -489,14 +489,6 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         },
     };
     scheduler.EndRendering();
-    auto command_access = scheduler.AcquireCommandBuffer();
-    const auto cmdbuf = command_access.Handle();
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-        .bufferMemoryBarrierCount = 2,
-        .pBufferMemoryBarriers = buf_barriers_before,
-    });
-    cmdbuf.copyBuffer(src_buffer.Handle(), dst_buffer.Handle(), region);
     const vk::BufferMemoryBarrier2 buf_barriers_after[2] = {
         {
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -517,10 +509,20 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
             .size = num_bytes,
         },
     };
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-        .bufferMemoryBarrierCount = 2,
-        .pBufferMemoryBarriers = buf_barriers_after,
+    scheduler.Record([source = src_buffer.Handle(), destination = dst_buffer.Handle(), region,
+                      before = std::to_array(buf_barriers_before),
+                      after = std::to_array(buf_barriers_after)](vk::CommandBuffer cmdbuf) {
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+            .bufferMemoryBarrierCount = 2,
+            .pBufferMemoryBarriers = before.data(),
+        });
+        cmdbuf.copyBuffer(source, destination, region);
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+            .bufferMemoryBarrierCount = 2,
+            .pBufferMemoryBarriers = after.data(),
+        });
     });
 }
 

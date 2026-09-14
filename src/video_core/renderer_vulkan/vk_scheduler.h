@@ -5,9 +5,11 @@
 
 #include <condition_variable>
 #include <mutex>
+#include <source_location>
 #include <span>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
 #include <queue>
 
 #include "common/command_recording_worker.h"
@@ -391,10 +393,16 @@ public:
     // inline, so helpers retaining a handle cannot race the recording worker.
     class CommandBufferAccess {
     public:
-        explicit CommandBufferAccess(Scheduler& scheduler) : scheduler{scheduler} {
-            scheduler.DrainRecording();
+        explicit CommandBufferAccess(Scheduler& scheduler, std::source_location location)
+            : scheduler{scheduler} {
+            if (scheduler.synchronous_scopes == 0) {
+                scheduler.DrainRecording();
+            }
             ++scheduler.synchronous_scopes;
             ++scheduler.synchronous_borrows;
+            if (scheduler.recording_measure_timing) {
+                ++scheduler.recording_borrow_counts[location.function_name()];
+            }
         }
         ~CommandBufferAccess() {
             --scheduler.synchronous_scopes;
@@ -409,8 +417,9 @@ public:
         Scheduler& scheduler;
     };
 
-    [[nodiscard]] CommandBufferAccess AcquireCommandBuffer() {
-        return CommandBufferAccess{*this};
+    [[nodiscard]] CommandBufferAccess AcquireCommandBuffer(
+        std::source_location location = std::source_location::current()) {
+        return CommandBufferAccess{*this, location};
     }
 
     void DrainRecording();
@@ -520,6 +529,8 @@ private:
 private:
     const Instance& instance;
     std::unique_ptr<Common::CommandRecordingWorker<>> recording_worker;
+    bool recording_measure_timing = false;
+    std::unordered_map<std::string_view, u64> recording_borrow_counts;
     u32 synchronous_scopes = 0;
     u64 synchronous_borrows = 0;
     u64 recording_submits = 0;

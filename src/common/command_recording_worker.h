@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -105,9 +106,13 @@ public:
         std::uint64_t commands{};
         std::uint64_t chunks{};
         std::uint64_t bytes{};
+        std::uint64_t worker_ns{};
+        std::uint64_t drain_ns{};
+        std::uint64_t space_wait_ns{};
     };
 
-    CommandRecordingWorker() : worker_{&CommandRecordingWorker::WorkerLoop, this} {}
+    explicit CommandRecordingWorker(const bool measure_timing = false)
+        : measure_timing_{measure_timing}, worker_{&CommandRecordingWorker::WorkerLoop, this} {}
 
     ~CommandRecordingWorker() noexcept {
         try {
@@ -138,9 +143,11 @@ public:
         static_assert(alignof(Callable) <= alignof(std::max_align_t),
                       "Command callable alignment exceeds max_align_t");
         static_assert(std::is_invocable_v<Callable&>, "Command callable must be invocable");
-        RecordImpl<Callable>([&](void* object) {
-            std::construct_at(reinterpret_cast<Callable*>(object), std::forward<F>(function));
-        }, sizeof(Callable), alignof(Callable), 0);
+        RecordImpl<Callable>(
+            [&](void* object) {
+                std::construct_at(reinterpret_cast<Callable*>(object), std::forward<F>(function));
+            },
+            sizeof(Callable), alignof(Callable), 0);
     }
 
     template <typename Factory>
@@ -173,6 +180,12 @@ public:
     /// Rethrows the first callback exception after all commands through this drain point have been
     /// invoked or discarded and destroyed.
     void Drain() {
+        const auto drain_start = measure_timing_ ? Clock::now() : Clock::time_point{};
+        const auto finish_drain_timing = [this, drain_start] {
+            if (measure_timing_) {
+                drain_ns_ += ToNanoseconds(Clock::now() - drain_start);
+            }
+        };
         Chunk* discard_current = nullptr;
         std::uint64_t target{};
         {
@@ -204,16 +217,28 @@ public:
             error = failure_;
         }
         if (error) {
+            finish_drain_timing();
             std::rethrow_exception(error);
         }
+        finish_drain_timing();
     }
 
     /// Returns cumulative work counters. Only the sole producer may call this, after Drain.
+    /// Timing counters written by the worker are synchronized by the queue mutex.
     [[nodiscard]] Counters GetCounters() const noexcept {
-        return Counters{accepted_commands_, published_chunks_, reserved_bytes_};
+        std::lock_guard lock{mutex_};
+        return Counters{accepted_commands_, published_chunks_, reserved_bytes_,
+                        worker_ns_,         drain_ns_,         space_wait_ns_};
     }
 
 private:
+    using Clock = std::chrono::steady_clock;
+
+    static std::uint64_t ToNanoseconds(const Clock::duration duration) noexcept {
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count());
+    }
+
     template <typename Callable, typename Construct>
     void RecordImpl(Construct&& construct, const std::size_t object_bytes,
                     const std::size_t object_alignment, const std::size_t payload_bytes) {
@@ -289,11 +314,11 @@ private:
             .old_first_offset = old_first_offset,
             .old_command_count = old_command_count,
             .layout = *layout,
-            .header = reinterpret_cast<CommandHeader*>(chunk->storage.data() +
-                                                        layout->header_offset),
+            .header =
+                reinterpret_cast<CommandHeader*>(chunk->storage.data() + layout->header_offset),
             .object = chunk->storage.data() + layout->object_offset,
-            .payload = std::span<std::byte>{chunk->storage.data() + layout->payload_offset,
-                                             payload_bytes},
+            .payload =
+                std::span<std::byte>{chunk->storage.data() + layout->payload_offset, payload_bytes},
         };
         try {
             if constexpr (std::is_invocable_v<Construct&, void*, std::span<std::byte>>) {
@@ -398,9 +423,16 @@ private:
 
     Chunk* AcquireCurrentLocked(std::unique_lock<std::mutex>& lock) {
         while (current_ == nullptr) {
-            space_cv_.wait(lock, [this] {
+            const auto can_acquire = [this] {
                 return stop_requested_ || failure_ || HasFreeChunkLocked();
-            });
+            };
+            if (measure_timing_ && !stop_requested_ && !failure_ && !HasFreeChunkLocked()) {
+                const auto wait_start = Clock::now();
+                space_cv_.wait(lock, can_acquire);
+                space_wait_ns_ += ToNanoseconds(Clock::now() - wait_start);
+            } else {
+                space_cv_.wait(lock, can_acquire);
+            }
             CheckAcceptingLocked();
             for (auto& chunk : chunks_) {
                 if (chunk.state == ChunkState::Free) {
@@ -414,9 +446,9 @@ private:
     }
 
     [[nodiscard]] Reservation ReserveLocked(std::unique_lock<std::mutex>& lock,
-                                             const std::size_t object_bytes,
-                                             const std::size_t object_alignment,
-                                             const std::size_t payload_bytes) {
+                                            const std::size_t object_bytes,
+                                            const std::size_t object_alignment,
+                                            const std::size_t payload_bytes) {
         // Validate against an empty chunk before publishing the current one. An oversized command
         // therefore cannot unexpectedly publish older work before throwing.
         const auto empty_layout = TryLayout(0, object_bytes, object_alignment, payload_bytes);
@@ -444,11 +476,11 @@ private:
             .old_first_offset = old_first_offset,
             .old_command_count = old_command_count,
             .layout = *layout,
-            .header = reinterpret_cast<CommandHeader*>(chunk->storage.data() +
-                                                        layout->header_offset),
+            .header =
+                reinterpret_cast<CommandHeader*>(chunk->storage.data() + layout->header_offset),
             .object = chunk->storage.data() + layout->object_offset,
-            .payload = std::span<std::byte>{chunk->storage.data() + layout->payload_offset,
-                                             payload_bytes},
+            .payload =
+                std::span<std::byte>{chunk->storage.data() + layout->payload_offset, payload_bytes},
         };
     }
 
@@ -494,8 +526,8 @@ private:
     static void DestroyChunkContents(Chunk& chunk) noexcept {
         std::size_t offset = chunk.first_offset;
         for (std::size_t index = 0; index < chunk.command_count; ++index) {
-            auto* const header = std::launder(reinterpret_cast<CommandHeader*>(
-                chunk.storage.data() + offset));
+            auto* const header =
+                std::launder(reinterpret_cast<CommandHeader*>(chunk.storage.data() + offset));
             const std::size_t next_offset = header->next_offset;
             header->destroy(header->object);
             offset = next_offset;
@@ -540,11 +572,12 @@ private:
                 chunk = PopPublishedLocked();
             }
 
+            const auto worker_start = measure_timing_ ? Clock::now() : Clock::time_point{};
             std::exception_ptr callback_error;
             std::size_t offset = chunk->first_offset;
             for (std::size_t index = 0; index < chunk->command_count; ++index) {
-                auto* const header = std::launder(reinterpret_cast<CommandHeader*>(
-                    chunk->storage.data() + offset));
+                auto* const header =
+                    std::launder(reinterpret_cast<CommandHeader*>(chunk->storage.data() + offset));
                 const std::size_t next_offset = header->next_offset;
                 if (!callback_error) {
                     try {
@@ -557,9 +590,12 @@ private:
                 offset = next_offset;
             }
             assert(offset == chunk->used);
+            const std::uint64_t chunk_ns =
+                measure_timing_ ? ToNanoseconds(Clock::now() - worker_start) : 0;
 
             if (!callback_error) {
                 std::lock_guard lock{mutex_};
+                worker_ns_ += chunk_ns;
                 ReleaseCompletedChunkLocked(*chunk);
                 continue;
             }
@@ -570,6 +606,7 @@ private:
                 std::lock_guard lock{mutex_};
                 failure_ = callback_error;
                 failure_flag_.store(true, std::memory_order_release);
+                worker_ns_ += chunk_ns;
                 chunk->state = ChunkState::Discarding;
                 completed_commands_ += chunk->command_count;
                 chunk->used = 0;
@@ -589,8 +626,12 @@ private:
             // like callbacks.
             for (std::size_t index = 0; index < discarded_count; ++index) {
                 Chunk& queued = *discarded[index];
+                const auto discard_start = measure_timing_ ? Clock::now() : Clock::time_point{};
                 DestroyChunkContents(queued);
+                const std::uint64_t discard_ns =
+                    measure_timing_ ? ToNanoseconds(Clock::now() - discard_start) : 0;
                 std::lock_guard lock{mutex_};
+                worker_ns_ += discard_ns;
                 ReleaseDiscardedChunkLocked(queued);
             }
             done_cv_.notify_all();
@@ -614,6 +655,10 @@ private:
     std::exception_ptr failure_{};
     std::atomic<bool> failure_flag_{};
     bool stop_requested_{};
+    const bool measure_timing_;
+    std::uint64_t worker_ns_{};
+    std::uint64_t drain_ns_{};
+    std::uint64_t space_wait_ns_{};
     std::thread worker_;
 };
 

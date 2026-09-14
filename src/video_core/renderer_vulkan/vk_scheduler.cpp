@@ -22,7 +22,10 @@ Scheduler::Scheduler(const Instance& instance, bool allow_recording_worker)
 #endif
     const char* enabled = std::getenv("SHADPS4_ASYNC_RECORDING");
     if (allow_recording_worker && enabled && std::string_view{enabled} == "1") {
-        recording_worker = std::make_unique<Common::CommandRecordingWorker<>>();
+        const char* timing = std::getenv("SHADPS4_ASYNC_RECORDING_TIMING");
+        recording_measure_timing = timing && std::string_view{timing} == "1";
+        recording_worker =
+            std::make_unique<Common::CommandRecordingWorker<>>(recording_measure_timing);
         recording_worker->Record([] { Common::SetCurrentThreadName("shadPS4:VkRecorder"); });
         LOG_INFO(Render_Vulkan, "AsyncRecording: enabled, ordered primary command worker");
     }
@@ -269,6 +272,13 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         LOG_INFO(
             Render_Vulkan, "AsyncRecording: commands={} chunks={} bytes={} borrows={} submits={}",
             counts.commands, counts.chunks, counts.bytes, synchronous_borrows, recording_submits);
+        if (recording_measure_timing) {
+            LOG_INFO(Render_Vulkan, "AsyncRecordingTime: worker_ns={} drain_ns={} space_wait_ns={}",
+                     counts.worker_ns, counts.drain_ns, counts.space_wait_ns);
+            for (const auto& [caller, calls] : recording_borrow_counts) {
+                LOG_INFO(Render_Vulkan, "AsyncBorrow: calls={} caller={}", calls, caller);
+            }
+        }
     }
     const u64 signal_value = master_semaphore.NextTick();
 
