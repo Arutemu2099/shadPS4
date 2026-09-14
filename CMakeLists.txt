@@ -1420,6 +1420,7 @@ if (ENABLE_DISCORD_RPC)
 endif()
 
 # Install rules
+include(cmake/AstraOptimizations.cmake)
 install(TARGETS shadps4 BUNDLE DESTINATION .)
 
 else()
