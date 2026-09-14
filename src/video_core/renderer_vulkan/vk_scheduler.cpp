@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/fault_monitor.h"
@@ -13,20 +15,121 @@ namespace Vulkan {
 
 std::mutex Scheduler::submit_mutex;
 
-Scheduler::Scheduler(const Instance& instance)
+Scheduler::Scheduler(const Instance& instance, bool allow_recording_worker)
     : instance{instance}, master_semaphore{instance}, command_pool{instance, &master_semaphore} {
 #if TRACY_GPU_ENABLED
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
 #endif
+    const char* enabled = std::getenv("SHADPS4_ASYNC_RECORDING");
+    if (allow_recording_worker && enabled && std::string_view{enabled} == "1") {
+        recording_worker = std::make_unique<Common::CommandRecordingWorker<>>();
+        recording_worker->Record([] { Common::SetCurrentThreadName("shadPS4:VkRecorder"); });
+        LOG_INFO(Render_Vulkan, "AsyncRecording: enabled, ordered primary command worker");
+    }
     AllocateWorkerCommandBuffers();
     priority_pending_ops_thread =
         std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
 }
 
 Scheduler::~Scheduler() {
+    recording_worker.reset();
 #if TRACY_GPU_ENABLED
     std::free(profiler_scope);
 #endif
+}
+
+void Scheduler::DrainRecording() {
+    if (recording_worker) {
+        recording_worker->Drain();
+    }
+}
+
+void Scheduler::CommitDynamicState() {
+    if (!IsAsyncRecording()) {
+        dynamic_state.Commit(instance, current_cmdbuf);
+        return;
+    }
+    auto& state = dynamic_state;
+    const auto old_dirty = state.dirty_state;
+    Record([snapshot = state, instance = &instance](vk::CommandBuffer cmdbuf) mutable {
+        snapshot.Commit(*instance, cmdbuf);
+    });
+    // Keep the conditional dirtiness which Commit deliberately postpones until
+    // its corresponding test is enabled. All values in the packet are owned.
+    state.dirty_state = {};
+    state.dirty_state.depth_compare_op = old_dirty.depth_compare_op && !state.depth_test_enabled;
+    state.dirty_state.depth_bounds = old_dirty.depth_bounds && !state.depth_bounds_test_enabled;
+    state.dirty_state.depth_bias = old_dirty.depth_bias && !state.depth_bias_enabled;
+    if (!state.stencil_test_enabled) {
+        state.dirty_state.stencil_front_ops = old_dirty.stencil_front_ops;
+        state.dirty_state.stencil_back_ops = old_dirty.stencil_back_ops;
+        state.dirty_state.stencil_front_reference = old_dirty.stencil_front_reference;
+        state.dirty_state.stencil_back_reference = old_dirty.stencil_back_reference;
+        state.dirty_state.stencil_front_write_mask = old_dirty.stencil_front_write_mask;
+        state.dirty_state.stencil_back_write_mask = old_dirty.stencil_back_write_mask;
+        state.dirty_state.stencil_front_compare_mask = old_dirty.stencil_front_compare_mask;
+        state.dirty_state.stencil_back_compare_mask = old_dirty.stencil_back_compare_mask;
+    }
+    state.dirty_state.feedback_loop_enabled =
+        old_dirty.feedback_loop_enabled && !instance.IsAttachmentFeedbackLoopLayoutSupported();
+}
+
+void Scheduler::PushDescriptors(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
+                                std::span<const vk::WriteDescriptorSet> writes) {
+    if (!IsAsyncRecording()) {
+        current_cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, writes);
+        return;
+    }
+    size_t bytes = AlignedPayloadSize(writes.size_bytes());
+    for (const auto& write : writes) {
+        // Extension chains are not produced by the guest pipeline path. Keep a
+        // scoped synchronous fallback for future callers with other descriptors.
+        if (write.pNext) {
+            auto access = AcquireCommandBuffer();
+            access.Handle().pushDescriptorSetKHR(bind_point, layout, 0, writes);
+            return;
+        }
+        if (write.pBufferInfo) {
+            bytes += AlignedPayloadSize(sizeof(vk::DescriptorBufferInfo) * write.descriptorCount);
+        }
+        if (write.pImageInfo) {
+            bytes += AlignedPayloadSize(sizeof(vk::DescriptorImageInfo) * write.descriptorCount);
+        }
+        if (write.pTexelBufferView) {
+            bytes += AlignedPayloadSize(sizeof(vk::BufferView) * write.descriptorCount);
+        }
+    }
+    if (bytes > 32768) {
+        auto access = AcquireCommandBuffer();
+        access.Handle().pushDescriptorSetKHR(bind_point, layout, 0, writes);
+        return;
+    }
+    recording_worker->RecordWithPayload(bytes, [&](std::span<std::byte> storage) {
+        auto* cursor = storage.data();
+        auto* copies = reinterpret_cast<vk::WriteDescriptorSet*>(cursor);
+        std::memcpy(copies, writes.data(), writes.size_bytes());
+        cursor += AlignedPayloadSize(writes.size_bytes());
+        for (size_t i = 0; i < writes.size(); ++i) {
+            auto& write = copies[i];
+            if (write.pBufferInfo) {
+                write.pBufferInfo =
+                    CopyPayload(cursor, std::span{write.pBufferInfo, write.descriptorCount}).data();
+            }
+            if (write.pImageInfo) {
+                write.pImageInfo =
+                    CopyPayload(cursor, std::span{write.pImageInfo, write.descriptorCount}).data();
+            }
+            if (write.pTexelBufferView) {
+                write.pTexelBufferView =
+                    CopyPayload(cursor, std::span{write.pTexelBufferView, write.descriptorCount})
+                        .data();
+            }
+        }
+        return [cmdbuf = current_cmdbuf, bind_point, layout, copies, count = writes.size()] {
+            cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0,
+                                        std::span<const vk::WriteDescriptorSet>{copies, count});
+        };
+    });
 }
 
 void Scheduler::BeginRendering(const RenderState& new_state) {
@@ -37,51 +140,55 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     is_rendering = true;
     render_state = new_state;
 
-    std::array<vk::RenderingAttachmentInfo, 8> color_attachments;
-    for (u32 i = 0; i < render_state.num_color_attachments; ++i) {
-        const auto& cb = render_state.color_attachments[i];
-        color_attachments[i] = vk::RenderingAttachmentInfo{
-            .imageView = cb.image_view,
-            .imageLayout = cb.image_layout,
-            .loadOp = cb.is_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
+    Record([render_state = new_state](vk::CommandBuffer cmdbuf) {
+        std::array<vk::RenderingAttachmentInfo, 8> color_attachments;
+        for (u32 i = 0; i < render_state.num_color_attachments; ++i) {
+            const auto& cb = render_state.color_attachments[i];
+            color_attachments[i] = vk::RenderingAttachmentInfo{
+                .imageView = cb.image_view,
+                .imageLayout = cb.image_layout,
+                .loadOp = cb.is_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
+                .storeOp = vk::AttachmentStoreOp::eStore,
+                .clearValue =
+                    vk::ClearValue{.color = vk::ClearColorValue{.uint32 = cb.clear_value}},
+            };
+        }
+
+        const auto& db = render_state.depth_stencil_attachment;
+        const vk::RenderingAttachmentInfo depth_attachment = {
+            .imageView = db.image_view,
+            .imageLayout = db.image_layout,
+            .loadOp = db.depth_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
             .storeOp = vk::AttachmentStoreOp::eStore,
-            .clearValue = vk::ClearValue{.color = vk::ClearColorValue{.uint32 = cb.clear_value}},
+            .clearValue = vk::ClearValue{.depthStencil =
+                                             vk::ClearDepthStencilValue{
+                                                 .depth = std::bit_cast<float>(db.clear_value[0])}},
         };
-    }
+        const vk::RenderingAttachmentInfo stencil_attachment = {
+            .imageView = db.image_view,
+            .imageLayout = db.image_layout,
+            .loadOp = db.stencil_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
+            .storeOp = vk::AttachmentStoreOp::eStore,
+            .clearValue =
+                vk::ClearValue{.depthStencil =
+                                   vk::ClearDepthStencilValue{.stencil = db.clear_value[1]}},
+        };
 
-    const auto& db = render_state.depth_stencil_attachment;
-    const vk::RenderingAttachmentInfo depth_attachment = {
-        .imageView = db.image_view,
-        .imageLayout = db.image_layout,
-        .loadOp = db.depth_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
-        .storeOp = vk::AttachmentStoreOp::eStore,
-        .clearValue =
-            vk::ClearValue{.depthStencil = vk::ClearDepthStencilValue{.depth = std::bit_cast<float>(
-                                                                          db.clear_value[0])}},
-    };
-    const vk::RenderingAttachmentInfo stencil_attachment = {
-        .imageView = db.image_view,
-        .imageLayout = db.image_layout,
-        .loadOp = db.stencil_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
-        .storeOp = vk::AttachmentStoreOp::eStore,
-        .clearValue = vk::ClearValue{.depthStencil =
-                                         vk::ClearDepthStencilValue{.stencil = db.clear_value[1]}},
-    };
+        const vk::RenderingInfo rendering_info = {
+            .renderArea =
+                {
+                    .offset = {0, 0},
+                    .extent = {render_state.width, render_state.height},
+                },
+            .layerCount = render_state.num_layers,
+            .colorAttachmentCount = render_state.num_color_attachments,
+            .pColorAttachments = color_attachments.data(),
+            .pDepthAttachment = db.has_depth ? &depth_attachment : nullptr,
+            .pStencilAttachment = db.has_stencil ? &stencil_attachment : nullptr,
+        };
 
-    const vk::RenderingInfo rendering_info = {
-        .renderArea =
-            {
-                .offset = {0, 0},
-                .extent = {render_state.width, render_state.height},
-            },
-        .layerCount = render_state.num_layers,
-        .colorAttachmentCount = render_state.num_color_attachments,
-        .pColorAttachments = color_attachments.data(),
-        .pDepthAttachment = db.has_depth ? &depth_attachment : nullptr,
-        .pStencilAttachment = db.has_stencil ? &stencil_attachment : nullptr,
-    };
-
-    current_cmdbuf.beginRendering(rendering_info);
+        cmdbuf.beginRendering(rendering_info);
+    });
 }
 
 void Scheduler::EndRendering() {
@@ -89,7 +196,7 @@ void Scheduler::EndRendering() {
         return;
     }
     is_rendering = false;
-    current_cmdbuf.endRendering();
+    Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
 }
 
 void Scheduler::Flush(SubmitInfo& info) {
@@ -131,6 +238,7 @@ void Scheduler::PopPendingOperations() {
 }
 
 void Scheduler::AllocateWorkerCommandBuffers() {
+    DrainRecording();
     const vk::CommandBufferBeginInfo begin_info = {
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
     };
@@ -154,6 +262,14 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 void Scheduler::SubmitExecution(SubmitInfo& info) {
     std::scoped_lock lk{submit_mutex};
     Common::FaultMonitor::CountGpuSubmit();
+    EndRendering();
+    DrainRecording();
+    if (recording_worker && ++recording_submits % 1000 == 0) {
+        const auto counts = recording_worker->GetCounters();
+        LOG_INFO(
+            Render_Vulkan, "AsyncRecording: commands={} chunks={} bytes={} borrows={} submits={}",
+            counts.commands, counts.chunks, counts.bytes, synchronous_borrows, recording_submits);
+    }
     const u64 signal_value = master_semaphore.NextTick();
 
 #if TRACY_GPU_ENABLED

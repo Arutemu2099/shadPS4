@@ -134,7 +134,8 @@ void FaultManager::ProcessFaultBuffer() {
         },
     }};
     scheduler.EndRendering();
-    const auto cmdbuf = scheduler.CommandBuffer();
+    auto command_access = scheduler.AcquireCommandBuffer();
+    const auto cmdbuf = command_access.Handle();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .dependencyFlags = vk::DependencyFlagBits::eByRegion,
         .bufferMemoryBarrierCount = 1,

@@ -21,22 +21,27 @@ Pipeline::~Pipeline() = default;
 
 void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers& buffer_barriers,
                              const Shader::PushData& push_data) const {
-    const auto cmdbuf = scheduler.CommandBuffer();
     const auto bind_point =
         IsCompute() ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;
 
     if (!buffer_barriers.empty()) {
-        const auto dependencies = vk::DependencyInfo{
-            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-            .bufferMemoryBarrierCount = u32(buffer_barriers.size()),
-            .pBufferMemoryBarriers = buffer_barriers.data(),
-        };
         scheduler.EndRendering();
-        cmdbuf.pipelineBarrier2(dependencies);
+        scheduler.RecordArrays(
+            [](vk::CommandBuffer cmdbuf, auto barriers) {
+                cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                    .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                    .bufferMemoryBarrierCount = u32(barriers.size()),
+                    .pBufferMemoryBarriers = barriers.data(),
+                });
+            },
+            std::span<const vk::BufferMemoryBarrier2>{buffer_barriers});
     }
 
     const auto stage_flags = IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
-    cmdbuf.pushConstants(*pipeline_layout, stage_flags, 0u, sizeof(push_data), &push_data);
+    const auto layout = *pipeline_layout;
+    scheduler.Record([layout, stage_flags, push_data](vk::CommandBuffer cmdbuf) {
+        cmdbuf.pushConstants(layout, stage_flags, 0u, sizeof(push_data), &push_data);
+    });
 
     // Bind descriptor set.
     if (set_writes.empty()) {
@@ -44,7 +49,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
     }
 
     if (uses_push_descriptors) {
-        cmdbuf.pushDescriptorSetKHR(bind_point, *pipeline_layout, 0, set_writes);
+        scheduler.PushDescriptors(bind_point, layout, set_writes);
         return;
     }
 
@@ -53,7 +58,9 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
         set_write.dstSet = desc_set;
     }
     instance.GetDevice().updateDescriptorSets(set_writes, {});
-    cmdbuf.bindDescriptorSets(bind_point, *pipeline_layout, 0, desc_set, {});
+    scheduler.Record([bind_point, layout, desc_set](vk::CommandBuffer cmdbuf) {
+        cmdbuf.bindDescriptorSets(bind_point, layout, 0, desc_set, {});
+    });
 }
 
 std::string Pipeline::GetDebugString() const {

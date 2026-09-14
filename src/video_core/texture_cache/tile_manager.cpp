@@ -193,7 +193,8 @@ TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset
 
     scheduler.EndRendering();
 
-    const auto cmdbuf = scheduler.CommandBuffer();
+    auto command_access = scheduler.AcquireCommandBuffer();
+    const auto cmdbuf = command_access.Handle();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, false));
 
     const vk::DescriptorBufferInfo tiled_buffer_info{
@@ -276,7 +277,8 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
         vmaDestroyBuffer(instance.GetAllocator(), temp_buffer, temp_allocation);
     });
 
-    const auto cmdbuf = scheduler.CommandBuffer();
+    auto command_access = scheduler.AcquireCommandBuffer();
+    const auto cmdbuf = command_access.Handle();
     in_image.Download(buffer_copies, temp_buffer, 0, copy_size);
 
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, true));

@@ -96,13 +96,13 @@ static u64 StreamCopyMaxSize() {
 /// The clip is what keeps this safe: `FindBuffer` has already run on the original range, so
 /// buffer creation and merging behaviour is unchanged by the wider download.
 static std::pair<VAddr, u64> WidenReadFault(const Buffer& buffer, VAddr device_addr, u64 size,
-                                          u64 window) {
+                                            u64 window) {
     if (!buffer.IsInBounds(device_addr, size)) {
         return {device_addr, size};
     }
     const VAddr begin = std::max(Common::AlignDown(device_addr, window), buffer.CpuAddr());
     const VAddr end = std::min(Common::AlignUp(device_addr + size, window),
-                              buffer.CpuAddr() + buffer.SizeBytes());
+                               buffer.CpuAddr() + buffer.SizeBytes());
     return {begin, end - begin};
 }
 
@@ -148,7 +148,9 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                       DEFAULT_CRITICAL_GC_MEMORY));
 }
 
-BufferCache::~BufferCache() = default;
+BufferCache::~BufferCache() {
+    scheduler.DrainRecording();
+}
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
     if (!IsRegionRegistered(device_addr, size)) {
@@ -245,7 +247,8 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     }
     download_buffer.Commit();
     scheduler.EndRendering();
-    const auto cmdbuf = scheduler.CommandBuffer();
+    auto command_access = scheduler.AcquireCommandBuffer();
+    const auto cmdbuf = command_access.Handle();
     cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(), copies);
     const auto write_data = [&]() {
         auto* memory = Core::Memory::Instance();
@@ -281,8 +284,12 @@ void BufferCache::BindVertexBuffers(
 
     if (instance.IsVertexInputDynamicState()) {
         // Update current vertex inputs.
-        const auto cmdbuf = scheduler.CommandBuffer();
-        cmdbuf.setVertexInputEXT(bindings, attributes);
+        scheduler.RecordArrays(
+            [](vk::CommandBuffer cmdbuf, auto bindings, auto attributes) {
+                cmdbuf.setVertexInputEXT(bindings, attributes);
+            },
+            std::span<const vk::VertexInputBindingDescription2EXT>{bindings},
+            std::span<const vk::VertexInputAttributeDescription2EXT>{attributes});
     }
 
     if (bindings.empty()) {
@@ -365,14 +372,18 @@ void BufferCache::BindVertexBuffers(
         host_strides.push_back(buffer.GetStride());
     }
 
-    const auto cmdbuf = scheduler.CommandBuffer();
-    const auto num_buffers = guest_buffers.size();
-    if (instance.IsVertexInputDynamicState()) {
-        cmdbuf.bindVertexBuffers(0, num_buffers, host_buffers.data(), host_offsets.data());
-    } else {
-        cmdbuf.bindVertexBuffers2(0, num_buffers, host_buffers.data(), host_offsets.data(),
-                                  host_sizes.data(), host_strides.data());
-    }
+    scheduler.RecordArrays(
+        [dynamic = instance.IsVertexInputDynamicState()](vk::CommandBuffer cmdbuf, auto buffers,
+                                                         auto offsets, auto sizes, auto strides) {
+            if (dynamic) {
+                cmdbuf.bindVertexBuffers(0, u32(buffers.size()), buffers.data(), offsets.data());
+            } else {
+                cmdbuf.bindVertexBuffers2(0, u32(buffers.size()), buffers.data(), offsets.data(),
+                                          sizes.data(), strides.data());
+            }
+        },
+        std::span<const vk::Buffer>{host_buffers}, std::span<const vk::DeviceSize>{host_offsets},
+        std::span<const vk::DeviceSize>{host_sizes}, std::span<const vk::DeviceSize>{host_strides});
 }
 
 void BufferCache::BindIndexBuffer(
@@ -395,8 +406,9 @@ void BufferCache::BindIndexBuffer(
             barriers.emplace_back(*barrier);
         }
     }
-    const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindIndexBuffer(vk_buffer->Handle(), offset, index_type);
+    scheduler.Record([buffer = vk_buffer->Handle(), offset, index_type](vk::CommandBuffer cmdbuf) {
+        cmdbuf.bindIndexBuffer(buffer, offset, index_type);
+    });
 }
 
 void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
@@ -477,7 +489,8 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         },
     };
     scheduler.EndRendering();
-    const auto cmdbuf = scheduler.CommandBuffer();
+    auto command_access = scheduler.AcquireCommandBuffer();
+    const auto cmdbuf = command_access.Handle();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .dependencyFlags = vk::DependencyFlagBits::eByRegion,
         .bufferMemoryBarrierCount = 2,
@@ -690,7 +703,8 @@ void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
         .size = overlap.SizeBytes(),
     };
     scheduler.EndRendering();
-    const auto cmdbuf = scheduler.CommandBuffer();
+    auto command_access = scheduler.AcquireCommandBuffer();
+    const auto cmdbuf = command_access.Handle();
 
     boost::container::static_vector<vk::BufferMemoryBarrier2, 2> pre_barriers{};
     if (auto src_barrier = overlap.GetBarrier(vk::AccessFlagBits2::eTransferRead,
@@ -811,7 +825,6 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
 
     if (src_buffer) {
         scheduler.EndRendering();
-        const auto cmdbuf = scheduler.CommandBuffer();
         const vk::BufferMemoryBarrier2 pre_barrier = {
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
             .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
@@ -832,17 +845,22 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             .offset = 0,
             .size = buffer.SizeBytes(),
         };
-        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-            .bufferMemoryBarrierCount = 1,
-            .pBufferMemoryBarriers = &pre_barrier,
-        });
-        cmdbuf.copyBuffer(src_buffer, buffer.buffer, copies);
-        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-            .bufferMemoryBarrierCount = 1,
-            .pBufferMemoryBarriers = &post_barrier,
-        });
+        scheduler.RecordArrays(
+            [src_buffer, destination = buffer.Handle(), pre_barrier,
+             post_barrier](vk::CommandBuffer cmdbuf, auto owned_copies) {
+                cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                    .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                    .bufferMemoryBarrierCount = 1,
+                    .pBufferMemoryBarriers = &pre_barrier,
+                });
+                cmdbuf.copyBuffer(src_buffer, destination, owned_copies);
+                cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                    .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                    .bufferMemoryBarrierCount = 1,
+                    .pBufferMemoryBarriers = &post_barrier,
+                });
+            },
+            std::span<const vk::BufferCopy>{copies});
         TouchBuffer(buffer);
     }
     if (is_texel_buffer && !is_written) {
@@ -887,8 +905,8 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, u32 size) {
     // TIER-2 SPLIT PROBE: the ob_sync gap (ob_sync - scan/copy/mark = ~7.7 ms/frame) is untimed and
     // was GUESSED to be lock/framing. This path (read-only texel buffers) is the prime suspect.
-    // Split it: FindImageFromRange (texture-cache lookup under TextureCache::mutex) vs TileImage (the
-    // real work, only when an image actually aliases). Strip before ship.
+    // Split it: FindImageFromRange (texture-cache lookup under TextureCache::mutex) vs TileImage
+    // (the real work, only when an image actually aliases). Strip before ship.
     static u64 sfi_calls = 0, sfi_found = 0, sfi_find_ns = 0, sfi_tile_ns = 0;
     const auto sfi_t0 = Common::FaultMonitor::Now();
     const ImageId image_id = texture_cache.FindImageFromRange(device_addr, size);
@@ -898,8 +916,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, 
         if (sfi_calls < 300000) {
             return;
         }
-        LOG_INFO(Render,
-                 "SfiSplit: calls={} found={:.1f}% find={:.3f}us/call tile={:.3f}us/found",
+        LOG_INFO(Render, "SfiSplit: calls={} found={:.1f}% find={:.3f}us/call tile={:.3f}us/found",
                  sfi_calls, 100.0 * static_cast<double>(sfi_found) / sfi_calls,
                  static_cast<double>(sfi_find_ns) / 1e3 / sfi_calls,
                  sfi_found ? static_cast<double>(sfi_tile_ns) / 1e3 / sfi_found : 0.0);
@@ -987,7 +1004,8 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* val
         scheduler.DeferOperation([buffer = std::move(temp_buffer)]() mutable {});
     }
     scheduler.EndRendering();
-    const auto cmdbuf = scheduler.CommandBuffer();
+    auto command_access = scheduler.AcquireCommandBuffer();
+    const auto cmdbuf = command_access.Handle();
     const vk::BufferMemoryBarrier2 pre_barrier = {
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,

@@ -324,7 +324,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     pipeline_cache = std::move(cache);
 }
 
-PipelineCache::~PipelineCache() = default;
+PipelineCache::~PipelineCache() {
+    scheduler.DrainRecording();
+}
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     // MEASUREMENT (perf-forest): GetGraphicsPipeline is 0.99 us/draw = 6.3 ms/frame and never
@@ -815,31 +817,36 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,
                                                              std::span<const u32> spv_code) {
     std::optional<vk::ShaderModule> new_module{};
-    for (const auto& [_, program] : program_cache) {
-        for (auto& m : program->modules) {
-            if (m.module == module) {
-                if (program->prepared) {
-                    program->prepared->valid = false;
+    // Devtools calls this from the UI thread. Serialize replacement with guest
+    // draws, then finish all uses of the old pipelines before destroying them.
+    liverpool->SendCommand<true>([&] {
+        scheduler.Finish();
+        for (const auto& [_, program] : program_cache) {
+            for (auto& m : program->modules) {
+                if (m.module == module) {
+                    if (program->prepared) {
+                        program->prepared->valid = false;
+                    }
+                    const auto& d = instance.GetDevice();
+                    d.destroyShaderModule(m.module);
+                    m.module = CompileSPV(spv_code, d);
+                    new_module = m.module;
                 }
-                const auto& d = instance.GetDevice();
-                d.destroyShaderModule(m.module);
-                m.module = CompileSPV(spv_code, d);
-                new_module = m.module;
             }
         }
-    }
-    if (module_related_pipelines.contains(module)) {
-        auto& pipeline_keys = module_related_pipelines[module];
-        for (auto& key : pipeline_keys) {
-            if (std::holds_alternative<GraphicsPipelineKey>(key)) {
-                auto& graphics_key = std::get<GraphicsPipelineKey>(key);
-                graphics_pipelines.erase(graphics_key);
-            } else if (std::holds_alternative<ComputePipelineKey>(key)) {
-                auto& compute_key = std::get<ComputePipelineKey>(key);
-                compute_pipelines.erase(compute_key);
+        if (module_related_pipelines.contains(module)) {
+            auto& pipeline_keys = module_related_pipelines[module];
+            for (auto& key : pipeline_keys) {
+                if (std::holds_alternative<GraphicsPipelineKey>(key)) {
+                    auto& graphics_key = std::get<GraphicsPipelineKey>(key);
+                    graphics_pipelines.erase(graphics_key);
+                } else if (std::holds_alternative<ComputePipelineKey>(key)) {
+                    auto& compute_key = std::get<ComputePipelineKey>(key);
+                    compute_pipelines.erase(compute_key);
+                }
             }
         }
-    }
+    });
     return new_module;
 }
 

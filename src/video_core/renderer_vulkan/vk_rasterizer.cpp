@@ -120,11 +120,14 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     memory->SetRasterizer(this);
 }
 
-Rasterizer::~Rasterizer() = default;
+Rasterizer::~Rasterizer() {
+    scheduler.DrainRecording();
+}
 
 void Rasterizer::CpSync() {
     scheduler.EndRendering();
-    auto cmdbuf = scheduler.CommandBuffer();
+    auto command_access = scheduler.AcquireCommandBuffer();
+    auto cmdbuf = command_access.Handle();
 
     const vk::MemoryBarrier ib_barrier{
         .srcAccessMask = vk::AccessFlagBits::eShaderWrite,
@@ -297,7 +300,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             if (verify_targets) {
                 verify(hit, entry.value,
                        VideoCore::TextureCache::ImageDesc{regs.depth_buffer, regs.depth_view,
-                                                         regs.depth_control, htile_address, hint});
+                                                          regs.depth_control, htile_address, hint});
             }
             desc = entry.value;
         } else {
@@ -420,16 +423,16 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     const auto& fetch_shader = pipeline->GetFetchShader();
     const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
 
-    const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
-
-    if (is_indexed) {
-        cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
-                           s32(vertex_offset), instance_offset);
-    } else {
-        cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
-                    instance_offset);
-    }
+    scheduler.Record([handle = pipeline->Handle(), is_indexed, count = regs.num_indices,
+                      instances = regs.num_instances.NumInstances(), vertex_offset,
+                      instance_offset](vk::CommandBuffer cmdbuf) {
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+        if (is_indexed) {
+            cmdbuf.drawIndexed(count, instances, 0, s32(vertex_offset), instance_offset);
+        } else {
+            cmdbuf.draw(count, instances, vertex_offset, instance_offset);
+        }
+    });
     DebugState.IncDrawCall();
 
     sample.EndPhase(Common::DrawSampleProbe::Phase::ActualDraw);
@@ -438,14 +441,13 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     sample.EndPhase(Common::DrawSampleProbe::Phase::ResetImageBindings);
     sample.Finish();
 
-    Common::FaultMonitor::CountDrawTail(
-        Common::FaultMonitor::DiffNs(t_entry, t_pipeline) +
-            Common::FaultMonitor::DiffNs(t_prepare, t_bindres),
-        Common::FaultMonitor::DiffNs(t_vtxbuf, t_descwrite),
-        Common::FaultMonitor::DiffNs(t_descwrite, t_dynstate),
-        Common::FaultMonitor::DiffNs(t_dynstate, t_schedbegin),
-        Common::FaultMonitor::DiffNs(t_schedbegin, t_emit),
-        Common::FaultMonitor::SinceNs(t_emit));
+    Common::FaultMonitor::CountDrawTail(Common::FaultMonitor::DiffNs(t_entry, t_pipeline) +
+                                            Common::FaultMonitor::DiffNs(t_prepare, t_bindres),
+                                        Common::FaultMonitor::DiffNs(t_vtxbuf, t_descwrite),
+                                        Common::FaultMonitor::DiffNs(t_descwrite, t_dynstate),
+                                        Common::FaultMonitor::DiffNs(t_dynstate, t_schedbegin),
+                                        Common::FaultMonitor::DiffNs(t_schedbegin, t_emit),
+                                        Common::FaultMonitor::SinceNs(t_emit));
 }
 
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
@@ -501,7 +503,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     // We can safely ignore both SGPR UD indices and results of fetch shader parsing, as vertex and
     // instance offsets will be automatically applied by Vulkan from indirect args buffer.
 
-    const auto cmdbuf = scheduler.CommandBuffer();
+    auto command_access = scheduler.AcquireCommandBuffer();
+    const auto cmdbuf = command_access.Handle();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
 
     if (is_indexed) {
@@ -559,9 +562,11 @@ void Rasterizer::DispatchDirect() {
     scheduler.EndRendering();
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
 
-    const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
-    cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    scheduler.Record([handle = pipeline->Handle(), x = cs_program.dim_x, y = cs_program.dim_y,
+                      z = cs_program.dim_z](vk::CommandBuffer cmdbuf) {
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+        cmdbuf.dispatch(x, y, z);
+    });
     DebugState.IncDispatch();
 
     ResetBindings();
@@ -597,9 +602,11 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     scheduler.EndRendering();
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
 
-    const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
-    cmdbuf.dispatchIndirect(buffer->Handle(), base);
+    scheduler.Record(
+        [handle = pipeline->Handle(), buffer = buffer->Handle(), base](vk::CommandBuffer cmdbuf) {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+            cmdbuf.dispatchIndirect(buffer, base);
+        });
     DebugState.IncDispatch();
 
     ResetBindings();
@@ -1166,10 +1173,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     // The descriptor-write loop between t_view's end and t_sampler_start is bookkeeping only and
     // is folded into the sampler span; if sampler time looks large with a high memo hit rate, that
     // loop is where to look next rather than GetSampler.
-    Common::FaultMonitor::CountBindTexSplit(
-        Common::FaultMonitor::DiffNs(t_findimage, t_view),
-        Common::FaultMonitor::DiffNs(t_view, t_sampler_start),
-        Common::FaultMonitor::SinceNs(t_sampler_start));
+    Common::FaultMonitor::CountBindTexSplit(Common::FaultMonitor::DiffNs(t_findimage, t_view),
+                                            Common::FaultMonitor::DiffNs(t_view, t_sampler_start),
+                                            Common::FaultMonitor::SinceNs(t_sampler_start));
 }
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
@@ -1345,8 +1351,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                             "color_writes_disabled={} depth_en={} depth_valid={} stencil_en={} "
                             "stencil_valid={}{} shaders:{}",
                             key.mrt_mask, cb_disabled, bool(regs.depth_control.depth_enable),
-                            regs.depth_buffer.DepthValid(),
-                            bool(regs.depth_control.stencil_enable),
+                            regs.depth_buffer.DepthValid(), bool(regs.depth_control.stencil_enable),
                             regs.depth_buffer.StencilValid(), detail, stages);
             }
         }
@@ -1424,9 +1429,9 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
         .dstOffset = {0, 0, 0},
         .extent = {write_image.info.size.width, write_image.info.size.height, 1},
     };
-    scheduler.CommandBuffer().copyImage(read_image.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
-                                        write_image.GetImage(),
-                                        vk::ImageLayout::eTransferDstOptimal, region);
+    scheduler.AcquireCommandBuffer().Handle().copyImage(
+        read_image.GetImage(), vk::ImageLayout::eTransferSrcOptimal, write_image.GetImage(),
+        vk::ImageLayout::eTransferDstOptimal, region);
 
     ScopeMarkerEnd();
 }
@@ -1509,8 +1514,7 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
     UpdateRasterizationState();
     UpdateColorBlendingState(pipeline);
 
-    auto& dynamic_state = scheduler.GetDynamicState();
-    dynamic_state.Commit(instance, scheduler.CommandBuffer());
+    scheduler.CommitDynamicState();
 }
 
 void Rasterizer::UpdateViewportScissorState() const {
@@ -1758,7 +1762,8 @@ void Rasterizer::ScopeMarkerBegin(const std::string_view& str, bool from_guest) 
         (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
         return;
     }
-    const auto cmdbuf = scheduler.CommandBuffer();
+    auto command_access = scheduler.AcquireCommandBuffer();
+    const auto cmdbuf = command_access.Handle();
     cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
         .pLabelName = str.data(),
     });
@@ -1769,7 +1774,8 @@ void Rasterizer::ScopeMarkerEnd(bool from_guest) {
         (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
         return;
     }
-    const auto cmdbuf = scheduler.CommandBuffer();
+    auto command_access = scheduler.AcquireCommandBuffer();
+    const auto cmdbuf = command_access.Handle();
     cmdbuf.endDebugUtilsLabelEXT();
 }
 
@@ -1778,7 +1784,8 @@ void Rasterizer::ScopedMarkerInsert(const std::string_view& str, bool from_guest
         (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
         return;
     }
-    const auto cmdbuf = scheduler.CommandBuffer();
+    auto command_access = scheduler.AcquireCommandBuffer();
+    const auto cmdbuf = command_access.Handle();
     cmdbuf.insertDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
         .pLabelName = str.data(),
     });
@@ -1790,7 +1797,8 @@ void Rasterizer::ScopedMarkerInsertColor(const std::string_view& str, const u32 
         (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
         return;
     }
-    const auto cmdbuf = scheduler.CommandBuffer();
+    auto command_access = scheduler.AcquireCommandBuffer();
+    const auto cmdbuf = command_access.Handle();
     cmdbuf.insertDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
         .pLabelName = str.data(),
         .color = std::array<f32, 4>(

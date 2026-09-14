@@ -5,8 +5,12 @@
 
 #include <condition_variable>
 #include <mutex>
+#include <span>
 #include <thread>
+#include <tuple>
 #include <queue>
+
+#include "common/command_recording_worker.h"
 
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
@@ -347,7 +351,7 @@ struct DynamicState {
 
 class Scheduler {
 public:
-    explicit Scheduler(const Instance& instance);
+    explicit Scheduler(const Instance& instance, bool allow_recording_worker = false);
     ~Scheduler();
 
     /// Sends the current execution context to the GPU
@@ -383,9 +387,75 @@ public:
         return dynamic_state;
     }
 
-    /// Returns the current command buffer.
-    vk::CommandBuffer CommandBuffer() const {
-        return current_cmdbuf;
+    // A raw handle may only be used while this scope is alive. Nested recordings run
+    // inline, so helpers retaining a handle cannot race the recording worker.
+    class CommandBufferAccess {
+    public:
+        explicit CommandBufferAccess(Scheduler& scheduler) : scheduler{scheduler} {
+            scheduler.DrainRecording();
+            ++scheduler.synchronous_scopes;
+            ++scheduler.synchronous_borrows;
+        }
+        ~CommandBufferAccess() {
+            --scheduler.synchronous_scopes;
+        }
+        CommandBufferAccess(const CommandBufferAccess&) = delete;
+        CommandBufferAccess& operator=(const CommandBufferAccess&) = delete;
+        vk::CommandBuffer Handle() const {
+            return scheduler.current_cmdbuf;
+        }
+
+    private:
+        Scheduler& scheduler;
+    };
+
+    [[nodiscard]] CommandBufferAccess AcquireCommandBuffer() {
+        return CommandBufferAccess{*this};
+    }
+
+    void DrainRecording();
+    void CommitDynamicState();
+    void PushDescriptors(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
+                         std::span<const vk::WriteDescriptorSet> writes);
+
+    bool IsAsyncRecording() const {
+        return recording_worker && synchronous_scopes == 0;
+    }
+
+    template <typename F>
+    void Record(F&& command) {
+        if (!IsAsyncRecording()) {
+            command(current_cmdbuf);
+            return;
+        }
+        recording_worker->Record(
+            [cmdbuf = current_cmdbuf, command = std::forward<F>(command)]() mutable {
+                command(cmdbuf);
+            });
+    }
+
+    // Clone transient arrays into the same unpublished chunk as their callback.
+    // Factories never execute guest-memory reads or reenter the scheduler.
+    template <typename F, typename... T>
+    void RecordArrays(F&& command, std::span<const T>... arrays) {
+        static_assert((std::is_trivially_copyable_v<T> && ...));
+        if (!IsAsyncRecording()) {
+            command(current_cmdbuf, arrays...);
+            return;
+        }
+        const size_t bytes = (size_t{} + ... + AlignedPayloadSize(arrays.size_bytes()));
+        if (bytes > 32768) {
+            auto access = AcquireCommandBuffer();
+            command(access.Handle(), arrays...);
+            return;
+        }
+        recording_worker->RecordWithPayload(bytes, [&](std::span<std::byte> storage) {
+            auto* cursor = storage.data();
+            auto copies = std::tuple{CopyPayload(cursor, arrays)...};
+            return [cmdbuf = current_cmdbuf, command = std::forward<F>(command), copies]() mutable {
+                std::apply([&](auto... spans) { command(cmdbuf, spans...); }, copies);
+            };
+        });
     }
 
     /// Returns the current command buffer tick.
@@ -426,6 +496,21 @@ public:
     static std::mutex submit_mutex;
 
 private:
+    static constexpr size_t AlignedPayloadSize(size_t bytes) {
+        constexpr size_t alignment = alignof(std::max_align_t);
+        return (bytes + alignment - 1) & ~(alignment - 1);
+    }
+    template <typename T>
+    static std::span<const T> CopyPayload(std::byte*& cursor, std::span<const T> source) {
+        static_assert(alignof(T) <= alignof(std::max_align_t));
+        const auto* result = reinterpret_cast<const T*>(cursor);
+        if (!source.empty()) {
+            std::memcpy(cursor, source.data(), source.size_bytes());
+            cursor += AlignedPayloadSize(source.size_bytes());
+        }
+        return {result, source.size()};
+    }
+
     void AllocateWorkerCommandBuffers();
 
     void SubmitExecution(SubmitInfo& info);
@@ -434,6 +519,10 @@ private:
 
 private:
     const Instance& instance;
+    std::unique_ptr<Common::CommandRecordingWorker<>> recording_worker;
+    u32 synchronous_scopes = 0;
+    u64 synchronous_borrows = 0;
+    u64 recording_submits = 0;
     MasterSemaphore master_semaphore;
     CommandPool command_pool;
     DynamicState dynamic_state;

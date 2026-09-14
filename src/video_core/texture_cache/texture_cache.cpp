@@ -70,7 +70,9 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     trigger_gc_memory = static_cast<u64>((device_local_memory - mem_threshold) / 2);
 }
 
-TextureCache::~TextureCache() = default;
+TextureCache::~TextureCache() {
+    scheduler.DrainRecording();
+}
 
 void TextureCache::ProcessDownloadImages() {
     std::unique_lock lk{download_images_mutex};
@@ -87,8 +89,9 @@ void TextureCache::ProcessDownloadImages() {
             if (False(image.flags & ImageFlagBits::GpuModified)) {
                 continue;
             }
-            const u64 size = u64(image.info.pitch) * image.info.size.height * image.info.size.depth *
-                             image.info.resources.layers * (image.info.num_bits / 8);
+            const u64 size = u64(image.info.pitch) * image.info.size.height *
+                             image.info.size.depth * image.info.resources.layers *
+                             (image.info.num_bits / 8);
             ++batch_copies;
             batch_bytes += (size + 15) & ~u64{15};
         }
@@ -146,7 +149,8 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
         .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
     };
     scheduler.EndRendering();
-    const auto cmdbuf = scheduler.CommandBuffer();
+    auto command_access = scheduler.AcquireCommandBuffer();
+    const auto cmdbuf = command_access.Handle();
     image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
     cmdbuf.copyImageToBuffer(image.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
                              download_buffer.Handle(), image_download);
@@ -580,12 +584,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         if (info.guest_address && info.guest_address < address_limit && info.guest_size &&
             info.guest_size <= address_limit - info.guest_address &&
             info.pixel_format != vk::Format::eUndefined) {
-            key = {info.guest_address, info.guest_size, info.size, info.type, info.pixel_format,
-                   info.resources, desc.type, exact_fmt};
+            key = {info.guest_address, info.guest_size, info.size, info.type,
+                   info.pixel_format,  info.resources,  desc.type, exact_fmt};
             // Address/format select a bounded slot; full field equality resolves collisions.
             const u64 address_hash = (info.guest_address >> 8) ^ (info.guest_address >> 25);
-            const u64 index = (address_hash ^ (u64(info.pixel_format) << 3)) &
-                              (PreparedImages::Capacity - 1);
+            const u64 index =
+                (address_hash ^ (u64(info.pixel_format) << 3)) & (PreparedImages::Capacity - 1);
             memo = &prepared_images->entries[index];
             if (memo->generation == lookup_generation && memo->key == key && memo->id &&
                 slot_images.is_allocated(memo->id)) {
@@ -610,15 +614,17 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     ImageIds image_ids;
     if (!reuse) {
         // Verification runs this original lookup once, not a second mutating resolve pass.
-        ForEachImageInRegion(info.guest_address, info.guest_size,
-                             [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
+        ForEachImageInRegion(
+            info.guest_address, info.guest_size,
+            [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
     }
     const auto fi_t2 = Common::FaultMonitor::Now();
     ++fi_calls;
     fi_lock_ns += Common::FaultMonitor::DiffNs(fi_t0, fi_t1);
     fi_walk_ns += Common::FaultMonitor::DiffNs(fi_t1, fi_t2);
     if (!reuse) {
-        fi_pages += ((info.guest_address + info.guest_size - 1) >> 20) - (info.guest_address >> 20) + 1;
+        fi_pages +=
+            ((info.guest_address + info.guest_size - 1) >> 20) - (info.guest_address >> 20) + 1;
     }
     fi_cands += image_ids.size();
 
@@ -712,8 +718,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         // Creation and overlap resolution are intentionally not memoized. Even an initial
         // perfect match can be freed/recreated by the resource check; don't publish that result.
         // CMASK/FMASK/HTILE metadata mutations do not enter any perfect-match predicate.
-        if (memo && !memo_id && perfect_image_id && image_id == perfect_image_id && image.image_uid &&
-            True(image.flags & ImageFlagBits::Registered) &&
+        if (memo && !memo_id && perfect_image_id && image_id == perfect_image_id &&
+            image.image_uid && True(image.flags & ImageFlagBits::Registered) &&
             !(image.info.resources < info.resources) && final_generation == lookup_generation) {
             *memo = {key, image_id, image.image_uid, final_generation};
         }
@@ -731,8 +737,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
     fi_rest_ns += Common::FaultMonitor::SinceNs(fi_t2);
     if (fi_calls >= 500000) {
-        LOG_INFO(Render, "FiSplit: calls={} lock={:.3f} walk={:.3f} rest={:.3f}us/call "
-                         "perfect={:.1f}% new={:.1f}% pages={:.2f} cands={:.2f}",
+        LOG_INFO(Render,
+                 "FiSplit: calls={} lock={:.3f} walk={:.3f} rest={:.3f}us/call "
+                 "perfect={:.1f}% new={:.1f}% pages={:.2f} cands={:.2f}",
                  fi_calls, static_cast<double>(fi_lock_ns) / 1e3 / fi_calls,
                  static_cast<double>(fi_walk_ns) / 1e3 / fi_calls,
                  static_cast<double>(fi_rest_ns) / 1e3 / fi_calls,
@@ -747,11 +754,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 }
 
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
-    // Only images whose guest_address == address can match here. RegisterImage registers an image on
-    // every page it spans, so any such candidate is present on the single page containing `address`.
-    // Walking every page of the (often multi-MB) texel-buffer range therefore did N all-missing
-    // page-table lookups to find candidates that can only ever live on the first page - measured
-    // ~1.45 us/call, ~8.9 ms/frame in the forest, always missing. One lookup is sufficient and exact.
+    // Only images whose guest_address == address can match here. RegisterImage registers an image
+    // on every page it spans, so any such candidate is present on the single page containing
+    // `address`. Walking every page of the (often multi-MB) texel-buffer range therefore did N
+    // all-missing page-table lookups to find candidates that can only ever live on the first page -
+    // measured ~1.45 us/call, ~8.9 ms/frame in the forest, always missing. One lookup is sufficient
+    // and exact.
     ImageIds image_ids;
     if (const auto it = page_table.find(address >> Traits::PageBits); it != nullptr) {
         for (const ImageId image_id : *it) {
@@ -949,7 +957,7 @@ void TextureCache::RefreshImage(Image& image) {
         buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
     if (auto barrier = in_buffer->GetBarrier(vk::AccessFlagBits2::eTransferRead,
                                              vk::PipelineStageFlagBits2::eTransfer)) {
-        scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+        scheduler.AcquireCommandBuffer().Handle().pipelineBarrier2(vk::DependencyInfo{
             .dependencyFlags = vk::DependencyFlagBits::eByRegion,
             .bufferMemoryBarrierCount = 1,
             .pBufferMemoryBarriers = &barrier.value(),

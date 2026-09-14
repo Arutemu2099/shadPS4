@@ -340,8 +340,8 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
             const u32 ov_end = std::min(r.end, b);
             if (ov_begin < ov_end) {
                 const bool is_write = static_cast<bool>(r.state.access_mask & write_flags);
-                const bool needs = r.state.layout != dst_layout ||
-                                   r.state.access_mask != dst_mask || is_write;
+                const bool needs =
+                    r.state.layout != dst_layout || r.state.access_mask != dst_mask || is_write;
                 if (needs) {
                     barriers.emplace_back(vk::ImageMemoryBarrier2{
                         .srcStageMask = r.state.pl_stage,
@@ -395,8 +395,8 @@ void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
             ? vk::PipelineStageFlagBits2::eTransfer
             : vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
 
-    // MEASUREMENT (perf-forest): bt_transit is 11.5 ms/frame, the biggest single leaf, and has never
-    // been split into its three parts: GetBarriers (the subresource loop), EndRendering (the
+    // MEASUREMENT (perf-forest): bt_transit is 11.5 ms/frame, the biggest single leaf, and has
+    // never been split into its three parts: GetBarriers (the subresource loop), EndRendering (the
     // render-pass break, only when a barrier is actually emitted), and pipelineBarrier2 (submit).
     // Which dominates decides whether there is any lever left here.
     static u64 tr_calls = 0, tr_empty = 0, tr_getbar_ns = 0, tr_endr_ns = 0, tr_submit_ns = 0;
@@ -425,16 +425,22 @@ void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
         return;
     }
 
+    const auto emit_barriers = [](vk::CommandBuffer command, auto owned_barriers) {
+        command.pipelineBarrier2(vk::DependencyInfo{
+            .imageMemoryBarrierCount = static_cast<u32>(owned_barriers.size()),
+            .pImageMemoryBarriers = owned_barriers.data(),
+        });
+    };
     if (!cmdbuf) {
-        // When using external cmdbuf you are responsible for ending rp.
+        // External command buffers must be protected by their caller's access scope.
         scheduler->EndRendering();
-        cmdbuf = scheduler->CommandBuffer();
     }
     const auto tr_t2 = Common::FaultMonitor::Now();
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
-        .pImageMemoryBarriers = barriers.data(),
-    });
+    if (cmdbuf) {
+        emit_barriers(cmdbuf, std::span<const vk::ImageMemoryBarrier2>{barriers});
+    } else {
+        scheduler->RecordArrays(emit_barriers, std::span<const vk::ImageMemoryBarrier2>{barriers});
+    }
     tr_endr_ns += Common::FaultMonitor::DiffNs(tr_t1, tr_t2);
     tr_submit_ns += Common::FaultMonitor::DiffNs(tr_t2, Common::FaultMonitor::Now());
     tr_report();
@@ -466,21 +472,25 @@ void Image::Upload(std::span<const vk::BufferImageCopy> upload_copies, vk::Buffe
     const auto image_barriers =
         GetBarriers(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
                     vk::PipelineStageFlagBits2::eCopy, {});
-    const auto cmdbuf = scheduler->CommandBuffer();
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-        .bufferMemoryBarrierCount = 1,
-        .pBufferMemoryBarriers = &pre_barrier,
-        .imageMemoryBarrierCount = static_cast<u32>(image_barriers.size()),
-        .pImageMemoryBarriers = image_barriers.data(),
-    });
-    cmdbuf.copyBufferToImage(buffer, GetImage(), vk::ImageLayout::eTransferDstOptimal,
-                             upload_copies);
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-        .bufferMemoryBarrierCount = 1,
-        .pBufferMemoryBarriers = &post_barrier,
-    });
+    scheduler->RecordArrays(
+        [buffer, image = GetImage(), pre_barrier,
+         post_barrier](vk::CommandBuffer cmdbuf, auto owned_barriers, auto owned_copies) {
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                .bufferMemoryBarrierCount = 1,
+                .pBufferMemoryBarriers = &pre_barrier,
+                .imageMemoryBarrierCount = static_cast<u32>(owned_barriers.size()),
+                .pImageMemoryBarriers = owned_barriers.data(),
+            });
+            cmdbuf.copyBufferToImage(buffer, image, vk::ImageLayout::eTransferDstOptimal,
+                                     owned_copies);
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                .bufferMemoryBarrierCount = 1,
+                .pBufferMemoryBarriers = &post_barrier,
+            });
+        },
+        std::span<const vk::ImageMemoryBarrier2>{image_barriers}, upload_copies);
     Transit(vk::ImageLayout::eGeneral,
             vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {});
     flags &= ~ImageFlagBits::Dirty;
@@ -512,7 +522,8 @@ void Image::Download(std::span<const vk::BufferImageCopy> download_copies, vk::B
     const auto image_barriers =
         GetBarriers(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
                     vk::PipelineStageFlagBits2::eCopy, {});
-    auto cmdbuf = scheduler->CommandBuffer();
+    auto command_access = scheduler->AcquireCommandBuffer();
+    auto cmdbuf = command_access.Handle();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .dependencyFlags = vk::DependencyFlagBits::eByRegion,
         .bufferMemoryBarrierCount = 1,
@@ -667,7 +678,8 @@ void Image::CopyImage(Image& src_image) {
 
     Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {});
 
-    auto cmdbuf = scheduler->CommandBuffer();
+    auto command_access = scheduler->AcquireCommandBuffer();
+    auto cmdbuf = command_access.Handle();
 
     if (!regions.empty()) {
         cmdbuf.copyImage(src_image.GetImage(), src_image.backing->state.layout, GetImage(),
@@ -731,7 +743,8 @@ void Image::CopyImageWithBuffer(Image& src_image, vk::Buffer buffer, u64 offset)
     src_image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
     Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {});
 
-    auto cmdbuf = scheduler->CommandBuffer();
+    auto command_access = scheduler->AcquireCommandBuffer();
+    auto cmdbuf = command_access.Handle();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .dependencyFlags = vk::DependencyFlagBits::eByRegion,
         .bufferMemoryBarrierCount = 1,
@@ -795,7 +808,8 @@ void Image::CopyMip(Image& src_image, u32 mip, u32 slice) {
     Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {});
     src_image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
 
-    const auto cmdbuf = scheduler->CommandBuffer();
+    auto command_access = scheduler->AcquireCommandBuffer();
+    const auto cmdbuf = command_access.Handle();
     cmdbuf.copyImage(src_image.GetImage(), src_image.backing->state.layout, GetImage(),
                      backing->state.layout, image_copy);
     Transit(vk::ImageLayout::eGeneral,
@@ -830,9 +844,9 @@ void Image::Resolve(Image& src_image, const VideoCore::SubresourceRange& mrt0_ra
             .dstOffset = {0, 0, 0},
             .extent = {info.size.width, info.size.height, 1},
         };
-        scheduler->CommandBuffer().copyImage(src_image.GetImage(),
-                                             vk::ImageLayout::eTransferSrcOptimal, GetImage(),
-                                             vk::ImageLayout::eTransferDstOptimal, region);
+        scheduler->AcquireCommandBuffer().Handle().copyImage(
+            src_image.GetImage(), vk::ImageLayout::eTransferSrcOptimal, GetImage(),
+            vk::ImageLayout::eTransferDstOptimal, region);
     } else {
         const vk::ImageResolve region = {
             .srcSubresource{
@@ -851,9 +865,9 @@ void Image::Resolve(Image& src_image, const VideoCore::SubresourceRange& mrt0_ra
             .dstOffset = {0, 0, 0},
             .extent = {info.size.width, info.size.height, 1},
         };
-        scheduler->CommandBuffer().resolveImage(src_image.GetImage(),
-                                                vk::ImageLayout::eTransferSrcOptimal, GetImage(),
-                                                vk::ImageLayout::eTransferDstOptimal, region);
+        scheduler->AcquireCommandBuffer().Handle().resolveImage(
+            src_image.GetImage(), vk::ImageLayout::eTransferSrcOptimal, GetImage(),
+            vk::ImageLayout::eTransferDstOptimal, region);
     }
 
     flags |= VideoCore::ImageFlagBits::GpuModified;
@@ -870,7 +884,8 @@ void Image::Clear(const vk::ClearValue& clear_value, const VideoCore::Subresourc
     };
     scheduler->EndRendering();
     Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {});
-    const auto cmdbuf = scheduler->CommandBuffer();
+    auto command_access = scheduler->AcquireCommandBuffer();
+    const auto cmdbuf = command_access.Handle();
     cmdbuf.clearColorImage(GetImage(), vk::ImageLayout::eTransferDstOptimal, clear_value.color,
                            vk_range);
 }
@@ -932,7 +947,8 @@ void Image::SetBackingSamples(u32 num_samples, bool copy_backing) {
                 .layerCount = info.resources.layers,
             },
         });
-        const auto cmdbuf = scheduler->CommandBuffer();
+        auto command_access = scheduler->AcquireCommandBuffer();
+        const auto cmdbuf = command_access.Handle();
         cmdbuf.pipelineBarrier2(vk::DependencyInfo{
             .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
             .pImageMemoryBarriers = barriers.data(),
