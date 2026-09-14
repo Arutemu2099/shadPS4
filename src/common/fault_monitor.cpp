@@ -14,6 +14,10 @@
 
 #include <fmt/format.h>
 
+#if defined(__LLVM_INSTR_PROFILE_GENERATE)
+#include <profile/instr_prof_interface.h>
+#endif
+
 #include "common/fault_monitor.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
@@ -421,6 +425,10 @@ std::ofstream OpenCsv() {
     return csv;
 }
 
+#if defined(__clang__)
+// Keep this collection hook out of profiles in both training and profile-use builds.
+__attribute__((no_profile_instrument_function))
+#endif
 void ReportLoop() {
     Common::SetCurrentThreadName("shadPS4:FaultMonitor");
     LOG_INFO(Render, "FaultMonitor: reporting every {} ms",
@@ -430,6 +438,11 @@ void ReportLoop() {
     const auto started = std::chrono::steady_clock::now();
     auto prev_time = started;
     Sample prev = Read();
+#if defined(__LLVM_INSTR_PROFILE_GENERATE)
+    bool pgo_reset = false;
+    bool pgo_dumped = false;
+    double pgo_reset_elapsed = 0.0;
+#endif
 
     while (true) {
         std::unique_lock lk(stop_mutex);
@@ -554,6 +567,20 @@ void ReportLoop() {
             d_draws ? static_cast<double>(cur.ob_stream_bytes - prev.ob_stream_bytes) /
                           static_cast<double>(d_draws) / 1024.0
                     : 0.0;
+#if defined(__LLVM_INSTR_PROFILE_GENERATE)
+        if (!pgo_reset && elapsed >= 180.0 && draws_per_frame > 1000.0) {
+            __llvm_profile_reset_counters();
+            pgo_reset = true;
+            pgo_reset_elapsed = elapsed;
+            LOG_INFO(Render, "PGO: counters reset at t={:.1f}s draws/frame={:.0f}", elapsed,
+                     draws_per_frame);
+        } else if (pgo_reset && !pgo_dumped && elapsed - pgo_reset_elapsed >= 120.0) {
+            const int dump_result = __llvm_profile_dump();
+            pgo_dumped = true;
+            LOG_INFO(Render, "PGO: profile dumped at t={:.1f}s reset={:.1f}s rc={}", elapsed,
+                     pgo_reset_elapsed, dump_result);
+        }
+#endif
         // Phases of ForEachUploadRange, per draw, so they add against ob_sync_us_each.
         const double up_scan_us = per_draw_us(cur.up_scan_ns - prev.up_scan_ns);
         const double up_copy_us = per_draw_us(cur.up_copy_ns - prev.up_copy_ns);
