@@ -258,9 +258,15 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     Shader::StageSpecialization spec{};
     spec.info = &program->info;
     size_t perm_idx{};
-    if (!LoadShaderMeta(ar, program->info, fetch_shader, spec, perm_idx)) {
+    std::optional<Shader::Gcn::FetchShaderData> loaded_fetch;
+    if (!LoadShaderMeta(ar, program->info, loaded_fetch, spec, perm_idx)) {
         return false;
     }
+    // Preserve loader scratch state on later failure; on success use the module's
+    // immutable owner below. Serialized values and cache format stay unchanged.
+    fetch_shader = loaded_fetch
+                       ? std::make_shared<const Shader::Gcn::FetchShaderData>(*loaded_fetch)
+                       : nullptr;
 
     std::vector<u32> spv{};
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,
@@ -299,6 +305,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         }
     }
     it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx);
+    fetch_shader = it_pgm.value()->modules[perm_idx].fetch_shader;
 
     infos[stage] = &it_pgm.value()->info;
     modules[stage] = module;

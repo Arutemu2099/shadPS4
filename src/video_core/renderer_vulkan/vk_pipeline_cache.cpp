@@ -552,7 +552,7 @@ bool PipelineCache::RefreshGraphicsKey() {
 bool PipelineCache::RefreshGraphicsStages() {
     const auto& regs = liverpool->regs;
     auto& key = graphics_key;
-    fetch_shader = std::nullopt;
+    fetch_shader.reset();
 
     Shader::Backend::Bindings binding{};
     const auto bind_stage = [&](Shader::Stage stage_in, Shader::LogicalStage stage_out) -> bool {
@@ -572,12 +572,12 @@ bool PipelineCache::RefreshGraphicsStages() {
         }
 
         const auto params = AmdGpu::GetParams(*pgm);
-        std::optional<Shader::Gcn::FetchShaderData> fetch_shader_;
+        std::shared_ptr<const Shader::Gcn::FetchShaderData> fetch_shader_;
         std::tie(infos[stage_out_idx], modules[stage_out_idx], fetch_shader_,
                  key.stage_hashes[stage_out_idx]) =
             GetProgram(stage_in, stage_out, params, binding);
         if (fetch_shader_) {
-            fetch_shader = fetch_shader_;
+            fetch_shader = std::move(fetch_shader_);
         }
         return true;
     };
@@ -714,6 +714,43 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     return module;
 }
 
+static std::shared_ptr<const Shader::Gcn::FetchShaderData> SharedFetchMetadata(
+    const Program::Module& module) {
+    static const bool verify = [] {
+        const char* value = std::getenv("SHADPS4_SHARED_FETCH_VERIFY");
+        return value && std::string_view{value} == "1";
+    }();
+    if (verify) {
+        const auto& expected = module.spec.fetch_shader_data;
+        const auto& actual = module.fetch_shader;
+        ASSERT_MSG(bool(expected) == bool(actual), "SharedFetch presence mismatch");
+        if (expected) {
+            ASSERT_MSG(expected->size == actual->size &&
+                           expected->vertex_offset_sgpr == actual->vertex_offset_sgpr &&
+                           expected->instance_offset_sgpr == actual->instance_offset_sgpr &&
+                           expected->attributes.size() == actual->attributes.size(),
+                       "SharedFetch header mismatch");
+            for (size_t i = 0; i < expected->attributes.size(); ++i) {
+                const auto& a = expected->attributes[i];
+                const auto& b = actual->attributes[i];
+                ASSERT_MSG(a.semantic == b.semantic && a.dest_vgpr == b.dest_vgpr &&
+                               a.num_elements == b.num_elements && a.sgpr_base == b.sgpr_base &&
+                               a.dword_offset == b.dword_offset &&
+                               a.instance_data == b.instance_data && a.inst_offset == b.inst_offset &&
+                               a.data_format == b.data_format && a.num_format == b.num_format,
+                           "SharedFetch attribute mismatch");
+            }
+        }
+        static u64 calls = 0, nonempty = 0;
+        nonempty += bool(actual);
+        if ((++calls & 0x3ffff) == 0) {
+            LOG_INFO(Render_Vulkan, "SharedFetch: verified={} nonempty={} empty={}", calls,
+                     nonempty, calls - nonempty);
+        }
+    }
+    return module.fetch_shader;
+}
+
 PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
@@ -729,7 +766,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
 
         RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
         program->AddPermut(module, std::move(spec));
-        return std::make_tuple(&program->info, module, program->modules[0].spec.fetch_shader_data,
+        return std::make_tuple(&program->info, module, SharedFetchMetadata(program->modules[0]),
                                perm_hash);
     }
 
@@ -781,7 +818,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         if (hit) {
             info.AddBindings(binding);
             const auto& selected = program->modules[prepared.permutation];
-            return std::make_tuple(&info, selected.module, selected.spec.fetch_shader_data,
+            return std::make_tuple(&info, selected.module, SharedFetchMetadata(selected),
                                    HashCombine(params.hash, prepared.permutation));
         }
     }
@@ -811,7 +848,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         }
     }
     return std::make_tuple(&program->info, module,
-                           program->modules[perm_idx].spec.fetch_shader_data, perm_hash);
+                           SharedFetchMetadata(program->modules[perm_idx]), perm_hash);
 }
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,

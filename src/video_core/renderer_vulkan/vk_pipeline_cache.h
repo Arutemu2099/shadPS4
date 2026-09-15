@@ -42,6 +42,9 @@ struct Program {
     struct Module {
         vk::ShaderModule module;
         Shader::StageSpecialization spec;
+        // Immutable and independently owned: module-vector growth/replacement
+        // cannot invalidate metadata retained by a pipeline or a current draw.
+        std::shared_ptr<const Shader::Gcn::FetchShaderData> fetch_shader;
     };
     static constexpr size_t MaxPermutations = 8;
     using ModuleList = boost::container::small_vector<Module, MaxPermutations>;
@@ -58,7 +61,10 @@ struct Program {
         if (prepared) {
             prepared->valid = false;
         }
-        modules.emplace_back(module, std::move(spec));
+        auto fetch = spec.fetch_shader_data
+                         ? std::make_shared<const Shader::Gcn::FetchShaderData>(*spec.fetch_shader_data)
+                         : nullptr;
+        modules.emplace_back(module, std::move(spec), std::move(fetch));
     }
 
     void InsertPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
@@ -67,7 +73,10 @@ struct Program {
             prepared->valid = false;
         }
         modules.resize(std::max(modules.size(), perm_idx + 1)); // <-- beware of realloc
-        modules[perm_idx] = {module, std::move(spec)};
+        auto fetch = spec.fetch_shader_data
+                         ? std::make_shared<const Shader::Gcn::FetchShaderData>(*spec.fetch_shader_data)
+                         : nullptr;
+        modules[perm_idx] = {module, std::move(spec), std::move(fetch)};
     }
 };
 
@@ -89,7 +98,7 @@ public:
     const ComputePipeline* GetComputePipeline();
 
     using Result = std::tuple<const Shader::Info*, vk::ShaderModule,
-                              std::optional<Shader::Gcn::FetchShaderData>, u64>;
+                              std::shared_ptr<const Shader::Gcn::FetchShaderData>, u64>;
     Result GetProgram(Shader::Stage stage, Shader::LogicalStage l_stage,
                       const Shader::ShaderParams& params, Shader::Backend::Bindings& binding);
 
@@ -136,7 +145,7 @@ private:
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
     std::array<const Shader::Info*, MaxShaderStages> infos{};
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
-    std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
+    std::shared_ptr<const Shader::Gcn::FetchShaderData> fetch_shader;
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
