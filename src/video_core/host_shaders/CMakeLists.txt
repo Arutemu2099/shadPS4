@@ -16,6 +16,7 @@ set(SHADER_FILES
     fault_buffer_process.comp
     fs_tri.vert
     fsr.comp
+    infamous_particle_sort.comp
     post_process.frag
     tiling.comp
 )

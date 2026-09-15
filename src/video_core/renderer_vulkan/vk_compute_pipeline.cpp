@@ -2,11 +2,16 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <boost/container/small_vector.hpp>
+#include <cstdlib>
+#include <string_view>
 
+#include "common/scope_exit.h"
 #include "shader_recompiler/info.h"
+#include "video_core/host_shaders/infamous_particle_sort_comp.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_shader_util.h"
 
 namespace Vulkan {
 
@@ -20,6 +25,32 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     auto& info = stages[int(Shader::LogicalStage::Compute)];
     info = &info_;
     const auto debug_str = GetDebugString();
+    const auto device = instance.GetDevice();
+
+    // The game's 64-lane merge loop reads other lanes' SSBO writes between steps.
+    // Its translated shader has no barriers. Keep this targeted diagnostic opt-in;
+    // changing the pipeline module here also covers shader-cache preloading without
+    // replacing/persisting the cached guest SPIR-V or its binding metadata.
+    static const bool synchronize_smoke_sort = [] {
+        const char* value = std::getenv("SHADPS4_SMOKE_SORT_SYNC");
+        return value && std::string_view{value} == "1";
+    }();
+    vk::ShaderModule synchronized_module{};
+    SCOPE_EXIT {
+        if (synchronized_module) {
+            device.destroyShaderModule(synchronized_module);
+        }
+    };
+    if (synchronize_smoke_sort && info->pgm_hash == 0xa16fa93a) {
+        ASSERT_MSG(info->buffers.size() == 5 && info->images.empty() && info->samplers.empty(),
+                   "Unexpected particle sort binding contract");
+        synchronized_module = Compile(HostShaders::INFAMOUS_PARTICLE_SORT_COMP,
+                                      vk::ShaderStageFlagBits::eCompute, device);
+        module = synchronized_module;
+        SetObjectName(device, module, "Synchronized infamous particle sort");
+        LOG_INFO(Render_Vulkan, "Smoke sort synchronization enabled for {:#x}, preloading={}",
+                 info->pgm_hash, preloading);
+    }
 
     const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
         .requiredSubgroupSize = 64,
@@ -95,7 +126,6 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         .bindingCount = static_cast<u32>(bindings.size()),
         .pBindings = bindings.data(),
     };
-    const auto device = instance.GetDevice();
     auto [descriptor_set_result, descriptor_set] =
         device.createDescriptorSetLayoutUnique(desc_layout_ci);
     ASSERT_MSG(descriptor_set_result == vk::Result::eSuccess,
