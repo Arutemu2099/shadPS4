@@ -1724,7 +1724,50 @@ void Rasterizer::UpdateDepthStencilState() const {
         const auto front = regs.stencil_ref_front;
         const auto back =
             regs.depth_control.backface_enable ? regs.stencil_ref_back : regs.stencil_ref_front;
-        dynamic_state.SetStencilReferences(front.stencil_test_val, back.stencil_test_val);
+        static const bool replace_op_reference = [] {
+            const char* value = std::getenv("SHADPS4_STENCIL_REPLACE_OP");
+            return value && std::string{value} == "1";
+        }();
+        const auto reference = [&](const AmdGpu::StencilRefMask& face, AmdGpu::CompareFunc compare,
+                                   AmdGpu::StencilFunc fail, AmdGpu::StencilFunc pass,
+                                   AmdGpu::StencilFunc depth_fail) -> u32 {
+            // PS4 ReplaceOp writes stencil_op_val, independently of stencil_test_val.
+            // Vulkan Replace uses one reference for both. With an unconditional test
+            // and Keep for the other outcomes, changing that reference is equivalent.
+            // Other combinations and shader-exported references need separate handling.
+            if (replace_op_reference && compare == AmdGpu::CompareFunc::Always &&
+                fail == AmdGpu::StencilFunc::Keep && pass == AmdGpu::StencilFunc::ReplaceOp &&
+                depth_fail == AmdGpu::StencilFunc::Keep &&
+                !regs.depth_shader_control.stencil_test_val_export_enable &&
+                !regs.depth_shader_control.stencil_op_val_export_enable) {
+                return face.stencil_op_val;
+            }
+            return face.stencil_test_val;
+        };
+        const u32 front_reference =
+            reference(front, regs.depth_control.stencil_ref_func,
+                      regs.stencil_control.stencil_fail_front, regs.stencil_control.stencil_zpass_front,
+                      regs.stencil_control.stencil_zfail_front);
+        const u32 back_reference = regs.depth_control.backface_enable
+                                      ? reference(back, regs.depth_control.stencil_bf_func,
+                                                  regs.stencil_control.stencil_fail_back,
+                                                  regs.stencil_control.stencil_zpass_back,
+                                                  regs.stencil_control.stencil_zfail_back)
+                                      : front_reference;
+        if (replace_op_reference && (front_reference != front.stencil_test_val ||
+                                     back_reference != back.stencil_test_val)) {
+            static bool reported{};
+            if (!reported) {
+                LOG_INFO(Render_Vulkan,
+                         "Stencil ReplaceOp correction active: front test={} op={} reference={} "
+                         "write_mask={:#x}; back test={} op={} reference={} write_mask={:#x}",
+                         front.stencil_test_val, front.stencil_op_val, front_reference,
+                         front.stencil_write_mask, back.stencil_test_val, back.stencil_op_val,
+                         back_reference, back.stencil_write_mask);
+                reported = true;
+            }
+        }
+        dynamic_state.SetStencilReferences(front_reference, back_reference);
         dynamic_state.SetStencilWriteMasks(!stencil_clear ? front.stencil_write_mask : 0U,
                                            !stencil_clear ? back.stencil_write_mask : 0U);
         dynamic_state.SetStencilCompareMasks(front.stencil_mask, back.stencil_mask);
