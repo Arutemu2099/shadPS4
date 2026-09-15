@@ -1508,6 +1508,33 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
 void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
     UpdateViewportScissorState();
     UpdateDepthStencilState();
+
+    // Bounded read-only diagnostic: distinguish PS4 test/operation stencil values
+    // before selecting any correction for the captured hair composite failure.
+    static const bool hair_stencil_trace = [] {
+        const char* value = std::getenv("SHADPS4_HAIR_STENCIL_TRACE");
+        return value && std::string{value} == "1";
+    }();
+    if (hair_stencil_trace) {
+        const auto* fs = pipeline->GetStages()[int(Shader::LogicalStage::Fragment)];
+        if (fs && (fs->pgm_hash == 0xe59a987f || fs->pgm_hash == 0x1540dfa9 ||
+                   fs->pgm_hash == 0x86bb04f5 || fs->pgm_hash == 0x6f5258e8)) {
+            static std::unordered_set<std::string> seen;
+            const auto& regs = liverpool->regs;
+            const auto state = fmt::format(
+                "fs={:#x} control={:#x} ops={:#x} front={:#x} back={:#x} shader={:#x} "
+                "render={:#x} stencil_valid={} depth_addr={:#x}",
+                fs->pgm_hash, std::bit_cast<u32>(regs.depth_control),
+                std::bit_cast<u32>(regs.stencil_control), std::bit_cast<u32>(regs.stencil_ref_front),
+                std::bit_cast<u32>(regs.stencil_ref_back),
+                std::bit_cast<u32>(regs.depth_shader_control),
+                std::bit_cast<u32>(regs.depth_render_control), regs.depth_buffer.StencilValid(),
+                regs.depth_buffer.DepthAddress());
+            if (seen.size() < 128 && seen.insert(state).second) {
+                LOG_INFO(Render_Vulkan, "HairStencil: {}", state);
+            }
+        }
+    }
     UpdatePrimitiveState(is_indexed);
     UpdateRasterizationState();
     UpdateColorBlendingState(pipeline);
