@@ -7,6 +7,7 @@
 #include "video_core/renderdoc.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <renderdoc_app.h>
 
 #ifdef _WIN32
@@ -27,6 +28,8 @@ enum class CaptureState {
 // Atomic: StartCapture runs on the GPU command processor thread, EndCapture on the presenting
 // thread, and TriggerCapture on the input thread.
 static std::atomic<CaptureState> capture_state{CaptureState::Idle};
+static u32 capture_frame_span{1};
+static std::atomic<u32> capture_frames_left{0};
 static std::atomic<u32> screenshot_game_only_count{0};
 static std::atomic<u32> screenshot_with_overlays_count{0};
 
@@ -86,6 +89,16 @@ void LoadRenderDoc() {
     }
 #endif
     if (rdoc_api) {
+        // Diagnostic only: span several presented frames to include work queued ahead of a flip.
+        if (const char* value = std::getenv("SHADPS4_RENDERDOC_CAPTURE_FRAMES")) {
+            char* end{};
+            const unsigned long frames = std::strtoul(value, &end, 10);
+            if (end != value && *end == '\0' && frames >= 1 && frames <= 8) {
+                capture_frame_span = static_cast<u32>(frames);
+            } else {
+                LOG_WARNING(Render, "Invalid RenderDoc capture span; using one frame");
+            }
+        }
         // Disable default capture keys as they suppose to trigger present-to-present capturing
         // and it is not what we want
         rdoc_api->SetCaptureKeys(nullptr, 0);
@@ -102,6 +115,7 @@ void StartCapture() {
 
     if (capture_state.load() == CaptureState::Triggered) {
         rdoc_api->StartFrameCapture(nullptr, nullptr);
+        capture_frames_left.store(capture_frame_span);
         capture_state.store(CaptureState::InProgress);
     }
 }
@@ -113,6 +127,7 @@ void EndCapture() {
 
     if (capture_state.load() == CaptureState::InProgress) {
         rdoc_api->EndFrameCapture(nullptr, nullptr);
+        capture_frames_left.store(0);
         capture_state.store(CaptureState::Idle);
     }
 }
@@ -132,12 +147,20 @@ void OnFrameBoundary() {
     // tail, and a range that misses the final composite presents a black image.
     switch (capture_state.load()) {
     case CaptureState::InProgress:
+        if (const u32 remaining = capture_frames_left.load(); remaining > 1) {
+            capture_frames_left.store(remaining - 1);
+            break;
+        }
         rdoc_api->EndFrameCapture(nullptr, nullptr);
+        capture_frames_left.store(0);
         capture_state.store(CaptureState::Idle);
+        LOG_INFO(Render, "RenderDoc capture completed: {} frame boundaries", capture_frame_span);
         break;
     case CaptureState::Triggered:
         rdoc_api->StartFrameCapture(nullptr, nullptr);
+        capture_frames_left.store(capture_frame_span);
         capture_state.store(CaptureState::InProgress);
+        LOG_INFO(Render, "RenderDoc capture started: {} frame boundaries", capture_frame_span);
         break;
     default:
         break;
