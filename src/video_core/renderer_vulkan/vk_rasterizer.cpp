@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstdlib>
-#include <optional>
 #include <string>
 #include <unordered_set>
 
@@ -971,41 +970,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const char* value = std::getenv("SHADPS4_DECODE_IMAGE_VERIFY");
         return value && value[0] == '1';
     }();
-    // Default OFF. When set, every guest descriptor of the stage is decoded first, then the
-    // lookups and the whole second pass run in their original order under one cache-mutex
-    // scope instead of two acquisitions per image. Unset keeps the interleaved order and the
-    // per-call locks below exactly as they were.
-    static const bool batch_stage_lookups = [] {
-        const char* value = std::getenv("SHADPS4_TEXTURE_STAGE_BATCH");
-        return value && value[0] == '1' && value[1] == '\0';
-    }();
-    std::optional<VideoCore::TextureCache::StageBatch> stage_batch;
-    // Batched mode only, parallel to image_bindings: bit 0 lookup pending, bit 1 is_written.
-    boost::container::small_vector<u8, 16> pending_lookups;
-    u32 num_pending_lookups{};
-
-    const auto find_image = [&](VideoCore::TextureCache::ImageDesc& desc) {
-        return stage_batch ? stage_batch->FindImage(desc) : texture_cache.FindImage(desc);
-    };
-    const auto lookup_binding = [&](VideoCore::ImageId& image_id,
-                                    VideoCore::TextureCache::ImageDesc& desc, bool is_written) {
-        image_id = find_image(desc);
-        ++lookup_count;
-        auto* image = &texture_cache.GetImage(image_id);
-        if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
-            // If this image has an associated depth image, it's a stencil attachment.
-            // Redirect the access to the actual depth-stencil buffer.
-            image_id = depth_image_id;
-            image = &texture_cache.GetImage(image_id);
-        }
-        if (image->binding.is_bound) {
-            // The image is already bound. In case if it is about to be used as storage we
-            // need to force general layout on it.
-            image->binding.force_general |= is_written;
-        }
-        image->binding.is_bound = 1u;
-    };
-
     for (size_t image_slot = 0; image_slot < stage.images.size(); ++image_slot) {
         const auto& image_desc = stage.images[image_slot];
         const auto tsharp = image_desc.GetSharp(stage);
@@ -1016,9 +980,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         if (tsharp.Address() == 0 || tsharp.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid) {
             image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
             image_descriptor_array_sizes.push_back(1);
-            if (batch_stage_lookups) {
-                pending_lookups.push_back(0);
-            }
             continue;
         }
 
@@ -1087,27 +1048,24 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 desc.view_info.range.extent.levels = 1;
             }
 
-            if (batch_stage_lookups) {
-                pending_lookups.push_back(u8(1u | (image_desc.is_written ? 2u : 0u)));
-                ++num_pending_lookups;
-            } else {
-                lookup_binding(image_id, desc, image_desc.is_written);
+            image_id = texture_cache.FindImage(desc);
+            ++lookup_count;
+            auto* image = &texture_cache.GetImage(image_id);
+            if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
+                // If this image has an associated depth image, it's a stencil attachment.
+                // Redirect the access to the actual depth-stencil buffer.
+                image_id = depth_image_id;
+                image = &texture_cache.GetImage(image_id);
             }
+            if (image->binding.is_bound) {
+                // The image is already bound. In case if it is about to be used as storage we
+                // need to force general layout on it.
+                image->binding.force_general |= image_desc.is_written;
+            }
+            image->binding.is_bound = 1u;
         }
 
         image_descriptor_array_sizes.push_back(num_bindings);
-    }
-
-    if (num_pending_lookups != 0) {
-        // No guest descriptor is read from here until the scope ends after the second pass.
-        // Stages with only null descriptors never get here and take no lock.
-        stage_batch.emplace(texture_cache, num_pending_lookups);
-        for (size_t i = 0; i < image_bindings.size(); ++i) {
-            if (pending_lookups[i] & 1u) {
-                auto& [image_id, desc] = image_bindings[i];
-                lookup_binding(image_id, desc, (pending_lookups[i] & 2u) != 0);
-            }
-        }
     }
 
     if (Common::BufferSampleProbe::Enabled()) {
@@ -1137,16 +1095,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             if (auto& old_image = texture_cache.GetImage(image_id);
                 old_image.binding.needs_rebind) {
                 old_image.binding = {};
-                image_id = find_image(desc);
+                image_id = texture_cache.FindImage(desc);
             }
 
             bound_images.emplace_back(image_id);
 
             auto& image = texture_cache.GetImage(image_id);
             const auto t_ft = Common::FaultMonitor::Now();
-            // The batched variant runs the same sequence without reentering UpdateImage's lock.
-            auto& image_view = stage_batch ? stage_batch->FindTexture(image_id, desc)
-                                           : texture_cache.FindTexture(image_id, desc);
+            auto& image_view = texture_cache.FindTexture(image_id, desc);
             const auto t_tr = Common::FaultMonitor::Now();
             findtex_ns += Common::FaultMonitor::DiffNs(t_ft, t_tr);
 
@@ -1187,9 +1143,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                                      image.backing->state.layout);
         }
     }
-
-    // Release before the descriptor-write and sampler loops: they read guest sampler state.
-    stage_batch.reset();
 
     Common::FaultMonitor::CountBindTexView(findtex_ns, transit_ns);
     const auto t_sampler_start = Common::FaultMonitor::Now();
