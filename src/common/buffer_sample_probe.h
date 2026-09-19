@@ -7,10 +7,20 @@
 #include <chrono>
 #include <cstdlib>
 
+#include "common/fault_monitor.h"
 #include "common/logging/log.h"
 #include "common/types.h"
 
 namespace Common {
+
+/// Explicit ObtainBuffer caller class for the probe's size/caller rows. Only the cache-buffer
+/// path of Rasterizer::BindBuffers supplies Uniform or Storage; every other caller is Other.
+/// It is an argument rather than a thread-local scope so nested fault work cannot inherit it.
+enum class BufferSampleCaller : u8 {
+    Other = 0,
+    Uniform,
+    Storage,
+};
 
 /// A low-frequency, runtime-opt-in probe for the ordinary BufferCache path.
 ///
@@ -54,10 +64,12 @@ public:
         return (state & (SampleEvery - 1)) == 0;
     }
 
-    BufferSampleProbe(bool active, bool is_written, bool is_texel, u64 size)
+    BufferSampleProbe(bool active, bool is_written, bool is_texel, u64 size,
+                      BufferSampleCaller caller = BufferSampleCaller::Other)
         : active{active},
           kind{is_written ? Kind::Written
                           : (is_texel ? Kind::ReadOnlyTexel : Kind::ReadOnly)},
+          caller{caller},
           size{size},
           start{active ? Clock::now() : Clock::time_point{}} {}
 
@@ -164,11 +176,36 @@ private:
         u64 upload_ranges = 0;
     };
 
+    /// One Kind x Caller x request-size group. The timings are nested (upload inside sync inside
+    /// span) and must not be added together as exclusive work. "dirty" is upload_bytes > 0.
+    struct SizeStats {
+        u64 calls = 0;
+        u64 call_bytes = 0;
+        u64 stream_calls = 0;
+        u64 span_ns = 0;
+        u64 sync_ns = 0;
+        u64 upload_ns = 0;
+        u64 upload_bytes = 0;
+        u64 upload_ranges = 0;
+        u64 dirty_calls = 0;
+        u64 dirty_span_ns = 0;
+        u64 dirty_sync_ns = 0;
+        u64 dirty_upload_ns = 0;
+    };
+
+    static constexpr size_t NumKinds = 3;
+    static constexpr size_t NumCallers = 3;
+    static constexpr size_t NumSizeBuckets = 4;
+
+    using SizeGroups =
+        std::array<std::array<std::array<SizeStats, NumSizeBuckets>, NumCallers>, NumKinds>;
+
     struct Counters {
         u64 window_count = 0;
         u64 total_count = 0;
         u64 sequence = 0;
-        std::array<KindStats, 3> kinds{};
+        std::array<KindStats, NumKinds> kinds{};
+        SizeGroups groups{};
     };
 
     static constexpr u64 SampleEvery = 128;
@@ -200,6 +237,50 @@ private:
         return "unknown";
     }
 
+    static constexpr size_t Index(BufferSampleCaller value) noexcept {
+        const auto index = static_cast<size_t>(value);
+        return index < NumCallers ? index : 0;
+    }
+
+    static const char* CallerName(BufferSampleCaller value) noexcept {
+        switch (value) {
+        case BufferSampleCaller::Other:
+            return "other";
+        case BufferSampleCaller::Uniform:
+            return "uniform";
+        case BufferSampleCaller::Storage:
+            return "storage";
+        }
+        return "unknown";
+    }
+
+    static constexpr size_t SizeBucket(u64 bytes) noexcept {
+        if (bytes <= 4 * 1024) {
+            return 0;
+        }
+        if (bytes <= 16 * 1024) {
+            return 1;
+        }
+        if (bytes <= 64 * 1024) {
+            return 2;
+        }
+        return 3;
+    }
+
+    static const char* SizeBucketName(size_t bucket) noexcept {
+        switch (bucket) {
+        case 0:
+            return "le4k";
+        case 1:
+            return "4k_16k";
+        case 2:
+            return "16k_64k";
+        case 3:
+            return "gt64k";
+        }
+        return "unknown";
+    }
+
     void Finish() noexcept {
         if (!active || finished) {
             return;
@@ -211,7 +292,25 @@ private:
         ++counters.total_count;
         ++stats.calls;
         stats.call_bytes += size;
-        stats.span_ns += SinceNs(start);
+        const u64 span_ns = SinceNs(start);
+        stats.span_ns += span_ns;
+        auto& group = counters.groups[Index(kind)][Index(caller)][SizeBucket(size)];
+        ++group.calls;
+        group.call_bytes += size;
+        group.span_ns += span_ns;
+        group.sync_ns += sync_ns;
+        group.upload_ns += upload_ns;
+        group.upload_bytes += upload_bytes;
+        group.upload_ranges += upload_ranges;
+        if (stream) {
+            ++group.stream_calls;
+        }
+        if (upload_bytes > 0) {
+            ++group.dirty_calls;
+            group.dirty_span_ns += span_ns;
+            group.dirty_sync_ns += sync_ns;
+            group.dirty_upload_ns += upload_ns;
+        }
         if (stream) {
             ++stats.stream_calls;
         }
@@ -260,11 +359,39 @@ private:
                      stats.upload_coarse, stats.upload_walk, stats.upload_bytes,
                      stats.upload_ranges, SampleEvery);
         }
+        // Cumulative frame count, read once per window so consecutive reports give an approximate
+        // sampled rate per frame. Integer totals keep the rows exactly aggregable.
+        const u64 frames = FaultMonitor::presented_frames.load(std::memory_order_relaxed);
+        for (size_t k = 0; k < NumKinds; ++k) {
+            for (size_t c = 0; c < NumCallers; ++c) {
+                for (size_t b = 0; b < NumSizeBuckets; ++b) {
+                    const auto& group = counters.groups[k][c][b];
+                    if (group.calls == 0) {
+                        continue;
+                    }
+                    LOG_INFO(Render,
+                             "BufferSizeSample seq={} window_count={} total_count={} "
+                             "sample_every={} presented_frames={} kind={} caller={} size={} "
+                             "calls={} call_bytes={} stream={} span_ns={} sync_ns={} "
+                             "upload_ns={} uploaded_bytes={} upload_ranges={} dirty_calls={} "
+                             "dirty_span_ns={} dirty_sync_ns={} dirty_upload_ns={} "
+                             "nested_timings=true",
+                             counters.sequence, counters.window_count, counters.total_count,
+                             SampleEvery, frames, KindName(static_cast<Kind>(k)),
+                             CallerName(static_cast<BufferSampleCaller>(c)), SizeBucketName(b),
+                             group.calls, group.call_bytes, group.stream_calls, group.span_ns,
+                             group.sync_ns, group.upload_ns, group.upload_bytes,
+                             group.upload_ranges, group.dirty_calls, group.dirty_span_ns,
+                             group.dirty_sync_ns, group.dirty_upload_ns);
+                }
+            }
+        }
     }
 
     bool active = false;
     bool finished = false;
     Kind kind = Kind::ReadOnly;
+    BufferSampleCaller caller = BufferSampleCaller::Other;
     u64 size = 0;
     Clock::time_point start{};
     bool stream = false;

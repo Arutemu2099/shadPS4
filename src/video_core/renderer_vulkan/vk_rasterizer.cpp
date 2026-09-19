@@ -918,7 +918,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         } else {
             const auto t_obtain = Common::FaultMonitor::Now();
             const auto [vk_buffer, offset] = buffer_cache.ObtainBuffer(
-                vsharp.base_address, size, desc.is_written, desc.is_formatted, buffer_id);
+                vsharp.base_address, size, desc.is_written, desc.is_formatted, buffer_id,
+                is_storage ? Common::BufferSampleCaller::Storage
+                           : Common::BufferSampleCaller::Uniform);
             obtain_ns += Common::FaultMonitor::SinceNs(t_obtain);
             const u32 offset_aligned = Common::AlignDown(offset, alignment);
             const u32 adjust = offset - offset_aligned;

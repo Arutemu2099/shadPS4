@@ -33,7 +33,8 @@ class GraphicsPipeline;
 
 namespace Common {
 class BufferSampleProbe;
-}
+enum class BufferSampleCaller : u8;
+} // namespace Common
 
 namespace Common::ReadbackOffload {
 enum class Origin : u32;
@@ -145,10 +146,11 @@ public:
     /// Performs buffer to buffer data copy on the GPU.
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
 
-    /// Obtains a buffer for the specified region.
-    [[nodiscard]] std::pair<Buffer*, u32> ObtainBuffer(VAddr gpu_addr, u32 size, bool is_written,
-                                                       bool is_texel_buffer = false,
-                                                       BufferId buffer_id = {});
+    /// Obtains a buffer for the specified region. `sample_caller` only labels the opt-in
+    /// BufferSampleProbe rows; it never affects the returned buffer.
+    [[nodiscard]] std::pair<Buffer*, u32> ObtainBuffer(
+        VAddr gpu_addr, u32 size, bool is_written, bool is_texel_buffer = false,
+        BufferId buffer_id = {}, Common::BufferSampleCaller sample_caller = {});
 
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<Buffer*, u32> ObtainBufferForImage(VAddr gpu_addr, u32 size);

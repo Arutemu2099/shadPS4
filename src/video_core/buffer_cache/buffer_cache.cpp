@@ -1141,13 +1141,15 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
 }
 
 std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
-                                                  bool is_texel_buffer, BufferId buffer_id) {
+                                                  bool is_texel_buffer, BufferId buffer_id,
+                                                  Common::BufferSampleCaller sample_caller) {
     // This function is 4.93 us/draw, 61% of all per-draw CPU cost, and it has two halves that
     // share no code: the early exit below (a tracker query plus a guest-memory memcpy) and the
     // SynchronizeBuffer fall-through. Time them separately - the split decides which is worth
     // cutting, and it has never actually been measured.
     const bool sample_this_call = Common::BufferSampleProbe::ShouldSample();
-    Common::BufferSampleProbe sample{sample_this_call, is_written, is_texel_buffer, size};
+    Common::BufferSampleProbe sample{sample_this_call, is_written, is_texel_buffer, size,
+                                     sample_caller};
     const auto t_entry = Common::FaultMonitor::Now();
     u64 query_ns = 0;
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
