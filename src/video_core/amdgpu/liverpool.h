@@ -108,6 +108,11 @@ public:
         rasterizer = rasterizer_;
     }
 
+    /// True on the command processor thread, where SendCommand runs its callback inline.
+    bool IsGpuThread() const {
+        return std::this_thread::get_id() == gpu_id;
+    }
+
     template <bool wait_done = false>
     void SendCommand(auto&& func) {
         if (std::this_thread::get_id() == gpu_id) {

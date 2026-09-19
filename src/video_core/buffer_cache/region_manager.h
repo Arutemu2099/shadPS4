@@ -93,6 +93,17 @@ public:
         return cpu_addr;
     }
 
+    /// Number of GPU write markings this region has received. Read under the region lock.
+    u64 GpuWriteSeq() const noexcept {
+        return gpu_write_seq;
+    }
+
+    /// Records a GPU write that sets no tracker bit, so in-flight fault downloads of this
+    /// region drop their snapshot. Call under the region lock.
+    void BumpGpuWriteSeq() noexcept {
+        ++gpu_write_seq;
+    }
+
     static constexpr size_t SanitizeAddress(size_t address) {
         return static_cast<size_t>(std::max<s64>(static_cast<s64>(address), 0LL));
     }
@@ -142,6 +153,9 @@ public:
                     bits.SetRange(start_page, end_page);
                 });
             } else {
+                // Counts every GPU write marking, including one that finds all bits already
+                // set, so an in-flight fault download can tell its snapshot went stale.
+                ++gpu_write_seq;
                 bits.SetRange(start_page, end_page);
             }
         } else {
@@ -294,6 +308,7 @@ private:
     u64 summary_mask{0};
     // Conservative summary of `cpu`, readable without the lock. See MayHaveCpuModified().
     std::atomic<bool> any_cpu{true};
+    u64 gpu_write_seq{0};
     RegionBits cpu;
     RegionBits gpu;
     RegionBits writeable;

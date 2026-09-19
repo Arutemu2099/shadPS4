@@ -3,10 +3,13 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
+#include <thread>
 #include "common/alignment.h"
 #include "common/buffer_sample_probe.h"
 #include "common/debug.h"
 #include "common/fault_monitor.h"
+#include "common/readback_offload.h"
 #include "common/scope_exit.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -17,7 +20,11 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
 
+#include <vk_mem_alloc.h>
+
 namespace VideoCore {
+
+namespace Offload = Common::ReadbackOffload;
 
 static constexpr size_t DataShareBufferSize = 64_KB;
 static constexpr size_t StagingBufferSize = 512_MB;
@@ -126,6 +133,11 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 
     memory_tracker = std::make_unique<MemoryTracker>(tracker);
 
+    if (Offload::Enabled() || Offload::VerifyEnabled() || Offload::ProfileEnabled()) {
+        LOG_INFO(Render, "ReadbackOffload: offload={} verify={} profile={}", Offload::Enabled(),
+                 Offload::VerifyEnabled(), Offload::ProfileEnabled());
+    }
+
     std::memset(gds_buffer.mapped_data.data(), 0, DataShareBufferSize);
 
     // Set up garbage collection parameters
@@ -151,69 +163,652 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 
 BufferCache::~BufferCache() {
     scheduler.DrainRecording();
+    // Not reached in the supported lifecycle. The presenter that owns this cache is a global
+    // that is never reset (gnmdriver.cpp), and every exit once it exists is std::quick_exit
+    // (emulator.cpp Run and Relaunch), which runs Emulator::Shutdown and no static destructor.
+    // Guest threads therefore never outlive this object, and there is no teardown protocol
+    // for them: an in-process teardown has to stop the guest and the command processor
+    // first. One that did not must not continue into freed jobs with threads still waiting.
+    const bool jobs_idle = std::ranges::all_of(
+        fault_jobs, [](const FaultJob& job) { return job.state == FaultJobState::Free; });
+    ASSERT_MSG(jobs_idle && fault_guest_waiters.load() == 0,
+               "BufferCache destroyed with fault downloads in flight ({} guest waiters)",
+               fault_guest_waiters.load());
+}
+
+void BufferCache::BeginGpuUnmap(VAddr device_addr, u64 size) {
+    if (!Offload::Enabled() || size == 0) {
+        return;
+    }
+    // Linearizes against job admission, not against CPU memory operations. Release the gate
+    // before waiting for CP: finalization may need the memory manager's shared lock.
+    fault_mapping_gate.Block(device_addr, size);
+    if (HasOverlappingFaultJob(device_addr, size)) {
+        liverpool->SendCommand<true>([this, device_addr, size] {
+            SettleOverlappingJobs(device_addr, size);
+            ASSERT_MSG(!HasOverlappingFaultJob(device_addr, size),
+                       "GPU unmap reentered an active readback publication");
+        });
+    }
+    // Keep the range blocked through physical unmap and until a later EndGpuMap. Late faults
+    // retain the synchronous contract instead of admitting a job that could outlive unmap.
+}
+
+void BufferCache::EndGpuMap(VAddr device_addr, u64 size) {
+    if (Offload::Enabled() && size != 0) {
+        // MapMemory can hold the memory manager's writer lock. This must not call CP or wait
+        // for a job; TryAdmit's callback only publishes bookkeeping under the same gate.
+        fault_mapping_gate.Unblock(device_addr, size);
+    }
 }
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
     if (!IsRegionRegistered(device_addr, size)) {
         return;
     }
+    if (Offload::Enabled() && HasOverlappingFaultJob(device_addr, size)) {
+        // InvalidateRegion marks CPU state on this thread wherever it finds no GPU bit, and an
+        // unmap then removes the pages. A job over this range still has a publication to
+        // make, so it is finalized first, while the range is mapped and untouched. The flush
+        // callback below cannot do this: it never runs for the GPU-clean part of the range.
+        Offload::Add(Offload::State().invalidate_settle_hops);
+        liverpool->SendCommand<true>(
+            [this, device_addr, size] { SettleOverlappingJobs(device_addr, size); });
+    }
     memory_tracker->InvalidateRegion(
         device_addr, size, [this, device_addr, size] { ReadMemory(device_addr, size, true); });
 }
 
-void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
-    liverpool->SendCommand<true>([this, device_addr, size, is_write] {
-        Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
-        if (is_write) {
-            // Invalidation path. The caller picked this exact range and is about to mark it CPU
-            // modified, so it must not be widened.
-            DownloadBufferMemory<false>(buffer, device_addr, size, true);
-            return;
+/// Span of the tracker pages a range touches. Publication and tracker clears act on whole
+/// tracker pages, so this is the granularity jobs are compared at.
+static std::pair<VAddr, VAddr> TrackerPageSpan(VAddr device_addr, u64 size) {
+    return {Common::AlignDown(device_addr, TRACKER_BYTES_PER_PAGE),
+            Common::AlignUp(device_addr + size, TRACKER_BYTES_PER_PAGE)};
+}
+
+bool BufferCache::HasOverlappingFaultJob(VAddr device_addr, u64 size) {
+    // Fast path. The command processor raises the count, under the mutex and together with
+    // the window, before it records the job's copy, and lowers it only once the job has been
+    // published or vetoed. A zero read here therefore proves that every job admitted before
+    // this load is finalized. One admitted after it is concurrent with this invalidation, as
+    // a synchronous fault download would be. Where the range is GPU-dirty its bits are
+    // intact, so the flush callback meets it in SettleOverlappingJobs; where the range is
+    // GPU-clean the job copied nothing and writes nothing back there.
+    if (pending_fault_jobs.load() == 0) {
+        return false;
+    }
+    const auto [begin, end] = TrackerPageSpan(device_addr, size);
+    std::scoped_lock lk{fault_window_mutex};
+    for (const FaultWindow& window : fault_windows) {
+        if (window.begin < end && begin < window.end) {
+            return true;
         }
-        const u64 window = ReadFaultWidenSize(size);
-        auto [wide_addr, wide_size] = WidenReadFault(buffer, device_addr, size, window);
-        if (window != DefaultReadFaultWidenSize) {
-            // Preflight the SAME page/byte intersections and 64-byte padding used
-            // by DownloadBufferMemory, before it subtracts any GPU-dirty ranges.
-            // Both passes run in this CP callback; GPU range additions are owned
-            // by that thread. Never turn an oversized speculative transfer into
-            // a dropped download or a null staging pointer.
-            u64 padded_bytes = 0;
-            bool fits = true;
-            memory_tracker->ForEachDownloadRange<false>(
-                wide_addr, wide_size, [&](u64 range_addr, u64 range_size) {
-                    gpu_modified_ranges.ForEachInRange(
-                        range_addr, range_size, [&](VAddr begin, VAddr end) {
-                            if (!fits) {
-                                return;
-                            }
-                            const u64 bytes = end - begin;
-                            if (bytes > DownloadBufferSize) {
-                                fits = false;
-                                return;
-                            }
-                            const u64 padded = (bytes + 63) & ~63ULL;
-                            if (padded > DownloadBufferSize - padded_bytes) {
-                                fits = false;
-                            } else {
-                                padded_bytes += padded;
-                            }
-                        });
+    }
+    return false;
+}
+
+void BufferCache::CompleteEmptyWriteFault(VAddr device_addr, u64 size) {
+    // The synchronous download marks CPU state only after a nonempty download. With jobs in
+    // play an invalidation can legitimately arrive here with nothing left: InvalidateRegion
+    // saw the GPU bits of a pending job, and that job was settled, publishing the same data,
+    // before this callback collected anything. The caller is owed the marking
+    // InvalidateRegion would have made itself had it found the range GPU-clean, which is the
+    // state the range is now in. If GPU bits remain there is unpublished data the range set
+    // does not describe; that is left exactly as the synchronous path leaves it.
+    if (!memory_tracker->IsRegionGpuModified(device_addr, size)) {
+        memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+        Offload::Add(Offload::State().write_marks);
+    }
+}
+
+/// Superset of any window ResolveFaultWindow can pick for this fault, computable before the
+/// buffer lookup so overlapping jobs are settled while no Buffer reference is held.
+static std::pair<VAddr, u64> FaultSettleSpan(VAddr device_addr, u64 size, bool is_write) {
+    if (is_write) {
+        return {device_addr, size};
+    }
+    const u64 window = std::max(ReadFaultWidenSize(size), DefaultReadFaultWidenSize);
+    const VAddr begin = Common::AlignDown(device_addr, window);
+    const VAddr end = Common::AlignUp(device_addr + size, window);
+    return {begin, end - begin};
+}
+
+void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
+    const bool cp_self = liverpool->IsGpuThread();
+    const auto origin = cp_self ? Offload::Origin::CpSelf : Offload::Origin::Guest;
+    Offload::CountFault(origin);
+    if (!Offload::Enabled() || cp_self || is_write) {
+        // A command processor fault cannot leave its own thread: the wait would land there
+        // anyway, and a second step queued to it could never run while it is blocked here.
+        // Write invalidations also stay synchronous: an offloaded write job could mark CPU
+        // state over clean pages after a concurrent unmap. Read jobs never make that mark.
+        liverpool->SendCommand<true>([this, device_addr, size, is_write, origin] {
+            ResolveFaultSync(device_addr, size, is_write, origin);
+        });
+        Offload::MaybeLog();
+        return;
+    }
+
+    // Guest-origin fault. The command processor records an owned staging copy and flushes;
+    // this thread waits for that tick on the master semaphore only (Scheduler::Wait may flush
+    // and is not callable here); the command processor then votes and publishes. Tracker
+    // bits, gpu_modified_ranges and page protection stay untouched until that last step.
+    AmdGpu::Liverpool* const cp = liverpool;
+    Vulkan::MasterSemaphore* const semaphore = scheduler.GetMasterSemaphore();
+    fault_guest_waiters.fetch_add(1);
+    FaultTicket ticket{};
+    cp->SendCommand<true>(
+        [&] { ticket = PrepareFaultDownload(device_addr, size, is_write); });
+    if (ticket.id == 0) {
+        fault_guest_waiters.fetch_sub(1);
+        Offload::MaybeLog();
+        return;
+    }
+    const u64 wait_start = Offload::ProfileNowNs();
+    semaphore->Wait(ticket.tick);
+    Offload::AddSince(Offload::State().guest_wait_ns, wait_start);
+    // No teardown check: the cache outlives every guest thread (see ~BufferCache).
+    cp->SendCommand<true>(
+        [&] { FinishFaultDownload(ticket.id, device_addr, size, is_write); });
+    fault_guest_waiters.fetch_sub(1);
+    Offload::MaybeLog();
+}
+
+std::pair<VAddr, u64> BufferCache::ResolveFaultWindow(const Buffer& buffer, VAddr device_addr,
+                                                      u64 size, bool is_write) {
+    if (is_write) {
+        // Invalidation path. The caller picked this exact range and is about to mark it CPU
+        // modified, so it must not be widened.
+        return {device_addr, size};
+    }
+    const u64 window = ReadFaultWidenSize(size);
+    auto [wide_addr, wide_size] = WidenReadFault(buffer, device_addr, size, window);
+    if (window != DefaultReadFaultWidenSize) {
+        // Preflight the SAME page/byte intersections and 64-byte padding used
+        // by DownloadBufferMemory, before it subtracts any GPU-dirty ranges.
+        // Both passes run in this CP callback; GPU range additions are owned
+        // by that thread. Never turn an oversized speculative transfer into
+        // a dropped download or a null staging pointer.
+        u64 padded_bytes = 0;
+        bool fits = true;
+        memory_tracker->ForEachDownloadRange<false>(
+            wide_addr, wide_size, [&](u64 range_addr, u64 range_size) {
+                gpu_modified_ranges.ForEachInRange(
+                    range_addr, range_size, [&](VAddr begin, VAddr end) {
+                        if (!fits) {
+                            return;
+                        }
+                        const u64 bytes = end - begin;
+                        if (bytes > DownloadBufferSize) {
+                            fits = false;
+                            return;
+                        }
+                        const u64 padded = (bytes + 63) & ~63ULL;
+                        if (padded > DownloadBufferSize - padded_bytes) {
+                            fits = false;
+                        } else {
+                            padded_bytes += padded;
+                        }
+                    });
+            });
+        if (!fits) {
+            LOG_INFO(Render, "Read-fault window exceeded staging capacity; using 64 KiB");
+            const auto fallback =
+                WidenReadFault(buffer, device_addr, size, DefaultReadFaultWidenSize);
+            wide_addr = fallback.first;
+            wide_size = fallback.second;
+        }
+    }
+    return {wide_addr, wide_size};
+}
+
+void BufferCache::ResolveFaultSync(VAddr device_addr, u64 size, bool is_write,
+                                   Offload::Origin origin) {
+    const auto [settle_addr, settle_size] = FaultSettleSpan(device_addr, size, is_write);
+    SettleOverlappingJobs(settle_addr, settle_size);
+    Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
+    const auto [addr, bytes] = ResolveFaultWindow(buffer, device_addr, size, is_write);
+    Offload::SyncTiming timing{};
+    const bool downloaded = DownloadBufferMemory<false>(
+        buffer, addr, bytes, is_write, Offload::ProfileEnabled() ? &timing : nullptr);
+    Offload::CountSyncResolve(origin, timing);
+    if (!downloaded && is_write && Offload::Enabled()) {
+        // With the offload off nothing here differs from the path this was split out of.
+        CompleteEmptyWriteFault(device_addr, size);
+    }
+}
+
+u64 BufferCache::CollectFaultCopies(VAddr device_addr, u64 size, std::vector<FaultCopy>& copies) {
+    u64 total_size_bytes = 0;
+    memory_tracker->ForEachDownloadRange<false>(
+        device_addr, size, [&](u64 device_addr_out, u64 range_size) {
+            gpu_modified_ranges.ForEachInRange(
+                device_addr_out, range_size, [&](VAddr start, VAddr end) {
+                    const u64 new_size = end - start;
+                    copies.push_back(FaultCopy{
+                        .addr = start,
+                        .staging_offset = total_size_bytes,
+                        .size = new_size,
+                    });
+                    // Same padding as DownloadBufferMemory.
+                    total_size_bytes += (new_size + 63) & ~63ULL;
                 });
-            if (!fits) {
-                LOG_INFO(Render, "Read-fault window exceeded staging capacity; using 64 KiB");
-                const auto fallback =
-                    WidenReadFault(buffer, device_addr, size, DefaultReadFaultWidenSize);
-                wide_addr = fallback.first;
-                wide_size = fallback.second;
+        });
+    return total_size_bytes;
+}
+
+std::unique_ptr<Buffer> BufferCache::AcquireFaultStaging() {
+    if (!fault_staging_pool.empty()) {
+        auto staging = std::move(fault_staging_pool.back());
+        fault_staging_pool.pop_back();
+        return staging;
+    }
+    // One per job plus one for the verifier. Never the shared download ring: it reclaims by
+    // GPU tick alone and could hand these bytes out again before they are published.
+    if (fault_staging_created >= MaxFaultJobs + 1) {
+        return nullptr;
+    }
+    auto staging =
+        std::make_unique<Buffer>(instance, scheduler, MemoryUsage::Download, 0,
+                                 vk::BufferUsageFlagBits::eTransferDst, FaultStagingSize);
+    if (staging->mapped_data.empty()) {
+        LOG_ERROR(Render, "ReadbackOffload: staging buffer is not host mapped");
+        return nullptr;
+    }
+    ++fault_staging_created;
+    return staging;
+}
+
+void BufferCache::ReleaseFaultStaging(std::unique_ptr<Buffer> staging) {
+    // Callers only release after the tick of the last copy into it has been reached.
+    if (staging) {
+        fault_staging_pool.push_back(std::move(staging));
+    }
+}
+
+BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u64 size,
+                                                           bool is_write) {
+    ASSERT_MSG(!is_write, "Only read faults may use the readback offload prototype");
+    const auto [settle_addr, settle_size] = FaultSettleSpan(device_addr, size, is_write);
+    SettleOverlappingJobs(settle_addr, settle_size);
+    Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
+    const auto [addr, bytes] = ResolveFaultWindow(buffer, device_addr, size, is_write);
+
+    std::vector<FaultCopy> copies;
+    const u64 total_size_bytes = CollectFaultCopies(addr, bytes, copies);
+    if (total_size_bytes == 0) {
+        // DownloadBufferMemory returns here too, without touching the tracker.
+        Offload::Add(Offload::State().prepare_empty);
+        if (is_write) {
+            CompleteEmptyWriteFault(device_addr, size);
+        }
+        return {};
+    }
+
+    FaultJob* job = nullptr;
+    for (FaultJob& candidate : fault_jobs) {
+        if (candidate.state == FaultJobState::Free) {
+            job = &candidate;
+            break;
+        }
+    }
+    std::unique_ptr<Buffer> staging;
+    if (job && total_size_bytes <= FaultStagingSize) {
+        staging = AcquireFaultStaging();
+    }
+    if (!staging) {
+        // Out of job slots or staging, or too large for a job. Nothing was mutated above, and
+        // the list just collected is not empty, so this download marks what is_write needs.
+        Offload::SyncTiming timing{};
+        DownloadBufferMemory<false>(buffer, addr, bytes, is_write,
+                                    Offload::ProfileEnabled() ? &timing : nullptr);
+        // A guest-origin synchronous download like any other, and additionally a capacity miss.
+        Offload::CountSyncResolve(Offload::Origin::Guest, timing);
+        Offload::Add(Offload::State().capacity_fallbacks);
+        Offload::Add(Offload::State().capacity_wait_ns, timing.total_ns);
+        return {};
+    }
+
+    boost::container::small_vector<vk::BufferCopy, 8> vk_copies;
+    for (const FaultCopy& copy : copies) {
+        vk_copies.push_back(vk::BufferCopy{
+            .srcOffset = copy.addr - buffer.CpuAddr(),
+            .dstOffset = copy.staging_offset,
+            .size = copy.size,
+        });
+    }
+
+    // Snapshot and copy list are taken in one uninterrupted step on this thread, which also
+    // owns every GPU write marking, so the recorded copy matches them. The job is complete
+    // before anything below can reenter.
+    const u64 id = next_fault_job_id++;
+    const u64 tick = scheduler.CurrentTick();
+    job->seqs.clear();
+    memory_tracker->SnapshotGpuWriteSeq(addr, bytes, job->seqs);
+    const bool admitted = fault_mapping_gate.TryAdmit(addr, bytes, [&] {
+        // No GPU, memory-manager call or wait inside this callback. Unmap either blocks this
+        // admission or observes the published window and settles it before removing pages.
+        job->id = id;
+        job->state = FaultJobState::Pending;
+        job->abandoned = false;
+        job->is_write = is_write;
+        job->addr = addr;
+        job->size = bytes;
+        job->tick = tick;
+        job->total_bytes = total_size_bytes;
+        job->copies = std::move(copies);
+        job->staging = std::move(staging);
+        std::scoped_lock lk{fault_window_mutex};
+        const auto [window_begin, window_end] = TrackerPageSpan(addr, bytes);
+        fault_windows[job - fault_jobs.data()] = {window_begin, window_end};
+        pending_fault_jobs.fetch_add(1);
+    });
+    if (!admitted) {
+        job->seqs.clear();
+        ReleaseFaultStaging(std::move(staging)); // Never submitted or host-consumed.
+        Offload::Add(Offload::State().mapping_fallbacks);
+        Offload::Add(Offload::State().sync_fallbacks);
+        ResolveFaultSync(device_addr, size, is_write, Offload::Origin::Guest);
+        return {};
+    }
+    const vk::Buffer staging_handle = job->staging->Handle();
+    Offload::Add(Offload::State().jobs);
+    Common::FaultMonitor::CountReadbackDownload(total_size_bytes);
+
+    scheduler.EndRendering();
+    {
+        auto command_access = scheduler.AcquireCommandBuffer();
+        RecordFaultCopies(command_access.Handle(), buffer, staging_handle,
+                          {vk_copies.data(), vk_copies.size()});
+    }
+    scheduler.Flush();
+    return {id, tick};
+}
+
+void BufferCache::RecordFaultCopies(vk::CommandBuffer cmdbuf, Buffer& source, vk::Buffer staging,
+                                    std::span<const vk::BufferCopy> copies) {
+    // A nested verification can run while a binding's barriers have been collected but not
+    // recorded. The tracked access may already describe that future binding, so use an
+    // explicit all-writes source dependency rather than trusting it for this readback.
+    const vk::BufferMemoryBarrier2 source_barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = source.Handle(),
+        .offset = 0,
+        .size = source.SizeBytes(),
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &source_barrier,
+    });
+    // Keep access tracking consistent for the closing dependency and subsequent users.
+    (void)source.GetBarrier(vk::AccessFlagBits2::eTransferRead,
+                            vk::PipelineStageFlagBits2::eTransfer);
+    cmdbuf.copyBuffer(source.Handle(), staging, copies);
+    // The timeline wait establishes completion; this dependency also makes transfer writes
+    // available to the host domain before mapped bytes are read (including by the verifier).
+    const vk::BufferMemoryBarrier2 host_barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = staging,
+        .offset = 0,
+        .size = VK_WHOLE_SIZE,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &host_barrier,
+    });
+    if (const auto barrier = source.GetBarrier(
+            vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            vk::PipelineStageFlagBits2::eAllCommands)) {
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers = &*barrier,
+        });
+    }
+}
+
+void BufferCache::FinishFaultDownload(u64 id, VAddr device_addr, u64 size, bool is_write) {
+    FaultJob* job = nullptr;
+    for (FaultJob& candidate : fault_jobs) {
+        if (candidate.state != FaultJobState::Free && candidate.id == id) {
+            job = &candidate;
+            break;
+        }
+    }
+    bool vetoed = true;
+    if (!job) {
+        // Only teardown frees a job its owner has not consumed. Tracking is intact by
+        // construction, so the synchronous path below is still correct.
+        LOG_ERROR(Render, "ReadbackOffload: job {} missing at finish", id);
+    } else {
+        if (job->state == FaultJobState::Pending) {
+            job->state = FaultJobState::Settling;
+            // The owner already waited for this tick, so this is not expected to block.
+            if (!scheduler.IsFree(job->tick)) {
+                const u64 wait_start = Offload::ProfileNowNs();
+                scheduler.Wait(job->tick);
+                Offload::AddSince(Offload::State().cp_settle_wait_ns, wait_start);
+            }
+            FinalizeFaultJob(*job);
+        }
+        if (job->state == FaultJobState::Settling) {
+            // Only reachable nested inside a settle of this job, which the command queue
+            // does not do. Let that settle free the slot and resolve synchronously here.
+            LOG_ERROR(Render, "ReadbackOffload: job {} finished while settling", id);
+            job->abandoned = true;
+        } else {
+            // A job the command processor settled earlier stays in Success or Vetoed until
+            // this point, so removal after a veto is never mistaken for success.
+            vetoed = job->state == FaultJobState::Vetoed;
+            job->state = FaultJobState::Free;
+        }
+    }
+    if (vetoed) {
+        // Exactly one synchronous fallback per vetoed job, and no retry.
+        Offload::Add(Offload::State().sync_fallbacks);
+        ResolveFaultSync(device_addr, size, is_write, Offload::Origin::Guest);
+    }
+}
+
+void BufferCache::SettleOverlappingJobs(VAddr device_addr, u64 size) {
+    if (pending_fault_jobs.load(std::memory_order_relaxed) == 0) {
+        return;
+    }
+    // Downloads and tracker clears act on whole tracker pages, so compare page spans.
+    const auto [begin, end] = TrackerPageSpan(device_addr, size);
+    for (;;) {
+        FaultJob* found = nullptr;
+        for (FaultJob& job : fault_jobs) {
+            if (job.state != FaultJobState::Pending) {
+                continue;
+            }
+            const auto [job_begin, job_end] = TrackerPageSpan(job.addr, job.size);
+            if (job_begin < end && begin < job_end) {
+                found = &job;
+                break;
             }
         }
-        DownloadBufferMemory<false>(buffer, wide_addr, wide_size, false);
-    });
+        if (!found) {
+            return;
+        }
+        // Leave Pending before anything that can reenter, then rescan from the start. The
+        // slot array never moves and a Settling slot is not reused, so the pointer holds.
+        // This runs on the command processor and needs no callback from it, which is what a
+        // command processor fault during a guest job requires.
+        found->state = FaultJobState::Settling;
+        Offload::Add(Offload::State().cp_settles);
+        const u64 wait_start = Offload::ProfileNowNs();
+        scheduler.Wait(found->tick);
+        Offload::AddSince(Offload::State().cp_settle_wait_ns, wait_start);
+        FinalizeFaultJob(*found);
+    }
+}
+
+void BufferCache::FinalizeFaultJob(FaultJob& job) {
+    // Precondition: state is Settling and the GPU has reached job.tick.
+    bool ok = true;
+    if (Offload::VerifyEnabled()) {
+        // Only a completed comparison lets a job through. Anything else is a veto, which
+        // leaves the dirty state for the synchronous fallback, so a verified run contains no
+        // publication that was not checked.
+        ok = VerifyFaultJob(job) == VerifyResult::Matched;
+    }
+    if (ok) {
+        ok = PublishFaultJob(job);
+    }
+    ReleaseFaultStaging(std::move(job.staging));
+    job.copies.clear();
+    job.seqs.clear();
+    {
+        // After the publication or veto, never before: an invalidation that no longer sees
+        // this window must find the tracker already in its final state for this job.
+        std::scoped_lock lk{fault_window_mutex};
+        fault_windows[&job - fault_jobs.data()] = {};
+        pending_fault_jobs.fetch_sub(1);
+    }
+    if (ok) {
+        Offload::Add(Offload::State().successes);
+    }
+    if (job.abandoned) {
+        job.state = FaultJobState::Free;
+    } else {
+        job.state = ok ? FaultJobState::Success : FaultJobState::Vetoed;
+    }
+}
+
+bool BufferCache::PublishFaultJob(FaultJob& job) {
+    // One uninterrupted command processor step: vote, compare, then mutate. Nothing here can
+    // fault or submit, so no GPU write marking lands between the vote and the clears.
+    if (!memory_tracker->GpuWriteSeqMatches(job.addr, job.size, job.seqs)) {
+        Offload::Add(Offload::State().seq_vetoes);
+        return false;
+    }
+    // Compare BEFORE subtracting: on a mismatch the sync fallback must find the ranges.
+    std::vector<FaultCopy> current;
+    const u64 current_bytes = CollectFaultCopies(job.addr, job.size, current);
+    if (current_bytes != job.total_bytes || current != job.copies) {
+        // A nested synchronous download took part of the window while this job settled.
+        LOG_ERROR(Render, "ReadbackOffload: copy list changed for {:#x}:{:#x}; falling back",
+                  job.addr, job.size);
+        Offload::Add(Offload::State().list_vetoes);
+        return false;
+    }
+    memory_tracker->ForEachDownloadRange<false>(
+        job.addr, job.size, [&](u64 device_addr_out, u64 range_size) {
+            gpu_modified_ranges.Subtract(device_addr_out, range_size);
+            Common::FaultMonitor::CountRangeSubtract(
+                gpu_modified_ranges.m_ranges_set.iterative_size());
+        });
+    if (!job.staging->is_coherent) {
+        vmaInvalidateAllocation(instance.GetAllocator(), job.staging->buffer.allocation, 0,
+                                job.total_bytes);
+    }
+    const u8* const download = job.staging->mapped_data.data();
+    auto* memory = Core::Memory::Instance();
+    for (const FaultCopy& copy : job.copies) {
+        memory->TryWriteBacking(std::bit_cast<u8*>(copy.addr), download + copy.staging_offset,
+                                copy.size);
+    }
+    memory_tracker->UnmarkRegionAsGpuModified(job.addr, job.size);
+    if (job.is_write) {
+        memory_tracker->MarkRegionAsCpuModified(job.addr, job.size);
+    }
+    return true;
+}
+
+BufferCache::VerifyResult BufferCache::VerifyFaultJob(FaultJob& job) {
+    // Oracle for GPU writes that bypass the region sequence. It does not prove the absence
+    // of races; it only compares two readbacks the sequence claims are identical.
+    if (!memory_tracker->GpuWriteSeqMatches(job.addr, job.size, job.seqs)) {
+        // Differing bytes are expected, so nothing is compared. The veto PublishFaultJob
+        // would have cast is counted here, since it is no longer reached.
+        Offload::Add(Offload::State().seq_vetoes);
+        return VerifyResult::Unverified;
+    }
+    // Look the buffer up without creating or merging anything. The source has to be the
+    // cache's current buffer for these bytes, found independently of the job.
+    const BufferId buffer_id = page_table[job.addr >> CACHING_PAGEBITS].buffer_id;
+    std::unique_ptr<Buffer> second;
+    boost::container::small_vector<vk::BufferCopy, 8> vk_copies;
+    if (!IsBufferInvalid(buffer_id)) {
+        const Buffer& buffer = slot_buffers[buffer_id];
+        const bool in_bounds = std::ranges::all_of(job.copies, [&](const FaultCopy& copy) {
+            return buffer.IsInBounds(copy.addr, copy.size);
+        });
+        if (in_bounds) {
+            second = AcquireFaultStaging();
+            for (const FaultCopy& copy : job.copies) {
+                vk_copies.push_back(vk::BufferCopy{
+                    .srcOffset = copy.addr - buffer.CpuAddr(),
+                    .dstOffset = copy.staging_offset,
+                    .size = copy.size,
+                });
+            }
+        }
+    }
+    if (!second) {
+        // No source buffer spans the list any more, or no second staging is left. The job is
+        // vetoed rather than published unchecked.
+        LOG_WARNING(Render, "ReadbackOffload: no independent readback for {:#x}:{:#x}; vetoed",
+                    job.addr, job.size);
+        Offload::Add(Offload::State().verify_skips);
+        return VerifyResult::Unverified;
+    }
+    // Same ordering rules as the first copy: end rendering, drain, record in stream order.
+    // The reference is taken here and dropped before Finish, which can reenter the cache.
+    scheduler.EndRendering();
+    {
+        auto command_access = scheduler.AcquireCommandBuffer();
+        RecordFaultCopies(command_access.Handle(), slot_buffers[buffer_id], second->Handle(),
+                          {vk_copies.data(), vk_copies.size()});
+    }
+    scheduler.Finish();
+    VerifyResult result = VerifyResult::Unverified;
+    // Finish can reenter. A marking since then makes differing bytes legitimate; the job is
+    // then vetoed by the same vote in PublishFaultJob's place.
+    if (!memory_tracker->GpuWriteSeqMatches(job.addr, job.size, job.seqs)) {
+        Offload::Add(Offload::State().seq_vetoes);
+    } else {
+        for (const Buffer* staging : {second.get(), job.staging.get()}) {
+            if (!staging->is_coherent) {
+                vmaInvalidateAllocation(instance.GetAllocator(), staging->buffer.allocation, 0,
+                                        job.total_bytes);
+            }
+        }
+        Offload::Add(Offload::State().verify_checks);
+        result = VerifyResult::Matched;
+        const u8* const first_data = job.staging->mapped_data.data();
+        const u8* const second_data = second->mapped_data.data();
+        for (const FaultCopy& copy : job.copies) {
+            if (std::memcmp(first_data + copy.staging_offset, second_data + copy.staging_offset,
+                            copy.size) != 0) {
+                LOG_CRITICAL(Render,
+                             "ReadbackOffload: verify mismatch at {:#x}:{:#x} in job window "
+                             "{:#x}:{:#x}; GPU write without a sequence bump",
+                             copy.addr, copy.size, job.addr, job.size);
+                Offload::Add(Offload::State().verify_mismatches);
+                result = VerifyResult::Mismatch;
+                break;
+            }
+        }
+    }
+    ReleaseFaultStaging(std::move(second));
+    return result;
 }
 
 template <bool async>
-void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size, bool is_write) {
+bool BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size, bool is_write,
+                                       Offload::SyncTiming* timing) {
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     memory_tracker->ForEachDownloadRange<false>(
@@ -238,7 +833,7 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
                 gpu_modified_ranges.m_ranges_set.iterative_size());
         });
     if (total_size_bytes == 0) {
-        return;
+        return false;
     }
     Common::FaultMonitor::CountReadbackDownload(total_size_bytes);
     const auto [download, offset] = download_buffer.Map(total_size_bytes);
@@ -265,11 +860,29 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         }
     };
     if constexpr (async) {
+        (void)timing;
         scheduler.DeferOperation(write_data);
     } else {
-        scheduler.Finish();
+        if (timing) {
+            // Scheduler::Finish, statement for statement (vk_scheduler.cpp): take the tick,
+            // submit with an empty SubmitInfo, which is all Flush() does, then Wait on the
+            // tick. The submit has advanced the current tick past it, so Wait does not flush
+            // again and its time is the GPU wait alone.
+            const u64 start = Offload::NowNs();
+            const u64 presubmit_tick = scheduler.CurrentTick();
+            scheduler.Flush();
+            const u64 submitted = Offload::NowNs();
+            scheduler.Wait(presubmit_tick);
+            const u64 done = Offload::NowNs();
+            timing->submit_ns += submitted - start;
+            timing->gpu_wait_ns += done - submitted;
+            timing->total_ns += done - start;
+        } else {
+            scheduler.Finish();
+        }
         write_data();
     }
+    return true;
 }
 
 void BufferCache::BindVertexBuffers(
@@ -989,6 +1602,18 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, 
         sfi_report();
         return false;
     }
+    if (pending_fault_jobs.load(std::memory_order_relaxed) != 0) {
+        // TileImage writes this cache buffer with no tracker marking, so the region sequence
+        // would not move and a pending fault job over these bytes would still pass its vote.
+        // Bump it by hand, before the write is recorded: every publication from here on is
+        // vetoed and resolved by a synchronous download recorded after the tiling. A settle
+        // would also do, but it waits and can reenter the cache while the caller holds
+        // `buffer`. A tiled image binds its whole guest size, so cover that too.
+        const u64 written = std::min<u64>(std::max<u64>(copy_size, image.info.guest_size),
+                                          buffer.SizeBytes() - buf_offset);
+        memory_tracker->InvalidateGpuWriteSeq(image.info.guest_address, written);
+        Offload::Add(Offload::State().alias_bumps);
+    }
     auto& tile_manager = texture_cache.GetTileManager();
     const auto sfi_t1 = Common::FaultMonitor::Now();
     tile_manager.TileImage(image, buffer_copies, buffer.Handle(), buf_offset, copy_size);
@@ -1083,6 +1708,9 @@ void BufferCache::RunGarbageCollector() {
             return;
         }
         --max_deletions;
+        // Settle before taking the reference: no in-flight fault job may span this download.
+        SettleOverlappingJobs(slot_buffers[buffer_id].CpuAddr(),
+                              slot_buffers[buffer_id].SizeBytes());
         Buffer& buffer = slot_buffers[buffer_id];
         // InvalidateMemory(buffer.CpuAddr(), buffer.SizeBytes());
         DownloadBufferMemory<true>(buffer, buffer.CpuAddr(), buffer.SizeBytes(), true);

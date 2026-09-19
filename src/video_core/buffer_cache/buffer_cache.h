@@ -3,8 +3,15 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
+#include <memory>
+#include <mutex>
+#include <span>
+#include <vector>
 #include <boost/container/small_vector.hpp>
 #include "common/lru_cache.h"
+#include "common/readback_unmap_gate.h"
 #include "common/slot_vector.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -27,6 +34,11 @@ class GraphicsPipeline;
 namespace Common {
 class BufferSampleProbe;
 }
+
+namespace Common::ReadbackOffload {
+enum class Origin : u32;
+struct SyncTiming;
+} // namespace Common::ReadbackOffload
 
 namespace VideoCore {
 
@@ -110,6 +122,12 @@ public:
     /// Invalidates any buffer in the logical page range.
     void InvalidateMemory(VAddr device_addr, u64 size);
 
+    /// Block new asynchronous readbacks before GPU unmap and settle earlier ones.
+    void BeginGpuUnmap(VAddr device_addr, u64 size);
+
+    /// A completed GPU mapping can admit asynchronous readbacks again; never waits on CP.
+    void EndGpuMap(VAddr device_addr, u64 size);
+
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false);
 
@@ -173,8 +191,111 @@ private:
         return !buffer_id || slot_buffers[buffer_id].is_deleted;
     }
 
+    /// Returns false when nothing was GPU-dirty, in which case no tracker state was changed.
+    /// timing, when set, receives the split ns of the synchronous submit and wait.
     template <bool async>
-    void DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size, bool is_write);
+    bool DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size, bool is_write,
+                              Common::ReadbackOffload::SyncTiming* timing = nullptr);
+
+    // Readback wait offload (SHADPS4_READBACK_OFFLOAD, default off). A guest fault is split
+    // into two command processor steps around a GPU wait taken on the faulting thread.
+    // Everything below is owned by the command processor thread, except fault_guest_waiters
+    // and the two members guests read before an invalidation: pending_fault_jobs and
+    // fault_windows.
+
+    /// Guest bytes covered by one staging copy, in absolute addresses so the list still
+    /// compares after the source buffer has been merged into another.
+    struct FaultCopy {
+        VAddr addr;
+        u64 staging_offset;
+        u64 size;
+
+        bool operator==(const FaultCopy&) const = default;
+    };
+
+    enum class FaultJobState : u8 {
+        Free,
+        Pending,  ///< Copy submitted; tracker state still exactly as the sync path left it.
+        Settling, ///< Being finalized; skipped by nested settles.
+        Success,  ///< Published. Kept until the owning thread consumes the result.
+        Vetoed,   ///< Snapshot dropped, tracking untouched. The owner runs one sync fallback.
+    };
+
+    struct FaultJob {
+        u64 id{};
+        FaultJobState state{FaultJobState::Free};
+        bool abandoned{};
+        bool is_write{};
+        VAddr addr{};
+        u64 size{};
+        u64 tick{};
+        u64 total_bytes{};
+        std::vector<FaultCopy> copies;
+        std::vector<u64> seqs;
+        std::unique_ptr<Buffer> staging;
+    };
+
+    /// Returned to the faulting thread by value. id 0 means the fault was resolved already.
+    struct FaultTicket {
+        u64 id{};
+        u64 tick{};
+    };
+
+    /// Tracker-page span of an unfinalized job, indexed like fault_jobs. Empty when end is 0.
+    struct FaultWindow {
+        VAddr begin{};
+        VAddr end{};
+    };
+
+    enum class VerifyResult : u8 {
+        Matched,    ///< An independent second readback held the same bytes.
+        Unverified, ///< No comparison was made. The job is vetoed, never published.
+        Mismatch,
+    };
+
+    static constexpr size_t MaxFaultJobs = 8;
+    static constexpr u64 FaultStagingSize = 2_MB;
+
+    /// The window a fault downloads: exact for writes, widened and preflighted for reads.
+    std::pair<VAddr, u64> ResolveFaultWindow(const Buffer& buffer, VAddr device_addr, u64 size,
+                                             bool is_write);
+
+    /// The existing synchronous fault download, after settling overlapping jobs.
+    void ResolveFaultSync(VAddr device_addr, u64 size, bool is_write,
+                          Common::ReadbackOffload::Origin origin);
+
+    FaultTicket PrepareFaultDownload(VAddr device_addr, u64 size, bool is_write);
+
+    void FinishFaultDownload(u64 id, VAddr device_addr, u64 size, bool is_write);
+
+    /// Finalizes every pending job sharing a tracker page with the range, waiting on its tick
+    /// here. Must precede any download, publication or tracker clear over that range.
+    void SettleOverlappingJobs(VAddr device_addr, u64 size);
+
+    /// Callable from any thread. True if an unfinalized job shares a tracker page with the
+    /// range, in which case the caller settles it on the command processor before it lets
+    /// the tracker decide anything about that range.
+    bool HasOverlappingFaultJob(VAddr device_addr, u64 size);
+
+    /// An invalidation that found nothing left to download still owes its CPU marking.
+    void CompleteEmptyWriteFault(VAddr device_addr, u64 size);
+
+    /// Transfer read of a cache buffer into staging, entered into the buffer's barrier chain.
+    void RecordFaultCopies(vk::CommandBuffer cmdbuf, Buffer& source, vk::Buffer staging,
+                           std::span<const vk::BufferCopy> copies);
+
+    void FinalizeFaultJob(FaultJob& job);
+
+    VerifyResult VerifyFaultJob(FaultJob& job);
+
+    bool PublishFaultJob(FaultJob& job);
+
+    /// Same walk and staging layout as DownloadBufferMemory, without subtracting anything.
+    u64 CollectFaultCopies(VAddr device_addr, u64 size, std::vector<FaultCopy>& copies);
+
+    std::unique_ptr<Buffer> AcquireFaultStaging();
+
+    void ReleaseFaultStaging(std::unique_ptr<Buffer> staging);
 
     [[nodiscard]] OverlapResult ResolveOverlaps(VAddr device_addr, u32 wanted_size);
 
@@ -225,6 +346,19 @@ private:
     RangeSet gpu_modified_ranges;
     SplitRangeMap<BufferId> buffer_ranges;
     PageTable page_table;
+    std::array<FaultJob, MaxFaultJobs> fault_jobs;
+    std::vector<std::unique_ptr<Buffer>> fault_staging_pool;
+    u32 fault_staging_created = 0;
+    u64 next_fault_job_id = 1;
+    /// Jobs admitted and not yet finalized. Written by the command processor only, under
+    /// fault_window_mutex together with fault_windows; guests read it without the mutex as
+    /// the no-pending fast path of InvalidateMemory.
+    std::atomic<u32> pending_fault_jobs{0};
+    std::mutex fault_window_mutex;
+    std::array<FaultWindow, MaxFaultJobs> fault_windows{};
+    Common::ReadbackUnmapGate fault_mapping_gate;
+    /// Guest threads between entering the offload path and consuming their result.
+    std::atomic<u32> fault_guest_waiters{0};
 };
 
 } // namespace VideoCore

@@ -239,7 +239,58 @@ public:
                             });
     }
 
+    /// Appends the GPU write sequence of every 4 MB region the range touches, in address order.
+    /// A region without a manager reads as 0, the value a new manager starts from, so a region
+    /// created and GPU-written later still compares unequal.
+    void SnapshotGpuWriteSeq(VAddr cpu_addr, u64 size, std::vector<u64>& out) {
+        ForEachGpuWriteSeq(cpu_addr, size, [&out](u64 seq) {
+            out.push_back(seq);
+            return true;
+        });
+    }
+
+    /// True if no region of the range received a GPU write marking since the snapshot.
+    bool GpuWriteSeqMatches(VAddr cpu_addr, u64 size, const std::vector<u64>& snapshot) {
+        size_t index = 0;
+        const bool complete = ForEachGpuWriteSeq(cpu_addr, size, [&](u64 seq) {
+            return index < snapshot.size() && snapshot[index++] == seq;
+        });
+        return complete && index == snapshot.size();
+    }
+
+    /// Makes every snapshot over the range compare unequal, for a GPU write into a cache
+    /// buffer that takes no tracker marking. A region without a manager holds no GPU-dirty
+    /// page, so no fault download can have copied from it and it needs no bump.
+    void InvalidateGpuWriteSeq(VAddr cpu_addr, u64 size) {
+        IteratePages<false>(cpu_addr, size, [](RegionManager* manager, u64, size_t) {
+            std::scoped_lock lk{manager->lock};
+            manager->BumpGpuWriteSeq();
+        });
+    }
+
 private:
+    /// Calls func with each touched region's sequence until it returns false.
+    template <typename Func>
+    bool ForEachGpuWriteSeq(VAddr cpu_addr, u64 size, Func&& func) {
+        if (size == 0) {
+            return true;
+        }
+        const size_t first = cpu_addr >> TRACKER_HIGHER_PAGE_BITS;
+        const size_t last = (cpu_addr + size - 1) >> TRACKER_HIGHER_PAGE_BITS;
+        for (size_t page_index = first; page_index <= last; ++page_index) {
+            RegionManager* manager = top_tier[page_index];
+            u64 seq = 0;
+            if (manager) {
+                std::scoped_lock lk{manager->lock};
+                seq = manager->GpuWriteSeq();
+            }
+            if (!func(seq)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /**
      * @brief IteratePages Iterates L2 word manager page table.
      * @param cpu_address Start byte cpu address
