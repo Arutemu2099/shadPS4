@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <bit>
 #include <cstring>
 #include <type_traits>
 #include "common/types.h"
@@ -42,8 +43,8 @@ struct PreparedGraphicsState {
     u32 z_info;
     u32 stencil_info;
     u32 depth_presence; // bit0 z_read_base != 0, bit1 stencil_read_base != 0
-    u32 fs_settings;
-    u32 vs_settings;
+    std::array<u32, 2> fs_settings;
+    std::array<u32, 2> vs_settings;
     u32 color_presence; // bit per color buffer: base_address && info.format
     u32 reserved;
     std::array<u32, AmdGpu::NUM_COLOR_BUFFERS> blend_control;
@@ -89,8 +90,8 @@ struct PreparedGraphicsState {
         stencil_info = Raw(regs.depth_buffer.stencil_info);
         depth_presence = u32(regs.depth_buffer.z_read_base != 0) |
                          (u32(regs.depth_buffer.stencil_read_base != 0) << 1);
-        fs_settings = Raw(regs.ps_program.settings);
-        vs_settings = Raw(regs.vs_program.settings);
+        fs_settings = std::bit_cast<std::array<u32, 2>>(regs.ps_program.settings);
+        vs_settings = std::bit_cast<std::array<u32, 2>>(regs.vs_program.settings);
         for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
             blend_control[cb] = Raw(regs.blend_control[cb]);
             const auto& col_buf = regs.color_buffers[cb];
