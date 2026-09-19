@@ -12,7 +12,6 @@
 #include <unordered_set>
 #include <boost/container/small_vector.hpp>
 #include <queue>
-#include <span>
 #include <tsl/robin_map.h>
 
 #include "common/lru_cache.h"
@@ -102,14 +101,6 @@ public:
 
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
-
-    /// Finds and binds already-decoded image descriptors while holding the cache mutex once.
-    /// This preserves associated-depth redirection and binding flags for each entry. Callers must
-    /// complete all guest descriptor reads before entering this method.
-    void FindAndBindImages(std::span<std::pair<ImageId, ImageDesc>> entries);
-
-    /// Runtime switch for the narrow BindTextures lookup batch. Disabled by default.
-    [[nodiscard]] static bool BatchImageLookupsEnabled() noexcept;
 
     /// Retrieves image whose address matches provided
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
@@ -356,8 +347,6 @@ private:
     // here under the same synchronization as the mapping change. Currently those are immutable:
     // expansion/depth replacement creates and registers a new Image instead.
     void InvalidatePreparedImages();
-
-    [[nodiscard]] ImageId FindImageLocked(ImageDesc& desc, bool exact_fmt, u64 lock_ns);
 
 private:
     const Vulkan::Instance& instance;
