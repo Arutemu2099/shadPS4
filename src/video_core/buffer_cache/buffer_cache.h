@@ -24,6 +24,10 @@ namespace Vulkan {
 class GraphicsPipeline;
 }
 
+namespace Common {
+class BufferSampleProbe;
+}
+
 namespace VideoCore {
 
 using BufferId = Common::SlotId;
@@ -186,7 +190,7 @@ private:
     void ChangeRegister(BufferId buffer_id);
 
     bool SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
-                           bool is_texel_buffer);
+                           bool is_texel_buffer, Common::BufferSampleProbe* sample_probe);
 
     vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
                             size_t total_size_bytes);

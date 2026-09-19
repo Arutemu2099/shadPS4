@@ -10,6 +10,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "common/buffer_sample_probe.h"
 #include "common/debug.h"
 #include "common/fault_monitor.h"
 #include "common/types.h"
@@ -23,6 +24,7 @@ public:
     static constexpr size_t MAX_CPU_PAGE_BITS = 40;
     static constexpr size_t NUM_HIGH_PAGES = 1ULL << (MAX_CPU_PAGE_BITS - TRACKER_HIGHER_PAGE_BITS);
     static constexpr size_t MANAGER_POOL_SIZE = 32;
+    using UploadPath = Common::BufferSampleProbe::UploadPath;
 
 public:
     explicit MemoryTracker(PageManager& tracker_) : tracker{&tracker_} {}
@@ -136,8 +138,8 @@ public:
         return static_cast<size_t>(h % CLEAN_MEMO_SIZE);
     }
 
-    void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, bool is_written, auto&& func,
-                            auto&& on_upload) {
+    UploadPath ForEachUploadRange(VAddr query_cpu_range, u64 query_size, bool is_written,
+                                  auto&& func, auto&& on_upload) {
         // Three phases with very different costs - scan is bitset work, mark can reach a
         // VirtualProtect syscall. Timed separately so a fix is aimed at the one that is expensive.
         const auto t_scan = Common::FaultMonitor::Now();
@@ -169,14 +171,14 @@ public:
             on_upload();
             Common::FaultMonitor::CountUploadShape(0, 0, 0, query_size);
             Common::FaultMonitor::CountUploadMemoHit();
-            return;
+            return UploadPath::Memo;
         }
         if (clean_skip && AllRegionsSkippable(query_cpu_range, query_size)) {
             MemoRecordClean(query_cpu_range, query_size, epoch);
             on_upload();
             Common::FaultMonitor::CountUploadShape(0, 0, 0, query_size);
             Common::FaultMonitor::CountUploadFastPath();
-            return;
+            return UploadPath::Coarse;
         }
         IteratePages<true>(query_cpu_range, query_size,
                            [&counting_func, &shape_managers, &shape_skipped, clean_skip,
@@ -212,7 +214,7 @@ public:
             Common::FaultMonitor::CountUploadPhases(Common::FaultMonitor::DiffNs(t_scan, t_copy),
                                                     Common::FaultMonitor::DiffNs(t_copy, t_mark), 0,
                                                     false);
-            return;
+            return UploadPath::Walk;
         }
         IteratePages<false>(query_cpu_range, query_size,
                             [&func, is_written](RegionManager* manager, u64 offset, size_t size) {
@@ -223,6 +225,7 @@ public:
         Common::FaultMonitor::CountUploadPhases(Common::FaultMonitor::DiffNs(t_scan, t_copy),
                                                 Common::FaultMonitor::DiffNs(t_copy, t_mark),
                                                 Common::FaultMonitor::SinceNs(t_mark), true);
+        return UploadPath::Walk;
     }
 
     /// Call 'func' for each GPU modified range and unmark those pages as GPU modified

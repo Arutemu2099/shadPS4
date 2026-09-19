@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include "common/alignment.h"
+#include "common/buffer_sample_probe.h"
 #include "common/debug.h"
 #include "common/fault_monitor.h"
 #include "common/scope_exit.h"
@@ -449,7 +450,7 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         }
         const auto buffer_id = FindBuffer(src, num_bytes);
         auto& buffer = slot_buffers[buffer_id];
-        SynchronizeBuffer(buffer, src, num_bytes, false, true);
+        SynchronizeBuffer(buffer, src, num_bytes, false, true, nullptr);
         return buffer;
     }();
     auto& dst_buffer = [&] -> const Buffer& {
@@ -458,7 +459,7 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         }
         const auto buffer_id = FindBuffer(dst, num_bytes);
         auto& buffer = slot_buffers[buffer_id];
-        SynchronizeBuffer(buffer, dst, num_bytes, true, true);
+        SynchronizeBuffer(buffer, dst, num_bytes, true, true, nullptr);
         gpu_modified_ranges.Add(dst, num_bytes);
         Common::FaultMonitor::CountRangeAdd(gpu_modified_ranges.m_ranges_set.iterative_size());
         return buffer;
@@ -532,6 +533,8 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     // share no code: the early exit below (a tracker query plus a guest-memory memcpy) and the
     // SynchronizeBuffer fall-through. Time them separately - the split decides which is worth
     // cutting, and it has never actually been measured.
+    const bool sample_this_call = Common::BufferSampleProbe::ShouldSample();
+    Common::BufferSampleProbe sample{sample_this_call, is_written, is_texel_buffer, size};
     const auto t_entry = Common::FaultMonitor::Now();
     u64 query_ns = 0;
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
@@ -549,20 +552,30 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         if (!gpu_modified) {
             const u64 offset =
                 stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
+            sample.RecordStream();
             Common::FaultMonitor::CountObtainStream(query_ns,
                                                     Common::FaultMonitor::SinceNs(t_query), size);
             return {&stream_buffer, offset};
         }
     }
-    if (IsBufferInvalid(buffer_id)) {
+    const bool buffer_id_fallback = IsBufferInvalid(buffer_id);
+    sample.RecordBufferIdFallback(buffer_id_fallback);
+    if (buffer_id_fallback) {
+        const auto t_find = sample.Now();
         buffer_id = FindBuffer(device_addr, size);
+        sample.AddFindNs(sample.SinceNs(t_find));
     }
     Buffer& buffer = slot_buffers[buffer_id];
     const auto t_sync = Common::FaultMonitor::Now();
-    SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer);
+    const auto t_sample_sync = sample.Now();
+    SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer,
+                      sample.Active() ? &sample : nullptr);
+    sample.AddSyncNs(sample.SinceNs(t_sample_sync));
     Common::FaultMonitor::CountObtainSync(query_ns, Common::FaultMonitor::SinceNs(t_sync));
     if (is_written) {
+        const auto t_range_add = sample.Now();
         gpu_modified_ranges.Add(device_addr, size);
+        sample.AddRangeAddNs(sample.SinceNs(t_range_add));
         Common::FaultMonitor::CountRangeAdd(gpu_modified_ranges.m_ranges_set.iterative_size());
     }
     return {&buffer, buffer.Offset(device_addr)};
@@ -573,7 +586,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 si
     const BufferId buffer_id = page_table[gpu_addr >> CACHING_PAGEBITS].buffer_id;
     if (buffer_id) {
         if (Buffer& buffer = slot_buffers[buffer_id]; buffer.IsInBounds(gpu_addr, size)) {
-            SynchronizeBuffer(buffer, gpu_addr, size, false, false);
+            SynchronizeBuffer(buffer, gpu_addr, size, false, false, nullptr);
             return {&buffer, buffer.Offset(gpu_addr)};
         }
     }
@@ -812,18 +825,25 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
 }
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
-                                    bool is_texel_buffer) {
+                                    bool is_texel_buffer,
+                                    Common::BufferSampleProbe* sample_probe) {
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes = 0;
     VAddr buffer_start = buffer.CpuAddr();
     vk::Buffer src_buffer = VK_NULL_HANDLE;
-    memory_tracker->ForEachUploadRange(
+    const auto t_upload = sample_probe ? sample_probe->Now()
+                                       : Common::BufferSampleProbe::Clock::time_point{};
+    const auto upload_path = memory_tracker->ForEachUploadRange(
         device_addr, size, is_written,
         [&](u64 device_addr_out, u64 range_size) {
             copies.emplace_back(total_size_bytes, device_addr_out - buffer_start, range_size);
             total_size_bytes += range_size;
         },
         [&] { src_buffer = UploadCopies(buffer, copies, total_size_bytes); });
+    if (sample_probe) {
+        sample_probe->AddUploadNs(sample_probe->SinceNs(t_upload));
+        sample_probe->RecordUpload(upload_path, total_size_bytes, copies.size());
+    }
 
     if (src_buffer) {
         scheduler.EndRendering();
@@ -866,7 +886,13 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
         TouchBuffer(buffer);
     }
     if (is_texel_buffer && !is_written) {
-        return SynchronizeBufferFromImage(buffer, device_addr, size);
+        const auto t_texel = sample_probe ? sample_probe->Now()
+                                          : Common::BufferSampleProbe::Clock::time_point{};
+        const bool result = SynchronizeBufferFromImage(buffer, device_addr, size);
+        if (sample_probe) {
+            sample_probe->AddTexelNs(sample_probe->SinceNs(t_texel));
+        }
+        return result;
     }
     return false;
 }
@@ -978,7 +1004,7 @@ void BufferCache::SynchronizeBuffersInRange(VAddr device_addr, u64 size) {
         VAddr start = std::max(buffer.CpuAddr(), device_addr);
         VAddr end = std::min(buffer.CpuAddr() + buffer.SizeBytes(), device_addr_end);
         u32 size = static_cast<u32>(end - start);
-        SynchronizeBuffer(buffer, start, size, false, false);
+        SynchronizeBuffer(buffer, start, size, false, false, nullptr);
     });
 }
 

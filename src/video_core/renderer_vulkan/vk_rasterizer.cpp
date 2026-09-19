@@ -6,6 +6,7 @@
 #include <unordered_set>
 
 #include "common/debug.h"
+#include "common/buffer_sample_probe.h"
 #include "common/draw_sample_probe.h"
 #include "common/fault_monitor.h"
 #include "common/scope_exit.h"
@@ -949,6 +950,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
 }
 
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
+    u32 lookup_count{};
     image_bindings.clear();
     const u32 first_image_idx = image_infos.size();
     // For loading/storing to explicit mip levels, when no native instruction support, bind an array
@@ -1047,6 +1049,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
 
             image_id = texture_cache.FindImage(desc);
+            ++lookup_count;
             auto* image = &texture_cache.GetImage(image_id);
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
                 // If this image has an associated depth image, it's a stencil attachment.
@@ -1065,6 +1068,20 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         image_descriptor_array_sizes.push_back(num_bindings);
     }
 
+    if (Common::BufferSampleProbe::Enabled()) {
+        struct LookupShape {
+            u64 stages{}, nonempty{}, lookups{};
+        };
+        static thread_local LookupShape shape;
+        ++shape.stages;
+        shape.nonempty += lookup_count != 0;
+        shape.lookups += lookup_count;
+        if ((shape.stages & 0xfffff) == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "TextureLookupShape: stages={} nonempty={} lookups={} (cumulative)",
+                     shape.stages, shape.nonempty, shape.lookups);
+        }
+    }
     const auto t_view = Common::FaultMonitor::Now();
     u64 findtex_ns = 0;
     u64 transit_ns = 0;
