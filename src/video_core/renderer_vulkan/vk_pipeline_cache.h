@@ -51,16 +51,26 @@ struct Program {
 
     Shader::Info info;
     ModuleList modules{};
+    // MRU guards only; guest user data and descriptors still refresh before each probe.
+    // The secondary is allocated only for the opt-in two-entry experiment.
     std::unique_ptr<Shader::PreparedSpecialization> prepared;
+    std::unique_ptr<Shader::PreparedSpecialization> prepared_secondary;
 
     Program() = default;
     Program(Shader::Stage stage, Shader::LogicalStage l_stage, Shader::ShaderParams params)
         : info{stage, l_stage, params} {}
 
-    void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec) {
+    void InvalidatePrepared() {
         if (prepared) {
             prepared->valid = false;
         }
+        if (prepared_secondary) {
+            prepared_secondary->valid = false;
+        }
+    }
+
+    void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec) {
+        InvalidatePrepared();
         auto fetch = spec.fetch_shader_data
                          ? std::make_shared<const Shader::Gcn::FetchShaderData>(*spec.fetch_shader_data)
                          : nullptr;
@@ -69,9 +79,7 @@ struct Program {
 
     void InsertPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
                       size_t perm_idx) {
-        if (prepared) {
-            prepared->valid = false;
-        }
+        InvalidatePrepared();
         modules.resize(std::max(modules.size(), perm_idx + 1)); // <-- beware of realloc
         auto fetch = spec.fetch_shader_data
                          ? std::make_shared<const Shader::Gcn::FetchShaderData>(*spec.fetch_shader_data)

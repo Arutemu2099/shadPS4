@@ -783,6 +783,10 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         const char* value = std::getenv("SHADPS4_PREPARED_PROGRAMS_VERIFY");
         return value && value[0] == '1' && value[1] == '\0';
     }();
+    static const bool prepared_two_entry_enabled = [] {
+        const char* value = std::getenv("SHADPS4_PREPARED_PROGRAMS_TWO_ENTRY");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
     const bool eligible =
         prepared_enabled && Shader::PreparedSpecialization::Eligible(info, stage, l_stage);
     const auto start = binding;
@@ -790,14 +794,21 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         if (!program->prepared) {
             program->prepared = std::make_unique<Shader::PreparedSpecialization>();
         }
-        const auto& prepared = *program->prepared;
-        const bool hit = prepared.permutation < program->modules.size() &&
-                         prepared.Matches(info, runtime_info, binding);
-        static std::array<u64, 2> calls{}, hits{}, verified{};
+        bool hit = program->prepared->permutation < program->modules.size() &&
+                   program->prepared->Matches(info, runtime_info, binding);
+        static std::array<u64, 2> calls{}, hits{}, secondary_hits{}, verified{};
         const size_t counter = stage == Stage::Vertex;
         ++calls[counter];
+        if (!hit && prepared_two_entry_enabled && program->prepared_secondary &&
+            program->prepared_secondary->permutation < program->modules.size() &&
+            program->prepared_secondary->Matches(info, runtime_info, binding)) {
+            std::swap(program->prepared, program->prepared_secondary);
+            hit = true;
+            ++secondary_hits[counter];
+        }
         if (hit) {
             ++hits[counter];
+            const auto& prepared = *program->prepared;
             if (prepared_verify) {
                 const auto fresh =
                     Shader::StageSpecialization(info, runtime_info, profile, binding);
@@ -812,11 +823,13 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
             }
         }
         if ((calls[counter] & 0x3ffff) == 0) {
-            LOG_INFO(Render_Vulkan, "PreparedPrograms: stage={} calls={} hit={} verified={}", stage,
-                     calls[counter], hits[counter], verified[counter]);
+            LOG_INFO(Render_Vulkan,
+                     "PreparedPrograms: stage={} calls={} hit={} secondary={} verified={}", stage,
+                     calls[counter], hits[counter], secondary_hits[counter], verified[counter]);
         }
         if (hit) {
             info.AddBindings(binding);
+            const auto& prepared = *program->prepared;
             const auto& selected = program->modules[prepared.permutation];
             return std::make_tuple(&info, selected.module, SharedFetchMetadata(selected),
                                    HashCombine(params.hash, prepared.permutation));
@@ -844,6 +857,13 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         if (eligible) {
             // Seed only a successful ordinary first-match selection. New or
             // inserted permutations invalidate the guard before the next use.
+            if (prepared_two_entry_enabled) {
+                if (!program->prepared_secondary) {
+                    program->prepared_secondary =
+                        std::make_unique<Shader::PreparedSpecialization>();
+                }
+                std::swap(program->prepared, program->prepared_secondary);
+            }
             program->prepared->Capture(info, runtime_info, start, spec, perm_idx);
         }
     }
@@ -861,9 +881,7 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
         for (const auto& [_, program] : program_cache) {
             for (auto& m : program->modules) {
                 if (m.module == module) {
-                    if (program->prepared) {
-                        program->prepared->valid = false;
-                    }
+                    program->InvalidatePrepared();
                     const auto& d = instance.GetDevice();
                     d.destroyShaderModule(m.module);
                     m.module = CompileSPV(spv_code, d);
