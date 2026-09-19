@@ -9,6 +9,7 @@
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/specialization.h"
+#include "video_core/renderer_vulkan/prepared_graphics_state.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
@@ -55,12 +56,16 @@ struct Program {
     // The secondary is allocated only for the opt-in two-entry experiment.
     std::unique_ptr<Shader::PreparedSpecialization> prepared;
     std::unique_ptr<Shader::PreparedSpecialization> prepared_secondary;
+    // Bumped by every module-list or module-handle mutation. Prepared graphics pipeline
+    // entries record it, since a new/inserted permutation can change first-match selection.
+    u64 generation{};
 
     Program() = default;
     Program(Shader::Stage stage, Shader::LogicalStage l_stage, Shader::ShaderParams params)
         : info{stage, l_stage, params} {}
 
     void InvalidatePrepared() {
+        ++generation;
         if (prepared) {
             prepared->valid = false;
         }
@@ -125,6 +130,40 @@ private:
     bool RefreshGraphicsStages();
     bool RefreshComputeKey();
 
+    // SHADPS4_PREPARED_PIPELINES: one successful original VS+PS selection, reused while its
+    // exact register snapshot, both per-stage specialization guards, both program
+    // generations and the table epoch still hold. Command-processor thread only.
+    struct PreparedPipelineEntry {
+        bool valid{};
+        u64 epoch{};
+        PreparedGraphicsState state;
+        Program* fs_program{};
+        Program* vs_program{};
+        u64 fs_generation{};
+        u64 vs_generation{};
+        // Their captured RuntimeInfo bytes/permutation also restore the cache outputs.
+        Shader::PreparedSpecialization fs_guard;
+        Shader::PreparedSpecialization vs_guard;
+        const GraphicsPipeline* pipeline{};
+        vk::ShaderModule fs_module;
+        vk::ShaderModule vs_module;
+        std::shared_ptr<const Shader::Gcn::FetchShaderData> fetch_shader;
+    };
+    struct StageSelection {
+        Program* program{};
+        size_t permutation{};
+        bool compiled{};
+    };
+    static constexpr size_t PreparedPipelineSets = 1024;
+    static constexpr size_t PreparedPipelineWays = 4;
+
+    PreparedPipelineEntry* TryPreparedPipeline(PreparedGraphicsState& state, bool& eligible);
+    void SeedPreparedPipeline(const PreparedGraphicsState& state, const GraphicsPipeline* pipeline);
+    void VerifyPreparedPipeline(PreparedPipelineEntry& entry,
+                                const GraphicsPipeline* pipeline, bool is_new);
+    void NoteStageSelection(Shader::LogicalStage l_stage, Program* program, size_t permutation,
+                            bool compiled);
+
     void DumpShader(std::span<const u32> code, u64 hash, Shader::Stage stage, size_t perm_idx,
                     std::string_view ext);
     std::optional<std::vector<u32>> GetShaderPatch(u64 hash, Shader::Stage stage, size_t perm_idx,
@@ -157,6 +196,13 @@ private:
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+
+    // Allocated on first use when SHADPS4_PREPARED_PIPELINES=1. The epoch invalidates every
+    // entry at once whenever a pipeline is erased or a module handle is replaced.
+    std::vector<PreparedPipelineEntry> prepared_pipelines;
+    std::array<StageSelection, MaxShaderStages> stage_selections{};
+    u64 prepared_pipeline_epoch{1};
+    u32 prepared_pipeline_victim{};
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,

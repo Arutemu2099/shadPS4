@@ -100,8 +100,18 @@ struct PreparedSpecialization {
 
     bool Matches(const Info& info, const RuntimeInfo& current, Backend::Bindings binding) const {
         if (!valid || start != binding ||
-            std::memcmp(runtime.data(), &current, sizeof(current)) != 0 ||
-            info.has_fetch_shader != fetch.has_value()) {
+            std::memcmp(runtime.data(), &current, sizeof(current)) != 0) {
+            return false;
+        }
+        return MatchesInputs(info);
+    }
+
+    // The guest-visible half of Matches: fetch code and resource specialization inputs,
+    // after Info::RefreshFlatBuf. Only for a caller that separately guarantees the
+    // captured RuntimeInfo and incoming Bindings (prepared graphics pipelines derive
+    // both from an exact register snapshot plus the program pair).
+    bool MatchesInputs(const Info& info) const {
+        if (!valid || info.has_fetch_shader != fetch.has_value()) {
             return false;
         }
         if (fetch && !Gcn::FetchShaderCodeMatches(

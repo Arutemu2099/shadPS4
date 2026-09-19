@@ -328,6 +328,313 @@ PipelineCache::~PipelineCache() {
     scheduler.DrainRecording();
 }
 
+static bool PreparedPipelinesEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_PREPARED_PIPELINES");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
+static bool PreparedPipelinesVerify() {
+    static const bool verify = [] {
+        const char* value = std::getenv("SHADPS4_PREPARED_PIPELINES_VERIFY");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return verify;
+}
+
+namespace {
+// Command-processor thread only, like every GetGraphicsPipeline caller.
+struct PreparedPipelineStats {
+    u64 attempts, ineligible, candidates, stale, guard_fallbacks, hits, seeds, seed_rejects,
+        verified, input_changes;
+};
+PreparedPipelineStats prepared_stats{};
+
+// Verification only: what the fast path's own refresh left in each Info, to compare with
+// the original path's refresh of the same draw.
+struct PreparedRefreshRecord {
+    VAddr pgm_base{};
+    const u32* user_data{};
+    std::vector<u32> flat;
+
+    void Save(const Shader::Info& info) {
+        pgm_base = info.pgm_base;
+        user_data = info.user_data.data();
+        flat = info.flattened_ud_buf;
+    }
+
+    bool Same(const Shader::Info& info) const {
+        return pgm_base == info.pgm_base && user_data == info.user_data.data() &&
+               flat == info.flattened_ud_buf;
+    }
+};
+std::array<PreparedRefreshRecord, 2> prepared_refresh_records;
+
+// Every initialized field; the raw representation is not compared here.
+bool SameRuntimeInfo(const Shader::RuntimeInfo& a, const Shader::RuntimeInfo& b) {
+    return a.stage == b.stage && a.num_user_data == b.num_user_data &&
+           a.num_input_vgprs == b.num_input_vgprs &&
+           a.num_allocated_vgprs == b.num_allocated_vgprs &&
+           a.fp_denorm_mode32 == b.fp_denorm_mode32 &&
+           a.fp_denorm_mode16_64 == b.fp_denorm_mode16_64 &&
+           a.fp_round_mode32 == b.fp_round_mode32 && a.fp_round_mode16_64 == b.fp_round_mode16_64 &&
+           a == b;
+}
+} // namespace
+
+void PipelineCache::NoteStageSelection(LogicalStage l_stage, Program* program, size_t permutation,
+                                       bool compiled) {
+    if (PreparedPipelinesEnabled()) {
+        stage_selections[u32(l_stage)] = {program, permutation, compiled};
+    }
+}
+
+PipelineCache::PreparedPipelineEntry* PipelineCache::TryPreparedPipeline(
+    PreparedGraphicsState& state, bool& eligible) {
+    constexpr auto fs_idx = u32(LogicalStage::Fragment);
+    constexpr auto vs_idx = u32(LogicalStage::Vertex);
+    auto& stats = prepared_stats;
+    if ((++stats.attempts & 0x3ffff) == 0) {
+        LOG_INFO(Render_Vulkan,
+                 "PreparedPipelines: attempts={} ineligible={} candidates={} stale={} "
+                 "guard_fallbacks={} hits={} seeds={} seed_rejects={} verified={} input_changes={}",
+                 stats.attempts, stats.ineligible, stats.candidates, stats.stale,
+                 stats.guard_fallbacks, stats.hits, stats.seeds, stats.seed_rejects,
+                 stats.verified, stats.input_changes);
+    }
+
+    eligible = false;
+    const auto& regs = liverpool->regs;
+    // Same stage/program presence tests as RefreshGraphicsStages for the plain VS+PS case.
+    // Shader collection records module/pipeline relations on the original path only.
+    if (regs.stage_enable.raw != AmdGpu::ShaderStageEnable::VgtStages::Vs ||
+        !regs.ps_program.Address<u32*>() || !regs.vs_program.Address<u32*>() ||
+        EmulatorSettings.IsShaderCollect()) {
+        ++stats.ineligible;
+        return nullptr;
+    }
+    const auto fs_params = AmdGpu::GetParams(regs.ps_program);
+    const auto vs_params = AmdGpu::GetParams(regs.vs_program);
+    if (!state.Capture(regs, fs_params.hash, vs_params.hash)) {
+        ++stats.ineligible;
+        return nullptr;
+    }
+    eligible = true;
+
+    if (prepared_pipelines.empty()) {
+        prepared_pipelines.resize(PreparedPipelineSets * PreparedPipelineWays);
+    }
+    auto* set =
+        &prepared_pipelines[(state.Hash() & (PreparedPipelineSets - 1)) * PreparedPipelineWays];
+    const bool check_formats = !instance.IsVertexInputDynamicState();
+    bool refreshed = false;
+    for (size_t way = 0; way < PreparedPipelineWays; ++way) {
+        auto& entry = set[way];
+        if (!entry.valid || entry.state != state) {
+            continue;
+        }
+        if (entry.epoch != prepared_pipeline_epoch ||
+            entry.fs_program->generation != entry.fs_generation ||
+            entry.vs_program->generation != entry.vs_generation) {
+            entry.valid = false;
+            ++stats.stale;
+            continue;
+        }
+        // Equal hashes name the same never-erased Program objects as at seeding. Several
+        // ways may share a snapshot and differ only in their guards, so refresh once.
+        auto& fs_info = entry.fs_program->info;
+        auto& vs_info = entry.vs_program->info;
+        if (!refreshed) {
+            ++stats.candidates;
+            // Live per-draw guest state, in the original FS-then-VS order. The walker
+            // rereads memory behind extended-user-data pointers on every attempt.
+            fs_info.pgm_base = fs_params.Base();
+            fs_info.user_data = fs_params.user_data;
+            fs_info.RefreshFlatBuf();
+            vs_info.pgm_base = vs_params.Base();
+            vs_info.user_data = vs_params.user_data;
+            vs_info.RefreshFlatBuf();
+            refreshed = true;
+        }
+        if (!entry.fs_guard.MatchesInputs(fs_info) || !entry.vs_guard.MatchesInputs(vs_info)) {
+            continue;
+        }
+        if (check_formats && entry.fetch_shader) {
+            // Without dynamic vertex input the key specializes on the current formats.
+            const auto& formats = entry.pipeline->GetGraphicsKey().vertex_buffer_formats;
+            const auto& attributes = entry.fetch_shader->attributes;
+            bool same = attributes.size() <= MaxVertexBufferCount;
+            for (size_t i = 0; same && i < attributes.size(); ++i) {
+                const auto buffer = attributes[i].GetSharp(vs_info);
+                same = formats[i] == LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(),
+                                                                  buffer.GetNumberFmt());
+            }
+            if (!same) {
+                continue;
+            }
+        }
+
+        ++stats.hits;
+        if (PreparedPipelinesVerify()) {
+            prepared_refresh_records[0].Save(fs_info);
+            prepared_refresh_records[1].Save(vs_info);
+        }
+        // Everything the original selection leaves in the cache, from owned storage.
+        infos.fill(nullptr);
+        modules.fill(nullptr);
+        infos[fs_idx] = &fs_info;
+        infos[vs_idx] = &vs_info;
+        modules[fs_idx] = entry.fs_module;
+        modules[vs_idx] = entry.vs_module;
+        std::memcpy(&runtime_infos[fs_idx], entry.fs_guard.runtime.data(),
+                    sizeof(Shader::RuntimeInfo));
+        std::memcpy(&runtime_infos[vs_idx], entry.vs_guard.runtime.data(),
+                    sizeof(Shader::RuntimeInfo));
+        graphics_key = entry.pipeline->GetGraphicsKey();
+        if (fetch_shader != entry.fetch_shader) {
+            fetch_shader = entry.fetch_shader;
+        }
+        return &entry;
+    }
+    if (refreshed) {
+        ++stats.guard_fallbacks;
+    }
+    return nullptr;
+}
+
+void PipelineCache::SeedPreparedPipeline(const PreparedGraphicsState& state,
+                                         const GraphicsPipeline* pipeline) {
+    constexpr auto fs_idx = u32(LogicalStage::Fragment);
+    constexpr auto vs_idx = u32(LogicalStage::Vertex);
+    using Guard = Shader::PreparedSpecialization;
+    const auto& fs_sel = stage_selections[fs_idx];
+    const auto& vs_sel = stage_selections[vs_idx];
+    bool ok = pipeline && fs_sel.program && vs_sel.program && fs_sel.program != vs_sel.program &&
+              !fs_sel.compiled && !vs_sel.compiled;
+    for (u32 i = 0; ok && i < MaxShaderStages; ++i) {
+        ok = i == fs_idx   ? infos[i] == &fs_sel.program->info
+             : i == vs_idx ? infos[i] == &vs_sel.program->info
+                           : infos[i] == nullptr;
+    }
+    if (ok) {
+        const auto& fs_info = fs_sel.program->info;
+        const auto& vs_info = vs_sel.program->info;
+        const auto& fs_modules = fs_sel.program->modules;
+        const auto& vs_modules = vs_sel.program->modules;
+        ok = fs_info.pgm_hash == state.fs_hash && vs_info.pgm_hash == state.vs_hash &&
+             Guard::Eligible(fs_info, Stage::Fragment, LogicalStage::Fragment) &&
+             Guard::Eligible(vs_info, Stage::Vertex, LogicalStage::Vertex) &&
+             fs_sel.permutation < fs_modules.size() && vs_sel.permutation < vs_modules.size() &&
+             fs_modules[fs_sel.permutation].module == modules[fs_idx] &&
+             vs_modules[vs_sel.permutation].module == modules[vs_idx] &&
+             vs_modules[vs_sel.permutation].fetch_shader == fetch_shader;
+    }
+    if (!ok) {
+        ++prepared_stats.seed_rejects;
+        return;
+    }
+
+    // Capture the guards belonging to the actual original selection. Re-parsing fetch code
+    // here could pair a newly changed guest fetch program with the previously selected module.
+    // If the retained per-program cache is disabled or could not capture, fall back normally.
+    const auto& fs_info = fs_sel.program->info;
+    const auto& vs_info = vs_sel.program->info;
+    const auto* fs_guard = fs_sel.program->prepared.get();
+    const auto* vs_guard = vs_sel.program->prepared.get();
+    Shader::Backend::Bindings binding{};
+    if (!fs_guard || !vs_guard || fs_guard->permutation != fs_sel.permutation ||
+        vs_guard->permutation != vs_sel.permutation ||
+        !fs_guard->Matches(fs_info, runtime_infos[fs_idx], binding)) {
+        ++prepared_stats.seed_rejects;
+        return;
+    }
+    fs_info.AddBindings(binding);
+    if (!vs_guard->Matches(vs_info, runtime_infos[vs_idx], binding)) {
+        ++prepared_stats.seed_rejects;
+        return;
+    }
+
+    auto* set =
+        &prepared_pipelines[(state.Hash() & (PreparedPipelineSets - 1)) * PreparedPipelineWays];
+    PreparedPipelineEntry* entry = nullptr;
+    for (size_t way = 0; way < PreparedPipelineWays && !entry; ++way) {
+        if (!set[way].valid || set[way].epoch != prepared_pipeline_epoch) {
+            entry = &set[way];
+        }
+    }
+    if (!entry) {
+        entry = &set[prepared_pipeline_victim++ % PreparedPipelineWays];
+    }
+
+    entry->valid = false;
+    entry->fs_guard = *fs_guard;
+    entry->vs_guard = *vs_guard;
+    entry->state = state;
+    entry->epoch = prepared_pipeline_epoch;
+    entry->fs_program = fs_sel.program;
+    entry->vs_program = vs_sel.program;
+    entry->fs_generation = fs_sel.program->generation;
+    entry->vs_generation = vs_sel.program->generation;
+    entry->pipeline = pipeline;
+    entry->fs_module = modules[fs_idx];
+    entry->vs_module = modules[vs_idx];
+    entry->fetch_shader = fetch_shader;
+    entry->valid = true;
+    ++prepared_stats.seeds;
+}
+
+void PipelineCache::VerifyPreparedPipeline(PreparedPipelineEntry& entry,
+                                           const GraphicsPipeline* pipeline, bool is_new) {
+    constexpr auto fs_idx = u32(LogicalStage::Fragment);
+    constexpr auto vs_idx = u32(LogicalStage::Vertex);
+    const auto& fs_sel = stage_selections[fs_idx];
+    const auto& vs_sel = stage_selections[vs_idx];
+    // The oracle deliberately performs the original live refresh. Guest descriptors or
+    // fetch code can change between the two observations. Such a draw is unverified, not
+    // a cache mismatch; return the original result and discard this entry. This check
+    // precedes selection assertions, so legitimate changed-input compilations are allowed.
+    const bool changed_program =
+        (fs_sel.program && fs_sel.program->info.pgm_hash != entry.state.fs_hash) ||
+        (vs_sel.program && vs_sel.program->info.pgm_hash != entry.state.vs_hash);
+    if (changed_program || !prepared_refresh_records[0].Same(entry.fs_program->info) ||
+        !prepared_refresh_records[1].Same(entry.vs_program->info) ||
+        !entry.fs_guard.MatchesInputs(entry.fs_program->info) ||
+        !entry.vs_guard.MatchesInputs(entry.vs_program->info)) {
+        ++prepared_stats.input_changes;
+        entry.valid = false;
+        return;
+    }
+    ASSERT_MSG(!is_new && pipeline == entry.pipeline,
+               "PreparedPipelines selected a different pipeline: fs={:#x} vs={:#x}",
+               entry.state.fs_hash, entry.state.vs_hash);
+    ASSERT_MSG(graphics_key == entry.pipeline->GetGraphicsKey(), "PreparedPipelines key mismatch");
+    for (u32 i = 0; i < MaxShaderStages; ++i) {
+        const Shader::Info* info = i == fs_idx   ? &entry.fs_program->info
+                                   : i == vs_idx ? &entry.vs_program->info
+                                                 : nullptr;
+        const vk::ShaderModule module = i == fs_idx   ? entry.fs_module
+                                        : i == vs_idx ? entry.vs_module
+                                                      : vk::ShaderModule{};
+        ASSERT_MSG(infos[i] == info && modules[i] == module,
+                   "PreparedPipelines stage {} info/module mismatch", i);
+    }
+    ASSERT_MSG(fs_sel.program == entry.fs_program && vs_sel.program == entry.vs_program &&
+                   !fs_sel.compiled && !vs_sel.compiled &&
+                   fs_sel.permutation == entry.fs_guard.permutation &&
+                   vs_sel.permutation == entry.vs_guard.permutation,
+               "PreparedPipelines program/permutation mismatch");
+    ASSERT_MSG(fetch_shader == entry.fetch_shader, "PreparedPipelines fetch metadata mismatch");
+    Shader::RuntimeInfo fs_runtime{}, vs_runtime{};
+    std::memcpy(&fs_runtime, entry.fs_guard.runtime.data(), sizeof(fs_runtime));
+    std::memcpy(&vs_runtime, entry.vs_guard.runtime.data(), sizeof(vs_runtime));
+    ASSERT_MSG(SameRuntimeInfo(runtime_infos[fs_idx], fs_runtime) &&
+                   SameRuntimeInfo(runtime_infos[vs_idx], vs_runtime),
+               "PreparedPipelines runtime info mismatch");
+    ++prepared_stats.verified;
+}
+
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     // MEASUREMENT (perf-forest): GetGraphicsPipeline is 0.99 us/draw = 6.3 ms/frame and never
     // split. Before designing a memo, learn (a) how the cost divides between RefreshGraphicsKey
@@ -335,8 +642,21 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     // freshly built key equals the previous draw's - the hit rate a memo would ride on. Windowed so
     // a stable-scene line is not diluted by boot. ~3 clock reads + one key compare per draw, the
     // memo's own cost.
+    PreparedGraphicsState prepared_state;
+    PreparedPipelineEntry* prepared_hit = nullptr;
+    bool prepared_eligible = false;
+    if (PreparedPipelinesEnabled()) {
+        prepared_hit = TryPreparedPipeline(prepared_state, prepared_eligible);
+        if (prepared_hit && !PreparedPipelinesVerify()) {
+            return prepared_hit->pipeline;
+        }
+        if (prepared_eligible) {
+            stage_selections.fill({});
+        }
+    }
     const auto t_probe0 = Common::FaultMonitor::Now();
     if (!RefreshGraphicsKey()) {
+        ASSERT_MSG(!prepared_hit, "PreparedPipelines hit a draw the original path rejects");
         return nullptr;
     }
     const auto t_probe1 = Common::FaultMonitor::Now();
@@ -402,6 +722,12 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
             }
         }
         fetch_shader.reset();
+    }
+    if (prepared_hit) {
+        VerifyPreparedPipeline(*prepared_hit, it->second.get(), is_new);
+    } else if (prepared_eligible && !is_new) {
+        // Only a complete original selection of an existing pipeline is ever captured.
+        SeedPreparedPipeline(prepared_state, it->second.get());
     }
     return it->second.get();
 }
@@ -766,6 +1092,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
 
         RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
         program->AddPermut(module, std::move(spec));
+        NoteStageSelection(l_stage, program.get(), 0, true);
         return std::make_tuple(&program->info, module, SharedFetchMetadata(program->modules[0]),
                                perm_hash);
     }
@@ -831,6 +1158,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
             info.AddBindings(binding);
             const auto& prepared = *program->prepared;
             const auto& selected = program->modules[prepared.permutation];
+            NoteStageSelection(l_stage, program.get(), prepared.permutation, false);
             return std::make_tuple(&info, selected.module, SharedFetchMetadata(selected),
                                    HashCombine(params.hash, prepared.permutation));
         }
@@ -843,7 +1171,8 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
     vk::ShaderModule module{};
 
     const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
-    if (it == program->modules.end()) {
+    const bool compiled = it == program->modules.end();
+    if (compiled) {
         auto new_info = Shader::Info(stage, l_stage, params);
         module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
 
@@ -867,6 +1196,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
             program->prepared->Capture(info, runtime_info, start, spec, perm_idx);
         }
     }
+    NoteStageSelection(l_stage, program.get(), perm_idx, compiled);
     return std::make_tuple(&program->info, module,
                            SharedFetchMetadata(program->modules[perm_idx]), perm_hash);
 }
@@ -878,6 +1208,9 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
     // draws, then finish all uses of the old pipelines before destroying them.
     liverpool->SendCommand<true>([&] {
         scheduler.Finish();
+        // Entries hold pipeline pointers and module handles; drop them all before either
+        // can be destroyed below. Runs on the command-processor thread like the draws.
+        ++prepared_pipeline_epoch;
         for (const auto& [_, program] : program_cache) {
             for (auto& m : program->modules) {
                 if (m.module == module) {
