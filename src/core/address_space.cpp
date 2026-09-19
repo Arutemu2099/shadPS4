@@ -1,12 +1,17 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <map>
+#include <mutex>
 #include "common/alignment.h"
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/error.h"
+#include "common/fault_monitor.h"
 #include "core/address_space.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/memory.h"
@@ -101,6 +106,23 @@ struct MemoryRegion {
     u32 prot;
     s32 fd;
     bool is_mapped;
+};
+
+// Diagnostic only: SHADPS4_PROTECT_LOCK_PROFILE=1 measures acquisition of the Impl mutex in
+// Protect. Read once at static initialization so the disabled path is a single cached branch.
+static const bool ProtectLockProfile = [] {
+    const char* value = std::getenv("SHADPS4_PROTECT_LOCK_PROFILE");
+    return value && value[0] == '1' && value[1] == '\0';
+}();
+
+// Cumulative per thread, never reset. A failed try_lock is not proof of blocking (it may even
+// fail spuriously); wait_ns is the wall time of the subsequent lock() call, which
+// includes spinning, any real block and the two clock reads.
+struct ProtectLockStats {
+    u64 calls;
+    u64 failed_try_lock;
+    u64 wait_ns;
+    u64 max_wait_ns;
 };
 
 struct AddressSpace::Impl {
@@ -506,7 +528,49 @@ struct AddressSpace::Impl {
     }
 
     void Protect(VAddr virtual_addr, u64 size, bool read, bool write, bool execute) {
-        std::scoped_lock lk{mutex};
+        if (!ProtectLockProfile) {
+            std::scoped_lock lk{mutex};
+            ProtectLocked(virtual_addr, size, read, write, execute);
+            return;
+        }
+
+        std::unique_lock lk{mutex, std::defer_lock};
+        bool failed_try_lock = false;
+        u64 wait_ns = 0;
+        if (!lk.try_lock()) {
+            // Clock reads only on this path; a successful try_lock is never timed.
+            const auto start = std::chrono::steady_clock::now();
+            lk.lock();
+            wait_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           std::chrono::steady_clock::now() - start)
+                                           .count());
+            failed_try_lock = true;
+        }
+        ProtectLocked(virtual_addr, size, read, write, execute);
+        lk.unlock();
+
+        // Thread-local bookkeeping and reporting happen after the mutex is released.
+        static thread_local ProtectLockStats stats{};
+        ++stats.calls;
+        if (failed_try_lock) {
+            ++stats.failed_try_lock;
+            stats.wait_ns += wait_ns;
+            if (wait_ns > stats.max_wait_ns) {
+                stats.max_wait_ns = wait_ns;
+            }
+        }
+        if ((stats.calls & 0xFFFF) == 0) {
+            LOG_INFO(Core,
+                     "protect_lock_profile frames={} cp={} tid={} calls={} failed_try_lock={} "
+                     "wait_ns={} max_wait_ns={}",
+                     Common::FaultMonitor::presented_frames.load(std::memory_order_relaxed),
+                     Common::FaultMonitor::t_is_cp_thread, GetCurrentThreadId(), stats.calls,
+                     stats.failed_try_lock, stats.wait_ns, stats.max_wait_ns);
+        }
+    }
+
+    // Requires mutex to be held by the caller.
+    void ProtectLocked(VAddr virtual_addr, u64 size, bool read, bool write, bool execute) {
         DWORD new_flags{};
 
         if (write && !read) {
