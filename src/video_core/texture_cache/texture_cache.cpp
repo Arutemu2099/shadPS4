@@ -41,6 +41,9 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
         prepared_images = std::make_unique<PreparedImages>();
         prepared_images->verify = enabled("SHADPS4_PREPARED_IMAGES_VERIFY");
     }
+    if (enabled("SHADPS4_TEXTURE_STAGE_BATCH_PROFILE")) {
+        lock_profile = std::make_unique<LockProfile>();
+    }
 
     u32 max_samplers = instance.GetMaxSamplerAllocationCount();
     trigger_gc_samplers = max_samplers * 3 / 4;
@@ -180,6 +183,7 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
 
 void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     std::scoped_lock lock{mutex};
+    CountLock(LockSite::Invalidate);
     const auto pages_start = PageManager::GetPageAddr(addr);
     const auto pages_end = PageManager::GetNextPageAddr(addr + size - 1);
     ForEachImageInRegion(pages_start, pages_end - pages_start, [&](ImageId image_id, Image& image) {
@@ -211,6 +215,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
 
 void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
     std::scoped_lock lock{mutex};
+    CountLock(LockSite::InvalidateGpu);
     ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
         // Only consider images that match base address.
         // TODO: Maybe also consider subresources
@@ -224,6 +229,7 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
 
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
     std::scoped_lock lk{mutex};
+    CountLock(LockSite::Unmap);
 
     ImageIds deleted_images;
     ForEachImageInRegion(cpu_addr, size, [&](ImageId id, Image&) { deleted_images.push_back(id); });
@@ -559,6 +565,15 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
+    ASSERT(desc.info.guest_address != 0);
+    const auto lock_start = Common::FaultMonitor::Now();
+    std::scoped_lock lock{mutex};
+    CountLock(LockSite::FindImage);
+    return FindImageLocked(desc, exact_fmt, lock_start);
+}
+
+ImageId TextureCache::FindImageLocked(ImageDesc& desc, bool exact_fmt,
+                                      std::chrono::steady_clock::time_point lock_start) {
     const auto& info = desc.info;
     ASSERT(info.guest_address != 0);
 
@@ -567,9 +582,28 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     // match+resolve, and count perfect-hit% + pages walked + new-image(miss)%. Strip before ship.
     static u64 fi_calls = 0, fi_lock_ns = 0, fi_walk_ns = 0, fi_rest_ns = 0, fi_pages = 0,
                fi_hit = 0, fi_new = 0, fi_cands = 0;
-    const auto fi_t0 = Common::FaultMonitor::Now();
-    std::scoped_lock lock{mutex};
+    // The wrapper sampled fi_t0 before taking the mutex; a stage batch passes "now" (no wait).
+    const auto fi_t0 = lock_start;
     const auto fi_t1 = Common::FaultMonitor::Now();
+    if (lock_profile) {
+        LockProfile& p = *lock_profile;
+        if ((++p.find_image_calls & 0x7fffff) == 0) {
+            const auto site = [&p](LockSite s) { return p.locks[static_cast<size_t>(s)]; };
+            LOG_INFO(Render_Vulkan,
+                     "TextureLockProfile: find_image_calls={} update_image_calls={} "
+                     "texture_update_calls={} lock_find_image={} lock_texture_update={} "
+                     "lock_target_update={} lock_stencil_link={} lock_stage_batch={} "
+                     "lock_invalidate={} lock_invalidate_gpu={} lock_unmap={} lock_gc={} "
+                     "stage_lookups={} stage_max_lookups={} (cumulative; *_calls are logical "
+                     "bodies, lock_* are actual cache-mutex acquisitions)",
+                     p.find_image_calls, p.update_image_calls, p.texture_update_calls,
+                     site(LockSite::FindImage), site(LockSite::TextureUpdate),
+                     site(LockSite::TargetUpdate), site(LockSite::StencilLink),
+                     site(LockSite::StageBatch), site(LockSite::Invalidate),
+                     site(LockSite::InvalidateGpu), site(LockSite::Unmap), site(LockSite::Gc),
+                     p.stage_lookups, p.stage_max_lookups);
+        }
+    }
 
     PreparedImage* memo = nullptr;
     PreparedImageKey key{};
@@ -792,8 +826,7 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
     return {};
 }
 
-ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
-    Image& image = slot_images[image_id];
+void TextureCache::MarkTextureBinding(ImageId image_id, Image& image, const ImageDesc& desc) {
     if (desc.type == BindingType::Storage) {
         image.flags |= ImageFlagBits::GpuModified;
         if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
@@ -802,8 +835,52 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
             download_images.emplace(image_id);
         }
     }
-    UpdateImage(image_id);
+}
+
+ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
+    Image& image = slot_images[image_id];
+    MarkTextureBinding(image_id, image, desc);
+    {
+        // Same boundary as the UpdateImage call this replaces; only the profile site differs.
+        std::scoped_lock lock{mutex};
+        CountLock(LockSite::TextureUpdate);
+        if (lock_profile) {
+            ++lock_profile->texture_update_calls;
+        }
+        UpdateImageLocked(image_id);
+    }
     return image.FindView(desc.view_info);
+}
+
+ImageView& TextureCache::FindTextureLocked(ImageId image_id, const ImageDesc& desc) {
+    // Identical sequence to FindTexture with the stage already holding the cache mutex, so
+    // UpdateImage's wrapper is never reentered. cache mutex -> download_images_mutex is the
+    // existing UnmapMemory/GC -> FreeImage -> DeleteImage order.
+    Image& image = slot_images[image_id];
+    MarkTextureBinding(image_id, image, desc);
+    if (lock_profile) {
+        ++lock_profile->texture_update_calls;
+    }
+    UpdateImageLocked(image_id);
+    return image.FindView(desc.view_info);
+}
+
+TextureCache::StageBatch::StageBatch(TextureCache& cache_, u32 num_lookups)
+    : cache{cache_}, lock{cache_.mutex} {
+    cache.CountLock(LockSite::StageBatch);
+    if (cache.lock_profile) {
+        LockProfile& p = *cache.lock_profile;
+        p.stage_lookups += num_lookups;
+        p.stage_max_lookups = std::max<u64>(p.stage_max_lookups, num_lookups);
+    }
+}
+
+ImageId TextureCache::StageBatch::FindImage(ImageDesc& desc, bool exact_fmt) {
+    return cache.FindImageLocked(desc, exact_fmt, Common::FaultMonitor::Now());
+}
+
+ImageView& TextureCache::StageBatch::FindTexture(ImageId image_id, const ImageDesc& desc) {
+    return cache.FindTextureLocked(image_id, desc);
 }
 
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
@@ -852,6 +929,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
         // their cleanup. Also publish any new stencil mapping under that same lock.
         // UpdateImage above acquires/releases the mutex itself; do not cover it here.
         std::scoped_lock lock{mutex};
+        CountLock(LockSite::StencilLink);
         ImageId stencil_id{};
         ForEachImageInRegion(desc.info.stencil_addr, desc.info.stencil_size,
                              [&](ImageId image_id, Image& image) {
@@ -978,6 +1056,11 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
     const u64 hash = XXH3_64bits(&sampler, sizeof(sampler));
 
     std::scoped_lock lock{samplers_mutex};
+    if (lock_profile && (++lock_profile->sampler_locks & 0x7fffff) == 0) {
+        // Own line: this counter is guarded by samplers_mutex, not the cache mutex.
+        LOG_INFO(Render_Vulkan, "TextureLockProfile: lock_sampler={} (cumulative)",
+                 lock_profile->sampler_locks);
+    }
     const auto [it, new_sampler] = samplers.try_emplace(hash, instance, sampler, border_color_base);
     if (new_sampler) {
         samplers.at(hash).lru_id = sampler_lru_cache.Insert(hash, gc_tick);
@@ -1151,6 +1234,7 @@ void TextureCache::GarbageCollectImages() {
         return;
     }
     std::scoped_lock lock{mutex};
+    CountLock(LockSite::Gc);
     bool pressured = false;
     bool aggresive = false;
     u64 ticks_to_destroy = 0;

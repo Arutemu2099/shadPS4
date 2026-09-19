@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -117,11 +118,29 @@ public:
     /// Updates image contents if it was modified by CPU.
     void UpdateImage(ImageId image_id) {
         std::scoped_lock lock{mutex};
-        Image& image = slot_images[image_id];
-        TrackImage(image_id);
-        TouchImage(image);
-        RefreshImage(image);
+        CountLock(LockSite::TargetUpdate);
+        UpdateImageLocked(image_id);
     }
+
+    /// Owns the cache mutex for one BindTextures stage (SHADPS4_TEXTURE_STAGE_BATCH=1) and
+    /// forwards to the same locked bodies the public wrappers use. The mutex is not exposed.
+    /// While one is alive its thread must not call any lock-taking TextureCache entry point
+    /// (FindImage, UpdateImage, FindTexture, FindRenderTarget, FindDepthTarget, Invalidate*,
+    /// UnmapMemory, RunGarbageCollector) and must not read guest descriptors: a fault there
+    /// reenters InvalidateMemory on this non-recursive mutex.
+    class StageBatch {
+    public:
+        StageBatch(TextureCache& cache, u32 num_lookups);
+        StageBatch(const StageBatch&) = delete;
+        StageBatch& operator=(const StageBatch&) = delete;
+
+        [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
+        [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc);
+
+    private:
+        TextureCache& cache;
+        std::scoped_lock<std::mutex> lock;
+    };
 
     /// Resolves overlap between existing cache image and pending merged image
     [[nodiscard]] std::tuple<ImageId, int, int> ResolveOverlap(const ImageInfo& info,
@@ -348,6 +367,53 @@ private:
     // expansion/depth replacement creates and registers a new Image instead.
     void InvalidatePreparedImages();
 
+    // Bodies of the public lock-taking wrappers; the caller holds `mutex`. Reached only through
+    // those wrappers and StageBatch. lock_start feeds the existing FiSplit lock-wait split.
+    [[nodiscard]] ImageId FindImageLocked(ImageDesc& desc, bool exact_fmt,
+                                          std::chrono::steady_clock::time_point lock_start);
+    void UpdateImageLocked(ImageId image_id) {
+        if (lock_profile) {
+            ++lock_profile->update_image_calls;
+        }
+        Image& image = slot_images[image_id];
+        TrackImage(image_id);
+        TouchImage(image);
+        RefreshImage(image);
+    }
+    [[nodiscard]] ImageView& FindTextureLocked(ImageId image_id, const ImageDesc& desc);
+    /// Storage marking and download-list handling shared by both FindTexture variants.
+    void MarkTextureBinding(ImageId image_id, Image& image, const ImageDesc& desc);
+
+    // SHADPS4_TEXTURE_STAGE_BATCH_PROFILE=1 only. Every cache-lock field is written and read
+    // while holding `mutex` (guest fault, presenter and CP threads all count under the lock
+    // they are counting), sampler_locks under `samplers_mutex`. No atomics, no clocks.
+    enum class LockSite : u32 {
+        FindImage,     // public FindImage wrapper
+        TextureUpdate, // public FindTexture -> UpdateImage (sampled/storage textures)
+        TargetUpdate,  // public UpdateImage: render/depth targets, presenter, direct calls
+        StencilLink,   // FindDepthTarget stencil association
+        StageBatch,    // one per batched nonempty stage
+        Invalidate,    // InvalidateMemory (guest fault threads)
+        InvalidateGpu, // InvalidateMemoryFromGPU
+        Unmap,         // UnmapMemory
+        Gc,            // GarbageCollectImages past its early-out
+        Count,
+    };
+    struct LockProfile {
+        std::array<u64, static_cast<size_t>(LockSite::Count)> locks{};
+        u64 find_image_calls{};     // Logical FindImage bodies run, however locked.
+        u64 update_image_calls{};   // Logical UpdateImage bodies run, however locked.
+        u64 texture_update_calls{}; // Subset of update_image_calls reached through FindTexture.
+        u64 stage_lookups{};        // Sum of first-pass lookups over batched stages.
+        u64 stage_max_lookups{};
+        u64 sampler_locks{};        // samplers_mutex acquisitions; guarded by samplers_mutex.
+    };
+    void CountLock(LockSite site) {
+        if (lock_profile) {
+            ++lock_profile->locks[static_cast<size_t>(site)];
+        }
+    }
+
 private:
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
@@ -377,6 +443,7 @@ private:
     std::mutex samplers_mutex;
     std::mutex download_images_mutex;
     std::unique_ptr<PreparedImages> prepared_images; // Allocated only when explicitly enabled.
+    std::unique_ptr<LockProfile> lock_profile;       // Allocated only when explicitly enabled.
     struct MetaDataInfo {
         enum class Type {
             CMask,
