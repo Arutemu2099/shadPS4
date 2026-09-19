@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstdlib>
+#include <span>
 #include <string>
 #include <unordered_set>
 
@@ -961,6 +962,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
 
     const auto t_findimage = Common::FaultMonitor::Now();
+    const bool batch_image_lookups = VideoCore::TextureCache::BatchImageLookupsEnabled();
 
     static const bool cache_decoded_images = [] {
         const char* value = std::getenv("SHADPS4_DECODE_IMAGE_CACHE");
@@ -1048,24 +1050,33 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 desc.view_info.range.extent.levels = 1;
             }
 
-            image_id = texture_cache.FindImage(desc);
-            ++lookup_count;
-            auto* image = &texture_cache.GetImage(image_id);
-            if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
-                // If this image has an associated depth image, it's a stencil attachment.
-                // Redirect the access to the actual depth-stencil buffer.
-                image_id = depth_image_id;
-                image = &texture_cache.GetImage(image_id);
+            if (batch_image_lookups) {
+                lookup_count += desc.info.guest_address != 0;
+            } else {
+                image_id = texture_cache.FindImage(desc);
+                ++lookup_count;
+                auto* image = &texture_cache.GetImage(image_id);
+                if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
+                    // If this image has an associated depth image, it's a stencil attachment.
+                    // Redirect the access to the actual depth-stencil buffer.
+                    image_id = depth_image_id;
+                    image = &texture_cache.GetImage(image_id);
+                }
+                if (image->binding.is_bound) {
+                    // The image is already bound. In case if it is about to be used as storage we
+                    // need to force general layout on it.
+                    image->binding.force_general |= image_desc.is_written;
+                }
+                image->binding.is_bound = 1u;
             }
-            if (image->binding.is_bound) {
-                // The image is already bound. In case if it is about to be used as storage we
-                // need to force general layout on it.
-                image->binding.force_general |= image_desc.is_written;
-            }
-            image->binding.is_bound = 1u;
         }
 
         image_descriptor_array_sizes.push_back(num_bindings);
+    }
+
+    if (batch_image_lookups) {
+        texture_cache.FindAndBindImages(
+            std::span{image_bindings.data(), static_cast<size_t>(image_bindings.size())});
     }
 
     if (Common::BufferSampleProbe::Enabled()) {

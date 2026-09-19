@@ -25,6 +25,54 @@ namespace VideoCore {
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
 
+namespace {
+
+[[nodiscard]] bool IsEnvOne(const char* name) {
+    const auto* value = std::getenv(name);
+    return value && value[0] == '1' && value[1] == '\0';
+}
+
+[[nodiscard]] bool BatchImageProbeEnabled() {
+    static const bool enabled = IsEnvOne("SHADPS4_BATCH_IMAGE_PROBE");
+    return enabled;
+}
+
+struct BatchImageProbeState {
+    u64 lookups{};
+    u64 locks{};
+    u64 groups{};
+    u64 batched_groups{};
+    u64 batched_lookups{};
+    u64 max_group{};
+    u64 next_report{500000};
+
+    void Record(size_t count, bool batched) {
+        lookups += count;
+        ++locks;
+        ++groups;
+        batched_groups += batched;
+        batched_lookups += batched ? count : 0;
+        max_group = std::max<u64>(max_group, count);
+        if (lookups >= next_report) {
+            LOG_INFO(Render_Vulkan,
+                     "BatchImageProbe: lookups={} locks={} groups={} batched_groups={} "
+                     "batched_lookups={} max_group={} (cumulative)",
+                     lookups, locks, groups, batched_groups, batched_lookups, max_group);
+            next_report += 500000;
+        }
+    }
+};
+
+void RecordBatchImageProbe(size_t count, bool batched) {
+    if (!BatchImageProbeEnabled()) {
+        return;
+    }
+    thread_local BatchImageProbeState state;
+    state.Record(count, batched);
+}
+
+} // namespace
+
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            AmdGpu::Liverpool* liverpool_, BufferCache& buffer_cache_,
                            PageManager& tracker_)
@@ -558,7 +606,58 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     return new_image_id;
 }
 
+bool TextureCache::BatchImageLookupsEnabled() noexcept {
+    static const bool enabled = IsEnvOne("SHADPS4_BATCH_IMAGE_LOOKUPS");
+    return enabled;
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
+    const auto t0 = Common::FaultMonitor::Now();
+    std::scoped_lock lock{mutex};
+    const auto lock_ns = Common::FaultMonitor::DiffNs(t0, Common::FaultMonitor::Now());
+    RecordBatchImageProbe(1, false);
+    return FindImageLocked(desc, exact_fmt, lock_ns);
+}
+
+void TextureCache::FindAndBindImages(std::span<std::pair<ImageId, ImageDesc>> entries) {
+    size_t lookup_count{};
+    for (const auto& [image_id, desc] : entries) {
+        (void)image_id;
+        lookup_count += desc.info.guest_address != 0;
+    }
+    if (lookup_count == 0) {
+        return;
+    }
+
+    const auto t0 = Common::FaultMonitor::Now();
+    std::scoped_lock lock{mutex};
+    const auto lock_ns = Common::FaultMonitor::DiffNs(t0, Common::FaultMonitor::Now());
+    RecordBatchImageProbe(lookup_count, true);
+
+    bool first = true;
+    for (auto& [image_id, desc] : entries) {
+        if (desc.info.guest_address == 0) {
+            continue;
+        }
+        image_id = FindImageLocked(desc, false, first ? lock_ns : 0);
+        first = false;
+
+        auto* image = &GetImage(image_id);
+        if (const auto depth_image_id = GetAssociatedDepth(*image)) {
+            // If this image has an associated depth image, it is a stencil attachment. Redirect
+            // the access to the actual depth-stencil buffer.
+            image_id = depth_image_id;
+            image = &GetImage(image_id);
+        }
+        if (image->binding.is_bound) {
+            // Storage bindings require a general layout when the image is already bound.
+            image->binding.force_general |= desc.type == BindingType::Storage;
+        }
+        image->binding.is_bound = 1u;
+    }
+}
+
+ImageId TextureCache::FindImageLocked(ImageDesc& desc, bool exact_fmt, u64 lock_ns) {
     const auto& info = desc.info;
     ASSERT(info.guest_address != 0);
 
@@ -567,10 +666,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     // match+resolve, and count perfect-hit% + pages walked + new-image(miss)%. Strip before ship.
     static u64 fi_calls = 0, fi_lock_ns = 0, fi_walk_ns = 0, fi_rest_ns = 0, fi_pages = 0,
                fi_hit = 0, fi_new = 0, fi_cands = 0;
-    const auto fi_t0 = Common::FaultMonitor::Now();
-    std::scoped_lock lock{mutex};
     const auto fi_t1 = Common::FaultMonitor::Now();
-
     PreparedImage* memo = nullptr;
     PreparedImageKey key{};
     ImageId memo_id{};
@@ -620,7 +716,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
     const auto fi_t2 = Common::FaultMonitor::Now();
     ++fi_calls;
-    fi_lock_ns += Common::FaultMonitor::DiffNs(fi_t0, fi_t1);
+    fi_lock_ns += lock_ns;
     fi_walk_ns += Common::FaultMonitor::DiffNs(fi_t1, fi_t2);
     if (!reuse) {
         fi_pages +=
