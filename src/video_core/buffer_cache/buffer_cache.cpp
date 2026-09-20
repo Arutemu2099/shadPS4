@@ -133,6 +133,19 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 
     memory_tracker = std::make_unique<MemoryTracker>(tracker);
 
+    const auto env_set = [](const char* name) {
+        const char* env = std::getenv(name);
+        return env != nullptr && std::atoi(env) != 0;
+    };
+    // The verify switch implies the experiment: there is nothing to verify without hits.
+    const bool resolved_ro_verify = env_set("SHADPS4_RESOLVED_RO_BUFFERS_VERIFY");
+    if (env_set("SHADPS4_RESOLVED_RO_BUFFERS") || resolved_ro_verify) {
+        resolved_ro = std::make_unique<ResolvedRoState>();
+        resolved_ro->verify = resolved_ro_verify;
+        LOG_INFO(Render, "ResolvedRoBuffers: enabled verify={} stream_max={}", resolved_ro_verify,
+                 StreamCopyMaxSize());
+    }
+
     if (Offload::Enabled() || Offload::VerifyEnabled() || Offload::ProfileEnabled()) {
         LOG_INFO(Render, "ReadbackOffload: offload={} verify={} profile={}", Offload::Enabled(),
                  Offload::VerifyEnabled(), Offload::ProfileEnabled());
@@ -177,6 +190,9 @@ BufferCache::~BufferCache() {
 }
 
 void BufferCache::BeginGpuUnmap(VAddr device_addr, u64 size) {
+    // Unmapping deletes no cache buffer here and its invalidation publishes a dirty epoch, so
+    // this is conservative: no resolved entry outlives a change to the GPU mapping.
+    InvalidateResolvedStructure();
     if (!Offload::Enabled() || size == 0) {
         return;
     }
@@ -195,6 +211,7 @@ void BufferCache::BeginGpuUnmap(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::EndGpuMap(VAddr device_addr, u64 size) {
+    InvalidateResolvedStructure();
     if (Offload::Enabled() && size != 0) {
         // MapMemory can hold the memory manager's writer lock. This must not call CP or wait
         // for a job; TryAdmit's callback only publishes bookkeeping under the same gate.
@@ -1143,6 +1160,23 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
 std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
                                                   bool is_texel_buffer, BufferId buffer_id,
                                                   Common::BufferSampleCaller sample_caller) {
+    // Resolved read-only reuse. A hit stands for exactly what the code below does when the
+    // range is clean: no upload, no LRU touch, no range add, the same buffer and offset. It
+    // also skips that path's FaultMonitor and BufferSampleProbe rows. Barriers are taken by
+    // the caller from the returned buffer and are never part of a hit.
+    bool resolved_eligible = false;
+    ResolvedRoCandidate resolved_candidate{};
+    u64 original_generation = 0;
+    if (resolved_ro) {
+        resolved_eligible = ResolvedRoEligible(device_addr, size, is_written, is_texel_buffer);
+        original_generation = structural_generation.load(std::memory_order_acquire);
+        if (!resolved_eligible) {
+            ++resolved_ro->stats.ineligible;
+        } else if (TryResolvedRoSync(device_addr, size, buffer_id, resolved_candidate) &&
+                   !resolved_ro->verify) {
+            return {resolved_candidate.buffer, resolved_candidate.offset};
+        }
+    }
     // This function is 4.93 us/draw, 61% of all per-draw CPU cost, and it has two halves that
     // share no code: the early exit below (a tracker query plus a guest-memory memcpy) and the
     // SynchronizeBuffer fall-through. Time them separately - the split decides which is worth
@@ -1183,10 +1217,19 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     Buffer& buffer = slot_buffers[buffer_id];
     const auto t_sync = Common::FaultMonitor::Now();
     const auto t_sample_sync = sample.Now();
+    u64 uploaded_bytes = 0;
     SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer,
-                      sample.Active() ? &sample : nullptr);
+                      sample.Active() ? &sample : nullptr,
+                      resolved_candidate.buffer ? &uploaded_bytes : nullptr);
     sample.AddSyncNs(sample.SinceNs(t_sample_sync));
     Common::FaultMonitor::CountObtainSync(query_ns, Common::FaultMonitor::SinceNs(t_sync));
+    if (resolved_eligible) {
+        if (resolved_candidate.buffer) {
+            // Verify mode: the original path above ran in full and its result is returned.
+            VerifyResolvedRoSync(resolved_candidate, device_addr, size, buffer, uploaded_bytes);
+        }
+        SeedResolvedRo(device_addr, size, buffer_id, original_generation);
+    }
     if (is_written) {
         const auto t_range_add = sample.Now();
         gpu_modified_ranges.Add(device_addr, size);
@@ -1241,6 +1284,205 @@ BufferId BufferCache::FindBuffer(VAddr device_addr, u32 size) {
         return buffer_id;
     }
     return CreateBuffer(device_addr, size);
+}
+
+BufferId BufferCache::FindBufferResolvedRo(VAddr device_addr, u32 size) {
+    if (!resolved_ro || device_addr == 0 || size == 0) {
+        return FindBuffer(device_addr, size);
+    }
+    // FindBuffer reads page_table and the bounds of the buffer it names, nothing else. Both
+    // only change behind a generation bump, so at the seeding generation it would return the
+    // seeded id again without creating anything. The dirty epoch plays no part in a lookup.
+    ResolvedRoStats& stats = resolved_ro->stats;
+    ++stats.lookup_attempts;
+    const ResolvedRoEntry& entry = resolved_ro->table[ResolvedRoSlot(device_addr, size)];
+    if (entry.addr != device_addr || entry.size != size) {
+        ++stats.lookup_key_fallbacks;
+        return FindBuffer(device_addr, size);
+    }
+    if (!ResolvedGenerationCurrent(entry.generation)) {
+        ++stats.lookup_generation_fallbacks;
+        return FindBuffer(device_addr, size);
+    }
+    const BufferId candidate = entry.buffer_id;
+    if (!candidate || !slot_buffers.is_allocated(candidate) ||
+        slot_buffers[candidate].is_deleted ||
+        !slot_buffers[candidate].IsInBounds(device_addr, size) ||
+        !ResolvedGenerationCurrent(entry.generation)) {
+        ++stats.lookup_generation_fallbacks;
+        return FindBuffer(device_addr, size);
+    }
+    ++stats.lookup_hits;
+    if (resolved_ro->verify) {
+        // Structure belongs to the command processor, so no concurrent input excuses a
+        // difference here. A wrong candidate shows up as another id, possibly a new buffer.
+        const BufferId original = FindBuffer(device_addr, size);
+        ASSERT_MSG(original == candidate,
+                   "ResolvedRoBuffers: lookup {:#x}+{:#x} resolved slot {} but FindBuffer "
+                   "returned {}",
+                   device_addr, size, candidate.index, original.index);
+        ++stats.verified_lookups;
+        return original;
+    }
+    return candidate;
+}
+
+bool BufferCache::ResolvedRoEligible(VAddr device_addr, u32 size, bool is_written,
+                                     bool is_texel_buffer) const noexcept {
+    // A size the stream route could take is excluded whether or not it would be taken: that
+    // route depends on live GPU-modified state and returns a per-call copy.
+    return !is_written && !is_texel_buffer && device_addr != 0 && size != 0 &&
+           size > StreamCopyMaxSize();
+}
+
+bool BufferCache::TryResolvedRoSync(VAddr device_addr, u32 size, BufferId buffer_id,
+                                    ResolvedRoCandidate& candidate) {
+    ResolvedRoStats& stats = resolved_ro->stats;
+    ++stats.sync_attempts;
+    MaybeLogResolvedRo();
+    const ResolvedRoEntry& entry = resolved_ro->table[ResolvedRoSlot(device_addr, size)];
+    if (entry.addr != device_addr || entry.size != size) {
+        ++stats.key_fallbacks;
+        return false;
+    }
+    // Checked before entry.buffer_id is compared or dereferenced. An equal generation means
+    // no buffer was created, merged, registered, unregistered or deleted since seeding, so
+    // the id still names the live buffer it was seeded from and slot_buffers has not moved.
+    if (!ResolvedGenerationCurrent(entry.generation)) {
+        ++stats.generation_fallbacks;
+        return false;
+    }
+    // The original uses a valid caller id as it is. One that differs, which includes every
+    // id an intervening merge deleted, takes the original path and its FindBuffer fallback.
+    if (buffer_id && buffer_id != entry.buffer_id) {
+        ++stats.buffer_id_fallbacks;
+        return false;
+    }
+    // Same proof and same load as the tracker memo: the range was clean at entry.epoch, and
+    // an unchanged epoch means no page anywhere was marked dirty since. 0 is never current.
+    const u64 epoch = g_dirty_epoch.load(std::memory_order_acquire);
+    if (entry.epoch != epoch) {
+        ++stats.epoch_fallbacks;
+        return false;
+    }
+    if (!entry.buffer_id || !slot_buffers.is_allocated(entry.buffer_id)) {
+        ++stats.buffer_id_fallbacks;
+        return false;
+    }
+    Buffer& buffer = slot_buffers[entry.buffer_id];
+    if (buffer.is_deleted || !buffer.IsInBounds(device_addr, size) ||
+        !ResolvedGenerationCurrent(entry.generation)) {
+        ++stats.generation_fallbacks;
+        return false;
+    }
+    ++stats.sync_hits;
+    candidate.buffer = &buffer;
+    candidate.offset = entry.offset;
+    candidate.epoch = epoch;
+    candidate.generation = entry.generation;
+    if (resolved_ro->verify) {
+        // Independent of both the table and the memo: a locked scan of the tracker's bits.
+        candidate.oracle_dirty = memory_tracker->IsRegionCpuModified(device_addr, size);
+        candidate.oracle_epoch = g_dirty_epoch.load(std::memory_order_acquire);
+    }
+    return true;
+}
+
+void BufferCache::SeedResolvedRo(VAddr device_addr, u32 size, BufferId buffer_id,
+                                  u64 original_generation) {
+    ResolvedRoStats& stats = resolved_ro->stats;
+    if (!ResolvedGenerationCurrent(original_generation)) {
+        ++stats.rejected_seeds;
+        return;
+    }
+    // Only an id FindBuffer would return right now, without creating anything. The original
+    // path may have used a caller id it never looked up again; this does not assume the two
+    // agree.
+    if (!buffer_id || page_table[device_addr >> CACHING_PAGEBITS].buffer_id != buffer_id) {
+        ++stats.rejected_seeds;
+        return;
+    }
+    const Buffer& buffer = slot_buffers[buffer_id];
+    if (buffer.is_deleted || !buffer.IsInBounds(device_addr, size)) {
+        ++stats.rejected_seeds;
+        return;
+    }
+    // The clean proof is the memo's own record at a freshly loaded epoch. A call that just
+    // uploaded left no such record, and returning from the upload proves nothing by itself:
+    // it seeds the lookup only, and a later clean call adds the epoch.
+    const u64 epoch = g_dirty_epoch.load(std::memory_order_acquire);
+    const bool clean = MemoryTracker::CleanSkipEnabled() &&
+                       memory_tracker->MemoSaysClean(device_addr, size, epoch);
+    // Do not attach a newer mapping generation to an observation from before the change.
+    if (!ResolvedGenerationCurrent(original_generation)) {
+        ++stats.rejected_seeds;
+        return;
+    }
+    ++(clean ? stats.clean_seeds : stats.lookup_only_seeds);
+    resolved_ro->table[ResolvedRoSlot(device_addr, size)] = ResolvedRoEntry{
+        .addr = device_addr,
+        .size = size,
+        .offset = static_cast<u32>(buffer.Offset(device_addr)),
+        .buffer_id = buffer_id,
+        .generation = original_generation,
+        .epoch = clean ? epoch : 0,
+    };
+}
+
+void BufferCache::VerifyResolvedRoSync(const ResolvedRoCandidate& candidate, VAddr device_addr,
+                                       u32 size, Buffer& buffer, u64 uploaded_bytes) {
+    ResolvedRoStats& stats = resolved_ro->stats;
+    // Identity, offset and coverage follow from cache structure alone, which only the
+    // command processor changes. Asserted whatever the epoch did meanwhile.
+    ASSERT_MSG(candidate.buffer == &buffer &&
+                   candidate.offset == static_cast<u32>(buffer.Offset(device_addr)) &&
+                   buffer.IsInBounds(device_addr, size) && !buffer.is_deleted,
+               "ResolvedRoBuffers: hit {:#x}+{:#x} offset {:#x} differs from the original "
+               "path, buffer {:#x}+{:#x}",
+               device_addr, size, candidate.offset, buffer.CpuAddr(), buffer.SizeBytes());
+    if (!ResolvedGenerationCurrent(candidate.generation)) {
+        ++stats.changed_inputs;
+        return;
+    }
+    const bool dirty = candidate.oracle_dirty || uploaded_bytes != 0;
+    if (!dirty) {
+        ++stats.verified_syncs;
+        return;
+    }
+    // Dirty bits and their epoch are both published under the region lock, bits first, and
+    // both witnesses read the bits under that lock. An epoch loaded after a witness saw dirt
+    // therefore already includes it. If that epoch has moved past the hit's, the guest wrote
+    // during this call: a changed input, not a verified hit. If it has not, the dirt predates
+    // the hit and the clean claim was false.
+    const u64 witness_epoch = candidate.oracle_dirty
+                                  ? candidate.oracle_epoch
+                                  : g_dirty_epoch.load(std::memory_order_acquire);
+    if (witness_epoch != candidate.epoch) {
+        ++stats.changed_inputs;
+        return;
+    }
+    ASSERT_MSG(false,
+               "ResolvedRoBuffers: hit {:#x}+{:#x} claimed clean at epoch {} but the tracker "
+               "held dirt (scan={}, uploaded={:#x})",
+               device_addr, size, candidate.epoch, candidate.oracle_dirty, uploaded_bytes);
+}
+
+void BufferCache::MaybeLogResolvedRo() {
+    static constexpr u64 LogEvery = u64{1} << 22;
+    const ResolvedRoStats& s = resolved_ro->stats;
+    if ((s.sync_attempts & (LogEvery - 1)) != 0) {
+        return;
+    }
+    LOG_INFO(Render,
+             "ResolvedRoBuffers: gen={} lookup att={} hit={} key={} gen_fb={} | sync att={} "
+             "hit={} key={} gen_fb={} id={} epoch={} inelig={} | seeds clean={} lookup={} "
+             "rejected={} | verified lookup={} sync={} changed={}",
+             structural_generation.load(std::memory_order_acquire), s.lookup_attempts,
+             s.lookup_hits, s.lookup_key_fallbacks, s.lookup_generation_fallbacks,
+             s.sync_attempts, s.sync_hits, s.key_fallbacks, s.generation_fallbacks,
+             s.buffer_id_fallbacks, s.epoch_fallbacks, s.ineligible, s.clean_seeds,
+             s.lookup_only_seeds, s.rejected_seeds, s.verified_lookups, s.verified_syncs,
+             s.changed_inputs);
 }
 
 BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 wanted_size) {
@@ -1321,6 +1563,7 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
 
 void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
                               bool accumulate_stream_score) {
+    InvalidateResolvedStructure();
     Buffer& new_buffer = slot_buffers[new_buffer_id];
     Buffer& overlap = slot_buffers[overlap_id];
     if (accumulate_stream_score) {
@@ -1374,6 +1617,8 @@ void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
 }
 
 BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
+    // Before the insert: it can hand out a freed slot index or move slot_buffers' storage.
+    InvalidateResolvedStructure();
     const VAddr device_addr_end = Common::AlignUp(device_addr + wanted_size, CACHING_PAGESIZE);
     device_addr = Common::AlignDown(device_addr, CACHING_PAGESIZE);
     wanted_size = static_cast<u32>(device_addr_end - device_addr);
@@ -1404,6 +1649,8 @@ void BufferCache::Unregister(BufferId buffer_id) {
 
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId buffer_id) {
+    // The only writer of page_table and buffer_ranges.
+    InvalidateResolvedStructure();
     Buffer& buffer = slot_buffers[buffer_id];
     const auto size = buffer.SizeBytes();
     const VAddr device_addr_begin = buffer.CpuAddr();
@@ -1441,7 +1688,8 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
                                     bool is_texel_buffer,
-                                    Common::BufferSampleProbe* sample_probe) {
+                                    Common::BufferSampleProbe* sample_probe,
+                                    u64* uploaded_bytes) {
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes = 0;
     VAddr buffer_start = buffer.CpuAddr();
@@ -1455,6 +1703,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             total_size_bytes += range_size;
         },
         [&] { src_buffer = UploadCopies(buffer, copies, total_size_bytes); });
+    if (uploaded_bytes) {
+        *uploaded_bytes = total_size_bytes;
+    }
     if (sample_probe) {
         sample_probe->AddUploadNs(sample_probe->SinceNs(t_upload));
         sample_probe->RecordUpload(upload_path, total_size_bytes, copies.size());
@@ -1725,6 +1976,10 @@ void BufferCache::TouchBuffer(const Buffer& buffer) {
 }
 
 void BufferCache::DeleteBuffer(BufferId buffer_id) {
+    // The deferred erase below needs no bump of its own: from here on the buffer is
+    // unregistered, so nothing can seed its id, and the slot is only handed out again by
+    // CreateBuffer, which bumps before it inserts.
+    InvalidateResolvedStructure();
     Buffer& buffer = slot_buffers[buffer_id];
     Unregister(buffer_id);
     scheduler.DeferOperation([this, buffer_id] { slot_buffers.erase(buffer_id); });
