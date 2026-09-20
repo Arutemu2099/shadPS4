@@ -277,6 +277,9 @@ inline constexpr u32 NativePushBlockSize = NativePushIndexAddressOffset + sizeof
 /// Upper bound on unified bindings per pipeline: Shader::NUM_BUFFERS (40) buffer infos plus
 /// Shader::NUM_IMAGES (64) image and sampler infos, which is what the rasterizer can hold.
 inline constexpr u32 NativeMaxBindingsPerDraw = 128;
+inline constexpr u32 NativeDirectPushBindingCapacity = 32;
+inline constexpr u32 NativeDirectPushBlockCapacity =
+    NativePushIndexAddressOffset + NativeDirectPushBindingCapacity * sizeof(u32);
 
 inline constexpr u32 NativeNullStorageBufferSlot = 0;
 inline constexpr u32 NativeNullUniformBufferSlot = 1;
@@ -291,6 +294,7 @@ inline constexpr u32 NativeImageStaticSlots = 2;
 /// Heap geometry, fixed from queried device properties before any guest pipeline exists.
 /// Guest pipelines bake these offsets and strides into their descriptor mappings.
 struct NativeBindingLayout {
+    u64 max_push_data_size{};
     u64 resource_heap_size{};
     u64 resource_reserved_size{};
     u64 resource_heap_alignment{};

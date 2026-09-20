@@ -78,7 +78,7 @@ public:
     }
 
     /// Descriptor heap emission: barriers, heap binds when invalidated, then one push-data
-    /// block carrying the shader push constants and the index array address.
+    /// block carrying shader push constants plus direct indices or an indirect index address.
     void BindResourcesNative(NativeBindings& native, std::span<const u32> indices,
                              const BufferBarriers& buffer_barriers,
                              const Shader::PushData& push_data) const;
@@ -107,6 +107,7 @@ protected:
     bool uses_push_descriptors{};
     bool is_compute;
     bool uses_native_bindings{};
+    bool uses_direct_push_index{};
     u32 native_binding_count{};
     struct NativeStageMappings {
         vk::ShaderStageFlags stage{};

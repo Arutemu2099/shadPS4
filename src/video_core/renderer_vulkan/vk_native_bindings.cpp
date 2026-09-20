@@ -557,6 +557,7 @@ u64 NativeBindings::CommitIndices(std::span<const u32> indices, bool is_compute)
     const u64 tick = scheduler.CurrentTick();
     index_ring.ticks[index_ring.current] = tick;
     buffer_ring.ticks[buffer_ring.current] = tick;
+    ++counters.indirect_index_bindings;
 
     counters.index_bytes += indices.size_bytes();
     ++(is_compute ? counters.dispatches : counters.draws);
@@ -564,6 +565,15 @@ u64 NativeBindings::CommitIndices(std::span<const u32> indices, bool is_compute)
         ReportCounters();
     }
     return index_buffer.address + offset;
+}
+
+void NativeBindings::CommitDirect(bool is_compute) {
+    buffer_ring.ticks[buffer_ring.current] = scheduler.CurrentTick();
+    ++counters.direct_push_bindings;
+    ++(is_compute ? counters.dispatches : counters.draws);
+    if (counters.draws + counters.dispatches >= next_report) {
+        ReportCounters();
+    }
 }
 
 void NativeBindings::BindHeapsIfNeeded() {
@@ -677,13 +687,14 @@ void NativeBindings::ReportCounters() {
     LOG_INFO(Render_Vulkan,
              "NativeBindings: native draws={} dispatches={} legacy=0 | buffers encoded={} "
              "reused={} | images encoded={} reused={} | samplers encoded={} reused={} | "
-             "ring wraps={} flushes={} waits={} rollovers={} heap_binds={} | index_bytes={} "
-             "descriptor_bytes={} verified={}",
+             "direct_push={} indirect_index={} | ring wraps={} flushes={} waits={} rollovers={} "
+             "heap_binds={} | index_bytes={} descriptor_bytes={} verified={}",
              counters.draws, counters.dispatches, counters.buffers_encoded,
              counters.buffers_reused, counters.images_encoded, counters.images_reused,
-             counters.samplers_encoded, counters.samplers_reused, counters.ring_wraps,
-             counters.ring_flushes, counters.ring_waits, counters.rollovers, counters.heap_binds,
-             counters.index_bytes, counters.descriptor_bytes, counters.verified);
+             counters.samplers_encoded, counters.samplers_reused, counters.direct_push_bindings,
+             counters.indirect_index_bindings, counters.ring_wraps, counters.ring_flushes,
+             counters.ring_waits, counters.rollovers, counters.heap_binds, counters.index_bytes,
+             counters.descriptor_bytes, counters.verified);
 }
 
 } // namespace Vulkan

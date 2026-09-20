@@ -106,6 +106,10 @@ public:
     /// returns its device address.
     u64 CommitIndices(std::span<const u32> indices, bool is_compute);
 
+    /// Marks a direct push-index draw without consuming the GPU index ring. Buffer descriptors
+    /// still belong to the current submission block and must stamp its completion tick.
+    void CommitDirect(bool is_compute);
+
     /// Records the heap binds when the scheduler reports them invalid.
     void BindHeapsIfNeeded();
 
@@ -253,6 +257,8 @@ private:
         u64 ring_flushes{};
         u64 ring_waits{};
         u64 rollovers{};
+        u64 direct_push_bindings{};
+        u64 indirect_index_bindings{};
         u64 heap_binds{};
         u64 index_bytes{};
         u64 descriptor_bytes{};

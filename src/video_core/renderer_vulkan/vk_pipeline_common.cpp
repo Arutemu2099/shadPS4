@@ -85,6 +85,29 @@ void Pipeline::BindResourcesNative(NativeBindings& native, std::span<const u32> 
     RecordBufferBarriers(buffer_barriers);
     native.BindHeapsIfNeeded();
 
+    if (uses_direct_push_index) {
+        native.CommitDirect(IsCompute());
+        const u32 data_size = NativePushIndexAddressOffset + u32(indices.size_bytes());
+        std::array<u8, NativeDirectPushBlockCapacity> block{};
+        std::memcpy(block.data(), &push_data, sizeof(push_data));
+        if (!indices.empty()) {
+            std::memcpy(block.data() + NativePushIndexAddressOffset, indices.data(),
+                        indices.size_bytes());
+        }
+        scheduler.RecordArrays(
+            [push = instance.GetNativeApi().cmd_push_data](vk::CommandBuffer cmdbuf,
+                                                            std::span<const u8> data) {
+                const NativeApi::PushDataInfo info = {
+                    .sType = NativeApi::StructureTypePushDataInfo,
+                    .offset = 0,
+                    .data = {data.data(), data.size()},
+                };
+                push(cmdbuf, &info);
+            },
+            std::span<const u8>{block.data(), data_size});
+        return;
+    }
+
     // The index array is owned by the native ring until the GPU completes this submission,
     // not by the recording worker's chunk.
     const u64 index_address = native.CommitIndices(indices, IsCompute());
@@ -109,10 +132,18 @@ void Pipeline::BuildNativeMappings(std::span<const vk::DescriptorSetLayoutBindin
     native_binding_count = 0;
     native_stage_mappings.clear();
 
+    bool all_scalar = true;
     for (const auto& binding : bindings) {
         native_binding_count =
             std::max(native_binding_count, binding.binding + binding.descriptorCount);
+        all_scalar &= binding.descriptorCount == 1;
+    }
+    uses_direct_push_index =
+        all_scalar && native_binding_count <= NativeDirectPushBindingCapacity &&
+        NativePushIndexAddressOffset + native_binding_count * sizeof(u32) <=
+            heap.max_push_data_size;
 
+    for (const auto& binding : bindings) {
         auto it = std::ranges::find_if(native_stage_mappings, [&](const auto& entry) {
             return entry.stage == binding.stageFlags;
         });
@@ -151,7 +182,15 @@ void Pipeline::BuildNativeMappings(std::span<const vk::DescriptorSetLayoutBindin
             .bindingCount = 1,
             .resourceMask = NativeApi::SpirvResourceTypeAll,
         };
-        if (binding.descriptorCount > 1) {
+        if (uses_direct_push_index) {
+            mapping.source = NativeApi::MappingSourceHeapWithPushIndex;
+            mapping.sourceData.pushIndex = {
+                .heapOffset = base,
+                .pushOffset = NativePushIndexAddressOffset + address_offset,
+                .heapIndexStride = stride,
+                .heapArrayStride = stride,
+            };
+        } else if (binding.descriptorCount > 1) {
             mapping.source = NativeApi::MappingSourceHeapWithIndirectIndexArray;
             mapping.sourceData.indirectIndexArray = {
                 .heapOffset = base,

@@ -736,6 +736,7 @@ bool Instance::QueryNativeBindings() {
     };
     auto& layout = native_binding_layout;
     layout = {};
+    layout.max_push_data_size = props.maxPushDataSize;
 
     // Resource heap: [reserved][persistent image slots][static + ring buffer slots].
     constexpr u64 MaxResourceHeap = 32ULL << 20;
