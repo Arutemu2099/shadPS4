@@ -853,12 +853,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         const auto vsharp = desc.GetSharp(stage);
         if (!desc.IsSpecial() && vsharp.base_address != 0 && vsharp.GetSize() > 0) {
             const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
-            // Only the non-texel read-only bindings the second pass can also reuse. The id is
-            // revalidated there: a later binding in this loop can still merge it away.
-            const auto buffer_id =
-                !desc.is_written && !desc.is_formatted
-                    ? buffer_cache.FindBufferResolvedRo(vsharp.base_address, size)
-                    : buffer_cache.FindBuffer(vsharp.base_address, size);
+            const auto buffer_id = buffer_cache.FindBuffer(vsharp.base_address, size);
             buffer_bindings.emplace_back(buffer_id, vsharp, size);
         } else {
             buffer_bindings.emplace_back(VideoCore::BufferId{}, vsharp, 0);
@@ -1512,8 +1507,6 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
 }
 
 void Rasterizer::MapMemory(VAddr addr, u64 size) {
-    buffer_cache.BeginResolvedMappingChange();
-    SCOPE_EXIT { buffer_cache.EndResolvedMappingChange(); };
     {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges += decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
@@ -1523,8 +1516,6 @@ void Rasterizer::MapMemory(VAddr addr, u64 size) {
 }
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
-    buffer_cache.BeginResolvedMappingChange();
-    SCOPE_EXIT { buffer_cache.EndResolvedMappingChange(); };
     buffer_cache.BeginGpuUnmap(addr, size);
     buffer_cache.InvalidateMemory(addr, size);
     texture_cache.UnmapMemory(addr, size);

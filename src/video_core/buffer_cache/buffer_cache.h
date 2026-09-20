@@ -129,18 +129,6 @@ public:
     /// A completed GPU mapping can admit asynchronous readbacks again; never waits on CP.
     void EndGpuMap(VAddr device_addr, u64 size);
 
-    /// Mapping callbacks can overlap command processing. Reject replay throughout the
-    /// transition, including entries that would otherwise be seeded between its endpoints.
-    void BeginResolvedMappingChange() noexcept {
-        active_mapping_changes.fetch_add(1, std::memory_order_acq_rel);
-        InvalidateResolvedStructure();
-    }
-
-    void EndResolvedMappingChange() noexcept {
-        InvalidateResolvedStructure();
-        active_mapping_changes.fetch_sub(1, std::memory_order_release);
-    }
-
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false);
 
@@ -178,11 +166,6 @@ public:
 
     /// Return buffer id for the specified region
     BufferId FindBuffer(VAddr device_addr, u32 size);
-
-    /// FindBuffer for the first BindBuffers pass of a non-texel read-only binding. With
-    /// SHADPS4_RESOLVED_RO_BUFFERS=1 an exact key at an unchanged structural generation is
-    /// answered from the resolved table; everything else is FindBuffer.
-    BufferId FindBufferResolvedRo(VAddr device_addr, u32 size);
 
     /// Processes the fault buffer.
     void ProcessFaultBuffer();
@@ -329,97 +312,8 @@ private:
     template <bool insert>
     void ChangeRegister(BufferId buffer_id);
 
-    /// uploaded_bytes, when set, receives the CPU-dirty bytes this call found and uploaded.
     bool SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
-                           bool is_texel_buffer, Common::BufferSampleProbe* sample_probe,
-                           u64* uploaded_bytes = nullptr);
-
-    // Resolved read-only buffer reuse (SHADPS4_RESOLVED_RO_BUFFERS, default off). Remembers,
-    // per exact (address, size), the cache buffer a non-texel read-only ObtainBuffer resolved
-    // to and the dirty epoch at which the tracker memo proved that range clean. The table and
-    // its counters are owned by the command processor thread, like slot_buffers and
-    // page_table. structural_generation is the only part other threads touch.
-
-    struct ResolvedRoEntry {
-        VAddr addr{};
-        u32 size{};
-        u32 offset{};
-        BufferId buffer_id{};
-        u64 generation{}; ///< structural_generation at seeding. Live values start at 1.
-        u64 epoch{};      ///< Dirty epoch of the clean proof. 0 means lookup only.
-    };
-
-    struct ResolvedRoStats {
-        u64 lookup_attempts{};
-        u64 lookup_hits{};
-        u64 lookup_key_fallbacks{};
-        u64 lookup_generation_fallbacks{};
-        u64 sync_attempts{};
-        u64 sync_hits{};
-        u64 ineligible{};
-        u64 key_fallbacks{};
-        u64 generation_fallbacks{};
-        u64 buffer_id_fallbacks{};
-        u64 epoch_fallbacks{};
-        u64 clean_seeds{};
-        u64 lookup_only_seeds{};
-        u64 rejected_seeds{};
-        u64 verified_lookups{};
-        u64 verified_syncs{};
-        u64 changed_inputs{};
-    };
-
-    struct ResolvedRoState {
-        static constexpr size_t TableSize = 8192;
-        std::array<ResolvedRoEntry, TableSize> table{};
-        ResolvedRoStats stats{};
-        bool verify{};
-    };
-
-    /// A sync hit awaiting comparison with the original path. Verify mode only.
-    struct ResolvedRoCandidate {
-        Buffer* buffer{};
-        u32 offset{};
-        u64 epoch{};
-        u64 generation{};
-        bool oracle_dirty{};
-        u64 oracle_epoch{};
-    };
-
-    static size_t ResolvedRoSlot(VAddr addr, u32 size) noexcept {
-        u64 h = addr * 0x9E3779B97F4A7C15ULL;
-        h ^= u64{size} * 0xC2B2AE3D27D4EB4FULL;
-        h ^= h >> 29;
-        return static_cast<size_t>(h & (ResolvedRoState::TableSize - 1));
-    }
-
-    /// Every change to which buffer a guest address resolves to calls this first. Entries
-    /// seeded at an older generation never hit again, so a reused slot index, a merged or
-    /// deleted buffer and a moved slot_buffers storage are all unreachable through the table.
-    void InvalidateResolvedStructure() noexcept {
-        structural_generation.fetch_add(1, std::memory_order_release);
-    }
-
-    bool ResolvedGenerationCurrent(u64 generation) const noexcept {
-        return active_mapping_changes.load(std::memory_order_acquire) == 0 &&
-               structural_generation.load(std::memory_order_acquire) == generation;
-    }
-
-    bool ResolvedRoEligible(VAddr device_addr, u32 size, bool is_written,
-                            bool is_texel_buffer) const noexcept;
-
-    /// Validates an entry for a clean read-only ObtainBuffer. Touches nothing on failure.
-    bool TryResolvedRoSync(VAddr device_addr, u32 size, BufferId buffer_id,
-                           ResolvedRoCandidate& candidate);
-
-    /// Runs after the original path. Seeds only what that path and the tracker memo proved.
-    void SeedResolvedRo(VAddr device_addr, u32 size, BufferId buffer_id,
-                        u64 original_generation);
-
-    void VerifyResolvedRoSync(const ResolvedRoCandidate& candidate, VAddr device_addr, u32 size,
-                              Buffer& buffer, u64 uploaded_bytes);
-
-    void MaybeLogResolvedRo();
+                           bool is_texel_buffer, Common::BufferSampleProbe* sample_probe);
 
     vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
                             size_t total_size_bytes);
@@ -467,12 +361,6 @@ private:
     Common::ReadbackUnmapGate fault_mapping_gate;
     /// Guest threads between entering the offload path and consuming their result.
     std::atomic<u32> fault_guest_waiters{0};
-    /// Separate from the CPU dirty epoch. Raised by the command processor before each
-    /// structural change, and by guest threads at GPU map and unmap, hence atomic.
-    std::atomic<u64> structural_generation{1};
-    std::atomic<u32> active_mapping_changes{0};
-    /// Allocated once at construction when the switch is set, otherwise null.
-    std::unique_ptr<ResolvedRoState> resolved_ro;
 };
 
 } // namespace VideoCore
