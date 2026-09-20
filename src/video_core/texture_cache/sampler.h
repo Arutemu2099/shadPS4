@@ -6,6 +6,7 @@
 #include "video_core/amdgpu/regs_texture.h"
 #include "video_core/amdgpu/resource.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#include "video_core/renderer_vulkan/vk_native_bindings.h"
 
 namespace Vulkan {
 class Instance;
@@ -30,6 +31,9 @@ public:
     }
 
     size_t lru_id{};
+    /// Descriptor heap slot, retained create info and border colour registration; inert in
+    /// legacy mode.
+    Vulkan::NativeSamplerState native;
 
 private:
     vk::UniqueSampler handle;

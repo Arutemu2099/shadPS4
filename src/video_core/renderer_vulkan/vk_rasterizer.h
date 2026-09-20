@@ -9,6 +9,7 @@
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/vk_native_bindings.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/texture_cache/texture_cache.h"
 
@@ -106,6 +107,9 @@ private:
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     bool BindResources(const Pipeline* pipeline);
 
+    /// Emits the bindings assembled by BindResources through the pipeline's binding model.
+    void EmitPipelineResources(const Pipeline* pipeline);
+
     void ResetBindings() {
         for (auto& image_id : bound_images) {
             texture_cache.GetImage(image_id).binding = {};
@@ -122,6 +126,9 @@ private:
 
     const Instance& instance;
     Scheduler& scheduler;
+    // Declared before the caches: created before any buffer, view, sampler or pipeline, and
+    // destroyed after them so object-owned heap slots can still be released. Null in legacy.
+    std::unique_ptr<NativeBindings> native_bindings;
     VideoCore::PageManager page_manager;
     VideoCore::BufferCache buffer_cache;
     VideoCore::TextureCache texture_cache;
@@ -156,6 +163,13 @@ private:
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
     boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
+
+    // Heap slot per unified binding, filled from the same resolved buffer_infos/image_infos
+    // entries the legacy writes point at. Legacy writes are skipped unless verifying.
+    std::array<u32, NativeMaxBindingsPerDraw> native_indices{};
+    std::array<u32, Shader::NUM_IMAGES> native_image_indices{};
+    u32 native_bound_count{};
+    bool build_set_writes{true};
 
     u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;

@@ -79,6 +79,7 @@ void Scheduler::CommitDynamicState() {
 
 void Scheduler::PushDescriptors(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
                                 std::span<const vk::WriteDescriptorSet> writes) {
+    native_heaps_bound = false;
     if (!IsAsyncRecording()) {
         current_cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, writes);
         return;
@@ -251,6 +252,7 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
+    native_heaps_bound = false;
 
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();

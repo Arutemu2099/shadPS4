@@ -1,10 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstdlib>
+#include <string_view>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/types.h"
@@ -339,6 +343,18 @@ bool Instance::CreateDevice() {
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
 
+    // Opt-in descriptor heap experiment. Nothing below is touched unless
+    // SHADPS4_NATIVE_BINDINGS=1 and the device passes every capability check.
+    bool native_bindings = QueryNativeBindings();
+    if (native_bindings && enabled_extensions.size() + 2 > enabled_extensions.capacity()) {
+        LOG_WARNING(Render_Vulkan, "NativeBindings: no room in the extension list, using legacy");
+        native_bindings = false;
+    }
+    if (native_bindings) {
+        native_bindings = add_extension(NativeApi::Maintenance5ExtensionName) &&
+                          add_extension(NativeApi::DescriptorHeapExtensionName);
+    }
+
     const auto family_properties = physical_device.getQueueFamilyProperties();
     if (family_properties.empty()) {
         LOG_CRITICAL(Render_Vulkan, "Physical device reported no queues.");
@@ -549,6 +565,22 @@ bool Instance::CreateDevice() {
         device_chain.unlink<vk::PhysicalDeviceImageViewMinLodFeaturesEXT>();
     }
 
+    // The heap feature struct is unknown to the project's Vulkan-Hpp chain traits, so it is
+    // spliced into the raw pNext chain by hand, and only in the opt-in mode.
+    NativeApi::PhysicalDeviceDescriptorHeapFeatures heap_features = {
+        .sType = NativeApi::StructureTypePhysicalDeviceDescriptorHeapFeatures,
+        .descriptorHeap = VK_TRUE,
+    };
+    vk::PhysicalDeviceMaintenance5FeaturesKHR maintenance5_features = {
+        .maintenance5 = true,
+    };
+    if (native_bindings) {
+        auto& device_ci = device_chain.get<vk::DeviceCreateInfo>();
+        maintenance5_features.pNext = const_cast<void*>(device_ci.pNext);
+        heap_features.pNext = &maintenance5_features;
+        device_ci.pNext = &heap_features;
+    }
+
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
     if (device_result != vk::Result::eSuccess) {
         LOG_CRITICAL(Render_Vulkan, "Failed to create device: {}", vk::to_string(device_result));
@@ -557,6 +589,42 @@ bool Instance::CreateDevice() {
     device = std::move(dev);
 
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
+
+    if (native_bindings) {
+        const auto load = [&](const char* name) {
+            return VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr(static_cast<VkDevice>(*device),
+                                                                     name);
+        };
+        native_api.write_sampler_descriptors =
+            reinterpret_cast<NativeApi::PfnWriteSamplerDescriptors>(
+                load("vkWriteSamplerDescriptorsEXT"));
+        native_api.write_resource_descriptors =
+            reinterpret_cast<NativeApi::PfnWriteResourceDescriptors>(
+                load("vkWriteResourceDescriptorsEXT"));
+        native_api.cmd_bind_sampler_heap =
+            reinterpret_cast<NativeApi::PfnCmdBindHeap>(load("vkCmdBindSamplerHeapEXT"));
+        native_api.cmd_bind_resource_heap =
+            reinterpret_cast<NativeApi::PfnCmdBindHeap>(load("vkCmdBindResourceHeapEXT"));
+        native_api.cmd_push_data =
+            reinterpret_cast<NativeApi::PfnCmdPushData>(load("vkCmdPushDataEXT"));
+        native_api.register_custom_border_color =
+            reinterpret_cast<NativeApi::PfnRegisterCustomBorderColor>(
+                load("vkRegisterCustomBorderColorEXT"));
+        native_api.unregister_custom_border_color =
+            reinterpret_cast<NativeApi::PfnUnregisterCustomBorderColor>(
+                load("vkUnregisterCustomBorderColorEXT"));
+        native_bindings_active =
+            native_api.IsComplete() &&
+            (!IsCustomBorderColorSupported() ||
+             (native_api.register_custom_border_color && native_api.unregister_custom_border_color));
+        if (native_bindings_active) {
+            LOG_INFO(Render_Vulkan, "NativeBindings: descriptor heap guest bindings enabled");
+        } else {
+            // The extension and feature stay enabled on the device but are never used.
+            LOG_WARNING(Render_Vulkan,
+                        "NativeBindings: descriptor heap entry points missing, using legacy");
+        }
+    }
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
@@ -593,6 +661,159 @@ bool Instance::CreateDevice() {
     }
 
     CreateAllocator();
+    return true;
+}
+
+bool Instance::QueryNativeBindings() {
+    const char* requested = std::getenv("SHADPS4_NATIVE_BINDINGS");
+    if (!requested || std::string_view{requested} != "1") {
+        return false;
+    }
+    const auto has_extension = [&](std::string_view name) {
+        return std::ranges::any_of(available_extensions,
+                                   [&](const std::string& ext) { return ext == name; });
+    };
+    for (const char* name :
+         {NativeApi::DescriptorHeapExtensionName, NativeApi::Maintenance5ExtensionName,
+          NativeApi::ShaderUntypedPointersExtensionName}) {
+        if (!has_extension(name)) {
+            LOG_WARNING(Render_Vulkan, "NativeBindings: {} unavailable, using legacy", name);
+            return false;
+        }
+    }
+
+    NativeApi::PhysicalDeviceDescriptorHeapFeatures heap_features = {
+        .sType = NativeApi::StructureTypePhysicalDeviceDescriptorHeapFeatures,
+    };
+    vk::PhysicalDeviceMaintenance5FeaturesKHR maintenance5_features{};
+    maintenance5_features.pNext = &heap_features;
+    vk::PhysicalDeviceVulkan12Features vk12{};
+    vk12.pNext = &maintenance5_features;
+    vk::PhysicalDeviceFeatures2 features2{};
+    features2.pNext = &vk12;
+    physical_device.getFeatures2(&features2);
+    if (!heap_features.descriptorHeap || !maintenance5_features.maintenance5 ||
+        !vk12.bufferDeviceAddress) {
+        LOG_WARNING(Render_Vulkan,
+                    "NativeBindings: descriptorHeap={} maintenance5={} bufferDeviceAddress={}, "
+                    "using legacy",
+                    heap_features.descriptorHeap, maintenance5_features.maintenance5,
+                    vk12.bufferDeviceAddress);
+        return false;
+    }
+
+    NativeApi::PhysicalDeviceDescriptorHeapProperties props = {
+        .sType = NativeApi::StructureTypePhysicalDeviceDescriptorHeapProperties,
+    };
+    vk::PhysicalDeviceProperties2 properties2{};
+    properties2.pNext = &props;
+    physical_device.getProperties2(&properties2);
+    LOG_INFO(Render_Vulkan,
+             "NativeBindings: resourceHeap max={:#x} align={} reserved={:#x}, samplerHeap "
+             "max={:#x} align={} reserved={:#x}, descriptor size/align sampler={}/{} image={}/{} "
+             "buffer={}/{}, maxPushDataSize={}",
+             props.maxResourceHeapSize, props.resourceHeapAlignment,
+             props.minResourceHeapReservedRange, props.maxSamplerHeapSize,
+             props.samplerHeapAlignment, props.minSamplerHeapReservedRange,
+             props.samplerDescriptorSize, props.samplerDescriptorAlignment,
+             props.imageDescriptorSize, props.imageDescriptorAlignment, props.bufferDescriptorSize,
+             props.bufferDescriptorAlignment, props.maxPushDataSize);
+
+    if (props.maxPushDataSize < NativePushBlockSize) {
+        LOG_WARNING(Render_Vulkan, "NativeBindings: maxPushDataSize {} < {}, using legacy",
+                    props.maxPushDataSize, NativePushBlockSize);
+        return false;
+    }
+    if (!props.samplerDescriptorSize || !props.imageDescriptorSize || !props.bufferDescriptorSize ||
+        !props.samplerDescriptorAlignment || !props.imageDescriptorAlignment ||
+        !props.bufferDescriptorAlignment || !props.resourceHeapAlignment || !props.samplerHeapAlignment) {
+        LOG_WARNING(Render_Vulkan, "NativeBindings: zero descriptor size/alignment, using legacy");
+        return false;
+    }
+
+    const auto stride = [](u64 size, u64 alignment) {
+        return Common::AlignUp(size, std::max<u64>(alignment, 1));
+    };
+    auto& layout = native_binding_layout;
+    layout = {};
+
+    // Resource heap: [reserved][persistent image slots][static + ring buffer slots].
+    constexpr u64 MaxResourceHeap = 32ULL << 20;
+    constexpr u64 MaxImageSlots = 1ULL << 18;
+    constexpr u64 MinImageSlots = 4096;
+    const u64 region_alignment =
+        std::max<u64>({props.imageDescriptorAlignment, props.bufferDescriptorAlignment, 64});
+    const u64 heap_alignment = std::max<u64>(props.resourceHeapAlignment, 1);
+    const u64 heap_budget =
+        Common::AlignDown(std::min(props.maxResourceHeapSize, MaxResourceHeap), heap_alignment);
+    const u64 image_stride = stride(props.imageDescriptorSize, props.imageDescriptorAlignment);
+    const u64 buffer_stride = stride(props.bufferDescriptorSize, props.bufferDescriptorAlignment);
+    const u64 buffer_slots = NativeBufferStaticSlots + u64(NativeBufferBlocks) * NativeBufferBlockSlots;
+    const u64 buffer_bytes = Common::AlignUp(buffer_slots * buffer_stride, region_alignment);
+    const u64 image_base = Common::AlignUp(props.minResourceHeapReservedRange, region_alignment);
+    if (image_base + buffer_bytes + region_alignment >= heap_budget) {
+        LOG_WARNING(Render_Vulkan, "NativeBindings: resource heap too small, using legacy");
+        return false;
+    }
+    const u64 image_slots = std::min(
+        (heap_budget - image_base - buffer_bytes - region_alignment) / image_stride, MaxImageSlots);
+    if (image_slots < MinImageSlots) {
+        LOG_WARNING(Render_Vulkan, "NativeBindings: only {} image slots fit, using legacy",
+                    image_slots);
+        return false;
+    }
+    const u64 buffer_base =
+        Common::AlignUp(image_base + image_slots * image_stride, region_alignment);
+    layout.resource_heap_size = Common::AlignUp(buffer_base + buffer_bytes, heap_alignment);
+    ASSERT(layout.resource_heap_size <= heap_budget);
+    layout.resource_reserved_size = props.minResourceHeapReservedRange;
+    layout.resource_heap_alignment = heap_alignment;
+    layout.image_base = u32(image_base);
+    layout.image_stride = u32(image_stride);
+    layout.image_descriptor_size = u32(props.imageDescriptorSize);
+    layout.image_slots = u32(image_slots);
+    layout.buffer_base = u32(buffer_base);
+    layout.buffer_stride = u32(buffer_stride);
+    layout.buffer_descriptor_size = u32(props.bufferDescriptorSize);
+    layout.buffer_slots = u32(buffer_slots);
+
+    // Sampler heap: [reserved][persistent sampler slots]. No embedded samplers are used.
+    constexpr u64 MaxSamplerHeap = 1ULL << 20;
+    constexpr u64 MinSamplerSlots = 256;
+    const u64 sampler_alignment = std::max<u64>(props.samplerHeapAlignment, 1);
+    const u64 sampler_budget =
+        Common::AlignDown(std::min(props.maxSamplerHeapSize, MaxSamplerHeap), sampler_alignment);
+    const u64 sampler_stride =
+        stride(props.samplerDescriptorSize, props.samplerDescriptorAlignment);
+    const u64 sampler_base = Common::AlignUp(props.minSamplerHeapReservedRange, sampler_stride);
+    const u64 sampler_slots =
+        sampler_budget > sampler_base ? (sampler_budget - sampler_base) / sampler_stride : 0;
+    if (sampler_slots < MinSamplerSlots) {
+        LOG_WARNING(Render_Vulkan, "NativeBindings: only {} sampler slots fit, using legacy",
+                    sampler_slots);
+        return false;
+    }
+    layout.sampler_heap_size = sampler_budget;
+    layout.sampler_reserved_size = props.minSamplerHeapReservedRange;
+    layout.sampler_heap_alignment = sampler_alignment;
+    layout.sampler_base = u32(sampler_base);
+    layout.sampler_stride = u32(sampler_stride);
+    layout.sampler_descriptor_size = u32(props.samplerDescriptorSize);
+    layout.sampler_slots = u32(sampler_slots);
+    if (layout.sampler_slots < GetMaxSamplerAllocationCount()) {
+        // Correct but slow: exhaustion is handled by a full rollover.
+        LOG_WARNING(Render_Vulkan,
+                    "NativeBindings: {} sampler slots is below the sampler cache limit {}",
+                    layout.sampler_slots, GetMaxSamplerAllocationCount());
+    }
+
+    LOG_INFO(Render_Vulkan,
+             "NativeBindings: resource heap {:#x} bytes (images {} x {} at {:#x}, buffers {} x {} "
+             "at {:#x}), sampler heap {:#x} bytes ({} x {} at {:#x})",
+             layout.resource_heap_size, layout.image_slots, layout.image_stride, layout.image_base,
+             layout.buffer_slots, layout.buffer_stride, layout.buffer_base,
+             layout.sampler_heap_size, layout.sampler_slots, layout.sampler_stride,
+             layout.sampler_base);
     return true;
 }
 

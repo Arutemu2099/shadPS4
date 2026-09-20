@@ -47,18 +47,21 @@ GraphicsPipeline::GraphicsPipeline(
         .size = sizeof(Shader::PushData),
     };
 
-    const vk::DescriptorSetLayout set_layout = *desc_layout;
-    const vk::PipelineLayoutCreateInfo layout_info = {
-        .setLayoutCount = 1U,
-        .pSetLayouts = &set_layout,
-        .pushConstantRangeCount = 1,
-        .pPushConstantRanges = &push_constants,
-    };
-    auto [layout_result, layout] = instance.GetDevice().createPipelineLayoutUnique(layout_info);
-    ASSERT_MSG(layout_result == vk::Result::eSuccess,
-               "Failed to create graphics pipeline layout: {}", vk::to_string(layout_result));
-    pipeline_layout = std::move(layout);
-    SetObjectName(device, *pipeline_layout, "Graphics PipelineLayout {}", debug_str);
+    // Descriptor heap pipelines have neither a descriptor set layout nor a pipeline layout.
+    if (!uses_native_bindings) {
+        const vk::DescriptorSetLayout set_layout = *desc_layout;
+        const vk::PipelineLayoutCreateInfo layout_info = {
+            .setLayoutCount = 1U,
+            .pSetLayouts = &set_layout,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &push_constants,
+        };
+        auto [layout_result, layout] = instance.GetDevice().createPipelineLayoutUnique(layout_info);
+        ASSERT_MSG(layout_result == vk::Result::eSuccess,
+                   "Failed to create graphics pipeline layout: {}", vk::to_string(layout_result));
+        pipeline_layout = std::move(layout);
+        SetObjectName(device, *pipeline_layout, "Graphics PipelineLayout {}", debug_str);
+    }
 
     if (!preloading) {
         VertexInputs<AmdGpu::Buffer> guest_buffers;
@@ -367,8 +370,24 @@ GraphicsPipeline::GraphicsPipeline(
     // In practice, we use dynamic state for all of it.
     constexpr vk::PipelineDepthStencilStateCreateInfo depth_stencil_info = {};
 
-    const vk::GraphicsPipelineCreateInfo pipeline_info = {
+    // Descriptor mappings go on shader stage creation; auxiliary stages bind nothing.
+    const NativeApi::PipelineCreateFlags2CreateInfo flags2_ci = {
+        .sType = NativeApi::StructureTypePipelineCreateFlags2CreateInfo,
         .pNext = &pipeline_rendering_ci,
+        .flags = NativeApi::PipelineCreate2DescriptorHeapBit,
+    };
+    if (uses_native_bindings) {
+        for (auto& shader_stage : shader_stages) {
+            if (const auto* mapping_info =
+                    NativeMappingInfo(shader_stage.stage, shader_stage.pNext)) {
+                shader_stage.pNext = mapping_info;
+            }
+        }
+    }
+
+    const vk::GraphicsPipelineCreateInfo pipeline_info = {
+        .pNext = uses_native_bindings ? static_cast<const void*>(&flags2_ci)
+                                      : static_cast<const void*>(&pipeline_rendering_ci),
         .stageCount = static_cast<u32>(shader_stages.size()),
         .pStages = shader_stages.data(),
         .pVertexInputState = !instance.IsVertexInputDynamicState() ? &vertex_input_info : nullptr,
@@ -381,7 +400,7 @@ GraphicsPipeline::GraphicsPipeline(
             !instance.IsExtendedDynamicState3Supported() ? &depth_stencil_info : nullptr,
         .pColorBlendState = &color_blending,
         .pDynamicState = &dynamic_info,
-        .layout = *pipeline_layout,
+        .layout = uses_native_bindings ? vk::PipelineLayout{} : *pipeline_layout,
     };
 
     auto [pipeline_result, pipe] =
@@ -506,6 +525,11 @@ void GraphicsPipeline::BuildDescSetLayout(SerializationSupport& sdata, bool prel
                 .stageFlags = stage_bit,
             });
         }
+    }
+    if (instance.IsNativeBindingsActive()) {
+        // Same unified binding numbering, expressed as descriptor heap mappings instead.
+        BuildNativeMappings(bindings);
+        return;
     }
     uses_push_descriptors = binding < instance.MaxPushDescriptors();
     const auto flags = uses_push_descriptors

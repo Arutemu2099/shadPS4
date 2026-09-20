@@ -6,7 +6,10 @@
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#include "video_core/renderer_vulkan/vk_native_bindings_api.h"
 
+#include <span>
+#include <vector>
 #include <boost/container/small_vector.hpp>
 
 namespace Shader {
@@ -24,6 +27,7 @@ static constexpr auto AllGraphicsStageBits =
 class Instance;
 class Scheduler;
 class DescriptorHeap;
+class NativeBindings;
 
 class Pipeline {
 public:
@@ -63,8 +67,34 @@ public:
     void BindResources(DescriptorWrites& set_writes, const BufferBarriers& buffer_barriers,
                        const Shader::PushData& push_data) const;
 
+    /// True when the pipeline was created with descriptor heap mappings and no legacy layout.
+    bool UsesNativeBindings() const noexcept {
+        return uses_native_bindings;
+    }
+
+    /// Number of unified bindings, i.e. the length of the per-draw heap index array.
+    u32 NativeBindingCount() const noexcept {
+        return native_binding_count;
+    }
+
+    /// Descriptor heap emission: barriers, heap binds when invalidated, then one push-data
+    /// block carrying the shader push constants and the index array address.
+    void BindResourcesNative(NativeBindings& native, std::span<const u32> indices,
+                             const BufferBarriers& buffer_barriers,
+                             const Shader::PushData& push_data) const;
+
 protected:
     [[nodiscard]] std::string GetDebugString() const;
+
+    void RecordBufferBarriers(const BufferBarriers& buffer_barriers) const;
+
+    /// Builds one heap mapping per legacy binding, grouped by the owning shader stage.
+    void BuildNativeMappings(std::span<const vk::DescriptorSetLayoutBinding> bindings);
+
+    /// Mapping info to chain into the given stage's create info, or null if it binds nothing.
+    /// Pointers stay valid for the lifetime of the pipeline object.
+    const NativeApi::ShaderDescriptorSetAndBindingMappingInfo* NativeMappingInfo(
+        vk::ShaderStageFlagBits stage, const void* next) const;
 
     const Instance& instance;
     Scheduler& scheduler;
@@ -76,6 +106,14 @@ protected:
     std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};
     bool uses_push_descriptors{};
     bool is_compute;
+    bool uses_native_bindings{};
+    u32 native_binding_count{};
+    struct NativeStageMappings {
+        vk::ShaderStageFlags stage{};
+        std::vector<NativeApi::DescriptorSetAndBindingMapping> mappings;
+        mutable NativeApi::ShaderDescriptorSetAndBindingMappingInfo info{};
+    };
+    std::vector<NativeStageMappings> native_stage_mappings;
 };
 
 } // namespace Vulkan

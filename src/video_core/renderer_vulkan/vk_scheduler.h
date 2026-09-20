@@ -398,6 +398,8 @@ public:
             if (scheduler.synchronous_scopes == 0) {
                 scheduler.DrainRecording();
             }
+            // A borrower may bind legacy descriptor state behind the scheduler's back.
+            scheduler.native_heaps_bound = false;
             ++scheduler.synchronous_scopes;
             ++scheduler.synchronous_borrows;
             if (scheduler.recording_measure_timing) {
@@ -405,6 +407,7 @@ public:
             }
         }
         ~CommandBufferAccess() {
+            scheduler.native_heaps_bound = false;
             --scheduler.synchronous_scopes;
         }
         CommandBufferAccess(const CommandBufferAccess&) = delete;
@@ -429,6 +432,18 @@ public:
 
     bool IsAsyncRecording() const {
         return recording_worker && synchronous_scopes == 0;
+    }
+
+    /// Descriptor heap binds are invalidated by legacy descriptor state and do not survive a
+    /// command buffer. Tracked in recording order on the command-processor thread.
+    bool NativeHeapsBound() const {
+        return native_heaps_bound && synchronous_scopes == 0;
+    }
+    void MarkNativeHeapsBound() {
+        native_heaps_bound = true;
+    }
+    void InvalidateNativeHeaps() {
+        native_heaps_bound = false;
     }
 
     template <typename F>
@@ -532,6 +547,7 @@ private:
     bool recording_measure_timing = false;
     std::unordered_map<std::string_view, u64> recording_borrow_counts;
     u32 synchronous_scopes = 0;
+    bool native_heaps_bound = false;
     u64 synchronous_borrows = 0;
     u64 recording_submits = 0;
     MasterSemaphore master_semaphore;

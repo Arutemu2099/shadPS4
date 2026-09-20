@@ -974,7 +974,8 @@ void TextureCache::RefreshImage(Image& image) {
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
-                                     AmdGpu::BorderColorBuffer border_color_base) {
+                                     AmdGpu::BorderColorBuffer border_color_base,
+                                     u32* native_index) {
     const u64 hash = XXH3_64bits(&sampler, sizeof(sampler));
 
     std::scoped_lock lock{samplers_mutex};
@@ -985,6 +986,10 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
         sampler_lru_cache.Touch(it->second.lru_id, gc_tick);
     }
 
+    if (native_index) {
+        *native_index =
+            Vulkan::NativeBindings::Get()->SamplerIndex(it.value().native, it->second.Handle());
+    }
     return it->second.Handle();
 }
 

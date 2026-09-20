@@ -141,6 +141,18 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
                vk::to_string(view_result));
     image_view = std::move(view);
 
+    if (instance.IsNativeBindingsActive()) {
+        // The heap encodes a view from its creation parameters, so keep exactly the ones
+        // used above: subresource range, swizzle, usage restriction and minLod.
+        native.view_ci = image_view_ci;
+        native.view_ci.pNext = nullptr;
+        native.usage_ci = usage_ci;
+        native.usage_ci.pNext = nullptr;
+        native.min_lod_ci = min_lod_ci;
+        native.has_min_lod = usage_ci.pNext != nullptr;
+        native.armed = true;
+    }
+
     const auto view_aspect = aspect & vk::ImageAspectFlagBits::eDepth     ? "Depth"
                              : aspect & vk::ImageAspectFlagBits::eStencil ? "Stencil"
                                                                           : "Color";

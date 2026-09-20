@@ -6,6 +6,7 @@
 #include <span>
 #include <unordered_map>
 
+#include "video_core/renderer_vulkan/vk_native_bindings_api.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 #define TRACY_VK_USE_SYMBOL_TABLE
@@ -439,6 +440,25 @@ public:
         return supports_memory_budget;
     }
 
+    /// Returns true when the opt-in VK_EXT_descriptor_heap guest binding model is in use.
+    /// Fixed before any guest pipeline, buffer, image view or sampler is created.
+    bool IsNativeBindingsActive() const {
+        return native_bindings_active;
+    }
+
+    /// Startup fallback to the legacy model when the heaps themselves cannot be set up.
+    void DeactivateNativeBindings() const {
+        native_bindings_active = false;
+    }
+
+    const NativeBindingLayout& GetNativeBindingLayout() const {
+        return native_binding_layout;
+    }
+
+    const NativeApi::Functions& GetNativeApi() const {
+        return native_api;
+    }
+
     /// Returns the amount of memory used.
     [[nodiscard]] u64 GetDeviceMemoryUsage() const;
 
@@ -456,6 +476,10 @@ private:
 
     /// Creates the VMA allocator handle
     void CreateAllocator();
+
+    /// Checks SHADPS4_NATIVE_BINDINGS and the device's descriptor heap capabilities, and
+    /// derives the heap layout. Returns false, with the reason logged, to stay legacy.
+    bool QueryNativeBindings();
 
     /// Collects various information from the device.
     void CollectDeviceParameters();
@@ -521,6 +545,9 @@ private:
     bool image_view_min_lod{};
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
+    mutable bool native_bindings_active{};
+    NativeBindingLayout native_binding_layout{};
+    NativeApi::Functions native_api{};
     u64 total_memory_budget{};
     std::vector<size_t> valid_heaps;
 };

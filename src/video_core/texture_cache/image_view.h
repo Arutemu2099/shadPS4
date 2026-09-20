@@ -6,6 +6,7 @@
 #include "video_core/amdgpu/regs_depth.h"
 #include "video_core/amdgpu/resource.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#include "video_core/renderer_vulkan/vk_native_bindings.h"
 #include "video_core/texture_cache/types.h"
 
 namespace AmdGpu {
@@ -54,6 +55,8 @@ struct ImageView {
 
     ImageViewInfo info;
     vk::UniqueImageView image_view;
+    /// Descriptor heap slots and the retained creation parameters; inert in legacy mode.
+    Vulkan::NativeImageViewState native;
 };
 
 } // namespace VideoCore

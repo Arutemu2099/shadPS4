@@ -139,9 +139,12 @@ public:
     /// Reuploads image contents.
     void RefreshImage(Image& image);
 
-    /// Retrieves the sampler that matches the provided S# descriptor.
+    /// Retrieves the sampler that matches the provided S# descriptor. When native_index is
+    /// provided, it also receives the sampler's descriptor heap slot; the sampler object may
+    /// move in its map, so the slot is resolved here under the same lock.
     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,
-                                         AmdGpu::BorderColorBuffer border_color_base);
+                                         AmdGpu::BorderColorBuffer border_color_base,
+                                         u32* native_index = nullptr);
 
     /// Retrieves the image with the specified id.
     [[nodiscard]] Image& GetImage(ImageId id) {

@@ -55,7 +55,7 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
         .requiredSubgroupSize = 64,
     };
-    const vk::PipelineShaderStageCreateInfo shader_ci = {
+    vk::PipelineShaderStageCreateInfo shader_ci = {
         .pNext = instance.IsSubgroupSize64Supported() ? &subgroup_size_ci : nullptr,
         .stage = vk::ShaderStageFlagBits::eCompute,
         .module = module,
@@ -109,6 +109,33 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
             .descriptorCount = 1,
             .stageFlags = vk::ShaderStageFlagBits::eCompute,
         });
+    }
+
+    if (instance.IsNativeBindingsActive()) {
+        // Descriptor heap model: mappings ride on the shader stage, the pipeline carries the
+        // heap flag and there is no descriptor set layout or pipeline layout at all.
+        BuildNativeMappings(bindings);
+        if (const auto* mapping_info =
+                NativeMappingInfo(vk::ShaderStageFlagBits::eCompute, shader_ci.pNext)) {
+            shader_ci.pNext = mapping_info;
+        }
+        const NativeApi::PipelineCreateFlags2CreateInfo flags2_ci = {
+            .sType = NativeApi::StructureTypePipelineCreateFlags2CreateInfo,
+            .flags = NativeApi::PipelineCreate2DescriptorHeapBit,
+        };
+        const vk::ComputePipelineCreateInfo native_pipeline_ci = {
+            .pNext = &flags2_ci,
+            .stage = shader_ci,
+            .layout = VK_NULL_HANDLE,
+        };
+        auto [pipeline_result, pipe] =
+            instance.GetDevice().createComputePipelineUnique(pipeline_cache, native_pipeline_ci);
+        ASSERT_MSG(pipeline_result == vk::Result::eSuccess,
+                   "Failed to create descriptor heap compute pipeline: {}",
+                   vk::to_string(pipeline_result));
+        pipeline = std::move(pipe);
+        SetObjectName(device, *pipeline, "Compute Pipeline {}", debug_str);
+        return;
     }
 
     const vk::PushConstantRange push_constants = {

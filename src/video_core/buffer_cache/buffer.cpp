@@ -68,6 +68,20 @@ UniqueBuffer::~UniqueBuffer() {
     }
 }
 
+UniqueBuffer& UniqueBuffer::operator=(UniqueBuffer&& other) noexcept {
+    if (this != &other) {
+        if (buffer) {
+            vmaDestroyBuffer(allocator, buffer, allocation);
+        }
+        device = std::exchange(other.device, VK_NULL_HANDLE);
+        allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
+        allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
+        buffer = std::exchange(other.buffer, VK_NULL_HANDLE);
+        bda_addr = std::exchange(other.bda_addr, 0);
+    }
+    return *this;
+}
+
 void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usage,
                           VmaAllocationInfo* out_alloc_info) {
     const bool with_bda = bool(buffer_ci.usage & vk::BufferUsageFlagBits::eShaderDeviceAddress);
@@ -104,6 +118,14 @@ Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                VAddr cpu_addr_, vk::BufferUsageFlags flags, u64 size_bytes_)
     : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, instance{&instance_}, scheduler{&scheduler_},
       usage{usage_}, buffer{instance->GetDevice(), instance->GetAllocator()} {
+    // Descriptor heap buffer descriptors are encoded from device addresses, so every buffer a
+    // guest shader can bind (stream, GDS, fault and page-table buffers included) needs one.
+    // Opt-in mode only; the legacy allocation flags are otherwise untouched.
+    if (instance->IsNativeBindingsActive() &&
+        (flags & (vk::BufferUsageFlagBits::eUniformBuffer |
+                  vk::BufferUsageFlagBits::eStorageBuffer))) {
+        flags |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    }
     // Create buffer object.
     const vk::BufferCreateInfo buffer_ci = {
         .size = size_bytes,
