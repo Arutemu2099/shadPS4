@@ -144,6 +144,10 @@ bool ComputePipeline::SerializationSupport::Deserialize(Serialization::Archive& 
 }
 
 bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
+    // A prior preload may have returned midway through loading its stages.
+    infos.fill(nullptr);
+    modules.fill(nullptr);
+    fetch_shader.reset();
     compute_key.Deserialize(ar);
 
     ComputePipeline::SerializationSupport sdata{};
@@ -214,6 +218,9 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
 }
 
 bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
+    infos.fill(nullptr);
+    modules.fill(nullptr);
+    fetch_shader.reset();
     graphics_key.Deserialize(ar);
 
     GraphicsPipeline::SerializationSupport sdata{};
@@ -318,7 +325,7 @@ void PipelineCache::WarmUp() {
         return;
     }
 
-    Storage::DataBase::Instance().Open();
+    Storage::DataBase::Instance().Open(instance.IsNativeBindingsActive());
 
     // Check if cache is compatible
     std::vector<u8> profile_data{};

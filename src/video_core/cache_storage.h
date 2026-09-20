@@ -26,7 +26,7 @@ public:
         return *Common::Singleton<DataBase>::Instance();
     }
 
-    void Open();
+    void Open(bool native_bindings = false);
     void Close();
     [[nodiscard]] bool IsOpened() const {
         return opened;
