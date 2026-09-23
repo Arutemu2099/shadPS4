@@ -376,6 +376,9 @@ private:
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     bool readback_linear_images;
     PageTable page_table;
+    /// Registered images per page_table page, maintained under `mutex`, read without it by the
+    /// guest write-fault pre-check in InvalidateMemory (SHADPS4_TEX_INVALIDATE_PRECHECK=1).
+    std::unique_ptr<std::atomic<u32>[]> page_image_counts;
     std::mutex mutex;
     std::mutex samplers_mutex;
     std::mutex download_images_mutex;

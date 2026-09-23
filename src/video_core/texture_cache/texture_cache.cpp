@@ -32,6 +32,9 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
       buffer_cache{buffer_cache_}, tracker{tracker_}, blit_helper{instance, scheduler},
       tile_manager{instance, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)},
       readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()} {
+    // 4 MB: one zeroed counter per 1 MB page of the 40-bit guest space.
+    page_image_counts = std::make_unique<std::atomic<u32>[]>(
+        1ULL << (Traits::AddressSpaceBits - Traits::PageBits));
 
     const auto enabled = [](const char* name) {
         const auto* value = std::getenv(name);
@@ -179,9 +182,37 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
 }
 
 void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
-    std::scoped_lock lock{mutex};
     const auto pages_start = PageManager::GetPageAddr(addr);
     const auto pages_end = PageManager::GetNextPageAddr(addr + size - 1);
+    // Every guest write fault lands here and used to take the mutex FindImage takes ~30k times
+    // a frame on the CP, even for pages no image touches. Reading a zero count is equivalent to
+    // having taken the mutex just before a concurrent registration, which the locked path
+    // already allows; a nonzero count takes the locked path unchanged.
+    static const bool precheck = [] {
+        const char* value = std::getenv("SHADPS4_TEX_INVALIDATE_PRECHECK");
+        return value && value[0] == '1';
+    }();
+    if (precheck) {
+        static std::atomic<u64> calls{0}, skips{0};
+        const u64 first = pages_start >> Traits::PageBits;
+        const u64 last = (pages_end - 1) >> Traits::PageBits;
+        bool any = last >= (1ULL << (Traits::AddressSpaceBits - Traits::PageBits));
+        for (u64 page = first; !any && page <= last; ++page) {
+            any = page_image_counts[page].load(std::memory_order_acquire) != 0;
+        }
+        const u64 n = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (!any) {
+            skips.fetch_add(1, std::memory_order_relaxed);
+        }
+        if ((n & 0x7ffff) == 0) {
+            LOG_INFO(Render_Vulkan, "TexInvalidatePrecheck: calls={} skipped={} ({:.1f}%)", n,
+                     skips.load(), 100.0 * skips.load() / n);
+        }
+        if (!any) {
+            return;
+        }
+    }
+    std::scoped_lock lock{mutex};
     ForEachImageInRegion(pages_start, pages_end - pages_start, [&](ImageId image_id, Image& image) {
         const auto image_begin = image.info.guest_address;
         const auto image_end = image.info.guest_address + image.info.guest_size;
@@ -1011,8 +1042,10 @@ void TextureCache::RegisterImage(ImageId image_id) {
     image.flags |= ImageFlagBits::Registered;
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
-    ForEachPage(image.info.guest_address, image.info.guest_size,
-                [this, image_id](u64 page) { page_table[page].push_back(image_id); });
+    ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
+        page_table[page].push_back(image_id);
+        page_image_counts[page].fetch_add(1, std::memory_order_release);
+    });
     InvalidatePreparedImages();
 }
 
@@ -1036,6 +1069,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
             return;
         }
         image_ids.erase(vector_it);
+        page_image_counts[page].fetch_sub(1, std::memory_order_release);
     });
     InvalidatePreparedImages();
 }

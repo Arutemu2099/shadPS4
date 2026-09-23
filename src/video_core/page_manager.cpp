@@ -40,6 +40,10 @@ namespace VideoCore {
 constexpr size_t PM_PAGE_SIZE = 4_KB;
 constexpr size_t PM_PAGE_BITS = 12;
 
+/// See PageManager::SetDeferredProtectSink. Only write-protect (track, !is_read) requests go
+/// here; unprotects and read protection always reach the OS immediately.
+static thread_local std::vector<PageManager::ProtectRange>* t_protect_sink = nullptr;
+
 struct PageManager::Impl {
     struct PageState {
         u8 num_write_watchers : 7;
@@ -255,7 +259,14 @@ struct PageManager::Impl {
         const auto release_pending = [&] {
             if (range_bytes > 0) {
                 RENDERER_TRACE;
-                // Perform pending (un)protect action
+                if constexpr (track && !is_read) {
+                    if (t_protect_sink) {
+                        t_protect_sink->push_back({range_begin << PM_PAGE_BITS, range_bytes});
+                        range_bytes = 0;
+                        potential_range_bytes = 0;
+                        return;
+                    }
+                }
                 Protect(range_begin << PM_PAGE_BITS, range_bytes, perms);
                 range_bytes = 0;
                 potential_range_bytes = 0;
@@ -326,7 +337,14 @@ struct PageManager::Impl {
         const auto release_pending = [&] {
             if (range_bytes > 0) {
                 RENDERER_TRACE;
-                // Perform pending (un)protect action
+                if constexpr (track && !is_read) {
+                    if (t_protect_sink) {
+                        t_protect_sink->push_back({range_begin << PM_PAGE_BITS, range_bytes});
+                        range_bytes = 0;
+                        potential_range_bytes = 0;
+                        return;
+                    }
+                }
                 Protect((range_begin << PM_PAGE_BITS), range_bytes, perms);
                 range_bytes = 0;
                 potential_range_bytes = 0;
@@ -372,6 +390,34 @@ struct PageManager::Impl {
         release_pending();
     }
 
+    /// Applies the current watcher state of every page in the range to the OS protection.
+    void ReconcileProtection(VAddr addr, u64 size) {
+        RENDERER_TRACE;
+        const size_t first = addr >> PM_PAGE_BITS;
+        const size_t end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
+        if (end <= first) {
+            return;
+        }
+        Common::RangeLockGuard lk(locks.begin() + (first / PAGES_PER_LOCK),
+                                  locks.begin() + Common::DivCeil(end, PAGES_PER_LOCK));
+        const auto perms_of = [&](size_t page) {
+            const auto perms = cached_pages[page].Perms();
+            // Write-only is not expressible on the CPU; the stricter state is always safe.
+            return perms == Core::MemoryPermission::Write ? Core::MemoryPermission::None : perms;
+        };
+        size_t run = first;
+        auto perms = perms_of(first);
+        for (size_t page = first + 1; page < end; ++page) {
+            const auto next = perms_of(page);
+            if (next != perms) {
+                Protect(run << PM_PAGE_BITS, (page - run) << PM_PAGE_BITS, perms);
+                run = page;
+                perms = next;
+            }
+        }
+        Protect(run << PM_PAGE_BITS, (end - run) << PM_PAGE_BITS, perms);
+    }
+
     std::array<PageState, NUM_ADDRESS_PAGES> cached_pages{};
 #ifdef PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
     using LockType = Common::AdaptiveMutex;
@@ -385,6 +431,16 @@ PageManager::PageManager(Vulkan::Rasterizer* rasterizer_)
     : impl{std::make_unique<Impl>(rasterizer_)} {}
 
 PageManager::~PageManager() = default;
+
+void PageManager::SetDeferredProtectSink(std::vector<ProtectRange>* sink) {
+    t_protect_sink = sink;
+}
+
+void PageManager::ReconcileProtection(std::span<const ProtectRange> ranges) const {
+    for (const ProtectRange& range : ranges) {
+        impl->ReconcileProtection(range.addr, range.size);
+    }
+}
 
 void PageManager::OnGpuMap(VAddr address, size_t size) {
     impl->OnMap(address, size);

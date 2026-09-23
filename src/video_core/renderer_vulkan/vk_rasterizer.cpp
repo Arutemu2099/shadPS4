@@ -448,6 +448,22 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     sample.EndPhase(Common::DrawSampleProbe::Phase::ResetImageBindings);
     sample.Finish();
 
+    // SHADPS4_FLUSH_EVERY_DRAWS=N: hand recorded work to the GPU every N draws. Guest readback
+    // faults wait for everything queued before their copy; measured 2026-09-23 Game:Main spent
+    // 51% of its wall time in that wait while the CP sat 41% idle, so earlier submission trades
+    // spare CP time for shorter readback latency. 0 (default) keeps the old cadence.
+    static const u32 flush_every_draws = [] {
+        const char* value = std::getenv("SHADPS4_FLUSH_EVERY_DRAWS");
+        return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0u;
+    }();
+    if (flush_every_draws != 0) {
+        static thread_local u32 draws_since_flush = 0;
+        if (++draws_since_flush >= flush_every_draws) {
+            draws_since_flush = 0;
+            scheduler.Flush();
+        }
+    }
+
     Common::FaultMonitor::CountDrawTail(Common::FaultMonitor::DiffNs(t_entry, t_pipeline) +
                                             Common::FaultMonitor::DiffNs(t_prepare, t_bindres),
                                         Common::FaultMonitor::DiffNs(t_vtxbuf, t_descwrite),

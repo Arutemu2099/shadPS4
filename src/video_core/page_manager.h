@@ -5,6 +5,8 @@
 
 #include <cstddef>
 #include <memory>
+#include <span>
+#include <vector>
 #include "common/alignment.h"
 #include "common/types.h"
 #include "video_core/buffer_cache//region_definitions.h"
@@ -42,6 +44,18 @@ public:
     /// Updates watches in the pages touching the specified region using a mask.
     template <bool track, bool is_read = false>
     void UpdatePageWatchersForRegion(VAddr base_addr, RegionBits& mask) const;
+
+    /// Deferred write protection (SHADPS4_DEFERRED_PROTECT). While a sink is installed on the
+    /// calling thread, write-protect requests update watcher counts as usual but append the
+    /// affected ranges to the sink instead of calling the OS. ReconcileProtection later applies
+    /// each range's *current* watcher state under the same range locks every other protection
+    /// change takes, so it is order-independent with concurrent fault-handler unprotects.
+    struct ProtectRange {
+        VAddr addr;
+        u64 size;
+    };
+    static void SetDeferredProtectSink(std::vector<ProtectRange>* sink);
+    void ReconcileProtection(std::span<const ProtectRange> ranges) const;
 
     /// Returns page aligned address.
     static constexpr VAddr GetPageAddr(VAddr addr) {

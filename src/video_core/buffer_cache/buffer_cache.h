@@ -19,6 +19,7 @@
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/multi_level_page_table.h"
+#include "video_core/page_manager.h"
 
 namespace AmdGpu {
 struct Liverpool;
@@ -243,7 +244,13 @@ private:
     struct FaultTicket {
         u64 id{};
         u64 tick{};
+        /// SHADPS4_FAULT_OVERLAP_RETRY: `id` names an overlapping pending job to wait for on the
+        /// faulting thread, settle, then retry, instead of a job created for this fault.
+        bool retry{};
     };
+
+    /// Settles job `id` if it is still pending (its tick is normally already reached).
+    void SettlePendingJob(u64 id);
 
     /// Tracker-page span of an unfinalized job, indexed like fault_jobs. Empty when end is 0.
     struct FaultWindow {
@@ -317,6 +324,9 @@ private:
     bool SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer, Common::BufferSampleProbe* sample_probe);
 
+    vk::Buffer ReserveDeferredCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
+                                     size_t total_size_bytes);
+
     vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
                             size_t total_size_bytes);
 
@@ -333,6 +343,15 @@ private:
     AmdGpu::Liverpool* liverpool;
     Core::MemoryManager* memory;
     TextureCache& texture_cache;
+    PageManager& page_manager;
+    /// SHADPS4_DEFERRED_PROTECT scratch, command processor only.
+    std::vector<PageManager::ProtectRange> deferred_protects;
+    struct DeferredCopy {
+        VAddr addr;
+        u8* dest;
+        u64 size;
+    };
+    std::vector<DeferredCopy> deferred_copies;
     FaultManager fault_manager;
     std::unique_ptr<MemoryTracker> memory_tracker;
     StreamBuffer staging_buffer;

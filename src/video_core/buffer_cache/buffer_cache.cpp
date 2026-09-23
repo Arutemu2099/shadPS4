@@ -118,7 +118,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                          AmdGpu::Liverpool* liverpool_, TextureCache& texture_cache_,
                          PageManager& tracker)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
-      memory{Core::Memory::Instance()}, texture_cache{texture_cache_},
+      memory{Core::Memory::Instance()}, texture_cache{texture_cache_}, page_manager{tracker},
       fault_manager{instance, scheduler, *this, CACHING_PAGEBITS, CACHING_NUMPAGES},
       staging_buffer{instance, scheduler, MemoryUsage::Upload, StagingBufferSize},
       stream_buffer{instance, scheduler, MemoryUsage::Stream, UboStreamBufferSize},
@@ -310,16 +310,23 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
     Vulkan::MasterSemaphore* const semaphore = scheduler.GetMasterSemaphore();
     fault_guest_waiters.fetch_add(1);
     FaultTicket ticket{};
-    cp->SendCommand<true>(
-        [&] { ticket = PrepareFaultDownload(device_addr, size, is_write); });
-    if (ticket.id == 0) {
-        fault_guest_waiters.fetch_sub(1);
-        Offload::MaybeLog();
-        return;
+    for (;;) {
+        cp->SendCommand<true>(
+            [&] { ticket = PrepareFaultDownload(device_addr, size, is_write); });
+        if (ticket.id == 0) {
+            fault_guest_waiters.fetch_sub(1);
+            Offload::MaybeLog();
+            return;
+        }
+        const u64 wait_start = Offload::ProfileNowNs();
+        semaphore->Wait(ticket.tick);
+        Offload::AddSince(Offload::State().guest_wait_ns, wait_start);
+        if (!ticket.retry) {
+            break;
+        }
+        // Another fault's job covered this window; publish it, then look again.
+        cp->SendCommand<true>([&] { SettlePendingJob(ticket.id); });
     }
-    const u64 wait_start = Offload::ProfileNowNs();
-    semaphore->Wait(ticket.tick);
-    Offload::AddSince(Offload::State().guest_wait_ns, wait_start);
     // No teardown check: the cache outlives every guest thread (see ~BufferCache).
     cp->SendCommand<true>(
         [&] { FinishFaultDownload(ticket.id, device_addr, size, is_write); });
@@ -443,7 +450,32 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
                                                            bool is_write) {
     ASSERT_MSG(!is_write, "Only read faults may use the readback offload prototype");
     const auto [settle_addr, settle_size] = FaultSettleSpan(device_addr, size, is_write);
-    SettleOverlappingJobs(settle_addr, settle_size);
+    // SHADPS4_FAULT_OVERLAP_RETRY=1: a read fault inside a pending job's window no longer makes
+    // the command processor wait on the GPU for that job. The faulting guest thread waits for
+    // the job's tick itself, has it settled (no GPU wait left by then) and retries from the
+    // start; the job's own owner still frees it. No overlapping job is ever created, which is
+    // what the settle guaranteed. Measured 2026-09-23 with deferred protection: this settle
+    // blocked the CP on the GPU for 13.75% of its wall time.
+    static const bool overlap_retry = [] {
+        const char* value = std::getenv("SHADPS4_FAULT_OVERLAP_RETRY");
+        return value && value[0] == '1';
+    }();
+    if (overlap_retry) {
+        if (pending_fault_jobs.load(std::memory_order_relaxed) != 0) {
+            const auto [begin, end] = TrackerPageSpan(settle_addr, settle_size);
+            for (const FaultJob& job : fault_jobs) {
+                if (job.state != FaultJobState::Pending) {
+                    continue;
+                }
+                const auto [job_begin, job_end] = TrackerPageSpan(job.addr, job.size);
+                if (job_begin < end && begin < job_end) {
+                    return {job.id, job.tick, true};
+                }
+            }
+        }
+    } else {
+        SettleOverlappingJobs(settle_addr, settle_size);
+    }
     Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
     const auto [addr, bytes] = ResolveFaultWindow(buffer, device_addr, size, is_write);
 
@@ -587,6 +619,23 @@ void BufferCache::RecordFaultCopies(vk::CommandBuffer cmdbuf, Buffer& source, vk
             .bufferMemoryBarrierCount = 1,
             .pBufferMemoryBarriers = &*barrier,
         });
+    }
+}
+
+void BufferCache::SettlePendingJob(u64 id) {
+    for (FaultJob& job : fault_jobs) {
+        if (job.state != FaultJobState::Pending || job.id != id) {
+            continue;
+        }
+        job.state = FaultJobState::Settling;
+        Offload::Add(Offload::State().cp_settles);
+        if (!scheduler.IsFree(job.tick)) {
+            const u64 wait_start = Offload::ProfileNowNs();
+            scheduler.Wait(job.tick);
+            Offload::AddSince(Offload::State().cp_settle_wait_ns, wait_start);
+        }
+        FinalizeFaultJob(job);
+        return;
     }
 }
 
@@ -1463,13 +1512,41 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     vk::Buffer src_buffer = VK_NULL_HANDLE;
     const auto t_upload = sample_probe ? sample_probe->Now()
                                        : Common::BufferSampleProbe::Clock::time_point{};
+    // SHADPS4_DEFERRED_PROTECT=1: the re-protect syscalls and the guest-to-staging copy of this
+    // upload move to the recording thread, in the same order (protect, then copy). The command
+    // processor still clears the dirty bits and updates watcher counts now. A guest write that
+    // lands before the deferred protect is applied is captured by the copy that follows it; one
+    // after it faults as usual. The copy reads the physical backing, so pages read-protected in
+    // the meantime (readbacks) cannot fault on the recording thread.
+    // Measured 2026-09-23: VirtualProtect was 10.2% and this copy ~2% of CP wall time.
+    static const bool deferred_protect = [] {
+        const char* value = std::getenv("SHADPS4_DEFERRED_PROTECT");
+        return value && value[0] == '1';
+    }();
+    const bool defer = deferred_protect && scheduler.IsAsyncRecording();
+    if (defer) {
+        deferred_protects.clear();
+        deferred_copies.clear();
+        PageManager::SetDeferredProtectSink(&deferred_protects);
+    }
     const auto upload_path = memory_tracker->ForEachUploadRange(
         device_addr, size, is_written,
         [&](u64 device_addr_out, u64 range_size) {
             copies.emplace_back(total_size_bytes, device_addr_out - buffer_start, range_size);
             total_size_bytes += range_size;
         },
-        [&] { src_buffer = UploadCopies(buffer, copies, total_size_bytes); });
+        [&] {
+            src_buffer = defer ? ReserveDeferredCopies(buffer, copies, total_size_bytes)
+                               : UploadCopies(buffer, copies, total_size_bytes);
+        });
+    if (defer) {
+        PageManager::SetDeferredProtectSink(nullptr);
+        if (!src_buffer && !deferred_protects.empty()) {
+            // Nothing to copy after all; apply the protection here.
+            page_manager.ReconcileProtection(deferred_protects);
+            deferred_protects.clear();
+        }
+    }
     if (sample_probe) {
         sample_probe->AddUploadNs(sample_probe->SinceNs(t_upload));
         sample_probe->RecordUpload(upload_path, total_size_bytes, copies.size());
@@ -1497,6 +1574,35 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             .offset = 0,
             .size = buffer.SizeBytes(),
         };
+        if (defer) {
+            scheduler.RecordArrays(
+                [src_buffer, destination = buffer.Handle(), pre_barrier, post_barrier,
+                 memory = memory, pm = &page_manager](vk::CommandBuffer cmdbuf, auto owned_copies,
+                                                      auto cpu_copies, auto protects) {
+                    // Protect first, then copy: see SynchronizeBuffer.
+                    pm->ReconcileProtection(protects);
+                    for (const DeferredCopy& copy : cpu_copies) {
+                        if (!memory->TryReadBacking(copy.addr, copy.dest, copy.size)) {
+                            memory->CopySparseMemory(copy.addr, copy.dest, copy.size);
+                        }
+                    }
+                    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                        .bufferMemoryBarrierCount = 1,
+                        .pBufferMemoryBarriers = &pre_barrier,
+                    });
+                    cmdbuf.copyBuffer(src_buffer, destination, owned_copies);
+                    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                        .bufferMemoryBarrierCount = 1,
+                        .pBufferMemoryBarriers = &post_barrier,
+                    });
+                },
+                std::span<const vk::BufferCopy>{copies},
+                std::span<const DeferredCopy>{deferred_copies},
+                std::span<const PageManager::ProtectRange>{deferred_protects});
+            TouchBuffer(buffer);
+        } else {
         scheduler.RecordArrays(
             [src_buffer, destination = buffer.Handle(), pre_barrier,
              post_barrier](vk::CommandBuffer cmdbuf, auto owned_copies) {
@@ -1514,6 +1620,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             },
             std::span<const vk::BufferCopy>{copies});
         TouchBuffer(buffer);
+        }
     }
     if (is_texel_buffer && !is_written) {
         const auto t_texel = sample_probe ? sample_probe->Now()
@@ -1525,6 +1632,30 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
         return result;
     }
     return false;
+}
+
+vk::Buffer BufferCache::ReserveDeferredCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
+                                              size_t total_size_bytes) {
+    if (copies.empty()) {
+        return VK_NULL_HANDLE;
+    }
+    // Commit flushes non-coherent memory immediately, before a deferred copy would have run.
+    const auto [staging, offset] = staging_buffer.is_coherent
+                                       ? staging_buffer.Map(total_size_bytes)
+                                       : std::pair<u8*, u64>{nullptr, 0};
+    if (!staging) {
+        // Non-coherent staging or a large one-time transfer: synchronous, protection first.
+        page_manager.ReconcileProtection(deferred_protects);
+        deferred_protects.clear();
+        return UploadCopies(buffer, copies, total_size_bytes);
+    }
+    for (auto& copy : copies) {
+        deferred_copies.push_back(
+            {buffer.CpuAddr() + copy.dstOffset, staging + copy.srcOffset, copy.size});
+        copy.srcOffset += offset;
+    }
+    staging_buffer.Commit();
+    return staging_buffer.Handle();
 }
 
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
