@@ -50,6 +50,7 @@ using BufferId = Common::SlotId;
 class TextureCache;
 class MemoryTracker;
 class PageManager;
+class ReadbackQueue;
 
 class BufferCache {
 public:
@@ -234,6 +235,8 @@ private:
         VAddr addr{};
         u64 size{};
         u64 tick{};
+        /// `tick` is a value of the readback queue's timeline, not the main one.
+        bool on_readback_queue{};
         u64 total_bytes{};
         std::vector<FaultCopy> copies;
         std::vector<u64> seqs;
@@ -247,7 +250,31 @@ private:
         /// SHADPS4_FAULT_OVERLAP_RETRY: `id` names an overlapping pending job to wait for on the
         /// faulting thread, settle, then retry, instead of a job created for this fault.
         bool retry{};
+        /// `tick` belongs to the readback queue's timeline.
+        bool on_readback_queue{};
     };
+
+    /// Waits until a job's copy has completed on whichever queue it ran.
+    void WaitFaultJob(const FaultJob& job);
+    /// Newest main-timeline tick that GPU-wrote any byte of the range (0 if never).
+    u64 ProducerTick(VAddr addr, u64 size) const;
+    void RecordFaultCopiesOnReadbackQueue(vk::CommandBuffer cmdbuf, Buffer& source,
+                                          vk::Buffer staging,
+                                          std::span<const vk::BufferCopy> copies);
+    std::unique_ptr<ReadbackQueue> readback_queue;
+    u64 producer_floor = 0; ///< Tick of the newest write too large to record per slot.
+    /// SHADPS4_READBACK_EARLY_FLUSH: main tick of the last readback job per 1 MB slot, and a
+    /// request raised when a GPU write lands in a recently read-back slot.
+    std::unique_ptr<u64[]> readback_hot_ticks;
+    bool readback_flush_requested = false;
+
+public:
+    /// True once per GPU write into a recently read-back 1 MB slot since the last call.
+    bool TakeReadbackFlushRequest() {
+        return std::exchange(readback_flush_requested, false);
+    }
+
+private:
 
     /// Settles job `id` if it is still pending (its tick is normally already reached).
     void SettlePendingJob(u64 id);
@@ -352,6 +379,11 @@ private:
         u64 size;
     };
     std::vector<DeferredCopy> deferred_copies;
+    /// SHADPS4_READBACK_PRODUCER_STATS=1: last command tick that GPU-wrote each 1 MB slot, to
+    /// measure whether readback data is already complete when a fault asks for it.
+    std::unique_ptr<u64[]> producer_ticks;
+    void NoteGpuWrite(VAddr addr, u64 size);
+    void NoteReadbackProducer(VAddr addr, u64 size);
     FaultManager fault_manager;
     std::unique_ptr<MemoryTracker> memory_tracker;
     StreamBuffer staging_buffer;

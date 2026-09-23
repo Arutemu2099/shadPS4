@@ -14,6 +14,7 @@
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/buffer_cache/readback_queue.h"
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -132,6 +133,9 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                           "BDA Page Table Buffer");
 
     memory_tracker = std::make_unique<MemoryTracker>(tracker);
+    if (instance.HasReadbackQueue()) {
+        readback_queue = std::make_unique<ReadbackQueue>(instance);
+    }
 
     if (Offload::Enabled() || Offload::VerifyEnabled() || Offload::ProfileEnabled()) {
         LOG_INFO(Render, "ReadbackOffload: offload={} verify={} profile={}", Offload::Enabled(),
@@ -276,6 +280,8 @@ void BufferCache::CompleteEmptyWriteFault(VAddr device_addr, u64 size) {
 
 /// Superset of any window ResolveFaultWindow can pick for this fault, computable before the
 /// buffer lookup so overlapping jobs are settled while no Buffer reference is held.
+static bool EarlyFlushEnabled();
+
 static std::pair<VAddr, u64> FaultSettleSpan(VAddr device_addr, u64 size, bool is_write) {
     if (is_write) {
         return {device_addr, size};
@@ -319,7 +325,11 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
             return;
         }
         const u64 wait_start = Offload::ProfileNowNs();
-        semaphore->Wait(ticket.tick);
+        if (ticket.on_readback_queue) {
+            readback_queue->Semaphore().Wait(ticket.tick);
+        } else {
+            semaphore->Wait(ticket.tick);
+        }
         Offload::AddSince(Offload::State().guest_wait_ns, wait_start);
         if (!ticket.retry) {
             break;
@@ -469,7 +479,7 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
                 }
                 const auto [job_begin, job_end] = TrackerPageSpan(job.addr, job.size);
                 if (job_begin < end && begin < job_end) {
-                    return {job.id, job.tick, true};
+                    return {job.id, job.tick, true, job.on_readback_queue};
                 }
             }
         }
@@ -526,6 +536,17 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
     // Snapshot and copy list are taken in one uninterrupted step on this thread, which also
     // owns every GPU write marking, so the recorded copy matches them. The job is complete
     // before anything below can reenter.
+    NoteReadbackProducer(addr, bytes);
+    if (EarlyFlushEnabled()) {
+        if (!readback_hot_ticks) {
+            readback_hot_ticks = std::make_unique<u64[]>(1ULL << 20);
+        }
+        const u64 now = scheduler.CurrentTick();
+        for (u64 slot = addr >> 20; slot <= ((addr + bytes - 1) >> 20) && slot < (1ULL << 20);
+             ++slot) {
+            readback_hot_ticks[slot] = now;
+        }
+    }
     const u64 id = next_fault_job_id++;
     const u64 tick = scheduler.CurrentTick();
     job->seqs.clear();
@@ -560,6 +581,32 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
     Offload::Add(Offload::State().jobs);
     Common::FaultMonitor::CountReadbackDownload(total_size_bytes);
 
+    job->on_readback_queue = false;
+    if (readback_queue) {
+        // Every GPU write into this window was recorded no later than `producer`. If that batch
+        // is already submitted, copy on the readback queue after it alone.
+        const u64 producer = ProducerTick(addr, bytes);
+        if (producer != 0 && producer < tick) {
+            static std::atomic<u64> side{0}, total{0};
+            const u64 side_tick = readback_queue->Submit(
+                scheduler.GetMasterSemaphore()->Handle(), producer, [&](vk::CommandBuffer cmd) {
+                    RecordFaultCopiesOnReadbackQueue(cmd, buffer, staging_handle,
+                                                     {vk_copies.data(), vk_copies.size()});
+                });
+            job->tick = side_tick;
+            job->on_readback_queue = true;
+            const u64 n = total.fetch_add(1) + 1;
+            side.fetch_add(1);
+            if ((n & 0x3ff) == 0) {
+                LOG_INFO(Render_Vulkan, "ReadbackQueue: {} of {} jobs on the readback queue",
+                         side.load(), n);
+            }
+            return {id, side_tick, false, true};
+        }
+        static std::atomic<u64> main_jobs{0};
+        main_jobs.fetch_add(1);
+    }
+
     scheduler.EndRendering();
     {
         auto command_access = scheduler.AcquireCommandBuffer();
@@ -568,6 +615,29 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
     }
     scheduler.Flush();
     return {id, tick};
+}
+
+void BufferCache::RecordFaultCopiesOnReadbackQueue(vk::CommandBuffer cmdbuf, Buffer& source,
+                                                    vk::Buffer staging,
+                                                    std::span<const vk::BufferCopy> copies) {
+    // The producer's main-timeline value is waited on at the transfer stage, which makes its
+    // writes visible here. Main-queue access tracking of `source` is left untouched.
+    cmdbuf.copyBuffer(source.Handle(), staging, copies);
+    const vk::BufferMemoryBarrier2 host_barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = staging,
+        .offset = 0,
+        .size = VK_WHOLE_SIZE,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &host_barrier,
+    });
 }
 
 void BufferCache::RecordFaultCopies(vk::CommandBuffer cmdbuf, Buffer& source, vk::Buffer staging,
@@ -622,6 +692,101 @@ void BufferCache::RecordFaultCopies(vk::CommandBuffer cmdbuf, Buffer& source, vk
     }
 }
 
+static bool EarlyFlushEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_READBACK_EARLY_FLUSH");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
+static bool ProducerStatsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_READBACK_PRODUCER_STATS");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
+void BufferCache::NoteGpuWrite(VAddr addr, u64 size) {
+    if ((!ProducerStatsEnabled() && !readback_queue && !EarlyFlushEnabled()) || size == 0) {
+        return;
+    }
+    if (!producer_ticks) {
+        producer_ticks = std::make_unique<u64[]>(1ULL << 20);
+    }
+    const u64 tick = scheduler.CurrentTick();
+    const u64 first = addr >> 20;
+    const u64 last = (addr + size - 1) >> 20;
+    if (EarlyFlushEnabled() && readback_hot_ticks && !readback_flush_requested) {
+        // A slot read back within the last ~64 submissions is likely read back again; submit
+        // this write soon so the readback finds it complete (and can use the readback queue).
+        for (u64 slot = first; slot <= std::min(last, first + 64) && slot < (1ULL << 20);
+             ++slot) {
+            if (readback_hot_ticks[slot] != 0 && readback_hot_ticks[slot] + 64 > tick) {
+                readback_flush_requested = true;
+                break;
+            }
+        }
+    }
+    if (last - first > 64 || last >= (1ULL << 20)) {
+        // Too wide to record per slot: every readback until the next submission sees it.
+        producer_floor = tick;
+        return;
+    }
+    for (u64 slot = first; slot <= last; ++slot) {
+        producer_ticks[slot] = tick;
+    }
+}
+
+u64 BufferCache::ProducerTick(VAddr addr, u64 size) const {
+    u64 producer = producer_floor;
+    if (!producer_ticks || size == 0) {
+        return producer;
+    }
+    for (u64 slot = addr >> 20; slot <= ((addr + size - 1) >> 20) && slot < (1ULL << 20);
+         ++slot) {
+        producer = std::max(producer, producer_ticks[slot]);
+    }
+    return producer;
+}
+
+void BufferCache::WaitFaultJob(const FaultJob& job) {
+    if (job.on_readback_queue) {
+        readback_queue->Semaphore().Wait(job.tick);
+        return;
+    }
+    if (!scheduler.IsFree(job.tick)) {
+        scheduler.Wait(job.tick);
+    }
+}
+
+void BufferCache::NoteReadbackProducer(VAddr addr, u64 size) {
+    if (!ProducerStatsEnabled() || !producer_ticks || size == 0) {
+        return;
+    }
+    const u64 producer = ProducerTick(addr, size);
+    static u64 jobs = 0, done = 0, in_current = 0, unknown = 0, age_sum = 0;
+    const u64 current = scheduler.CurrentTick();
+    ++jobs;
+    if (producer == 0) {
+        ++unknown;
+    } else if (producer >= current) {
+        ++in_current;
+    } else {
+        age_sum += current - producer;
+        done += scheduler.IsFree(producer);
+    }
+    if ((jobs & 0x3ff) == 0) {
+        LOG_INFO(Render_Vulkan,
+                 "ReadbackProducer: jobs={} producer_done_at_fault={} ({:.1f}%) producer_in_"
+                 "unsubmitted_batch={} unknown={} mean_age_ticks={:.1f}",
+                 jobs, done, 100.0 * done / jobs, in_current, unknown,
+                 jobs - in_current - unknown ? double(age_sum) / (jobs - in_current - unknown)
+                                             : 0.0);
+    }
+}
+
 void BufferCache::SettlePendingJob(u64 id) {
     for (FaultJob& job : fault_jobs) {
         if (job.state != FaultJobState::Pending || job.id != id) {
@@ -629,11 +794,9 @@ void BufferCache::SettlePendingJob(u64 id) {
         }
         job.state = FaultJobState::Settling;
         Offload::Add(Offload::State().cp_settles);
-        if (!scheduler.IsFree(job.tick)) {
-            const u64 wait_start = Offload::ProfileNowNs();
-            scheduler.Wait(job.tick);
-            Offload::AddSince(Offload::State().cp_settle_wait_ns, wait_start);
-        }
+        const u64 wait_start = Offload::ProfileNowNs();
+        WaitFaultJob(job);
+        Offload::AddSince(Offload::State().cp_settle_wait_ns, wait_start);
         FinalizeFaultJob(job);
         return;
     }
@@ -656,11 +819,9 @@ void BufferCache::FinishFaultDownload(u64 id, VAddr device_addr, u64 size, bool 
         if (job->state == FaultJobState::Pending) {
             job->state = FaultJobState::Settling;
             // The owner already waited for this tick, so this is not expected to block.
-            if (!scheduler.IsFree(job->tick)) {
-                const u64 wait_start = Offload::ProfileNowNs();
-                scheduler.Wait(job->tick);
-                Offload::AddSince(Offload::State().cp_settle_wait_ns, wait_start);
-            }
+            const u64 wait_start = Offload::ProfileNowNs();
+            WaitFaultJob(*job);
+            Offload::AddSince(Offload::State().cp_settle_wait_ns, wait_start);
             FinalizeFaultJob(*job);
         }
         if (job->state == FaultJobState::Settling) {
@@ -710,7 +871,7 @@ void BufferCache::SettleOverlappingJobs(VAddr device_addr, u64 size) {
         found->state = FaultJobState::Settling;
         Offload::Add(Offload::State().cp_settles);
         const u64 wait_start = Offload::ProfileNowNs();
-        scheduler.Wait(found->tick);
+        WaitFaultJob(*found);
         Offload::AddSince(Offload::State().cp_settle_wait_ns, wait_start);
         FinalizeFaultJob(*found);
     }
@@ -1137,6 +1298,7 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         const auto buffer_id = FindBuffer(dst, num_bytes);
         auto& buffer = slot_buffers[buffer_id];
         SynchronizeBuffer(buffer, dst, num_bytes, true, true, nullptr);
+        NoteGpuWrite(dst, num_bytes);
         gpu_modified_ranges.Add(dst, num_bytes);
         Common::FaultMonitor::CountRangeAdd(gpu_modified_ranges.m_ranges_set.iterative_size());
         return buffer;
@@ -1253,6 +1415,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     Common::FaultMonitor::CountObtainSync(query_ns, Common::FaultMonitor::SinceNs(t_sync));
     if (is_written) {
         const auto t_range_add = sample.Now();
+        NoteGpuWrite(device_addr, size);
         gpu_modified_ranges.Add(device_addr, size);
         sample.AddRangeAddNs(sample.SinceNs(t_range_add));
         Common::FaultMonitor::CountRangeAdd(gpu_modified_ranges.m_ranges_set.iterative_size());

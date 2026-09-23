@@ -463,6 +463,13 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
             scheduler.Flush();
         }
     }
+    // SHADPS4_READBACK_EARLY_FLUSH=1: this draw wrote into memory the guest recently read
+    // back; submit now so the next readback of it waits less (see BufferCache::NoteGpuWrite).
+    if (buffer_cache.TakeReadbackFlushRequest()) {
+        static thread_local u32 early_flushes = 0;
+        ++early_flushes;
+        scheduler.Flush();
+    }
 
     Common::FaultMonitor::CountDrawTail(Common::FaultMonitor::DiffNs(t_entry, t_pipeline) +
                                             Common::FaultMonitor::DiffNs(t_prepare, t_bindres),
@@ -597,6 +604,9 @@ void Rasterizer::DispatchDirect() {
     DebugState.IncDispatch();
 
     ResetBindings();
+    if (buffer_cache.TakeReadbackFlushRequest()) {
+        scheduler.Flush();
+    }
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {

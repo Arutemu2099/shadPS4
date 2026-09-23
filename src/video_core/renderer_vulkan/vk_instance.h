@@ -76,6 +76,19 @@ public:
         return present_queue;
     }
 
+    /// Second queue of the graphics family, when SHADPS4_READBACK_QUEUE=1 and available.
+    bool HasReadbackQueue() const {
+        return has_readback_queue;
+    }
+
+    vk::Queue GetReadbackQueue() const {
+        return readback_queue;
+    }
+
+    u32 GetReadbackQueueFamilyIndex() const {
+        return readback_queue_family;
+    }
+
     TracyVkCtx GetProfilerContext() const {
         return profiler_context;
     }
@@ -515,6 +528,9 @@ private:
     VmaAllocator allocator{};
     vk::Queue present_queue;
     vk::Queue graphics_queue;
+    vk::Queue readback_queue;
+    bool has_readback_queue{};
+    u32 readback_queue_family{};
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;

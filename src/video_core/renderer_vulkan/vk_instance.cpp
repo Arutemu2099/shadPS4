@@ -375,11 +375,40 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    static constexpr std::array queue_priorities = {1.0f};
-    const vk::DeviceQueueCreateInfo queue_info = {
-        .queueFamilyIndex = queue_family_index,
-        .queueCount = static_cast<u32>(queue_priorities.size()),
-        .pQueuePriorities = queue_priorities.data(),
+    // SHADPS4_READBACK_QUEUE for guest readback copies (see buffer_cache/readback_queue.h):
+    // 1 = a second queue of the graphics family (measured 2026-09-23: no gain, likely shares
+    // the graphics engine); 2 = a transfer-only family, i.e. a dedicated copy engine.
+    static constexpr std::array queue_priorities = {1.0f, 1.0f};
+    const char readback_mode = [] {
+        const char* value = std::getenv("SHADPS4_READBACK_QUEUE");
+        return value ? value[0] : '0';
+    }();
+    readback_queue_family = queue_family_index;
+    if (readback_mode == '2') {
+        for (u32 i = 0; i < family_properties.size(); ++i) {
+            const auto flags = family_properties[i].queueFlags;
+            if ((flags & vk::QueueFlagBits::eTransfer) && !(flags & vk::QueueFlagBits::eGraphics) &&
+                !(flags & vk::QueueFlagBits::eCompute)) {
+                readback_queue_family = i;
+                has_readback_queue = true;
+                break;
+            }
+        }
+    } else if (readback_mode == '1') {
+        has_readback_queue = family_properties[queue_family_index].queueCount >= 2;
+    }
+    const bool separate_family = has_readback_queue && readback_queue_family != queue_family_index;
+    const std::array queue_infos = {
+        vk::DeviceQueueCreateInfo{
+            .queueFamilyIndex = queue_family_index,
+            .queueCount = has_readback_queue && !separate_family ? 2u : 1u,
+            .pQueuePriorities = queue_priorities.data(),
+        },
+        vk::DeviceQueueCreateInfo{
+            .queueFamilyIndex = readback_queue_family,
+            .queueCount = 1u,
+            .pQueuePriorities = queue_priorities.data(),
+        },
     };
 
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
@@ -387,8 +416,8 @@ bool Instance::CreateDevice() {
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
-            .queueCreateInfoCount = 1u,
-            .pQueueCreateInfos = &queue_info,
+            .queueCreateInfoCount = separate_family ? 2u : 1u,
+            .pQueueCreateInfos = queue_infos.data(),
             .enabledExtensionCount = static_cast<u32>(enabled_extensions.size()),
             .ppEnabledExtensionNames = enabled_extensions.data(),
         },
@@ -628,6 +657,12 @@ bool Instance::CreateDevice() {
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
+    if (has_readback_queue) {
+        const u32 index = readback_queue_family == queue_family_index ? 1u : 0u;
+        readback_queue = device->getQueue(readback_queue_family, index);
+        LOG_INFO(Render_Vulkan, "ReadbackQueue: using queue {} of family {}", index,
+                 readback_queue_family);
+    }
 
     if (calibrated_timestamps) {
         const auto [time_domains_result, time_domains] =
