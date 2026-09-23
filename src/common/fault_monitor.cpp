@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <condition_variable>
@@ -22,6 +23,7 @@
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "common/thread.h"
+#include "video_core/buffer_cache/submit_epoch.h"
 
 namespace Common::FaultMonitor {
 
@@ -150,6 +152,99 @@ void RecordReadFaultPage(u64 addr) {
     std::scoped_lock lk(page_mutex);
     ++read_fault_pages[addr >> 12];
 }
+
+std::atomic<u64> gfx_submits{0};
+std::atomic<u64> asc_submits{0};
+std::atomic<u64> deferred_syncs{0};
+std::atomic<u64> deferred_pages{0};
+
+bool WriteFaultPagesEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_WRITE_FAULT_PAGES");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
+namespace {
+struct WritePage {
+    u32 faults{};
+    u32 frames{};
+    u64 last_frame{~0ULL};
+};
+std::mutex write_page_mutex;
+std::unordered_map<u64, WritePage> write_fault_pages;
+} // namespace
+
+void RecordWriteFaultPage(u64 addr) {
+    const u64 frame = presented_frames.load(std::memory_order_relaxed);
+    std::scoped_lock lk(write_page_mutex);
+    auto& page = write_fault_pages[addr >> 12];
+    ++page.faults;
+    if (page.last_frame != frame) {
+        page.last_frame = frame;
+        ++page.frames;
+    }
+}
+
+namespace {
+
+/// Summarise and reset the window. "hot" = faulted in at least 90% of the window's frames.
+std::string WriteFaultPageReport(u64 frames, u64 d_gfx, u64 d_asc) {
+    std::vector<std::pair<u64, WritePage>> pages;
+    {
+        std::scoped_lock lk(write_page_mutex);
+        pages.assign(write_fault_pages.begin(), write_fault_pages.end());
+        write_fault_pages.clear();
+    }
+    if (frames == 0) {
+        return "no frames";
+    }
+    u64 total = 0, hot_faults = 0, hot_frames = 0;
+    u64 bucket_pages[4]{}, bucket_faults[4]{};
+    std::vector<u64> hot;
+    for (const auto& [page, st] : pages) {
+        total += st.faults;
+        const double frac = static_cast<double>(st.frames) / static_cast<double>(frames);
+        const int b = frac >= 0.9 ? 3 : frac >= 0.5 ? 2 : frac >= 0.1 ? 1 : 0;
+        bucket_pages[b]++;
+        bucket_faults[b] += st.faults;
+        if (b == 3) {
+            hot.push_back(page);
+            hot_faults += st.faults;
+            hot_frames += st.frames;
+        }
+    }
+    std::sort(hot.begin(), hot.end());
+    std::vector<std::pair<u64, u64>> spans; // first page, count
+    for (const u64 page : hot) {
+        if (!spans.empty() && spans.back().first + spans.back().second == page) {
+            ++spans.back().second;
+        } else {
+            spans.emplace_back(page, 1);
+        }
+    }
+    std::sort(spans.begin(), spans.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    const double f = static_cast<double>(frames);
+    std::string out = fmt::format(
+        "frames={} faults/frame={:.1f} distinct_pages={} pages/frame(<10%,10-50,50-90,>=90% of "
+        "frames)={}/{}/{}/{} fault_share={:.1f}/{:.1f}/{:.1f}/{:.1f}% hot_refaults_per_page_frame="
+        "{:.2f} hot_spans={} gfx_submits/frame={:.2f} asc_submits/frame={:.2f} top_spans:",
+        frames, total / f, pages.size(), bucket_pages[0], bucket_pages[1], bucket_pages[2],
+        bucket_pages[3], total ? 100.0 * bucket_faults[0] / total : 0.0,
+        total ? 100.0 * bucket_faults[1] / total : 0.0,
+        total ? 100.0 * bucket_faults[2] / total : 0.0,
+        total ? 100.0 * bucket_faults[3] / total : 0.0,
+        hot_frames ? static_cast<double>(hot_faults) / hot_frames : 0.0, spans.size(), d_gfx / f,
+        d_asc / f);
+    for (size_t i = 0; i < std::min<size_t>(6, spans.size()); ++i) {
+        out += fmt::format(" {:#x}+{}p", spans[i].first << 12, spans[i].second);
+    }
+    return out;
+}
+
+} // namespace
 
 namespace {
 
@@ -745,6 +840,44 @@ void ReportLoop() {
 
         if (d_read > 0) {
             LOG_INFO(Render, "FaultPages: {}", TopReadFaultPages(6));
+        }
+        if (VideoCore::g_epoch_defer_upload && d_frames > 0) {
+            static u64 prev_epoch = 0, prev_syncs = 0, prev_pages = 0;
+            const u64 epoch = VideoCore::g_submit_epoch.load(std::memory_order_relaxed);
+            const u64 syncs = deferred_syncs.load(std::memory_order_relaxed);
+            const u64 pages = deferred_pages.load(std::memory_order_relaxed);
+            const double f = static_cast<double>(d_frames);
+            static std::array<u64, 256> prev_reasons{};
+            std::vector<std::pair<u64, u32>> reasons;
+            for (u32 i = 0; i < 256; ++i) {
+                const u64 v = VideoCore::g_submit_epoch_reasons[i].load(std::memory_order_relaxed);
+                if (v != prev_reasons[i]) {
+                    reasons.emplace_back(v - prev_reasons[i], i);
+                }
+                prev_reasons[i] = v;
+            }
+            std::sort(reasons.rbegin(), reasons.rend());
+            std::string top;
+            for (size_t i = 0; i < std::min<size_t>(5, reasons.size()); ++i) {
+                top += fmt::format(" op{:#x}={:.1f}", reasons[i].second, reasons[i].first / f);
+            }
+            LOG_INFO(Render,
+                     "EpochDefer: epochs/frame={:.1f} deferred_syncs/frame={:.1f} "
+                     "deferred_pages/frame={:.1f} faults/frame={:.1f} bumps/frame by opcode:{}",
+                     (epoch - prev_epoch) / f, (syncs - prev_syncs) / f, (pages - prev_pages) / f,
+                     d_write / f, top);
+            prev_epoch = epoch;
+            prev_syncs = syncs;
+            prev_pages = pages;
+        }
+        if (WriteFaultPagesEnabled()) {
+            static u64 prev_gfx = 0, prev_asc = 0;
+            const u64 gfx = gfx_submits.load(std::memory_order_relaxed);
+            const u64 asc = asc_submits.load(std::memory_order_relaxed);
+            LOG_INFO(Render, "WriteFaultPages: {}",
+                     WriteFaultPageReport(d_frames, gfx - prev_gfx, asc - prev_asc));
+            prev_gfx = gfx;
+            prev_asc = asc;
         }
 
         if (csv) {

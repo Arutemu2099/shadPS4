@@ -15,6 +15,7 @@
 #include "common/slot_vector.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/buffer_cache/submit_epoch.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/multi_level_page_table.h"
@@ -121,7 +122,8 @@ public:
     }
 
     /// Invalidates any buffer in the logical page range.
-    void InvalidateMemory(VAddr device_addr, u64 size);
+    void InvalidateMemory(VAddr device_addr, u64 size,
+                          InvalidateOrigin origin = InvalidateOrigin::Explicit);
 
     /// Block new asynchronous readbacks before GPU unmap and settle earlier ones.
     void BeginGpuUnmap(VAddr device_addr, u64 size);

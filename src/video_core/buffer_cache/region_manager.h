@@ -18,6 +18,7 @@
 #include "common/fault_monitor.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/dirty_epoch.h"
+#include "video_core/buffer_cache/fast_settings.h"
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/page_manager.h"
 
@@ -168,7 +169,7 @@ public:
         }
         if constexpr (type == Type::CPU) {
             UpdateProtection<!enable, false>();
-        } else if (EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise) {
+        } else if (ReadbacksMode() == GpuReadbacksMode::Precise) {
             UpdateProtection<enable, true>();
         }
     }
@@ -221,7 +222,7 @@ public:
                     MarkClean();
                 }
                 UpdateProtection<true, false>();
-            } else if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled) {
+            } else if (ReadbacksMode() != GpuReadbacksMode::Disabled) {
                 UpdateProtection<false, true>();
             }
         }
@@ -229,6 +230,90 @@ public:
         for (const auto& [start, end] : mask) {
             func(cpu_addr + start * TRACKER_BYTES_PER_PAGE, (end - start) * TRACKER_BYTES_PER_PAGE);
         }
+    }
+
+    /// Guest-fault marking, called under the lock BEFORE ChangeRegionState<CPU, true>: pages that
+    /// were clean become "recent" for `epoch`. Pages already dirty keep their older status, since
+    /// they may hold data written before the current submission. See submit_epoch.h.
+    void MarkRecentFromFault(u64 dirty_addr, u64 size, u64 epoch) noexcept {
+        const size_t offset = dirty_addr - cpu_addr;
+        const size_t start_page = SanitizeAddress(offset) / TRACKER_BYTES_PER_PAGE;
+        const size_t end_page = std::min<size_t>(
+            Common::DivCeil(SanitizeAddress(offset + size), TRACKER_BYTES_PER_PAGE),
+            NUM_PAGES_PER_REGION);
+        if (recent_epoch.load(std::memory_order_relaxed) != epoch) {
+            recent.Clear();
+            recent_epoch.store(epoch, std::memory_order_release);
+        }
+        for (size_t page = start_page; page < end_page; ++page) {
+            if (!cpu.Get(page)) {
+                recent.Set(page);
+            }
+        }
+    }
+
+    /// True if pages may be held for `epoch`. Lock-free pre-check for ClearRecent: a page can
+    /// only become recent through a guest fault, which stores this before unprotecting it.
+    bool MayHaveRecent(u64 epoch) const noexcept {
+        return recent_epoch.load(std::memory_order_acquire) == epoch;
+    }
+
+    /// Non-fault CPU marking (CP or HLE writes) is never deferred. Call under the lock.
+    void ClearRecent(u64 dirty_addr, u64 size) noexcept {
+        const size_t offset = dirty_addr - cpu_addr;
+        const size_t start_page = SanitizeAddress(offset) / TRACKER_BYTES_PER_PAGE;
+        const size_t end_page = std::min<size_t>(
+            Common::DivCeil(SanitizeAddress(offset + size), TRACKER_BYTES_PER_PAGE),
+            NUM_PAGES_PER_REGION);
+        if (end_page > start_page) {
+            recent.UnsetRange(start_page, end_page);
+        }
+    }
+
+    /**
+     * ForEachModifiedRange<Type::CPU, true> for read-only syncs under upload deferral: pages
+     * first dirtied by a guest fault in `epoch` stay dirty and writable. Returns how many dirty
+     * pages were deferred; the caller must not memoise the range as clean if that is nonzero.
+     * Protection stays exact: `writeable` is re-synced to `cpu`, so only uploaded pages are
+     * re-protected, and contiguous ones in a single call.
+     */
+    template <typename Func>
+    u64 ForEachModifiedRangeDeferred(VAddr query_cpu_range, s64 size, u64 epoch, Func&& func) {
+        RENDERER_TRACE;
+        const size_t offset = query_cpu_range - cpu_addr;
+        const size_t start_page = SanitizeAddress(offset) / TRACKER_BYTES_PER_PAGE;
+        const size_t end_page =
+            Common::DivCeil(SanitizeAddress(offset + size), TRACKER_BYTES_PER_PAGE);
+        if (start_page >= NUM_PAGES_PER_REGION || end_page <= start_page) {
+            return 0;
+        }
+        if (!cpu.AnyInRange(start_page, end_page)) {
+            return 0;
+        }
+        RegionBits mask(cpu, start_page, end_page);
+        u64 deferred = 0;
+        if (recent_epoch.load(std::memory_order_relaxed) == epoch &&
+            recent.AnyInRange(start_page, end_page)) {
+            const RegionBits held = mask & recent;
+            for (const auto& [start, end] : held) {
+                deferred += end - start;
+            }
+            mask &= ~recent;
+            if (mask.None()) {
+                return deferred;
+            }
+            cpu &= ~mask;
+        } else {
+            cpu.UnsetRange(start_page, end_page);
+        }
+        if (cpu.None()) {
+            MarkClean();
+        }
+        UpdateProtection<true, false>();
+        for (const auto& [start, end] : mask) {
+            func(cpu_addr + start * TRACKER_BYTES_PER_PAGE, (end - start) * TRACKER_BYTES_PER_PAGE);
+        }
+        return deferred;
     }
 
     /**
@@ -312,6 +397,10 @@ private:
     RegionBits gpu;
     RegionBits writeable;
     RegionBits readable;
+    /// CPU-dirty pages first dirtied by a guest fault during `recent_epoch`. Stale bits for pages
+    /// that are no longer dirty are harmless: the deferred walk intersects with `cpu`.
+    RegionBits recent;
+    std::atomic<u64> recent_epoch{0};
 };
 
 } // namespace VideoCore

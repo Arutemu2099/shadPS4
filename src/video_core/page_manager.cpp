@@ -212,9 +212,17 @@ struct PageManager::Impl {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
         const auto start = Common::FaultMonitor::Now();
         if (Common::IsWriteError(context)) {
-            const bool handled = rasterizer->InvalidateMemory(addr, 8);
+            // A fault taken by the CP itself is part of the command stream it is executing, so
+            // only guest threads' faults may be deferred (submit_epoch.h).
+            const bool handled = rasterizer->InvalidateMemory(
+                addr, 8,
+                Common::FaultMonitor::t_is_cp_thread ? VideoCore::InvalidateOrigin::CpWriteFault
+                                                     : VideoCore::InvalidateOrigin::GuestWriteFault);
             Common::FaultMonitor::CountGuestWriteFault(handled,
                                                        Common::FaultMonitor::SinceNs(start));
+            if (handled && Common::FaultMonitor::WriteFaultPagesEnabled()) {
+                Common::FaultMonitor::RecordWriteFaultPage(addr);
+            }
             return handled;
         } else {
             // Read faults only exist under Precise readbacks - it is the only mode that

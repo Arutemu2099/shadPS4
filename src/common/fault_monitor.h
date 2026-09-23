@@ -480,6 +480,23 @@ inline u64 DiffNs(Clock::time_point start, Clock::time_point end) {
  */
 void RecordReadFaultPage(u64 addr);
 
+/// SHADPS4_WRITE_FAULT_PAGES=1: per-page write-fault distribution per report window, to tell
+/// a few pages re-faulting every frame from many pages faulting once. Diagnostic only.
+bool WriteFaultPagesEnabled();
+void RecordWriteFaultPage(u64 addr);
+extern std::atomic<u64> gfx_submits;
+extern std::atomic<u64> asc_submits;
+/// Upload deferral (SHADPS4_EPOCH_DEFER_UPLOAD): syncs that held back at least one page.
+extern std::atomic<u64> deferred_syncs;
+extern std::atomic<u64> deferred_pages;
+inline void CountDeferredSync(u64 pages) {
+    deferred_syncs.fetch_add(1, std::memory_order_relaxed);
+    deferred_pages.fetch_add(pages, std::memory_order_relaxed);
+}
+inline void CountGuestSubmit(bool gfx) {
+    (gfx ? gfx_submits : asc_submits).fetch_add(1, std::memory_order_relaxed);
+}
+
 inline void CountGuestReadFault(bool handled, u64 ns, u64 addr) {
     guest_read_faults.fetch_add(1, std::memory_order_relaxed);
     AddTime(guest_read_ns, ns);

@@ -202,11 +202,22 @@ void BufferCache::EndGpuMap(VAddr device_addr, u64 size) {
     }
 }
 
-void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
+void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, InvalidateOrigin origin) {
     if (!IsRegionRegistered(device_addr, size)) {
         return;
     }
-    if (Offload::Enabled() && HasOverlappingFaultJob(device_addr, size)) {
+    // SHADPS4_FAULT_WRITE_SKIP_SETTLE=1: a write fault (guest or CP thread) needs no
+    // pre-settle. It cannot unmap, and a job neither copies nor publishes a GPU-clean page,
+    // while a GPU-dirty page takes the flush callback below, which settles in
+    // ResolveFaultSync. A GPU write landing later bumps the region sequence and vetoes the job.
+    // Measured 2026-09-23: this settle, reached from CP-thread DMA fast-path faults, blocked
+    // the CP on the GPU for 3.9% of its wall time.
+    static const bool skip_fault_settle = [] {
+        const char* value = std::getenv("SHADPS4_FAULT_WRITE_SKIP_SETTLE");
+        return value && value[0] == '1';
+    }();
+    if (Offload::Enabled() && !(skip_fault_settle && origin != InvalidateOrigin::Explicit) &&
+        HasOverlappingFaultJob(device_addr, size)) {
         // InvalidateRegion marks CPU state on this thread wherever it finds no GPU bit, and an
         // unmap then removes the pages. A job over this range still has a publication to
         // make, so it is finalized first, while the range is mapped and untouched. The flush
@@ -215,8 +226,10 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
         liverpool->SendCommand<true>(
             [this, device_addr, size] { SettleOverlappingJobs(device_addr, size); });
     }
-    memory_tracker->InvalidateRegion(
-        device_addr, size, [this, device_addr, size] { ReadMemory(device_addr, size, true); });
+    const bool from_guest_fault = origin == InvalidateOrigin::GuestWriteFault;
+    memory_tracker->InvalidateRegion(device_addr, size, from_guest_fault, [this, device_addr, size] {
+        ReadMemory(device_addr, size, true);
+    });
 }
 
 /// Span of the tracker pages a range touches. Publication and tracker clears act on whole
@@ -1032,6 +1045,7 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
         if (!IsRegionGpuModified(address, num_bytes)) {
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + num_bytes / sizeof(u32), value);
+            memory_tracker->ClearRecent(address, num_bytes);
             return;
         }
     }
@@ -1051,6 +1065,7 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
             !texture_cache.FindImageFromRange(src, num_bytes)) {
             // Both buffers were not transferred to GPU yet. Can safely copy in host memory.
             memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
+            memory_tracker->ClearRecent(dst, num_bytes);
             return;
         }
         // Without a readback there's nothing we can do with this

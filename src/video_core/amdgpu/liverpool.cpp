@@ -6,6 +6,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/fault_monitor.h"
+#include "video_core/buffer_cache/submit_epoch.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
@@ -51,6 +52,50 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 #define RESUME_ASC(task, id) RESUME(task, acb_task_name[id])
 
 std::array<u8, 48_KB> Liverpool::ConstantEngine::constants_heap;
+
+/// Packets that neither write guest memory from the CP nor wait on it: register state, draws,
+/// dispatches, cache-control events and nested IBs (which bump at their own start). Any other
+/// packet closes the upload-deferral window (submit_epoch.h). Conservative on purpose: an extra
+/// bump only uploads a deferred page earlier, a missing one could upload it too late.
+static constexpr bool KeepsSubmitEpoch(PM4ItOpcode opcode) {
+    switch (opcode) {
+    case PM4ItOpcode::Nop:
+    case PM4ItOpcode::SetContextReg:
+    case PM4ItOpcode::SetShReg:
+    case PM4ItOpcode::SetUconfigReg:
+    case PM4ItOpcode::SetConfigReg:
+    case PM4ItOpcode::SetQueueReg:
+    case PM4ItOpcode::ContextControl:
+    case PM4ItOpcode::ClearState:
+    case PM4ItOpcode::SetPredication:
+    case PM4ItOpcode::IndexType:
+    case PM4ItOpcode::IndexBase:
+    case PM4ItOpcode::IndexBufferSize:
+    case PM4ItOpcode::NumInstances:
+    case PM4ItOpcode::SetBase:
+    case PM4ItOpcode::DrawIndex2:
+    case PM4ItOpcode::DrawIndexOffset2:
+    case PM4ItOpcode::DrawIndexAuto:
+    case PM4ItOpcode::DrawIndirect:
+    case PM4ItOpcode::DrawIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirect:
+    case PM4ItOpcode::DrawIndexIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirectCountMulti:
+    case PM4ItOpcode::DispatchDirect:
+    case PM4ItOpcode::DispatchIndirect:
+    // GPU copy/fill; its CPU fast paths clear deferral for the bytes they write themselves
+    // (BufferCache::FillBuffer/CopyBuffer). Measured ~3,100 per frame in the forest.
+    case PM4ItOpcode::DmaData:
+    case PM4ItOpcode::EventWrite:
+    case PM4ItOpcode::AcquireMem:
+    case PM4ItOpcode::IncrementDeCounter:
+    case PM4ItOpcode::PfpSyncMe:
+    case PM4ItOpcode::IndirectBuffer:
+        return true;
+    default:
+        return false;
+    }
+}
 
 static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset) {
     if (offset > span.size()) {
@@ -195,6 +240,8 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
             const auto* dump_const = reinterpret_cast<const PM4DumpConstRam*>(header);
             memcpy(dump_const->Address<void*>(),
                    cblock.constants_heap.data() + dump_const->Offset(), dump_const->Size());
+            // A CP-side guest memory write: later draws may read it (submit_epoch.h).
+            VideoCore::BumpSubmitEpoch(PM4ItOpcode::DumpConstRam);
             break;
         }
         case PM4ItOpcode::IncrementCeCounter: {
@@ -233,6 +280,11 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
 
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
     FIBER_ENTER(dcb_task_name);
+    // Everything the guest wrote before this submission is now due (submit_epoch.h). An indirect
+    // buffer is part of its parent submission, so it does not reopen the window.
+    if (!std::exchange(starting_indirect_gfx, false)) {
+        VideoCore::BumpSubmitEpoch(PM4ItOpcode::Nop);
+    }
 
     cblock.Reset();
 
@@ -875,6 +927,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
                 auto task = ProcessGraphics(
                     {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
+                starting_indirect_gfx = true;
                 RESUME_GFX(task);
 
                 while (!task.handle.done()) {
@@ -930,6 +983,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}",
                                 static_cast<u32>(opcode), count);
             }
+            if (!KeepsSubmitEpoch(opcode)) {
+                VideoCore::BumpSubmitEpoch(opcode);
+            }
             dcb = NextPacket(dcb, header->type3.NumWords() + 1);
             break;
         }
@@ -948,6 +1004,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 template <bool is_indirect>
 Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
+    if constexpr (!is_indirect) {
+        VideoCore::BumpSubmitEpoch(PM4ItOpcode::Nop);
+    }
     auto& queue = asc_queues[{vqid}];
     const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
 
@@ -1210,6 +1269,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                             static_cast<u32>(opcode), header->type3.NumWords());
         }
 
+        if (!KeepsSubmitEpoch(opcode)) {
+            VideoCore::BumpSubmitEpoch(opcode);
+        }
         acb = NextPacket(acb, next_dw_off);
 
         if constexpr (!is_indirect) {
@@ -1261,6 +1323,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
         std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
     }
 
+    Common::FaultMonitor::CountGuestSubmit(true);
     auto task = ProcessGraphics(dcb, ccb);
     {
         std::scoped_lock lock{queue.m_access};
@@ -1277,6 +1340,7 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     auto& queue = mapped_queues[gnm_vqid];
 
     const auto vqid = gnm_vqid - 1;
+    Common::FaultMonitor::CountGuestSubmit(false);
     const auto& task = ProcessCompute(acb, vqid);
     {
         std::scoped_lock lock{queue.m_access};

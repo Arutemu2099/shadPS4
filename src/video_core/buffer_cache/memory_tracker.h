@@ -16,6 +16,7 @@
 #include "common/types.h"
 #include "core/emulator_settings.h"
 #include "video_core/buffer_cache/region_manager.h"
+#include "video_core/buffer_cache/submit_epoch.h"
 
 namespace VideoCore {
 
@@ -53,9 +54,27 @@ public:
         IteratePages<false>(dirty_cpu_addr, query_size,
                             [](RegionManager* manager, u64 offset, size_t size) {
                                 std::scoped_lock lk{manager->lock};
+                                if (g_epoch_defer_upload) {
+                                    manager->ClearRecent(manager->GetCpuAddr() + offset, size);
+                                }
                                 manager->template ChangeRegionState<Type::CPU, true>(
                                     manager->GetCpuAddr() + offset, size);
                             });
+    }
+
+    /// The CP wrote these guest bytes itself without a fault (DMA fast paths): never defer them.
+    void ClearRecent(VAddr cpu_addr, u64 size) {
+        if (!g_epoch_defer_upload) {
+            return;
+        }
+        const u64 epoch = g_submit_epoch.load(std::memory_order_acquire);
+        IteratePages<false>(cpu_addr, size, [epoch](RegionManager* manager, u64 offset,
+                                                    size_t size) {
+            if (manager->MayHaveRecent(epoch)) {
+                std::scoped_lock lk{manager->lock};
+                manager->ClearRecent(manager->GetCpuAddr() + offset, size);
+            }
+        });
     }
 
     /// Unmark region as modified from the host GPU
@@ -69,18 +88,33 @@ public:
     }
 
     /// Removes all protection from a page and ensures GPU data has been flushed if requested
-    void InvalidateRegion(VAddr cpu_addr, u64 size, auto&& on_flush) noexcept {
+    /// `from_guest_fault`: the call comes from a guest thread's write fault (not the CP, not an
+    /// HLE write), so a newly dirtied page may be deferred. See submit_epoch.h.
+    void InvalidateRegion(VAddr cpu_addr, u64 size, bool from_guest_fault,
+                          auto&& on_flush) noexcept {
+        const bool defer = g_epoch_defer_upload;
+        const u64 submit_epoch = defer ? g_submit_epoch.load(std::memory_order_acquire) : 0;
         IteratePages<false>(
-            cpu_addr, size, [&on_flush](RegionManager* manager, u64 offset, size_t size) {
+            cpu_addr, size,
+            [&on_flush, defer, from_guest_fault, submit_epoch](RegionManager* manager, u64 offset,
+                                                               size_t size) {
                 const bool should_flush = [&] {
                     // Perform both the GPU modification check and CPU state change with the lock
                     // in case we are racing with GPU thread trying to mark the page as GPU
                     // modified. If we need to flush the flush function is going to perform CPU
                     // state change.
                     std::scoped_lock lk{manager->lock};
-                    if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled &&
+                    if (ReadbacksMode() != GpuReadbacksMode::Disabled &&
                         manager->template IsRegionModified<Type::GPU>(offset, size)) {
                         return true;
+                    }
+                    if (defer) {
+                        if (from_guest_fault) {
+                            manager->MarkRecentFromFault(manager->GetCpuAddr() + offset, size,
+                                                         submit_epoch);
+                        } else {
+                            manager->ClearRecent(manager->GetCpuAddr() + offset, size);
+                        }
                     }
                     manager->template ChangeRegionState<Type::CPU, true>(
                         manager->GetCpuAddr() + offset, size);
@@ -167,6 +201,9 @@ public:
         // them find nothing, so this is the common case by a wide margin. !is_written only, for
         // the same lock-pairing reason as below.
         const u64 epoch = g_dirty_epoch.load(std::memory_order_acquire);
+        const bool defer = g_epoch_defer_upload && !is_written;
+        const u64 submit_epoch = defer ? g_submit_epoch.load(std::memory_order_acquire) : 0;
+        u64 deferred_pages = 0;
         if (clean_skip && MemoSaysClean(query_cpu_range, query_size, epoch)) {
             on_upload();
             Common::FaultMonitor::CountUploadShape(0, 0, 0, query_size);
@@ -181,16 +218,23 @@ public:
             return UploadPath::Coarse;
         }
         IteratePages<true>(query_cpu_range, query_size,
-                           [&counting_func, &shape_managers, &shape_skipped, clean_skip,
-                            is_written](RegionManager* manager, u64 offset, size_t size) {
+                           [&counting_func, &shape_managers, &shape_skipped, &deferred_pages,
+                            clean_skip, is_written, defer,
+                            submit_epoch](RegionManager* manager, u64 offset, size_t size) {
                                ++shape_managers;
                                if (clean_skip && !manager->MayHaveCpuModified()) {
                                    ++shape_skipped;
                                    return;
                                }
                                manager->lock.lock();
-                               manager->template ForEachModifiedRange<Type::CPU, true>(
-                                   manager->GetCpuAddr() + offset, size, counting_func);
+                               if (defer) {
+                                   deferred_pages += manager->ForEachModifiedRangeDeferred(
+                                       manager->GetCpuAddr() + offset, size, submit_epoch,
+                                       counting_func);
+                               } else {
+                                   manager->template ForEachModifiedRange<Type::CPU, true>(
+                                       manager->GetCpuAddr() + offset, size, counting_func);
+                               }
                                if (!is_written) {
                                    manager->lock.unlock();
                                }
@@ -202,8 +246,11 @@ public:
         // still find zero modified ranges in its own range. Sound for the same reason as above:
         // no ranges found, and the epoch read BEFORE the walk still current, means still clean.
         // If dirt landed mid-walk the epoch has moved and the record simply never hits.
-        if (clean_skip && shape_ranges == 0) {
+        if (clean_skip && shape_ranges == 0 && deferred_pages == 0) {
             MemoRecordClean(query_cpu_range, query_size, epoch);
+        }
+        if (deferred_pages != 0) {
+            Common::FaultMonitor::CountDeferredSync(deferred_pages);
         }
         Common::FaultMonitor::CountUploadShape(shape_managers, shape_ranges, shape_skipped,
                                                query_size);
