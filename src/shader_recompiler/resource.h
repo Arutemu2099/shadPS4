@@ -123,10 +123,32 @@ struct SamplerResource {
     u32 is_inline_sampler : 1;
     u32 associated_image : 4;
     u32 disable_aniso : 1;
+    /// Word 0 of a user-data S# rewritten by constant scalar ALU before use, e.g. the PS4 Pro
+    /// checkerboard resolve does s_or_b32 s12, s8, 0x8000 (force_unnormalized) on a UD sampler.
+    /// Effective word 0 = (ud & and_mask) | or_mask. Stored in `inline_sampler`, which a UD
+    /// sampler does not otherwise use, so the persisted Info layout is unchanged; the encoding
+    /// makes all-zero (every pipeline-cache entry written before this) mean "unmodified".
+    constexpr void SetWord0Masks(u32 and_mask, u32 or_mask) noexcept {
+        inline_sampler.raw0 = u64(~and_mask) | (u64(or_mask) << 32);
+        inline_sampler.raw1 = 0;
+    }
+    constexpr u32 Word0AndMask() const noexcept {
+        return ~static_cast<u32>(inline_sampler.raw0);
+    }
+    constexpr u32 Word0OrMask() const noexcept {
+        return static_cast<u32>(inline_sampler.raw0 >> 32);
+    }
 
     constexpr AmdGpu::Sampler GetSharp(const auto& info) const noexcept {
-        return is_inline_sampler ? inline_sampler
-                                 : info.template ReadUdSharp<AmdGpu::Sampler>(sharp_idx);
+        if (is_inline_sampler) {
+            return inline_sampler;
+        }
+        auto sharp = info.template ReadUdSharp<AmdGpu::Sampler>(sharp_idx);
+        if (inline_sampler.raw0 != 0) {
+            const u32 word0 = (static_cast<u32>(sharp.raw0) & Word0AndMask()) | Word0OrMask();
+            sharp.raw0 = (sharp.raw0 & ~u64{0xFFFFFFFFu}) | word0;
+        }
+        return sharp;
     }
 };
 using SamplerResourceList = boost::container::static_vector<SamplerResource, NUM_SAMPLERS>;

@@ -370,6 +370,48 @@ bool IsSharpSource(const IR::Inst* inst) {
            inst->GetOpcode() == IR::Opcode::ReadConst;
 }
 
+struct SamplerWord0Masks {
+    const IR::Inst* source;
+    u32 and_mask;
+    u32 or_mask;
+};
+
+/// Peels constant s_and_b32 / s_or_b32 applied to word 0 of a user-data S# (see
+/// SamplerResource::dword0_and_mask). Returns the untouched source and the composed masks, or
+/// the input with identity masks if the pattern does not match.
+SamplerWord0Masks PeelSamplerWord0Masks(const IR::Inst* inst) {
+    boost::container::small_vector<std::pair<IR::Opcode, u32>, 4> ops;
+    const IR::Inst* source = inst;
+    while (ops.size() < 4) {
+        const auto op = source->GetOpcode();
+        if (op != IR::Opcode::BitwiseOr32 && op != IR::Opcode::BitwiseAnd32) {
+            break;
+        }
+        const IR::Value a = source->Arg(0);
+        const IR::Value b = source->Arg(1);
+        if (a.IsImmediate() == b.IsImmediate()) {
+            break;
+        }
+        ops.emplace_back(op, a.IsImmediate() ? a.U32() : b.U32());
+        source = (a.IsImmediate() ? b : a).InstRecursive();
+    }
+    if (ops.empty() || !IsSharpSource(source)) {
+        return {inst, ~0u, 0u};
+    }
+    u32 and_mask = ~0u;
+    u32 or_mask = 0u;
+    // ops is outermost first; compose from the source outwards.
+    for (auto it = ops.rbegin(); it != ops.rend(); ++it) {
+        if (it->first == IR::Opcode::BitwiseAnd32) {
+            and_mask &= it->second;
+            or_mask &= it->second;
+        } else {
+            or_mask |= it->second;
+        }
+    }
+    return {source, and_mask, or_mask};
+}
+
 SharpSources FindSharpSources(const IR::Inst* handle, u32 pc) {
     SharpSources sources;
     if (IsSharpSource(handle)) {
@@ -648,15 +690,22 @@ void PatchImageSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors& 
             });
         } else {
             // Normal sampler resource.
-            const auto& [sampler_handle, disable_aniso] =
+            auto [sampler_handle, disable_aniso] =
                 TryDisableAnisoLod0(sampler->Arg(0).InstRecursive());
-            const auto ssharp = TrackSharp(sampler_handle, block, inst_info.pc);
-            sampler_binding = descriptors.Add(SamplerResource{
+            const auto [word0_handle, and_mask, or_mask] =
+                disable_aniso ? SamplerWord0Masks{sampler_handle, ~0u, 0u}
+                              : PeelSamplerWord0Masks(sampler_handle);
+            const auto ssharp = TrackSharp(word0_handle, block, inst_info.pc);
+            SamplerResource sampler_res{
                 .sharp_idx = ssharp,
                 .is_inline_sampler = false,
                 .associated_image = image_binding,
                 .disable_aniso = disable_aniso,
-            });
+            };
+            // Compared by Descriptors::Add through inline_sampler, so differently masked uses
+            // of one UD sampler get separate bindings.
+            sampler_res.SetWord0Masks(and_mask, or_mask);
+            sampler_binding = descriptors.Add(sampler_res);
         }
         inst.SetArg(0, ir.Imm32(image_binding | sampler_binding << 16));
     } else {
