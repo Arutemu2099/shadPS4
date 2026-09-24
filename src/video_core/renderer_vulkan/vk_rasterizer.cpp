@@ -1269,6 +1269,28 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             image_id = texture_cache.FindImage(desc);
             ++lookup_count;
             auto* image = &texture_cache.GetImage(image_id);
+            {
+                // Diagnostic SHADPS4_TRACE_SHADER=<hex pgm hash>: log texture bindings of that
+                // shader (first 16 binds): requested T# vs the cache image it resolved to.
+                static const u64 trace_hash = [] {
+                    const char* value = std::getenv("SHADPS4_TRACE_SHADER");
+                    return value ? std::strtoull(value, nullptr, 16) : 0ull;
+                }();
+                static u32 traced = 0;
+                if (trace_hash != 0 && stage.pgm_hash == trace_hash && traced < 16) {
+                    ++traced;
+                    LOG_WARNING(Render_Vulkan,
+                                "TraceShader {:#x}: slot {} type {} T# {:#x} {}x{} {} -> image "
+                                "{:#x} {}x{} {} samples {} uid {} flags {:#x}",
+                                trace_hash, image_slot, static_cast<u32>(desc.type),
+                                desc.info.guest_address, desc.info.size.width,
+                                desc.info.size.height, vk::to_string(desc.info.pixel_format),
+                                image->info.guest_address, image->info.size.width,
+                                image->info.size.height, vk::to_string(image->info.pixel_format),
+                                image->info.num_samples, image->image_uid,
+                                static_cast<u32>(image->flags));
+                }
+            }
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
                 static const bool stencil_storage = [] {
                     const char* value = std::getenv("SHADPS4_STENCIL_STORAGE");
