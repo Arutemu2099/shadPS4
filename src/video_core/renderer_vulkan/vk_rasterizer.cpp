@@ -696,6 +696,36 @@ void Rasterizer::Finish() {
 }
 
 void Rasterizer::OnSubmit() {
+    {
+        // Diagnostic: SHADPS4_DUMP_IMAGES=addr[,addr...] (hex) with SHADPS4_DUMP_IMAGES_AT_S=N
+        // dumps those surfaces at the first submit N s after the first one, twice (a frame apart).
+        static const std::vector<VAddr> dump_addresses = [] {
+            std::vector<VAddr> out;
+            if (const char* value = std::getenv("SHADPS4_DUMP_IMAGES")) {
+                std::string list{value};
+                size_t pos = 0;
+                while (pos < list.size()) {
+                    const size_t comma = list.find(',', pos);
+                    out.push_back(std::strtoull(list.substr(pos, comma - pos).c_str(), nullptr, 16));
+                    pos = comma == std::string::npos ? list.size() : comma + 1;
+                }
+            }
+            return out;
+        }();
+        if (!dump_addresses.empty()) {
+            static const double at_s = [] {
+                const char* value = std::getenv("SHADPS4_DUMP_IMAGES_AT_S");
+                return value ? std::atof(value) : 120.0;
+            }();
+            static const auto first = std::chrono::steady_clock::now();
+            static u32 dumps_done = 0;
+            if (dumps_done < 2 &&
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - first).count() >=
+                    at_s + dumps_done * 0.05) {
+                texture_cache.DebugDumpImages(dump_addresses, dumps_done++);
+            }
+        }
+    }
     if (fault_process_pending) {
         fault_process_pending = false;
         buffer_cache.ProcessFaultBuffer();

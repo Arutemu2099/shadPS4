@@ -175,6 +175,11 @@ public:
         return slot_image_views[id];
     }
 
+    /// Diagnostic (SHADPS4_DUMP_IMAGES): writes mip 0 / layer 0 of every registered image whose
+    /// guest address is listed to `<log dir>/imgdump_<tag>_<addr>_<w>x<h>_<format>_<uid>.raw`
+    /// (tightly packed texels, first aspect). Blocks on the GPU; CP thread only.
+    void DebugDumpImages(const std::vector<VAddr>& addresses, u32 tag);
+
     /// SHADPS4_STENCIL_STORAGE: the registered depth image at `address` whose extent matches
     /// `size`. One address can hold several depth surfaces (PS4 Pro: 1600x1800 scene depth and a
     /// 3200x1800 reconstruction depth-stencil share a base address).
@@ -321,6 +326,7 @@ private:
 
     /// Copies image memory back to CPU.
     void DownloadImageMemory(ImageId image_id, bool sync = false);
+
 
     /// Thread function for copying downloaded images out to CPU memory.
     void DownloadedImagesThread(const std::stop_token& token);

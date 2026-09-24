@@ -10,6 +10,7 @@
 #include <xxhash.h>
 
 #include "common/assert.h"
+#include "common/path_util.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
 #include "common/fault_monitor.h"
@@ -173,6 +174,73 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
                 Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr), download,
                                                           download_size);
             });
+    }
+}
+
+void TextureCache::DebugDumpImages(const std::vector<VAddr>& addresses, u32 tag) {
+    std::vector<ImageId> ids;
+    {
+        std::scoped_lock lock{mutex};
+        for (const VAddr address : addresses) {
+            if (const auto it = page_table.find(address >> Traits::PageBits); it != nullptr) {
+                for (const ImageId id : *it) {
+                    if (slot_images[id].info.guest_address == address &&
+                        std::ranges::find(ids, id) == ids.end()) {
+                        ids.push_back(id);
+                    }
+                }
+            }
+        }
+    }
+    auto& download_buffer = buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+    for (const ImageId id : ids) {
+        Image& image = slot_images[id];
+        const u32 width = image.info.size.width;
+        const u32 height = image.info.size.height;
+        const u32 bytes_per_texel =
+            image.info.pixel_format == vk::Format::eD32SfloatS8Uint ? 4 : image.info.num_bits / 8;
+        if (width == 0 || height == 0 || bytes_per_texel == 0 || image.info.props.is_block) {
+            continue;
+        }
+        const auto aspect = image.info.props.is_depth ? vk::ImageAspectFlagBits::eDepth
+                                                      : vk::ImageAspectFlagBits::eColor;
+        const auto path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) /
+                          fmt::format("imgdump_{}_{:x}_{}x{}_{}_{}.raw", tag,
+                                      image.info.guest_address, width, height,
+                                      vk::to_string(image.info.pixel_format), image.image_uid);
+        std::FILE* file = std::fopen(path.string().c_str(), "wb");
+        if (!file) {
+            continue;
+        }
+        const u32 row_bytes = width * bytes_per_texel;
+        const u32 rows_per_band = std::max(1u, static_cast<u32>((16_MB) / row_bytes));
+        for (u32 y = 0; y < height; y += rows_per_band) {
+            const u32 rows = std::min(rows_per_band, height - y);
+            const u32 band_size = rows * row_bytes;
+            const auto [mapped, offset] = download_buffer.Map(band_size);
+            download_buffer.Commit();
+            const vk::BufferImageCopy region = {
+                .bufferOffset = offset,
+                .bufferRowLength = 0,
+                .bufferImageHeight = 0,
+                .imageSubresource = {aspect, 0, 0, 1},
+                .imageOffset = {0, static_cast<s32>(y), 0},
+                .imageExtent = {width, rows, 1},
+            };
+            scheduler.EndRendering();
+            image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
+                          {});
+            {
+                auto command_access = scheduler.AcquireCommandBuffer();
+                command_access.Handle().copyImageToBuffer(
+                    image.GetImage(), image.backing->state.layout, download_buffer.Handle(),
+                    region);
+            }
+            scheduler.Finish();
+            std::fwrite(mapped, 1, band_size, file);
+        }
+        std::fclose(file);
+        LOG_WARNING(Render_Vulkan, "ImageDump: wrote {}", path.string());
     }
 }
 
