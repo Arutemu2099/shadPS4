@@ -176,6 +176,15 @@ public:
             sizeof(Callable), alignof(Callable), payload_bytes);
     }
 
+    /// Publishes the producer's partial chunk without waiting, so everything recorded so far runs
+    /// even if nothing else is recorded for a while (an asynchronous submission, for instance).
+    void Publish() {
+        std::unique_lock lock{mutex_};
+        if (current_ != nullptr && !failure_ && current_->command_count != 0) {
+            PublishCurrentLocked();
+        }
+    }
+
     /// Publishes the producer's partial chunk and waits for every prior command to finish.
     /// Rethrows the first callback exception after all commands through this drain point have been
     /// invoked or discarded and destroyed.

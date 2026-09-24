@@ -321,6 +321,9 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
             .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
         }));
     });
+    // A partial chunk is otherwise only handed over when full or drained; a waiter on this tick
+    // would then wait for commands nobody records.
+    recording_worker->Publish();
     // What AllocateWorkerCommandBuffers resets on this thread for a new command buffer.
     dynamic_state.Invalidate();
     native_heaps_bound = false;
