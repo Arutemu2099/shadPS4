@@ -582,7 +582,7 @@ std::unique_ptr<Buffer> BufferCache::AcquireFaultStaging() {
     }
     auto staging =
         std::make_unique<Buffer>(instance, scheduler, MemoryUsage::Download, 0,
-                                 vk::BufferUsageFlagBits::eTransferDst, FaultStagingSize);
+                                 vk::BufferUsageFlagBits::eTransferDst, FaultStagingSize());
     if (staging->mapped_data.empty()) {
         LOG_ERROR(Render, "ReadbackOffload: staging buffer is not host mapped");
         return nullptr;
@@ -650,7 +650,7 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
         }
     }
     std::unique_ptr<Buffer> staging;
-    if (job && total_size_bytes <= FaultStagingSize) {
+    if (job && total_size_bytes <= FaultStagingSize()) {
         staging = AcquireFaultStaging();
     }
     if (!staging) {

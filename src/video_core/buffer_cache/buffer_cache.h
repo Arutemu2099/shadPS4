@@ -300,7 +300,15 @@ private:
     };
 
     static constexpr size_t MaxFaultJobs = 8;
-    static constexpr u64 FaultStagingSize = 2_MB;
+    /// SHADPS4_FAULT_STAGING_MB=N (default 2): per-job readback staging size.
+    static u64 FaultStagingSize() {
+        static const u64 size = [] {
+            const char* value = std::getenv("SHADPS4_FAULT_STAGING_MB");
+            const u64 mb = value ? std::strtoull(value, nullptr, 10) : 0;
+            return (mb >= 2 && mb <= 64 ? mb : 2) * 1024 * 1024;
+        }();
+        return size;
+    }
 
     /// The window a fault downloads: exact for writes, widened and preflighted for reads.
     std::pair<VAddr, u64> ResolveFaultWindow(const Buffer& buffer, VAddr device_addr, u64 size,
