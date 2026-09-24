@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <unordered_set>
 #include <boost/preprocessor/stringize.hpp>
 
 #include "common/assert.h"
@@ -21,6 +23,73 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace AmdGpu {
+
+namespace {
+/// SHADPS4_CP_WAIT_STATS=1: where the command processor's wall time goes. WaitRegMem waits are
+/// split by whether the polled address is one the CP itself writes (EOS/EOP/RELEASE_MEM/
+/// WRITE_DATA: a GPU-side dependency) or not (written by guest CPU code). Wait intervals
+/// overlap with other queues' work done between yields; they are latencies, not CPU cost.
+struct CpWaitStats {
+    bool enabled = [] {
+        const char* v = std::getenv("SHADPS4_CP_WAIT_STATS");
+        return v && v[0] == '1';
+    }();
+    std::unordered_set<VAddr> cp_written;
+    u64 idle_ns = 0;
+    u64 gfx_wrm_cp_ns = 0, gfx_wrm_cpu_ns = 0, gfx_wrm_cp_n = 0, gfx_wrm_cpu_n = 0;
+    u64 asc_wrm_cp_ns = 0, asc_wrm_cpu_ns = 0, asc_wrm_cp_n = 0, asc_wrm_cpu_n = 0;
+    u64 gfx_wrm_instant = 0;
+    u64 labels = 0;
+    u64 window_start = 0;
+
+    static u64 Now() {
+        return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count());
+    }
+    void NoteWrite(const void* addr) {
+        if (enabled) {
+            cp_written.insert(reinterpret_cast<VAddr>(addr));
+            ++labels;
+        }
+    }
+    void CountWait(bool gfx, const void* addr, u64 ns) {
+        const bool by_cp = cp_written.contains(reinterpret_cast<VAddr>(addr));
+        if (gfx) {
+            (by_cp ? gfx_wrm_cp_ns : gfx_wrm_cpu_ns) += ns;
+            ++(by_cp ? gfx_wrm_cp_n : gfx_wrm_cpu_n);
+        } else {
+            (by_cp ? asc_wrm_cp_ns : asc_wrm_cpu_ns) += ns;
+            ++(by_cp ? asc_wrm_cp_n : asc_wrm_cpu_n);
+        }
+        MaybeLog();
+    }
+    void MaybeLog() {
+        const u64 now = Now();
+        if (window_start == 0) {
+            window_start = now;
+            return;
+        }
+        const u64 span = now - window_start;
+        if (span < 10'000'000'000ULL) {
+            return;
+        }
+        const auto pct = [span](u64 ns) { return 100.0 * double(ns) / double(span); };
+        LOG_INFO(Render, "CpWait: window_s={:.1f} idle_pct={:.1f} gfx_wrm_cp_pct={:.1f} "
+                 "gfx_wrm_cpu_pct={:.1f} gfx_wrm_cp_n={} gfx_wrm_cpu_n={} gfx_wrm_instant={} "
+                 "asc_wrm_cp_pct={:.1f} asc_wrm_cpu_pct={:.1f} asc_wrm_cp_n={} asc_wrm_cpu_n={} "
+                 "labels={} label_addrs={}",
+                 double(span) / 1e9, pct(idle_ns), pct(gfx_wrm_cp_ns), pct(gfx_wrm_cpu_ns),
+                 gfx_wrm_cp_n, gfx_wrm_cpu_n, gfx_wrm_instant, pct(asc_wrm_cp_ns),
+                 pct(asc_wrm_cpu_ns), asc_wrm_cp_n, asc_wrm_cpu_n, labels, cp_written.size());
+        idle_ns = gfx_wrm_cp_ns = gfx_wrm_cpu_ns = gfx_wrm_cp_n = gfx_wrm_cpu_n = 0;
+        asc_wrm_cp_ns = asc_wrm_cpu_ns = asc_wrm_cp_n = asc_wrm_cpu_n = 0;
+        gfx_wrm_instant = labels = 0;
+        window_start = now;
+    }
+};
+CpWaitStats g_cp_wait;
+} // namespace
 
 static const char* dcb_task_name{"DCB_TASK"};
 static const char* ccb_task_name{"CCB_TASK"};
@@ -147,10 +216,14 @@ void Liverpool::Process(std::stop_token stoken) {
             // is what says whether parallel command recording can pay off - see
             // notes\parallel-command-recording-plan.md.
             const auto t_wait = Common::FaultMonitor::Now();
+            const u64 idle_start = g_cp_wait.enabled ? CpWaitStats::Now() : 0;
             std::unique_lock lk{submit_mutex};
             Common::CondvarWait(submit_cv, lk, stoken,
                                 [this] { return num_commands || num_submits || submit_done; });
             Common::FaultMonitor::CountCpWait(Common::FaultMonitor::SinceNs(t_wait));
+            if (g_cp_wait.enabled) {
+                g_cp_wait.idle_ns += CpWaitStats::Now() - idle_start;
+            }
         }
         if (stoken.stop_requested()) {
             break;
@@ -785,6 +858,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (rasterizer) {
                     rasterizer->ProcessDownloadImages();
                 }
+                g_cp_wait.NoteWrite(event_eos->Address());
                 event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
                     auto* memory = Core::Memory::Instance();
                     if (!memory->TryWriteBacking(address, &data, num_bytes)) {
@@ -806,6 +880,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (rasterizer) {
                     rasterizer->ProcessDownloadImages();
                 }
+                g_cp_wait.NoteWrite(event_eop->Address<u32>());
                 event_eop->SignalFence(
                     [](void* address, u64 data, u32 num_bytes) {
                         auto* memory = Core::Memory::Instance();
@@ -857,6 +932,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
                 const u32 data_size = (header->type3.count.Value() - 2) * 4;
                 u64* address = write_data->Address<u64*>();
+                g_cp_wait.NoteWrite(address);
                 if (!write_data->wr_one_addr.Value()) {
                     std::memcpy(address, write_data->data, data_size);
                 } else {
@@ -917,8 +993,19 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 const auto wrm_start = Common::FaultMonitor::Now();
+                const u64 wrm_ns0 = g_cp_wait.enabled ? CpWaitStats::Now() : 0;
+                bool wrm_waited = false;
                 while (!wait_reg_mem->Test(regs.reg_array)) {
+                    wrm_waited = true;
                     YIELD_GFX();
+                }
+                if (g_cp_wait.enabled) {
+                    if (wrm_waited) {
+                        g_cp_wait.CountWait(true, wait_reg_mem->Address<u64*>(),
+                                            CpWaitStats::Now() - wrm_ns0);
+                    } else {
+                        ++g_cp_wait.gfx_wrm_instant;
+                    }
                 }
                 Common::FaultMonitor::CountWaitRegMem(Common::FaultMonitor::SinceNs(wrm_start));
                 break;
@@ -1217,6 +1304,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
+            g_cp_wait.NoteWrite(write_data->Address<void*>());
             if (!write_data->wr_one_addr.Value()) {
                 std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
             } else {
@@ -1240,8 +1328,15 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
             const auto wrm_start = Common::FaultMonitor::Now();
+            const u64 wrm_ns0 = g_cp_wait.enabled ? CpWaitStats::Now() : 0;
+            bool wrm_waited = false;
             while (!wait_reg_mem->Test(regs.reg_array)) {
+                wrm_waited = true;
                 YIELD_ASC(vqid);
+            }
+            if (g_cp_wait.enabled && wrm_waited) {
+                g_cp_wait.CountWait(false, wait_reg_mem->Address<u64*>(),
+                                    CpWaitStats::Now() - wrm_ns0);
             }
             Common::FaultMonitor::CountWaitRegMem(Common::FaultMonitor::SinceNs(wrm_start));
             break;
@@ -1251,6 +1346,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (rasterizer) {
                 rasterizer->ProcessDownloadImages();
             }
+            g_cp_wait.NoteWrite(release_mem->Address<void*>());
             release_mem->SignalFence(
                 [pipe_id = queue.pipe_id] {
                     Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
