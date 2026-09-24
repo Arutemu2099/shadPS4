@@ -459,8 +459,14 @@ void GcnDecodeContext::decodeSubDwordAddressing(InstEncoding encoding, GcnCodeSl
             m_instruction.src[1].input_modifier.abs = sdwa.src1_abs;
             m_instruction.src[1].input_modifier.sext = sdwa.src1_sext;
 
-            m_instruction.dst[0].field = sdwa.sd ? OperandField::ScalarGPR : OperandField::VccLo;
-            m_instruction.dst[0].code = sdwa.sdst;
+            // VOPC results live in dst[1] (see decodeInstructionVOPC; the translator's V_CMP_*
+            // write inst.dst[1]). With sd=1 the SDWA form names an explicit SGPR pair. Writing it
+            // to dst[0] left dst[1] = VCC, so the named pair was never written and later reads of
+            // it became UndefU1 (PS4 Pro checkerboard resolve cs 0xaa2bb7c0 output zero).
+            m_instruction.dst[1].field = sdwa.sd ? OperandField::ScalarGPR : OperandField::VccLo;
+            m_instruction.dst[1].type = ScalarType::Uint64;
+            m_instruction.dst[1].code =
+                sdwa.sd ? u32(sdwa.sdst) : static_cast<u32>(OperandField::VccLo);
 
         } else if (encoding == InstEncoding::VOP1 || encoding == InstEncoding::VOP2) {
             SdwaVop12 sdwa = *reinterpret_cast<SdwaVop12*>(&m_instruction.src[0].code);
