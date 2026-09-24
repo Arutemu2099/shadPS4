@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cstdlib>
+
 #include <atomic>
 #include <filesystem>
 #include <functional>
@@ -653,7 +655,18 @@ public:
 
     // General settings
     SETTING_FORWARD(m_general, VolumeSlider, volume_slider)
-    SETTING_FORWARD_BOOL(m_general, Neo, neo_mode)
+    // SHADPS4_NEO_MODE=0/1 overrides the configured PS4 Pro mode, so a launcher can select it
+    // without editing the shared per-title config.
+    bool IsNeo() const {
+        static const int env = [] {
+            const char* value = std::getenv("SHADPS4_NEO_MODE");
+            return value && (value[0] == '0' || value[0] == '1') ? value[0] - '0' : -1;
+        }();
+        return env >= 0 ? env == 1 : m_general.neo_mode.get(m_configMode);
+    }
+    void SetNeo(bool v, bool specific = false) {
+        m_general.neo_mode.set(v, specific);
+    }
     SETTING_FORWARD_BOOL(m_general, DevKit, dev_kit_mode)
     SETTING_FORWARD(m_general, ExtraDmemInMBytes, extra_dmem_in_mbytes)
     bool IsShadNetEnabled() const {
