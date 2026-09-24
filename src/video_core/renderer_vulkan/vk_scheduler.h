@@ -573,6 +573,7 @@ private:
     u64 synchronous_borrows = 0;
     u64 recording_submits = 0;
     bool async_submit = false;
+    std::unique_ptr<class GpuBatchTimer> batch_timer;
     void SubmitExecutionAsync(SubmitInfo& info);
     u32 batch_draws = 0;
     u32 last_batch_draws = 0;

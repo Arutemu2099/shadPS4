@@ -12,6 +12,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 #include <thread>
+#include "video_core/renderer_vulkan/vk_gpu_batch_timer.h"
 
 namespace Vulkan {
 
@@ -37,6 +38,9 @@ Scheduler::Scheduler(const Instance& instance, bool allow_recording_worker)
         if (async_submit) {
             async_timeline.store(static_cast<VkSemaphore>(master_semaphore.Handle()));
             LOG_INFO(Render_Vulkan, "AsyncSubmit: the recording worker ends and submits batches");
+            if (GpuBatchTimer::Enabled()) {
+                batch_timer = std::make_unique<GpuBatchTimer>(instance, master_semaphore);
+            }
         }
     }
     AllocateWorkerCommandBuffers();
@@ -304,7 +308,12 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
         std::scoped_lock lk{submit_mutex};
         ImGui::Core::TextureManager::Submit();
     }
-    recording_worker->Record([this, info, signal_value]() mutable {
+    const u32 draws = batch_draws;
+    batch_draws = 0;
+    recording_worker->Record([this, info, signal_value, draws]() mutable {
+        if (batch_timer) {
+            batch_timer->End(current_cmdbuf, signal_value, draws);
+        }
         Check(current_cmdbuf.end());
         static constexpr std::array<vk::PipelineStageFlags, 3> wait_stage_masks = {
             vk::PipelineStageFlagBits::eAllCommands,
@@ -337,6 +346,9 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
         Check(current_cmdbuf.begin(vk::CommandBufferBeginInfo{
             .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
         }));
+        if (batch_timer) {
+            batch_timer->Begin(current_cmdbuf);
+        }
     });
     // A partial chunk is otherwise only handed over when full or drained; a waiter on this tick
     // would then wait for commands nobody records.
