@@ -352,6 +352,60 @@ void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
     }
 }
 
+void TextureCache::CopyStencilAspect(ImageId src_id, ImageId dst_id) {
+    auto& src = slot_images[src_id];
+    auto& dst = slot_images[dst_id];
+    const auto aspect_of = [](const Image& image) {
+        return (image.aspect_mask & vk::ImageAspectFlagBits::eStencil)
+                   ? vk::ImageAspectFlagBits::eStencil
+                   : vk::ImageAspectFlagBits::eColor;
+    };
+    const vk::ImageCopy region{
+        .srcSubresource = {aspect_of(src), 0, 0, 1},
+        .dstSubresource = {aspect_of(dst), 0, 0, 1},
+        .extent = {std::min(src.info.size.width, dst.info.size.width),
+                   std::min(src.info.size.height, dst.info.size.height), 1},
+    };
+    scheduler.EndRendering();
+    src.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
+    dst.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {});
+    auto command_access = scheduler.AcquireCommandBuffer();
+    command_access.Handle().copyImage(src.GetImage(), src.backing->state.layout, dst.GetImage(),
+                                      dst.backing->state.layout, region);
+}
+
+void TextureCache::SaveStencilShadow(ImageId depth_id) {
+    const VAddr address = slot_images[depth_id].info.guest_address;
+    const auto size = slot_images[depth_id].info.size;
+    ImageId shadow_id{};
+    if (const auto it = stencil_shadows.find(address); it != stencil_shadows.end() &&
+                                                       slot_images[it->second].info.size == size) {
+        shadow_id = it->second;
+    } else {
+        ImageInfo info = slot_images[depth_id].info;
+        info.pixel_format = vk::Format::eR8Uint;
+        info.props.is_depth = false;
+        info.props.has_stencil = false;
+        info.num_bits = 8;
+        info.meta_info = {};
+        shadow_id = slot_images.insert(instance, scheduler, blit_helper, slot_image_views, info);
+        slot_images[shadow_id].flags = ImageFlagBits::Empty;
+        stencil_shadows[address] = shadow_id;
+        LOG_WARNING(Render_Vulkan, "StencilShadow: created {}x{} shadow for {:#x}", size.width,
+                    size.height, address);
+    }
+    CopyStencilAspect(depth_id, shadow_id);
+}
+
+void TextureCache::RestoreStencilShadow(ImageId depth_id) {
+    const auto it = stencil_shadows.find(slot_images[depth_id].info.guest_address);
+    if (it == stencil_shadows.end() ||
+        !(slot_images[it->second].info.size == slot_images[depth_id].info.size)) {
+        return;
+    }
+    CopyStencilAspect(it->second, depth_id);
+}
+
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, BindingType binding,
                                           ImageId cache_image_id) {
     auto& cache_image = slot_images[cache_image_id];
@@ -432,6 +486,20 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
                 new_image.GetImage());
         } else {
             LOG_WARNING(Render_Vulkan, "Unimplemented depth overlap copy");
+        }
+
+        static const bool stencil_shadow = [] {
+            const char* value = std::getenv("SHADPS4_STENCIL_SHADOW");
+            return value && value[0] == '1';
+        }();
+        if (stencil_shadow) {
+            const bool old_stencil = slot_images[cache_image_id].info.props.has_stencil;
+            const bool new_stencil = slot_images[new_image_id].info.props.has_stencil;
+            if (old_stencil && !new_stencil) {
+                SaveStencilShadow(cache_image_id);
+            } else if (!old_stencil && new_stencil) {
+                RestoreStencilShadow(new_image_id);
+            }
         }
 
         // Free the cache image.

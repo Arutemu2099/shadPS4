@@ -9,6 +9,7 @@
 #include "common/switch_mutex.h"
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <thread>
 #include <unordered_set>
 #include <boost/container/small_vector.hpp>
@@ -137,6 +138,15 @@ public:
                                                                ImageId merged_image_id);
 
     /// Resolves depth overlap and either re-creates the image or returns existing one
+    /// SHADPS4_STENCIL_SHADOW=1: when overlap resolution replaces a depth-stencil image with
+    /// one without stencil (depth read or written as R32, depth-only target), the stencil plane
+    /// is saved to an R8 shadow keyed by guest address and restored into the next depth-stencil
+    /// image recreated there. Without it every hop drops the stencil (PS4 Pro checkerboard mask).
+    void SaveStencilShadow(ImageId depth_id);
+    void RestoreStencilShadow(ImageId depth_id);
+    void CopyStencilAspect(ImageId src_id, ImageId dst_id);
+    std::unordered_map<VAddr, ImageId> stencil_shadows;
+
     [[nodiscard]] ImageId ResolveDepthOverlap(const ImageInfo& requested_info, BindingType binding,
                                               ImageId cache_img_id);
 
