@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <vector>
 
 #include "common/div_ceil.h"
 #include "common/logging/log.h"
@@ -23,6 +24,40 @@
 #include "video_core/page_manager.h"
 
 namespace VideoCore {
+
+/// SHADPS4_FAULT_WATCH_OUTSIDE=1: page-watcher updates (the VirtualProtect calls) that a guest
+/// write fault's invalidation computes under a region lock, applied after the lock is released.
+/// Measured 2026-09-24 on 386F5167: the CP spun on these region locks for ~3.3% of its wall
+/// time while fault handlers held them across VirtualProtect. Watcher counts commute and each
+/// update sets protection from the counts under the page manager's own locks, so a reordered
+/// update leaves the same final state; at worst the faulting write faults once more.
+struct DeferredWatch {
+    const PageManager* tracker;
+    VAddr addr;
+    RegionBits mask;
+    bool track;
+    bool is_read;
+};
+inline thread_local std::vector<DeferredWatch>* g_deferred_watch = nullptr;
+
+inline void ApplyDeferredWatches(std::vector<DeferredWatch>& list) {
+    for (DeferredWatch& w : list) {
+        if (w.track) {
+            if (w.is_read) {
+                w.tracker->UpdatePageWatchersForRegion<true, true>(w.addr, w.mask);
+            } else {
+                w.tracker->UpdatePageWatchersForRegion<true, false>(w.addr, w.mask);
+            }
+        } else {
+            if (w.is_read) {
+                w.tracker->UpdatePageWatchersForRegion<false, true>(w.addr, w.mask);
+            } else {
+                w.tracker->UpdatePageWatchersForRegion<false, false>(w.addr, w.mask);
+            }
+        }
+    }
+    list.clear();
+}
 
 #ifdef PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
 using LockType = Common::AdaptiveMutex;
@@ -363,6 +398,10 @@ private:
         // This is the only path out of the tracker that reaches a VirtualProtect syscall. Count
         // and time it: it is the one candidate in the per-draw sync path that can plausibly cost
         // microseconds, and bitset arithmetic cannot.
+        if (g_deferred_watch) {
+            g_deferred_watch->push_back({tracker, cpu_addr, mask, track, is_read});
+            return;
+        }
         const auto t_protect = Common::FaultMonitor::Now();
         tracker->UpdatePageWatchersForRegion<track, is_read>(cpu_addr, mask);
         Common::FaultMonitor::CountProtect<is_read>(Common::FaultMonitor::SinceNs(t_protect));

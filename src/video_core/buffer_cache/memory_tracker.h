@@ -94,10 +94,18 @@ public:
                           auto&& on_flush) noexcept {
         const bool defer = g_epoch_defer_upload;
         const u64 submit_epoch = defer ? g_submit_epoch.load(std::memory_order_acquire) : 0;
+        static const bool watch_outside = [] {
+            const char* env = std::getenv("SHADPS4_FAULT_WATCH_OUTSIDE");
+            return env != nullptr && env[0] == '1';
+        }();
+        thread_local std::vector<DeferredWatch> deferred_watches;
         IteratePages<false>(
             cpu_addr, size,
             [&on_flush, defer, from_guest_fault, submit_epoch](RegionManager* manager, u64 offset,
                                                                size_t size) {
+                if (watch_outside && from_guest_fault) {
+                    g_deferred_watch = &deferred_watches;
+                }
                 const bool should_flush = [&] {
                     // Perform both the GPU modification check and CPU state change with the lock
                     // in case we are racing with GPU thread trying to mark the page as GPU
@@ -120,6 +128,10 @@ public:
                         manager->GetCpuAddr() + offset, size);
                     return false;
                 }();
+                if (g_deferred_watch) {
+                    g_deferred_watch = nullptr;
+                    ApplyDeferredWatches(deferred_watches);
+                }
                 if (should_flush) {
                     on_flush();
                 }
