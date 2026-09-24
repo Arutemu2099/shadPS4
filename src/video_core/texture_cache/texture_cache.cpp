@@ -3,6 +3,8 @@
 
 #include <boost/container/small_vector.hpp>
 #include <cstdlib>
+#include <immintrin.h>
+#include <thread>
 #include <limits>
 #include <xxhash.h>
 
@@ -230,7 +232,27 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
         }
     }
     boost::container::small_vector<std::pair<VAddr, u64>, 8> deferred;
-    std::unique_lock lock{mutex};
+    // SHADPS4_TEX_GUEST_SPIN=1: fault handlers spin for this mutex instead of sleeping on it, so
+    // the command processor, which takes it ~30k times a frame, never pays a kernel wake-up in
+    // its unlock. Measured 2026-09-24 on 386F5167: CP time in this mutex's lock/unlock system
+    // calls was ~6% of its wall time.
+    static const bool guest_spin = [] {
+        const char* value = std::getenv("SHADPS4_TEX_GUEST_SPIN");
+        return value && value[0] == '1';
+    }();
+    std::unique_lock lock{mutex, std::defer_lock};
+    if (guest_spin) {
+        u32 spins = 0;
+        while (!lock.try_lock()) {
+            if (++spins < 64) {
+                _mm_pause();
+            } else {
+                std::this_thread::yield();
+            }
+        }
+    } else {
+        lock.lock();
+    }
     if (UntrackOutsideEnabled()) {
         g_deferred_untracks = &deferred;
     }
