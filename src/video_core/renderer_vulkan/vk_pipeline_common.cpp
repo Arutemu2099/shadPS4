@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/renderer_vulkan/vk_gpu_batch_timer.h"
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -29,6 +30,10 @@ Pipeline::~Pipeline() = default;
 void Pipeline::RecordBufferBarriers(const BufferBarriers& buffer_barriers) const {
     if (buffer_barriers.empty()) {
         return;
+    }
+    if (GpuBatchTimer::Enabled()) {
+        GpuBreaks().buffer_barrier_calls.fetch_add(1, std::memory_order_relaxed);
+        GpuBreaks().buffer_barriers.fetch_add(buffer_barriers.size(), std::memory_order_relaxed);
     }
     scheduler.EndRendering();
     scheduler.RecordArrays(

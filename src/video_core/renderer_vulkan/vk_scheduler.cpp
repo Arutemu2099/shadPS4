@@ -156,6 +156,9 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     }
     EndRendering();
     is_rendering = true;
+    if (batch_timer) {
+        GpuBreaks().render_begins.fetch_add(1, std::memory_order_relaxed);
+    }
     render_state = new_state;
 
     Record([render_state = new_state](vk::CommandBuffer cmdbuf) {

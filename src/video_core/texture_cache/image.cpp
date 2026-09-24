@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/renderer_vulkan/vk_gpu_batch_timer.h"
 #include <ranges>
 #include "common/assert.h"
 #include "common/fault_monitor.h"
@@ -443,6 +444,10 @@ void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
     }
     tr_endr_ns += Common::FaultMonitor::DiffNs(tr_t1, tr_t2);
     tr_submit_ns += Common::FaultMonitor::DiffNs(tr_t2, Common::FaultMonitor::Now());
+    if (Vulkan::GpuBatchTimer::Enabled()) {
+        Vulkan::GpuBreaks().image_barrier_calls.fetch_add(1, std::memory_order_relaxed);
+        Vulkan::GpuBreaks().image_barriers.fetch_add(barriers.size(), std::memory_order_relaxed);
+    }
     tr_report();
 }
 

@@ -18,6 +18,19 @@
 
 namespace Vulkan {
 
+/// Per-window counters of GPU pipeline breaks, bumped on the CP (diagnostic, same flag).
+struct GpuBreakCounters {
+    std::atomic<u64> render_begins{0};
+    std::atomic<u64> buffer_barrier_calls{0};
+    std::atomic<u64> buffer_barriers{0};
+    std::atomic<u64> image_barrier_calls{0};
+    std::atomic<u64> image_barriers{0};
+};
+inline GpuBreakCounters& GpuBreaks() {
+    static GpuBreakCounters counters;
+    return counters;
+}
+
 /**
  * SHADPS4_GPU_BATCH_TIMING=1 (with SHADPS4_ASYNC_SUBMIT=1): GPU timestamps at the start and end
  * of every main-queue batch, written by the recording worker. A reader thread waits for each
@@ -126,12 +139,18 @@ private:
                 LOG_INFO(Render_Vulkan,
                          "GpuBatchTiming: batches={} busy_pct={:.1f} batch_us={:.1f} "
                          "max_batch_us={:.1f} gap_us={:.1f} draws_per_batch={:.1f} "
-                         "gpu_us_per_draw={:.3f}",
+                         "gpu_us_per_draw={:.3f} render_begins={} buf_barrier_calls={} buf_barriers={} "
+                         "img_barrier_calls={} img_barriers={}",
                          batches, 100.0 * double(busy) / wall_ns,
                          double(busy) / double(batches) / 1000.0, double(max_batch) / 1000.0,
                          gap_count ? double(gaps) / double(gap_count) / 1000.0 : 0.0,
                          double(draws) / double(batches),
-                         draws ? double(busy) / double(draws) / 1000.0 : 0.0);
+                         draws ? double(busy) / double(draws) / 1000.0 : 0.0,
+                         GpuBreaks().render_begins.exchange(0),
+                         GpuBreaks().buffer_barrier_calls.exchange(0),
+                         GpuBreaks().buffer_barriers.exchange(0),
+                         GpuBreaks().image_barrier_calls.exchange(0),
+                         GpuBreaks().image_barriers.exchange(0));
                 busy = gaps = gap_count = batches = draws = max_batch = 0;
                 window_start = now;
             }
