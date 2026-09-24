@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <boost/container/small_vector.hpp>
 #include <cstdlib>
 #include <limits>
 #include <xxhash.h>
@@ -181,6 +182,22 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
     UntrackImage(image_id);
 }
 
+/// SHADPS4_TEX_UNTRACK_OUTSIDE=1: page-watcher decrements that a guest write fault's
+/// invalidation collects under the texture-cache mutex, applied after it is released.
+/// Measured 2026-09-24: the CP blocked on this mutex ~5.5% of its wall time while fault
+/// handlers held it across UpdatePageWatchers -> VirtualProtect (itself behind the address-space
+/// mutex the CP also takes). Watcher counts commute; a reordered re-track only costs a refault.
+static thread_local boost::container::small_vector<std::pair<VAddr, u64>, 8>* g_deferred_untracks =
+    nullptr;
+
+static bool UntrackOutsideEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_TEX_UNTRACK_OUTSIDE");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
 void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     const auto pages_start = PageManager::GetPageAddr(addr);
     const auto pages_end = PageManager::GetNextPageAddr(addr + size - 1);
@@ -212,7 +229,11 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             return;
         }
     }
-    std::scoped_lock lock{mutex};
+    boost::container::small_vector<std::pair<VAddr, u64>, 8> deferred;
+    std::unique_lock lock{mutex};
+    if (UntrackOutsideEnabled()) {
+        g_deferred_untracks = &deferred;
+    }
     ForEachImageInRegion(pages_start, pages_end - pages_start, [&](ImageId image_id, Image& image) {
         const auto image_begin = image.info.guest_address;
         const auto image_end = image.info.guest_address + image.info.guest_size;
@@ -238,6 +259,11 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             MarkAsMaybeDirty(image_id, image);
         }
     });
+    g_deferred_untracks = nullptr;
+    lock.unlock();
+    for (const auto& [untrack_addr, untrack_size] : deferred) {
+        tracker.UpdatePageWatchers<false>(untrack_addr, untrack_size);
+    }
 }
 
 void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
@@ -1141,7 +1167,11 @@ void TextureCache::UntrackImage(ImageId image_id) {
     image.track_addr = 0;
     image.track_addr_end = 0;
     if (size != 0) {
-        tracker.UpdatePageWatchers<false>(addr, size);
+        if (g_deferred_untracks) {
+            g_deferred_untracks->emplace_back(addr, size);
+        } else {
+            tracker.UpdatePageWatchers<false>(addr, size);
+        }
     }
 }
 
@@ -1160,7 +1190,11 @@ void TextureCache::UntrackImageHead(ImageId image_id) {
         // Cehck its hash later.
         MarkAsMaybeDirty(image_id, image);
     }
-    tracker.UpdatePageWatchers<false>(image_begin, size);
+    if (g_deferred_untracks) {
+        g_deferred_untracks->emplace_back(image_begin, size);
+    } else {
+        tracker.UpdatePageWatchers<false>(image_begin, size);
+    }
 }
 
 void TextureCache::UntrackImageTail(ImageId image_id) {
@@ -1179,7 +1213,11 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
         // Cehck its hash later.
         MarkAsMaybeDirty(image_id, image);
     }
-    tracker.UpdatePageWatchers<false>(addr, size);
+    if (g_deferred_untracks) {
+        g_deferred_untracks->emplace_back(addr, size);
+    } else {
+        tracker.UpdatePageWatchers<false>(addr, size);
+    }
 }
 
 void TextureCache::GarbageCollectImages() {
