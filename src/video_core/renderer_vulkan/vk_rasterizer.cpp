@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <set>
 #include <cstdlib>
 #include <string>
 #include <unordered_set>
@@ -398,6 +399,36 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
     const auto t_begin = Common::FaultMonitor::Now();
     sample.BeginPhase(Common::DrawSampleProbe::Phase::BuildRenderingState);
+    {
+        // Diagnostic SHADPS4_NEO_REG_DIAG=1: raw depth / AA / CB0 registers, logged once per
+        // distinct combination (max 60), to see how PS4 Pro checkerboard programs the DB.
+        static const bool neo_reg_diag = [] {
+            const char* value = std::getenv("SHADPS4_NEO_REG_DIAG");
+            return value && value[0] == '1';
+        }();
+        if (neo_reg_diag && liverpool->regs.depth_buffer.DepthValid()) {
+            static constexpr std::array<u32, 16> offsets{
+                0x000, 0x003, 0x010, 0x011, 0x012, 0x014, 0x016, 0x017,
+                0x201, 0x203, 0x292, 0x293, 0x2F8, 0x2F9, 0x31D, 0x31C};
+            std::array<u32, 16> values{};
+            for (size_t i = 0; i < offsets.size(); ++i) {
+                values[i] = liverpool->regs.reg_array[AmdGpu::Regs::ContextRegWordOffset +
+                                                      offsets[i]];
+            }
+            static std::set<std::array<u32, 16>> seen;
+            if (seen.size() < 60 && seen.insert(values).second) {
+                LOG_WARNING(Render_Vulkan,
+                            "NeoRegs: DB_RENDER_CONTROL={:#x} DB_RENDER_OVERRIDE={:#x} "
+                            "Z_INFO={:#x} STENCIL_INFO={:#x} Z_READ_BASE={:#x} Z_WRITE_BASE={:#x} "
+                            "DEPTH_SIZE={:#x} DEPTH_SLICE={:#x} DB_EQAA={:#x} "
+                            "DB_SHADER_CONTROL={:#x} PA_SC_MODE_CNTL_0={:#x} MODE_CNTL_1={:#x} "
+                            "PA_SC_AA_CONFIG={:#x} AA_MASK?={:#x} CB0_ATTRIB={:#x} CB0_INFO={:#x}",
+                            values[0], values[1], values[2], values[3], values[4], values[5],
+                            values[6], values[7], values[8], values[9], values[10], values[11],
+                            values[12], values[13], values[14], values[15]);
+            }
+        }
+    }
     const auto state = BeginRendering(pipeline);
     sample.EndPhase(Common::DrawSampleProbe::Phase::BuildRenderingState);
     const auto t_vtxbuf = Common::FaultMonitor::Now();
