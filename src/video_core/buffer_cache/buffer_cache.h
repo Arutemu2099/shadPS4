@@ -391,6 +391,9 @@ private:
     /// measure whether readback data is already complete when a fault asks for it.
     std::unique_ptr<u64[]> producer_ticks;
     void NoteGpuWrite(VAddr addr, u64 size);
+    bool AsyncFaultCopies();
+    void RecordFaultCopiesAsync(Buffer& source, vk::Buffer staging,
+                                std::span<const vk::BufferCopy> copies);
     /// SHADPS4_READBACK_PREBATCH: guest ranges the batch being recorded writes on the GPU.
     std::vector<std::pair<VAddr, VAddr>> batch_writes;
     u64 batch_writes_tick = 0;

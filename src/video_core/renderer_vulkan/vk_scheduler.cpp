@@ -11,9 +11,13 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
+#include <thread>
+
 namespace Vulkan {
 
 std::mutex Scheduler::submit_mutex;
+std::atomic<VkSemaphore> Scheduler::async_timeline{VK_NULL_HANDLE};
+std::atomic<u64> Scheduler::async_submitted_tick{0};
 
 Scheduler::Scheduler(const Instance& instance, bool allow_recording_worker)
     : instance{instance}, master_semaphore{instance}, command_pool{instance, &master_semaphore} {
@@ -28,6 +32,12 @@ Scheduler::Scheduler(const Instance& instance, bool allow_recording_worker)
             std::make_unique<Common::CommandRecordingWorker<>>(recording_measure_timing);
         recording_worker->Record([] { Common::SetCurrentThreadName("shadPS4:VkRecorder"); });
         LOG_INFO(Render_Vulkan, "AsyncRecording: enabled, ordered primary command worker");
+        const char* async = std::getenv("SHADPS4_ASYNC_SUBMIT");
+        async_submit = async && std::string_view{async} == "1";
+        if (async_submit) {
+            async_timeline.store(static_cast<VkSemaphore>(master_semaphore.Handle()));
+            LOG_INFO(Render_Vulkan, "AsyncSubmit: the recording worker ends and submits batches");
+        }
     }
     AllocateWorkerCommandBuffers();
     priority_pending_ops_thread =
@@ -129,9 +139,9 @@ void Scheduler::PushDescriptors(vk::PipelineBindPoint bind_point, vk::PipelineLa
                         .data();
             }
         }
-        return [cmdbuf = current_cmdbuf, bind_point, layout, copies, count = writes.size()] {
-            cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0,
-                                        std::span<const vk::WriteDescriptorSet>{copies, count});
+        return [this, bind_point, layout, copies, count = writes.size()] {
+            current_cmdbuf.pushDescriptorSetKHR(
+                bind_point, layout, 0, std::span<const vk::WriteDescriptorSet>{copies, count});
         };
     });
 }
@@ -264,7 +274,76 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 #endif
 }
 
+void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
+    // SHADPS4_ASYNC_SUBMIT=1: the command processor only picks the tick; the recording worker
+    // ends the command buffer, submits it and begins the next one after every command recorded
+    // before this point. Measured 2026-09-24: the CP spent ~4.2% of its wall time draining the
+    // worker for submits/borrows and ~1.6% inside vkQueueSubmit.
+    Common::FaultMonitor::CountGpuSubmit();
+    EndRendering();
+    const u64 signal_value = master_semaphore.NextTick();
+    info.AddSignal(master_semaphore.Handle(), signal_value);
+    {
+        std::scoped_lock lk{submit_mutex};
+        ImGui::Core::TextureManager::Submit();
+    }
+    recording_worker->Record([this, info, signal_value]() mutable {
+        Check(current_cmdbuf.end());
+        static constexpr std::array<vk::PipelineStageFlags, 3> wait_stage_masks = {
+            vk::PipelineStageFlagBits::eAllCommands,
+            vk::PipelineStageFlagBits::eColorAttachmentOutput,
+            vk::PipelineStageFlagBits::eAllCommands,
+        };
+        const vk::TimelineSemaphoreSubmitInfo timeline_si = {
+            .waitSemaphoreValueCount = info.num_wait_semas,
+            .pWaitSemaphoreValues = info.wait_ticks.data(),
+            .signalSemaphoreValueCount = info.num_signal_semas,
+            .pSignalSemaphoreValues = info.signal_ticks.data(),
+        };
+        const vk::SubmitInfo submit_info = {
+            .pNext = &timeline_si,
+            .waitSemaphoreCount = info.num_wait_semas,
+            .pWaitSemaphores = info.wait_semas.data(),
+            .pWaitDstStageMask = wait_stage_masks.data(),
+            .commandBufferCount = 1U,
+            .pCommandBuffers = &current_cmdbuf,
+            .signalSemaphoreCount = info.num_signal_semas,
+            .pSignalSemaphores = info.signal_semas.data(),
+        };
+        {
+            std::scoped_lock lk{submit_mutex};
+            const auto result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+            ASSERT_MSG(result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+            async_submitted_tick.store(signal_value, std::memory_order_release);
+        }
+        current_cmdbuf = command_pool.Commit();
+        Check(current_cmdbuf.begin(vk::CommandBufferBeginInfo{
+            .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+        }));
+    });
+    // What AllocateWorkerCommandBuffers resets on this thread for a new command buffer.
+    dynamic_state.Invalidate();
+    native_heaps_bound = false;
+    master_semaphore.Refresh();
+    PopPendingOperations();
+}
+
 void Scheduler::SubmitExecution(SubmitInfo& info) {
+    if (async_submit && synchronous_scopes == 0) {
+        SubmitExecutionAsync(info);
+        return;
+    }
+    // A batch on this queue must not wait for a draw-timeline value the async worker has not
+    // submitted yet: it would block the queue ahead of its own signal.
+    if (const VkSemaphore async = async_timeline.load(); async != VK_NULL_HANDLE) {
+        for (u32 i = 0; i < info.num_wait_semas; ++i) {
+            if (static_cast<VkSemaphore>(info.wait_semas[i]) == async) {
+                while (async_submitted_tick.load(std::memory_order_acquire) < info.wait_ticks[i]) {
+                    std::this_thread::yield();
+                }
+            }
+        }
+    }
     std::scoped_lock lk{submit_mutex};
     Common::FaultMonitor::CountGpuSubmit();
     EndRendering();

@@ -199,7 +199,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     memory_tracker = std::make_unique<MemoryTracker>(tracker);
     if (instance.HasReadbackQueue()) {
         readback_queue = std::make_unique<ReadbackQueue>(instance);
-    } else if (PrebatchEnabled() && Offload::Enabled()) {
+    } else if (PrebatchEnabled() && Offload::Enabled() && !std::getenv("SHADPS4_ASYNC_SUBMIT")) {
         readback_queue = std::make_unique<ReadbackQueue>(
             instance, instance.GetGraphicsQueue(), instance.GetGraphicsQueueFamilyIndex(),
             &Vulkan::Scheduler::submit_mutex);
@@ -765,7 +765,9 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
     }
 
     scheduler.EndRendering();
-    {
+    if (AsyncFaultCopies()) {
+        RecordFaultCopiesAsync(buffer, staging_handle, {vk_copies.data(), vk_copies.size()});
+    } else {
         auto command_access = scheduler.AcquireCommandBuffer();
         RecordFaultCopies(command_access.Handle(), buffer, staging_handle,
                           {vk_copies.data(), vk_copies.size()});
@@ -885,6 +887,73 @@ void BufferCache::RecordFaultCopies(vk::CommandBuffer cmdbuf, Buffer& source, vk
             .pBufferMemoryBarriers = &*barrier,
         });
     }
+}
+
+/// SHADPS4_ASYNC_SUBMIT=1 also records a guest fault's copies through the recording worker
+/// instead of draining it for a synchronous borrow (measured 2026-09-24: that drain was 2.8% of
+/// the CP's wall time). Access tracking of the source is still updated here, in order.
+bool BufferCache::AsyncFaultCopies() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_ASYNC_SUBMIT");
+        return value && value[0] == '1';
+    }();
+    return enabled && scheduler.IsAsyncRecording();
+}
+
+void BufferCache::RecordFaultCopiesAsync(Buffer& source, vk::Buffer staging,
+                                         std::span<const vk::BufferCopy> copies) {
+    const vk::Buffer src = source.Handle();
+    const u64 src_size = source.SizeBytes();
+    (void)source.GetBarrier(vk::AccessFlagBits2::eTransferRead,
+                            vk::PipelineStageFlagBits2::eTransfer);
+    const auto closing = source.GetBarrier(
+        vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        vk::PipelineStageFlagBits2::eAllCommands);
+    const bool has_closing = closing.has_value();
+    const vk::BufferMemoryBarrier2 closing_barrier = closing.value_or(vk::BufferMemoryBarrier2{});
+    scheduler.RecordArrays(
+        [src, src_size, staging, has_closing,
+         closing_barrier](vk::CommandBuffer cmdbuf, std::span<const vk::BufferCopy> list) {
+            const vk::BufferMemoryBarrier2 source_barrier{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .buffer = src,
+                .offset = 0,
+                .size = src_size,
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .bufferMemoryBarrierCount = 1,
+                .pBufferMemoryBarriers = &source_barrier,
+            });
+            cmdbuf.copyBuffer(src, staging, list);
+            const vk::BufferMemoryBarrier2 host_barrier{
+                .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+                .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .buffer = staging,
+                .offset = 0,
+                .size = VK_WHOLE_SIZE,
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .bufferMemoryBarrierCount = 1,
+                .pBufferMemoryBarriers = &host_barrier,
+            });
+            if (has_closing) {
+                cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                    .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                    .bufferMemoryBarrierCount = 1,
+                    .pBufferMemoryBarriers = &closing_barrier,
+                });
+            }
+        },
+        copies);
 }
 
 static bool EarlyFlushEnabled() {

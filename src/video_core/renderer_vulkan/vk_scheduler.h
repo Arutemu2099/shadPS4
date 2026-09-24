@@ -452,10 +452,11 @@ public:
             command(current_cmdbuf);
             return;
         }
-        recording_worker->Record(
-            [cmdbuf = current_cmdbuf, command = std::forward<F>(command)]() mutable {
-                command(cmdbuf);
-            });
+        // The handle is read when the worker runs the command: with SHADPS4_ASYNC_SUBMIT the
+        // worker itself ends, submits and replaces the command buffer, in recording order.
+        recording_worker->Record([this, command = std::forward<F>(command)]() mutable {
+            command(current_cmdbuf);
+        });
     }
 
     // Clone transient arrays into the same unpublished chunk as their callback.
@@ -476,8 +477,8 @@ public:
         recording_worker->RecordWithPayload(bytes, [&](std::span<std::byte> storage) {
             auto* cursor = storage.data();
             auto copies = std::tuple{CopyPayload(cursor, arrays)...};
-            return [cmdbuf = current_cmdbuf, command = std::forward<F>(command), copies]() mutable {
-                std::apply([&](auto... spans) { command(cmdbuf, spans...); }, copies);
+            return [this, command = std::forward<F>(command), copies]() mutable {
+                std::apply([&](auto... spans) { command(current_cmdbuf, spans...); }, copies);
             };
         });
     }
@@ -527,6 +528,13 @@ public:
 
     static std::mutex submit_mutex;
 
+    /// SHADPS4_ASYNC_SUBMIT: timeline of the scheduler whose submissions the recording worker
+    /// makes, and the highest value the worker has actually handed to vkQueueSubmit. A
+    /// synchronous submission waiting on that timeline first waits for the value to be
+    /// submitted, so no batch on the queue waits for a signal queued behind it.
+    static std::atomic<VkSemaphore> async_timeline;
+    static std::atomic<u64> async_submitted_tick;
+
 private:
     static constexpr size_t AlignedPayloadSize(size_t bytes) {
         constexpr size_t alignment = alignof(std::max_align_t);
@@ -558,6 +566,8 @@ private:
     bool native_heaps_bound = false;
     u64 synchronous_borrows = 0;
     u64 recording_submits = 0;
+    bool async_submit = false;
+    void SubmitExecutionAsync(SubmitInfo& info);
     u32 batch_draws = 0;
     u32 last_batch_draws = 0;
     MasterSemaphore master_semaphore;
