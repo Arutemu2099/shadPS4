@@ -1005,6 +1005,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                                           vk::PipelineStageFlagBits2::eAllCommands)) {
                 buffer_barriers.emplace_back(*barrier);
             }
+            if (desc.is_written && VideoCore::TextureCache::BufferImageAliasDiag()) {
+                texture_cache.DiagBufferWriteOverImages(vsharp.base_address, size,
+                                                        desc.is_formatted);
+            }
             if (desc.is_written && desc.is_formatted) {
                 texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
             }

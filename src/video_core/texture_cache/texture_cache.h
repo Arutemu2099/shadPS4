@@ -94,6 +94,12 @@ public:
     /// Marks an image as dirty if it exists at the provided address.
     void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
 
+    /// SHADPS4_BUFFER_IMAGE_ALIAS_DIAG=1 (diagnostic): a shader-written buffer range overlapping
+    /// cached images. "handled" is the formatted same-base case InvalidateMemoryFromGPU marks
+    /// GpuDirty; anything else ("missed") leaves the cached image as it was.
+    static bool BufferImageAliasDiag();
+    void DiagBufferWriteOverImages(VAddr address, size_t size, bool formatted);
+
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
 

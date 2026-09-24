@@ -302,6 +302,44 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
     });
 }
 
+bool TextureCache::BufferImageAliasDiag() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_BUFFER_IMAGE_ALIAS_DIAG");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+void TextureCache::DiagBufferWriteOverImages(VAddr address, size_t size, bool formatted) {
+    static u64 handled = 0, missed = 0, writes = 0, report_at = 1;
+    static std::unordered_set<u64> seen;
+    std::scoped_lock lock{mutex};
+    ++writes;
+    ForEachImageInRegion(address, size, [&](ImageId, Image& image) {
+        const bool covered = formatted && image.info.guest_address == address;
+        ++(covered ? handled : missed);
+        const u64 key = image.info.guest_address ^ (u64(covered) << 63) ^ (u64(formatted) << 62) ^
+                        (u64(address - image.info.guest_address) << 40);
+        if (seen.size() < 96 && seen.insert(key).second) {
+            LOG_WARNING(Render_Vulkan,
+                        "BufferWriteOverImage: {} buf={:#x}+{:#x} formatted={} image={:#x}+{:#x} "
+                        "offset={:#x} {}x{}x{} {} tiled={} usage tex={} storage={} rt={} depth={}",
+                        covered ? "handled" : "MISSED", address, size, formatted,
+                        image.info.guest_address, image.info.guest_size,
+                        s64(address) - s64(image.info.guest_address), image.info.size.width,
+                        image.info.size.height, image.info.size.depth,
+                        vk::to_string(image.info.pixel_format), u32(image.info.props.is_tiled),
+                        u32(image.usage.texture), u32(image.usage.storage),
+                        u32(image.usage.render_target), u32(image.usage.depth_target));
+        }
+    });
+    if (writes >= report_at) {
+        LOG_INFO(Render_Vulkan, "BufferWriteOverImage totals: written_binds={} handled={} missed={}",
+                 writes, handled, missed);
+        report_at *= 2;
+    }
+}
+
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
     std::scoped_lock lk{mutex};
 
