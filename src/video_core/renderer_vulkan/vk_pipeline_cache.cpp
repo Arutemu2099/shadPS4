@@ -391,6 +391,13 @@ void PipelineCache::NoteStageSelection(LogicalStage l_stage, Program* program, s
     }
 }
 
+// Read once: EmulatorSettings takes a mutex and copies a shared_ptr per access, and this ran per
+// draw (~0.7% of CP wall time, 2026-09-24). Shader collection is a launch-time setting.
+static bool ShaderCollectCached() {
+    static const bool collect = EmulatorSettings.IsShaderCollect();
+    return collect;
+}
+
 PipelineCache::PreparedPipelineEntry* PipelineCache::TryPreparedPipeline(
     PreparedGraphicsState& state, bool& eligible) {
     constexpr auto fs_idx = u32(LogicalStage::Fragment);
@@ -411,7 +418,7 @@ PipelineCache::PreparedPipelineEntry* PipelineCache::TryPreparedPipeline(
     // Shader collection records module/pipeline relations on the original path only.
     if (regs.stage_enable.raw != AmdGpu::ShaderStageEnable::VgtStages::Vs ||
         !regs.ps_program.Address<u32*>() || !regs.vs_program.Address<u32*>() ||
-        EmulatorSettings.IsShaderCollect()) {
+        ShaderCollectCached()) {
         ++stats.ineligible;
         return nullptr;
     }

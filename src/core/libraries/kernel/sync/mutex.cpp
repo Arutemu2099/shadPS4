@@ -8,6 +8,7 @@
 #include <thread>
 
 #include "common/assert.h"
+#include "common/switch_mutex.h"
 
 #ifdef _WIN64
 #pragma comment(lib, "synchronization.lib")
@@ -111,3 +112,19 @@ void TimedMutex::unlock() {
 }
 
 } // namespace Libraries::Kernel
+
+namespace Common {
+
+void FutexWait(std::atomic<u32>* address, u32 value) {
+#ifdef _WIN64
+    WaitOnAddress(address, &value, sizeof(value), INFINITE);
+#endif
+}
+
+void FutexWakeOne(std::atomic<u32>* address) {
+#ifdef _WIN64
+    WakeByAddressSingle(address);
+#endif
+}
+
+} // namespace Common

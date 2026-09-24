@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include "common/switch_mutex.h"
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -379,8 +380,10 @@ private:
     /// Registered images per page_table page, maintained under `mutex`, read without it by the
     /// guest write-fault pre-check in InvalidateMemory (SHADPS4_TEX_INVALIDATE_PRECHECK=1).
     std::unique_ptr<std::atomic<u32>[]> page_image_counts;
-    std::mutex mutex;
-    std::mutex samplers_mutex;
+    // SHADPS4_FAST_TEX_MUTEX=1: inline futex locks (measured 2026-09-24: lock/unlock of these
+    // two was ~9% of the CP's wall time at ~30k acquisitions per frame).
+    Common::SwitchMutex<Common::FastTexMutexFlag> mutex;
+    Common::SwitchMutex<Common::FastTexMutexFlag> samplers_mutex;
     std::mutex download_images_mutex;
     std::unique_ptr<PreparedImages> prepared_images; // Allocated only when explicitly enabled.
     struct MetaDataInfo {
