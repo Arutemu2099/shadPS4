@@ -27,12 +27,20 @@ namespace VideoCore {
 
 namespace Offload = Common::ReadbackOffload;
 
-static bool PrebatchEnabled() {
-    static const bool enabled = [] {
+/// SHADPS4_READBACK_PREBATCH: 1 = copies of data the recorded batch does not write go ahead of
+/// it; 2 = the same, and the batch is still submitted right after, as a fault always did.
+/// Measured 2026-09-24: mode 1 alone let batches grow (787 vs 650 draws) and the remaining
+/// in-batch readbacks waited 2.9 ms instead of 1.1 ms.
+static char PrebatchMode() {
+    static const char mode = [] {
         const char* value = std::getenv("SHADPS4_READBACK_PREBATCH");
-        return value && value[0] == '1';
+        return value && (value[0] == '1' || value[0] == '2') ? value[0] : '0';
     }();
-    return enabled;
+    return mode;
+}
+
+static bool PrebatchEnabled() {
+    return PrebatchMode() != '0';
 }
 
 namespace {
@@ -736,6 +744,11 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
                 });
             job->tick = side_tick;
             job->on_readback_queue = true;
+            if (prebatch && PrebatchMode() == '2') {
+                // After the copy's submission, so the copy does not wait for this batch.
+                scheduler.EndRendering();
+                scheduler.Flush();
+            }
             const u64 n = total.fetch_add(1) + 1;
             side.fetch_add(1);
             if ((n & 0x3ff) == 0) {
