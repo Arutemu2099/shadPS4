@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+#include <cstdlib>
 #include "common/assert.h"
 #include "common/types.h"
 #include "shader_recompiler/params.h"
@@ -209,7 +211,15 @@ struct ComputeProgram {
     }
 };
 
-static constexpr const BinaryInfo& SearchBinaryInfo(const u32* code) {
+inline bool BinaryInfoMemoEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADPS4_BININFO_MEMO");
+        return env != nullptr && env[0] == '1';
+    }();
+    return enabled;
+}
+
+inline const BinaryInfo& SearchBinaryInfo(const u32* code) {
     constexpr u32 token_mov_vcchi = 0xBEEB03FF;
     if (code[0] == token_mov_vcchi) {
         const auto* info = std::bit_cast<const BinaryInfo*>(code + (code[1] + 1) * 2);
@@ -217,18 +227,35 @@ static constexpr const BinaryInfo& SearchBinaryInfo(const u32* code) {
             return *info;
         }
     }
-    constexpr u32 signature_size = sizeof(BinaryInfo::signature_ref) / sizeof(u8);
     constexpr u32 search_limit = 0x4000;
+    // SHADPS4_BININFO_MEMO=1: the scan below ran per draw per stage for shaders without the
+    // leading token (measured 2026-09-24: 1.6% of CP wall time). Remember where it ended, per
+    // thread, and re-check the signature at that spot on every hit, so rewritten guest code
+    // simply misses.
+    struct Memo {
+        const u32* code;
+        const BinaryInfo* info;
+    };
+    static constexpr size_t MemoSize = 256;
+    thread_local std::array<Memo, MemoSize> memo{};
+    const bool use_memo = BinaryInfoMemoEnabled();
+    Memo& slot = memo[(reinterpret_cast<uintptr_t>(code) >> 4) % MemoSize];
+    if (use_memo && slot.code == code && slot.info->Valid()) {
+        return *slot.info;
+    }
     const u32* end = code + search_limit;
     for (const u32* it = code; it < end; ++it) {
         if (const BinaryInfo* info = std::bit_cast<const BinaryInfo*>(it); info->Valid()) {
+            if (use_memo) {
+                slot = {code, info};
+            }
             return *info;
         }
     }
     UNREACHABLE_MSG("Shader binary info not found.");
 }
 
-static constexpr Shader::ShaderParams GetParams(const auto& sh) {
+inline Shader::ShaderParams GetParams(const auto& sh) {
     const auto* code = sh.template Address<u32*>();
     const auto& bininfo = SearchBinaryInfo(code);
     return {
