@@ -15,6 +15,7 @@
 #include "common/fault_monitor.h"
 #include "common/types.h"
 #include "core/emulator_settings.h"
+#include "video_core/buffer_cache/protect_queue.h"
 #include "video_core/buffer_cache/region_manager.h"
 #include "video_core/buffer_cache/submit_epoch.h"
 
@@ -275,12 +276,23 @@ public:
                                                     false);
             return UploadPath::Walk;
         }
+        // SHADPS4_DEFER_READ_PROTECT: the read protection this marking triggers goes to the
+        // protector thread (see ProtectQueue); the bits change here as before.
+        thread_local std::vector<DeferredWatch> read_protects;
+        const bool defer_read_protect = ProtectQueue::Enabled();
+        if (defer_read_protect) {
+            g_deferred_watch = &read_protects;
+        }
         IteratePages<false>(query_cpu_range, query_size,
                             [&func, is_written](RegionManager* manager, u64 offset, size_t size) {
                                 manager->template ChangeRegionState<Type::GPU, true>(
                                     manager->GetCpuAddr() + offset, size);
                                 manager->lock.unlock();
                             });
+        if (defer_read_protect) {
+            g_deferred_watch = nullptr;
+            ProtectQueue::Instance().Push(read_protects);
+        }
         Common::FaultMonitor::CountUploadPhases(Common::FaultMonitor::DiffNs(t_scan, t_copy),
                                                 Common::FaultMonitor::DiffNs(t_copy, t_mark),
                                                 Common::FaultMonitor::SinceNs(t_mark), true);

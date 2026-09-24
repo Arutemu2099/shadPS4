@@ -8,6 +8,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/fault_monitor.h"
+#include "video_core/buffer_cache/protect_queue.h"
 #include "video_core/buffer_cache/submit_epoch.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
@@ -280,6 +281,7 @@ void Liverpool::Process(std::stop_token stoken) {
             submit_done = false;
         }
 
+        VideoCore::ProtectFence();
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
     }
 }
@@ -860,6 +862,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     rasterizer->ProcessDownloadImages();
                 }
                 g_cp_wait.NoteWrite(event_eos->Address());
+                VideoCore::ProtectFence();
                 event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
                     auto* memory = Core::Memory::Instance();
                     if (!memory->TryWriteBacking(address, &data, num_bytes)) {
@@ -882,6 +885,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     rasterizer->ProcessDownloadImages();
                 }
                 g_cp_wait.NoteWrite(event_eop->Address<u32>());
+                VideoCore::ProtectFence();
                 event_eop->SignalFence(
                     [](void* address, u64 data, u32 num_bytes) {
                         auto* memory = Core::Memory::Instance();
@@ -934,6 +938,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const u32 data_size = (header->type3.count.Value() - 2) * 4;
                 u64* address = write_data->Address<u64*>();
                 g_cp_wait.NoteWrite(address);
+                VideoCore::ProtectFence();
                 if (!write_data->wr_one_addr.Value()) {
                     std::memcpy(address, write_data->data, data_size);
                 } else {
@@ -1306,6 +1311,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
             g_cp_wait.NoteWrite(write_data->Address<void*>());
+            VideoCore::ProtectFence();
             if (!write_data->wr_one_addr.Value()) {
                 std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
             } else {
@@ -1348,6 +1354,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 rasterizer->ProcessDownloadImages();
             }
             g_cp_wait.NoteWrite(release_mem->Address<void*>());
+            VideoCore::ProtectFence();
             release_mem->SignalFence(
                 [pipe_id = queue.pipe_id] {
                     Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
