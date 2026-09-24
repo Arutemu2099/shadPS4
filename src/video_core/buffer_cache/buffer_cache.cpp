@@ -1221,7 +1221,7 @@ bool BufferCache::PublishFaultJob(FaultJob& job) {
     }
     memory_tracker->ForEachDownloadRange<false>(
         job.addr, job.size, [&](u64 device_addr_out, u64 range_size) {
-            gpu_modified_ranges.Subtract(device_addr_out, range_size);
+            gpu_modified_ranges.Subtract(device_addr_out, range_size); MemoryTracker::gpu_clear_epoch.fetch_add(1, std::memory_order_acq_rel);
             Common::FaultMonitor::CountRangeSubtract(
                 gpu_modified_ranges.m_ranges_set.iterative_size());
         });
@@ -1344,7 +1344,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
                 total_size_bytes += (new_size + align - 1) & mask;
             };
             gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, add_download);
-            gpu_modified_ranges.Subtract(device_addr_out, range_size);
+            gpu_modified_ranges.Subtract(device_addr_out, range_size); MemoryTracker::gpu_clear_epoch.fetch_add(1, std::memory_order_acq_rel);
             Common::FaultMonitor::CountRangeSubtract(
                 gpu_modified_ranges.m_ranges_set.iterative_size());
         });
@@ -1700,10 +1700,55 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         sample.AddFindNs(sample.SinceNs(t_find));
     }
     Buffer& buffer = slot_buffers[buffer_id];
+    // SHADPS4_WRITTEN_MEMO=1: a GPU-written binding of exactly this range was fully synchronized
+    // and marked GPU-modified before, and since then no GPU-modified bit was cleared anywhere
+    // (download/publication bump the epoch), no page in its regions became CPU-dirty, and no
+    // readback job is pending (their write-sequence vote needs the marking). Then the walk
+    // would upload nothing and change no bit: skip it, and the range add it would repeat.
+    // Measured 2026-09-24: written bindings walk and lock every region with no fast path.
+    static const bool written_memo = [] {
+        const char* value = std::getenv("SHADPS4_WRITTEN_MEMO");
+        return value && value[0] == '1';
+    }();
+    u64 memo_epoch = 0;
+    WrittenMemoEntry* memo_entry = nullptr;
+    if (written_memo && is_written) {
+        static u64 calls = 0, hits = 0, miss_key = 0, miss_epoch = 0, miss_jobs = 0, miss_cpu = 0;
+        ++calls;
+        memo_epoch = MemoryTracker::gpu_clear_epoch.load(std::memory_order_acquire);
+        const u64 h = (device_addr * 0x9E3779B97F4A7C15ULL) ^ (u64(size) * 0xC2B2AE3D27D4EB4FULL);
+        memo_entry = &written_memo_table[(h ^ (h >> 29)) % written_memo_table.size()];
+        bool hit = false;
+        if (memo_entry->addr != device_addr || memo_entry->size != size) {
+            ++miss_key;
+        } else if (memo_entry->epoch != memo_epoch) {
+            ++miss_epoch;
+        } else if (pending_fault_jobs.load(std::memory_order_acquire) != 0) {
+            ++miss_jobs;
+        } else if (!memory_tracker->RangeCpuClean(device_addr, size)) {
+            ++miss_cpu;
+        } else {
+            hit = true;
+            ++hits;
+        }
+        if ((calls & 0xffff) == 0) {
+            LOG_INFO(Render, "WrittenMemo: calls={} hits={} ({:.1f}%) miss_key={} miss_epoch={} "
+                             "miss_jobs={} miss_cpu={}",
+                     calls, hits, 100.0 * double(hits) / double(calls), miss_key, miss_epoch,
+                     miss_jobs, miss_cpu);
+        }
+        if (hit) {
+            return {&buffer, buffer.Offset(device_addr)};
+        }
+    }
     const auto t_sync = Common::FaultMonitor::Now();
     const auto t_sample_sync = sample.Now();
     SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer,
                       sample.Active() ? &sample : nullptr);
+    if (memo_entry) {
+        // Epoch read before the walk: a clear during it makes the record miss next time.
+        *memo_entry = {device_addr, size, memo_epoch};
+    }
     sample.AddSyncNs(sample.SinceNs(t_sample_sync));
     Common::FaultMonitor::CountObtainSync(query_ns, Common::FaultMonitor::SinceNs(t_sync));
     if (is_written) {

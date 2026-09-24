@@ -78,8 +78,17 @@ public:
         });
     }
 
+    /// Bumped before any GPU-modified bit is cleared (SHADPS4_WRITTEN_MEMO). CP thread only.
+    static inline std::atomic<u64> gpu_clear_epoch{0};
+
+    /// True when no CPU-dirty page is recorded in any region the range touches (lock-free).
+    bool RangeCpuClean(VAddr cpu_addr, u64 size) const {
+        return AllRegionsSkippable(cpu_addr, size);
+    }
+
     /// Unmark region as modified from the host GPU
     void UnmarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
+        gpu_clear_epoch.fetch_add(1, std::memory_order_acq_rel);
         IteratePages<false>(dirty_cpu_addr, query_size,
                             [](RegionManager* manager, u64 offset, size_t size) {
                                 std::scoped_lock lk{manager->lock};

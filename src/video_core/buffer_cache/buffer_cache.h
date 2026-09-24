@@ -391,6 +391,12 @@ private:
     /// measure whether readback data is already complete when a fault asks for it.
     std::unique_ptr<u64[]> producer_ticks;
     void NoteGpuWrite(VAddr addr, u64 size);
+    struct WrittenMemoEntry {
+        VAddr addr{};
+        u64 size{};
+        u64 epoch{};
+    };
+    std::array<WrittenMemoEntry, 4096> written_memo_table{};
     bool AsyncFaultCopies();
     void RecordFaultCopiesAsync(Buffer& source, vk::Buffer staging,
                                 std::span<const vk::BufferCopy> copies);
