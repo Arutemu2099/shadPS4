@@ -406,6 +406,30 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
             const char* value = std::getenv("SHADPS4_NEO_REG_DIAG");
             return value && value[0] == '1';
         }();
+        if (neo_reg_diag) {
+            // Sample-location registers (PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0 .. X1Y1_0) and
+            // PA_SC_AA_CONFIG: log each change with a timestamp (first 200), to see whether the
+            // Pro checkerboard alternates sample positions per frame.
+            const auto& ra = liverpool->regs.reg_array;
+            constexpr u32 base = AmdGpu::Regs::ContextRegWordOffset;
+            const std::array<u32, 5> locs{ra[base + 0x2F8], ra[base + 0x2FE], ra[base + 0x302],
+                                          ra[base + 0x306], ra[base + 0x30A]};
+            static std::array<u32, 5> last_locs{};
+            static u32 loc_lines = 0;
+            if (locs != last_locs && loc_lines < 200) {
+                ++loc_lines;
+                last_locs = locs;
+                const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count();
+                LOG_WARNING(Render_Vulkan,
+                            "NeoSampleLocs: t={}us AA_CONFIG={:#x} X0Y0={:#010x} X1Y0={:#010x} "
+                            "X0Y1={:#010x} X1Y1={:#010x} rt0={}x{}",
+                            us, locs[0], locs[1], locs[2], locs[3], locs[4],
+                            liverpool->regs.color_buffers[0].Pitch(),
+                            liverpool->regs.color_buffers[0].Height());
+            }
+        }
         if (neo_reg_diag && liverpool->regs.depth_buffer.DepthValid()) {
             static constexpr std::array<u32, 16> offsets{
                 0x000, 0x003, 0x010, 0x011, 0x012, 0x014, 0x016, 0x017,
