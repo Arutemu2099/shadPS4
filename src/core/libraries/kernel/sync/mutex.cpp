@@ -3,25 +3,75 @@
 
 #include "mutex.h"
 
+#include <cstdlib>
+#include <string_view>
+#include <thread>
+
 #include "common/assert.h"
+
+#ifdef _WIN64
+#pragma comment(lib, "synchronization.lib")
+#endif
 
 namespace Libraries::Kernel {
 
+#ifdef _WIN64
+bool TimedMutex::UserMode() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_USER_MUTEX");
+        return value != nullptr && std::string_view{value} == "1";
+    }();
+    return enabled;
+}
+
+bool TimedMutex::LockSlow(u32 timeout_ms) {
+    // Brief spin first: guest critical sections are usually short.
+    for (int i = 0; i < 64; ++i) {
+        u32 expected = 0;
+        if (state.load(std::memory_order_relaxed) == 0 &&
+            state.compare_exchange_weak(expected, 1, std::memory_order_acquire,
+                                        std::memory_order_relaxed)) {
+            return true;
+        }
+        YieldProcessor();
+    }
+    // Mark contended; whoever takes it from here also leaves it marked, so unlock wakes.
+    if (state.exchange(2, std::memory_order_acquire) == 0) {
+        return true;
+    }
+    u32 contended = 2;
+    WaitOnAddress(&state, &contended, sizeof(contended), timeout_ms);
+    return state.exchange(2, std::memory_order_acquire) == 0;
+}
+#endif
+
 TimedMutex::TimedMutex() {
 #ifdef _WIN64
-    mtx = CreateMutex(nullptr, false, nullptr);
-    ASSERT(mtx);
+    if (!UserMode()) {
+        mtx = CreateMutex(nullptr, false, nullptr);
+        ASSERT(mtx);
+    }
 #endif
 }
 
 TimedMutex::~TimedMutex() {
 #ifdef _WIN64
-    CloseHandle(mtx);
+    if (mtx) {
+        CloseHandle(mtx);
+    }
 #endif
 }
 
 void TimedMutex::lock() {
 #ifdef _WIN64
+    if (UserMode()) {
+        if (try_lock()) {
+            return;
+        }
+        while (!LockSlow(INFINITE)) {
+        }
+        return;
+    }
     for (;;) {
         u64 res = WaitForSingleObjectEx(mtx, INFINITE, true);
         if (res == WAIT_OBJECT_0) {
@@ -35,6 +85,11 @@ void TimedMutex::lock() {
 
 bool TimedMutex::try_lock() {
 #ifdef _WIN64
+    if (UserMode()) {
+        u32 expected = 0;
+        return state.compare_exchange_strong(expected, 1, std::memory_order_acquire,
+                                             std::memory_order_relaxed);
+    }
     return WaitForSingleObjectEx(mtx, 0, true) == WAIT_OBJECT_0;
 #else
     return mtx.try_lock();
@@ -43,6 +98,12 @@ bool TimedMutex::try_lock() {
 
 void TimedMutex::unlock() {
 #ifdef _WIN64
+    if (UserMode()) {
+        if (state.exchange(0, std::memory_order_release) == 2) {
+            WakeByAddressSingle(&state);
+        }
+        return;
+    }
     ReleaseMutex(mtx);
 #else
     mtx.unlock();

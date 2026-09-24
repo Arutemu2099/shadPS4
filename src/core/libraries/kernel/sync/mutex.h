@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 
 #include "common/types.h"
@@ -50,6 +52,21 @@ public:
     template <class Clock, class Duration>
     bool try_lock_until(const std::chrono::time_point<Clock, Duration>& abs_time) {
 #ifdef _WIN64
+        if (UserMode()) {
+            if (try_lock()) {
+                return true;
+            }
+            for (;;) {
+                const auto now = Clock::now();
+                if (abs_time <= now) {
+                    return false;
+                }
+                const auto rel_ms = std::chrono::ceil<std::chrono::milliseconds>(abs_time - now);
+                if (LockSlow(static_cast<u32>(std::min<s64>(rel_ms.count(), 0x7FFFFFFF)))) {
+                    return true;
+                }
+            }
+        }
         for (;;) {
             const auto now = Clock::now();
             if (abs_time <= now) {
@@ -71,7 +88,16 @@ public:
 
 private:
 #ifdef _WIN64
-    HANDLE mtx;
+    /// SHADPS4_USER_MUTEX=1: a user-mode futex lock (0 free, 1 held, 2 held with waiters) on
+    /// WaitOnAddress instead of a kernel mutex object, so uncontended lock/unlock/try_lock make
+    /// no system call. Measured 2026-09-24: Game:Main spent ~27% of its wall time inside
+    /// ReleaseMutex and ~11% in WaitForSingleObjectEx through guest pthread mutexes.
+    static bool UserMode();
+    /// One contended acquisition attempt that may sleep for up to timeout_ms (INFINITE ok).
+    bool LockSlow(u32 timeout_ms);
+
+    HANDLE mtx{};
+    std::atomic<u32> state{0};
 #else
     std::timed_mutex mtx;
 #endif
