@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <unordered_map>
 #include <boost/container/small_vector.hpp>
 #include <cstdlib>
 #include <immintrin.h>
@@ -1132,11 +1133,48 @@ void TextureCache::InvalidatePreparedImages() {
     }
 }
 
+namespace {
+/// SHADPS4_IMAGE_CHURN_LOG=1 (diagnostic): logs register/unregister of images whose guest
+/// address has been registered 3+ times - the texture cache recreating a surface - capped at
+/// 400 lines. CP thread and fault paths both register, so the map is guarded.
+void LogImageChurn(const char* what, const VideoCore::Image& image) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_IMAGE_CHURN_LOG");
+        return value && value[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    static std::mutex churn_mutex;
+    static std::unordered_map<VAddr, u32> registrations;
+    static u32 lines = 0;
+    std::scoped_lock lock{churn_mutex};
+    const auto& info = image.info;
+    u32& count = registrations[info.guest_address];
+    if (what[0] == 'R') {
+        ++count;
+    }
+    if (count < 3 || lines >= 400) {
+        return;
+    }
+    ++lines;
+    LOG_WARNING(Render_Vulkan,
+                "ImageChurn: {} #{} addr={:#x} size={:#x} {}x{}x{} {} samples={} type={} "
+                "tile={} layers={} mips={} depth={} uid={}",
+                what, count, info.guest_address, info.guest_size, info.size.width,
+                info.size.height, info.size.depth, vk::to_string(info.pixel_format),
+                info.num_samples, static_cast<u32>(info.type), static_cast<u32>(info.tile_mode),
+                info.resources.layers, info.resources.levels, info.props.is_depth,
+                image.image_uid);
+}
+} // namespace
+
 void TextureCache::RegisterImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    LogImageChurn("Register", image);
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
@@ -1151,6 +1189,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
+    LogImageChurn("Unregister", image);
     lru_cache.Free(image.lru_id);
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {

@@ -1044,8 +1044,18 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
 VideoCore::ImageId Rasterizer::StencilScratchFor(VideoCore::ImageId depth_id,
                                                  const VideoCore::ImageInfo& info) {
     const u64 depth_uid = texture_cache.GetImage(depth_id).image_uid;
-    for (const auto& entry : stencil_scratches) {
+    for (auto& entry : stencil_scratches) {
         if (entry.depth_id == depth_id && entry.depth_uid == depth_uid) {
+            return entry.scratch_id;
+        }
+    }
+    // The depth image can be recreated at the same address (same surface): reuse the scratch.
+    for (auto& entry : stencil_scratches) {
+        const auto& scratch = texture_cache.GetImage(entry.scratch_id);
+        if (scratch.info.guest_address == info.guest_address &&
+            scratch.info.size == info.size && scratch.info.pixel_format == info.pixel_format) {
+            entry.depth_id = depth_id;
+            entry.depth_uid = depth_uid;
             return entry.scratch_id;
         }
     }
