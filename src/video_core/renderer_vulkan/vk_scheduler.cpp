@@ -333,6 +333,11 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         SubmitExecutionAsync(info);
         return;
     }
+    if (async_submit) {
+        // Inside a borrow scope. The worker may still hold queued submissions, which take
+        // submit_mutex: drain it before taking the lock below, or both wait forever.
+        DrainRecording();
+    }
     // A batch on this queue must not wait for a draw-timeline value the async worker has not
     // submitted yet: it would block the queue ahead of its own signal.
     if (const VkSemaphore async = async_timeline.load(); async != VK_NULL_HANDLE) {
@@ -405,6 +410,10 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     ImGui::Core::TextureManager::Submit();
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    if (async_submit) {
+        // A synchronous submission of the async timeline (inside a borrow scope) counts too.
+        async_submitted_tick.store(signal_value, std::memory_order_release);
+    }
 
     master_semaphore.Refresh();
     AllocateWorkerCommandBuffers();
