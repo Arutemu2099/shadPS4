@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdlib>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -123,9 +124,25 @@ public:
         return buffer.bda_addr;
     }
 
+    /// SHADPS4_SMART_BUFFER_BARRIERS=1: emit a barrier only for a real hazard. A read after a
+    /// read needs none; a read after a write needs one only until that write has been made
+    /// visible to the reading stage and access; a write waits for every earlier read and write.
+    /// Measured 2026-09-24: ~490 buffer barrier calls per frame (each also ends the render pass)
+    /// under the default "any change of access or stage" rule.
+    static bool SmartBarriers() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("SHADPS4_SMART_BUFFER_BARRIERS");
+            return value != nullptr && value[0] == '1';
+        }();
+        return enabled;
+    }
+
     std::optional<vk::BufferMemoryBarrier2> GetBarrier(vk::AccessFlags2 dst_acess_mask,
                                                        vk::PipelineStageFlagBits2 dst_stage,
                                                        u32 offset = 0) {
+        if (SmartBarriers()) {
+            return GetHazardBarrier(dst_acess_mask, vk::PipelineStageFlags2{dst_stage}, offset);
+        }
         if (dst_acess_mask == access_mask && stage == dst_stage) {
             return {};
         }
@@ -147,6 +164,69 @@ public:
     }
 
     void Fill(u64 offset, u32 num_bytes, u32 value);
+
+private:
+    static constexpr vk::AccessFlags2 WriteAccessBits =
+        vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite |
+        vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eMemoryWrite |
+        vk::AccessFlagBits2::eHostWrite | vk::AccessFlagBits2::eColorAttachmentWrite |
+        vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+        vk::AccessFlagBits2::eTransformFeedbackWriteEXT |
+        vk::AccessFlagBits2::eTransformFeedbackCounterWriteEXT;
+
+    std::optional<vk::BufferMemoryBarrier2> GetHazardBarrier(vk::AccessFlags2 dst_access,
+                                                             vk::PipelineStageFlags2 dst_stages,
+                                                             u32 offset) {
+        const bool is_write = bool(dst_access & WriteAccessBits);
+        if (!is_write) {
+            const bool covered = (hz_visible_stages & dst_stages) == dst_stages &&
+                                 (hz_visible_access & dst_access) == dst_access;
+            hz_read_stages |= dst_stages;
+            if (!hz_write_access || covered) {
+                return {};
+            }
+            const auto barrier = vk::BufferMemoryBarrier2{
+                .srcStageMask = hz_write_stages,
+                .srcAccessMask = hz_write_access,
+                .dstStageMask = dst_stages,
+                .dstAccessMask = dst_access,
+                .buffer = buffer.buffer,
+                .offset = offset,
+                .size = size_bytes - offset,
+            };
+            hz_visible_stages |= dst_stages;
+            hz_visible_access |= dst_access;
+            return barrier;
+        }
+        vk::PipelineStageFlags2 src_stages = hz_write_stages | hz_read_stages;
+        if (!src_stages) {
+            src_stages = vk::PipelineStageFlagBits2::eAllCommands;
+        }
+        const auto barrier = vk::BufferMemoryBarrier2{
+            .srcStageMask = src_stages,
+            .srcAccessMask = hz_write_access,
+            .dstStageMask = dst_stages,
+            .dstAccessMask = dst_access,
+            .buffer = buffer.buffer,
+            .offset = offset,
+            .size = size_bytes - offset,
+        };
+        hz_write_stages = dst_stages;
+        hz_write_access = dst_access & WriteAccessBits;
+        hz_read_stages = {};
+        hz_visible_stages = {};
+        hz_visible_access = {};
+        return barrier;
+    }
+
+    // Hazard state for SmartBarriers(); starts as "unknown write by anything".
+    vk::PipelineStageFlags2 hz_write_stages{vk::PipelineStageFlagBits2::eAllCommands};
+    vk::AccessFlags2 hz_write_access{vk::AccessFlagBits2::eMemoryWrite};
+    vk::PipelineStageFlags2 hz_read_stages{};
+    vk::PipelineStageFlags2 hz_visible_stages{};
+    vk::AccessFlags2 hz_visible_access{};
+
+public:
 
 public:
     VAddr cpu_addr = 0;
