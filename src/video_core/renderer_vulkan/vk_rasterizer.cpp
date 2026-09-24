@@ -1510,6 +1510,13 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             attachment.clear_value[1] = is_stencil_clear ? regs.stencil_clear : 0u;
             attachment.has_stencil = true;
             attachment.stencil_clear = is_stencil_clear;
+        } else if (regs.depth_buffer.DepthValid() &&
+                   LiverpoolToVK::PromoteDepthToStencil(regs.depth_buffer.z_info.format,
+                                                        regs.depth_buffer.stencil_info.format)) {
+            // Promoted D32S8: attach the stencil aspect (loaded, never cleared) so the attachment
+            // matches the pipeline's stencil format.
+            attachment.has_stencil = true;
+            attachment.stencil_clear = false;
         }
 
         image.usage.depth_target = true;

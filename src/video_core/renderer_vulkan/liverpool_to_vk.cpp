@@ -808,6 +808,16 @@ std::span<const DepthFormatInfo> DepthFormats() {
     return formats;
 }
 
+bool PromoteDepthToStencil(DepthBuffer::ZFormat z_format,
+                           DepthBuffer::StencilFormat stencil_format) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_DEPTH_PROMOTE_S8");
+        return value && value[0] == '1';
+    }();
+    return enabled && z_format == DepthBuffer::ZFormat::Z32Float &&
+           stencil_format == DepthBuffer::StencilFormat::Invalid;
+}
+
 vk::Format DepthFormat(DepthBuffer::ZFormat z_format, DepthBuffer::StencilFormat stencil_format) {
     const auto& formats = DepthFormats();
     const auto format =

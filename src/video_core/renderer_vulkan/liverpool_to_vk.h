@@ -74,6 +74,13 @@ std::span<const DepthFormatInfo> DepthFormats();
 vk::Format DepthFormat(AmdGpu::DepthBuffer::ZFormat z_format,
                        AmdGpu::DepthBuffer::StencilFormat stencil_format);
 
+/// SHADPS4_DEPTH_PROMOTE_S8=1: a Z32Float depth buffer bound without stencil is created, viewed
+/// and attached as D32S8, so a surface the guest binds with and without stencil (PS4 Pro
+/// checkerboard) stays one image instead of being recreated - and its stencil lost - each time.
+/// Stencil testing still follows the guest (stencil_enable && StencilValid).
+bool PromoteDepthToStencil(AmdGpu::DepthBuffer::ZFormat z_format,
+                           AmdGpu::DepthBuffer::StencilFormat stencil_format);
+
 vk::ClearValue ColorBufferClearValue(const AmdGpu::ColorBuffer& color_buffer);
 
 vk::SampleCountFlagBits NumSamples(u32 num_samples, vk::SampleCountFlags supported_flags);

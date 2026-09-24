@@ -782,6 +782,10 @@ bool PipelineCache::RefreshGraphicsKey() {
     key.stencil_format = regs.depth_buffer.StencilValid()
                              ? regs.depth_buffer.stencil_info.format
                              : AmdGpu::DepthBuffer::StencilFormat::Invalid;
+    if (LiverpoolToVK::PromoteDepthToStencil(key.z_format, key.stencil_format)) {
+        // Matches the promoted D32S8 attachment; stencil testing stays off (not StencilValid).
+        key.stencil_format = AmdGpu::DepthBuffer::StencilFormat::Stencil8;
+    }
     key.depth_clamp_enable = !regs.depth_render_override.disable_viewport_clamp;
     key.depth_clip_enable = regs.clipper_control.ZclipEnable();
     key.clip_space = regs.clipper_control.clip_space;

@@ -93,6 +93,10 @@ ImageInfo::ImageInfo(const AmdGpu::DepthBuffer& buffer, u32 num_slices, VAddr ht
     props.is_tiled = buffer.IsTiled();
     props.is_depth = true;
     props.has_stencil = buffer.stencil_info.format != AmdGpu::DepthBuffer::StencilFormat::Invalid;
+    if (LiverpoolToVK::PromoteDepthToStencil(buffer.z_info.format, buffer.stencil_info.format)) {
+        pixel_format = vk::Format::eD32SfloatS8Uint;
+        props.has_stencil = true;
+    }
     num_samples = buffer.NumSamples();
     num_bits = buffer.NumBits();
     size.width = hint.Valid() ? hint.width : buffer.Pitch();

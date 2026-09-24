@@ -83,6 +83,10 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::DepthBuffer& depth_buffer, AmdGpu::De
                              AmdGpu::DepthControl ctl) {
     format = Vulkan::LiverpoolToVK::DepthFormat(depth_buffer.z_info.format,
                                                 depth_buffer.stencil_info.format);
+    if (Vulkan::LiverpoolToVK::PromoteDepthToStencil(depth_buffer.z_info.format,
+                                                     depth_buffer.stencil_info.format)) {
+        format = vk::Format::eD32SfloatS8Uint;
+    }
     is_storage = ctl.depth_write_enable;
     range.base.layer = view.slice_start;
     range.extent.layers = view.NumSlices() - range.base.layer;
