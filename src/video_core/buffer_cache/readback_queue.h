@@ -111,6 +111,49 @@ public:
         return semaphore;
     }
 
+    /// SHADPS4_READBACK_PREBATCH with SHADPS4_ASYNC_SUBMIT: the command processor reserves the
+    /// value here, in order, and the recording worker submits it with SubmitReserved when it
+    /// reaches that point of the command stream - after every batch recorded before it and
+    /// before the batch still being recorded.
+    u64 ReserveTick() noexcept {
+        return semaphore.NextTick();
+    }
+
+    template <typename Record>
+    void SubmitReserved(u64 signal_value, Record&& record) {
+        const size_t slot = next_slot++ % NumSlots;
+        semaphore.Wait(slot_values[slot]);
+        const vk::CommandBuffer cmdbuf = cmdbufs[slot];
+        ASSERT(cmdbuf.reset() == vk::Result::eSuccess);
+        ASSERT(cmdbuf.begin(vk::CommandBufferBeginInfo{
+                   .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit}) ==
+               vk::Result::eSuccess);
+        record(cmdbuf);
+        ASSERT(cmdbuf.end() == vk::Result::eSuccess);
+        const vk::Semaphore signal_semaphore = semaphore.Handle();
+        const vk::TimelineSemaphoreSubmitInfo timeline_info = {
+            .signalSemaphoreValueCount = 1,
+            .pSignalSemaphoreValues = &signal_value,
+        };
+        const vk::SubmitInfo submit_info = {
+            .pNext = &timeline_info,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &cmdbuf,
+            .signalSemaphoreCount = 1,
+            .pSignalSemaphores = &signal_semaphore,
+        };
+        vk::Result result;
+        if (submit_lock) {
+            std::scoped_lock lk{*submit_lock};
+            result = queue.submit(submit_info);
+        } else {
+            result = queue.submit(submit_info);
+        }
+        ASSERT_MSG(result == vk::Result::eSuccess, "ReadbackQueue: submit failed: {}",
+                   vk::to_string(result));
+        slot_values[slot] = signal_value;
+    }
+
     /// True when this is the main graphics queue (copies are ordered by submission).
     bool InQueueOrder() const noexcept {
         return submit_lock != nullptr;

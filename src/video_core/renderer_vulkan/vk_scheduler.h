@@ -426,6 +426,12 @@ public:
     }
 
     void DrainRecording();
+    /// Hands the recording worker everything recorded so far without waiting.
+    void PublishRecording() {
+        if (recording_worker) {
+            recording_worker->Publish();
+        }
+    }
     void CommitDynamicState();
     void PushDescriptors(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
                          std::span<const vk::WriteDescriptorSet> writes);

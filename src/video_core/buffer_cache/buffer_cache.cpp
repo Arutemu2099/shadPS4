@@ -199,7 +199,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     memory_tracker = std::make_unique<MemoryTracker>(tracker);
     if (instance.HasReadbackQueue()) {
         readback_queue = std::make_unique<ReadbackQueue>(instance);
-    } else if (PrebatchEnabled() && Offload::Enabled() && !std::getenv("SHADPS4_ASYNC_SUBMIT")) {
+    } else if (PrebatchEnabled() && Offload::Enabled()) {
         readback_queue = std::make_unique<ReadbackQueue>(
             instance, instance.GetGraphicsQueue(), instance.GetGraphicsQueueFamilyIndex(),
             &Vulkan::Scheduler::submit_mutex);
@@ -736,12 +736,30 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
                                       : (producer != 0 && producer < tick);
         if (side_ok) {
             static std::atomic<u64> side{0}, total{0};
-            const u64 side_tick = readback_queue->Submit(
-                scheduler.GetMasterSemaphore()->Handle(), producer, [&](vk::CommandBuffer cmd) {
-                    RecordFaultCopiesOnReadbackQueue(cmd, buffer, staging_handle,
-                                                     {vk_copies.data(), vk_copies.size()},
-                                                     prebatch);
+            u64 side_tick = 0;
+            if (prebatch && AsyncFaultCopies()) {
+                // Asynchronous submission: batches recorded before this point may not be
+                // submitted yet, so the recording worker submits the copy when it gets here.
+                side_tick = readback_queue->ReserveTick();
+                std::vector<vk::BufferCopy> owned(vk_copies.begin(), vk_copies.end());
+                scheduler.Record([this, rq = readback_queue.get(), side_tick,
+                                  src = buffer.Handle(), staging_handle,
+                                  owned = std::move(owned)](vk::CommandBuffer) {
+                    rq->SubmitReserved(side_tick, [&](vk::CommandBuffer cmd) {
+                        RecordFaultCopiesOnReadbackQueue(cmd, src, staging_handle,
+                                                         {owned.data(), owned.size()}, true);
+                    });
                 });
+                scheduler.PublishRecording();
+            } else {
+                side_tick = readback_queue->Submit(
+                    scheduler.GetMasterSemaphore()->Handle(), producer,
+                    [&](vk::CommandBuffer cmd) {
+                        RecordFaultCopiesOnReadbackQueue(cmd, buffer.Handle(), staging_handle,
+                                                         {vk_copies.data(), vk_copies.size()},
+                                                         prebatch);
+                    });
+            }
             job->tick = side_tick;
             job->on_readback_queue = true;
             if (prebatch && PrebatchMode() == '2') {
@@ -786,7 +804,7 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
     return {id, tick};
 }
 
-void BufferCache::RecordFaultCopiesOnReadbackQueue(vk::CommandBuffer cmdbuf, Buffer& source,
+void BufferCache::RecordFaultCopiesOnReadbackQueue(vk::CommandBuffer cmdbuf, vk::Buffer source,
                                                     vk::Buffer staging,
                                                     std::span<const vk::BufferCopy> copies,
                                                     bool in_queue_order) {
@@ -807,7 +825,7 @@ void BufferCache::RecordFaultCopiesOnReadbackQueue(vk::CommandBuffer cmdbuf, Buf
             .pMemoryBarriers = &before,
         });
     }
-    cmdbuf.copyBuffer(source.Handle(), staging, copies);
+    cmdbuf.copyBuffer(source, staging, copies);
     if (in_queue_order) {
         const vk::MemoryBarrier2 after{
             .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,

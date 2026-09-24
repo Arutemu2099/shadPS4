@@ -265,7 +265,7 @@ private:
     void WaitFaultJob(const FaultJob& job);
     /// Newest main-timeline tick that GPU-wrote any byte of the range (0 if never).
     u64 ProducerTick(VAddr addr, u64 size) const;
-    void RecordFaultCopiesOnReadbackQueue(vk::CommandBuffer cmdbuf, Buffer& source,
+    void RecordFaultCopiesOnReadbackQueue(vk::CommandBuffer cmdbuf, vk::Buffer source,
                                           vk::Buffer staging,
                                           std::span<const vk::BufferCopy> copies,
                                           bool in_queue_order);
