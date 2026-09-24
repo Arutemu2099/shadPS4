@@ -8,6 +8,7 @@
 #include <thread>
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/switch_mutex.h"
 
 #ifdef _WIN64
@@ -126,5 +127,41 @@ void FutexWakeOne(std::atomic<u32>* address) {
     WakeByAddressSingle(address);
 #endif
 }
+
+void ReportMutexReentry(const char* name, void* outer_caller, void* inner_caller) {
+    static std::atomic<u64> events{0};
+    const u64 n = events.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n > 20 && (n & (n - 1)) != 0) {
+        return;
+    }
+#ifdef _WIN64
+    const auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+#else
+    const uintptr_t base = 0;
+#endif
+    // Offsets from the EXE base: symbolize with the archived PDB (llvm-symbolizer --obj).
+    LOG_ERROR(Kernel, "SwitchMutex re-entry #{} ({}) tid={} outer=exe+{:#x} inner=exe+{:#x}", n, name,
+              GetCurrentThreadId(), reinterpret_cast<uintptr_t>(outer_caller) - base,
+              reinterpret_cast<uintptr_t>(inner_caller) - base);
+}
+
+#ifdef _WIN64
+static_assert(sizeof(SRWLOCK) == sizeof(void*));
+void SrwLockExclusive(void** lock) {
+    AcquireSRWLockExclusive(reinterpret_cast<PSRWLOCK>(lock));
+}
+bool SrwTryLockExclusive(void** lock) {
+    return TryAcquireSRWLockExclusive(reinterpret_cast<PSRWLOCK>(lock)) != 0;
+}
+void SrwUnlockExclusive(void** lock) {
+    ReleaseSRWLockExclusive(reinterpret_cast<PSRWLOCK>(lock));
+}
+#else
+void SrwLockExclusive(void**) {}
+bool SrwTryLockExclusive(void**) {
+    return false;
+}
+void SrwUnlockExclusive(void**) {}
+#endif
 
 } // namespace Common
