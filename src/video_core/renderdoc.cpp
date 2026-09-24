@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <cstdlib>
 #include "common/assert.h"
 #include "common/logging/formatter.h"
 #include "core/emulator_settings.h"
@@ -142,6 +144,24 @@ void OnFrameBoundary() {
         return;
     }
 
+    // Diagnostic: SHADPS4_RENDERDOC_AUTO_CAPTURE_S=N triggers one capture at the first present
+    // N seconds after the first present, without a keypress (F12 needs window focus).
+    static const double auto_capture_s = [] {
+        const char* value = std::getenv("SHADPS4_RENDERDOC_AUTO_CAPTURE_S");
+        return value ? std::atof(value) : 0.0;
+    }();
+    if (auto_capture_s > 0.0) {
+        static const auto first_present = std::chrono::steady_clock::now();
+        static bool auto_fired = false;
+        if (!auto_fired && std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                         first_present)
+                                   .count() >= auto_capture_s) {
+            auto_fired = true;
+            TriggerCapture();
+            LOG_INFO(Render, "RenderDoc auto capture triggered at {:.0f} s", auto_capture_s);
+        }
+    }
+
     // Both boundaries of a capture must be presents, otherwise the recorded range is an arbitrary
     // slice of a frame: starting when the GPU thread happens to wake mid-frame yields only the
     // tail, and a range that misses the final composite presents a black image.
@@ -171,8 +191,14 @@ void SetOutputDir(const std::filesystem::path& path, const std::string& prefix) 
     if (!rdoc_api) {
         return;
     }
-    LOG_WARNING(Common, "RenderDoc capture path: {}", (path / prefix).string());
-    rdoc_api->SetCaptureFilePathTemplate(fmt::UTF((path / prefix).u8string()).data.data());
+    // Diagnostic: SHADPS4_RENDERDOC_CAPTURE_NAME replaces the file prefix. RenderDoc's counter
+    // restarts every launch, so the default name would overwrite an older session's capture.
+    std::string name = prefix;
+    if (const char* value = std::getenv("SHADPS4_RENDERDOC_CAPTURE_NAME"); value && *value) {
+        name = value;
+    }
+    LOG_WARNING(Common, "RenderDoc capture path: {}", (path / name).string());
+    rdoc_api->SetCaptureFilePathTemplate(fmt::UTF((path / name).u8string()).data.data());
 }
 
 bool IsRenderDocLoaded() {
