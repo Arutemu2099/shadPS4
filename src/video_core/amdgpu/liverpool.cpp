@@ -223,6 +223,7 @@ void Liverpool::Process(std::stop_token stoken) {
             Common::FaultMonitor::CountCpWait(Common::FaultMonitor::SinceNs(t_wait));
             if (g_cp_wait.enabled) {
                 g_cp_wait.idle_ns += CpWaitStats::Now() - idle_start;
+                g_cp_wait.MaybeLog();
             }
         }
         if (stoken.stop_requested()) {
