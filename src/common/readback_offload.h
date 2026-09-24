@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -42,6 +43,51 @@ inline bool VerifyEnabled() {
 inline bool ProfileEnabled() {
     static const bool value = EnvFlag("SHADPS4_READBACK_OFFLOAD_PROFILE");
     return value;
+}
+
+/// SHADPS4_READBACK_LATENCY=1: split each guest readback job's latency into CP pickup, prepare,
+/// flush (recorder drain + submit), GPU backlog, completion-to-wake and finish. Starts a thread
+/// that spins on the timeline semaphore to timestamp every tick; diagnostic only.
+inline bool LatencyEnabled() {
+    static const bool value = EnvFlag("SHADPS4_READBACK_LATENCY");
+    return value;
+}
+
+/// SHADPS4_READBACK_SPIN_WAIT=N: a guest readback polls the timeline semaphore for up to N us
+/// before falling back to vkWaitSemaphores.
+inline u64 SpinWaitNs() {
+    static const u64 value = [] {
+        const char* env = std::getenv("SHADPS4_READBACK_SPIN_WAIT");
+        return env ? static_cast<u64>(std::strtoull(env, nullptr, 10)) * 1000ULL : 0ULL;
+    }();
+    return value;
+}
+
+struct LatencyCounters {
+    std::atomic<u64> jobs{};
+    std::atomic<u64> hop_ns{};      ///< fault -> CP starts PrepareFaultDownload
+    std::atomic<u64> prep_ns{};     ///< prepare body before the flush
+    std::atomic<u64> flush_ns{};    ///< Scheduler::Flush (recorder drain + vkQueueSubmit)
+    std::atomic<u64> wait_ns{};     ///< guest wait for the tick
+    std::atomic<u64> finish_ns{};   ///< wake -> FinishFaultDownload returned
+    std::atomic<u64> total_ns{};    ///< fault -> finish
+    std::atomic<u64> timed_jobs{};  ///< jobs whose tick completion the poller observed
+    std::atomic<u64> ahead_ns{};    ///< flush end -> previous tick complete (earlier batches)
+    std::atomic<u64> own_ns{};      ///< max(flush end, prev complete) -> own tick complete
+    std::atomic<u64> wake_ns{};     ///< own tick complete (poller) -> guest woke
+    std::atomic<u64> batch_draws{}; ///< draws in the batch the job's flush submitted
+    std::atomic<u64> inflight{};    ///< submitted, incomplete batches ahead at flush
+    std::atomic<u64> free_at_wait{};///< tick already complete when the guest started waiting
+    std::atomic<u64> side_jobs{};   ///< single-pass jobs on the readback queue
+    std::atomic<u64> side_wait_ns{};
+    std::atomic<u64> side_total_ns{};
+    std::atomic<u64> other_jobs{};  ///< retried jobs, not timed
+    std::atomic<u64> next_log_ns{};
+};
+
+inline LatencyCounters& Latency() {
+    static LatencyCounters counters;
+    return counters;
 }
 
 /// Which thread took the fault. Anything that is not the command processor counts as Guest.
@@ -137,6 +183,38 @@ inline void AddSince(std::atomic<u64>& counter, u64 start_ns) {
     if (ProfileEnabled()) {
         counter.fetch_add(NowNs() - start_ns, std::memory_order_relaxed);
     }
+}
+
+inline void MaybeLogLatency() {
+    if (!LatencyEnabled()) {
+        return;
+    }
+    constexpr u64 period_ns = 10'000'000'000ULL;
+    auto& s = Latency();
+    const u64 now = NowNs();
+    u64 next = s.next_log_ns.load(std::memory_order_relaxed);
+    if (now < next ||
+        !s.next_log_ns.compare_exchange_strong(next, now + period_ns, std::memory_order_relaxed)) {
+        return;
+    }
+    const auto get = [](const std::atomic<u64>& counter) {
+        return counter.load(std::memory_order_relaxed);
+    };
+    const u64 jobs = std::max<u64>(get(s.jobs), 1);
+    const u64 timed = std::max<u64>(get(s.timed_jobs), 1);
+    const auto us = [](u64 ns, u64 n) { return double(ns) / double(n) / 1000.0; };
+    LOG_INFO(Render,
+             "ReadbackLatency: jobs={} side={} hop_us={:.1f} prep_us={:.1f} flush_us={:.1f} "
+             "wait_us={:.1f} finish_us={:.1f} total_us={:.1f} timed={} ahead_us={:.1f} "
+             "own_us={:.1f} wake_us={:.1f} batch_draws={:.1f} inflight={:.2f} free_at_wait={} "
+             "side_wait_us={:.1f} side_total_us={:.1f} other={}",
+             get(s.jobs), get(s.side_jobs), us(get(s.hop_ns), jobs), us(get(s.prep_ns), jobs),
+             us(get(s.flush_ns), jobs), us(get(s.wait_ns), jobs), us(get(s.finish_ns), jobs),
+             us(get(s.total_ns), jobs), get(s.timed_jobs), us(get(s.ahead_ns), timed),
+             us(get(s.own_ns), timed), us(get(s.wake_ns), timed),
+             double(get(s.batch_draws)) / double(jobs), double(get(s.inflight)) / double(jobs),
+             get(s.free_at_wait), us(get(s.side_wait_ns), std::max<u64>(get(s.side_jobs), 1)),
+             us(get(s.side_total_ns), std::max<u64>(get(s.side_jobs), 1)), get(s.other_jobs));
 }
 
 /// At most one line per ten seconds, from whichever thread wins the exchange.

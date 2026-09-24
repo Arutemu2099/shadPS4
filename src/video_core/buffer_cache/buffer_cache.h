@@ -252,7 +252,14 @@ private:
         bool retry{};
         /// `tick` belongs to the readback queue's timeline.
         bool on_readback_queue{};
+        /// SHADPS4_READBACK_LATENCY diagnostics, set by PrepareFaultDownload.
+        u64 prep_end_ns{};
+        u64 flush_end_ns{};
+        u32 batch_draws{};
+        u32 inflight{};
     };
+    void RecordFaultLatency(const FaultTicket& ticket, u32 passes, u64 t_fault, u64 t_cp,
+                            u64 t_wait, u64 t_woke, bool free_at_wait);
 
     /// Waits until a job's copy has completed on whichever queue it ran.
     void WaitFaultJob(const FaultJob& job);
@@ -260,7 +267,8 @@ private:
     u64 ProducerTick(VAddr addr, u64 size) const;
     void RecordFaultCopiesOnReadbackQueue(vk::CommandBuffer cmdbuf, Buffer& source,
                                           vk::Buffer staging,
-                                          std::span<const vk::BufferCopy> copies);
+                                          std::span<const vk::BufferCopy> copies,
+                                          bool in_queue_order);
     std::unique_ptr<ReadbackQueue> readback_queue;
     u64 producer_floor = 0; ///< Tick of the newest write too large to record per slot.
     /// SHADPS4_READBACK_EARLY_FLUSH: main tick of the last readback job per 1 MB slot, and a
@@ -383,6 +391,11 @@ private:
     /// measure whether readback data is already complete when a fault asks for it.
     std::unique_ptr<u64[]> producer_ticks;
     void NoteGpuWrite(VAddr addr, u64 size);
+    /// SHADPS4_READBACK_PREBATCH: guest ranges the batch being recorded writes on the GPU.
+    std::vector<std::pair<VAddr, VAddr>> batch_writes;
+    u64 batch_writes_tick = 0;
+    void NoteBatchWrite(VAddr addr, u64 size);
+    bool BatchWritesAny(std::span<const FaultCopy> copies);
     void NoteReadbackProducer(VAddr addr, u64 size);
     FaultManager fault_manager;
     std::unique_ptr<MemoryTracker> memory_tracker;

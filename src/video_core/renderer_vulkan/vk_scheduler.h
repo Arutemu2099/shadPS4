@@ -501,6 +501,14 @@ public:
         return &master_semaphore;
     }
 
+    /// Draws recorded since the last submission, and in the last submitted batch (diagnostic).
+    void NoteDraw() noexcept {
+        ++batch_draws;
+    }
+    [[nodiscard]] u32 LastBatchDraws() const noexcept {
+        return last_batch_draws;
+    }
+
     /// Defers an operation until the gpu has reached the current cpu tick.
     /// Will be run when submitting or calling PopPendingOperations.
     void DeferOperation(Common::UniqueFunction<void>&& func) {
@@ -550,6 +558,8 @@ private:
     bool native_heaps_bound = false;
     u64 synchronous_borrows = 0;
     u64 recording_submits = 0;
+    u32 batch_draws = 0;
+    u32 last_batch_draws = 0;
     MasterSemaphore master_semaphore;
     CommandPool command_pool;
     DynamicState dynamic_state;

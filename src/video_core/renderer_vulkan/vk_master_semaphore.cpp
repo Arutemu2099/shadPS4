@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <limits>
+#include <immintrin.h>
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 
@@ -65,6 +67,28 @@ void MasterSemaphore::Wait(u64 tick) {
     while (instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT) != vk::Result::eSuccess) {
     }
     Refresh();
+}
+
+void MasterSemaphore::SpinWait(u64 tick, u64 spin_ns) {
+    if (IsFree(tick)) {
+        return;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(spin_ns);
+    do {
+        Refresh();
+        if (IsFree(tick)) {
+            return;
+        }
+        for (int i = 0; i < 16; ++i) {
+            _mm_pause();
+        }
+    } while (std::chrono::steady_clock::now() < deadline);
+    Wait(tick);
+}
+
+u64 MasterSemaphore::QueryCounter() const {
+    auto [result, value] = instance.GetDevice().getSemaphoreCounterValue(*semaphore);
+    return result == vk::Result::eSuccess ? value : 0;
 }
 
 } // namespace Vulkan

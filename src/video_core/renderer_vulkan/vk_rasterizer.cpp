@@ -441,6 +441,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         }
     });
     DebugState.IncDrawCall();
+    scheduler.NoteDraw();
 
     sample.EndPhase(Common::DrawSampleProbe::Phase::ActualDraw);
     sample.BeginPhase(Common::DrawSampleProbe::Phase::ResetImageBindings);

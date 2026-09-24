@@ -46,6 +46,12 @@ public:
     /// Waits for a tick to be hit on the GPU
     void Wait(u64 tick);
 
+    /// Polls the counter for up to spin_ns before falling back to Wait.
+    void SpinWait(u64 tick, u64 spin_ns);
+
+    /// Reads the semaphore counter without touching the known tick.
+    [[nodiscard]] u64 QueryCounter() const;
+
 protected:
     const Instance& instance;
     vk::UniqueSemaphore semaphore;    ///< Timeline semaphore.

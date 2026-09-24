@@ -27,6 +27,62 @@ namespace VideoCore {
 
 namespace Offload = Common::ReadbackOffload;
 
+static bool PrebatchEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_READBACK_PREBATCH");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
+namespace {
+/// SHADPS4_READBACK_LATENCY: a thread spinning on the master timeline semaphore that records
+/// when each tick was first seen complete. Diagnostic only; it burns one core.
+struct TickPoller {
+    static constexpr u64 Size = 8192;
+    std::array<std::atomic<u64>, Size> ticks{};
+    std::array<std::atomic<u64>, Size> done_ns{};
+    std::jthread thread;
+
+    /// When `tick` was first observed complete, or 0 if unknown.
+    u64 DoneNs(u64 tick) const {
+        const u64 i = tick % Size;
+        if (ticks[i].load(std::memory_order_acquire) != tick) {
+            return 0;
+        }
+        return done_ns[i].load(std::memory_order_relaxed);
+    }
+};
+TickPoller* g_tick_poller = nullptr;
+
+void StartTickPoller(Vulkan::MasterSemaphore* semaphore) {
+    static TickPoller poller;
+    g_tick_poller = &poller;
+    poller.thread = std::jthread([semaphore](std::stop_token stop) {
+        Common::SetCurrentThreadName("shadPS4:TickPoller");
+        u64 last = semaphore->QueryCounter();
+        while (!stop.stop_requested()) {
+            const u64 value = semaphore->QueryCounter();
+            if (value > last) {
+                const u64 now = Offload::NowNs();
+                const u64 first =
+                    std::max(last + 1, value > TickPoller::Size ? value - TickPoller::Size + 1 : 1);
+                for (u64 t = first; t <= value; ++t) {
+                    const u64 i = t % TickPoller::Size;
+                    poller.done_ns[i].store(now, std::memory_order_relaxed);
+                    poller.ticks[i].store(t, std::memory_order_release);
+                }
+                last = value;
+            } else {
+                for (int i = 0; i < 8; ++i) {
+                    _mm_pause();
+                }
+            }
+        }
+    });
+}
+} // namespace
+
 static constexpr size_t DataShareBufferSize = 64_KB;
 static constexpr size_t StagingBufferSize = 512_MB;
 static constexpr size_t DownloadBufferSize = 32_MB;
@@ -135,8 +191,17 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     memory_tracker = std::make_unique<MemoryTracker>(tracker);
     if (instance.HasReadbackQueue()) {
         readback_queue = std::make_unique<ReadbackQueue>(instance);
+    } else if (PrebatchEnabled() && Offload::Enabled()) {
+        readback_queue = std::make_unique<ReadbackQueue>(
+            instance, instance.GetGraphicsQueue(), instance.GetGraphicsQueueFamilyIndex(),
+            &Vulkan::Scheduler::submit_mutex);
+        LOG_INFO(Render, "ReadbackPrebatch: copies of data no unsubmitted draw writes go "
+                         "ahead of the batch being recorded");
     }
 
+    if (Offload::LatencyEnabled()) {
+        StartTickPoller(scheduler.GetMasterSemaphore());
+    }
     if (Offload::Enabled() || Offload::VerifyEnabled() || Offload::ProfileEnabled()) {
         LOG_INFO(Render, "ReadbackOffload: offload={} verify={} profile={}", Offload::Enabled(),
                  Offload::VerifyEnabled(), Offload::ProfileEnabled());
@@ -316,19 +381,41 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
     Vulkan::MasterSemaphore* const semaphore = scheduler.GetMasterSemaphore();
     fault_guest_waiters.fetch_add(1);
     FaultTicket ticket{};
+    const bool latency = Offload::LatencyEnabled();
+    const u64 t_fault = latency ? Offload::NowNs() : 0;
+    u64 t_cp = 0;
+    u64 t_wait = 0;
+    u64 t_woke = 0;
+    bool free_at_wait = false;
+    u32 passes = 0;
+    const u64 spin_ns = Offload::SpinWaitNs();
     for (;;) {
-        cp->SendCommand<true>(
-            [&] { ticket = PrepareFaultDownload(device_addr, size, is_write); });
+        cp->SendCommand<true>([&] {
+            if (latency && passes == 0) {
+                t_cp = Offload::NowNs();
+            }
+            ticket = PrepareFaultDownload(device_addr, size, is_write);
+        });
+        ++passes;
         if (ticket.id == 0) {
             fault_guest_waiters.fetch_sub(1);
             Offload::MaybeLog();
             return;
         }
         const u64 wait_start = Offload::ProfileNowNs();
+        if (latency) {
+            t_wait = Offload::NowNs();
+            free_at_wait = !ticket.on_readback_queue && semaphore->IsFree(ticket.tick);
+        }
         if (ticket.on_readback_queue) {
             readback_queue->Semaphore().Wait(ticket.tick);
+        } else if (spin_ns != 0) {
+            semaphore->SpinWait(ticket.tick, spin_ns);
         } else {
             semaphore->Wait(ticket.tick);
+        }
+        if (latency) {
+            t_woke = Offload::NowNs();
         }
         Offload::AddSince(Offload::State().guest_wait_ns, wait_start);
         if (!ticket.retry) {
@@ -341,7 +428,54 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
     cp->SendCommand<true>(
         [&] { FinishFaultDownload(ticket.id, device_addr, size, is_write); });
     fault_guest_waiters.fetch_sub(1);
+    if (latency) {
+        RecordFaultLatency(ticket, passes, t_fault, t_cp, t_wait, t_woke, free_at_wait);
+    }
     Offload::MaybeLog();
+}
+
+void BufferCache::RecordFaultLatency(const FaultTicket& ticket, u32 passes, u64 t_fault,
+                                     u64 t_cp, u64 t_wait, u64 t_woke, bool free_at_wait) {
+    auto& l = Offload::Latency();
+    const u64 t_done = Offload::NowNs();
+    const auto add = [](std::atomic<u64>& counter, u64 value) {
+        counter.fetch_add(value, std::memory_order_relaxed);
+    };
+    if (passes == 1 && ticket.on_readback_queue) {
+        add(l.side_jobs, 1);
+        add(l.side_wait_ns, t_woke - t_wait);
+        add(l.side_total_ns, t_done - t_fault);
+        Offload::MaybeLogLatency();
+        return;
+    }
+    if (passes != 1 || ticket.flush_end_ns == 0) {
+        // Retried jobs have no single flush to time against.
+        add(l.other_jobs, 1);
+        Offload::MaybeLogLatency();
+        return;
+    }
+    add(l.jobs, 1);
+    add(l.hop_ns, t_cp - t_fault);
+    add(l.prep_ns, ticket.prep_end_ns - t_cp);
+    add(l.flush_ns, ticket.flush_end_ns - ticket.prep_end_ns);
+    add(l.wait_ns, t_woke - t_wait);
+    add(l.finish_ns, t_done - t_woke);
+    add(l.total_ns, t_done - t_fault);
+    add(l.batch_draws, ticket.batch_draws);
+    add(l.inflight, ticket.inflight);
+    add(l.free_at_wait, free_at_wait ? 1 : 0);
+    if (g_tick_poller) {
+        const u64 own_done = g_tick_poller->DoneNs(ticket.tick);
+        const u64 prev_done = g_tick_poller->DoneNs(ticket.tick - 1);
+        if (own_done != 0 && own_done <= t_woke + 1'000'000) {
+            add(l.timed_jobs, 1);
+            const u64 start = std::max(ticket.flush_end_ns, prev_done);
+            add(l.ahead_ns, start - ticket.flush_end_ns);
+            add(l.own_ns, own_done > start ? own_done - start : 0);
+            add(l.wake_ns, t_woke > own_done ? t_woke - own_done : 0);
+        }
+    }
+    Offload::MaybeLogLatency();
 }
 
 std::pair<VAddr, u64> BufferCache::ResolveFaultWindow(const Buffer& buffer, VAddr device_addr,
@@ -585,13 +719,20 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
     if (readback_queue) {
         // Every GPU write into this window was recorded no later than `producer`. If that batch
         // is already submitted, copy on the readback queue after it alone.
-        const u64 producer = ProducerTick(addr, bytes);
-        if (producer != 0 && producer < tick) {
+        // SHADPS4_READBACK_PREBATCH: the queue is the main queue, so submission order already
+        // puts the copy after every submitted write; it only has to avoid bytes the batch still
+        // being recorded writes, which BatchWritesAny checks exactly.
+        const bool prebatch = readback_queue->InQueueOrder();
+        const u64 producer = prebatch ? 0 : ProducerTick(addr, bytes);
+        const bool side_ok = prebatch ? !BatchWritesAny(job->copies)
+                                      : (producer != 0 && producer < tick);
+        if (side_ok) {
             static std::atomic<u64> side{0}, total{0};
             const u64 side_tick = readback_queue->Submit(
                 scheduler.GetMasterSemaphore()->Handle(), producer, [&](vk::CommandBuffer cmd) {
                     RecordFaultCopiesOnReadbackQueue(cmd, buffer, staging_handle,
-                                                     {vk_copies.data(), vk_copies.size()});
+                                                     {vk_copies.data(), vk_copies.size()},
+                                                     prebatch);
                 });
             job->tick = side_tick;
             job->on_readback_queue = true;
@@ -604,7 +745,10 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
             return {id, side_tick, false, true};
         }
         static std::atomic<u64> main_jobs{0};
-        main_jobs.fetch_add(1);
+        const u64 m = main_jobs.fetch_add(1) + 1;
+        if (prebatch && (m & 0x3ff) == 0) {
+            LOG_INFO(Render_Vulkan, "ReadbackPrebatch: {} jobs stayed in the recorded batch", m);
+        }
     }
 
     scheduler.EndRendering();
@@ -613,16 +757,54 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
         RecordFaultCopies(command_access.Handle(), buffer, staging_handle,
                           {vk_copies.data(), vk_copies.size()});
     }
+    if (Offload::LatencyEnabled()) {
+        FaultTicket ticket{.id = id, .tick = tick};
+        ticket.prep_end_ns = Offload::NowNs();
+        scheduler.Flush();
+        ticket.flush_end_ns = Offload::NowNs();
+        ticket.batch_draws = scheduler.LastBatchDraws();
+        const u64 known = scheduler.GetMasterSemaphore()->KnownGpuTick();
+        ticket.inflight = tick > known + 1 ? static_cast<u32>(tick - known - 1) : 0;
+        return ticket;
+    }
     scheduler.Flush();
     return {id, tick};
 }
 
 void BufferCache::RecordFaultCopiesOnReadbackQueue(vk::CommandBuffer cmdbuf, Buffer& source,
                                                     vk::Buffer staging,
-                                                    std::span<const vk::BufferCopy> copies) {
+                                                    std::span<const vk::BufferCopy> copies,
+                                                    bool in_queue_order) {
     // The producer's main-timeline value is waited on at the transfer stage, which makes its
     // writes visible here. Main-queue access tracking of `source` is left untouched.
+    // In queue order (prebatch) there is no semaphore wait: a barrier's first scope covers
+    // every earlier submission on the queue, and the trailing one keeps later submissions'
+    // writes of `source` from overtaking this read.
+    if (in_queue_order) {
+        const vk::MemoryBarrier2 before{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &before,
+        });
+    }
     cmdbuf.copyBuffer(source.Handle(), staging, copies);
+    if (in_queue_order) {
+        const vk::MemoryBarrier2 after{
+            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eNone,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eNone,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &after,
+        });
+    }
     const vk::BufferMemoryBarrier2 host_barrier{
         .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
         .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
@@ -708,7 +890,36 @@ static bool ProducerStatsEnabled() {
     return enabled;
 }
 
+void BufferCache::NoteBatchWrite(VAddr addr, u64 size) {
+    if (!PrebatchEnabled() || size == 0) {
+        return;
+    }
+    const u64 tick = scheduler.CurrentTick();
+    if (tick != batch_writes_tick) {
+        batch_writes.clear();
+        batch_writes_tick = tick;
+    }
+    batch_writes.emplace_back(addr, addr + size);
+}
+
+bool BufferCache::BatchWritesAny(std::span<const FaultCopy> copies) {
+    if (batch_writes_tick != scheduler.CurrentTick()) {
+        return false;
+    }
+    for (const FaultCopy& copy : copies) {
+        const VAddr begin = copy.addr;
+        const VAddr end = copy.addr + copy.size;
+        for (const auto& [write_begin, write_end] : batch_writes) {
+            if (write_begin < end && begin < write_end) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 void BufferCache::NoteGpuWrite(VAddr addr, u64 size) {
+    NoteBatchWrite(addr, size);
     if ((!ProducerStatsEnabled() && !readback_queue && !EarlyFlushEnabled()) || size == 0) {
         return;
     }
@@ -1550,6 +1761,7 @@ void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
                               bool accumulate_stream_score) {
     Buffer& new_buffer = slot_buffers[new_buffer_id];
     Buffer& overlap = slot_buffers[overlap_id];
+    NoteBatchWrite(overlap.CpuAddr(), overlap.SizeBytes());
     if (accumulate_stream_score) {
         new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
     }
@@ -1913,6 +2125,11 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, 
         sfi_report();
         return false;
     }
+    if (PrebatchEnabled()) {
+        NoteBatchWrite(image.info.guest_address,
+                       std::min<u64>(std::max<u64>(copy_size, image.info.guest_size),
+                                     buffer.SizeBytes() - buf_offset));
+    }
     if (pending_fault_jobs.load(std::memory_order_relaxed) != 0) {
         // TileImage writes this cache buffer with no tracker marking, so the region sequence
         // would not move and a pending fault job over these bytes would still pass its vote.
@@ -1945,6 +2162,7 @@ void BufferCache::SynchronizeBuffersInRange(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* value, u32 num_bytes) {
+    NoteBatchWrite(address, num_bytes);
     vk::BufferCopy copy = {
         .srcOffset = 0,
         .dstOffset = buffer.Offset(address),

@@ -283,6 +283,8 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         }
     }
     const u64 signal_value = master_semaphore.NextTick();
+    last_batch_draws = batch_draws;
+    batch_draws = 0;
 
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();

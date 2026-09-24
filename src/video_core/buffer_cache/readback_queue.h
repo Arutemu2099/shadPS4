@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <mutex>
 #include "common/assert.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -26,12 +27,20 @@ namespace VideoCore {
 class ReadbackQueue {
 public:
     explicit ReadbackQueue(const Vulkan::Instance& instance_)
-        : instance{instance_}, queue{instance_.GetReadbackQueue()}, semaphore{instance_} {
+        : ReadbackQueue(instance_, instance_.GetReadbackQueue(),
+                        instance_.GetReadbackQueueFamilyIndex(), nullptr) {}
+
+    /// SHADPS4_READBACK_PREBATCH=1: `queue_` is the main graphics queue and `submit_lock_` the
+    /// scheduler's submit mutex. A copy submitted here runs after everything already submitted
+    /// and before the batch the command processor is still recording.
+    ReadbackQueue(const Vulkan::Instance& instance_, vk::Queue queue_, u32 family,
+                  std::mutex* submit_lock_)
+        : instance{instance_}, queue{queue_}, submit_lock{submit_lock_}, semaphore{instance_} {
         const auto device = instance.GetDevice();
         auto [pool_result, new_pool] = device.createCommandPoolUnique(vk::CommandPoolCreateInfo{
             .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer |
                      vk::CommandPoolCreateFlagBits::eTransient,
-            .queueFamilyIndex = instance.GetReadbackQueueFamilyIndex(),
+            .queueFamilyIndex = family,
         });
         ASSERT_MSG(pool_result == vk::Result::eSuccess, "ReadbackQueue: command pool failed");
         pool = std::move(new_pool);
@@ -85,7 +94,13 @@ public:
             .signalSemaphoreCount = 1,
             .pSignalSemaphores = &signal_semaphore,
         };
-        const vk::Result result = queue.submit(submit_info);
+        vk::Result result;
+        if (submit_lock) {
+            std::scoped_lock lk{*submit_lock};
+            result = queue.submit(submit_info);
+        } else {
+            result = queue.submit(submit_info);
+        }
         ASSERT_MSG(result == vk::Result::eSuccess, "ReadbackQueue: submit failed: {}",
                    vk::to_string(result));
         slot_values[slot] = signal_value;
@@ -96,10 +111,16 @@ public:
         return semaphore;
     }
 
+    /// True when this is the main graphics queue (copies are ordered by submission).
+    bool InQueueOrder() const noexcept {
+        return submit_lock != nullptr;
+    }
+
 private:
     static constexpr size_t NumSlots = 32;
     const Vulkan::Instance& instance;
     vk::Queue queue;
+    std::mutex* submit_lock{};
     Vulkan::MasterSemaphore semaphore;
     vk::UniqueCommandPool pool;
     std::array<vk::CommandBuffer, NumSlots> cmdbufs{};
