@@ -94,7 +94,8 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
     state.height = height;
     state.num_layers = 1;
     state.depth_stencil_attachment.image_view = depth_view;
-    state.depth_stencil_attachment.image_layout = vk::ImageLayout::eDepthAttachmentOptimal;
+    state.depth_stencil_attachment.image_layout =
+        Vulkan::GuestLayout(vk::ImageLayout::eDepthAttachmentOptimal);
     state.depth_stencil_attachment.has_depth = true;
     state.depth_stencil_attachment.depth_clear = true;
     scheduler.BeginRendering(state);
@@ -104,7 +105,7 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
     const vk::DescriptorImageInfo image_info = {
         .sampler = VK_NULL_HANDLE,
         .imageView = color_view,
-        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        .imageLayout = Vulkan::GuestLayout(vk::ImageLayout::eShaderReadOnlyOptimal),
     };
     const vk::WriteDescriptorSet texture_write = {
         .dstSet = VK_NULL_HANDLE,
@@ -197,7 +198,8 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
     state.num_layers = 1;
     state.num_color_attachments = 1;
     state.color_attachments[0].image_view = dst_view;
-    state.color_attachments[0].image_layout = vk::ImageLayout::eColorAttachmentOptimal;
+    state.color_attachments[0].image_layout =
+        Vulkan::GuestLayout(vk::ImageLayout::eColorAttachmentOptimal);
     state.color_attachments[0].is_clear = true;
     scheduler.BeginRendering(state);
 
@@ -206,7 +208,7 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
     const vk::DescriptorImageInfo image_info = {
         .sampler = VK_NULL_HANDLE,
         .imageView = src_view,
-        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        .imageLayout = Vulkan::GuestLayout(vk::ImageLayout::eShaderReadOnlyOptimal),
     };
     const vk::WriteDescriptorSet texture_write = {
         .dstSet = VK_NULL_HANDLE,

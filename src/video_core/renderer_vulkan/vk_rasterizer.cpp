@@ -1556,8 +1556,8 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
         .extent = {write_image.info.size.width, write_image.info.size.height, 1},
     };
     scheduler.AcquireCommandBuffer().Handle().copyImage(
-        read_image.GetImage(), vk::ImageLayout::eTransferSrcOptimal, write_image.GetImage(),
-        vk::ImageLayout::eTransferDstOptimal, region);
+        read_image.GetImage(), Vulkan::GuestLayout(vk::ImageLayout::eTransferSrcOptimal),
+        write_image.GetImage(), Vulkan::GuestLayout(vk::ImageLayout::eTransferDstOptimal), region);
 
     ScopeMarkerEnd();
 }

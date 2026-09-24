@@ -6,7 +6,13 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <algorithm>
 #include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <source_location>
+#include <string>
+#include <vector>
 #include <thread>
 
 #include "common/logging/log.h"
@@ -29,6 +35,107 @@ struct GpuBreakCounters {
 inline GpuBreakCounters& GpuBreaks() {
     static GpuBreakCounters counters;
     return counters;
+}
+
+/// Per source location (same flag, diagnostic): render-pass ends, how many of those were followed
+/// by a BeginRendering with the identical state (a pure restart), and image barriers by kind.
+class BreakSites {
+public:
+    /// Hazard kinds; the same four again (+4) when the barrier also changes layout.
+    enum Kind : u32 { WriteToRead, WriteToWrite, ReadToWrite, ReadToRead, NumKinds = 8 };
+
+    u32 Site(const std::source_location& loc) {
+        std::scoped_lock lk{mutex};
+        return SiteLocked(loc);
+    }
+    void End(u32 site) {
+        std::scoped_lock lk{mutex};
+        ++entries[site].ends;
+    }
+    void Resumed(u32 site) {
+        std::scoped_lock lk{mutex};
+        ++entries[site].resumed;
+    }
+    void Image(const std::source_location& loc, vk::ImageLayout old_layout,
+               vk::ImageLayout new_layout, vk::AccessFlags2 src, vk::AccessFlags2 dst) {
+        constexpr auto writes =
+            vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderWrite |
+            vk::AccessFlagBits2::eShaderStorageWrite | vk::AccessFlagBits2::eMemoryWrite |
+            vk::AccessFlagBits2::eColorAttachmentWrite |
+            vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+        const bool src_w = static_cast<bool>(src & writes);
+        const bool dst_w = static_cast<bool>(dst & writes);
+        const u32 kind = (src_w ? (dst_w ? WriteToWrite : WriteToRead)
+                          : dst_w ? ReadToWrite
+                                  : ReadToRead) +
+                         (old_layout != new_layout ? 4u : 0u);
+        std::scoped_lock lk{mutex};
+        ++entries[SiteLocked(loc)].img[kind];
+    }
+    /// Top sites by activity since the last call, then clears the counts.
+    std::string Report() {
+        std::scoped_lock lk{mutex};
+        std::vector<const Entry*> order;
+        for (const auto& e : entries) {
+            order.push_back(&e);
+        }
+        const auto weight = [](const Entry* e) {
+            u64 w = e->ends;
+            for (const u64 v : e->img) {
+                w += v;
+            }
+            return w;
+        };
+        std::ranges::sort(order,
+                          [&](const Entry* a, const Entry* b) { return weight(a) > weight(b); });
+        std::string out;
+        for (size_t i = 0; i < order.size() && i < 14; ++i) {
+            const Entry* e = order[i];
+            if (weight(e) == 0) {
+                break;
+            }
+            const char* base = e->file;
+            for (const char* p = e->file; *p; ++p) {
+                if (*p == '/' || *p == '\\') {
+                    base = p + 1;
+                }
+            }
+            out += fmt::format(" | {}:{} ends={} resumed={} same[w2r/w2w/r2w/r2r]={}/{}/{}/{} "
+                               "relayout[w2r/w2w/r2w/r2r]={}/{}/{}/{}",
+                               base, e->line, e->ends, e->resumed, e->img[0], e->img[1],
+                               e->img[2], e->img[3], e->img[4], e->img[5], e->img[6], e->img[7]);
+        }
+        for (auto& e : entries) {
+            e.ends = e.resumed = 0;
+            e.img = {};
+        }
+        return out;
+    }
+
+private:
+    struct Entry {
+        const char* file;
+        u32 line;
+        u64 ends = 0;
+        u64 resumed = 0;
+        std::array<u64, NumKinds> img{};
+    };
+    u32 SiteLocked(const std::source_location& loc) {
+        for (u32 i = 0; i < entries.size(); ++i) {
+            if (entries[i].line == loc.line() &&
+                std::strcmp(entries[i].file, loc.file_name()) == 0) {
+                return i;
+            }
+        }
+        entries.push_back(Entry{loc.file_name(), loc.line()});
+        return static_cast<u32>(entries.size() - 1);
+    }
+    std::mutex mutex;
+    std::vector<Entry> entries;
+};
+inline BreakSites& GpuBreakSites() {
+    static BreakSites sites;
+    return sites;
 }
 
 /**
@@ -151,6 +258,7 @@ private:
                          GpuBreaks().buffer_barriers.exchange(0),
                          GpuBreaks().image_barrier_calls.exchange(0),
                          GpuBreaks().image_barriers.exchange(0));
+                LOG_INFO(Render_Vulkan, "GpuBreakSites:{}", GpuBreakSites().Report());
                 busy = gaps = gap_count = batches = draws = max_batch = 0;
                 window_start = now;
             }

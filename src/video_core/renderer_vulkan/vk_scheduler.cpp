@@ -154,10 +154,14 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     if (is_rendering && render_state == new_state) {
         return;
     }
+    if (batch_timer && !is_rendering && last_end_site != ~0u && render_state == new_state) {
+        GpuBreakSites().Resumed(last_end_site);
+    }
     EndRendering();
     is_rendering = true;
     if (batch_timer) {
         GpuBreaks().render_begins.fetch_add(1, std::memory_order_relaxed);
+        last_end_site = ~0u;
     }
     render_state = new_state;
 
@@ -212,11 +216,15 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     });
 }
 
-void Scheduler::EndRendering() {
+void Scheduler::EndRendering(std::source_location loc) {
     if (!is_rendering) {
         return;
     }
     is_rendering = false;
+    if (batch_timer) {
+        last_end_site = GpuBreakSites().Site(loc);
+        GpuBreakSites().End(last_end_site);
+    }
     Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
 }
 

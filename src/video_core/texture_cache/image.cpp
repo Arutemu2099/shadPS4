@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "video_core/renderer_vulkan/vk_gpu_batch_timer.h"
+#include <algorithm>
 #include <ranges>
 #include "common/assert.h"
 #include "common/fault_monitor.h"
@@ -222,7 +223,10 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
 
 Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                                    vk::PipelineStageFlags2 dst_stage,
-                                   std::optional<SubresourceRange> subres_range) {
+                                   std::optional<SubresourceRange> subres_range, bool raw_layout) {
+    if (!raw_layout) {
+        dst_layout = Vulkan::GuestLayout(dst_layout);
+    }
     auto& last_state = backing->state;
     auto& runs = backing->subresource_runs;
 
@@ -234,6 +238,33 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
                                  vk::AccessFlagBits2::eMemoryWrite;
     const State dst_state{dst_stage, dst_mask, dst_layout};
 
+    // SHADPS4_SMART_IMAGE_BARRIERS=1: a read after reads in the same layout needs a barrier only to
+    // make an earlier write visible to a stage/access that has not been given it yet. `covered`
+    // skips reads whose stage and access are already in the state; otherwise the barrier is kept
+    // and the state becomes the union of the reads, so alternating read kinds settle after one
+    // barrier each (a later write waits for every stage in the union).
+    static const bool smart_images = [] {
+        const char* value = std::getenv("SHADPS4_SMART_IMAGE_BARRIERS");
+        return value != nullptr && value[0] == '1';
+    }();
+    constexpr auto any_writes = write_flags | vk::AccessFlagBits2::eShaderStorageWrite |
+                                vk::AccessFlagBits2::eColorAttachmentWrite |
+                                vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+    const bool dst_reads_only = !(dst_mask & any_writes);
+    const auto read_after_read = [&](const State& st) {
+        return smart_images && dst_reads_only && st.layout == dst_layout &&
+               !(st.access_mask & any_writes);
+    };
+    const auto covered = [&](const State& st) {
+        return read_after_read(st) && (st.access_mask & dst_mask) == dst_mask &&
+               (st.pl_stage & dst_stage) == dst_stage;
+    };
+    const auto next_state = [&](const State& st) {
+        return read_after_read(st)
+                   ? State{st.pl_stage | dst_stage, st.access_mask | dst_mask, dst_layout}
+                   : dst_state;
+    };
+
     const bool needs_partial_transition =
         subres_range &&
         (subres_range->base != SubresourceBase{} || subres_range->extent != info.resources);
@@ -244,7 +275,8 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
     // Fast path: whole image shares one state (never promoted to per-subresource tracking).
     if (!needs_partial_transition && !promoted) {
         const bool is_write = static_cast<bool>(last_state.access_mask & write_flags);
-        if (last_state.layout == dst_layout && last_state.access_mask == dst_mask && !is_write) {
+        if ((last_state.layout == dst_layout && last_state.access_mask == dst_mask && !is_write) ||
+            covered(last_state)) {
             Common::FaultMonitor::CountBarriers(false, 0, 0);
             return {};
         }
@@ -266,7 +298,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
                 .layerCount = VK_REMAINING_ARRAY_LAYERS,
             },
         });
-        last_state = dst_state;
+        last_state = next_state(last_state);
         Common::FaultMonitor::CountBarriers(false, 0, barriers.size());
         return barriers;
     }
@@ -308,7 +340,8 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
             ++seg_iters;
             const auto& st = runs[i].state;
             const bool is_write = static_cast<bool>(st.access_mask & write_flags);
-            if (st.layout != dst_layout || st.access_mask != dst_mask || is_write) {
+            if ((st.layout != dst_layout || st.access_mask != dst_mask || is_write) &&
+                !covered(st)) {
                 any = true;
                 break;
             }
@@ -342,7 +375,8 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
             if (ov_begin < ov_end) {
                 const bool is_write = static_cast<bool>(r.state.access_mask & write_flags);
                 const bool needs =
-                    r.state.layout != dst_layout || r.state.access_mask != dst_mask || is_write;
+                    (r.state.layout != dst_layout || r.state.access_mask != dst_mask || is_write) &&
+                    !covered(r.state);
                 if (needs) {
                     barriers.emplace_back(vk::ImageMemoryBarrier2{
                         .srcStageMask = r.state.pl_stage,
@@ -362,7 +396,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
                             .layerCount = ov_end - ov_begin,
                         },
                     });
-                    push(ov_begin, ov_end, dst_state);
+                    push(ov_begin, ov_end, next_state(r.state));
                 } else {
                     push(ov_begin, ov_end, r.state);
                 }
@@ -378,8 +412,19 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
 
     // A full-resource transition leaves every subresource in one state, so drop back to the cheap
     // uniform path for next time.
-    if (!needs_partial_transition) {
+    // With smart image barriers a full transition can leave differing (merged or skipped) states;
+    // keep per-subresource tracking unless every run agrees.
+    if (!needs_partial_transition && !smart_images) {
         runs.clear();
+    } else if (!needs_partial_transition) {
+        const bool uniform = std::ranges::all_of(
+            runs, [&](const StateRun& r) { return r.state == runs.front().state; });
+        if (uniform) {
+            last_state = runs.empty() ? dst_state : runs.front().state;
+            runs.clear();
+            Common::FaultMonitor::CountBarriers(true, seg_iters, barriers.size());
+            return barriers;
+        }
     }
 
     last_state = dst_state;
@@ -388,7 +433,8 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
 }
 
 void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
-                    std::optional<SubresourceRange> range, vk::CommandBuffer cmdbuf /*= {}*/) {
+                    std::optional<SubresourceRange> range, vk::CommandBuffer cmdbuf /*= {}*/,
+                    std::source_location loc) {
     // Adjust pipeline stage
     const vk::PipelineStageFlags2 dst_pl_stage =
         (dst_mask == vk::AccessFlagBits2::eTransferRead ||
@@ -402,7 +448,7 @@ void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
     // Which dominates decides whether there is any lever left here.
     static u64 tr_calls = 0, tr_empty = 0, tr_getbar_ns = 0, tr_endr_ns = 0, tr_submit_ns = 0;
     const auto tr_t0 = Common::FaultMonitor::Now();
-    const auto barriers = GetBarriers(dst_layout, dst_mask, dst_pl_stage, range);
+    const auto barriers = GetBarriers(dst_layout, dst_mask, dst_pl_stage, range, bool(cmdbuf));
     const auto tr_t1 = Common::FaultMonitor::Now();
     ++tr_calls;
     tr_getbar_ns += Common::FaultMonitor::DiffNs(tr_t0, tr_t1);
@@ -434,7 +480,7 @@ void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
     };
     if (!cmdbuf) {
         // External command buffers must be protected by their caller's access scope.
-        scheduler->EndRendering();
+        scheduler->EndRendering(loc);
     }
     const auto tr_t2 = Common::FaultMonitor::Now();
     if (cmdbuf) {
@@ -447,6 +493,10 @@ void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
     if (Vulkan::GpuBatchTimer::Enabled()) {
         Vulkan::GpuBreaks().image_barrier_calls.fetch_add(1, std::memory_order_relaxed);
         Vulkan::GpuBreaks().image_barriers.fetch_add(barriers.size(), std::memory_order_relaxed);
+        for (const auto& b : barriers) {
+            Vulkan::GpuBreakSites().Image(loc, b.oldLayout, b.newLayout, b.srcAccessMask,
+                                          b.dstAccessMask);
+        }
     }
     tr_report();
 }
@@ -487,7 +537,8 @@ void Image::Upload(std::span<const vk::BufferImageCopy> upload_copies, vk::Buffe
                 .imageMemoryBarrierCount = static_cast<u32>(owned_barriers.size()),
                 .pImageMemoryBarriers = owned_barriers.data(),
             });
-            cmdbuf.copyBufferToImage(buffer, image, vk::ImageLayout::eTransferDstOptimal,
+            cmdbuf.copyBufferToImage(buffer, image,
+                                     Vulkan::GuestLayout(vk::ImageLayout::eTransferDstOptimal),
                                      owned_copies);
             cmdbuf.pipelineBarrier2(vk::DependencyInfo{
                 .dependencyFlags = vk::DependencyFlagBits::eByRegion,
@@ -536,7 +587,8 @@ void Image::Download(std::span<const vk::BufferImageCopy> download_copies, vk::B
         .imageMemoryBarrierCount = static_cast<u32>(image_barriers.size()),
         .pImageMemoryBarriers = image_barriers.data(),
     });
-    cmdbuf.copyImageToBuffer(GetImage(), vk::ImageLayout::eTransferSrcOptimal, buffer,
+    cmdbuf.copyImageToBuffer(GetImage(), Vulkan::GuestLayout(vk::ImageLayout::eTransferSrcOptimal),
+                             buffer,
                              download_copies);
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .dependencyFlags = vk::DependencyFlagBits::eByRegion,
@@ -756,7 +808,8 @@ void Image::CopyImageWithBuffer(Image& src_image, vk::Buffer buffer, u64 offset)
         .pBufferMemoryBarriers = &pre_copy_barrier,
     });
 
-    cmdbuf.copyImageToBuffer(src_image.GetImage(), vk::ImageLayout::eTransferSrcOptimal, buffer,
+    cmdbuf.copyImageToBuffer(src_image.GetImage(),
+                             Vulkan::GuestLayout(vk::ImageLayout::eTransferSrcOptimal), buffer,
                              buffer_copies);
 
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
@@ -769,7 +822,8 @@ void Image::CopyImageWithBuffer(Image& src_image, vk::Buffer buffer, u64 offset)
         copy.imageSubresource.aspectMask = aspect_mask & ~vk::ImageAspectFlagBits::eStencil;
     }
 
-    cmdbuf.copyBufferToImage(buffer, GetImage(), vk::ImageLayout::eTransferDstOptimal,
+    cmdbuf.copyBufferToImage(buffer, GetImage(),
+                             Vulkan::GuestLayout(vk::ImageLayout::eTransferDstOptimal),
                              buffer_copies);
     Transit(vk::ImageLayout::eGeneral,
             vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {});
@@ -850,8 +904,8 @@ void Image::Resolve(Image& src_image, const VideoCore::SubresourceRange& mrt0_ra
             .extent = {info.size.width, info.size.height, 1},
         };
         scheduler->AcquireCommandBuffer().Handle().copyImage(
-            src_image.GetImage(), vk::ImageLayout::eTransferSrcOptimal, GetImage(),
-            vk::ImageLayout::eTransferDstOptimal, region);
+            src_image.GetImage(), Vulkan::GuestLayout(vk::ImageLayout::eTransferSrcOptimal),
+            GetImage(), Vulkan::GuestLayout(vk::ImageLayout::eTransferDstOptimal), region);
     } else {
         const vk::ImageResolve region = {
             .srcSubresource{
@@ -871,8 +925,8 @@ void Image::Resolve(Image& src_image, const VideoCore::SubresourceRange& mrt0_ra
             .extent = {info.size.width, info.size.height, 1},
         };
         scheduler->AcquireCommandBuffer().Handle().resolveImage(
-            src_image.GetImage(), vk::ImageLayout::eTransferSrcOptimal, GetImage(),
-            vk::ImageLayout::eTransferDstOptimal, region);
+            src_image.GetImage(), Vulkan::GuestLayout(vk::ImageLayout::eTransferSrcOptimal),
+            GetImage(), Vulkan::GuestLayout(vk::ImageLayout::eTransferDstOptimal), region);
     }
 
     flags |= VideoCore::ImageFlagBits::GpuModified;
@@ -891,7 +945,8 @@ void Image::Clear(const vk::ClearValue& clear_value, const VideoCore::Subresourc
     Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {});
     auto command_access = scheduler->AcquireCommandBuffer();
     const auto cmdbuf = command_access.Handle();
-    cmdbuf.clearColorImage(GetImage(), vk::ImageLayout::eTransferDstOptimal, clear_value.color,
+    cmdbuf.clearColorImage(GetImage(), Vulkan::GuestLayout(vk::ImageLayout::eTransferDstOptimal),
+                           clear_value.color,
                            vk_range);
 }
 
@@ -933,7 +988,7 @@ void Image::SetBackingSamples(u32 num_samples, bool copy_backing) {
         // Transition dest backing to color attachment layout, not caring of previous contents
         constexpr auto dst_stage = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
         constexpr auto dst_access = vk::AccessFlagBits2::eColorAttachmentWrite;
-        constexpr auto dst_layout = vk::ImageLayout::eColorAttachmentOptimal;
+        const auto dst_layout = Vulkan::GuestLayout(vk::ImageLayout::eColorAttachmentOptimal);
         barriers.push_back(vk::ImageMemoryBarrier2{
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
             .srcAccessMask = vk::AccessFlagBits2::eNone,

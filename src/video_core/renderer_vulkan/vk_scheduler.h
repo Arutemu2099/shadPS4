@@ -376,8 +376,8 @@ public:
     /// Starts a new rendering scope with provided state.
     void BeginRendering(const RenderState& new_state);
 
-    /// Ends current rendering scope.
-    void EndRendering();
+    /// Ends current rendering scope. `loc` attributes the break under SHADPS4_GPU_BATCH_TIMING.
+    void EndRendering(std::source_location loc = std::source_location::current());
 
     /// Returns the current render state.
     const RenderState& GetRenderState() const {
@@ -593,6 +593,7 @@ private:
     std::jthread priority_pending_ops_thread;
     RenderState render_state;
     bool is_rendering = false;
+    u32 last_end_site = ~0u;
     tracy::VkCtxScope* profiler_scope{};
 };
 

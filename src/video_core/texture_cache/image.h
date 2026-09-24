@@ -12,6 +12,7 @@
 
 #include <deque>
 #include <optional>
+#include <source_location>
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
 
@@ -125,9 +126,10 @@ struct Image {
     using Barriers = boost::container::small_vector<vk::ImageMemoryBarrier2, 32>;
     Barriers GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                          vk::PipelineStageFlags2 dst_stage,
-                         std::optional<SubresourceRange> subres_range);
+                         std::optional<SubresourceRange> subres_range, bool raw_layout = false);
     void Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
-                 std::optional<SubresourceRange> range, vk::CommandBuffer cmdbuf = {});
+                 std::optional<SubresourceRange> range, vk::CommandBuffer cmdbuf = {},
+                 std::source_location loc = std::source_location::current());
     void Upload(std::span<const vk::BufferImageCopy> upload_copies, vk::Buffer buffer, u64 offset);
     void Download(std::span<const vk::BufferImageCopy> download_copies, vk::Buffer buffer,
                   u64 offset, u64 download_size);

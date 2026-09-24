@@ -158,7 +158,8 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     auto command_access = scheduler.AcquireCommandBuffer();
     const auto cmdbuf = command_access.Handle();
     image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
-    cmdbuf.copyImageToBuffer(image.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
+    cmdbuf.copyImageToBuffer(image.GetImage(),
+                             Vulkan::GuestLayout(vk::ImageLayout::eTransferSrcOptimal),
                              download_buffer.Handle(), image_download);
 
     if (sync) {
