@@ -1387,6 +1387,31 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             const auto t_ft = Common::FaultMonitor::Now();
             auto& image_view = is_scratch ? image.FindView(desc.view_info)
                                           : texture_cache.FindTexture(image_id, desc);
+            {
+                // Experiment SHADPS4_NEO_IDBUF_FILL=<u32>: the PS4 Pro hardware ID buffer (a
+                // 2-sample R32Uint surface written by the rasterizer) is not emulated; fill it with
+                // a constant before a shader samples it, to test whether it gates the checkerboard
+                // resolve. Not a fix.
+                static const s64 idbuf_fill = [] {
+                    const char* value = std::getenv("SHADPS4_NEO_IDBUF_FILL");
+                    return value ? static_cast<s64>(std::strtoll(value, nullptr, 0)) : s64{-1};
+                }();
+                if (idbuf_fill >= 0 && !is_storage && image.info.num_samples == 2 &&
+                    image.info.pixel_format == vk::Format::eR32Uint) {
+                    scheduler.EndRendering();
+                    image.Transit(vk::ImageLayout::eTransferDstOptimal,
+                                  vk::AccessFlagBits2::eTransferWrite, {});
+                    const u32 fill = static_cast<u32>(idbuf_fill);
+                    vk::ClearColorValue value{};
+                    value.setUint32({fill, fill, fill, fill});
+                    const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0,
+                                                          1};
+                    auto command_access = scheduler.AcquireCommandBuffer();
+                    command_access.Handle().clearColorImage(image.GetImage(),
+                                                            image.backing->state.layout, value,
+                                                            range);
+                }
+            }
             const auto t_tr = Common::FaultMonitor::Now();
             findtex_ns += Common::FaultMonitor::DiffNs(t_ft, t_tr);
 
