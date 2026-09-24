@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include "common/types.h"
 
@@ -232,6 +233,62 @@ public:
             }
         }
         return (data[last_word] & end_mask) != 0;
+    }
+
+    /// AnyInRange for a reader that does not hold the writer's lock: each word is read with one
+    /// relaxed atomic load, so a concurrent writer can only make the answer stale, never torn.
+    inline bool AnyInRangeRelaxed(size_t start, size_t end) const {
+        if (start >= end || end > N) {
+            return false;
+        }
+        const auto load = [this](size_t i) {
+            return std::atomic_ref<u64>(const_cast<u64&>(data[i])).load(std::memory_order_relaxed);
+        };
+        const size_t first_word = start / BITS_PER_WORD;
+        const size_t last_word = (end - 1) / BITS_PER_WORD;
+        const u64 start_mask = ~((1ULL << (start % BITS_PER_WORD)) - 1);
+        const size_t end_bit = (end - 1) % BITS_PER_WORD;
+        const u64 end_mask = end_bit == BITS_PER_WORD - 1 ? ~0ULL : (1ULL << (end_bit + 1)) - 1;
+        if (first_word == last_word) {
+            return (load(first_word) & start_mask & end_mask) != 0;
+        }
+        if ((load(first_word) & start_mask) != 0) {
+            return true;
+        }
+        for (size_t i = first_word + 1; i < last_word; ++i) {
+            if (load(i) != 0) {
+                return true;
+            }
+        }
+        return (load(last_word) & end_mask) != 0;
+    }
+
+    /// True if every bit in [start, end) is set. An empty range is trivially all set.
+    inline bool AllInRange(size_t start, size_t end) const {
+        if (start >= end) {
+            return true;
+        }
+        if (end > N) {
+            return false;
+        }
+        const size_t first_word = start / BITS_PER_WORD;
+        const size_t last_word = (end - 1) / BITS_PER_WORD;
+        const u64 start_mask = ~((1ULL << (start % BITS_PER_WORD)) - 1);
+        const size_t end_bit = (end - 1) % BITS_PER_WORD;
+        const u64 end_mask = end_bit == BITS_PER_WORD - 1 ? ~0ULL : (1ULL << (end_bit + 1)) - 1;
+        if (first_word == last_word) {
+            const u64 mask = start_mask & end_mask;
+            return (data[first_word] & mask) == mask;
+        }
+        if ((data[first_word] & start_mask) != start_mask) {
+            return false;
+        }
+        for (size_t i = first_word + 1; i < last_word; ++i) {
+            if (data[i] != ~0ULL) {
+                return false;
+            }
+        }
+        return (data[last_word] & end_mask) == end_mask;
     }
 
     Range FirstRangeFrom(size_t start) const {

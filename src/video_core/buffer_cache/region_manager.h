@@ -129,9 +129,44 @@ public:
         return cpu_addr;
     }
 
-    /// Number of GPU write markings this region has received. Read under the region lock.
+    /// Number of GPU write markings this region has received. Atomic so the CP's lock-free
+    /// written-range fast path (SHADPS4_UPLOAD_PRECHECK) can bump it without the region lock.
     u64 GpuWriteSeq() const noexcept {
-        return gpu_write_seq;
+        return gpu_write_seq.load();
+    }
+
+    /**
+     * SHADPS4_UPLOAD_PRECHECK, read-only syncs: false proves the range has no CPU-dirty page
+     * as far as this caller can be required to see. Read without the lock. CPU bits are only set
+     * off the CP (write faults), before the faulting page is unprotected, so any guest write that
+     * precedes the submit being processed has its bit visible here; a bit set after this read is
+     * the same as a fault landing just after the locked walk released its lock.
+     */
+    bool CpuDirtyInRangeRelaxed(u64 offset, u64 size) const noexcept {
+        const size_t start_page = SanitizeAddress(offset) / TRACKER_BYTES_PER_PAGE;
+        const size_t end_page =
+            Common::DivCeil(SanitizeAddress(offset + size), TRACKER_BYTES_PER_PAGE);
+        if (start_page >= NUM_PAGES_PER_REGION || end_page <= start_page) {
+            return false;
+        }
+        return cpu.AnyInRangeRelaxed(start_page, end_page);
+    }
+
+    /**
+     * SHADPS4_UPLOAD_PRECHECK, written syncs, CP thread only: true when the locked written path
+     * would change nothing but gpu_write_seq - no CPU-dirty page to upload (relaxed read, as
+     * above) and every page already GPU-modified. GPU bits are mutated only on the CP, so that
+     * read is exact; with them unchanged, `readable` needs no update either (under Precise it is
+     * re-synced to ~gpu on every GPU-bit change).
+     */
+    bool WrittenRangeSettled(u64 offset, u64 size) const noexcept {
+        const size_t start_page = SanitizeAddress(offset) / TRACKER_BYTES_PER_PAGE;
+        const size_t end_page =
+            Common::DivCeil(SanitizeAddress(offset + size), TRACKER_BYTES_PER_PAGE);
+        if (start_page >= NUM_PAGES_PER_REGION || end_page <= start_page) {
+            return true;
+        }
+        return !cpu.AnyInRangeRelaxed(start_page, end_page) && gpu.AllInRange(start_page, end_page);
     }
 
     /// Records a GPU write that sets no tracker bit, so in-flight fault downloads of this
@@ -431,7 +466,7 @@ private:
     u64 summary_mask{0};
     // Conservative summary of `cpu`, readable without the lock. See MayHaveCpuModified().
     std::atomic<bool> any_cpu{true};
-    u64 gpu_write_seq{0};
+    std::atomic<u64> gpu_write_seq{0};
     RegionBits cpu;
     RegionBits gpu;
     RegionBits writeable;

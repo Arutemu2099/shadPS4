@@ -194,6 +194,65 @@ public:
         return static_cast<size_t>(h % CLEAN_MEMO_SIZE);
     }
 
+    /// SHADPS4_UPLOAD_PRECHECK=1 (default off): skip the region lock when a lock-free read of
+    /// the exact range proves the locked work would do nothing. See RegionManager::
+    /// CpuDirtyInRangeRelaxed / WrittenRangeSettled for why the reads are sound.
+    static bool UploadPrecheckEnabled() {
+        static const bool enabled = [] {
+            const char* env = std::getenv("SHADPS4_UPLOAD_PRECHECK");
+            return env != nullptr && env[0] == '1';
+        }();
+        return enabled;
+    }
+
+    /// Precheck counters (CP thread; logged under the flag). "visits" are region visits that
+    /// reached the lock before this change could skip them.
+    struct PrecheckStats {
+        u64 written_calls, written_fast, read_visits, read_skipped;
+    };
+    static PrecheckStats& Precheck() {
+        static thread_local PrecheckStats stats{};
+        return stats;
+    }
+
+    void MaybeLogPrecheck() {
+        auto& st = Precheck();
+        if (st.written_calls + st.read_visits < (u64{1} << 22)) {
+            return;
+        }
+        LOG_INFO(Render,
+                 "UploadPrecheck: written {} fast {:.1f}% | read region visits {} skipped {:.1f}%",
+                 st.written_calls,
+                 st.written_calls ? 100.0 * st.written_fast / st.written_calls : 0.0,
+                 st.read_visits, st.read_visits ? 100.0 * st.read_skipped / st.read_visits : 0.0);
+        st = {};
+    }
+
+    /// Written-range fast path: true if every touched region exists and is settled; then bumps
+    /// each region's GPU write sequence, which is all the locked path would have changed.
+    bool TryWrittenFastPath(VAddr cpu_addr, u64 size) {
+        if (size == 0) {
+            return false;
+        }
+        const size_t first = cpu_addr >> TRACKER_HIGHER_PAGE_BITS;
+        const size_t last = (cpu_addr + size - 1) >> TRACKER_HIGHER_PAGE_BITS;
+        u64 offset = cpu_addr & TRACKER_HIGHER_PAGE_MASK;
+        u64 remaining = size;
+        for (size_t index = first; index <= last; ++index) {
+            const RegionManager* manager = top_tier[index];
+            const u64 amount = std::min<u64>(TRACKER_HIGHER_PAGE_SIZE - offset, remaining);
+            if (!manager || !manager->WrittenRangeSettled(offset, amount)) {
+                return false;
+            }
+            offset = 0;
+            remaining -= amount;
+        }
+        for (size_t index = first; index <= last; ++index) {
+            top_tier[index]->BumpGpuWriteSeq();
+        }
+        return true;
+    }
+
     UploadPath ForEachUploadRange(VAddr query_cpu_range, u64 query_size, bool is_written,
                                   auto&& func, auto&& on_upload) {
         // Three phases with very different costs - scan is bitset work, mark can reach a
@@ -239,14 +298,33 @@ public:
             Common::FaultMonitor::CountUploadFastPath();
             return UploadPath::Coarse;
         }
+        const bool precheck = UploadPrecheckEnabled();
+        if (precheck && is_written) {
+            ++Precheck().written_calls;
+            if (TryWrittenFastPath(query_cpu_range, query_size)) {
+                ++Precheck().written_fast;
+                MaybeLogPrecheck();
+                on_upload();
+                Common::FaultMonitor::CountUploadShape(0, 0, 0, query_size);
+                return UploadPath::Coarse;
+            }
+        }
         IteratePages<true>(query_cpu_range, query_size,
                            [&counting_func, &shape_managers, &shape_skipped, &deferred_pages,
-                            clean_skip, is_written, defer,
+                            clean_skip, is_written, defer, precheck,
                             submit_epoch](RegionManager* manager, u64 offset, size_t size) {
                                ++shape_managers;
                                if (clean_skip && !manager->MayHaveCpuModified()) {
                                    ++shape_skipped;
                                    return;
+                               }
+                               if (precheck && !is_written) {
+                                   ++Precheck().read_visits;
+                                   if (!manager->CpuDirtyInRangeRelaxed(offset, size)) {
+                                       ++Precheck().read_skipped;
+                                       ++shape_skipped;
+                                       return;
+                                   }
                                }
                                manager->lock.lock();
                                if (defer) {
@@ -270,6 +348,9 @@ public:
         // If dirt landed mid-walk the epoch has moved and the record simply never hits.
         if (clean_skip && shape_ranges == 0 && deferred_pages == 0) {
             MemoRecordClean(query_cpu_range, query_size, epoch);
+        }
+        if (precheck) {
+            MaybeLogPrecheck();
         }
         if (deferred_pages != 0) {
             Common::FaultMonitor::CountDeferredSync(deferred_pages);
