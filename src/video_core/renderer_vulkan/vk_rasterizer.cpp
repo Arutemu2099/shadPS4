@@ -1272,12 +1272,25 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             {
                 // Diagnostic SHADPS4_TRACE_SHADER=<hex pgm hash>: log texture bindings of that
                 // shader (first 16 binds): requested T# vs the cache image it resolved to.
-                static const u64 trace_hash = [] {
-                    const char* value = std::getenv("SHADPS4_TRACE_SHADER");
-                    return value ? std::strtoull(value, nullptr, 16) : 0ull;
+                static const std::vector<u64> trace_hashes = [] {
+                    std::vector<u64> out;
+                    if (const char* value = std::getenv("SHADPS4_TRACE_SHADER")) {
+                        char* cursor = const_cast<char*>(value);
+                        while (*cursor) {
+                            out.push_back(std::strtoull(cursor, &cursor, 16));
+                            if (*cursor == ',') {
+                                ++cursor;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    return out;
                 }();
                 static u32 traced = 0;
-                if (trace_hash != 0 && stage.pgm_hash == trace_hash && traced < 16) {
+                const u64 trace_hash = stage.pgm_hash;
+                if (!trace_hashes.empty() && traced < 48 &&
+                    std::ranges::find(trace_hashes, trace_hash) != trace_hashes.end()) {
                     ++traced;
                     LOG_WARNING(Render_Vulkan,
                                 "TraceShader {:#x}: slot {} type {} T# {:#x} {}x{} {} -> image "
