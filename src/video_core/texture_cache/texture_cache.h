@@ -175,6 +175,24 @@ public:
         return slot_image_views[id];
     }
 
+    /// SHADPS4_STENCIL_STORAGE: the registered depth image at `address` whose extent matches
+    /// `size`. One address can hold several depth surfaces (PS4 Pro: 1600x1800 scene depth and a
+    /// 3200x1800 reconstruction depth-stencil share a base address).
+    ImageId FindDepthImageBySize(VAddr address, const Extent3D& size) {
+        std::scoped_lock lock{mutex};
+        ImageId found{};
+        if (const auto it = page_table.find(address >> Traits::PageBits); it != nullptr) {
+            for (const ImageId id : *it) {
+                const Image& image = slot_images[id];
+                if (image.info.guest_address == address && image.info.props.is_depth &&
+                    image.info.size == size && True(image.flags & ImageFlagBits::Registered)) {
+                    found = id;
+                }
+            }
+        }
+        return found;
+    }
+
     /// SHADPS4_STENCIL_STORAGE: an image outside the cache's page table, LRU and page tracking,
     /// never refreshed from guest memory. The caller owns it for the rest of the run.
     ImageId InsertScratchImage(const ImageInfo& info) {

@@ -1246,6 +1246,13 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 }();
                 if (stencil_storage &&
                     desc.type == VideoCore::TextureCache::BindingType::Storage) {
+                    // The placeholder's association is whichever depth surface bound it last;
+                    // prefer the depth image at that address whose extent matches this view.
+                    const VAddr depth_addr = texture_cache.GetImage(depth_image_id).info.guest_address;
+                    if (const auto sized = texture_cache.FindDepthImageBySize(depth_addr,
+                                                                             desc.info.size)) {
+                        depth_image_id = sized;
+                    }
                     // Vulkan cannot bind a D32S8 stencil aspect as a storage image. Write an R8
                     // scratch seeded from the stencil plane; copied back before the next bind.
                     image_id = StencilScratchFor(depth_image_id, desc.info);
