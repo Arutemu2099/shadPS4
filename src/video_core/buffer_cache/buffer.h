@@ -198,6 +198,12 @@ private:
             hz_visible_access |= dst_access;
             return barrier;
         }
+        // Same as the default rule: a repeat of the same write with no read in between gets no
+        // barrier (consecutive dispatches writing one buffer, as before this option).
+        if (!hz_read_stages && hz_write_stages == dst_stages &&
+            hz_write_access == (dst_access & WriteAccessBits)) {
+            return {};
+        }
         vk::PipelineStageFlags2 src_stages = hz_write_stages | hz_read_stages;
         if (!src_stages) {
             src_stages = vk::PipelineStageFlagBits2::eAllCommands;
