@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <magic_enum/magic_enum.hpp>
+#include "common/io_file.h"
+#include "common/path_util.h"
+#include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/control_flow_graph.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/structured_control_flow.h"
@@ -44,6 +48,32 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     program.ins_list.reserve(code.size());
     while (!slice.atEnd()) {
         program.ins_list.emplace_back(decoder.decodeInstruction(slice));
+    }
+
+    // With dump_shaders: the decoded GCN instruction list, <stage>_<hash>.gcn.txt, so recompiler
+    // problems (e.g. UndefU1 condition flags in the IR) can be traced to instructions.
+    if (EmulatorSettings.IsDumpShaders()) {
+        using namespace Common::FS;
+        const auto dump_dir = GetUserPath(PathType::ShaderDir) / "dumps";
+        std::filesystem::create_directories(dump_dir);
+        const auto name = fmt::format("{}_{:#018x}.gcn.txt", info.stage, info.pgm_hash);
+        const IOFile file{dump_dir / name, FileAccessMode::Create, FileType::TextFile};
+        const auto operand = [](const Gcn::InstOperand& op) {
+            return fmt::format("{}:{:#x}", magic_enum::enum_name(op.field), op.code);
+        };
+        u32 pc = 0;
+        for (const auto& inst : program.ins_list) {
+            std::string line = fmt::format("{:05x} {:<28} {}", pc, magic_enum::enum_name(inst.opcode),
+                                           magic_enum::enum_name(inst.encoding));
+            for (u32 i = 0; i < inst.dst_count; ++i) {
+                line += fmt::format(" d{}={}", i, operand(inst.dst[i]));
+            }
+            for (u32 i = 0; i < inst.src_count; ++i) {
+                line += fmt::format(" s{}={}", i, operand(inst.src[i]));
+            }
+            file.WriteString(line + "\n");
+            pc += inst.length;
+        }
     }
 
     // Clear any previous pooled data.
