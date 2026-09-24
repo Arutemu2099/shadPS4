@@ -411,6 +411,12 @@ private:
     /// SHADPS4_READBACK_PREBATCH: guest ranges the batch being recorded writes on the GPU.
     std::vector<std::pair<VAddr, VAddr>> batch_writes;
     u64 batch_writes_tick = 0;
+    /// SHADPS4_PRECISE_PRODUCER: the GPU write ranges of the last WriteHistory batches.
+    static constexpr u64 WriteHistory = 64;
+    std::array<std::vector<std::pair<VAddr, VAddr>>, WriteHistory> write_hist;
+    std::array<u64, WriteHistory> write_hist_tick{};
+    /// Newest batch tick that wrote any of the copies; 0 when none of the last WriteHistory did.
+    u64 PreciseProducer(std::span<const FaultCopy> copies) const;
     void NoteBatchWrite(VAddr addr, u64 size);
     bool BatchWritesAny(std::span<const FaultCopy> copies);
     void NoteReadbackProducer(VAddr addr, u64 size);

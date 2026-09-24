@@ -39,6 +39,19 @@ static char PrebatchMode() {
     return mode;
 }
 
+/// SHADPS4_PRECISE_PRODUCER=1 (with SHADPS4_READBACK_QUEUE=1 or 2, prebatch off): a readback
+/// copy on the readback queue waits only for the newest batch that actually wrote its bytes,
+/// found in a 64-batch write history, instead of the coarse 1 MiB-slot producer ticks (whose
+/// floor made nearly every copy wait for the newest submitted batch). Measured 2026-09-24:
+/// early copies in queue order waited ~0.7 ms behind unrelated batches.
+static bool PreciseProducerEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_PRECISE_PRODUCER");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
 static bool PrebatchEnabled() {
     return PrebatchMode() != '0';
 }
@@ -731,7 +744,9 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
         // puts the copy after every submitted write; it only has to avoid bytes the batch still
         // being recorded writes, which BatchWritesAny checks exactly.
         const bool prebatch = readback_queue->InQueueOrder();
-        const u64 producer = prebatch ? 0 : ProducerTick(addr, bytes);
+        const u64 producer = prebatch                   ? 0
+                             : PreciseProducerEnabled() ? PreciseProducer(job->copies)
+                                                        : ProducerTick(addr, bytes);
         const bool side_ok = prebatch ? !BatchWritesAny(job->copies)
                                       : (producer != 0 && producer < tick);
         if (side_ok) {
@@ -991,7 +1006,19 @@ static bool ProducerStatsEnabled() {
 }
 
 void BufferCache::NoteBatchWrite(VAddr addr, u64 size) {
-    if (!PrebatchEnabled() || size == 0) {
+    if (size == 0) {
+        return;
+    }
+    if (PreciseProducerEnabled()) {
+        const u64 tick = scheduler.CurrentTick();
+        const u64 i = tick % WriteHistory;
+        if (write_hist_tick[i] != tick) {
+            write_hist[i].clear();
+            write_hist_tick[i] = tick;
+        }
+        write_hist[i].emplace_back(addr, addr + size);
+    }
+    if (!PrebatchEnabled()) {
         return;
     }
     const u64 tick = scheduler.CurrentTick();
@@ -1000,6 +1027,26 @@ void BufferCache::NoteBatchWrite(VAddr addr, u64 size) {
         batch_writes_tick = tick;
     }
     batch_writes.emplace_back(addr, addr + size);
+}
+
+u64 BufferCache::PreciseProducer(std::span<const FaultCopy> copies) const {
+    const u64 current = scheduler.CurrentTick();
+    for (u64 back = 0; back < WriteHistory && back < current; ++back) {
+        const u64 t = current - back;
+        const u64 i = t % WriteHistory;
+        if (write_hist_tick[i] != t) {
+            continue;
+        }
+        for (const auto& [begin, end] : write_hist[i]) {
+            for (const FaultCopy& copy : copies) {
+                if (begin < copy.addr + copy.size && copy.addr < end) {
+                    return t;
+                }
+            }
+        }
+    }
+    // Older than the history: complete long ago, or at worst ordered by an earlier wait.
+    return current > WriteHistory ? current - WriteHistory : 0;
 }
 
 bool BufferCache::BatchWritesAny(std::span<const FaultCopy> copies) {
@@ -1020,7 +1067,8 @@ bool BufferCache::BatchWritesAny(std::span<const FaultCopy> copies) {
 
 void BufferCache::NoteGpuWrite(VAddr addr, u64 size) {
     NoteBatchWrite(addr, size);
-    if ((!ProducerStatsEnabled() && !readback_queue && !EarlyFlushEnabled()) || size == 0) {
+    if ((!ProducerStatsEnabled() && !readback_queue && !EarlyFlushEnabled()) || size == 0 ||
+        PreciseProducerEnabled()) {
         return;
     }
     if (!producer_ticks) {
@@ -2270,7 +2318,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, 
         sfi_report();
         return false;
     }
-    if (PrebatchEnabled()) {
+    if (PrebatchEnabled() || PreciseProducerEnabled()) {
         NoteBatchWrite(image.info.guest_address,
                        std::min<u64>(std::max<u64>(copy_size, image.info.guest_size),
                                      buffer.SizeBytes() - buf_offset));
