@@ -675,6 +675,9 @@ void Rasterizer::OnSubmit() {
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
+    if (!pending_stencil_writebacks.empty()) {
+        FlushStencilWritebacks();
+    }
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
         IsComputeImageClear(pipeline)) {
         return false;
@@ -1038,6 +1041,61 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     Common::FaultMonitor::CountBindBufferPass(find_ns, obtain_ns);
 }
 
+VideoCore::ImageId Rasterizer::StencilScratchFor(VideoCore::ImageId depth_id,
+                                                 const VideoCore::ImageInfo& info) {
+    const u64 depth_uid = texture_cache.GetImage(depth_id).image_uid;
+    for (const auto& entry : stencil_scratches) {
+        if (entry.depth_id == depth_id && entry.depth_uid == depth_uid) {
+            return entry.scratch_id;
+        }
+    }
+    const VideoCore::ImageId scratch_id = texture_cache.InsertScratchImage(info);
+    stencil_scratches.push_back({depth_id, depth_uid, scratch_id});
+    const auto& depth = texture_cache.GetImage(depth_id);
+    const auto& scratch = texture_cache.GetImage(scratch_id);
+    LOG_WARNING(Render_Vulkan,
+                "StencilStorage: scratch {} ({}x{} {}) for depth {:#x} ({}x{} {}, {} samples)",
+                scratch_id.index, scratch.info.size.width, scratch.info.size.height,
+                vk::to_string(scratch.info.pixel_format), depth.info.guest_address,
+                depth.info.size.width, depth.info.size.height,
+                vk::to_string(depth.info.pixel_format), depth.info.num_samples);
+    return scratch_id;
+}
+
+bool Rasterizer::IsStencilScratch(VideoCore::ImageId id) const {
+    return std::ranges::any_of(stencil_scratches,
+                               [id](const auto& entry) { return entry.scratch_id == id; });
+}
+
+void Rasterizer::CopyStencilPlane(VideoCore::ImageId src_id, VideoCore::ImageId dst_id) {
+    auto& src = texture_cache.GetImage(src_id);
+    auto& dst = texture_cache.GetImage(dst_id);
+    const auto aspect_of = [](const VideoCore::Image& image) {
+        return (image.aspect_mask & vk::ImageAspectFlagBits::eStencil)
+                   ? vk::ImageAspectFlagBits::eStencil
+                   : vk::ImageAspectFlagBits::eColor;
+    };
+    const vk::ImageCopy region{
+        .srcSubresource = {aspect_of(src), 0, 0, 1},
+        .dstSubresource = {aspect_of(dst), 0, 0, 1},
+        .extent = {std::min(src.info.size.width, dst.info.size.width),
+                   std::min(src.info.size.height, dst.info.size.height), 1},
+    };
+    scheduler.EndRendering();
+    src.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
+    dst.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {});
+    auto command_access = scheduler.AcquireCommandBuffer();
+    command_access.Handle().copyImage(src.GetImage(), src.backing->state.layout, dst.GetImage(),
+                                      dst.backing->state.layout, region);
+}
+
+void Rasterizer::FlushStencilWritebacks() {
+    for (const auto& [scratch_id, depth_id] : pending_stencil_writebacks) {
+        CopyStencilPlane(scratch_id, depth_id);
+    }
+    pending_stencil_writebacks.clear();
+}
+
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     u32 lookup_count{};
     image_bindings.clear();
@@ -1141,10 +1199,28 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             ++lookup_count;
             auto* image = &texture_cache.GetImage(image_id);
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
-                // If this image has an associated depth image, it's a stencil attachment.
-                // Redirect the access to the actual depth-stencil buffer.
-                image_id = depth_image_id;
-                image = &texture_cache.GetImage(image_id);
+                static const bool stencil_storage = [] {
+                    const char* value = std::getenv("SHADPS4_STENCIL_STORAGE");
+                    return value && value[0] == '1';
+                }();
+                if (stencil_storage &&
+                    desc.type == VideoCore::TextureCache::BindingType::Storage) {
+                    // Vulkan cannot bind a D32S8 stencil aspect as a storage image. Write an R8
+                    // scratch seeded from the stencil plane; copied back before the next bind.
+                    image_id = StencilScratchFor(depth_image_id, desc.info);
+                    image = &texture_cache.GetImage(image_id);
+                    const std::pair writeback{image_id, depth_image_id};
+                    if (std::ranges::find(pending_stencil_writebacks, writeback) ==
+                        pending_stencil_writebacks.end()) {
+                        CopyStencilPlane(depth_image_id, image_id);
+                        pending_stencil_writebacks.push_back(writeback);
+                    }
+                } else {
+                    // If this image has an associated depth image, it's a stencil attachment.
+                    // Redirect the access to the actual depth-stencil buffer.
+                    image_id = depth_image_id;
+                    image = &texture_cache.GetImage(image_id);
+                }
             }
             if (image->binding.is_bound) {
                 // The image is already bound. In case if it is about to be used as storage we
@@ -1185,8 +1261,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                     NativeBindings::NullImageIndex(is_storage);
             }
         } else {
+            const bool is_scratch = !stencil_scratches.empty() && IsStencilScratch(image_id);
             if (auto& old_image = texture_cache.GetImage(image_id);
-                old_image.binding.needs_rebind) {
+                !is_scratch && old_image.binding.needs_rebind) {
                 old_image.binding = {};
                 image_id = texture_cache.FindImage(desc);
             }
@@ -1195,7 +1272,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
             auto& image = texture_cache.GetImage(image_id);
             const auto t_ft = Common::FaultMonitor::Now();
-            auto& image_view = texture_cache.FindTexture(image_id, desc);
+            auto& image_view = is_scratch ? image.FindView(desc.view_info)
+                                          : texture_cache.FindTexture(image_id, desc);
             const auto t_tr = Common::FaultMonitor::Now();
             findtex_ns += Common::FaultMonitor::DiffNs(t_ft, t_tr);
 

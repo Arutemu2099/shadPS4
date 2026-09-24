@@ -165,6 +165,16 @@ public:
         return slot_image_views[id];
     }
 
+    /// SHADPS4_STENCIL_STORAGE: an image outside the cache's page table, LRU and page tracking,
+    /// never refreshed from guest memory. The caller owns it for the rest of the run.
+    ImageId InsertScratchImage(const ImageInfo& info) {
+        std::scoped_lock lock{mutex};
+        const ImageId id =
+            slot_images.insert(instance, scheduler, blit_helper, slot_image_views, info);
+        slot_images[id].flags = ImageFlagBits::Empty;
+        return id;
+    }
+
     /// Get the associated depth stencil image if it is still valid.
     ImageId GetAssociatedDepth(Image& image) {
         if (!image.depth_id) {

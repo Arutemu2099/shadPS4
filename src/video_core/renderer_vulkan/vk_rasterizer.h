@@ -108,6 +108,23 @@ private:
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     bool BindResources(const Pipeline* pipeline);
 
+    /// SHADPS4_STENCIL_STORAGE=1: shader storage writes into a depth buffer's stencil plane
+    /// (PS4 Pro checkerboard mask) go to an R8 scratch image that is seeded from and copied back
+    /// into the depth image's stencil aspect, instead of an invalid storage view of D32S8.
+    VideoCore::ImageId StencilScratchFor(VideoCore::ImageId depth_id,
+                                         const VideoCore::ImageInfo& info);
+    bool IsStencilScratch(VideoCore::ImageId id) const;
+    void CopyStencilPlane(VideoCore::ImageId src_id, VideoCore::ImageId dst_id);
+    void FlushStencilWritebacks();
+    struct StencilScratch {
+        VideoCore::ImageId depth_id;
+        u64 depth_uid;
+        VideoCore::ImageId scratch_id;
+    };
+    std::vector<StencilScratch> stencil_scratches;
+    boost::container::small_vector<std::pair<VideoCore::ImageId, VideoCore::ImageId>, 2>
+        pending_stencil_writebacks; // (scratch, depth)
+
     /// Emits the bindings assembled by BindResources through the pipeline's binding model.
     void EmitPipelineResources(const Pipeline* pipeline);
 
