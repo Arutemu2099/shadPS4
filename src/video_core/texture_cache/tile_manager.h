@@ -3,11 +3,24 @@
 
 #pragma once
 
+#include <cstdlib>
+
 #include "common/types.h"
 #include "video_core/amdgpu/tiling.h"
 #include "video_core/buffer_cache/buffer.h"
 
 namespace VideoCore {
+
+/// SHADPS4_ASYNC_UPLOAD_RECORD=1: texture uploads queue their pre-copy buffer barrier and detile
+/// dispatch on the recording worker instead of taking the command buffer directly, which first
+/// drains the worker (measured 2026-09-24: RefreshImage drains were ~1.1% of the CP's time).
+inline bool AsyncUploadRecord() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_ASYNC_UPLOAD_RECORD");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
 
 struct ImageInfo;
 struct Image;

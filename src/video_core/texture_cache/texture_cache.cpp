@@ -1075,11 +1075,21 @@ void TextureCache::RefreshImage(Image& image) {
         buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
     if (auto barrier = in_buffer->GetBarrier(vk::AccessFlagBits2::eTransferRead,
                                              vk::PipelineStageFlagBits2::eTransfer)) {
-        scheduler.AcquireCommandBuffer().Handle().pipelineBarrier2(vk::DependencyInfo{
-            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-            .bufferMemoryBarrierCount = 1,
-            .pBufferMemoryBarriers = &barrier.value(),
-        });
+        if (AsyncUploadRecord()) {
+            scheduler.Record([barrier = *barrier](vk::CommandBuffer cmdbuf) {
+                cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                    .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                    .bufferMemoryBarrierCount = 1,
+                    .pBufferMemoryBarriers = &barrier,
+                });
+            });
+        } else {
+            scheduler.AcquireCommandBuffer().Handle().pipelineBarrier2(vk::DependencyInfo{
+                .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                .bufferMemoryBarrierCount = 1,
+                .pBufferMemoryBarriers = &barrier.value(),
+            });
+        }
     }
 
     const auto [buffer, offset] =

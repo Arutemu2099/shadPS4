@@ -193,9 +193,46 @@ TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset
 
     scheduler.EndRendering();
 
+    const vk::Pipeline detile_pipeline = GetTilingPipeline(info, false);
+    const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
+    if (AsyncUploadRecord()) {
+        // Same commands as below, queued in order on the recording worker.
+        const vk::DescriptorBufferInfo tiled_info{
+            .buffer = in_buffer, .offset = in_offset, .range = info.guest_size};
+        const vk::DescriptorBufferInfo linear_info{
+            .buffer = out_buffer, .offset = 0, .range = info.guest_size};
+        scheduler.Record([detile_pipeline, layout = *pl_layout, tiled_info, linear_info,
+                          params_info = params_buffer_info, dim_x](vk::CommandBuffer cmdbuf) {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, detile_pipeline);
+            const std::array<vk::WriteDescriptorSet, 3> writes = {{
+                {.dstSet = VK_NULL_HANDLE,
+                 .dstBinding = 0,
+                 .dstArrayElement = 0,
+                 .descriptorCount = 1,
+                 .descriptorType = vk::DescriptorType::eStorageBuffer,
+                 .pBufferInfo = &tiled_info},
+                {.dstSet = VK_NULL_HANDLE,
+                 .dstBinding = 1,
+                 .dstArrayElement = 0,
+                 .descriptorCount = 1,
+                 .descriptorType = vk::DescriptorType::eStorageBuffer,
+                 .pBufferInfo = &linear_info},
+                {.dstSet = VK_NULL_HANDLE,
+                 .dstBinding = 2,
+                 .dstArrayElement = 0,
+                 .descriptorCount = 1,
+                 .descriptorType = vk::DescriptorType::eUniformBuffer,
+                 .pBufferInfo = &params_info},
+            }};
+            cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, writes);
+            cmdbuf.dispatch(dim_x, 1, 1);
+        });
+        return {out_buffer, 0};
+    }
+
     auto command_access = scheduler.AcquireCommandBuffer();
     const auto cmdbuf = command_access.Handle();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, false));
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, detile_pipeline);
 
     const vk::DescriptorBufferInfo tiled_buffer_info{
         .buffer = in_buffer,
@@ -237,7 +274,6 @@ TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset
     }};
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
 
-    const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
     cmdbuf.dispatch(dim_x, 1, 1);
     return {out_buffer, 0};
 }
