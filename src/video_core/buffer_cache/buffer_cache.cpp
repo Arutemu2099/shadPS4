@@ -293,7 +293,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                            0,        AllFlags,  BDA_PAGETABLE_SIZE} {
     if (const char* mirror = std::getenv("SHADPS4_HOST_MIRROR"); mirror && mirror[0] == '1') {
         host_mirror = instance.IsExternalMemoryHostEnabled();
-        host_mirror_max = 64_KB;
+        host_mirror_max = static_cast<u32>(256_MB);
         if (const char* max = std::getenv("SHADPS4_HOST_MIRROR_MAX")) {
             host_mirror_max = static_cast<u32>(std::strtoul(max, nullptr, 0));
         }
