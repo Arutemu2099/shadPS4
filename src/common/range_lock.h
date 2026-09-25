@@ -19,6 +19,9 @@ struct RangeLockGuard {
         LockRange(begin, end);
     }
 
+    /// Takes ownership of a range the caller already holds (e.g. after TryLockRange succeeded).
+    RangeLockGuard(Iterator begin_, Iterator end_, std::adopt_lock_t) : begin(begin_), end(end_) {}
+
     void release() {
         begin = end;
     }

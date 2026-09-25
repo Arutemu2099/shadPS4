@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <bit>
+#include <chrono>
 #include <cstdlib>
 #include <boost/container/small_vector.hpp>
 #include "common/assert.h"
@@ -248,9 +250,7 @@ struct PageManager::Impl {
         const u64 page_end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
 
         // Acquire locks for the range of pages
-        const auto lock_start = locks.begin() + (page / PAGES_PER_LOCK);
-        const auto lock_end = locks.begin() + Common::DivCeil(page_end, PAGES_PER_LOCK);
-        Common::RangeLockGuard lk(lock_start, lock_end);
+        auto lk = LockPages(page, page_end);
 
         auto perms = cached_pages[page].Perms();
         u64 range_begin = 0;
@@ -335,7 +335,9 @@ struct PageManager::Impl {
 
         size_t base_page = (base_addr >> PM_PAGE_BITS);
         ASSERT(base_page % PAGES_PER_LOCK == 0);
-        std::scoped_lock lk(locks[base_page / PAGES_PER_LOCK]);
+        // The stripes the mask's page span touches; without SHADPS4_PAGE_LOCK_PAGES that is the
+        // region's one lock, as before.
+        auto lk = LockPages(base_page + start_range.first, base_page + end_range.second);
         auto perms = cached_pages[base_page + start_range.first].Perms();
         u64 range_begin = 0;
         u64 range_bytes = 0;
@@ -405,8 +407,7 @@ struct PageManager::Impl {
         if (end <= first) {
             return;
         }
-        Common::RangeLockGuard lk(locks.begin() + (first / PAGES_PER_LOCK),
-                                  locks.begin() + Common::DivCeil(end, PAGES_PER_LOCK));
+        auto lk = LockPages(first, end);
         const auto perms_of = [&](size_t page) {
             const auto perms = cached_pages[page].Perms();
             // Write-only is not expressible on the CPU; the stricter state is always safe.
@@ -432,6 +433,145 @@ struct PageManager::Impl {
     using LockType = Common::SpinLock;
 #endif
     std::array<LockType, NUM_ADDRESS_LOCKS> locks{};
+
+    /**
+     * SHADPS4_PAGE_LOCK_PAGES=<n> (power of two, 16..NUM_PAGES_PER_REGION): lock stripes of n pages
+     * instead of `locks`' one per 4 MB region. Measured 2026-09-25 (a19): the CP spun 0.86% of its
+     * time in LockRange while re-protecting CPU-dirty pages, behind fault handlers, the Protector
+     * and ReconcileProtection holding the same region. Every page's counts and protection still
+     * change only under the stripe that covers it. Costs NUM_ADDRESS_PAGES / n extra locks
+     * (n=64: 2^22 x 4 B = 16 MB on Windows), allocated only when the flag is set.
+     *
+     * Fine stripes are taken in ascending order, iteratively: every holder takes its whole span in
+     * one LockPages call and takes no other stripe while holding it, so the order alone rules out
+     * deadlock. (LockRange/TryLockRange recurse once per lock, and an image span can cover
+     * hundreds of fine stripes - on a guest thread's stack when a fault handler untracks it.)
+     *
+     * SHADPS4_PAGE_LOCK_STATS=1: on the CP thread, try the whole span first and count the
+     * acquisitions where that failed (the ones that would spin), with the time spent getting them.
+     */
+    static u32 FineLockBits() {
+        const char* value = std::getenv("SHADPS4_PAGE_LOCK_PAGES");
+        if (!value) {
+            return 0;
+        }
+        const u64 pages = std::strtoull(value, nullptr, 10);
+        if (pages < 16 || pages > PAGES_PER_LOCK || !std::has_single_bit(pages)) {
+            LOG_WARNING(Render, "SHADPS4_PAGE_LOCK_PAGES={} ignored (power of two, 16-{})", value,
+                        PAGES_PER_LOCK);
+            return 0;
+        }
+        if (pages == PAGES_PER_LOCK) {
+            return 0;
+        }
+        LOG_INFO(Render, "PageLock: {} pages per lock stripe ({} locks)", pages,
+                 NUM_ADDRESS_PAGES / pages);
+        return static_cast<u32>(std::countr_zero(pages));
+    }
+
+    static bool LockStatsEnabled() {
+        const char* value = std::getenv("SHADPS4_PAGE_LOCK_STATS");
+        return value && value[0] == '1';
+    }
+
+    using LockGuard = Common::RangeLockGuard<LockType*>;
+
+    /// Locks every stripe covering pages [first, end).
+    LockGuard LockPages(size_t first, size_t end) {
+        if (lock_slow_path) [[unlikely]] {
+            return LockPagesSlow(first, end);
+        }
+        return LockGuard(locks.data() + first / PAGES_PER_LOCK,
+                         locks.data() + Common::DivCeil(end, PAGES_PER_LOCK));
+    }
+
+    static bool TryLockOrdered(LockType* begin, LockType* end) {
+        for (LockType* it = begin; it != end; ++it) {
+            if (!it->try_lock()) {
+                while (it != begin) {
+                    (--it)->unlock();
+                }
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static void LockOrdered(LockType* begin, LockType* end) {
+        for (; begin != end; ++begin) {
+            begin->lock();
+        }
+    }
+
+    LockGuard LockPagesSlow(size_t first, size_t end) {
+        const bool fine = fine_locks != nullptr;
+        LockType* begin = locks.data() + first / PAGES_PER_LOCK;
+        LockType* last = locks.data() + Common::DivCeil(end, PAGES_PER_LOCK);
+        if (fine) {
+            begin = fine_locks.get() + (first >> fine_lock_bits);
+            last = fine_locks.get() + ((end + (1ULL << fine_lock_bits) - 1) >> fine_lock_bits);
+        }
+        const bool count = lock_stats && Common::FaultMonitor::t_is_cp_thread;
+        if (count) {
+            // Both tries either take the whole span or release what they took.
+            if (fine ? TryLockOrdered(begin, last) : Common::TryLockRange(begin, last) == last) {
+                CountCpLock(false, 0);
+                return LockGuard(begin, last, std::adopt_lock);
+            }
+        }
+        const auto start =
+            count ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (fine) {
+            LockOrdered(begin, last);
+        } else {
+            Common::LockRange(begin, last);
+        }
+        if (count) {
+            CountCpLock(true, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                   std::chrono::steady_clock::now() - start)
+                                                   .count()));
+        }
+        return LockGuard(begin, last, std::adopt_lock);
+    }
+
+    /// CP thread only (t_is_cp_thread), so plain counters. Logged every 512 presented frames.
+    void CountCpLock(bool spun, u64 spin_ns) {
+        ++cp_locks;
+        cp_spins += spun;
+        cp_spin_ns += spin_ns;
+        if ((cp_locks & 0xfff) != 0) {
+            return;
+        }
+        const u64 frames = Common::FaultMonitor::presented_frames.load(std::memory_order_relaxed);
+        if (cp_stats_frames == 0 || frames < cp_stats_frames + 512) {
+            if (cp_stats_frames == 0 && frames != 0) {
+                // Start the first window at the first presented frame, not at boot.
+                cp_stats_frames = frames;
+                cp_locks = cp_spins = cp_spin_ns = 0;
+            }
+            return;
+        }
+        const double n = static_cast<double>(frames - cp_stats_frames);
+        LOG_INFO(Render,
+                 "PageLockSpin: stripe_pages={} frames={} cp_locks/frame={:.1f} "
+                 "cp_spins/frame={:.2f} ({:.2f}% of locks) cp_spin_us/frame={:.1f}",
+                 fine_locks ? (1ULL << fine_lock_bits) : PAGES_PER_LOCK, frames - cp_stats_frames,
+                 cp_locks / n, cp_spins / n, 100.0 * cp_spins / cp_locks, cp_spin_ns / n / 1000.0);
+        cp_stats_frames = frames;
+        cp_locks = cp_spins = cp_spin_ns = 0;
+    }
+
+    const u32 fine_lock_bits = FineLockBits();
+    const std::unique_ptr<LockType[]> fine_locks =
+        fine_lock_bits != 0 ? std::make_unique<LockType[]>(NUM_ADDRESS_PAGES >> fine_lock_bits)
+                            : nullptr;
+    const bool lock_stats = LockStatsEnabled();
+    // The one flag the default path reads: either option routes locking through LockPagesSlow.
+    const bool lock_slow_path = fine_lock_bits != 0 || lock_stats;
+    u64 cp_locks = 0;
+    u64 cp_spins = 0;
+    u64 cp_spin_ns = 0;
+    u64 cp_stats_frames = 0;
 };
 
 PageManager::PageManager(Vulkan::Rasterizer* rasterizer_)
