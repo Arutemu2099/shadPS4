@@ -17,6 +17,7 @@ set(SHADER_FILES
     fs_tri.vert
     fsr.comp
     infamous_particle_sort.comp
+    neo_id_derive.comp
     post_process.frag
     tiling.comp
 )

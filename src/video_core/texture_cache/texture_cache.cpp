@@ -1237,7 +1237,13 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
         ImageId stencil_id{};
         ForEachImageInRegion(desc.info.stencil_addr, desc.info.stencil_size,
                              [&](ImageId image_id, Image& image) {
-                                 if (image.info.guest_address == desc.info.stencil_addr) {
+                                 if (image.info.guest_address != desc.info.stencil_addr) {
+                                     return;
+                                 }
+                                 // STENCIL_PLANE_MERGE: several planes can share the address
+                                 // (Pro 1600x1800 and 3200x1800); keep the one matching the depth.
+                                 if (!stencil_id || !StencilPlaneMerge() ||
+                                     image.info.size == desc.info.size) {
                                      stencil_id = image_id;
                                  }
                              });

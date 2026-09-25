@@ -48,6 +48,13 @@ public:
 
     void Draw(bool is_indexed, u32 index_offset = 0);
     void ScanRegistersForValue();
+    /// SHADPS4_NEO_IDBUF_DERIVE=1: fill the Pro ID buffer from the last 2-sample scene depth.
+    void DeriveNeoIdBuffer(VideoCore::Image& id_image);
+    struct NeoIdDerive;
+    std::shared_ptr<NeoIdDerive> neo_id_derive;
+    VAddr neo_depth_addr{};
+    VideoCore::Extent3D neo_depth_size{};
+    u32 neo_depth_x0y0{};
     void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,
                       VAddr count_address);
 

@@ -16,6 +16,8 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "shader_recompiler/runtime_info.h"
+#include "video_core/host_shaders/neo_id_derive_comp.h"
+#include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -394,6 +396,144 @@ void Rasterizer::ScanRegistersForValue() {
                          target, i, draws);
             }
         }
+    }
+}
+
+struct Rasterizer::NeoIdDerive {
+    vk::UniqueDescriptorSetLayout set_layout;
+    vk::UniquePipelineLayout layout;
+    vk::UniquePipeline pipeline;
+    vk::Image depth_image{};
+    vk::ImageView depth_view{};
+    vk::Image id_image{};
+    vk::ImageView id_view{};
+    // Views are never destroyed while possibly in flight: superseded ones are kept (rare, small).
+    std::vector<vk::UniqueImageView> views;
+    u64 runs{};
+};
+
+void Rasterizer::DeriveNeoIdBuffer(VideoCore::Image& id_image) {
+    static const s64 parity_override = [] {
+        const char* value = std::getenv("SHADPS4_NEO_IDBUF_PARITY");
+        return value ? static_cast<s64>(std::strtoll(value, nullptr, 0)) : s64{-1};
+    }();
+    static const u32 bucket_mask = [] {
+        const char* value = std::getenv("SHADPS4_NEO_IDBUF_MASK");
+        return value ? static_cast<u32>(std::strtoull(value, nullptr, 0)) : 0xFFFFF000u;
+    }();
+    if (!neo_depth_addr) {
+        return;
+    }
+    const auto depth_id = texture_cache.FindDepthImageBySize(neo_depth_addr, neo_depth_size);
+    if (!depth_id) {
+        return;
+    }
+    auto& depth = texture_cache.GetImage(depth_id);
+    if (depth.info.num_samples != 2 || depth.info.size.width != id_image.info.size.width ||
+        depth.info.size.height != id_image.info.size.height) {
+        return;
+    }
+    const auto device = instance.GetDevice();
+    if (!neo_id_derive) {
+        neo_id_derive = std::make_shared<NeoIdDerive>();
+        auto& d = *neo_id_derive;
+        const std::array<vk::DescriptorSetLayoutBinding, 2> bindings = {{
+            {.binding = 0,
+             .descriptorType = vk::DescriptorType::eSampledImage,
+             .descriptorCount = 1,
+             .stageFlags = vk::ShaderStageFlagBits::eCompute},
+            {.binding = 1,
+             .descriptorType = vk::DescriptorType::eStorageImage,
+             .descriptorCount = 1,
+             .stageFlags = vk::ShaderStageFlagBits::eCompute},
+        }};
+        const vk::DescriptorSetLayoutCreateInfo set_ci{
+            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+            .bindingCount = 2,
+            .pBindings = bindings.data(),
+        };
+        d.set_layout = Check(device.createDescriptorSetLayoutUnique(set_ci));
+        const vk::PushConstantRange push_range{
+            .stageFlags = vk::ShaderStageFlagBits::eCompute, .offset = 0, .size = 16};
+        const vk::PipelineLayoutCreateInfo layout_ci{
+            .setLayoutCount = 1,
+            .pSetLayouts = &*d.set_layout,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &push_range,
+        };
+        d.layout = Check(device.createPipelineLayoutUnique(layout_ci));
+        const auto module =
+            Compile(HostShaders::NEO_ID_DERIVE_COMP, vk::ShaderStageFlagBits::eCompute, device);
+        const vk::ComputePipelineCreateInfo pipeline_ci{
+            .stage = {.stage = vk::ShaderStageFlagBits::eCompute, .module = module, .pName = "main"},
+            .layout = *d.layout,
+        };
+        d.pipeline = Check(device.createComputePipelineUnique({}, pipeline_ci));
+        device.destroyShaderModule(module);
+        LOG_INFO(Render_Vulkan, "NeoIdDerive: pipeline created");
+    }
+    auto& d = *neo_id_derive;
+    if (d.depth_image != depth.GetImage()) {
+        d.depth_image = depth.GetImage();
+        const vk::ImageViewCreateInfo view_ci{
+            .image = d.depth_image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = depth.info.pixel_format,
+            .subresourceRange = {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1},
+        };
+        d.views.push_back(Check(device.createImageViewUnique(view_ci)));
+        d.depth_view = *d.views.back();
+    }
+    if (d.id_image != id_image.GetImage()) {
+        d.id_image = id_image.GetImage();
+        const vk::ImageViewCreateInfo view_ci{
+            .image = d.id_image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = vk::Format::eR32Uint,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        };
+        d.views.push_back(Check(device.createImageViewUnique(view_ci)));
+        d.id_view = *d.views.back();
+    }
+    const u32 s0_x = neo_depth_x0y0 & 0xF;
+    const u32 parity = parity_override >= 0 ? static_cast<u32>(parity_override & 1)
+                                            : ((s0_x != 0 && s0_x < 8) ? 1u : 0u);
+    const std::array<u32, 4> push{id_image.info.size.width, id_image.info.size.height, parity,
+                                  bucket_mask};
+
+    scheduler.EndRendering();
+    depth.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderRead, {});
+    id_image.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite, {});
+    const vk::DescriptorImageInfo depth_info{.imageView = d.depth_view,
+                                             .imageLayout = vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo id_info{.imageView = d.id_view,
+                                          .imageLayout = vk::ImageLayout::eGeneral};
+    const std::array<vk::WriteDescriptorSet, 2> writes = {{
+        {.dstBinding = 0,
+         .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eSampledImage,
+         .pImageInfo = &depth_info},
+        {.dstBinding = 1,
+         .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eStorageImage,
+         .pImageInfo = &id_info},
+    }};
+    {
+        auto command_access = scheduler.AcquireCommandBuffer();
+        const auto cmdbuf = command_access.Handle();
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *d.pipeline);
+        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *d.layout, 0, writes);
+        cmdbuf.pushConstants(*d.layout, vk::ShaderStageFlagBits::eCompute, 0,
+                             static_cast<u32>(sizeof(push)), push.data());
+        cmdbuf.dispatch((push[0] + 7) / 8, (push[1] + 7) / 8, 1);
+    }
+    ++d.runs;
+    if (d.runs <= 20 || (d.runs & 1023) == 0) {
+        LOG_INFO(Render_Vulkan,
+                 "NeoIdDerive: depth {:#x} {}x{} 2s -> id {:#x} parity {} (x0y0 {:#x}) mask {:#x} "
+                 "run {}",
+                 neo_depth_addr, depth.info.size.width, depth.info.size.height,
+                 id_image.info.guest_address, parity, neo_depth_x0y0, bucket_mask, d.runs);
     }
 }
 
@@ -1488,8 +1628,15 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                     const char* value = std::getenv("SHADPS4_NEO_IDBUF_FILL");
                     return value ? static_cast<s64>(std::strtoll(value, nullptr, 0)) : s64{-1};
                 }();
-                if (idbuf_fill >= 0 && !is_storage && image.info.num_samples == 2 &&
+                static const bool idbuf_derive = [] {
+                    const char* value = std::getenv("SHADPS4_NEO_IDBUF_DERIVE");
+                    return value && value[0] == '1';
+                }();
+                if (idbuf_derive && !is_storage && image.info.num_samples == 2 &&
                     image.info.pixel_format == vk::Format::eR32Uint) {
+                    DeriveNeoIdBuffer(image);
+                } else if (idbuf_fill >= 0 && !is_storage && image.info.num_samples == 2 &&
+                           image.info.pixel_format == vk::Format::eR32Uint) {
                     scheduler.EndRendering();
                     image.Transit(vk::ImageLayout::eTransferDstOptimal,
                                   vk::AccessFlagBits2::eTransferWrite, {});
@@ -1686,6 +1833,13 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         const auto& image_view = texture_cache.FindDepthTarget(image_id, desc);
         Common::FaultMonitor::CountFindDepthTarget(Common::FaultMonitor::SinceNs(t_fd));
         auto& image = texture_cache.GetImage(image_id);
+        if (image.info.num_samples == 2) {
+            // Pro scene depth (2 samples): source for SHADPS4_NEO_IDBUF_DERIVE, with the sample
+            // locations active while it is rasterized (PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0).
+            neo_depth_addr = image.info.guest_address;
+            neo_depth_size = image.info.size;
+            neo_depth_x0y0 = regs.reg_array[0xA2FE];
+        }
 
         const auto slice = image_view.info.range.base.layer;
         const bool is_depth_clear =
