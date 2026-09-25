@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -51,9 +52,33 @@ public:
         return env != nullptr && env[0] == '1';
     }
 
+    /**
+     * SHADPS4_PROTECT_STEAL, default off (0). Measured 2026-09-25 (a19, SHADPS4_PROTECT_WAKE_STATS):
+     * a waited fence took 13.76 us against 4.98 us of Protector apply per batch, and 51.6% of
+     * waits began before the Protector had even claimed the batch, so wake latency dominates.
+     *   1: Push notifies the condition variable only when the Protector is blocked in it.
+     *   2: 1, plus Fence applies a batch the Protector has not yet claimed on the calling thread,
+     *      then waits only for the batch the Protector already has in flight.
+     */
+    static int StealMode() {
+        const char* env = std::getenv("SHADPS4_PROTECT_STEAL");
+        if (env == nullptr || (env[0] != '1' && env[0] != '2')) {
+            return 0;
+        }
+        return env[0] - '0';
+    }
+
     static ProtectQueue& Instance() {
         static ProtectQueue queue;
         return queue;
+    }
+
+    ProtectQueue() {
+        if (steal_mode != 0) {
+            LOG_INFO(Render, "ProtectQueue: SHADPS4_PROTECT_STEAL={} ({})", steal_mode,
+                     steal_mode == 2 ? "notify only when idle, fence applies unclaimed batches"
+                                     : "notify only when idle");
+        }
     }
 
     /// Queues the watcher updates and empties `items`. Command processor only.
@@ -61,6 +86,7 @@ public:
         if (items.empty()) {
             return;
         }
+        bool notify = true;
         {
             std::scoped_lock lk{mutex};
             if (!thread.joinable()) {
@@ -72,8 +98,23 @@ public:
             pending.insert(pending.end(), items.begin(), items.end());
             enqueued.store(enqueued.load(std::memory_order_relaxed) + 1,
                            std::memory_order_release);
+            if (steal_mode != 0) [[unlikely]] {
+                // `idle` is true only while the Protector is blocked (or about to block) in
+                // cv.wait with an empty queue: its wait predicate sets it under this mutex each
+                // time it finds `pending` empty. If it is false, the Protector has not yet
+                // re-checked the predicate and will see the items appended above, so no wake-up
+                // can be lost. Clearing it here makes later pushes skip the notify until the
+                // Protector blocks again.
+                notify = idle;
+                idle = false;
+            }
         }
-        cv.notify_one();
+        if (notify) {
+            cv.notify_one();
+        }
+        if (wake_stats) [[unlikely]] {
+            stats.push_notifies.fetch_add(notify ? 1 : 0, std::memory_order_relaxed);
+        }
         items.clear();
         if (wake_stats) [[unlikely]] {
             MaybeLogStats();
@@ -81,7 +122,7 @@ public:
     }
 
     /// Waits until every protection queued so far is applied. Cheap when the queue is idle.
-    void Fence() const {
+    void Fence() {
         if (wake_stats) [[unlikely]] {
             return FenceCounted();
         }
@@ -89,11 +130,72 @@ public:
         if (applied.load(std::memory_order_acquire) >= target) {
             return;
         }
+        if (steal_mode == 2 && StealAndApply()) [[unlikely]] {
+            return;
+        }
         WaitApplied(target);
     }
 
 private:
     using Clock = std::chrono::steady_clock;
+
+    /**
+     * SHADPS4_PROTECT_STEAL=2, from Fence. If `pending` is non-empty, claims it exactly as the
+     * Protector would, applies it on this thread, waits for the batch claimed before it, and
+     * publishes. Returns false if there was nothing to claim: every push so far has then been
+     * claimed by the Protector, and the caller waits for `applied` as before.
+     *
+     * Why Fence's contract (it returns only after every watch pushed before it is applied, by
+     * whichever thread) still holds:
+     * - Claiming is serialized by `mutex`: whoever swaps `pending` out takes every item pushed so
+     *   far, reads `enqueued` as that batch's sequence number, and records the previous claim in
+     *   `claimed_seq`. So batches are disjoint, each has one owner, and claims are totally ordered
+     *   by sequence number. The Fence caller's `target` (loaded before the lock) is <= the stolen
+     *   batch's number, because every push it counted is either in this batch or claimed earlier.
+     * - Publication is chained: a claimer stores `applied = seq` (release) only after it has
+     *   finished its own ApplyDeferredWatches and has observed (acquire) `applied >= prev`, the
+     *   previous claim's number. By induction `applied` never decreases, and `applied >= s` means
+     *   every batch numbered <= s is fully applied, and those VirtualProtect calls happen-before
+     *   any thread's acquire load that sees it. That is the same guarantee the single Protector
+     *   gave, when claim order and publish order could not differ.
+     * - The two batches in flight (Protector's and the stolen one) may be applied concurrently and
+     *   out of order. That is already allowed: watcher counts commute (see DeferredWatch), and the
+     *   Protector already runs UpdatePageWatchersForRegion concurrently with the CP's own updates
+     *   and with fault handlers, under the page manager's locks.
+     * - No deadlock: each claimer waits only for the claim immediately before its own, and the
+     *   Protector never waits on anything the CP holds. With one CP thread the Protector's `prev`
+     *   is always already published (nothing can be pushed while the CP is inside Fence).
+     */
+    bool StealAndApply() {
+        u64 seq;
+        u64 prev;
+        {
+            std::scoped_lock lk{mutex};
+            if (pending.empty()) {
+                return false;
+            }
+            steal_work.swap(pending);
+            seq = enqueued.load(std::memory_order_relaxed);
+            prev = claimed_seq;
+            claimed_seq = seq;
+            if (wake_stats) [[unlikely]] {
+                stats.claimed.store(seq, std::memory_order_release);
+            }
+        }
+        if (wake_stats) [[unlikely]] {
+            const auto start = Clock::now();
+            const u64 items = steal_work.size();
+            ApplyDeferredWatches(steal_work);
+            stats.steals.fetch_add(1, std::memory_order_relaxed);
+            stats.steal_items.fetch_add(items, std::memory_order_relaxed);
+            stats.steal_apply_ns.fetch_add(Ns(start, Clock::now()), std::memory_order_relaxed);
+        } else {
+            ApplyDeferredWatches(steal_work);
+        }
+        WaitApplied(prev);
+        applied.store(seq, std::memory_order_release);
+        return true;
+    }
 
     void WaitApplied(u64 target) const {
         u32 spins = 0;
@@ -111,18 +213,31 @@ private:
         std::vector<DeferredWatch> work;
         while (!stop.stop_requested()) {
             u64 seq;
+            u64 prev = 0;
             Clock::time_point first_push{};
             {
                 std::unique_lock lk{mutex};
                 if (wake_stats) [[unlikely]] {
                     sleeping = pending.empty();
                 }
-                cv.wait(lk, stop, [this] { return !pending.empty(); });
+                if (steal_mode != 0) [[unlikely]] {
+                    // The predicate runs under `mutex` before every block, including after a
+                    // wake-up that found the queue already stolen, so `idle` is true whenever
+                    // this thread is blocked (see Push).
+                    cv.wait(lk, stop, [this] {
+                        idle = pending.empty();
+                        return !idle;
+                    });
+                } else {
+                    cv.wait(lk, stop, [this] { return !pending.empty(); });
+                }
                 if (stop.stop_requested()) {
                     return;
                 }
                 work.swap(pending);
                 seq = enqueued.load(std::memory_order_relaxed);
+                prev = claimed_seq;
+                claimed_seq = seq;
                 if (wake_stats) [[unlikely]] {
                     sleeping = false;
                     first_push = batch_first_push;
@@ -139,6 +254,9 @@ private:
                 stats.apply_ns.fetch_add(Ns(start, Clock::now()), std::memory_order_relaxed);
             } else {
                 ApplyDeferredWatches(work);
+            }
+            if (steal_mode == 2) [[unlikely]] {
+                WaitApplied(prev); // chained publication, see StealAndApply
             }
             applied.store(seq, std::memory_order_release);
         }
@@ -161,15 +279,19 @@ private:
         }
     }
 
-    void FenceCounted() const {
+    void FenceCounted() {
         const u64 target = enqueued.load(std::memory_order_acquire);
         stats.fence_calls.fetch_add(1, std::memory_order_relaxed);
         if (applied.load(std::memory_order_acquire) < target) {
             // Unclaimed: the batch this fence needs is still in `pending`, so the wait includes
-            // the Protector's wake-up, not just its VirtualProtect calls.
+            // the Protector's wake-up, not just its VirtualProtect calls. With
+            // SHADPS4_PROTECT_STEAL=2 the CP applies such a batch itself, and wait_ns includes
+            // that apply time, so wait_us/frame stays the CP's whole cost of fencing.
             const bool unclaimed = stats.claimed.load(std::memory_order_acquire) < target;
             const auto start = Clock::now();
-            WaitApplied(target);
+            if (steal_mode != 2 || !StealAndApply()) {
+                WaitApplied(target);
+            }
             stats.fence_waits.fetch_add(1, std::memory_order_relaxed);
             stats.unclaimed_waits.fetch_add(unclaimed ? 1 : 0, std::memory_order_relaxed);
             stats.wait_ns.fetch_add(Ns(start, Clock::now()), std::memory_order_relaxed);
@@ -198,29 +320,42 @@ private:
         const auto per = [](u64 a, u64 b) { return b != 0 ? static_cast<double>(a) / b : 0.0; };
         const double wait_us = per(s.wait_ns, s.fence_waits) / 1000.0;
         const double apply_us = per(s.apply_ns, s.batches) / 1000.0;
+        // Steal columns only with SHADPS4_PROTECT_STEAL set, so a control line keeps its format.
+        // `batches` and the columns after it count only the Protector's batches.
+        const std::string steal_cols =
+            steal_mode == 0
+                ? std::string{}
+                : fmt::format(" | steal_mode={} steals/frame={:.2f} steal_items/steal={:.1f} "
+                              "steal_apply_us/steal={:.2f}",
+                              steal_mode, s.steals / n, per(s.steal_items, s.steals),
+                              per(s.steal_apply_ns, s.steals) / 1000.0);
         LOG_INFO(Render,
                  "ProtectWake: frames={} fence_calls/frame={:.1f} fence_waits/frame={:.2f} "
                  "wait_us/waited_fence={:.2f} unclaimed_waits={:.1f}% wait_us/frame={:.1f} | "
                  "batches/frame={:.2f} apply_us/batch={:.2f} items/batch={:.1f} "
                  "pickup_us/batch={:.2f} | push_calls/frame={:.1f} push_notifies/frame={:.1f} "
-                 "notifies_waking={:.1f}% | wait_over_apply={:.2f}",
+                 "notifies_waking={:.1f}% | wait_over_apply={:.2f}{}",
                  window, s.fence_calls / n, s.fence_waits / n, wait_us,
                  100.0 * per(s.unclaimed_waits, s.fence_waits), s.wait_ns / n / 1000.0,
                  s.batches / n, apply_us, per(s.batch_items, s.batches),
-                 per(s.pickup_ns, s.batches) / 1000.0, s.push_calls / n, s.push_calls / n,
-                 100.0 * per(s.push_wakes, s.push_calls), apply_us > 0 ? wait_us / apply_us : 0.0);
+                 per(s.pickup_ns, s.batches) / 1000.0, s.push_calls / n, s.push_notifies / n,
+                 100.0 * per(s.push_wakes, s.push_calls), apply_us > 0 ? wait_us / apply_us : 0.0,
+                 steal_cols);
     }
 
     struct WakeStats {
         struct Snapshot {
             u64 fence_calls, fence_waits, unclaimed_waits, wait_ns;
-            u64 push_calls, push_items, push_wakes;
+            u64 push_calls, push_items, push_wakes, push_notifies;
             u64 batches, batch_items, apply_ns, pickup_ns;
+            u64 steals, steal_items, steal_apply_ns;
         };
-        // Written by the CP (fence_*, wait_ns, push_*) and the Protector (batch/apply/pickup).
+        // Written by the CP (fence_*, wait_ns, push_*, steal_*) and the Protector
+        // (batch/apply/pickup).
         std::atomic<u64> fence_calls{0}, fence_waits{0}, unclaimed_waits{0}, wait_ns{0};
-        std::atomic<u64> push_calls{0}, push_items{0}, push_wakes{0};
+        std::atomic<u64> push_calls{0}, push_items{0}, push_wakes{0}, push_notifies{0};
         std::atomic<u64> batches{0}, batch_items{0}, apply_ns{0}, pickup_ns{0};
+        std::atomic<u64> steals{0}, steal_items{0}, steal_apply_ns{0};
         /// Highest `enqueued` value the Protector has swapped out of `pending`.
         std::atomic<u64> claimed{0};
         u64 log_checks = 0; // CP only
@@ -230,9 +365,11 @@ private:
             const auto take = [](std::atomic<u64>& c) {
                 return c.exchange(0, std::memory_order_relaxed);
             };
-            return {take(fence_calls), take(fence_waits), take(unclaimed_waits), take(wait_ns),
-                    take(push_calls),  take(push_items),  take(push_wakes),      take(batches),
-                    take(batch_items), take(apply_ns),    take(pickup_ns)};
+            return {take(fence_calls),   take(fence_waits),    take(unclaimed_waits),
+                    take(wait_ns),       take(push_calls),     take(push_items),
+                    take(push_wakes),    take(push_notifies),  take(batches),
+                    take(batch_items),   take(apply_ns),       take(pickup_ns),
+                    take(steals),        take(steal_items),    take(steal_apply_ns)};
         }
     };
 
@@ -242,6 +379,10 @@ private:
     std::atomic<u64> enqueued{0};
     std::atomic<u64> applied{0};
     const bool wake_stats = WakeStatsEnabled();
+    const int steal_mode = StealMode();
+    u64 claimed_seq = 0;                  // under `mutex`: `enqueued` value of the latest claim
+    bool idle = false;                    // under `mutex`, SHADPS4_PROTECT_STEAL only (see Push)
+    std::vector<DeferredWatch> steal_work; // CP only (StealAndApply), empty between fences
     bool sleeping = false;                // under `mutex`, stats only
     Clock::time_point batch_first_push{}; // under `mutex`, stats only
     mutable WakeStats stats;
