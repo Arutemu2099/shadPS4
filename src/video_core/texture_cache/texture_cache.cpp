@@ -14,6 +14,7 @@
 #include "common/debug.h"
 #include "common/div_ceil.h"
 #include "common/fault_monitor.h"
+#include "common/lean.h"
 #include "common/scope_exit.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -294,13 +295,16 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
         for (u64 page = first; !any && page <= last; ++page) {
             any = page_image_counts[page].load(std::memory_order_acquire) != 0;
         }
-        const u64 n = calls.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (!any) {
-            skips.fetch_add(1, std::memory_order_relaxed);
-        }
-        if ((n & 0x7ffff) == 0) {
-            LOG_INFO(Render_Vulkan, "TexInvalidatePrecheck: calls={} skipped={} ({:.1f}%)", n,
-                     skips.load(), 100.0 * skips.load() / n);
+        // Two locked RMWs on one line shared by every faulting thread; statistics only.
+        if (!::Common::Lean()) {
+            const u64 n = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (!any) {
+                skips.fetch_add(1, std::memory_order_relaxed);
+            }
+            if ((n & 0x7ffff) == 0) {
+                LOG_INFO(Render_Vulkan, "TexInvalidatePrecheck: calls={} skipped={} ({:.1f}%)",
+                         n, skips.load(), 100.0 * skips.load() / n);
+            }
         }
         if (!any) {
             return;
@@ -875,14 +879,18 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
     }
     const auto fi_t2 = Common::FaultMonitor::Now();
-    ++fi_calls;
-    fi_lock_ns += Common::FaultMonitor::DiffNs(fi_t0, fi_t1);
-    fi_walk_ns += Common::FaultMonitor::DiffNs(fi_t1, fi_t2);
-    if (!reuse) {
-        fi_pages +=
-            ((info.guest_address + info.guest_size - 1) >> 20) - (info.guest_address >> 20) + 1;
+    // SHADPS4_LEAN: no FiSplit accounting; fi_calls then never reaches the report threshold.
+    const bool fi_stats = !::Common::Lean();
+    if (fi_stats) {
+        ++fi_calls;
+        fi_lock_ns += Common::FaultMonitor::DiffNs(fi_t0, fi_t1);
+        fi_walk_ns += Common::FaultMonitor::DiffNs(fi_t1, fi_t2);
+        if (!reuse) {
+            fi_pages += ((info.guest_address + info.guest_size - 1) >> 20) -
+                        (info.guest_address >> 20) + 1;
+        }
+        fi_cands += image_ids.size();
     }
-    fi_cands += image_ids.size();
 
     ImageId image_id = reuse ? memo_id : ImageId{};
 
@@ -979,7 +987,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             !(image.info.resources < info.resources) && final_generation == lookup_generation) {
             *memo = {key, image_id, image.image_uid, final_generation};
         }
-        if ((prepared_images->calls & 0x3ffff) == 0) {
+        if (fi_stats && (prepared_images->calls & 0x3ffff) == 0) {
             LOG_INFO(Render_Vulkan,
                      "PreparedImages: calls={} hit={} invalidation={} fallback={} verified={} "
                      "(cumulative; invalidation=structural changes)",
@@ -988,10 +996,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         }
     }
 
-    if (fi_perfect) {
-        ++fi_hit;
+    if (fi_stats) {
+        fi_hit += fi_perfect;
+        fi_rest_ns += Common::FaultMonitor::SinceNs(fi_t2);
     }
-    fi_rest_ns += Common::FaultMonitor::SinceNs(fi_t2);
     if (fi_calls >= 500000) {
         LOG_INFO(Render,
                  "FiSplit: calls={} lock={:.3f} walk={:.3f} rest={:.3f}us/call "
@@ -1048,6 +1056,11 @@ TextureCache::CacheLock::~CacheLock() {
 }
 
 void TextureCache::CountLockFree(bool find, bool hit) {
+    // Statistics only; its TexLockFree line was the most frequent CP log line in the a20 forest
+    // run (1759 lines in one ~10-minute session).
+    if (::Common::Lean()) {
+        return;
+    }
     if (find) {
         ++lf_find_calls;
         lf_find_fast += hit;

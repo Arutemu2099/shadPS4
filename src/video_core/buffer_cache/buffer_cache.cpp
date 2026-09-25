@@ -4,12 +4,14 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 #include "common/alignment.h"
 #include "common/buffer_sample_probe.h"
 #include "common/debug.h"
 #include "common/fault_monitor.h"
+#include "common/lean.h"
 #include "common/readback_offload.h"
 #include "common/scope_exit.h"
 #include "core/memory.h"
@@ -1933,9 +1935,16 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     // share no code: the early exit below (a tracker query plus a guest-memory memcpy) and the
     // SynchronizeBuffer fall-through. Time them separately - the split decides which is worth
     // cutting, and it has never actually been measured.
-    const bool sample_this_call = Common::BufferSampleProbe::ShouldSample();
-    Common::BufferSampleProbe sample{sample_this_call, is_written, is_texel_buffer, size,
-                                     sample_caller};
+    // SHADPS4_LEAN: no probe object at all. An inactive probe still costs a ~100-byte construction,
+    // the sampling-flag guard and a destructor check per call (a19 profile: 9 of 1279 CP samples
+    // under BufferSampleProbe frames).
+    using ProbeClock = Common::BufferSampleProbe::Clock;
+    std::optional<Common::BufferSampleProbe> sample_storage;
+    if (!::Common::Lean()) {
+        sample_storage.emplace(Common::BufferSampleProbe::ShouldSample(), is_written,
+                               is_texel_buffer, size, sample_caller);
+    }
+    Common::BufferSampleProbe* const sample = sample_storage ? &*sample_storage : nullptr;
     const auto t_entry = Common::FaultMonitor::Now();
     u64 query_ns = 0;
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
@@ -1953,7 +1962,9 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         if (!gpu_modified) {
             const u64 offset =
                 stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
-            sample.RecordStream();
+            if (sample) {
+                sample->RecordStream();
+            }
             Common::FaultMonitor::CountObtainStream(query_ns,
                                                     Common::FaultMonitor::SinceNs(t_query), size);
             return {&stream_buffer, offset};
@@ -1967,11 +1978,15 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         }
     }
     const bool buffer_id_fallback = IsBufferInvalid(buffer_id);
-    sample.RecordBufferIdFallback(buffer_id_fallback);
+    if (sample) {
+        sample->RecordBufferIdFallback(buffer_id_fallback);
+    }
     if (buffer_id_fallback) {
-        const auto t_find = sample.Now();
+        const auto t_find = sample ? sample->Now() : ProbeClock::time_point{};
         buffer_id = FindBuffer(device_addr, size);
-        sample.AddFindNs(sample.SinceNs(t_find));
+        if (sample) {
+            sample->AddFindNs(sample->SinceNs(t_find));
+        }
     }
     Buffer& buffer = slot_buffers[buffer_id];
     // SHADPS4_WRITTEN_MEMO=1: a GPU-written binding of exactly this range was fully synchronized
@@ -2002,7 +2017,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             hit = true;
             ++hits;
         }
-        if ((calls & 0xffff) == 0) {
+        if (!::Common::Lean() && (calls & 0xffff) == 0) {
             LOG_INFO(Render, "WrittenMemo: calls={} hits={} ({:.1f}%) miss_key={} miss_epoch={} "
                              "miss_jobs={} miss_cpu={}",
                      calls, hits, 100.0 * double(hits) / double(calls), miss_key, miss_epoch,
@@ -2013,12 +2028,12 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         }
     }
     const auto t_sync = Common::FaultMonitor::Now();
-    const auto t_sample_sync = sample.Now();
+    const auto t_sample_sync = sample ? sample->Now() : ProbeClock::time_point{};
     const bool traffic = BufferTraffic::Enabled();
     const bool traffic_dirty = traffic && memory_tracker->IsRegionCpuModified(device_addr, size);
     last_sync_upload_bytes = 0;
     SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer,
-                      sample.Active() ? &sample : nullptr);
+                      sample && sample->Active() ? sample : nullptr);
     if (traffic) {
         g_buffer_traffic.Record(device_addr, size, is_written, is_texel_buffer,
                                 sample_caller == Common::BufferSampleCaller::Other, traffic_dirty,
@@ -2028,13 +2043,17 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         // Epoch read before the walk: a clear during it makes the record miss next time.
         *memo_entry = {device_addr, size, memo_epoch};
     }
-    sample.AddSyncNs(sample.SinceNs(t_sample_sync));
+    if (sample) {
+        sample->AddSyncNs(sample->SinceNs(t_sample_sync));
+    }
     Common::FaultMonitor::CountObtainSync(query_ns, Common::FaultMonitor::SinceNs(t_sync));
     if (is_written) {
-        const auto t_range_add = sample.Now();
+        const auto t_range_add = sample ? sample->Now() : ProbeClock::time_point{};
         NoteGpuWrite(device_addr, size);
         AddGpuModified(gpu_modified_ranges, device_addr, size);
-        sample.AddRangeAddNs(sample.SinceNs(t_range_add));
+        if (sample) {
+            sample->AddRangeAddNs(sample->SinceNs(t_range_add));
+        }
         Common::FaultMonitor::CountRangeAdd(gpu_modified_ranges.m_ranges_set.iterative_size());
     }
     return {&buffer, buffer.Offset(device_addr)};
@@ -2654,9 +2673,11 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, 
     const auto sfi_t0 = Common::FaultMonitor::Now();
     const ImageId image_id = texture_cache.FindImageFromRange(device_addr, size);
     sfi_find_ns += Common::FaultMonitor::SinceNs(sfi_t0);
-    ++sfi_calls;
+    // SHADPS4_LEAN: sfi_calls stays 0, so the SfiSplit line is never formatted or written.
+    const bool sfi_stats = !::Common::Lean();
+    sfi_calls += sfi_stats;
     const auto sfi_report = [&] {
-        if (sfi_calls < 300000) {
+        if (!sfi_stats || sfi_calls < 300000) {
             return;
         }
         LOG_INFO(Render, "SfiSplit: calls={} found={:.1f}% find={:.3f}us/call tile={:.3f}us/found",

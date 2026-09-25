@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <chrono>
+#include "common/lean.h"
 #include "common/types.h"
 
 #ifndef SHADPS4_FAULT_TIMERS
@@ -534,6 +535,11 @@ inline void CountPresentedFrame() {
 /// `fragments` is the interval count after the operation. Cheap: interval_set::iterative_size()
 /// is the underlying node count, O(1).
 inline void CountRangeAdd(u64 fragments) {
+    // SHADPS4_LEAN: a locked RMW plus a store per written binding, only read by the FaultRate
+    // report. Stack profile a19: 3 of 1279 CP samples land on the instruction after it.
+    if (::Common::Lean()) {
+        return;
+    }
     range_adds.fetch_add(1, std::memory_order_relaxed);
     range_fragments.store(fragments, std::memory_order_relaxed);
 }
@@ -571,8 +577,19 @@ inline void CountVoLabelWait(u64 ns) {
     AddTime(volabel_ns, ns);
 }
 
+/// SHADPS4_LEAN: draw_count and dispatch_count have one writer, the command processor thread,
+/// so a relaxed load and store keeps them exact for the FaultRate reader without a locked RMW
+/// (which also waits for the store buffer to drain after the draw's recorded payload).
+inline void BumpSingleWriter(std::atomic<u64>& counter) {
+    if (::Common::Lean()) {
+        counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    } else {
+        counter.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 inline void CountDraw(u64 pipeline_ns, u64 bindres_ns, u64 beginrender_ns) {
-    draw_count.fetch_add(1, std::memory_order_relaxed);
+    BumpSingleWriter(draw_count);
     AddTime(draw_pipeline_ns, pipeline_ns);
     AddTime(draw_bindres_ns, bindres_ns);
     AddTime(draw_beginrender_ns, beginrender_ns);
@@ -614,7 +631,7 @@ inline void CountCpActive(u64 ns) {
 }
 
 inline void CountDispatch(u64 ns) {
-    dispatch_count.fetch_add(1, std::memory_order_relaxed);
+    BumpSingleWriter(dispatch_count);
     AddTime(dispatch_ns, ns);
 }
 

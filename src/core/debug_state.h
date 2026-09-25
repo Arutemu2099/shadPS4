@@ -10,6 +10,7 @@
 #include <vector>
 #include <queue>
 
+#include "common/lean.h"
 #include "common/types.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/regs.h"
@@ -212,12 +213,18 @@ public:
         ++flip_frame_count;
     }
 
+    // Only the devtools frame graph reads these. SHADPS4_LEAN skips them: the locked increment
+    // right after Draw's recorded payload drew 11 of 1279 CP stack samples (a19, 2026-09-25).
     void IncDrawCall() noexcept {
-        draw_call_count.fetch_add(1, std::memory_order_relaxed);
+        if (!::Common::Lean()) {
+            draw_call_count.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     void IncDispatch() noexcept {
-        dispatch_count.fetch_add(1, std::memory_order_relaxed);
+        if (!::Common::Lean()) {
+            dispatch_count.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     [[nodiscard]] float GetDrawCallsAvg() const noexcept {

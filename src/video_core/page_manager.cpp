@@ -9,6 +9,7 @@
 #include "common/debug.h"
 #include "common/div_ceil.h"
 #include "common/fault_monitor.h"
+#include "common/lean.h"
 #include "common/range_lock.h"
 #include "common/signal_context.h"
 #include "core/memory.h"
@@ -278,10 +279,10 @@ struct PageManager::Impl {
         const u64 aligned_addr = page << PM_PAGE_BITS;
         const u64 aligned_end = page_end << PM_PAGE_BITS;
         // SHADPS4_WATCH_MAPCHECK=0: skip this log-only check (a locked hash lookup per call; the
-        // warning was never seen in the forest logs).
+        // warning was never seen in the forest logs). SHADPS4_LEAN=1 implies it.
         static const bool map_check = [] {
             const char* value = std::getenv("SHADPS4_WATCH_MAPCHECK");
-            return !value || value[0] != '0';
+            return !::Common::Lean() && (!value || value[0] != '0');
         }();
         if (map_check && !rasterizer->IsMapped(aligned_addr, aligned_end - aligned_addr)) {
             LOG_WARNING(Render,

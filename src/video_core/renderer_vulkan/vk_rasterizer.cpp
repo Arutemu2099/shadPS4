@@ -14,6 +14,7 @@
 #include "common/buffer_sample_probe.h"
 #include "common/draw_sample_probe.h"
 #include "common/fault_monitor.h"
+#include "common/lean.h"
 #include "common/rdtsc.h"
 #include "common/scope_exit.h"
 #include "core/debug_state.h"
@@ -2239,7 +2240,8 @@ void Rasterizer::BindTextures(const Shader::BoundStage& bound,
     for (size_t image_slot = 0; image_slot < stage.images.size(); ++image_slot) {
         const auto& image_desc = stage.images[image_slot];
         const auto tsharp = image_desc.GetSharp(bound);
-        if (texture_cache.IsMeta(tsharp.Address())) {
+        // Log-only: a hash lookup per image binding (a19 profile: 11 of 1279 CP samples).
+        if (!::Common::Lean() && texture_cache.IsMeta(tsharp.Address())) {
             LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
         }
 

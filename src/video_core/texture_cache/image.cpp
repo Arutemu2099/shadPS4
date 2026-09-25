@@ -6,6 +6,7 @@
 #include <ranges>
 #include "common/assert.h"
 #include "common/fault_monitor.h"
+#include "common/lean.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -454,10 +455,14 @@ void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
     const auto tr_t0 = Common::FaultMonitor::Now();
     const auto barriers = GetBarriers(dst_layout, dst_mask, dst_pl_stage, range, bool(cmdbuf));
     const auto tr_t1 = Common::FaultMonitor::Now();
-    ++tr_calls;
-    tr_getbar_ns += Common::FaultMonitor::DiffNs(tr_t0, tr_t1);
+    // SHADPS4_LEAN: no TransitSplit accounting (its timings are 0 unless SHADPS4_FAULT_TIMERS).
+    const bool tr_stats = !::Common::Lean();
+    if (tr_stats) {
+        ++tr_calls;
+        tr_getbar_ns += Common::FaultMonitor::DiffNs(tr_t0, tr_t1);
+    }
     const auto tr_report = [&] {
-        if (tr_calls < 500000) {
+        if (!tr_stats || tr_calls < 500000) {
             return;
         }
         const auto nonempty = tr_calls - tr_empty;
@@ -471,7 +476,7 @@ void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
         tr_calls = tr_empty = tr_getbar_ns = tr_endr_ns = tr_submit_ns = 0;
     };
     if (barriers.empty()) {
-        ++tr_empty;
+        tr_empty += tr_stats;
         tr_report();
         return;
     }
@@ -492,8 +497,10 @@ void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
     } else {
         scheduler->RecordArrays(emit_barriers, std::span<const vk::ImageMemoryBarrier2>{barriers});
     }
-    tr_endr_ns += Common::FaultMonitor::DiffNs(tr_t1, tr_t2);
-    tr_submit_ns += Common::FaultMonitor::DiffNs(tr_t2, Common::FaultMonitor::Now());
+    if (tr_stats) {
+        tr_endr_ns += Common::FaultMonitor::DiffNs(tr_t1, tr_t2);
+        tr_submit_ns += Common::FaultMonitor::DiffNs(tr_t2, Common::FaultMonitor::Now());
+    }
     if (Vulkan::GpuBatchTimer::Enabled()) {
         Vulkan::GpuBreaks().image_barrier_calls.fetch_add(1, std::memory_order_relaxed);
         Vulkan::GpuBreaks().image_barriers.fetch_add(barriers.size(), std::memory_order_relaxed);

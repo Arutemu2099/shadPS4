@@ -8,6 +8,7 @@
 #include "shader_recompiler/spirv_variants.h"
 #include "common/fault_monitor.h"
 #include "common/hash.h"
+#include "common/lean.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
 #include "core/debug_state.h"
@@ -434,7 +435,7 @@ PipelineCache::PreparedPipelineEntry* PipelineCache::TryPreparedPipeline(
     constexpr auto fs_idx = u32(LogicalStage::Fragment);
     constexpr auto vs_idx = u32(LogicalStage::Vertex);
     auto& stats = prepared_stats;
-    if ((++stats.attempts & 0x3ffff) == 0) {
+    if ((++stats.attempts & 0x3ffff) == 0 && !::Common::Lean()) {
         LOG_INFO(Render_Vulkan,
                  "PreparedPipelines: attempts={} ineligible={} candidates={} stale={} "
                  "guard_fallbacks={} hits={} seeds={} seed_rejects={} verified={} input_changes={} "
@@ -1228,7 +1229,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
                 ++verified[counter];
             }
         }
-        if ((calls[counter] & 0x3ffff) == 0) {
+        if ((calls[counter] & 0x3ffff) == 0 && !::Common::Lean()) {
             LOG_INFO(Render_Vulkan,
                      "PreparedPrograms: stage={} calls={} hit={} secondary={} verified={}", stage,
                      calls[counter], hits[counter], secondary_hits[counter], verified[counter]);
