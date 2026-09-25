@@ -123,13 +123,7 @@ public:
     [[nodiscard]] ImageView& FindDepthTarget(ImageId image_id, const ImageDesc& desc);
 
     /// Updates image contents if it was modified by CPU.
-    void UpdateImage(ImageId image_id) {
-        std::scoped_lock lock{mutex};
-        Image& image = slot_images[image_id];
-        TrackImage(image_id);
-        TouchImage(image);
-        RefreshImage(image);
-    }
+    void UpdateImage(ImageId image_id);
 
     /// Resolves overlap between existing cache image and pending merged image
     [[nodiscard]] std::tuple<ImageId, int, int> ResolveOverlap(const ImageInfo& info,
@@ -201,7 +195,7 @@ public:
     /// SHADPS4_STENCIL_STORAGE: an image outside the cache's page table, LRU and page tracking,
     /// never refreshed from guest memory. The caller owns it for the rest of the run.
     ImageId InsertScratchImage(const ImageInfo& info) {
-        std::scoped_lock lock{mutex};
+        CacheLock lock{*this};
         const ImageId id =
             slot_images.insert(instance, scheduler, blit_helper, slot_image_views, info);
         slot_images[id].flags = ImageFlagBits::Empty;
@@ -396,6 +390,43 @@ private:
         bool verify{};
         u64 calls{}, hits{}, fallbacks{}, verified{}; // FindImage mutex protects entries/counters.
     };
+
+    /// Memo slot for a lookup, or nullptr when the lookup is not eligible for memoization.
+    PreparedImage* PreparedSlot(const ImageInfo& info, BindingType type, bool exact_fmt,
+                                PreparedImageKey& key);
+
+    /**
+     * SHADPS4_TEX_LOCKFREE_HIT=1: the CP thread answers FindImage memo hits and no-op UpdateImage
+     * calls without the cache mutex (~30k lock pairs a frame, ~9% of CP time on a16).
+     *
+     * Who else touches the cache: guest write-fault handlers (InvalidateMemory) only change an
+     * image's flags, tracked range and hash under the mutex - the fast paths read those with
+     * relaxed loads, and a fault landing just after the read is the same as one landing just
+     * after the locked version. Structural changes (slot vector, page table, LRU, memo) are made
+     * by the CP itself, except for off-CP callers such as video-out buffer registration and guest
+     * unmaps. Those take CacheLock, which first raises `lf_foreign`, forces a serializing
+     * instruction on every core (FlushProcessWriteBuffers) and waits until the CP is outside its
+     * fast path; the CP marks `lf_cp_in_fast` with a plain store and then checks `lf_foreign`,
+     * falling back to the locked path when set (asymmetric Dekker handshake).
+     */
+    class CacheLock {
+    public:
+        explicit CacheLock(TextureCache& cache);
+        ~CacheLock();
+        CacheLock(const CacheLock&) = delete;
+        CacheLock& operator=(const CacheLock&) = delete;
+
+    private:
+        TextureCache& cache;
+        bool foreign;
+    };
+    ImageId FindImageLockFree(const ImageDesc& desc, bool exact_fmt);
+    bool UpdateImageLockFree(ImageId image_id);
+    void CountLockFree(bool find, bool hit);
+    bool lockfree_hit{};
+    alignas(64) std::atomic<u32> lf_cp_in_fast{0};
+    alignas(64) std::atomic<u32> lf_foreign{0};
+    u64 lf_find_calls{}, lf_find_fast{}, lf_update_calls{}, lf_update_fast{};
 
     // Any future in-place change of guest range, size, type, format or resources must invalidate
     // here under the same synchronization as the mapping change. Currently those are immutable:

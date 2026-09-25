@@ -128,6 +128,15 @@ void FutexWakeOne(std::atomic<u32>* address) {
 #endif
 }
 
+bool FlushProcessWriteBuffersAll() {
+#ifdef _WIN64
+    FlushProcessWriteBuffers();
+    return true;
+#else
+    return false;
+#endif
+}
+
 void ReportMutexReentry(const char* name, void* outer_caller, void* inner_caller) {
     static std::atomic<u64> events{0};
     const u64 n = events.fetch_add(1, std::memory_order_relaxed) + 1;

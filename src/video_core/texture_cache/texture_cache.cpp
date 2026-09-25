@@ -49,6 +49,11 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
         prepared_images = std::make_unique<PreparedImages>();
         prepared_images->verify = enabled("SHADPS4_PREPARED_IMAGES_VERIFY");
     }
+    // The off-CP side of the handshake needs FlushProcessWriteBuffers (Windows only).
+    lockfree_hit = enabled("SHADPS4_TEX_LOCKFREE_HIT") && Common::FlushProcessWriteBuffersAll();
+    if (lockfree_hit) {
+        LOG_INFO(Render_Vulkan, "SHADPS4_TEX_LOCKFREE_HIT: lock-free texture cache hits on the CP");
+    }
 
     u32 max_samplers = instance.GetMaxSamplerAllocationCount();
     trigger_gc_samplers = max_samplers * 3 / 4;
@@ -410,7 +415,7 @@ void TextureCache::DiagBufferWriteOverImages(VAddr address, size_t size, bool fo
 }
 
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
-    std::scoped_lock lk{mutex};
+    CacheLock lk{*this};
 
     ImageIds deleted_images;
     ForEachImageInRegion(cpu_addr, size, [&](ImageId id, Image&) { deleted_images.push_back(id); });
@@ -822,8 +827,13 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     // match+resolve, and count perfect-hit% + pages walked + new-image(miss)%. Strip before ship.
     static u64 fi_calls = 0, fi_lock_ns = 0, fi_walk_ns = 0, fi_rest_ns = 0, fi_pages = 0,
                fi_hit = 0, fi_new = 0, fi_cands = 0;
+    if (lockfree_hit && Common::FaultMonitor::t_is_cp_thread) {
+        if (const ImageId id = FindImageLockFree(desc, exact_fmt)) {
+            return id;
+        }
+    }
     const auto fi_t0 = Common::FaultMonitor::Now();
-    std::scoped_lock lock{mutex};
+    CacheLock lock{*this};
     const auto fi_t1 = Common::FaultMonitor::Now();
 
     PreparedImage* memo = nullptr;
@@ -835,17 +845,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     if (prepared_images) {
         ++prepared_images->calls;
         lookup_generation = prepared_images->generation.load(std::memory_order_acquire);
-        constexpr u64 address_limit = u64{1} << Traits::AddressSpaceBits;
-        if (info.guest_address && info.guest_address < address_limit && info.guest_size &&
-            info.guest_size <= address_limit - info.guest_address &&
-            info.pixel_format != vk::Format::eUndefined) {
-            key = {info.guest_address, info.guest_size, info.size, info.type,
-                   info.pixel_format,  info.resources,  desc.type, exact_fmt};
-            // Address/format select a bounded slot; full field equality resolves collisions.
-            const u64 address_hash = (info.guest_address >> 8) ^ (info.guest_address >> 25);
-            const u64 index =
-                (address_hash ^ (u64(info.pixel_format) << 3)) & (PreparedImages::Capacity - 1);
-            memo = &prepared_images->entries[index];
+        memo = PreparedSlot(info, desc.type, exact_fmt, key);
+        if (memo) {
             if (memo->generation == lookup_generation && memo->key == key && memo->id &&
                 slot_images.is_allocated(memo->id)) {
                 const auto& cached = slot_images[memo->id];
@@ -1008,6 +1009,131 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     return image_id;
 }
 
+TextureCache::PreparedImage* TextureCache::PreparedSlot(const ImageInfo& info, BindingType type,
+                                                        bool exact_fmt, PreparedImageKey& key) {
+    constexpr u64 address_limit = u64{1} << Traits::AddressSpaceBits;
+    if (!info.guest_address || info.guest_address >= address_limit || !info.guest_size ||
+        info.guest_size > address_limit - info.guest_address ||
+        info.pixel_format == vk::Format::eUndefined) {
+        return nullptr;
+    }
+    key = {info.guest_address, info.guest_size, info.size, info.type,
+           info.pixel_format,  info.resources,  type,      exact_fmt};
+    // Address/format select a bounded slot; full field equality resolves collisions.
+    const u64 address_hash = (info.guest_address >> 8) ^ (info.guest_address >> 25);
+    const u64 index =
+        (address_hash ^ (u64(info.pixel_format) << 3)) & (PreparedImages::Capacity - 1);
+    return &prepared_images->entries[index];
+}
+
+TextureCache::CacheLock::CacheLock(TextureCache& cache_)
+    : cache{cache_}, foreign{cache_.lockfree_hit && !Common::FaultMonitor::t_is_cp_thread} {
+    if (foreign) {
+        cache.lf_foreign.fetch_add(1, std::memory_order_seq_cst);
+        // After this returns, a CP that had already stored lf_cp_in_fast=1 has made it visible,
+        // and a CP that had not yet loaded lf_foreign will see it raised.
+        Common::FlushProcessWriteBuffersAll();
+        while (cache.lf_cp_in_fast.load(std::memory_order_acquire) != 0) {
+            _mm_pause();
+        }
+    }
+    cache.mutex.lock();
+}
+
+TextureCache::CacheLock::~CacheLock() {
+    cache.mutex.unlock();
+    if (foreign) {
+        cache.lf_foreign.fetch_sub(1, std::memory_order_release);
+    }
+}
+
+void TextureCache::CountLockFree(bool find, bool hit) {
+    if (find) {
+        ++lf_find_calls;
+        lf_find_fast += hit;
+    } else {
+        ++lf_update_calls;
+        lf_update_fast += hit;
+    }
+    if (((lf_find_calls + lf_update_calls) & 0xfffff) == 0) {
+        LOG_INFO(Render_Vulkan, "TexLockFree: find {}/{} ({:.1f}%) update {}/{} ({:.1f}%) fast",
+                 lf_find_fast, lf_find_calls,
+                 100.0 * lf_find_fast / std::max<u64>(lf_find_calls, 1), lf_update_fast,
+                 lf_update_calls, 100.0 * lf_update_fast / std::max<u64>(lf_update_calls, 1));
+    }
+}
+
+ImageId TextureCache::FindImageLockFree(const ImageDesc& desc, bool exact_fmt) {
+    if (!prepared_images || prepared_images->verify) {
+        return {};
+    }
+    // Plain store then load; see CacheLock for the other side of the handshake.
+    lf_cp_in_fast.store(1, std::memory_order_relaxed);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    ImageId result{};
+    if (lf_foreign.load(std::memory_order_relaxed) == 0) {
+        PreparedImageKey key{};
+        const u64 generation = prepared_images->generation.load(std::memory_order_acquire);
+        PreparedImage* memo = PreparedSlot(desc.info, desc.type, exact_fmt, key);
+        if (memo && memo->generation == generation && memo->key == key && memo->id &&
+            slot_images.is_allocated(memo->id)) {
+            Image& image = slot_images[memo->id];
+            // Fault handlers may set CpuDirty/Picked concurrently. Picked falls back to the
+            // locked path; dirtiness does not enter the match (UpdateImage handles it).
+            const auto flags =
+                std::atomic_ref<ImageFlagBits>{image.flags}.load(std::memory_order_relaxed);
+            if (memo->uid && image.image_uid == memo->uid &&
+                True(flags & ImageFlagBits::Registered) && False(flags & ImageFlagBits::Picked)) {
+                image.tick_accessed_last = scheduler.CurrentTick();
+                TouchImage(image);
+                ++prepared_images->calls;
+                ++prepared_images->hits;
+                result = memo->id;
+            }
+        }
+    }
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    lf_cp_in_fast.store(0, std::memory_order_release);
+    CountLockFree(true, static_cast<bool>(result));
+    return result;
+}
+
+bool TextureCache::UpdateImageLockFree(ImageId image_id) {
+    lf_cp_in_fast.store(1, std::memory_order_relaxed);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    bool hit = false;
+    if (lf_foreign.load(std::memory_order_relaxed) == 0) {
+        Image& image = slot_images[image_id];
+        const auto flags =
+            std::atomic_ref<ImageFlagBits>{image.flags}.load(std::memory_order_relaxed);
+        const VAddr begin = image.info.guest_address;
+        const VAddr end = begin + image.info.guest_size;
+        // Registered, fully tracked and clean: TrackImage and RefreshImage return at their own
+        // early-outs, so the locked UpdateImage would only touch the LRU.
+        if (True(flags & ImageFlagBits::Registered) && False(flags & ImageFlagBits::Dirty) &&
+            std::atomic_ref<VAddr>{image.track_addr}.load(std::memory_order_relaxed) == begin &&
+            std::atomic_ref<VAddr>{image.track_addr_end}.load(std::memory_order_relaxed) == end) {
+            TouchImage(image);
+            hit = true;
+        }
+    }
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    lf_cp_in_fast.store(0, std::memory_order_release);
+    CountLockFree(false, hit);
+    return hit;
+}
+
+void TextureCache::UpdateImage(ImageId image_id) {
+    if (lockfree_hit && Common::FaultMonitor::t_is_cp_thread && UpdateImageLockFree(image_id)) {
+        return;
+    }
+    CacheLock lock{*this};
+    Image& image = slot_images[image_id];
+    TrackImage(image_id);
+    TouchImage(image);
+    RefreshImage(image);
+}
+
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
     // Only images whose guest_address == address can match here. RegisterImage registers an image
     // on every page it spans, so any such candidate is present on the single page containing
@@ -1106,7 +1232,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
         // Serialize the traversal's temporary Picked flags with FindImage, including
         // their cleanup. Also publish any new stencil mapping under that same lock.
         // UpdateImage above acquires/releases the mutex itself; do not cover it here.
-        std::scoped_lock lock{mutex};
+        CacheLock lock{*this};
         ImageId stencil_id{};
         ForEachImageInRegion(desc.info.stencil_addr, desc.info.stencil_size,
                              [&](ImageId image_id, Image& image) {
@@ -1473,7 +1599,7 @@ void TextureCache::GarbageCollectImages() {
     if (total_used_memory < trigger_gc_memory) {
         return;
     }
-    std::scoped_lock lock{mutex};
+    CacheLock lock{*this};
     bool pressured = false;
     bool aggresive = false;
     u64 ticks_to_destroy = 0;

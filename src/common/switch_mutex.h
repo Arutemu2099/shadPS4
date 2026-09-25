@@ -23,6 +23,10 @@ void FutexWakeOne(std::atomic<u32>* address);
 void SrwLockExclusive(void** lock);
 bool SrwTryLockExclusive(void** lock);
 void SrwUnlockExclusive(void** lock);
+/// Makes every other thread of the process execute a serializing instruction before returning
+/// (Win32 FlushProcessWriteBuffers). The slow side of an asymmetric Dekker handshake: the fast
+/// side then needs only plain stores and loads. Returns false where unsupported.
+bool FlushProcessWriteBuffersAll();
 /// Futex mode: the owning thread locked again (see SwitchMutex). Logs the first few events.
 void ReportMutexReentry(const char* name, void* outer_caller, void* inner_caller);
 
