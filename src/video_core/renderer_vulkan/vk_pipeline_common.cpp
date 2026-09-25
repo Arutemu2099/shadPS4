@@ -57,9 +57,9 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
 
     const auto stage_flags = IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
     const auto layout = *pipeline_layout;
-    scheduler.Record([layout, stage_flags, push_data](vk::CommandBuffer cmdbuf) {
-        cmdbuf.pushConstants(layout, stage_flags, 0u, sizeof(push_data), &push_data);
-    });
+    scheduler.PushConstants(bind_point, layout, stage_flags,
+                            std::span<const u8>{reinterpret_cast<const u8*>(&push_data),
+                                                sizeof(push_data)});
 
     // Bind descriptor set.
     if (set_writes.empty()) {
@@ -86,6 +86,7 @@ void Pipeline::BindResourcesNative(NativeBindings& native, std::span<const u32> 
                                    const BufferBarriers& buffer_barriers,
                                    const Shader::PushData& push_data) const {
     ASSERT(uses_native_bindings && indices.size() == native_binding_count);
+    scheduler.InvalidatePushCache();
 
     RecordBufferBarriers(buffer_barriers);
     native.BindHeapsIfNeeded();

@@ -7,6 +7,7 @@
 #include <mutex>
 #include <source_location>
 #include <span>
+#include <vector>
 #include <thread>
 #include <tuple>
 #include <unordered_map>
@@ -400,6 +401,7 @@ public:
             }
             // A borrower may bind legacy descriptor state behind the scheduler's back.
             scheduler.native_heaps_bound = false;
+            scheduler.InvalidatePushCache();
             ++scheduler.synchronous_scopes;
             ++scheduler.synchronous_borrows;
             if (scheduler.recording_measure_timing) {
@@ -435,6 +437,63 @@ public:
     void CommitDynamicState();
     void PushDescriptors(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
                          std::span<const vk::WriteDescriptorSet> writes);
+    /// Records vkCmdPushConstants (deduplicated under SHADPS4_PUSH_DEDUPE).
+    void PushConstants(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
+                       vk::ShaderStageFlags stages, std::span<const u8> data);
+    /// SHADPS4_PUSH_DEDUPE: a pipeline with `layout` is bound next on `bind_point`. Push descriptor
+    /// and push constant state survive only while bound layouts stay the same.
+    void NotePipelineBind(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout) {
+        auto& cache = push_cache[bind_point == vk::PipelineBindPoint::eCompute ? 1 : 0];
+        if (cache.layout != layout) {
+            cache.desc_valid = false;
+            cache.pc_valid = false;
+            cache.layout = layout;
+        }
+    }
+    /// SHADPS4_PUSH_DEDUPE: true if these vertex-input arrays equal the last ones recorded in this
+    /// command buffer (every guest graphics pipeline declares vertex input dynamic). Updates the cache.
+    bool VertexInputUnchanged(std::span<const u8> bindings, std::span<const u8> attributes) {
+        const bool same = vi_valid && vi_bindings.size() == bindings.size() &&
+                          vi_attributes.size() == attributes.size() &&
+                          std::memcmp(vi_bindings.data(), bindings.data(), bindings.size()) == 0 &&
+                          std::memcmp(vi_attributes.data(), attributes.data(), attributes.size()) == 0;
+        if (!same) {
+            vi_bindings.assign(bindings.begin(), bindings.end());
+            vi_attributes.assign(attributes.begin(), attributes.end());
+            vi_valid = true;
+        }
+        ++vi_calls;
+        vi_same += same;
+        return same;
+    }
+    /// Unknown binds/pushes happened (borrowed command buffer, new command buffer, helpers).
+    void InvalidatePushCache() {
+        vi_valid = false;
+        for (auto& cache : push_cache) {
+            cache.desc_valid = false;
+            cache.pc_valid = false;
+            cache.layout = vk::PipelineLayout{};
+        }
+    }
+
+    struct PushCache {
+        vk::PipelineLayout layout{};
+        bool desc_valid{};
+        bool pc_valid{};
+        vk::ShaderStageFlags pc_stages{};
+        std::vector<u8> desc_sig;
+        std::vector<u8> pc_data;
+    };
+    std::array<PushCache, 2> push_cache{};
+    bool vi_valid{};
+    std::vector<u8> vi_bindings;
+    std::vector<u8> vi_attributes;
+    u64 vi_calls{};
+    u64 vi_same{};
+    u64 push_desc_calls{};
+    u64 push_desc_same{};
+    u64 push_pc_calls{};
+    u64 push_pc_same{};
 
     bool IsAsyncRecording() const {
         return recording_worker && synchronous_scopes == 0;

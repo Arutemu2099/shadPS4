@@ -115,9 +115,103 @@ void Scheduler::CommitDynamicState() {
     state.dirty_state = kept;
 }
 
+static int PushDedupeMode() {
+    // SHADPS4_PUSH_DEDUPE=1: skip vkCmdPushDescriptorSet / vkCmdPushConstants when the content equals
+    // the previous push on the same bind point and layout, with no layout change, borrowed command
+    // buffer or new command buffer in between. =2 counts only (still records) and logs the rate.
+    static const int mode = [] {
+        const char* value = std::getenv("SHADPS4_PUSH_DEDUPE");
+        return value ? value[0] - '0' : 0;
+    }();
+    return mode;
+}
+
+static void AppendBytes(std::vector<u8>& out, const void* data, size_t size) {
+    const auto* bytes = static_cast<const u8*>(data);
+    out.insert(out.end(), bytes, bytes + size);
+}
+
+void Scheduler::PushConstants(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
+                              vk::ShaderStageFlags stages, std::span<const u8> data) {
+    const int mode = PushDedupeMode();
+    if (mode > 0) {
+        auto& cache = push_cache[bind_point == vk::PipelineBindPoint::eCompute ? 1 : 0];
+        const bool same = cache.pc_valid && cache.layout == layout && cache.pc_stages == stages &&
+                          cache.pc_data.size() == data.size() &&
+                          std::memcmp(cache.pc_data.data(), data.data(), data.size()) == 0;
+        ++push_pc_calls;
+        push_pc_same += same;
+        if (same && mode == 1) {
+            return;
+        }
+        if (!same) {
+            if (cache.layout != layout) {
+                cache.desc_valid = false;
+            }
+            cache.layout = layout;
+            cache.pc_stages = stages;
+            cache.pc_data.assign(data.begin(), data.end());
+            cache.pc_valid = true;
+        }
+    }
+    RecordArrays(
+        [layout, stages](vk::CommandBuffer cmdbuf, auto bytes) {
+            cmdbuf.pushConstants(layout, stages, 0u, u32(bytes.size()), bytes.data());
+        },
+        data);
+}
+
 void Scheduler::PushDescriptors(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
                                 std::span<const vk::WriteDescriptorSet> writes) {
     native_heaps_bound = false;
+    if (const int mode = PushDedupeMode(); mode > 0) {
+        auto& cache = push_cache[bind_point == vk::PipelineBindPoint::eCompute ? 1 : 0];
+        static thread_local std::vector<u8> sig;
+        sig.clear();
+        for (const auto& write : writes) {
+            const u32 head[3] = {write.dstBinding, write.descriptorCount,
+                                 static_cast<u32>(write.descriptorType)};
+            AppendBytes(sig, head, sizeof(head));
+            if (write.pBufferInfo) {
+                AppendBytes(sig, write.pBufferInfo,
+                            sizeof(vk::DescriptorBufferInfo) * write.descriptorCount);
+            }
+            if (write.pImageInfo) {
+                AppendBytes(sig, write.pImageInfo,
+                            sizeof(vk::DescriptorImageInfo) * write.descriptorCount);
+            }
+            if (write.pTexelBufferView) {
+                AppendBytes(sig, write.pTexelBufferView,
+                            sizeof(vk::BufferView) * write.descriptorCount);
+            }
+            if (write.pNext) {
+                sig.push_back(0xFF); // never matches a signature without the marker position
+                AppendBytes(sig, &write, sizeof(write));
+            }
+        }
+        const bool same = cache.desc_valid && cache.layout == layout && cache.desc_sig == sig;
+        ++push_desc_calls;
+        push_desc_same += same;
+        if ((push_desc_calls & 0xfffff) == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "PUSH_DEDUPE: descriptor pushes {} same {:.1f}% | push constants {} same "
+                     "{:.1f}% | vertex input {} same {:.1f}%",
+                     push_desc_calls, 100.0 * push_desc_same / push_desc_calls, push_pc_calls,
+                     push_pc_calls ? 100.0 * push_pc_same / push_pc_calls : 0.0, vi_calls,
+                     vi_calls ? 100.0 * vi_same / vi_calls : 0.0);
+        }
+        if (same && mode == 1) {
+            return;
+        }
+        if (!same) {
+            if (cache.layout != layout) {
+                cache.pc_valid = false;
+            }
+            cache.layout = layout;
+            cache.desc_sig.swap(sig);
+            cache.desc_valid = true;
+        }
+    }
     if (!IsAsyncRecording()) {
         current_cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, writes);
         return;
@@ -319,6 +413,7 @@ void Scheduler::AllocateWorkerCommandBuffers() {
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
     native_heaps_bound = false;
+    InvalidatePushCache();
 
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();
@@ -391,6 +486,7 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
     // What AllocateWorkerCommandBuffers resets on this thread for a new command buffer.
     dynamic_state.Invalidate();
     native_heaps_bound = false;
+    InvalidatePushCache();
     master_semaphore.Refresh();
     PopPendingOperations();
 }

@@ -201,6 +201,7 @@ TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset
             .buffer = in_buffer, .offset = in_offset, .range = info.guest_size};
         const vk::DescriptorBufferInfo linear_info{
             .buffer = out_buffer, .offset = 0, .range = info.guest_size};
+        scheduler.InvalidatePushCache();
         scheduler.Record([detile_pipeline, layout = *pl_layout, tiled_info, linear_info,
                           params_info = params_buffer_info, dim_x](vk::CommandBuffer cmdbuf) {
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, detile_pipeline);
