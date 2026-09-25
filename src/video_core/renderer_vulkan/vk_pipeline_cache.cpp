@@ -358,7 +358,7 @@ namespace {
 // Command-processor thread only, like every GetGraphicsPipeline caller.
 struct PreparedPipelineStats {
     u64 attempts, ineligible, candidates, stale, guard_fallbacks, hits, seeds, seed_rejects,
-        verified, input_changes;
+        verified, input_changes, evictions;
 };
 PreparedPipelineStats prepared_stats{};
 
@@ -408,6 +408,15 @@ static bool ShaderCollectCached() {
     return collect;
 }
 
+size_t PipelineCache::PreparedPipelineWays() {
+    static const size_t ways = [] {
+        const char* value = std::getenv("SHADPS4_PREPARED_WAYS");
+        const size_t v = value ? std::strtoull(value, nullptr, 10) : 4;
+        return std::clamp<size_t>(v, 1, PreparedPipelineMaxWays);
+    }();
+    return ways;
+}
+
 PipelineCache::PreparedPipelineEntry* PipelineCache::TryPreparedPipeline(
     PreparedGraphicsState& state, bool& eligible) {
     constexpr auto fs_idx = u32(LogicalStage::Fragment);
@@ -416,10 +425,11 @@ PipelineCache::PreparedPipelineEntry* PipelineCache::TryPreparedPipeline(
     if ((++stats.attempts & 0x3ffff) == 0) {
         LOG_INFO(Render_Vulkan,
                  "PreparedPipelines: attempts={} ineligible={} candidates={} stale={} "
-                 "guard_fallbacks={} hits={} seeds={} seed_rejects={} verified={} input_changes={}",
+                 "guard_fallbacks={} hits={} seeds={} seed_rejects={} verified={} input_changes={} "
+                 "evictions={} ways={}",
                  stats.attempts, stats.ineligible, stats.candidates, stats.stale,
                  stats.guard_fallbacks, stats.hits, stats.seeds, stats.seed_rejects,
-                 stats.verified, stats.input_changes);
+                 stats.verified, stats.input_changes, stats.evictions, PreparedPipelineWays());
     }
 
     eligible = false;
@@ -441,17 +451,18 @@ PipelineCache::PreparedPipelineEntry* PipelineCache::TryPreparedPipeline(
     eligible = true;
 
     if (prepared_pipelines.empty()) {
-        prepared_pipelines.resize(PreparedPipelineSets * PreparedPipelineWays);
-        prepared_tags.assign(PreparedPipelineSets * PreparedPipelineWays, 0);
+        prepared_pipelines.resize(PreparedPipelineSets * PreparedPipelineWays());
+        prepared_tags.assign(PreparedPipelineSets * PreparedPipelineWays(), 0);
     }
     const u64 state_hash = state.Hash();
-    const size_t set_base = (state_hash & (PreparedPipelineSets - 1)) * PreparedPipelineWays;
+    const size_t set_base = (state_hash & (PreparedPipelineSets - 1)) * PreparedPipelineWays();
     auto* set = &prepared_pipelines[set_base];
     const u64* tags = &prepared_tags[set_base];
     const bool use_tags = PreparedTags();
     const bool check_formats = !instance.IsVertexInputDynamicState();
     bool refreshed = false;
-    for (size_t way = 0; way < PreparedPipelineWays; ++way) {
+    const size_t num_ways = PreparedPipelineWays();
+    for (size_t way = 0; way < num_ways; ++way) {
         if (use_tags && tags[way] != state_hash) {
             continue;
         }
@@ -581,16 +592,18 @@ void PipelineCache::SeedPreparedPipeline(const PreparedGraphicsState& state,
     }
 
     const u64 state_hash = state.Hash();
-    const size_t set_base = (state_hash & (PreparedPipelineSets - 1)) * PreparedPipelineWays;
+    const size_t set_base = (state_hash & (PreparedPipelineSets - 1)) * PreparedPipelineWays();
     auto* set = &prepared_pipelines[set_base];
     PreparedPipelineEntry* entry = nullptr;
-    for (size_t way = 0; way < PreparedPipelineWays && !entry; ++way) {
+    const size_t num_ways = PreparedPipelineWays();
+    for (size_t way = 0; way < num_ways && !entry; ++way) {
         if (!set[way].valid || set[way].epoch != prepared_pipeline_epoch) {
             entry = &set[way];
         }
     }
     if (!entry) {
-        entry = &set[prepared_pipeline_victim++ % PreparedPipelineWays];
+        entry = &set[prepared_pipeline_victim++ % num_ways];
+        ++prepared_stats.evictions;
     }
 
     entry->valid = false;

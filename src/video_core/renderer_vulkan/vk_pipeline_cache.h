@@ -155,7 +155,9 @@ private:
         bool compiled{};
     };
     static constexpr size_t PreparedPipelineSets = 1024;
-    static constexpr size_t PreparedPipelineWays = 4;
+    static constexpr size_t PreparedPipelineMaxWays = 32;
+    /// SHADPS4_PREPARED_WAYS=<4..32> (default 4): associativity of the prepared-pipeline table.
+    static size_t PreparedPipelineWays();
 
     PreparedPipelineEntry* TryPreparedPipeline(PreparedGraphicsState& state, bool& eligible);
     void SeedPreparedPipeline(const PreparedGraphicsState& state, const GraphicsPipeline* pipeline);
