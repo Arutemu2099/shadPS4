@@ -86,6 +86,32 @@ public:
         return AllRegionsSkippable(cpu_addr, size);
     }
 
+    /// SHADPS4_BIND_MEMO_STATS: true if any tracker page of the range is CPU-dirty, or a 4 MB
+    /// region it touches has no manager yet (counted as dirty). Lock-free and exact per page, for
+    /// the reason given at RegionManager::CpuDirtyInRangeRelaxed. CP thread.
+    bool CpuDirtyRelaxed(VAddr cpu_addr, u64 size) const noexcept {
+        if (size == 0) {
+            return false;
+        }
+        const size_t first = cpu_addr >> TRACKER_HIGHER_PAGE_BITS;
+        const size_t last = (cpu_addr + size - 1) >> TRACKER_HIGHER_PAGE_BITS;
+        if (last >= NUM_HIGH_PAGES) {
+            return true;
+        }
+        u64 offset = cpu_addr & TRACKER_HIGHER_PAGE_MASK;
+        u64 remaining = size;
+        for (size_t index = first; index <= last; ++index) {
+            const RegionManager* manager = top_tier[index];
+            const u64 amount = std::min<u64>(TRACKER_HIGHER_PAGE_SIZE - offset, remaining);
+            if (!manager || manager->CpuDirtyInRangeRelaxed(offset, amount)) {
+                return true;
+            }
+            offset = 0;
+            remaining -= amount;
+        }
+        return false;
+    }
+
     /// Unmark region as modified from the host GPU
     void UnmarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
         gpu_clear_epoch.fetch_add(1, std::memory_order_acq_rel);

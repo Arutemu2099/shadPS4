@@ -126,6 +126,21 @@ private:
     void BindTextures(const Shader::BoundStage& bound, Shader::Backend::Bindings& binding);
     bool BindResources(const Pipeline* pipeline);
 
+    /// SHADPS4_BIND_MEMO_STATS=1 (diagnostic, default off; notes/bind-memo-stats-2026-09-25.md):
+    /// evaluates a per-stage binding memo next to the unchanged full path and logs its hit rate,
+    /// miss reasons, output mismatches and the time a hit would save. Never skips anything.
+    /// Reads user data and the flattened buffer only through `bound`.
+    /// Returns bit 0 = both key halves hit, bit 1 = both halves would hit.
+    u8 BindStageMemoStats(const Pipeline* pipeline, const Shader::BoundStage& bound,
+                          Shader::Backend::Bindings& binding);
+    void BindMemoEndDraw(bool is_compute, u8 draw_bits);
+    bool bind_memo_stats{};  // read once in the constructor
+    bool bind_memo_active{}; // inside a stats stage: BindBuffers records uploads per binding
+    bool bind_memo_timing{}; // inside a timed stats stage: BindBuffers times always-full bindings
+    u64 bind_memo_fixed_ticks{};
+    u64 bind_memo_redirected{}; // image bindings BindTextures redirected to another image
+    std::array<u8, Shader::NUM_BUFFERS> bind_memo_uploaded{};
+
     /// Fills bound_stages from the pipeline lookup result; called right after the lookup.
     void BindStageData(const Pipeline* pipeline) {
         const auto stages = pipeline->GetStages();

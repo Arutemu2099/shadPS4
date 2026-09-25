@@ -1413,6 +1413,9 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
 }
 
 void TextureCache::InvalidatePreparedImages() {
+    // SHADPS4_BIND_MEMO_STATS: every register, unregister, delete and deferred erase comes here,
+    // with or without the prepared-image memo.
+    struct_generation.fetch_add(1, std::memory_order_acq_rel);
     if (prepared_images) {
         // Publish after mapping changes; invalidation also covers a competing candidate, not
         // just the selected ID. Retain the original caller locking / CP ownership contracts.
@@ -1707,6 +1710,7 @@ void TextureCache::GarbageCollectSamplers() {
             return true;
         }
         --num_deletions;
+        sampler_generation.fetch_add(1, std::memory_order_relaxed); // SHADPS4_BIND_MEMO_STATS
         const size_t lru_id = samplers.at(hash).lru_id;
         samplers.erase(hash);
         sampler_lru_cache.Free(lru_id);

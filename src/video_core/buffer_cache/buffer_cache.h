@@ -172,6 +172,25 @@ public:
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
 
+    /// SHADPS4_BIND_MEMO_STATS: lock-free exact per-page CPU-dirty check; a range without a
+    /// tracker region counts as dirty. CP thread.
+    [[nodiscard]] bool IsRegionCpuDirtyRelaxed(VAddr addr, u64 size) const;
+
+    /// SHADPS4_BIND_MEMO_STATS: bumped on every buffer register/unregister (create, join,
+    /// delete) and around GPU map/unmap, i.e. whenever FindBuffer or ClampRangeSize could
+    /// answer differently for an unchanged V#.
+    [[nodiscard]] u64 StructGeneration() const noexcept {
+        return struct_generation.load(std::memory_order_acquire);
+    }
+    void BumpStructGeneration() noexcept {
+        struct_generation.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    /// SHADPS4_BIND_MEMO_STATS: bytes uploaded by every SynchronizeBuffer so far. CP thread.
+    [[nodiscard]] u64 SyncUploadBytesTotal() const noexcept {
+        return sync_upload_bytes_total;
+    }
+
     /// Return buffer id for the specified region
     BufferId FindBuffer(VAddr device_addr, u32 size);
 
@@ -428,6 +447,9 @@ private:
     std::unique_ptr<MemoryTracker> memory_tracker;
     StreamBuffer staging_buffer;
     u64 last_sync_upload_bytes{}; // SHADPS4_BUFFER_TRAFFIC: bytes the last SynchronizeBuffer uploaded
+    // SHADPS4_BIND_MEMO_STATS: see SyncUploadBytesTotal and StructGeneration.
+    u64 sync_upload_bytes_total{};
+    std::atomic<u64> struct_generation{0};
 
     /**
      * SHADPS4_HOST_MIRROR=1 (plan b prototype, default off): read-only uniform/storage bindings

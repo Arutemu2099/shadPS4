@@ -186,6 +186,35 @@ public:
         return image;
     }
 
+    /// SHADPS4_BIND_MEMO_STATS: the image without the LRU touch GetImage does.
+    [[nodiscard]] Image& PeekImage(ImageId id) noexcept {
+        return slot_images[id];
+    }
+
+    /// SHADPS4_BIND_MEMO_STATS: the UpdateImageLockFree predicate (registered, clean, tracked
+    /// over its whole guest range) with relaxed loads, no LRU touch and no counters. CP thread.
+    [[nodiscard]] bool ImageUpToDateRelaxed(ImageId id) noexcept {
+        Image& image = slot_images[id];
+        const auto flags =
+            std::atomic_ref<ImageFlagBits>{image.flags}.load(std::memory_order_relaxed);
+        const VAddr begin = image.info.guest_address;
+        const VAddr end = begin + image.info.guest_size;
+        return True(flags & ImageFlagBits::Registered) && False(flags & ImageFlagBits::Dirty) &&
+               std::atomic_ref<VAddr>{image.track_addr}.load(std::memory_order_relaxed) == begin &&
+               std::atomic_ref<VAddr>{image.track_addr_end}.load(std::memory_order_relaxed) == end;
+    }
+
+    /// SHADPS4_BIND_MEMO_STATS: bumped by every InvalidatePreparedImages call (image register,
+    /// unregister, delete, deferred erase), whether or not the prepared-image memo is enabled.
+    [[nodiscard]] u64 StructGeneration() const noexcept {
+        return struct_generation.load(std::memory_order_acquire);
+    }
+
+    /// SHADPS4_BIND_MEMO_STATS: bumped for every sampler the sampler GC destroys.
+    [[nodiscard]] u64 SamplerGeneration() const noexcept {
+        return sampler_generation.load(std::memory_order_acquire);
+    }
+
     /// Retrieves the image view with the specified id.
     [[nodiscard]] ImageView& GetImageView(ImageId id) {
         return slot_image_views[id];
@@ -489,6 +518,9 @@ private:
     Common::SwitchMutex<Common::FastTexMutexFlag> samplers_mutex;
     std::mutex download_images_mutex;
     std::unique_ptr<PreparedImages> prepared_images; // Allocated only when explicitly enabled.
+    // SHADPS4_BIND_MEMO_STATS: see StructGeneration and SamplerGeneration.
+    std::atomic<u64> struct_generation{0};
+    std::atomic<u64> sampler_generation{0};
     struct MetaDataInfo {
         enum class Type {
             CMask,

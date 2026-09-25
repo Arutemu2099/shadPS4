@@ -378,6 +378,9 @@ BufferCache::~BufferCache() {
 
 void BufferCache::BeginGpuUnmap(VAddr device_addr, u64 size) {
     backing_span_generation.fetch_add(1, std::memory_order_release);
+    // SHADPS4_BIND_MEMO_STATS: an unmap can change ClampRangeSize and the buffers found there.
+    // Rasterizer::UnmapMemory bumps again once the unmap is complete.
+    BumpStructGeneration();
     if (!Offload::Enabled() || size == 0) {
         return;
     }
@@ -396,6 +399,7 @@ void BufferCache::BeginGpuUnmap(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::EndGpuMap(VAddr device_addr, u64 size) {
+    BumpStructGeneration(); // SHADPS4_BIND_MEMO_STATS: a map can change ClampRangeSize.
     if (Offload::Enabled() && size != 0) {
         // MapMemory can hold the memory manager's writer lock. This must not call CP or wait
         // for a job; TryAdmit's callback only publishes bookkeeping under the same gate.
@@ -2251,6 +2255,10 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
     return memory_tracker->IsRegionGpuModified(addr, size);
 }
 
+bool BufferCache::IsRegionCpuDirtyRelaxed(VAddr addr, u64 size) const {
+    return memory_tracker->CpuDirtyRelaxed(addr, size);
+}
+
 BufferId BufferCache::FindBuffer(VAddr device_addr, u32 size) {
     ASSERT(device_addr != 0);
     const u64 page = device_addr >> CACHING_PAGEBITS;
@@ -2427,6 +2435,8 @@ void BufferCache::Unregister(BufferId buffer_id) {
 
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId buffer_id) {
+    // SHADPS4_BIND_MEMO_STATS: every CreateBuffer, JoinOverlap and DeleteBuffer passes here.
+    BumpStructGeneration();
     Buffer& buffer = slot_buffers[buffer_id];
     const auto size = buffer.SizeBytes();
     const VAddr device_addr_begin = buffer.CpuAddr();
@@ -2499,6 +2509,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                                : UploadCopies(buffer, copies, total_size_bytes);
         });
     last_sync_upload_bytes = total_size_bytes;
+    sync_upload_bytes_total += total_size_bytes;
     if (defer) {
         PageManager::SetDeferredProtectSink(nullptr);
         if (!src_buffer && !deferred_protects.empty()) {

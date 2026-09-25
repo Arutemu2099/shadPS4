@@ -2,15 +2,19 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <set>
+#include <chrono>
 #include <cstdlib>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "common/thread.h"
 #include "common/debug.h"
 #include "common/buffer_sample_probe.h"
 #include "common/draw_sample_probe.h"
 #include "common/fault_monitor.h"
+#include "common/rdtsc.h"
 #include "common/scope_exit.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -128,6 +132,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     }
     memory->SetRasterizer(this);
     build_set_writes = !native_bindings || native_bindings->IsVerifying();
+    const char* memo_stats = std::getenv("SHADPS4_BIND_MEMO_STATS");
+    bind_memo_stats = memo_stats && memo_stats[0] == '1';
+    if (bind_memo_stats) {
+        LOG_INFO(Render_Vulkan, "BindMemoStats: enabled (counters only, behaviour unchanged)");
+    }
 }
 
 Rasterizer::~Rasterizer() {
@@ -1016,6 +1025,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     // Bind resource buffers and textures.
     Shader::Backend::Bindings binding{};
     push_data = MakeUserData(liverpool->BackRegs());
+    u8 memo_draw_bits = 3;
     for (const auto& bound : BoundStages(pipeline)) {
         const auto* stage = bound.info;
         if (!stage) {
@@ -1026,17 +1036,25 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
                               stage->samplers.size());
         }
         bound.PushUd(binding, push_data);
-        // Split measured because BindResources is 6.8 us of the 8.0 us spent per draw - 85% - and
-        // a stack scan could not tell these two apart from anything else.
-        const auto t_buf = Common::FaultMonitor::Now();
-        BindBuffers(bound, binding, push_data);
-        const auto t_tex = Common::FaultMonitor::Now();
-        BindTextures(bound, binding);
-        Common::FaultMonitor::CountBindSplit(Common::FaultMonitor::DiffNs(t_buf, t_tex),
-                                             Common::FaultMonitor::SinceNs(t_tex));
+        if (bind_memo_stats) {
+            // Runs the same BindBuffers/BindTextures, with the memo's key and checks around them.
+            memo_draw_bits &= BindStageMemoStats(pipeline, bound, binding);
+        } else {
+            // Split measured because BindResources is 6.8 us of the 8.0 us spent per draw - 85% -
+            // and a stack scan could not tell these two apart from anything else.
+            const auto t_buf = Common::FaultMonitor::Now();
+            BindBuffers(bound, binding, push_data);
+            const auto t_tex = Common::FaultMonitor::Now();
+            BindTextures(bound, binding);
+            Common::FaultMonitor::CountBindSplit(Common::FaultMonitor::DiffNs(t_buf, t_tex),
+                                                 Common::FaultMonitor::SinceNs(t_tex));
+        }
         uses_dma |= stage->uses_dma;
     }
     native_bound_count = binding.unified;
+    if (bind_memo_stats) {
+        BindMemoEndDraw(pipeline->IsCompute(), memo_draw_bits);
+    }
 
     if (uses_dma) {
         // We only use fault buffer for DMA right now.
@@ -1048,6 +1066,579 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     }
 
     return true;
+}
+
+namespace {
+
+// SHADPS4_BIND_MEMO_STATS state, CP thread only. One record per (pipeline, stage), which is where
+// the memo itself would keep it. Generations are the values read before the full path that
+// produced the outputs, so a bump during that path makes the next occurrence miss.
+struct BindMemoRecord {
+    struct Buf {
+        VideoCore::BufferId id{};
+        VAddr addr{};
+        u64 size{};
+        vk::Buffer handle{};
+        vk::DeviceSize offset{};
+        vk::DeviceSize range{};
+        u8 adjust{};
+        bool memo{}; // read-only guest binding: a hit would skip it
+    };
+    struct Img {
+        VideoCore::ImageId id{};
+        u64 uid{};
+        const VideoCore::Image::BackingImage* backing{};
+        vk::ImageView view{};
+        vk::ImageLayout layout{};
+        VideoCore::Image::State state{}; // after the full path's Transit
+    };
+    bool valid{};
+    std::vector<AmdGpu::Buffer> vsharps;
+    std::vector<AmdGpu::Image> tsharps;
+    std::vector<AmdGpu::Sampler> ssharps;
+    u64 border{};
+    u64 buf_gen{};
+    u64 buf_tex_gen{};
+    bool buf_excluded{};
+    bool buf_texel{};
+    std::vector<Buf> bufs;
+    u64 tex_gen{};
+    u64 smp_gen{};
+    bool tex_excluded{};
+    std::vector<Img> imgs;
+    std::vector<vk::Sampler> samplers;
+};
+
+enum BindMemoBufMiss : u32 { BufExcluded, BufGen, BufTexGen, BufDirtyPage, NumBufMiss };
+enum BindMemoTexMiss : u32 {
+    TexExcluded,
+    TexGen,
+    TexSamplerGen,
+    TexUid,
+    TexBacking,
+    TexDirtyImage,
+    TexFlags,
+    NumTexMiss
+};
+
+// Hit work that is not replayed: GetBarrier per skipped buffer, the sampler LRU touch per
+// sampler. Guesses, subtracted so the estimate is not flattered by leaving them out.
+constexpr double BindMemoAllowBufNs = 5.0;
+constexpr double BindMemoAllowSamplerNs = 5.0;
+
+struct BindMemoStats {
+    std::unordered_map<u64, BindMemoRecord> records;
+    // Key under test and dry-replay scratch; capacity is kept so timed spans do not allocate.
+    std::vector<AmdGpu::Buffer> vsharps;
+    std::vector<AmdGpu::Image> tsharps;
+    std::vector<AmdGpu::Sampler> ssharps;
+    std::vector<vk::DescriptorBufferInfo> replay_buffers;
+    std::vector<vk::DescriptorImageInfo> replay_images;
+    std::array<u8, Shader::NUM_BUFFERS> replay_adjust{};
+    u64 stage_counter{};
+    bool started{};
+    // Window origin.
+    u64 frames0{}, buf_gen0{}, tex_gen0{}, smp_gen0{}, tsc0{};
+    std::chrono::steady_clock::time_point clock0{};
+    // Window counters. Stage types: 0 vs, 1 ps, 2 cs, 3 other.
+    u64 binds{}, stages{}, draws{}, draw_key{}, draw_would{}, dma_stages{};
+    std::array<u64, 4> type_stages{}, type_key{}, type_would{};
+    u64 buf_key{}, buf_would{}, tex_key{}, tex_would{}, transit_needed{};
+    std::array<u64, NumBufMiss> buf_miss{};
+    std::array<u64, NumTexMiss> tex_miss{};
+    u64 slot_buf{}, slot_buf_key{}, slot_img{}, slot_img_key{}, slot_smp{}, slot_smp_key{};
+    u64 mis_buf{}, mis_upload{}, mis_img{}, mis_smp{}, layout_diff{};
+    u64 memo_bufs_on_hit{}, samplers_on_hit{};
+    // Timed stages (1 in 16), TSC ticks. t_empty is two back-to-back reads, subtracted from
+    // every span average so the fenced reads themselves are not counted as work.
+    u64 timed{}, t_empty{}, t_key_buf{}, t_key_tex{};
+    u64 t_check_buf_n{}, t_check_buf{}, t_check_tex_n{}, t_check_tex{};
+    u64 t_replay_buf_n{}, t_replay_buf{}, t_replay_tex_n{}, t_replay_tex{};
+    u64 t_buf_hit_n{}, t_buf_hit{}, t_fixed_hit{}, t_buf_miss_n{}, t_buf_miss{};
+    u64 t_tex_hit_n{}, t_tex_hit{}, t_tex_miss_n{}, t_tex_miss{};
+};
+
+BindMemoStats& GetBindMemoStats() {
+    static BindMemoStats stats;
+    return stats;
+}
+
+template <typename T>
+bool SameBytes(const std::vector<T>& a, const std::vector<T>& b) {
+    return a.size() == b.size() &&
+           (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0);
+}
+
+template <typename T>
+bool SameSlot(const std::vector<T>& a, const std::vector<T>& b, size_t i) {
+    return i < a.size() && i < b.size() && std::memcmp(&a[i], &b[i], sizeof(T)) == 0;
+}
+
+} // Anonymous namespace
+
+u8 Rasterizer::BindStageMemoStats(const Pipeline* pipeline, const Shader::BoundStage& bound,
+                                  Shader::Backend::Bindings& binding) {
+    const auto& stage = *bound.info;
+    auto& st = GetBindMemoStats();
+    if (!st.started) {
+        st.started = true;
+        st.frames0 = Common::FaultMonitor::presented_frames.load(std::memory_order_relaxed);
+        st.buf_gen0 = buffer_cache.StructGeneration();
+        st.tex_gen0 = texture_cache.StructGeneration();
+        st.smp_gen0 = texture_cache.SamplerGeneration();
+        st.clock0 = std::chrono::steady_clock::now();
+        st.tsc0 = Common::FencedRDTSC();
+    }
+    const bool timed = (++st.stage_counter & 15) == 0;
+    const auto tsc = [timed] { return timed ? Common::FencedRDTSC() : u64{0}; };
+    // The lookup stays outside the timed spans: the memo would own its record.
+    const u64 record_key =
+        (static_cast<u64>(reinterpret_cast<uintptr_t>(pipeline)) << 3) | u64(stage.l_stage);
+    auto& rec = st.records[record_key];
+    const u32 type = stage.l_stage == Shader::LogicalStage::Vertex     ? 0
+                     : stage.l_stage == Shader::LogicalStage::Fragment ? 1
+                     : stage.l_stage == Shader::LogicalStage::Compute  ? 2
+                                                                       : 3;
+
+    const u64 t_empty = tsc();
+    // Key, buffer half: every guest V#, read as BindBuffers reads it.
+    const u64 t_key = tsc();
+    st.vsharps.clear();
+    for (const auto& desc : stage.buffers) {
+        st.vsharps.push_back(desc.IsSpecial() ? AmdGpu::Buffer{} : desc.GetSharp(bound));
+    }
+    const bool buf_key = rec.valid && SameBytes(st.vsharps, rec.vsharps);
+    const u64 t_key_tex = tsc();
+    // Key, texture half: every T#, every S# after BindTextures' aniso adjustment, border base.
+    st.tsharps.clear();
+    for (const auto& desc : stage.images) {
+        st.tsharps.push_back(desc.GetSharp(bound));
+    }
+    st.ssharps.clear();
+    for (const auto& sampler : stage.samplers) {
+        auto ssharp = sampler.GetSharp(bound);
+        if (sampler.disable_aniso) {
+            const auto& tsharp = stage.images[sampler.associated_image].GetSharp(bound);
+            if (tsharp.base_level == 0 && tsharp.last_level == 0) {
+                ssharp.max_aniso.Assign(AmdGpu::AnisoRatio::One);
+            }
+        }
+        st.ssharps.push_back(ssharp);
+    }
+    const u64 border = liverpool->BackRegs().ta_bc_base.base_addr;
+    const bool tex_key = rec.valid && border == rec.border && SameBytes(st.tsharps, rec.tsharps) &&
+                         SameBytes(st.ssharps, rec.ssharps);
+
+    // Validation, buffer half (design section 3): structure generation, texel aliasing, exact
+    // CPU-dirty pages of every skipped range. Written and special bindings run in full anyway.
+    const u64 t_check_buf = tsc();
+    const u64 buf_gen = buffer_cache.StructGeneration();
+    const u64 tex_gen = texture_cache.StructGeneration();
+    const u64 smp_gen = texture_cache.SamplerGeneration();
+    s32 buf_miss = -1;
+    if (buf_key) {
+        if (rec.buf_excluded || stage.uses_dma || native_bindings) {
+            buf_miss = BufExcluded;
+        } else if (buf_gen != rec.buf_gen) {
+            buf_miss = BufGen;
+        } else if (rec.buf_texel && tex_gen != rec.buf_tex_gen) {
+            buf_miss = BufTexGen;
+        } else {
+            for (const auto& b : rec.bufs) {
+                if (b.memo && b.id && buffer_cache.IsRegionCpuDirtyRelaxed(b.addr, b.size)) {
+                    buf_miss = BufDirtyPage;
+                    break;
+                }
+            }
+        }
+    }
+    const bool buf_would = buf_key && buf_miss < 0;
+    // Validation, texture half: image structure and sampler generations, then per image the
+    // identity, backing, UpdateImageLockFree predicate and binding flags. A state difference is
+    // not a miss: the memo would call Transit.
+    const u64 t_check_tex = tsc();
+    s32 tex_miss = -1;
+    bool transit = false;
+    if (tex_key) {
+        if (rec.tex_excluded || native_bindings) {
+            tex_miss = TexExcluded;
+        } else if (tex_gen != rec.tex_gen) {
+            tex_miss = TexGen;
+        } else if (!rec.samplers.empty() && smp_gen != rec.smp_gen) {
+            tex_miss = TexSamplerGen;
+        } else {
+            for (const auto& img : rec.imgs) {
+                if (!img.id) {
+                    continue;
+                }
+                auto& image = texture_cache.PeekImage(img.id);
+                if (image.image_uid != img.uid) {
+                    tex_miss = TexUid;
+                } else if (image.backing != img.backing) {
+                    tex_miss = TexBacking;
+                } else if (!texture_cache.ImageUpToDateRelaxed(img.id)) {
+                    tex_miss = TexDirtyImage;
+                } else if (image.binding.is_target || image.binding.force_general ||
+                           image.binding.needs_rebind) {
+                    tex_miss = TexFlags;
+                }
+                if (tex_miss >= 0) {
+                    break;
+                }
+                const auto& backing = *image.backing;
+                transit |= !(backing.state == img.state) || !backing.subresource_runs.empty();
+            }
+        }
+    }
+    const bool tex_would = tex_key && tex_miss < 0;
+    const u64 t_checked = tsc();
+
+    // Dry replay of the stored outputs into scratch, timed only: what a hit writes instead.
+    u64 replay_buf_ticks = 0;
+    u64 replay_tex_ticks = 0;
+    if (timed && buf_would) {
+        const u64 t0 = tsc();
+        st.replay_buffers.clear();
+        for (size_t i = 0; i < rec.bufs.size(); ++i) {
+            const auto& b = rec.bufs[i];
+            st.replay_buffers.emplace_back(b.handle, b.offset, b.range);
+            st.replay_adjust[i] = b.adjust;
+        }
+        replay_buf_ticks = tsc() - t0;
+    }
+    if (timed && tex_would) {
+        const u64 t0 = tsc();
+        st.replay_images.clear();
+        for (const auto& img : rec.imgs) {
+            if (img.id) {
+                static_cast<void>(texture_cache.GetImage(img.id)); // the LRU touch a hit keeps
+            }
+            st.replay_images.emplace_back(vk::Sampler{}, img.view, img.layout);
+        }
+        for (const auto sampler : rec.samplers) {
+            st.replay_images.emplace_back(sampler, vk::ImageView{}, vk::ImageLayout::eGeneral);
+        }
+        replay_tex_ticks = tsc() - t0;
+    }
+
+    // The unchanged full path.
+    const size_t buf_begin = buffer_infos.size();
+    const size_t img_begin = image_infos.size();
+    const u32 buf_binding = binding.buffer;
+    bind_memo_active = true;
+    bind_memo_timing = timed;
+    bind_memo_fixed_ticks = 0;
+    bind_memo_redirected = 0;
+    bind_memo_uploaded.fill(0);
+    const u64 t_full = tsc();
+    BindBuffers(bound, binding, push_data);
+    const u64 t_full_tex = tsc();
+    BindTextures(bound, binding);
+    const u64 t_done = tsc();
+    bind_memo_active = false;
+    bind_memo_timing = false;
+
+    if (timed) {
+        ++st.timed;
+        st.t_empty += t_key - t_empty;
+        st.t_key_buf += t_key_tex - t_key;
+        st.t_key_tex += t_check_buf - t_key_tex;
+        if (buf_key) {
+            ++st.t_check_buf_n;
+            st.t_check_buf += t_check_tex - t_check_buf;
+        }
+        if (tex_key) {
+            ++st.t_check_tex_n;
+            st.t_check_tex += t_checked - t_check_tex;
+        }
+        if (buf_would) {
+            ++st.t_replay_buf_n;
+            st.t_replay_buf += replay_buf_ticks;
+            ++st.t_buf_hit_n;
+            st.t_buf_hit += t_full_tex - t_full;
+            st.t_fixed_hit += bind_memo_fixed_ticks;
+        } else {
+            ++st.t_buf_miss_n;
+            st.t_buf_miss += t_full_tex - t_full;
+        }
+        if (tex_would) {
+            ++st.t_replay_tex_n;
+            st.t_replay_tex += replay_tex_ticks;
+            ++st.t_tex_hit_n;
+            st.t_tex_hit += t_done - t_full_tex;
+        } else {
+            ++st.t_tex_miss_n;
+            st.t_tex_miss += t_done - t_full_tex;
+        }
+    }
+
+    ++st.stages;
+    ++st.type_stages[type];
+    st.type_key[type] += buf_key && tex_key;
+    st.type_would[type] += buf_would && tex_would;
+    st.dma_stages += stage.uses_dma;
+    st.buf_key += buf_key;
+    st.buf_would += buf_would;
+    st.tex_key += tex_key;
+    st.tex_would += tex_would;
+    st.transit_needed += tex_would && transit;
+    if (buf_miss >= 0) {
+        ++st.buf_miss[static_cast<u32>(buf_miss)];
+    }
+    if (tex_miss >= 0) {
+        ++st.tex_miss[static_cast<u32>(tex_miss)];
+    }
+    // Per-slot repeats against the previous occurrence (the per-binding fallback's key).
+    for (size_t i = 0; i < stage.buffers.size(); ++i) {
+        if (!stage.buffers[i].IsSpecial()) {
+            ++st.slot_buf;
+            st.slot_buf_key += rec.valid && SameSlot(st.vsharps, rec.vsharps, i);
+        }
+    }
+    for (size_t i = 0; i < st.tsharps.size(); ++i) {
+        ++st.slot_img;
+        st.slot_img_key += rec.valid && SameSlot(st.tsharps, rec.tsharps, i);
+    }
+    for (size_t i = 0; i < st.ssharps.size(); ++i) {
+        ++st.slot_smp;
+        st.slot_smp_key +=
+            rec.valid && border == rec.border && SameSlot(st.ssharps, rec.ssharps, i);
+    }
+
+    // Soundness: on a predicted hit the full path must have produced exactly the stored outputs
+    // and uploaded nothing. Anything else means the invalidation list is incomplete.
+    if (buf_would) {
+        if (rec.bufs.size() != stage.buffers.size()) {
+            ++st.mis_buf;
+        } else {
+            for (size_t i = 0; i < rec.bufs.size(); ++i) {
+                const auto& b = rec.bufs[i];
+                if (!b.memo) {
+                    continue;
+                }
+                const auto& info = buffer_infos[buf_begin + i];
+                const auto buffer_id = std::get<0>(buffer_bindings[i]);
+                st.mis_buf += buffer_id != b.id || info.buffer != b.handle ||
+                              info.offset != b.offset || info.range != b.range ||
+                              push_data.buf_offsets[buf_binding + i] != b.adjust;
+                st.mis_upload += bind_memo_uploaded[i] != 0;
+                ++st.memo_bufs_on_hit;
+            }
+        }
+    }
+    if (tex_would) {
+        const size_t num_images = image_bindings.size();
+        if (num_images != rec.imgs.size() || stage.samplers.size() != rec.samplers.size()) {
+            ++st.mis_img;
+        } else {
+            for (size_t i = 0; i < num_images; ++i) {
+                const auto& info = image_infos[img_begin + i];
+                const auto& img = rec.imgs[i];
+                st.mis_img += image_bindings[i].first != img.id || info.imageView != img.view;
+                st.layout_diff += info.imageLayout != img.layout;
+            }
+            for (size_t i = 0; i < rec.samplers.size(); ++i) {
+                st.mis_smp += image_infos[img_begin + num_images + i].sampler != rec.samplers[i];
+            }
+            st.samplers_on_hit += rec.samplers.size();
+        }
+    }
+
+    // Record this occurrence (outside every timed span).
+    rec.valid = true;
+    rec.vsharps = st.vsharps;
+    rec.tsharps = st.tsharps;
+    rec.ssharps = st.ssharps;
+    rec.border = border;
+    rec.buf_gen = buf_gen;
+    rec.buf_tex_gen = tex_gen;
+    rec.tex_gen = tex_gen;
+    rec.smp_gen = smp_gen;
+    rec.buf_excluded = false;
+    rec.buf_texel = false;
+    rec.bufs.resize(stage.buffers.size());
+    for (size_t i = 0; i < stage.buffers.size(); ++i) {
+        const auto& desc = stage.buffers[i];
+        const auto& [buffer_id, vsharp, size] = buffer_bindings[i];
+        const auto& info = buffer_infos[buf_begin + i];
+        auto& b = rec.bufs[i];
+        b.id = buffer_id;
+        b.addr = vsharp.base_address;
+        b.size = size;
+        b.handle = info.buffer;
+        b.offset = info.offset;
+        b.range = info.range;
+        b.adjust = push_data.buf_offsets[buf_binding + i];
+        b.memo = !desc.IsSpecial() && !desc.is_written;
+        if (b.memo && buffer_id) {
+            // Stream copies and host mirrors are not the cache buffer; a texel range aliasing
+            // an image is re-tiled on every bind (SynchronizeBufferFromImage).
+            if (info.buffer != buffer_cache.GetBuffer(buffer_id).Handle()) {
+                rec.buf_excluded = true;
+            }
+            if (desc.is_formatted) {
+                rec.buf_texel = true;
+                if (texture_cache.FindImageFromRange(vsharp.base_address, size)) {
+                    rec.buf_excluded = true;
+                }
+            }
+        }
+    }
+    rec.tex_excluded = native_bindings != nullptr;
+    for (const auto& desc : stage.images) {
+        rec.tex_excluded |= desc.mip_fallback_mode != Shader::MipStorageFallbackMode::None;
+    }
+    rec.imgs.resize(image_bindings.size());
+    for (size_t i = 0; i < image_bindings.size(); ++i) {
+        const auto& [image_id, desc] = image_bindings[i];
+        const auto& info = image_infos[img_begin + i];
+        auto& img = rec.imgs[i];
+        img = {};
+        img.id = image_id;
+        img.view = info.imageView;
+        img.layout = info.imageLayout;
+        if (!image_id) {
+            continue;
+        }
+        auto& image = texture_cache.PeekImage(image_id);
+        img.uid = image.image_uid;
+        img.backing = image.backing;
+        img.state = image.backing->state;
+        // Storage images, depth/stencil redirects and the Pro ID buffer stay on the full path.
+        rec.tex_excluded |= desc.type == VideoCore::TextureCache::BindingType::Storage ||
+                            ((bind_memo_redirected >> (i & 63)) & 1) != 0 ||
+                            (!stencil_scratches.empty() && IsStencilScratch(image_id)) ||
+                            (image.info.num_samples == 2 &&
+                             image.info.pixel_format == vk::Format::eR32Uint);
+    }
+    rec.samplers.resize(stage.samplers.size());
+    for (size_t i = 0; i < stage.samplers.size(); ++i) {
+        rec.samplers[i] = image_infos[img_begin + image_bindings.size() + i].sampler;
+    }
+    return u8(buf_key && tex_key) | u8((buf_would && tex_would) << 1);
+}
+
+void Rasterizer::BindMemoEndDraw(bool is_compute, u8 draw_bits) {
+    auto& st = GetBindMemoStats();
+    ++st.binds;
+    if (!is_compute) {
+        ++st.draws;
+        st.draw_key += (draw_bits & 1) != 0;
+        st.draw_would += (draw_bits & 2) != 0;
+    }
+    if (st.binds < (u64{1} << 18)) {
+        return;
+    }
+    const u64 tsc_now = Common::FencedRDTSC();
+    const auto clock_now = std::chrono::steady_clock::now();
+    const double wall_ns = double(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(clock_now - st.clock0).count());
+    const double ns_per_tick = tsc_now > st.tsc0 ? wall_ns / double(tsc_now - st.tsc0) : 0.0;
+    const u64 frames_now = Common::FaultMonitor::presented_frames.load(std::memory_order_relaxed);
+    const u64 frames = frames_now - st.frames0;
+    const double per_frame = frames ? 1.0 / double(frames) : 0.0;
+    const u64 buf_gen = buffer_cache.StructGeneration();
+    const u64 tex_gen = texture_cache.StructGeneration();
+    const u64 smp_gen = texture_cache.SamplerGeneration();
+    const auto pct = [](u64 part, u64 whole) {
+        return whole ? 100.0 * double(part) / double(whole) : 0.0;
+    };
+    const double empty_ns = st.timed ? double(st.t_empty) * ns_per_tick / double(st.timed) : 0.0;
+    const auto avg_ns = [ns_per_tick, empty_ns](u64 ticks, u64 n) {
+        return n ? std::max(0.0, double(ticks) * ns_per_tick / double(n) - empty_ns) : 0.0;
+    };
+    const double full_buf_hit = avg_ns(st.t_buf_hit, st.t_buf_hit_n);
+    // Summed per always-full binding inside BindBuffers, so no single-span correction here.
+    const double fixed_buf_hit =
+        st.t_buf_hit_n ? double(st.t_fixed_hit) * ns_per_tick / double(st.t_buf_hit_n) : 0.0;
+    const double full_buf_miss = avg_ns(st.t_buf_miss, st.t_buf_miss_n);
+    const double full_tex_hit = avg_ns(st.t_tex_hit, st.t_tex_hit_n);
+    const double full_tex_miss = avg_ns(st.t_tex_miss, st.t_tex_miss_n);
+    const double key_buf = avg_ns(st.t_key_buf, st.timed);
+    const double key_tex = avg_ns(st.t_key_tex, st.timed);
+    const double check_buf = avg_ns(st.t_check_buf, st.t_check_buf_n);
+    const double check_tex = avg_ns(st.t_check_tex, st.t_check_tex_n);
+    const double replay_buf = avg_ns(st.t_replay_buf, st.t_replay_buf_n);
+    const double replay_tex = avg_ns(st.t_replay_tex, st.t_replay_tex_n);
+    // Per predicted hit: the half's full path minus what a hit still runs (always-full buffer
+    // bindings, the checks, the replay, the unreplayed allowances).
+    const double allow_buf =
+        st.buf_would ? BindMemoAllowBufNs * double(st.memo_bufs_on_hit) / double(st.buf_would)
+                     : 0.0;
+    const double allow_tex =
+        st.tex_would ? BindMemoAllowSamplerNs * double(st.samplers_on_hit) / double(st.tex_would)
+                     : 0.0;
+    const double save_buf_hit = full_buf_hit - fixed_buf_hit - check_buf - replay_buf - allow_buf;
+    const double save_tex_hit = full_tex_hit - check_tex - replay_tex - allow_tex;
+    // Paid on every stage (key), on every key hit that fails validation (check) and on every
+    // miss (record update, costed like a replay).
+    const double gross_buf = double(st.buf_would) * save_buf_hit;
+    const double gross_tex = double(st.tex_would) * save_tex_hit;
+    const double cost_buf = double(st.stages) * key_buf +
+                            double(st.buf_key - st.buf_would) * check_buf +
+                            double(st.stages - st.buf_would) * replay_buf;
+    const double cost_tex = double(st.stages) * key_tex +
+                            double(st.tex_key - st.tex_would) * check_tex +
+                            double(st.stages - st.tex_would) * replay_tex;
+    const double net_buf_us = (gross_buf - cost_buf) * per_frame / 1000.0;
+    const double net_tex_us = (gross_tex - cost_tex) * per_frame / 1000.0;
+    const u64 mismatches = st.mis_buf + st.mis_upload + st.mis_img + st.mis_smp;
+
+    LOG_INFO(Render_Vulkan,
+             "BindMemoStats: binds={} draws={} frames={} stages={} "
+             "stage_key(vs/ps/cs/other)={:.1f}/{:.1f}/{:.1f}/{:.1f}% "
+             "stage_would(vs/ps/cs/other)={:.1f}/{:.1f}/{:.1f}/{:.1f}% "
+             "whole_draw(key/would)={:.1f}/{:.1f}% slot_key(buf/img/smp)={:.1f}/{:.1f}/{:.1f}% "
+             "dma_stages={}",
+             st.binds, st.draws, frames, st.stages, pct(st.type_key[0], st.type_stages[0]),
+             pct(st.type_key[1], st.type_stages[1]), pct(st.type_key[2], st.type_stages[2]),
+             pct(st.type_key[3], st.type_stages[3]), pct(st.type_would[0], st.type_stages[0]),
+             pct(st.type_would[1], st.type_stages[1]), pct(st.type_would[2], st.type_stages[2]),
+             pct(st.type_would[3], st.type_stages[3]), pct(st.draw_key, st.draws),
+             pct(st.draw_would, st.draws), pct(st.slot_buf_key, st.slot_buf),
+             pct(st.slot_img_key, st.slot_img), pct(st.slot_smp_key, st.slot_smp),
+             st.dma_stages);
+    LOG_INFO(Render_Vulkan,
+             "BindMemoStats: buf key={:.1f}% would={:.1f}% "
+             "miss(excluded/buf_gen/tex_gen/dirty_page)={}/{}/{}/{} tex key={:.1f}% "
+             "would={:.1f}% transit_needed={} "
+             "miss(excluded/tex_gen/smp_gen/uid/backing/dirty_image/flags)={}/{}/{}/{}/{}/{}/{} "
+             "mismatches={} (buf={} upload={} img={} smp={}) layout_diff={} "
+             "gens/frame(buf/tex/smp)={:.2f}/{:.3f}/{:.3f}",
+             pct(st.buf_key, st.stages), pct(st.buf_would, st.stages), st.buf_miss[BufExcluded],
+             st.buf_miss[BufGen], st.buf_miss[BufTexGen], st.buf_miss[BufDirtyPage],
+             pct(st.tex_key, st.stages), pct(st.tex_would, st.stages), st.transit_needed,
+             st.tex_miss[TexExcluded], st.tex_miss[TexGen], st.tex_miss[TexSamplerGen],
+             st.tex_miss[TexUid], st.tex_miss[TexBacking], st.tex_miss[TexDirtyImage],
+             st.tex_miss[TexFlags], mismatches, st.mis_buf, st.mis_upload, st.mis_img,
+             st.mis_smp, st.layout_diff, double(buf_gen - st.buf_gen0) * per_frame,
+             double(tex_gen - st.tex_gen0) * per_frame, double(smp_gen - st.smp_gen0) * per_frame);
+    LOG_INFO(Render_Vulkan,
+             "BindMemoCost: timed={} tsc_read_ns={:.1f} ns full_buf(hit/miss)={:.0f}/{:.0f} "
+             "fixed_buf_hit={:.0f} "
+             "full_tex(hit/miss)={:.0f}/{:.0f} key(buf/tex)={:.1f}/{:.1f} "
+             "check(buf/tex)={:.1f}/{:.1f} replay(buf/tex)={:.1f}/{:.1f} "
+             "save_per_hit(buf/tex)={:.0f}/{:.0f} gross_us_frame(buf/tex)={:.0f}/{:.0f} "
+             "est_save_us_frame(buf/tex/total)={:.0f}/{:.0f}/{:.0f}",
+             st.timed, empty_ns, full_buf_hit, full_buf_miss, fixed_buf_hit, full_tex_hit,
+             full_tex_miss,
+             key_buf, key_tex, check_buf, check_tex, replay_buf, replay_tex, save_buf_hit,
+             save_tex_hit, gross_buf * per_frame / 1000.0, gross_tex * per_frame / 1000.0,
+             net_buf_us, net_tex_us, net_buf_us + net_tex_us);
+
+    // Cumulative-and-reset: the next window starts here. Records are kept.
+    auto records = std::move(st.records);
+    const u64 stage_counter = st.stage_counter;
+    st = {};
+    st.records = std::move(records);
+    st.stage_counter = stage_counter;
+    st.started = true;
+    st.frames0 = frames_now;
+    st.buf_gen0 = buf_gen;
+    st.tex_gen0 = tex_gen;
+    st.smp_gen0 = smp_gen;
+    st.clock0 = clock_now;
+    st.tsc0 = tsc_now;
 }
 
 void Rasterizer::EmitPipelineResources(const Pipeline* pipeline) {
@@ -1255,6 +1846,9 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
     for (u32 i = 0; i < buffer_bindings.size(); i++) {
         const auto& [buffer_id, vsharp, size] = buffer_bindings[i];
         const auto& desc = stage.buffers[i];
+        // SHADPS4_BIND_MEMO_STATS: bindings a memo hit would still run in full are timed.
+        const bool memo_fixed = bind_memo_timing && (desc.IsSpecial() || desc.is_written);
+        const u64 memo_t0 = memo_fixed ? Common::FencedRDTSC() : 0;
         const bool is_storage = desc.IsStorage(vsharp);
         const u32 alignment =
             is_storage ? instance.StorageMinAlignment() : instance.UniformMinAlignment();
@@ -1314,11 +1908,15 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
             }
         } else {
             const auto t_obtain = Common::FaultMonitor::Now();
+            const u64 memo_uploads = bind_memo_active ? buffer_cache.SyncUploadBytesTotal() : 0;
             const auto [vk_buffer, offset] = buffer_cache.ObtainBuffer(
                 vsharp.base_address, size, desc.is_written, desc.is_formatted, buffer_id,
                 is_storage ? Common::BufferSampleCaller::Storage
                            : Common::BufferSampleCaller::Uniform);
             obtain_ns += Common::FaultMonitor::SinceNs(t_obtain);
+            if (bind_memo_active) {
+                bind_memo_uploaded[i] = buffer_cache.SyncUploadBytesTotal() != memo_uploads;
+            }
             const u32 offset_aligned = Common::AlignDown(offset, alignment);
             const u32 adjust = offset - offset_aligned;
             ASSERT(adjust % 4 == 0);
@@ -1366,6 +1964,9 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
             set_write.pBufferInfo = &buffer_infos.back();
         }
         ++binding.buffer;
+        if (memo_fixed) {
+            bind_memo_fixed_ticks += Common::FencedRDTSC() - memo_t0;
+        }
     }
     Common::FaultMonitor::CountBindBufferPass(find_ns, obtain_ns);
 }
@@ -1575,6 +2176,8 @@ void Rasterizer::BindTextures(const Shader::BoundStage& bound,
                 }
             }
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
+                // SHADPS4_BIND_MEMO_STATS: redirected bindings are excluded from the memo.
+                bind_memo_redirected |= u64{1} << ((image_bindings.size() - 1) & 63);
                 static const bool stencil_storage = [] {
                     const char* value = std::getenv("SHADPS4_STENCIL_STORAGE");
                     return value && value[0] == '1';
@@ -2154,6 +2757,9 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges -= decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
     }
+    // SHADPS4_BIND_MEMO_STATS: BeginGpuUnmap bumped before the unmap; bump again after it, so a
+    // record taken while it was in progress cannot validate against the final mapping.
+    buffer_cache.BumpStructGeneration();
 }
 
 void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
