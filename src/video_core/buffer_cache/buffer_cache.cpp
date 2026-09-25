@@ -1499,6 +1499,50 @@ BufferCache::VerifyResult BufferCache::VerifyFaultJob(FaultJob& job) {
     return result;
 }
 
+namespace {
+// SHADPS4_RANGE_ADD_SKIP=1: skip gpu_modified_ranges.Add when the range is already recorded
+// (one tree lookup instead of insert + join; the set stays identical). A direct-mapped memo of
+// ranges added since the last Subtract (gpu_clear_epoch) answers repeats without the lookup.
+bool RangeAddSkip() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_RANGE_ADD_SKIP");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+struct RangeAddMemo {
+    VAddr addr;
+    u64 size;
+    u64 epoch;
+};
+std::array<RangeAddMemo, 256> range_add_memo{};
+u64 range_add_calls = 0, range_add_skipped = 0;
+
+template <typename Set>
+void AddGpuModified(Set& set, VAddr addr, u64 size) {
+    if (!RangeAddSkip()) {
+        set.Add(addr, size);
+        return;
+    }
+    const u64 epoch = MemoryTracker::gpu_clear_epoch.load(std::memory_order_acquire);
+    auto& memo = range_add_memo[(addr >> 6) & (range_add_memo.size() - 1)];
+    bool contained = memo.addr == addr && memo.size >= size && memo.epoch == epoch;
+    if (!contained) {
+        contained = set.Contains(addr, size);
+        if (!contained) {
+            set.Add(addr, size);
+        }
+        memo = {addr, size, epoch};
+    }
+    ++range_add_calls;
+    range_add_skipped += contained;
+    if ((range_add_calls & 0xfffff) == 0) {
+        LOG_INFO(Render_Vulkan, "RangeAddSkip: adds={} contained={} ({:.1f}%)", range_add_calls,
+                 range_add_skipped, 100.0 * range_add_skipped / range_add_calls);
+    }
+}
+} // namespace
+
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size, bool is_write,
                                        Offload::SyncTiming* timing) {
@@ -1822,7 +1866,7 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         auto& buffer = slot_buffers[buffer_id];
         SynchronizeBuffer(buffer, dst, num_bytes, true, true, nullptr);
         NoteGpuWrite(dst, num_bytes);
-        gpu_modified_ranges.Add(dst, num_bytes);
+        AddGpuModified(gpu_modified_ranges, dst, num_bytes);
         Common::FaultMonitor::CountRangeAdd(gpu_modified_ranges.m_ranges_set.iterative_size());
         return buffer;
     }();
@@ -1999,7 +2043,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     if (is_written) {
         const auto t_range_add = sample.Now();
         NoteGpuWrite(device_addr, size);
-        gpu_modified_ranges.Add(device_addr, size);
+        AddGpuModified(gpu_modified_ranges, device_addr, size);
         sample.AddRangeAddNs(sample.SinceNs(t_range_add));
         Common::FaultMonitor::CountRangeAdd(gpu_modified_ranges.m_ranges_set.iterative_size());
     }

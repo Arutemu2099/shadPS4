@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cstdlib>
+
 #include <bit>
 #include "shader_recompiler/frontend/code_match.h"
 #include "shader_recompiler/specialization.h"
@@ -29,9 +31,16 @@ struct PreparedSpecialization {
         // Tessellation reads another guest constant buffer, and geometry reads a
         // copy program. They retain the original path until those dependencies
         // have their own contract. Cover both ordinary graphics stages here.
+        // SHADPS4_PREPARED_PROGRAMS_COMPUTE=1: compute has neither a fetch shader nor a
+        // tessellation constant buffer; its RuntimeInfo (workgroup setup) is compared whole.
+        static const bool compute = [] {
+            const char* value = std::getenv("SHADPS4_PREPARED_PROGRAMS_COMPUTE");
+            return value && value[0] == '1';
+        }();
         return info.stage == stage && info.l_stage == logical &&
                ((stage == Stage::Fragment && logical == LogicalStage::Fragment) ||
-                (stage == Stage::Vertex && logical == LogicalStage::Vertex));
+                (stage == Stage::Vertex && logical == LogicalStage::Vertex) ||
+                (compute && stage == Stage::Compute && logical == LogicalStage::Compute));
     }
 
     static u64 BufferInput(const BufferResource& desc, const Info& info) {

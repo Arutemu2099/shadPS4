@@ -1208,8 +1208,8 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         }
         bool hit = program->prepared->permutation < program->modules.size() &&
                    program->prepared->Matches(info, runtime_info, binding);
-        static std::array<u64, 2> calls{}, hits{}, secondary_hits{}, verified{};
-        const size_t counter = stage == Stage::Vertex;
+        static std::array<u64, 3> calls{}, hits{}, secondary_hits{}, verified{};
+        const size_t counter = stage == Stage::Vertex ? 1 : stage == Stage::Compute ? 2 : 0;
         ++calls[counter];
         if (!hit && prepared_two_entry_enabled && program->prepared_secondary &&
             program->prepared_secondary->permutation < program->modules.size() &&
