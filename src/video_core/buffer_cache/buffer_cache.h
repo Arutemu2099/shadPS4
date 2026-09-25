@@ -446,6 +446,8 @@ private:
     bool host_mirror{};
     u32 host_mirror_max{};
     u64 hm_calls{}, hm_hits{}, hm_clean{}, hm_gpu{}, hm_nobacking{}, hm_straddle{}, hm_bytes{};
+    u64 hm_toobig{}, hm_max_seen{}, hm_outside{}, hm_samples{};
+    VAddr host_mirror_lo{}, host_mirror_hi{}; // SHADPS4_HOST_MIRROR_RANGE
     StreamBuffer stream_buffer;
     StreamBuffer download_buffer;
     StreamBuffer device_buffer;

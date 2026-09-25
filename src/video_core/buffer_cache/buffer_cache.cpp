@@ -297,6 +297,17 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         if (const char* max = std::getenv("SHADPS4_HOST_MIRROR_MAX")) {
             host_mirror_max = static_cast<u32>(std::strtoul(max, nullptr, 0));
         }
+        // "lo-hi" (hex ok): mirror every eligible binding inside this guest range, without the
+        // per-bind dirty-page query (which walks the range a second time).
+        if (const char* range = std::getenv("SHADPS4_HOST_MIRROR_RANGE")) {
+            char* end = nullptr;
+            host_mirror_lo = std::strtoull(range, &end, 0);
+            if (end && *end == '-') {
+                host_mirror_hi = std::strtoull(end + 1, nullptr, 0);
+            }
+            LOG_INFO(Render_Vulkan, "SHADPS4_HOST_MIRROR_RANGE: {:#x}-{:#x}", host_mirror_lo,
+                     host_mirror_hi);
+        }
         LOG_INFO(Render_Vulkan, "SHADPS4_HOST_MIRROR: {} (max binding {} bytes)",
                  host_mirror ? "on" : "unavailable (VK_EXT_external_memory_host)",
                  host_mirror_max);
@@ -1855,7 +1866,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         }
     }
     if (host_mirror && !is_written && !is_texel_buffer &&
-        sample_caller != Common::BufferSampleCaller::Other && size <= host_mirror_max) {
+        sample_caller != Common::BufferSampleCaller::Other) {
         if (const auto mirrored = TryHostMirror(device_addr, size); mirrored.first) {
             return mirrored;
         }
@@ -1941,7 +1952,23 @@ std::pair<Buffer*, u32> BufferCache::TryHostMirror(VAddr device_addr, u32 size) 
     ++hm_calls;
     std::pair<Buffer*, u32> result{};
     u64 backing = 0;
-    if (!memory_tracker->IsRegionCpuModified(device_addr, size)) {
+    const bool range_mode = host_mirror_hi > host_mirror_lo;
+    const bool overlaps_range =
+        range_mode && device_addr < host_mirror_hi && device_addr + size > host_mirror_lo;
+    if (size > host_mirror_max) {
+        ++hm_toobig;
+        hm_max_seen = std::max<u64>(hm_max_seen, size);
+        if (overlaps_range && hm_samples < 12) {
+            ++hm_samples;
+            LOG_INFO(Render_Vulkan, "HostMirror: too big {:#x}+{:#x}", device_addr, size);
+        }
+    } else if (range_mode && (device_addr < host_mirror_lo || device_addr + size > host_mirror_hi)) {
+        ++hm_outside;
+        if (overlaps_range && hm_samples < 12) {
+            ++hm_samples;
+            LOG_INFO(Render_Vulkan, "HostMirror: partly outside {:#x}+{:#x}", device_addr, size);
+        }
+    } else if (!range_mode && !memory_tracker->IsRegionCpuModified(device_addr, size)) {
         // Clean: the tracked copy is current and in VRAM; keep using it.
         ++hm_clean;
     } else if (IsRegionGpuModified(device_addr, size)) {
@@ -1959,10 +1986,10 @@ std::pair<Buffer*, u32> BufferCache::TryHostMirror(VAddr device_addr, u32 size) 
     if ((hm_calls & 0xfffff) == 0) {
         LOG_INFO(Render_Vulkan,
                  "HostMirror: calls={} hits={} ({:.1f}%) clean={} gpu={} nobacking={} "
-                 "straddle={} chunks={} avg_hit_bytes={:.0f}",
+                 "straddle={} toobig={} (max {:#x}) outside={} chunks={} avg_hit_bytes={:.0f}",
                  hm_calls, hm_hits, 100.0 * double(hm_hits) / double(hm_calls), hm_clean, hm_gpu,
-                 hm_nobacking, hm_straddle, host_mirror_chunks.size(),
-                 hm_hits ? double(hm_bytes) / double(hm_hits) : 0.0);
+                 hm_nobacking, hm_straddle, hm_toobig, hm_max_seen, hm_outside,
+                 host_mirror_chunks.size(), hm_hits ? double(hm_bytes) / double(hm_hits) : 0.0);
     }
     return result;
 }

@@ -719,10 +719,22 @@ void Rasterizer::Finish() {
     scheduler.Finish();
 }
 
-void Rasterizer::DeferToGpu(Common::UniqueFunction<void>&& func) {
-    // Queued at the current tick first, then that tick is submitted.
+void Rasterizer::DeferToGpu(Common::UniqueFunction<void>&& func, bool flush) {
+    // Queued at the current tick first, then that tick is submitted (or, lazily, left to the
+    // next flush: every SHADPS4_FLUSH_EVERY_DRAWS draws, a CP memory wait or CP idle).
     scheduler.DeferPriorityOperation(std::move(func));
-    Flush();
+    if (flush) {
+        Flush();
+    } else {
+        lazy_fence_tick = scheduler.CurrentTick();
+    }
+}
+
+void Rasterizer::FlushLazyFences() {
+    if (lazy_fence_tick != 0 && lazy_fence_tick == scheduler.CurrentTick()) {
+        Flush();
+    }
+    lazy_fence_tick = 0;
 }
 
 void Rasterizer::OnSubmit() {

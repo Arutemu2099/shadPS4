@@ -75,7 +75,10 @@ public:
     void Finish();
     /// SHADPS4_FENCE_AT_GPU: run `func` on the scheduler's priority thread once the host GPU has
     /// finished everything recorded so far; submits the current batch so that happens.
-    void DeferToGpu(Common::UniqueFunction<void>&& func);
+    void DeferToGpu(Common::UniqueFunction<void>&& func, bool flush);
+    /// Mode 2 (lazy): submits the batch holding deferred fences if it is still being recorded.
+    void FlushLazyFences();
+    u64 lazy_fence_tick{};
     void OnSubmit();
 
     PipelineCache& GetPipelineCache() {
