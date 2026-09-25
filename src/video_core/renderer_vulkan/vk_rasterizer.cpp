@@ -187,6 +187,18 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     if (bind_memo_stats) {
         LOG_INFO(Render_Vulkan, "BindMemoStats: enabled (counters only, behaviour unchanged)");
     }
+    if (const char* value = std::getenv("SHADPS4_TEX_BIND_MEMO");
+        value && (value[0] == '1' || value[0] == '2')) {
+        if (bind_memo_stats) {
+            LOG_WARNING(Render_Vulkan, "TexBindMemo: off, SHADPS4_BIND_MEMO_STATS takes precedence");
+        } else if (native_bindings) {
+            LOG_WARNING(Render_Vulkan, "TexBindMemo: off, not supported with native bindings");
+        } else {
+            tex_bind_memo = static_cast<u8>(value[0] - '0');
+            LOG_INFO(Render_Vulkan, "TexBindMemo: enabled, mode={}",
+                     tex_bind_memo == 2 ? "verify (full path + compare)" : "memo");
+        }
+    }
 }
 
 Rasterizer::~Rasterizer() {
@@ -1232,7 +1244,11 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             const auto t_buf = Common::FaultMonitor::Now();
             BindBuffers(bound, binding, push_data);
             const auto t_tex = Common::FaultMonitor::Now();
-            BindTextures(bound, binding);
+            if (tex_bind_memo) {
+                BindTexturesMemo(pipeline, bound, binding);
+            } else {
+                BindTextures(bound, binding);
+            }
             Common::FaultMonitor::CountBindSplit(Common::FaultMonitor::DiffNs(t_buf, t_tex),
                                                  Common::FaultMonitor::SinceNs(t_tex));
         }
@@ -1828,6 +1844,481 @@ void Rasterizer::BindMemoEndDraw(bool is_compute, u8 draw_bits) {
     st.tsc0 = tsc_now;
 }
 
+// SHADPS4_TEX_BIND_MEMO: the texture half of the binding memo (notes/binding-memo-design-
+// 2026-09-25.md sections 3-4). Key and validity checks are the stats mode's above (measured
+// 2026-09-25: texture key hit 94.5%, 0 mismatches), plus a live depth-association check and a
+// perfect-match requirement at record time. One record per (pipeline, logical stage), owned by
+// the Pipeline. Binding thread only.
+struct TexMemoRecord {
+    struct Img {
+        VideoCore::ImageId id{};
+        u64 uid{};
+        const VideoCore::Image::BackingImage* backing{};
+        vk::ImageView view{};
+        vk::DescriptorType type{};
+        // Backing state after the recorded full path. With a full-range view and no subresource
+        // runs this state is a fixed point of the stage's Transit calls (same layout, access and
+        // stage every time), so a hit skips Transit only when the live state equals it.
+        VideoCore::Image::State state{};
+        VideoCore::SubresourceRange range{}; // the range the full path passed to Transit
+        bool full_range{};
+    };
+    bool valid{};
+    bool excluded{};
+    u64 border{};
+    u64 tex_gen{};
+    u64 smp_gen{};
+    std::vector<AmdGpu::Image> tsharps;
+    std::vector<AmdGpu::Sampler> ssharps;
+    std::vector<Img> imgs;
+    std::vector<vk::Sampler> samplers;
+    std::vector<size_t> sampler_lru;
+};
+
+namespace {
+
+enum TexMemoMiss : u32 {
+    TmKey,
+    TmExcluded,
+    TmTexGen,
+    TmSmpGen,
+    TmUid,
+    TmBacking,
+    TmDirtyImage,
+    TmFlags,
+    TmAssoc,
+    TmRefused,
+    NumTexMemoMiss
+};
+
+struct TexMemoState {
+    // Key under test; capacity is kept.
+    std::vector<AmdGpu::Image> tsharps;
+    std::vector<AmdGpu::Sampler> ssharps;
+    // Verify scratch: a hit's outputs, captured before they are rolled back.
+    struct Write {
+        u32 binding;
+        u32 count;
+        vk::DescriptorType type;
+        const vk::DescriptorImageInfo* info;
+    };
+    std::vector<vk::DescriptorImageInfo> hit_infos;
+    std::vector<Write> hit_writes;
+    std::vector<VideoCore::ImageId> hit_bound;
+    std::vector<std::pair<VideoCore::Image::State, size_t>> hit_states;
+    // Window counters (reset at every log line) and run totals.
+    bool started{};
+    u64 frames0{};
+    u64 stages{}, empty_stages{}, key_hits{}, hits{}, hit_transits{}, hit_images{}, hit_samplers{};
+    std::array<u64, NumTexMemoMiss> miss{};
+    u64 verified{}, mismatched{};
+    u64 mis_shape{}, mis_id{}, mis_view{}, mis_layout{}, mis_sampler{}, mis_write{}, mis_bound{},
+        mis_state{};
+    u64 total_stages{}, total_hits{}, total_verified{}, total_mismatched{};
+    u32 logged{};
+};
+
+TexMemoState& GetTexMemoState() {
+    static TexMemoState state;
+    return state;
+}
+
+void LogTexMemo(TexMemoState& st, u8 mode) {
+    const u64 frames_now = Common::FaultMonitor::presented_frames.load(std::memory_order_relaxed);
+    const u64 frames = frames_now - st.frames0;
+    const auto pct = [](u64 part, u64 whole) {
+        return whole ? 100.0 * double(part) / double(whole) : 0.0;
+    };
+    const auto per = [](u64 part, u64 whole) { return whole ? double(part) / double(whole) : 0.0; };
+    const u64 tex_stages = st.stages - st.empty_stages;
+    LOG_INFO(Render_Vulkan,
+             "TexBindMemo: mode={} frames={} stages={} tex_stages={} key={:.1f}% hit={:.1f}% "
+             "hit_all={:.1f}% hits/frame={:.0f} transits/hit={:.3f} images/hit={:.2f} "
+             "samplers/hit={:.2f} miss(key/excluded/tex_gen/smp_gen/uid/backing/dirty_image/"
+             "flags/assoc/refused)={}/{}/{}/{}/{}/{}/{}/{}/{}/{} verified={} mismatches={} "
+             "(shape={} id={} view={} layout={} sampler={} write={} bound={} state={}) "
+             "total(stages/hits/verified/mismatches)={}/{}/{}/{}",
+             mode == 2 ? "verify" : "memo", frames, st.stages, tex_stages,
+             pct(st.key_hits, tex_stages), pct(st.hits, tex_stages),
+             pct(st.hits + st.empty_stages, st.stages), per(st.hits, frames),
+             per(st.hit_transits, st.hits), per(st.hit_images, st.hits),
+             per(st.hit_samplers, st.hits), st.miss[TmKey], st.miss[TmExcluded],
+             st.miss[TmTexGen], st.miss[TmSmpGen], st.miss[TmUid], st.miss[TmBacking],
+             st.miss[TmDirtyImage], st.miss[TmFlags], st.miss[TmAssoc], st.miss[TmRefused],
+             st.verified, st.mismatched, st.mis_shape, st.mis_id, st.mis_view, st.mis_layout,
+             st.mis_sampler, st.mis_write, st.mis_bound, st.mis_state, st.total_stages,
+             st.total_hits, st.total_verified, st.total_mismatched);
+    st.frames0 = frames_now;
+    st.stages = st.empty_stages = st.key_hits = st.hits = st.hit_transits = st.hit_images =
+        st.hit_samplers = 0;
+    st.miss = {};
+    st.verified = st.mismatched = 0;
+    st.mis_shape = st.mis_id = st.mis_view = st.mis_layout = st.mis_sampler = st.mis_write =
+        st.mis_bound = st.mis_state = 0;
+}
+
+} // Anonymous namespace
+
+void Rasterizer::BindTexturesMemo(const Pipeline* pipeline, const Shader::BoundStage& bound,
+                                  Shader::Backend::Bindings& binding) {
+    const auto& stage = *bound.info;
+    auto& st = GetTexMemoState();
+    if (!st.started) {
+        st.started = true;
+        st.frames0 = Common::FaultMonitor::presented_frames.load(std::memory_order_relaxed);
+    }
+    if (st.stages >= (u64{1} << 18)) {
+        LogTexMemo(st, tex_bind_memo);
+    }
+    ++st.stages;
+    ++st.total_stages;
+    if (stage.images.empty() && stage.samplers.empty()) {
+        // Nothing to skip; BindTextures only walks empty lists.
+        ++st.empty_stages;
+        BindTextures(bound, binding);
+        return;
+    }
+    auto& slot = pipeline->tex_bind_memo[static_cast<u32>(stage.l_stage)];
+    if (!slot) {
+        slot = std::make_shared<TexMemoRecord>();
+    }
+    auto& rec = *static_cast<TexMemoRecord*>(slot.get());
+
+    // Key: every T#, every S# after BindTextures' aniso adjustment, the border colour base.
+    st.tsharps.clear();
+    for (const auto& desc : stage.images) {
+        st.tsharps.push_back(desc.GetSharp(bound));
+    }
+    st.ssharps.clear();
+    for (const auto& sampler : stage.samplers) {
+        auto ssharp = sampler.GetSharp(bound);
+        if (sampler.disable_aniso) {
+            const auto& tsharp = stage.images[sampler.associated_image].GetSharp(bound);
+            if (tsharp.base_level == 0 && tsharp.last_level == 0) {
+                ssharp.max_aniso.Assign(AmdGpu::AnisoRatio::One);
+            }
+        }
+        st.ssharps.push_back(ssharp);
+    }
+    const u64 border = liverpool->BackRegs().ta_bc_base.base_addr;
+
+    // Validation (design section 3). Image checks and the LRU touches a hit keeps run inside
+    // one memo section, so a foreign structural change cannot interleave with them; the
+    // structure generation is re-read inside it for the same reason.
+    s32 miss = -1;
+    if (!rec.valid || border != rec.border || !SameBytes(st.tsharps, rec.tsharps) ||
+        !SameBytes(st.ssharps, rec.ssharps)) {
+        miss = TmKey;
+    } else if (rec.excluded) {
+        miss = TmExcluded;
+    } else {
+        const auto section = texture_cache.EnterMemoSection();
+        if (section == VideoCore::TextureCache::MemoSection::Refused) {
+            miss = TmRefused;
+        } else {
+            if (texture_cache.StructGeneration() != rec.tex_gen) {
+                miss = TmTexGen;
+            } else {
+                for (const auto& img : rec.imgs) {
+                    if (!img.id) {
+                        continue;
+                    }
+                    const auto& image = texture_cache.PeekImage(img.id);
+                    if (image.image_uid != img.uid) {
+                        miss = TmUid;
+                    } else if (image.backing != img.backing) {
+                        miss = TmBacking;
+                    } else if (!texture_cache.ImageUpToDateRelaxed(img.id)) {
+                        miss = TmDirtyImage;
+                    } else if (image.binding.is_target || image.binding.force_general ||
+                               image.binding.needs_rebind) {
+                        miss = TmFlags;
+                    } else if (image.depth_id) {
+                        // AssociateDepth bumps no generation; the full path would redirect.
+                        miss = TmAssoc;
+                    }
+                    if (miss >= 0) {
+                        break;
+                    }
+                }
+            }
+            if (miss < 0) {
+                // FindImage and UpdateImage fast paths: access tick and LRU touch.
+                for (const auto& img : rec.imgs) {
+                    if (img.id) {
+                        texture_cache.TouchImageAccess(texture_cache.PeekImage(img.id));
+                    }
+                }
+            }
+            texture_cache.LeaveMemoSection(section);
+        }
+        // GetSampler's LRU touch, so the sampler GC cannot free a sampler this draw uses.
+        if (miss < 0 && !texture_cache.TouchSamplers(rec.sampler_lru, rec.smp_gen)) {
+            miss = TmSmpGen;
+        }
+    }
+    st.key_hits += miss != static_cast<s32>(TmKey);
+    if (miss >= 0) {
+        ++st.miss[static_cast<u32>(miss)];
+    }
+
+    if (miss < 0 && tex_bind_memo == 1) {
+        st.hit_transits += EmitTexMemoHit(rec, binding);
+        ++st.hits;
+        ++st.total_hits;
+        st.hit_images += rec.imgs.size();
+        st.hit_samplers += rec.samplers.size();
+        return;
+    }
+
+    const size_t img_begin = image_infos.size();
+    const u32 sw_begin = set_write_index;
+    if (miss < 0) {
+        // Verify: run the hit for real, capture its outputs, roll the outputs back and run the
+        // full path over the same slots. Binding flags, LRU touches and any Transit the hit made
+        // stay; the full path repeats them idempotently when the hit was exact, and redoes
+        // whatever the hit skipped wrongly (then caught below as a state mismatch).
+        const u32 unified_begin = binding.unified;
+        const size_t bound_begin = bound_images.size();
+        st.hit_transits += EmitTexMemoHit(rec, binding);
+        ++st.hits;
+        ++st.total_hits;
+        st.hit_images += rec.imgs.size();
+        st.hit_samplers += rec.samplers.size();
+        st.hit_infos.assign(image_infos.begin() + img_begin, image_infos.end());
+        st.hit_writes.clear();
+        for (u32 i = sw_begin; i < set_write_index; ++i) {
+            const auto& w = set_writes[i];
+            st.hit_writes.push_back({w.dstBinding, w.descriptorCount, w.descriptorType,
+                                     w.pImageInfo});
+        }
+        st.hit_bound.assign(bound_images.begin() + bound_begin, bound_images.end());
+        const u32 hit_unified = binding.unified;
+        st.hit_states.clear();
+        for (const auto& img : rec.imgs) {
+            if (img.id) {
+                const auto& backing = *texture_cache.PeekImage(img.id).backing;
+                st.hit_states.emplace_back(backing.state, backing.subresource_runs.size());
+            }
+        }
+        image_infos.erase(image_infos.begin() + img_begin, image_infos.end());
+        set_write_index = sw_begin;
+        binding.unified = unified_begin;
+        bound_images.erase(bound_images.begin() + bound_begin, bound_images.end());
+
+        const u64 tex_gen = texture_cache.StructGeneration();
+        const u64 smp_gen = texture_cache.SamplerGeneration();
+        bind_memo_redirected = 0;
+        bind_memo_rebound = false;
+        BindTextures(bound, binding);
+
+        u64 shape = 0, id = 0, view = 0, layout = 0, sampler = 0, write = 0, bound_diff = 0,
+            state = 0;
+        const size_t num_infos = image_infos.size() - img_begin;
+        if (num_infos != st.hit_infos.size() ||
+            set_write_index - sw_begin != st.hit_writes.size() || binding.unified != hit_unified ||
+            image_bindings.size() != rec.imgs.size()) {
+            shape = 1;
+        } else {
+            for (size_t i = 0; i < num_infos; ++i) {
+                const auto& full = image_infos[img_begin + i];
+                const auto& hit = st.hit_infos[i];
+                view += full.imageView != hit.imageView;
+                layout += full.imageLayout != hit.imageLayout;
+                sampler += full.sampler != hit.sampler;
+            }
+            for (size_t i = 0; i < st.hit_writes.size(); ++i) {
+                const auto& full = set_writes[sw_begin + i];
+                const auto& hit = st.hit_writes[i];
+                write += full.dstBinding != hit.binding || full.descriptorCount != hit.count ||
+                         full.descriptorType != hit.type || full.pImageInfo != hit.info;
+            }
+            for (size_t i = 0; i < rec.imgs.size(); ++i) {
+                id += image_bindings[i].first != rec.imgs[i].id;
+            }
+        }
+        bound_diff = bound_images.size() - bound_begin != st.hit_bound.size() ||
+                     !std::equal(st.hit_bound.begin(), st.hit_bound.end(),
+                                 bound_images.begin() + bound_begin);
+        size_t k = 0;
+        for (const auto& img : rec.imgs) {
+            if (!img.id) {
+                continue;
+            }
+            const auto& backing = *texture_cache.PeekImage(img.id).backing;
+            state += !(backing.state == st.hit_states[k].first) ||
+                     backing.subresource_runs.size() != st.hit_states[k].second;
+            ++k;
+        }
+        ++st.verified;
+        ++st.total_verified;
+        if (shape | id | view | layout | sampler | write | bound_diff | state) {
+            ++st.mismatched;
+            ++st.total_mismatched;
+            st.mis_shape += shape != 0;
+            st.mis_id += id != 0;
+            st.mis_view += view != 0;
+            st.mis_layout += layout != 0;
+            st.mis_sampler += sampler != 0;
+            st.mis_write += write != 0;
+            st.mis_bound += bound_diff != 0;
+            st.mis_state += state != 0;
+            if (st.logged < 32) {
+                ++st.logged;
+                LOG_ERROR(Render_Vulkan,
+                          "TexBindMemo verify MISMATCH #{}: pgm={:#x} stage={} images={} "
+                          "samplers={} shape={} id={} view={} layout={} sampler={} write={} "
+                          "bound={} state={}",
+                          st.total_mismatched, stage.pgm_hash, static_cast<u32>(stage.l_stage),
+                          rec.imgs.size(), rec.samplers.size(), shape, id, view, layout, sampler,
+                          write, bound_diff, state);
+            }
+            // Re-record from the full path so one hole is not reported on every draw.
+            RecordTexMemo(rec, stage, tex_gen, smp_gen, border, img_begin, sw_begin);
+        }
+        return;
+    }
+
+    // Miss: the unchanged full path, then record it. Generations are read first, so a bump
+    // during BindTextures makes the next occurrence miss.
+    const u64 tex_gen = texture_cache.StructGeneration();
+    const u64 smp_gen = texture_cache.SamplerGeneration();
+    bind_memo_redirected = 0;
+    bind_memo_rebound = false;
+    BindTextures(bound, binding);
+    RecordTexMemo(rec, stage, tex_gen, smp_gen, border, img_begin, sw_begin);
+}
+
+u32 Rasterizer::EmitTexMemoHit(const TexMemoRecord& rec, Shader::Backend::Bindings& binding) {
+    // BindTextures pass 1: binding flags. No memoized image is written, so force_general stays.
+    for (const auto& img : rec.imgs) {
+        if (img.id) {
+            texture_cache.PeekImage(img.id).binding.is_bound = 1u;
+        }
+    }
+    // Pass 2: bound_images, state, usage and image infos, in binding order.
+    const u32 first_image_idx = image_infos.size();
+    u32 transits = 0;
+    for (const auto& img : rec.imgs) {
+        if (!img.id) {
+            image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
+            continue;
+        }
+        bound_images.emplace_back(img.id);
+        auto& image = texture_cache.PeekImage(img.id);
+        const auto& backing = *image.backing;
+        if (!img.full_range || !backing.subresource_runs.empty() || !(backing.state == img.state)) {
+            // Exactly the full path's call for a sampled image with no feedback/general flags.
+            const auto new_layout = image.info.props.is_depth
+                                        ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+                                        : vk::ImageLayout::eShaderReadOnlyOptimal;
+            image.Transit(new_layout, vk::AccessFlagBits2::eShaderRead, img.range);
+            ++transits;
+        }
+        image.usage.texture |= 1u;
+        image_infos.emplace_back(VK_NULL_HANDLE, img.view, image.backing->state.layout);
+    }
+    // Descriptor writes: one per image (array size 1; mip-fallback arrays are never memoized),
+    // then one per sampler, advancing the unified binding exactly as BindTextures does.
+    u32 image_info_idx = first_image_idx;
+    for (const auto& img : rec.imgs) {
+        if (build_set_writes) {
+            auto& set_write = set_writes[set_write_index++];
+            set_write.dstSet = VK_NULL_HANDLE;
+            set_write.dstBinding = binding.unified;
+            set_write.dstArrayElement = 0;
+            set_write.descriptorCount = 1;
+            set_write.descriptorType = img.type;
+            set_write.pImageInfo = &image_infos[image_info_idx];
+        }
+        ++image_info_idx;
+        ++binding.unified;
+    }
+    for (const auto sampler : rec.samplers) {
+        image_infos.emplace_back(sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
+        const u32 unified_binding = binding.unified++;
+        if (build_set_writes) {
+            auto& set_write = set_writes[set_write_index++];
+            set_write.dstSet = VK_NULL_HANDLE;
+            set_write.dstBinding = unified_binding;
+            set_write.dstArrayElement = 0;
+            set_write.descriptorCount = 1;
+            set_write.descriptorType = vk::DescriptorType::eSampler;
+            set_write.pImageInfo = &image_infos.back();
+        }
+    }
+    return transits;
+}
+
+void Rasterizer::RecordTexMemo(TexMemoRecord& rec, const Shader::Info& stage, u64 tex_gen,
+                               u64 smp_gen, u64 border, size_t img_begin, u32 sw_begin) {
+    const auto& st = GetTexMemoState();
+    rec.valid = true;
+    rec.tsharps = st.tsharps;
+    rec.ssharps = st.ssharps;
+    rec.border = border;
+    rec.tex_gen = tex_gen;
+    rec.smp_gen = smp_gen;
+    const size_t num_images = image_bindings.size();
+    const size_t num_samplers = stage.samplers.size();
+    // Stage-wide exclusions: native bindings, stencil redirects and scratch (Pro paths), images
+    // re-found through needs_rebind, mip-fallback arrays, storage images, and any shape that is
+    // not one descriptor per image and per sampler.
+    rec.excluded = !build_set_writes || native_bindings != nullptr || bind_memo_redirected != 0 ||
+                   bind_memo_rebound || num_images != stage.images.size() ||
+                   image_infos.size() - img_begin != num_images + num_samplers ||
+                   set_write_index - sw_begin != num_images + num_samplers;
+    for (const auto& desc : stage.images) {
+        rec.excluded |=
+            desc.is_written || desc.mip_fallback_mode != Shader::MipStorageFallbackMode::None;
+    }
+    if (rec.excluded) {
+        rec.imgs.clear();
+        rec.samplers.clear();
+        rec.sampler_lru.clear();
+        return;
+    }
+    rec.imgs.resize(num_images);
+    for (size_t i = 0; i < num_images; ++i) {
+        const auto& [image_id, desc] = image_bindings[i];
+        const auto& info = image_infos[img_begin + i];
+        auto& img = rec.imgs[i];
+        img = {};
+        img.id = image_id;
+        img.view = info.imageView;
+        img.type = set_writes[sw_begin + i].descriptorType;
+        img.range = desc.view_info.range;
+        if (!image_id) {
+            continue;
+        }
+        auto& image = texture_cache.PeekImage(image_id);
+        img.uid = image.image_uid;
+        img.backing = image.backing;
+        img.state = image.backing->state;
+        img.full_range = img.range.base == VideoCore::SubresourceBase{} &&
+                         img.range.extent == image.info.resources;
+        // Per-image exclusions: anything but a plain sampled image, a live depth association,
+        // stencil scratch, the Pro ID buffer, and bindings FindImage reached through overlap
+        // resolution (only perfect matches are stable while the structure generation is).
+        rec.excluded |= desc.type != VideoCore::TextureCache::BindingType::Texture ||
+                        img.type != vk::DescriptorType::eSampledImage ||
+                        static_cast<bool>(image.depth_id) ||
+                        (!stencil_scratches.empty() && IsStencilScratch(image_id)) ||
+                        (image.info.num_samples == 2 &&
+                         image.info.pixel_format == vk::Format::eR32Uint) ||
+                        !texture_cache.IsPerfectMatch(desc.info, image_id);
+    }
+    rec.samplers.resize(num_samplers);
+    rec.sampler_lru.resize(num_samplers);
+    for (size_t i = 0; i < num_samplers; ++i) {
+        rec.samplers[i] = image_infos[img_begin + num_images + i].sampler;
+        rec.sampler_lru[i] = texture_cache.SamplerLruId(st.ssharps[i]);
+        rec.excluded |= rec.sampler_lru[i] == ~size_t{0} ||
+                        set_writes[sw_begin + num_images + i].descriptorType !=
+                            vk::DescriptorType::eSampler;
+    }
+}
+
 void Rasterizer::EmitPipelineResources(const Pipeline* pipeline) {
     if (!native_bindings) {
         pipeline->BindResources(set_writes, buffer_barriers, push_data);
@@ -2418,6 +2909,7 @@ void Rasterizer::BindTextures(const Shader::BoundStage& bound,
             const bool is_scratch = !stencil_scratches.empty() && IsStencilScratch(image_id);
             if (auto& old_image = texture_cache.GetImage(image_id);
                 !is_scratch && old_image.binding.needs_rebind) {
+                bind_memo_rebound = true; // SHADPS4_TEX_BIND_MEMO: not memoized
                 old_image.binding = {};
                 image_id = texture_cache.FindImage(desc);
             }

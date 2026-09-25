@@ -9,6 +9,7 @@
 #include "common/switch_mutex.h"
 #include <memory>
 #include <mutex>
+#include <span>
 #include <unordered_map>
 #include <thread>
 #include <unordered_set>
@@ -214,6 +215,31 @@ public:
     [[nodiscard]] u64 SamplerGeneration() const noexcept {
         return sampler_generation.load(std::memory_order_acquire);
     }
+
+    /// SHADPS4_TEX_BIND_MEMO: protects a binding-memo hit's validation and LRU touches the way
+    /// the FindImage/UpdateImage fast paths are protected: the lock-free handshake when
+    /// SHADPS4_TEX_LOCKFREE_HIT is on (Refused while a foreign CacheLock holder is active; the
+    /// caller then runs the full path), otherwise the cache mutex. Nothing inside the section may
+    /// take the cache lock.
+    enum class MemoSection : u8 { Refused, LockFree, Locked };
+    [[nodiscard]] MemoSection EnterMemoSection();
+    void LeaveMemoSection(MemoSection section);
+
+    /// SHADPS4_TEX_BIND_MEMO: FindImage's perfect-match predicate (non-exact format) for `id`
+    /// against the requested info, including its "enough resources" check. Bindings resolved by
+    /// overlap resolution fail it and are never memoized.
+    [[nodiscard]] bool IsPerfectMatch(const ImageInfo& requested, ImageId id);
+
+    /// SHADPS4_TEX_BIND_MEMO: what FindImage/UpdateImage do to a reused image on their fast
+    /// paths (access tick and LRU touch). Call inside a memo section.
+    void TouchImageAccess(Image& image);
+
+    /// SHADPS4_TEX_BIND_MEMO: LRU id of the cached sampler for this S#, or ~0 when absent.
+    [[nodiscard]] size_t SamplerLruId(const AmdGpu::Sampler& sampler);
+
+    /// SHADPS4_TEX_BIND_MEMO: the LRU touch GetSampler does on a hit, for every id, if no
+    /// sampler has been destroyed since `generation` (else returns false and touches nothing).
+    [[nodiscard]] bool TouchSamplers(std::span<const size_t> lru_ids, u64 generation);
 
     /// Retrieves the image view with the specified id.
     [[nodiscard]] ImageView& GetImageView(ImageId id) {

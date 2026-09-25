@@ -35,6 +35,7 @@ namespace Vulkan {
 class Scheduler;
 class RenderState;
 class GraphicsPipeline;
+struct TexMemoRecord;
 
 class Rasterizer {
 public:
@@ -202,6 +203,21 @@ private:
     u64 bind_memo_fixed_ticks{};
     u64 bind_memo_redirected{}; // image bindings BindTextures redirected to another image
     std::array<u8, Shader::NUM_BUFFERS> bind_memo_uploaded{};
+
+    /// SHADPS4_TEX_BIND_MEMO (default off; notes/bind-memo-stats-2026-09-25.md): the texture
+    /// half of the binding memo. =1: when a stage's T#/S#/border key and every validity check
+    /// match the record kept on the pipeline, replays the recorded views and samplers instead of
+    /// BindTextures, keeping what a hit must still do (binding flags, LRU touches, bound_images,
+    /// a layout transition when the state differs, descriptor writes). =2 verify: runs the hit,
+    /// rolls its outputs back, runs BindTextures and compares (log + counter, never a crash).
+    void BindTexturesMemo(const Pipeline* pipeline, const Shader::BoundStage& bound,
+                          Shader::Backend::Bindings& binding);
+    /// A hit's outputs; returns the number of Transit calls it made.
+    u32 EmitTexMemoHit(const TexMemoRecord& rec, Shader::Backend::Bindings& binding);
+    void RecordTexMemo(TexMemoRecord& rec, const Shader::Info& stage, u64 tex_gen, u64 smp_gen,
+                       u64 border, size_t img_begin, u32 sw_begin);
+    u8 tex_bind_memo{};        // 0 off, 1 memo, 2 verify; read once in the constructor
+    bool bind_memo_rebound{};  // BindTextures re-found a needs_rebind image
 
     /// Fills bound_stages from the pipeline lookup result; called right after the lookup.
     void BindStageData(const Pipeline* pipeline) {

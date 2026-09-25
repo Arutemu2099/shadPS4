@@ -1425,6 +1425,69 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
     return it->second.Handle();
 }
 
+TextureCache::MemoSection TextureCache::EnterMemoSection() {
+    if (lockfree_hit && Common::FaultMonitor::t_is_cp_thread) {
+        // Same handshake as UpdateImageLockFree; see CacheLock for the other side.
+        lf_cp_in_fast.store(1, std::memory_order_relaxed);
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+        if (lf_foreign.load(std::memory_order_relaxed) == 0) {
+            return MemoSection::LockFree;
+        }
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+        lf_cp_in_fast.store(0, std::memory_order_release);
+        return MemoSection::Refused;
+    }
+    mutex.lock();
+    return MemoSection::Locked;
+}
+
+void TextureCache::LeaveMemoSection(MemoSection section) {
+    if (section == MemoSection::LockFree) {
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+        lf_cp_in_fast.store(0, std::memory_order_release);
+    } else if (section == MemoSection::Locked) {
+        mutex.unlock();
+    }
+}
+
+bool TextureCache::IsPerfectMatch(const ImageInfo& info, ImageId id) {
+    const Image& image = slot_images[id];
+    // The FindImage perfect-match loop (exact_fmt = false) and its resource check.
+    return image.info.guest_address == info.guest_address &&
+           image.info.guest_size == info.guest_size && image.info.size == info.size &&
+           IsVulkanFormatCompatible(image.info.pixel_format, info.pixel_format) &&
+           (image.info.type == info.type || info.size == Extent3D{1, 1, 1}) &&
+           !(image.info.resources < info.resources);
+}
+
+void TextureCache::TouchImageAccess(Image& image) {
+    image.tick_accessed_last = scheduler.CurrentTick();
+    TouchImage(image);
+}
+
+size_t TextureCache::SamplerLruId(const AmdGpu::Sampler& sampler) {
+    const u64 hash = XXH3_64bits(&sampler, sizeof(sampler));
+    std::scoped_lock lock{samplers_mutex};
+    const auto it = samplers.find(hash);
+    return it != samplers.end() ? it->second.lru_id : ~size_t{0};
+}
+
+bool TextureCache::TouchSamplers(std::span<const size_t> lru_ids, u64 generation) {
+    if (lru_ids.empty()) {
+        return true;
+    }
+    std::scoped_lock lock{samplers_mutex};
+    // The sampler GC bumps the generation under this mutex before erasing, so an unchanged
+    // generation means every recorded LRU id (and VkSampler) is still live.
+    if (sampler_generation.load(std::memory_order_relaxed) != generation) {
+        return false;
+    }
+    for (const size_t lru_id : lru_ids) {
+        sampler_lru_cache.Touch(lru_id, gc_tick);
+    }
+    return true;
+}
+
 void TextureCache::InvalidatePreparedImages() {
     // SHADPS4_BIND_MEMO_STATS: every register, unregister, delete and deferred erase comes here,
     // with or without the prepared-image memo.

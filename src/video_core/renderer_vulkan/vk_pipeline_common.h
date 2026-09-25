@@ -8,6 +8,8 @@
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_native_bindings_api.h"
 
+#include <array>
+#include <memory>
 #include <span>
 #include <vector>
 #include <boost/container/small_vector.hpp>
@@ -82,6 +84,12 @@ public:
     void BindResourcesNative(NativeBindings& native, std::span<const u32> indices,
                              const BufferBarriers& buffer_barriers,
                              const Shader::PushData& push_data) const;
+
+    /// SHADPS4_TEX_BIND_MEMO (vk_rasterizer.cpp): one texture-binding memo record per logical
+    /// stage, owned by the pipeline so a record can never outlive, or be reused for, a different
+    /// Shader::Info. Type-erased (the record type is private to vk_rasterizer.cpp); touched only
+    /// by the thread that binds resources.
+    mutable std::array<std::shared_ptr<void>, Shader::MaxStageTypes> tex_bind_memo{};
 
 protected:
     [[nodiscard]] std::string GetDebugString() const;
