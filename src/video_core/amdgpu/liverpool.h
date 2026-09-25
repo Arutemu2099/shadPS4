@@ -18,6 +18,7 @@
 #include "common/types.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/cb_db_extent.h"
+#include "video_core/amdgpu/cp_split.h"
 #include "video_core/amdgpu/regs.h"
 
 namespace Vulkan {
@@ -29,6 +30,9 @@ struct VideoOutPort;
 }
 
 namespace AmdGpu {
+
+union PM4Header;
+enum class PM4ItOpcode : u32;
 
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
@@ -116,6 +120,8 @@ public:
         return std::this_thread::get_id() == gpu_id;
     }
 
+    /// Runs `func` on the CP thread. With SHADPS4_CP_SPLIT that is the back thread, which owns
+    /// the caches and the scheduler; it runs queued commands between records and while idle.
     template <bool wait_done = false>
     void SendCommand(auto&& func) {
         if (std::this_thread::get_id() == gpu_id) {
@@ -132,12 +138,20 @@ public:
                 ++num_commands;
                 submit_cv.notify_one();
             }
+            if (split_enabled) [[unlikely]] {
+                split->WakeBackIfParked();
+            }
             sem.acquire();
         } else {
-            std::scoped_lock lk{submit_mutex};
-            command_queue.emplace(std::move(func));
-            ++num_commands;
-            submit_cv.notify_one();
+            {
+                std::scoped_lock lk{submit_mutex};
+                command_queue.emplace(std::move(func));
+                ++num_commands;
+                submit_cv.notify_one();
+            }
+            if (split_enabled) [[unlikely]] {
+                split->WakeBackIfParked();
+            }
         }
     }
 
@@ -156,21 +170,25 @@ public:
     // CP front/back split (notes/cp-split-inventory-2026-09-25.md): every register, render-target
     // hint and compute-register read made by the back path (the rasterizer after the pipeline
     // lookup, and the buffer cache) goes through these, so the back can later read its own mirror.
-    // Today they return the front's state. The pipeline cache and FilterDraw keep reading regs.
+    // Without SHADPS4_CP_SPLIT they return the front's state. With it, the back's mirror
+    // (cp_split.h), and while a gfx dispatch record executes, its ComputeProgram snapshot.
+    // The pipeline cache and FilterDraw's classifier keep reading regs (front).
     const Regs& BackRegs() const {
-        return regs;
+        return *back_regs;
     }
     const CbDbExtent& BackCbExtent(u32 cb) const {
-        return last_cb_extent[cb];
+        return back_cb_extent[cb];
     }
     const CbDbExtent& BackDbExtent() const {
-        return last_db_extent;
+        return *back_db_extent;
     }
     u64 BackContextEpoch() const {
-        return context_change_epoch;
+        return *back_ctx_epoch;
     }
     const ComputeProgram& BackCsRegs() const {
-        return mapped_queues[curr_qid].cs_state;
+        // SPLIT-TODO(depth>0): ASC dispatches still run through Call records and read the
+        // front's mapped_queues[curr_qid] here (sound only while the front is parked).
+        return back_cs ? *back_cs : mapped_queues[curr_qid].cs_state;
     }
 
     struct AscQueueInfo {
@@ -228,6 +246,52 @@ private:
 
     void ProcessCommands();
     void Process(std::stop_token stoken);
+    /// The submission loop: today's Process body. Runs on the CP thread, or with
+    /// SHADPS4_CP_SPLIT on the front thread.
+    void ProcessLoop(std::stop_token stoken);
+
+    // ---- CP front/back split (cp_split.h). All no-ops or unused when split_enabled is false.
+    void FrontProcess(std::stop_token stoken);
+    void BackLoop(std::stop_token stoken);
+    void ExecuteRecord(const CpSplit::RecordHeader& record);
+    void ExecuteDrawRecord(const CpSplit::RecordHeader& record);
+    void ExecuteDispatchRecord(const CpSplit::RecordHeader& record);
+    void VerifyMirror(const char* what, u64 seq, const ComputeProgram* cs) const;
+    /// The back-side part of the gfx packets that have one (fences, DMA, WRITE_DATA, markers,
+    /// flip IRQ, ZPASS_DONE, PFP_SYNC_ME, MEM_SEMAPHORE signal/decrement). The inline path calls
+    /// it directly; the split path copies the packet into a Packet record.
+    void ExecuteGfxPacket(const PM4Header* header, bool guest_markers_enabled);
+    /// Inline: ExecuteGfxPacket now. Split: a synchronous Packet record.
+    void RunGfxPacket(const PM4Header* header, bool guest_markers_enabled);
+    /// Inline: fn() now. Split (depth 0): fn() on the back while the front waits.
+    template <typename F>
+    void OnBack(F&& fn);
+    /// Journals regs.reg_array[word_offset, +count) to the back's mirror (split only).
+    void JournalRegs(u32 word_offset, u32 count);
+    template <typename T>
+    void JournalField(const T& field) {
+        static_assert(sizeof(T) % sizeof(u32) == 0);
+        if (split_enabled) [[unlikely]] {
+            const auto byte_offset =
+                reinterpret_cast<const u8*>(&field) - reinterpret_cast<const u8*>(&regs);
+            JournalRegs(u32(byte_offset / sizeof(u32)), u32(sizeof(T) / sizeof(u32)));
+        }
+    }
+    /// Journals the CB/DB extent a SET_CONTEXT_REG at reg_addr may have changed (split only).
+    void JournalExtent(u32 reg_addr);
+    /// VideoCore::BumpSubmitEpoch, or in split mode an EpochBump record (runs in stream order).
+    void BumpEpoch(PM4ItOpcode opcode);
+    void EmitDraw(const PM4Header* header, const char* name, bool host_marker,
+                  const CpSplit::DrawArgs& args);
+    void EmitDispatch(const PM4Header* header, const char* name, bool host_marker,
+                      bool is_indirect, VAddr address, u32 offset, u32 size);
+    /// Publishes and waits for everything emitted so far. Called where the front reads what the
+    /// back produces (inventory section 4.6). At depth 0 it only flushes register records.
+    void FrontDrain() {
+        if (split_enabled) [[unlikely]] {
+            split->Drain();
+        }
+    }
 
     struct GpuQueue {
         std::mutex m_access{};
@@ -274,6 +338,19 @@ private:
     std::queue<Common::UniqueFunction<void>> command_queue{};
     std::thread::id gpu_id;
     s32 curr_qid{-1};
+
+    // CP front/back split. Set in the constructor before any thread starts, never changed.
+    bool split_enabled{false};
+    bool split_verify{false};
+    std::unique_ptr<CpSplit::Channel> split;
+    std::unique_ptr<CpSplit::BackMirror> mirror;
+    std::jthread front_thread{}; ///< Started and joined by the back (process_thread).
+    // What the Back* accessors read: the front's own state when the split is off.
+    const Regs* back_regs{&regs};
+    const CbDbExtent* back_cb_extent{last_cb_extent.data()};
+    const CbDbExtent* back_db_extent{&last_db_extent};
+    const u64* back_ctx_epoch{&context_change_epoch};
+    const ComputeProgram* back_cs{};
 };
 
 } // namespace AmdGpu

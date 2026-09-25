@@ -3,10 +3,13 @@
 
 #pragma once
 
+#include <chrono>
+
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/cb_db_extent.h"
+#include "video_core/amdgpu/cp_split.h"
 #include "video_core/amdgpu/regs.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -21,6 +24,10 @@ struct Liverpool;
 
 namespace Core {
 class MemoryManager;
+}
+
+namespace Common {
+class DrawSampleProbe;
 }
 
 namespace Vulkan {
@@ -64,6 +71,29 @@ public:
     static DrawClass ClassifyDraw(const AmdGpu::Regs& regs);
     /// The back-side action for a class other than Draw (texture cache work or a marker).
     void ExecuteFilteredDraw(DrawClass draw_class);
+
+    /// CP front/back split (SHADPS4_CP_SPLIT, video_core/amdgpu/cp_split.h): one draw as the
+    /// front hands it to the back. Trivially copyable; it travels inside a ring record.
+    struct SplitDraw {
+        AmdGpu::CpSplit::DrawArgs args{};
+        DrawClass draw_class{DrawClass::Draw};
+        bool skip{};                         ///< SHADPS4_EMPTY_DRAWS=2 dropped it on the front.
+        const GraphicsPipeline* pipeline{};  ///< Null: the lookup failed or was not reached.
+    };
+    /// Front thread: classification, hazard note, empty-draw skip and pipeline lookup, reading
+    /// the front's registers. Touches no cache, the scheduler or any per-draw member.
+    void PrepareDrawFront(SplitDraw& draw);
+    /// Front thread: compute pipeline lookup against the current queue's cs registers.
+    const ComputePipeline* PrepareDispatchFront();
+    /// Back thread: runs a draw the front prepared, with the per-stage user data it copied
+    /// (indexed by LogicalStage). Registers come from Liverpool::BackRegs().
+    void ExecuteDraw(const SplitDraw& draw,
+                     const std::array<Shader::BoundStage, Shader::MaxStageTypes>& stages);
+    /// Back thread: runs a dispatch the front looked up. The caller points
+    /// Liverpool::BackCsRegs() at the record's ComputeProgram snapshot.
+    void ExecuteDispatch(const ComputePipeline* pipeline,
+                         const std::array<Shader::BoundStage, Shader::MaxStageTypes>& stages,
+                         bool is_indirect, VAddr address, u32 offset, u32 size);
 
     void Draw(bool is_indexed, u32 index_offset = 0);
     void ScanRegistersForValue();
@@ -139,6 +169,19 @@ private:
     void UpdateColorBlendingState(const GraphicsPipeline* pipeline) const;
 
     bool FilterDraw();
+    /// SHADPS4_EMPTY_DRAWS counting and (=2) skipping; registers and statics only.
+    static bool SkipEmptyDraw(const AmdGpu::Regs& regs);
+
+    // Everything after the pipeline lookup, shared by the inline path and the CP split's back.
+    // bound_stages must already hold the draw's stage data.
+    void DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset,
+                  Common::DrawSampleProbe& sample, std::chrono::steady_clock::time_point t_entry,
+                  std::chrono::steady_clock::time_point t_pipeline, u64 pipeline_ns);
+    void DrawIndirectTail(const GraphicsPipeline* pipeline, bool is_indexed, VAddr arg_address,
+                          u32 offset, u32 stride, u32 max_count, VAddr count_address);
+    void DispatchDirectTail(const ComputePipeline* pipeline);
+    void DispatchIndirectTail(const ComputePipeline* pipeline, VAddr address, u32 offset,
+                              u32 size);
 
     void BindBuffers(const Shader::BoundStage& bound, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);

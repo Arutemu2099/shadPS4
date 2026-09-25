@@ -599,31 +599,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
 
     AmdGpu::SplitHazard::NoteDraw(liverpool->regs.ps_program, liverpool->regs.vs_program);
-    {
-        // SHADPS4_EMPTY_DRAWS=1 counts direct draws with zero indices or zero instances (they render
-        // nothing but still bind every resource); =2 also skips them. Clears and resolves are
-        // handled in FilterDraw before this point.
-        static const int empty_draws = [] {
-            const char* value = std::getenv("SHADPS4_EMPTY_DRAWS");
-            return value ? value[0] - '0' : 0;
-        }();
-        if (empty_draws > 0) {
-            static u64 draws = 0, empty = 0;
-            const auto& r = liverpool->regs;
-            const bool is_empty = r.num_indices == 0 || r.num_instances.NumInstances() == 0;
-            ++draws;
-            empty += is_empty;
-            if ((draws & 0xfffff) == 0) {
-                LOG_INFO(Render_Vulkan, "EMPTY_DRAWS: {} of {} direct draws ({:.2f}%)", empty,
-                         draws, 100.0 * empty / draws);
-            }
-            if (is_empty && empty_draws == 2) {
-                return;
-            }
-        }
+    if (SkipEmptyDraw(liverpool->regs)) {
+        return;
     }
 
-    const auto& regs = liverpool->BackRegs();
     // Scoped timers: the stack scanner reports inclusive frequencies with false positives and
     // cannot apportion cost here. See Common::FaultMonitor for why these exist.
     const auto t_pipeline = Common::FaultMonitor::Now();
@@ -635,7 +614,128 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
     BindStageData(pipeline);
+    DrawTail(pipeline, is_indexed, index_offset, sample, t_entry, t_pipeline, pipeline_ns);
+}
 
+bool Rasterizer::SkipEmptyDraw(const AmdGpu::Regs& r) {
+    // SHADPS4_EMPTY_DRAWS=1 counts direct draws with zero indices or zero instances (they render
+    // nothing but still bind every resource); =2 also skips them. Clears and resolves are
+    // handled in FilterDraw before this point. Register reads and statics only (front-safe).
+    static const int empty_draws = [] {
+        const char* value = std::getenv("SHADPS4_EMPTY_DRAWS");
+        return value ? value[0] - '0' : 0;
+    }();
+    if (empty_draws > 0) {
+        static u64 draws = 0, empty = 0;
+        const bool is_empty = r.num_indices == 0 || r.num_instances.NumInstances() == 0;
+        ++draws;
+        empty += is_empty;
+        if ((draws & 0xfffff) == 0) {
+            LOG_INFO(Render_Vulkan, "EMPTY_DRAWS: {} of {} direct draws ({:.2f}%)", empty, draws,
+                     100.0 * empty / draws);
+        }
+        if (is_empty && empty_draws == 2) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void Rasterizer::PrepareDrawFront(SplitDraw& draw) {
+    // CP split, front thread: the part of Draw/DrawIndirect before PopPendingOperations that
+    // reads only the front's registers and the pipeline cache, in the same order as the inline
+    // path. Only order change: the lookup now runs before the back's PopPendingOperations and
+    // native_bindings->BeginDraw instead of after them.
+    // SPLIT-TODO: confirm the pipeline constructor does not depend on BeginDraw (heap backend).
+    draw.draw_class = ClassifyDraw(liverpool->regs);
+    if (draw.draw_class != DrawClass::Draw) {
+        return;
+    }
+    if (!draw.args.is_indirect) {
+        AmdGpu::SplitHazard::NoteDraw(liverpool->regs.ps_program, liverpool->regs.vs_program);
+        draw.skip = SkipEmptyDraw(liverpool->regs);
+        if (draw.skip) {
+            return;
+        }
+    }
+    draw.pipeline = pipeline_cache.GetGraphicsPipeline();
+}
+
+const ComputePipeline* Rasterizer::PrepareDispatchFront() {
+    // CP split, front thread: reads the front's current queue cs registers (GetCsRegs).
+    return pipeline_cache.GetComputePipeline();
+}
+
+void Rasterizer::ExecuteDraw(const SplitDraw& draw,
+                             const std::array<Shader::BoundStage, Shader::MaxStageTypes>& stages) {
+    // CP split, back thread: Draw/DrawIndirect with the front's classification, lookup and
+    // per-stage data. Registers come from the back's mirror through BackRegs().
+    RENDERER_TRACE;
+    // Same prologue as the inline Draw/DrawIndirect, minus what the front already did.
+    const auto begin = [&] {
+        scheduler.PopPendingOperations();
+        if (native_bindings) {
+            native_bindings->BeginDraw();
+        }
+        if (draw.draw_class != DrawClass::Draw) {
+            ExecuteFilteredDraw(draw.draw_class);
+            return false;
+        }
+        if (draw.skip || !draw.pipeline) {
+            return false;
+        }
+        bound_stages = stages;
+        return true;
+    };
+    if (draw.args.is_indirect) {
+        if (begin()) {
+            DrawIndirectTail(draw.pipeline, draw.args.is_indexed, draw.args.arg_address,
+                             draw.args.offset, draw.args.stride, draw.args.max_count,
+                             draw.args.count_address);
+        }
+        return;
+    }
+    Common::SampleCommandProcessorCore();
+    ScanRegistersForValue();
+    auto sample = Common::DrawSampleProbe::Begin();
+    const auto t_entry = Common::FaultMonitor::Now();
+    if (begin()) {
+        // The lookup ran on the front: the Pipeline phase and pipeline_ns are 0 here.
+        DrawTail(draw.pipeline, draw.args.is_indexed, draw.args.index_offset, sample, t_entry,
+                 t_entry, 0);
+    }
+}
+
+void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
+                                 const std::array<Shader::BoundStage, Shader::MaxStageTypes>& stages,
+                                 bool is_indirect, VAddr address, u32 offset, u32 size) {
+    // CP split, back thread: DispatchDirect/DispatchIndirect after the front's lookup. The caller
+    // points Liverpool::BackCsRegs() at the record's ComputeProgram snapshot.
+    RENDERER_TRACE;
+    const auto t_dispatch = Common::FaultMonitor::Now();
+    SCOPE_EXIT {
+        Common::FaultMonitor::CountDispatch(Common::FaultMonitor::SinceNs(t_dispatch));
+    };
+    scheduler.PopPendingOperations();
+    if (native_bindings) {
+        native_bindings->BeginDraw();
+    }
+    if (!pipeline) {
+        return;
+    }
+    bound_stages = stages;
+    if (is_indirect) {
+        DispatchIndirectTail(pipeline, address, offset, size);
+    } else {
+        DispatchDirectTail(pipeline);
+    }
+}
+
+void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset,
+                          Common::DrawSampleProbe& sample,
+                          std::chrono::steady_clock::time_point t_entry,
+                          std::chrono::steady_clock::time_point t_pipeline, u64 pipeline_ns) {
+    const auto& regs = liverpool->BackRegs();
     const auto t_prepare = Common::FaultMonitor::Now();
     sample.BeginPhase(Common::DrawSampleProbe::Phase::Prepare);
     PrepareRenderState(pipeline);
@@ -806,7 +906,12 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         return;
     }
     BindStageData(pipeline);
+    DrawIndirectTail(pipeline, is_indexed, arg_address, offset, stride, max_count, count_address);
+}
 
+void Rasterizer::DrawIndirectTail(const GraphicsPipeline* pipeline, bool is_indexed,
+                                  VAddr arg_address, u32 offset, u32 stride, u32 max_count,
+                                  VAddr count_address) {
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
         return;
@@ -888,13 +993,16 @@ void Rasterizer::DispatchDirect() {
         native_bindings->BeginDraw();
     }
 
-    const auto& cs_program = liverpool->BackCsRegs();
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
     if (!pipeline) {
         return;
     }
     BindStageData(pipeline);
+    DispatchDirectTail(pipeline);
+}
 
+void Rasterizer::DispatchDirectTail(const ComputePipeline* pipeline) {
+    const auto& cs_program = liverpool->BackCsRegs();
     const auto& cs = GetBoundStage(Shader::LogicalStage::Compute);
     if (ExecuteShaderHLE(cs, liverpool->BackRegs(), cs_program, *this)) {
         return;
@@ -933,13 +1041,16 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         native_bindings->BeginDraw();
     }
 
-    const auto& cs_program = liverpool->BackCsRegs();
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
     if (!pipeline) {
         return;
     }
     BindStageData(pipeline);
+    DispatchIndirectTail(pipeline, address, offset, size);
+}
 
+void Rasterizer::DispatchIndirectTail(const ComputePipeline* pipeline, VAddr address, u32 offset,
+                                      u32 size) {
     if (!BindResources(pipeline)) {
         return;
     }

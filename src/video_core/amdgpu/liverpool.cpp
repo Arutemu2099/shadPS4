@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <immintrin.h>
@@ -166,6 +167,125 @@ struct CpWaitStats {
 CpWaitStats g_cp_wait;
 } // namespace
 
+namespace {
+// ---- CP front/back split records (cp_split.h). Built on the front, read on the back. ----
+
+/// A draw: the front's classification and lookup plus the per-stage data copied right after the
+/// lookup. Followed by stage_count stage blocks (WriteStage).
+struct SplitDrawRecord {
+    Vulkan::Rasterizer::SplitDraw draw;
+    u64 ctx_epoch;           ///< Liverpool::context_change_epoch at the draw (viewport memo).
+    const char* marker;      ///< Host marker packet name (static string), or null.
+    const void* cmd_address; ///< For the host marker text only.
+    u32 stage_count;
+    u32 pad;
+};
+static_assert(sizeof(SplitDrawRecord) % 8 == 0);
+
+/// A gfx-queue dispatch. `cs` is the front's cs registers at the packet (GetCsRegs() depends on
+/// the front's curr_qid; inventory section 0.3). Followed by at most one stage block.
+struct SplitDispatchRecord {
+    ComputeProgram cs;
+    const Vulkan::ComputePipeline* pipeline;
+    const char* marker;
+    const void* cmd_address;
+    VAddr address;
+    u32 offset;
+    u32 size;
+    u32 is_indirect;
+    u32 stage_count;
+};
+static_assert(sizeof(SplitDispatchRecord) % 8 == 0);
+
+u32 StageBytes(const Shader::Info& info) {
+    const size_t bytes = sizeof(CpSplit::StagePayload) +
+                         (info.user_data.size() + info.flattened_ud_buf.size()) * sizeof(u32);
+    return static_cast<u32>((bytes + 7) & ~size_t{7});
+}
+
+/// Copies what the back reads of a stage's per-draw data (Shader::BoundStage): user data,
+/// flat buffer and pgm_base, as the lookup just left them in the shared Info.
+u8* WriteStage(u8* out, const Shader::Info& info, u32 logical_stage) {
+    auto* stage = reinterpret_cast<CpSplit::StagePayload*>(out);
+    stage->info = &info;
+    stage->pgm_base = info.pgm_base;
+    stage->logical_stage = logical_stage;
+    stage->ud_dw = static_cast<u32>(info.user_data.size());
+    stage->flat_dw = static_cast<u32>(info.flattened_ud_buf.size());
+    stage->pad = 0;
+    auto* dwords = reinterpret_cast<u32*>(stage + 1);
+    if (!info.user_data.empty()) {
+        std::memcpy(dwords, info.user_data.data(), info.user_data.size_bytes());
+    }
+    if (!info.flattened_ud_buf.empty()) {
+        std::memcpy(dwords + stage->ud_dw, info.flattened_ud_buf.data(),
+                    info.flattened_ud_buf.size() * sizeof(u32));
+    }
+    return out + StageBytes(info);
+}
+
+/// The back's BoundStages, pointing into the record (valid until Channel::Done).
+void ReadStages(const u8* in, u32 count,
+                std::array<Shader::BoundStage, Shader::MaxStageTypes>& out) {
+    for (u32 i = 0; i < count; ++i) {
+        const auto* stage = reinterpret_cast<const CpSplit::StagePayload*>(in);
+        const auto* dwords = reinterpret_cast<const u32*>(stage + 1);
+        ASSERT(stage->logical_stage < Shader::MaxStageTypes);
+        auto& bound = out[stage->logical_stage];
+        bound.info = static_cast<const Shader::Info*>(stage->info);
+        bound.user_data = std::span<const u32>{dwords, stage->ud_dw};
+        bound.flattened_ud_buf = std::span<const u32>{dwords + stage->ud_dw, stage->flat_dw};
+        bound.pgm_base = stage->pgm_base;
+        const size_t bytes = sizeof(CpSplit::StagePayload) +
+                             (size_t{stage->ud_dw} + stage->flat_dw) * sizeof(u32);
+        in += (bytes + 7) & ~size_t{7};
+    }
+}
+
+/// VERIFY: at depth 0 the Info still holds what the front's lookup left there.
+void VerifyStages(const std::array<Shader::BoundStage, Shader::MaxStageTypes>& stages, u64 seq) {
+    for (const auto& bound : stages) {
+        if (!bound.info) {
+            continue;
+        }
+        const auto& info = *bound.info;
+        ASSERT_MSG(bound.pgm_base == info.pgm_base &&
+                       std::ranges::equal(bound.user_data, info.user_data) &&
+                       std::ranges::equal(bound.flattened_ud_buf, info.flattened_ud_buf),
+                   "CpSplit VERIFY: stage {} data differs from its Info at record {}",
+                   static_cast<u32>(info.l_stage), seq);
+    }
+}
+
+/// A NOP whose payload has a back-side effect (flip IRQ, guest markers). Other NOPs (CB/DB
+/// extent hints and the like) are front-only.
+bool NopHasBackEffect(const PM4Header* header, bool guest_markers_enabled) {
+    const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
+    if (nop->header.count.Value() == 0) {
+        return false;
+    }
+    switch (nop->data_block[0]) {
+    case PM4CmdNop::PayloadType::PatchedFlip:
+        return true;
+    case PM4CmdNop::PayloadType::DebugMarkerPush:
+    case PM4CmdNop::PayloadType::DebugColorMarkerPush:
+    case PM4CmdNop::PayloadType::DebugMarkerPop:
+        return guest_markers_enabled;
+    default:
+        return false;
+    }
+}
+} // namespace
+
+template <typename F>
+void Liverpool::OnBack(F&& fn) {
+    if (split_enabled) [[unlikely]] {
+        split->CallSync(fn);
+    } else {
+        fn();
+    }
+}
+
 static const char* dcb_task_name{"DCB_TASK"};
 static const char* ccb_task_name{"CCB_TASK"};
 
@@ -257,6 +377,21 @@ static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset)
 
 Liverpool::Liverpool() {
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
+    if (CpSplit::Enabled()) {
+        split_enabled = true;
+        split_verify = CpSplit::Verify();
+        split = std::make_unique<CpSplit::Channel>();
+        mirror = std::make_unique<CpSplit::BackMirror>();
+        std::memcpy(&mirror->regs, &regs, sizeof(Regs));
+        mirror->cb_extent = last_cb_extent;
+        mirror->db_extent = last_db_extent;
+        mirror->ctx_epoch = context_change_epoch;
+        back_regs = &mirror->regs;
+        back_cb_extent = mirror->cb_extent.data();
+        back_db_extent = &mirror->db_extent;
+        back_ctx_epoch = &mirror->ctx_epoch;
+        LOG_INFO(Render, "CpSplit: on (depth 0){}", split_verify ? ", VERIFY" : "");
+    }
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
 }
 
@@ -266,6 +401,11 @@ Liverpool::~Liverpool() {
 }
 
 void Liverpool::ProcessCommands() {
+    // CP split: commands need the caches and the scheduler, so only the back (gpu_id) runs them,
+    // between records and while idle. The front's per-packet calls return here.
+    if (split_enabled && !IsGpuThread()) [[unlikely]] {
+        return;
+    }
     // Process incoming commands with high priority
     while (num_commands) {
         Common::UniqueFunction<void> callback{};
@@ -286,6 +426,497 @@ void Liverpool::Process(std::stop_token stoken) {
     Common::FaultMonitor::MarkCpThread();
     Common::ApplyCommandProcessorPlacement();
 
+    if (split_enabled) {
+        // CP split: this thread keeps every CP identity (name, gpu_id, t_is_cp_thread, placement,
+        // scheduler producer, guest command queue) and becomes the back. The PM4 parser moves to
+        // a new front thread, started only now so gpu_id is set before it can send a command.
+        front_thread = std::jthread{std::bind_front(&Liverpool::FrontProcess, this)};
+        BackLoop(stoken);
+        return;
+    }
+    ProcessLoop(stoken);
+}
+
+void Liverpool::FrontProcess(std::stop_token stoken) {
+    Common::SetCurrentThreadName("shadPS4:GpuCommandFront");
+    // SPLIT-TODO: placement. ApplyCommandProcessorPlacement pins the back; the front wants its
+    // own P-core (with the recording worker and Game:Main, 4 hot threads on 6 P-cores).
+    ProcessLoop(stoken);
+    split->FrontExited();
+}
+
+void Liverpool::BackLoop(std::stop_token stoken) {
+    std::stop_callback wake_on_stop{stoken, [this] { split->WakeBack(); }};
+    bool stop_forwarded = false;
+    for (;;) {
+        if (const auto* record = split->Next()) {
+            ExecuteRecord(*record);
+            split->Done(record);
+            // Guest commands run at record boundaries, as they ran at packet boundaries before.
+            ProcessCommands();
+            continue;
+        }
+        ProcessCommands();
+        if (split->FrontHasExited()) {
+            break;
+        }
+        if (stoken.stop_requested() && !stop_forwarded) {
+            // The front owns the submission loop and leaves it on its own stop token. Keep
+            // executing its records until it has exited (it drains first).
+            // SPLIT-TODO: a front stuck in a guest wait loop hangs shutdown, as the CP does today.
+            stop_forwarded = true;
+            front_thread.request_stop();
+        }
+        split->WaitForWork(num_commands, stoken);
+    }
+    front_thread.join();
+}
+
+void Liverpool::ExecuteRecord(const CpSplit::RecordHeader& record) {
+    const auto* payload = reinterpret_cast<const u8*>(&record + 1);
+    switch (record.type) {
+    case CpSplit::RecordType::RegWrite: {
+        const auto* write = reinterpret_cast<const CpSplit::RegWritePayload*>(payload);
+        std::memcpy(&mirror->regs.reg_array[write->word_offset], write + 1,
+                    size_t{write->count} * sizeof(u32));
+        break;
+    }
+    case CpSplit::RecordType::ClearState:
+        mirror->regs.SetDefaults();
+        break;
+    case CpSplit::RecordType::Extent: {
+        const auto* extent = reinterpret_cast<const CpSplit::ExtentPayload*>(payload);
+        if (extent->slot < NUM_COLOR_BUFFERS) {
+            mirror->cb_extent[extent->slot].raw = extent->raw;
+        } else {
+            mirror->db_extent.raw = extent->raw;
+        }
+        break;
+    }
+    case CpSplit::RecordType::EpochBump: {
+        const auto* epoch = reinterpret_cast<const CpSplit::EpochPayload*>(payload);
+        VideoCore::BumpSubmitEpoch(static_cast<PM4ItOpcode>(epoch->opcode));
+        break;
+    }
+    case CpSplit::RecordType::Draw:
+        ExecuteDrawRecord(record);
+        break;
+    case CpSplit::RecordType::Dispatch:
+        ExecuteDispatchRecord(record);
+        break;
+    case CpSplit::RecordType::Packet:
+        ExecuteGfxPacket(reinterpret_cast<const PM4Header*>(payload),
+                         (record.flags & CpSplit::GuestMarkers) != 0);
+        break;
+    case CpSplit::RecordType::Call: {
+        const auto* call = reinterpret_cast<const CpSplit::CallPayload*>(payload);
+        call->invoke(call->context);
+        break;
+    }
+    case CpSplit::RecordType::Wrap:
+    default:
+        UNREACHABLE_MSG("CpSplit: bad record type {}", static_cast<u32>(record.type));
+    }
+}
+
+void Liverpool::ExecuteDrawRecord(const CpSplit::RecordHeader& record) {
+    const auto& rec = *reinterpret_cast<const SplitDrawRecord*>(&record + 1);
+    mirror->ctx_epoch = rec.ctx_epoch;
+    std::array<Shader::BoundStage, Shader::MaxStageTypes> stages{};
+    ReadStages(reinterpret_cast<const u8*>(&rec + 1), rec.stage_count, stages);
+    if (split_verify) {
+        VerifyMirror("draw", record.seq, nullptr);
+        VerifyStages(stages, record.seq);
+    }
+    if (rec.marker) {
+        rasterizer->ScopeMarkerBegin(fmt::format("gfx:{}:{}", rec.cmd_address, rec.marker));
+        rasterizer->ExecuteDraw(rec.draw, stages);
+        rasterizer->ScopeMarkerEnd();
+    } else {
+        rasterizer->ExecuteDraw(rec.draw, stages);
+    }
+}
+
+void Liverpool::ExecuteDispatchRecord(const CpSplit::RecordHeader& record) {
+    const auto& rec = *reinterpret_cast<const SplitDispatchRecord*>(&record + 1);
+    std::array<Shader::BoundStage, Shader::MaxStageTypes> stages{};
+    ReadStages(reinterpret_cast<const u8*>(&rec + 1), rec.stage_count, stages);
+    // BackCsRegs() returns the snapshot while this dispatch runs (HLE, IsCompute*, BindBuffers).
+    back_cs = &rec.cs;
+    if (split_verify) {
+        VerifyMirror("dispatch", record.seq, &rec.cs);
+        VerifyStages(stages, record.seq);
+    }
+    if (rec.marker) {
+        rasterizer->ScopeMarkerBegin(fmt::format("gfx:{}:{}", rec.cmd_address, rec.marker));
+        rasterizer->ExecuteDispatch(rec.pipeline, stages, rec.is_indirect != 0, rec.address,
+                                    rec.offset, rec.size);
+        rasterizer->ScopeMarkerEnd();
+    } else {
+        rasterizer->ExecuteDispatch(rec.pipeline, stages, rec.is_indirect != 0, rec.address,
+                                    rec.offset, rec.size);
+    }
+    back_cs = nullptr;
+}
+
+void Liverpool::VerifyMirror(const char* what, u64 seq, const ComputeProgram* cs) const {
+    // Depth 0: the front is parked in Channel::WaitDone for this very record, so its state is
+    // stable and published to this thread (release store of write_pos, acquire load in Next).
+    // A full memcmp rather than a hash: same pass over 213 KB, exact, and it names the word.
+    // SPLIT-TODO(depth>0): rolling hash per register write carried in the record (4.5).
+    const auto& back = mirror->regs.reg_array;
+    const auto& front = regs.reg_array;
+    if (std::memcmp(back.data(), front.data(), sizeof(back)) != 0) {
+        u32 i = 0;
+        while (back[i] == front[i]) {
+            ++i;
+        }
+        UNREACHABLE_MSG("CpSplit VERIFY: register word {:#x} differs at {} record {}: back {:#x} "
+                        "front {:#x}",
+                        i, what, seq, back[i], front[i]);
+    }
+    for (u32 cb = 0; cb < NUM_COLOR_BUFFERS; ++cb) {
+        ASSERT_MSG(mirror->cb_extent[cb].raw == last_cb_extent[cb].raw,
+                   "CpSplit VERIFY: CB{} extent differs at {} record {}", cb, what, seq);
+    }
+    ASSERT_MSG(mirror->db_extent.raw == last_db_extent.raw,
+               "CpSplit VERIFY: DB extent differs at {} record {}", what, seq);
+    // The context epoch only feeds the draw path's viewport memo; dispatch records do not carry
+    // it, so the mirror's copy is only current at draws.
+    ASSERT_MSG(cs || mirror->ctx_epoch == context_change_epoch,
+               "CpSplit VERIFY: context epoch differs at {} record {}", what, seq);
+    if (cs) {
+        ASSERT_MSG(std::memcmp(cs, &mapped_queues[GfxQueueId].cs_state, sizeof(*cs)) == 0,
+                   "CpSplit VERIFY: cs registers differ at {} record {}", what, seq);
+    }
+    static u64 checks = 0;
+    if ((++checks & 0xffff) == 0) {
+        LOG_INFO(Render, "CpSplit VERIFY: {} draw/dispatch records checked, 0 mismatches",
+                 checks);
+    }
+}
+
+void Liverpool::JournalRegs(u32 word_offset, u32 count) {
+    if (split_enabled) [[unlikely]] {
+        split->EmitRegWrite(word_offset, &regs.reg_array[word_offset], count);
+    }
+}
+
+void Liverpool::JournalExtent(u32 reg_addr) {
+    if (!split_enabled) [[likely]] {
+        return;
+    }
+    switch (reg_addr) {
+    case ContextRegs::CbColor0Base:
+    case ContextRegs::CbColor1Base:
+    case ContextRegs::CbColor2Base:
+    case ContextRegs::CbColor3Base:
+    case ContextRegs::CbColor4Base:
+    case ContextRegs::CbColor5Base:
+    case ContextRegs::CbColor6Base:
+    case ContextRegs::CbColor7Base: {
+        const u32 cb = (reg_addr - ContextRegs::CbColor0Base) /
+                       (ContextRegs::CbColor1Base - ContextRegs::CbColor0Base);
+        split->EmitExtent(cb, last_cb_extent[cb].raw);
+        break;
+    }
+    case ContextRegs::CbColor0Cmask:
+    case ContextRegs::CbColor1Cmask:
+    case ContextRegs::CbColor2Cmask:
+    case ContextRegs::CbColor3Cmask:
+    case ContextRegs::CbColor4Cmask:
+    case ContextRegs::CbColor5Cmask:
+    case ContextRegs::CbColor6Cmask:
+    case ContextRegs::CbColor7Cmask: {
+        const u32 cb = (reg_addr - ContextRegs::CbColor0Cmask) /
+                       (ContextRegs::CbColor1Cmask - ContextRegs::CbColor0Cmask);
+        split->EmitExtent(cb, last_cb_extent[cb].raw);
+        break;
+    }
+    case ContextRegs::DbZInfo:
+        split->EmitExtent(NUM_COLOR_BUFFERS, last_db_extent.raw);
+        break;
+    default:
+        break;
+    }
+}
+
+void Liverpool::BumpEpoch(PM4ItOpcode opcode) {
+    if (split_enabled) [[unlikely]] {
+        // In stream order on the back. Delaying a bump only makes an upload happen earlier
+        // (submit_epoch.h: an extra bump is safe, a missing one is not).
+        if (VideoCore::g_epoch_defer_upload) {
+            split->EmitEpochBump(static_cast<u32>(opcode));
+        }
+        return;
+    }
+    VideoCore::BumpSubmitEpoch(opcode);
+}
+
+void Liverpool::RunGfxPacket(const PM4Header* header, bool guest_markers_enabled) {
+    if (!split_enabled) [[likely]] {
+        ExecuteGfxPacket(header, guest_markers_enabled);
+        return;
+    }
+    // Verbatim copy: the guest may reuse the DCB once the front has moved on (depth > 0).
+    const u32 dwords = header->type3.NumWords() + 1;
+    void* copy = split->Reserve(CpSplit::RecordType::Packet, dwords * sizeof(u32),
+                                guest_markers_enabled ? CpSplit::GuestMarkers : 0);
+    std::memcpy(copy, header, dwords * sizeof(u32));
+    split->Commit(true);
+}
+
+void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_marker,
+                         const CpSplit::DrawArgs& args) {
+    Vulkan::Rasterizer::SplitDraw draw{.args = args};
+    rasterizer->PrepareDrawFront(draw);
+    const bool has_stages = draw.pipeline && draw.draw_class ==
+                                                 Vulkan::Rasterizer::DrawClass::Draw &&
+                            !draw.skip;
+    u32 bytes = sizeof(SplitDrawRecord);
+    if (has_stages) {
+        for (const Shader::Info* info : draw.pipeline->GetStages()) {
+            if (info) {
+                bytes += StageBytes(*info);
+            }
+        }
+    }
+    auto* rec = split->Reserve<SplitDrawRecord>(CpSplit::RecordType::Draw, bytes);
+    rec->draw = draw;
+    rec->ctx_epoch = context_change_epoch;
+    rec->marker = host_marker ? name : nullptr;
+    rec->cmd_address = header;
+    rec->stage_count = 0;
+    rec->pad = 0;
+    if (has_stages) {
+        // Copied now: the front's next lookup rewrites these Info fields (inventory 4.4).
+        auto* out = reinterpret_cast<u8*>(rec + 1);
+        const auto stages = draw.pipeline->GetStages();
+        for (u32 i = 0; i < stages.size(); ++i) {
+            if (stages[i]) {
+                out = WriteStage(out, *stages[i], i);
+                ++rec->stage_count;
+            }
+        }
+    }
+    // Depth 0: wait for the back. SPLIT-TODO(depth>0): do not wait; bound by the depth.
+    split->Commit(true);
+    split->MaybeLog();
+}
+
+void Liverpool::EmitDispatch(const PM4Header* header, const char* name, bool host_marker,
+                             bool is_indirect, VAddr address, u32 offset, u32 size) {
+    const Vulkan::ComputePipeline* pipeline = rasterizer->PrepareDispatchFront();
+    const Shader::Info* info = pipeline ? pipeline->GetStages()[0] : nullptr;
+    const u32 bytes = sizeof(SplitDispatchRecord) + (info ? StageBytes(*info) : 0u);
+    auto* rec = split->Reserve<SplitDispatchRecord>(CpSplit::RecordType::Dispatch, bytes);
+    std::memcpy(&rec->cs, &GetCsRegs(), sizeof(ComputeProgram));
+    rec->pipeline = pipeline;
+    rec->marker = host_marker ? name : nullptr;
+    rec->cmd_address = header;
+    rec->address = address;
+    rec->offset = offset;
+    rec->size = size;
+    rec->is_indirect = is_indirect ? 1u : 0u;
+    rec->stage_count = 0;
+    if (info) {
+        WriteStage(reinterpret_cast<u8*>(rec + 1), *info, u32(Shader::LogicalStage::Compute));
+        rec->stage_count = 1;
+    }
+    split->Commit(true);
+}
+
+void Liverpool::ExecuteGfxPacket(const PM4Header* header, bool guest_markers_enabled) {
+    // Bodies moved verbatim from ProcessGraphics (the inline path calls this directly).
+    const PM4ItOpcode opcode = header->type3.opcode;
+    switch (opcode) {
+    case PM4ItOpcode::Nop: {
+        const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
+        if (nop->header.count.Value() == 0) {
+            break;
+        }
+
+        switch (nop->data_block[0]) {
+        case PM4CmdNop::PayloadType::PatchedFlip: {
+            // There is no evidence that GPU CP drives flip events by parsing
+            // special NOP packets. For convenience lets assume that it does.
+            Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
+            break;
+        }
+        case PM4CmdNop::PayloadType::DebugMarkerPush: {
+            if (guest_markers_enabled) {
+                const auto marker_sz = nop->header.count.Value() * 2;
+                const std::string_view label{reinterpret_cast<const char*>(&nop->data_block[1]),
+                                             marker_sz};
+                rasterizer->ScopeMarkerBegin(label, true);
+            }
+            break;
+        }
+        case PM4CmdNop::PayloadType::DebugColorMarkerPush: {
+            if (guest_markers_enabled) {
+                const auto marker_sz = nop->header.count.Value() * 2;
+                const std::string_view label{reinterpret_cast<const char*>(&nop->data_block[1]),
+                                             marker_sz};
+                const u32 color = *reinterpret_cast<const u32*>(
+                    reinterpret_cast<const u8*>(&nop->data_block[1]) + marker_sz);
+                rasterizer->ScopedMarkerInsertColor(label, color, true);
+            }
+            break;
+        }
+        case PM4CmdNop::PayloadType::DebugMarkerPop: {
+            if (guest_markers_enabled) {
+                rasterizer->ScopeMarkerEnd(true);
+            }
+            break;
+        }
+        default:
+            break;
+        }
+        break;
+    }
+    case PM4ItOpcode::EventWrite: {
+        // The streamout-flush part is a register write and stays in ProcessGraphics.
+        const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
+        if (event->event_index.Value() == EventIndex::ZpassDone) {
+            if (event->event_type.Value() == EventType::PixelPipeStatDump) {
+                static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
+                static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
+                u64* results = event->Address<u64*>();
+                for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
+                    *results = pixel_counter | OcclusionCounterValidMask;
+                }
+                pixel_counter += OcclusionCounterStep;
+            }
+        }
+        break;
+    }
+    case PM4ItOpcode::EventWriteEos: {
+        const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
+        if (rasterizer) {
+            rasterizer->ProcessDownloadImages();
+        }
+        // SPLIT-TODO(depth>0): g_cp_wait and SplitHazard are front-side diagnostics; note these
+        // writes at parse time instead (inventory section 3).
+        g_cp_wait.NoteWrite(event_eos->Address());
+        SplitHazard::NoteWrite(reinterpret_cast<u64>(event_eos->Address()), 8);
+        VideoCore::ProtectFence();
+        if ((FenceAtGpu() == 1 || FenceAtGpu() == 2) && rasterizer &&
+            event_eos->command != PM4CmdEventWriteEos::Command::GdsStore) {
+            rasterizer->DeferToGpu([packet = *event_eos] { packet.SignalFence(WriteFenceValue); },
+                                   FenceAtGpu() == 1);
+        } else {
+            event_eos->SignalFence(WriteFenceValue);
+        }
+        if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
+            ASSERT(event_eos->size == 1);
+            if (rasterizer) {
+                rasterizer->Finish();
+                const u32 value = rasterizer->ReadDataFromGds(event_eos->gds_index);
+                *event_eos->Address() = value;
+            }
+        }
+        break;
+    }
+    case PM4ItOpcode::EventWriteEop: {
+        const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
+        if (rasterizer) {
+            rasterizer->ProcessDownloadImages();
+        }
+        g_cp_wait.NoteWrite(event_eop->Address<u32>());
+        SplitHazard::NoteWrite(reinterpret_cast<u64>(event_eop->Address<u32>()), 8);
+        VideoCore::ProtectFence();
+        if (FenceAtGpu() != 0 && rasterizer) {
+            rasterizer->DeferToGpu(
+                [packet = *event_eop] {
+                    packet.SignalFence(WriteFenceValue, [] {
+                        Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
+                    });
+                },
+                FenceAtGpu() != 2);
+            break;
+        }
+        event_eop->SignalFence(
+            [](void* address, u64 data, u32 num_bytes) {
+                auto* memory = Core::Memory::Instance();
+                if (!memory->TryWriteBacking(address, &data, num_bytes)) {
+                    memcpy(address, &data, num_bytes);
+                }
+            },
+            [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
+        break;
+    }
+    case PM4ItOpcode::DmaData: {
+        const auto* dma_data = reinterpret_cast<const PM4DmaData*>(header);
+        if (dma_data->dst_addr_lo == 0x3022C || !rasterizer) {
+            break;
+        }
+        if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
+            rasterizer->FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(), dma_data->data,
+                                   true);
+        } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
+                    dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
+                   dma_data->dst_sel == DmaDataDst::Gds) {
+            rasterizer->CopyBuffer(dma_data->dst_addr_lo, dma_data->SrcAddress<VAddr>(),
+                                   dma_data->NumBytes(), true, false);
+        } else if (dma_data->src_sel == DmaDataSrc::Data &&
+                   (dma_data->dst_sel == DmaDataDst::Memory ||
+                    dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+            rasterizer->FillBuffer(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(),
+                                   dma_data->data, false);
+        } else if (dma_data->src_sel == DmaDataSrc::Gds &&
+                   (dma_data->dst_sel == DmaDataDst::Memory ||
+                    dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+            rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->src_addr_lo,
+                                   dma_data->NumBytes(), false, true);
+        } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
+                    dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
+                   (dma_data->dst_sel == DmaDataDst::Memory ||
+                    dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+            rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->SrcAddress<VAddr>(),
+                                   dma_data->NumBytes(), false, false);
+        } else {
+            UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}", u32(dma_data->src_sel.Value()),
+                            u32(dma_data->dst_sel.Value()));
+        }
+        break;
+    }
+    case PM4ItOpcode::WriteData: {
+        const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
+        ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
+        const u32 data_size = (header->type3.count.Value() - 2) * 4;
+        u64* address = write_data->Address<u64*>();
+        g_cp_wait.NoteWrite(address);
+        SplitHazard::NoteWrite(reinterpret_cast<u64>(address), data_size);
+        VideoCore::ProtectFence();
+        if (!write_data->wr_one_addr.Value()) {
+            std::memcpy(address, write_data->data, data_size);
+        } else {
+            UNREACHABLE();
+        }
+        break;
+    }
+    case PM4ItOpcode::MemSemaphore: {
+        // The wait half of a waiting semaphore stays in ProcessGraphics (it yields).
+        const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
+        if (mem_semaphore->IsSignaling()) {
+            mem_semaphore->Signal();
+        } else {
+            mem_semaphore->Decrement();
+        }
+        break;
+    }
+    case PM4ItOpcode::PfpSyncMe: {
+        if (rasterizer) {
+            rasterizer->CpSync();
+        }
+        break;
+    }
+    default:
+        UNREACHABLE_MSG("CpSplit: no back action for PM4 opcode {:#x}", static_cast<u32>(opcode));
+    }
+}
+
+void Liverpool::ProcessLoop(std::stop_token stoken) {
     while (!stoken.stop_requested()) {
         {
             // Idle here is the CP thread waiting on the GUEST, not emulator cost. Splitting it out
@@ -331,6 +962,9 @@ void Liverpool::Process(std::stop_token stoken) {
             task.resume();
 
             if (task.done()) {
+                // CP split: the guest reads num_submits == 0 as "GPU idle", so the back must
+                // have finished the submission first.
+                FrontDrain();
                 task.destroy();
 
                 std::scoped_lock lock{queue.m_access};
@@ -342,6 +976,26 @@ void Liverpool::Process(std::stop_token stoken) {
             }
         }
         Common::FaultMonitor::CountCpActive(Common::FaultMonitor::SinceNs(t_active));
+        if (split_enabled) {
+            // CP split: the idle tail uses the scheduler, the caches and IrqC (back work). Same
+            // order as below; submit_done is consumed here on the front.
+            const bool flush_submit = submit_done;
+            if (flush_submit) {
+                submit_done = false;
+            }
+            OnBack([&] {
+                if (FenceAtGpu() == 2 && rasterizer) {
+                    rasterizer->FlushLazyFences();
+                }
+                if (flush_submit && rasterizer) {
+                    rasterizer->OnSubmit();
+                    rasterizer->Flush();
+                }
+                VideoCore::ProtectFence();
+                Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
+            });
+            continue;
+        }
         if (FenceAtGpu() == 2 && rasterizer) {
             rasterizer->FlushLazyFences();
         }
@@ -392,10 +1046,15 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
         case PM4ItOpcode::DumpConstRam: {
             const auto* dump_const = reinterpret_cast<const PM4DumpConstRam*>(header);
-            memcpy(dump_const->Address<void*>(),
-                   cblock.constants_heap.data() + dump_const->Offset(), dump_const->Size());
+            // CP split: a CP-side guest-memory write, so it runs on the back (fault identity).
+            // SPLIT-TODO(depth>0): copy the heap slice into an owned record instead of reading
+            // the front's constants_heap from the back.
+            OnBack([&] {
+                memcpy(dump_const->Address<void*>(),
+                       cblock.constants_heap.data() + dump_const->Offset(), dump_const->Size());
+            });
             // A CP-side guest memory write: later draws may read it (submit_epoch.h).
-            VideoCore::BumpSubmitEpoch(PM4ItOpcode::DumpConstRam);
+            BumpEpoch(PM4ItOpcode::DumpConstRam);
             break;
         }
         case PM4ItOpcode::IncrementCeCounter: {
@@ -437,7 +1096,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     // Everything the guest wrote before this submission is now due (submit_epoch.h). An indirect
     // buffer is part of its parent submission, so it does not reopen the window.
     if (!std::exchange(starting_indirect_gfx, false)) {
-        VideoCore::BumpSubmitEpoch(PM4ItOpcode::Nop);
+        BumpEpoch(PM4ItOpcode::Nop);
     }
 
     cblock.Reset();
@@ -478,47 +1137,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             const PM4ItOpcode opcode = header->type3.opcode;
             switch (opcode) {
             case PM4ItOpcode::Nop: {
-                const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
-                if (nop->header.count.Value() == 0) {
-                    break;
-                }
-
-                switch (nop->data_block[0]) {
-                case PM4CmdNop::PayloadType::PatchedFlip: {
-                    // There is no evidence that GPU CP drives flip events by parsing
-                    // special NOP packets. For convenience lets assume that it does.
-                    Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
-                    break;
-                }
-                case PM4CmdNop::PayloadType::DebugMarkerPush: {
-                    if (guest_markers_enabled) {
-                        const auto marker_sz = nop->header.count.Value() * 2;
-                        const std::string_view label{
-                            reinterpret_cast<const char*>(&nop->data_block[1]), marker_sz};
-                        rasterizer->ScopeMarkerBegin(label, true);
+                // Flip IRQ and guest markers are back work; the body is in ExecuteGfxPacket.
+                if (split_enabled) {
+                    if (NopHasBackEffect(header, guest_markers_enabled)) {
+                        RunGfxPacket(header, guest_markers_enabled);
                     }
                     break;
                 }
-                case PM4CmdNop::PayloadType::DebugColorMarkerPush: {
-                    if (guest_markers_enabled) {
-                        const auto marker_sz = nop->header.count.Value() * 2;
-                        const std::string_view label{
-                            reinterpret_cast<const char*>(&nop->data_block[1]), marker_sz};
-                        const u32 color = *reinterpret_cast<const u32*>(
-                            reinterpret_cast<const u8*>(&nop->data_block[1]) + marker_sz);
-                        rasterizer->ScopedMarkerInsertColor(label, color, true);
-                    }
-                    break;
-                }
-                case PM4CmdNop::PayloadType::DebugMarkerPop: {
-                    if (guest_markers_enabled) {
-                        rasterizer->ScopeMarkerEnd(true);
-                    }
-                    break;
-                }
-                default:
-                    break;
-                }
+                ExecuteGfxPacket(header, guest_markers_enabled);
                 break;
             }
             case PM4ItOpcode::ContextControl: {
@@ -530,6 +1156,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if constexpr (Common::FaultMonitor::DetailCountersEnabled) {
                     ++regs_generation;
                     ++regs_generation_ctx;
+                }
+                if (split_enabled) [[unlikely]] {
+                    split->EmitClearState();
                 }
                 break;
             }
@@ -543,6 +1172,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     ++regs_generation_ctx; // value-aware: only a real change dirties the key
                 }
                 std::memcpy(&regs.reg_array[reg_addr], payload, sz);
+                JournalRegs(reg_addr, count - 1);
                 if constexpr (Common::FaultMonitor::DetailCountersEnabled) { ++regs_generation; }
                 break;
             }
@@ -561,6 +1191,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     ++context_change_epoch;
                 }
                 std::memcpy(&regs.reg_array[reg_addr], payload, ctx_sz);
+                JournalRegs(reg_addr, count - 1);
                 if constexpr (Common::FaultMonitor::DetailCountersEnabled) { ++regs_generation; }
 
                 // In the case of HW, render target memory has alignment as color block operates on
@@ -627,6 +1258,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 default:
                     break;
                 }
+                JournalExtent(reg_addr);
                 break;
             }
             case PM4ItOpcode::SetShReg: {
@@ -642,6 +1274,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 } else {
                     std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
                                 header + 2, set_size);
+                    JournalRegs(Regs::ShRegWordOffset + set_data->reg_offset, count - 1);
                     if constexpr (Common::FaultMonitor::DetailCountersEnabled) { ++regs_generation; }
                     if (PgmPrefetchEnabled()) {
                         PrefetchProgramsOnWrite(regs, set_data->reg_offset, count - 1);
@@ -658,6 +1291,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     ++regs_generation_ctx; // value-aware: only a real change dirties the key
                 }
                 std::memcpy(&regs.reg_array[uc_addr], header + 2, uc_sz);
+                JournalRegs(uc_addr, count - 1);
                 if constexpr (Common::FaultMonitor::DetailCountersEnabled) { ++regs_generation; }
                 break;
             }
@@ -668,6 +1302,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::IndexType: {
                 const auto* index_type = reinterpret_cast<const PM4CmdDrawIndexType*>(header);
                 regs.index_buffer_type.raw = index_type->raw;
+                JournalField(regs.index_buffer_type);
                 break;
             }
             case PM4ItOpcode::DrawIndex2: {
@@ -677,8 +1312,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 regs.index_base_address.base_addr_hi = draw_index->index_base_hi;
                 regs.num_indices = draw_index->index_count;
                 regs.draw_initiator = draw_index->draw_initiator;
+                JournalField(regs.max_index_size);
+                JournalField(regs.index_base_address);
+                JournalField(regs.num_indices);
+                JournalField(regs.draw_initiator);
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
+                }
+                if (split_enabled && rasterizer) {
+                    EmitDraw(header, "DrawIndex2", host_markers_enabled, {.is_indexed = true});
+                    break;
                 }
                 if (rasterizer) {
                     const auto cmd_address = reinterpret_cast<const void*>(header);
@@ -698,8 +1341,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 regs.max_index_size = draw_index_off->max_size;
                 regs.num_indices = draw_index_off->index_count;
                 regs.draw_initiator = draw_index_off->draw_initiator;
+                JournalField(regs.max_index_size);
+                JournalField(regs.num_indices);
+                JournalField(regs.draw_initiator);
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
+                }
+                if (split_enabled && rasterizer) {
+                    EmitDraw(header, "DrawIndexOffset2", host_markers_enabled,
+                             {.is_indexed = true, .index_offset = draw_index_off->index_offset});
+                    break;
                 }
                 if (rasterizer) {
                     const auto cmd_address = reinterpret_cast<const void*>(header);
@@ -718,8 +1369,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* draw_index = reinterpret_cast<const PM4CmdDrawIndexAuto*>(header);
                 regs.num_indices = draw_index->index_count;
                 regs.draw_initiator = draw_index->draw_initiator;
+                JournalField(regs.num_indices);
+                JournalField(regs.draw_initiator);
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
+                }
+                if (split_enabled && rasterizer) {
+                    EmitDraw(header, "DrawIndexAuto", host_markers_enabled, {});
+                    break;
                 }
                 if (rasterizer) {
                     const auto cmd_address = reinterpret_cast<const void*>(header);
@@ -741,6 +1398,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
+                if (split_enabled && rasterizer) {
+                    EmitDraw(header, "DrawIndirect", host_markers_enabled,
+                             {.is_indirect = true,
+                              .arg_address = indirect_args_addr,
+                              .offset = offset,
+                              .stride = u32(stride),
+                              .max_count = 1});
+                    break;
+                }
                 if (rasterizer) {
                     const auto cmd_address = reinterpret_cast<const void*>(header);
                     if (host_markers_enabled) {
@@ -760,6 +1426,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto offset = draw_indirect->data_offset;
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
+                }
+                if (split_enabled && rasterizer) {
+                    EmitDraw(header, "DrawIndirectMulti", host_markers_enabled,
+                             {.is_indirect = true,
+                              .arg_address = indirect_args_addr,
+                              .offset = offset,
+                              .stride = draw_indirect->stride,
+                              .max_count = draw_indirect->count});
+                    break;
                 }
                 if (rasterizer) {
                     const auto cmd_address = reinterpret_cast<const void*>(header);
@@ -784,6 +1459,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
+                if (split_enabled && rasterizer) {
+                    EmitDraw(header, "DrawIndexIndirect", host_markers_enabled,
+                             {.is_indexed = true,
+                              .is_indirect = true,
+                              .arg_address = indirect_args_addr,
+                              .offset = offset,
+                              .stride = u32(stride),
+                              .max_count = 1});
+                    break;
+                }
                 if (rasterizer) {
                     const auto cmd_address = reinterpret_cast<const void*>(header);
                     if (host_markers_enabled) {
@@ -803,6 +1488,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto offset = draw_index_indirect->data_offset;
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
+                }
+                if (split_enabled && rasterizer) {
+                    EmitDraw(header, "DrawIndexIndirectMulti", host_markers_enabled,
+                             {.is_indexed = true,
+                              .is_indirect = true,
+                              .arg_address = indirect_args_addr,
+                              .offset = offset,
+                              .stride = draw_index_indirect->stride,
+                              .max_count = draw_index_indirect->count});
+                    break;
                 }
                 if (rasterizer) {
                     const auto cmd_address = reinterpret_cast<const void*>(header);
@@ -827,6 +1522,19 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto offset = draw_index_indirect->data_offset;
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
+                }
+                if (split_enabled && rasterizer) {
+                    EmitDraw(header, "DrawIndexIndirectCountMulti", host_markers_enabled,
+                             {.is_indexed = true,
+                              .is_indirect = true,
+                              .arg_address = indirect_args_addr,
+                              .offset = offset,
+                              .stride = draw_index_indirect->stride,
+                              .max_count = draw_index_indirect->count,
+                              .count_address = draw_index_indirect->count_indirect_enable.Value()
+                                                   ? VAddr(draw_index_indirect->count_addr)
+                                                   : VAddr{0}});
+                    break;
                 }
                 if (rasterizer) {
                     const auto cmd_address = reinterpret_cast<const void*>(header);
@@ -862,6 +1570,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     DebugState.PushRegsDumpCompute(base_addr, reinterpret_cast<uintptr_t>(header),
                                                    cs_program);
                 }
+                if (split_enabled) {
+                    if (rasterizer && (cs_program.dispatch_initiator & 1)) {
+                        EmitDispatch(header, "DispatchDirect", host_markers_enabled, false, 0, 0,
+                                     0);
+                    }
+                    break;
+                }
                 if (rasterizer && (cs_program.dispatch_initiator & 1)) {
                     const auto cmd_address = reinterpret_cast<const void*>(header);
                     if (host_markers_enabled) {
@@ -885,6 +1600,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     DebugState.PushRegsDumpCompute(base_addr, reinterpret_cast<uintptr_t>(header),
                                                    cs_program);
                 }
+                if (split_enabled) {
+                    if (rasterizer && (cs_program.dispatch_initiator & 1)) {
+                        EmitDispatch(header, "DispatchIndirect", host_markers_enabled, true,
+                                     indirect_args_addr, offset, size);
+                    }
+                    break;
+                }
                 if (rasterizer && (cs_program.dispatch_initiator & 1)) {
                     const auto cmd_address = reinterpret_cast<const void*>(header);
                     if (host_markers_enabled) {
@@ -901,17 +1623,20 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::NumInstances: {
                 const auto* num_instances = reinterpret_cast<const PM4CmdDrawNumInstances*>(header);
                 regs.num_instances.num_instances = num_instances->num_instances;
+                JournalField(regs.num_instances);
                 break;
             }
             case PM4ItOpcode::IndexBase: {
                 const auto* index_base = reinterpret_cast<const PM4CmdDrawIndexBase*>(header);
                 regs.index_base_address.base_addr_lo = index_base->addr_lo;
                 regs.index_base_address.base_addr_hi = index_base->addr_hi;
+                JournalField(regs.index_base_address);
                 break;
             }
             case PM4ItOpcode::IndexBufferSize: {
                 const auto* index_size = reinterpret_cast<const PM4CmdDrawIndexBufferSize*>(header);
                 regs.num_indices = index_size->num_indices;
+                JournalField(regs.num_indices);
                 break;
             }
             case PM4ItOpcode::SetBase: {
@@ -929,123 +1654,24 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     // TODO: handle proper synchronization, for now signal that update is done
                     // immediately
                     regs.cp_strmout_cntl.offset_update_done = 1;
-                } else if (event->event_index.Value() == EventIndex::ZpassDone) {
-                    if (event->event_type.Value() == EventType::PixelPipeStatDump) {
-                        static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
-                        static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
-                        u64* results = event->Address<u64*>();
-                        for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
-                            *results = pixel_counter | OcclusionCounterValidMask;
-                        }
-                        pixel_counter += OcclusionCounterStep;
-                    }
+                    JournalField(regs.cp_strmout_cntl);
+                } else if (!split_enabled) {
+                    ExecuteGfxPacket(header, guest_markers_enabled);
+                } else if (event->event_index.Value() == EventIndex::ZpassDone &&
+                           event->event_type.Value() == EventType::PixelPipeStatDump) {
+                    // Occlusion counter write into guest memory: back work.
+                    RunGfxPacket(header, guest_markers_enabled);
                 }
                 break;
             }
-            case PM4ItOpcode::EventWriteEos: {
-                const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
-                if (rasterizer) {
-                    rasterizer->ProcessDownloadImages();
-                }
-                g_cp_wait.NoteWrite(event_eos->Address());
-                SplitHazard::NoteWrite(reinterpret_cast<u64>(event_eos->Address()), 8);
-                VideoCore::ProtectFence();
-                if ((FenceAtGpu() == 1 || FenceAtGpu() == 2) && rasterizer &&
-                    event_eos->command != PM4CmdEventWriteEos::Command::GdsStore) {
-                    rasterizer->DeferToGpu(
-                        [packet = *event_eos] { packet.SignalFence(WriteFenceValue); },
-                        FenceAtGpu() == 1);
-                } else {
-                    event_eos->SignalFence(WriteFenceValue);
-                }
-                if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
-                    ASSERT(event_eos->size == 1);
-                    if (rasterizer) {
-                        rasterizer->Finish();
-                        const u32 value = rasterizer->ReadDataFromGds(event_eos->gds_index);
-                        *event_eos->Address() = value;
-                    }
-                }
-                break;
-            }
-            case PM4ItOpcode::EventWriteEop: {
-                const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
-                if (rasterizer) {
-                    rasterizer->ProcessDownloadImages();
-                }
-                g_cp_wait.NoteWrite(event_eop->Address<u32>());
-                SplitHazard::NoteWrite(reinterpret_cast<u64>(event_eop->Address<u32>()), 8);
-                VideoCore::ProtectFence();
-                if (FenceAtGpu() != 0 && rasterizer) {
-                    rasterizer->DeferToGpu(
-                        [packet = *event_eop] {
-                            packet.SignalFence(WriteFenceValue, [] {
-                                Platform::IrqC::Instance()->Signal(
-                                    Platform::InterruptId::GfxEop);
-                            });
-                        },
-                        FenceAtGpu() != 2);
-                    break;
-                }
-                event_eop->SignalFence(
-                    [](void* address, u64 data, u32 num_bytes) {
-                        auto* memory = Core::Memory::Instance();
-                        if (!memory->TryWriteBacking(address, &data, num_bytes)) {
-                            memcpy(address, &data, num_bytes);
-                        }
-                    },
-                    [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
-                break;
-            }
-            case PM4ItOpcode::DmaData: {
-                const auto* dma_data = reinterpret_cast<const PM4DmaData*>(header);
-                if (dma_data->dst_addr_lo == 0x3022C || !rasterizer) {
-                    break;
-                }
-                if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
-                    rasterizer->FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(),
-                                           dma_data->data, true);
-                } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
-                            dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
-                           dma_data->dst_sel == DmaDataDst::Gds) {
-                    rasterizer->CopyBuffer(dma_data->dst_addr_lo, dma_data->SrcAddress<VAddr>(),
-                                           dma_data->NumBytes(), true, false);
-                } else if (dma_data->src_sel == DmaDataSrc::Data &&
-                           (dma_data->dst_sel == DmaDataDst::Memory ||
-                            dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                    rasterizer->FillBuffer(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(),
-                                           dma_data->data, false);
-                } else if (dma_data->src_sel == DmaDataSrc::Gds &&
-                           (dma_data->dst_sel == DmaDataDst::Memory ||
-                            dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                    rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->src_addr_lo,
-                                           dma_data->NumBytes(), false, true);
-                } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
-                            dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
-                           (dma_data->dst_sel == DmaDataDst::Memory ||
-                            dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                    rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(),
-                                           dma_data->SrcAddress<VAddr>(), dma_data->NumBytes(),
-                                           false, false);
-                } else {
-                    UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}",
-                                    u32(dma_data->src_sel.Value()), u32(dma_data->dst_sel.Value()));
-                }
-                break;
-            }
-            case PM4ItOpcode::WriteData: {
-                const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
-                ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
-                const u32 data_size = (header->type3.count.Value() - 2) * 4;
-                u64* address = write_data->Address<u64*>();
-                g_cp_wait.NoteWrite(address);
-                SplitHazard::NoteWrite(reinterpret_cast<u64>(address), data_size);
-                VideoCore::ProtectFence();
-                if (!write_data->wr_one_addr.Value()) {
-                    std::memcpy(address, write_data->data, data_size);
-                } else {
-                    UNREACHABLE();
-                }
+            case PM4ItOpcode::EventWriteEos:
+            case PM4ItOpcode::EventWriteEop:
+            case PM4ItOpcode::DmaData:
+            case PM4ItOpcode::WriteData:
+            case PM4ItOpcode::PfpSyncMe: {
+                // Fences, DMA, CP memory writes and the CP sync barrier: back work, bodies in
+                // ExecuteGfxPacket.
+                RunGfxPacket(header, guest_markers_enabled);
                 break;
             }
             case PM4ItOpcode::CopyData: {
@@ -1060,14 +1686,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::MemSemaphore: {
                 const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
-                if (mem_semaphore->IsSignaling()) {
-                    mem_semaphore->Signal();
-                } else {
+                if (!mem_semaphore->IsSignaling()) {
+                    // The front reads guest memory the back may still write: drain first.
+                    FrontDrain();
                     while (!mem_semaphore->Signaled()) {
                         YIELD_GFX();
                     }
-                    mem_semaphore->Decrement();
                 }
+                // Signal() or Decrement(), in ExecuteGfxPacket.
+                RunGfxPacket(header, guest_markers_enabled);
                 break;
             }
             case PM4ItOpcode::AcquireMem: {
@@ -1079,6 +1706,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+                // The flag is written by the guest CPU, not the back: no drain needed.
                 while (!rewind->Valid()) {
                     YIELD_GFX();
                 }
@@ -1092,6 +1720,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // there are no other submits to yield to we can sleep the thread
                 // instead and allow other tasks to run.
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
+                // CP split: the back may still owe writes this wait reads (inventory 0.6), so
+                // drain before testing. At depth 0 this only flushes register records.
+                FrontDrain();
                 if (vo_port->IsVoLabel(wait_addr) &&
                     num_submits == mapped_queues[GfxQueueId].submits.size()) {
                     const auto vo_start = Common::FaultMonitor::Now();
@@ -1104,7 +1735,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const u64 wrm_ns0 = g_cp_wait.enabled ? CpWaitStats::Now() : 0;
                 bool wrm_waited = false;
                 if (FenceAtGpu() == 2 && rasterizer && !wait_reg_mem->Test(regs.reg_array)) {
-                    rasterizer->FlushLazyFences();
+                    OnBack([&] { rasterizer->FlushLazyFences(); });
                 }
                 while (!wait_reg_mem->Test(regs.reg_array)) {
                     wrm_waited = true;
@@ -1147,12 +1778,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 break;
             }
-            case PM4ItOpcode::PfpSyncMe: {
-                if (rasterizer) {
-                    rasterizer->CpSync();
-                }
-                break;
-            }
             case PM4ItOpcode::StrmoutBufferUpdate: {
                 const auto* strmout = reinterpret_cast<const PM4CmdStrmoutBufferUpdate*>(header);
                 LOG_WARNING(Render_Vulkan,
@@ -1172,6 +1797,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (cond_exec->command.Value() != 0) {
                     LOG_WARNING(Render, "IT_COND_EXEC used a reserved command");
                 }
+                FrontDrain(); // reads guest memory the back may write
                 const auto skip = *cond_exec->Address() == false;
                 if (skip) {
                     dcb = NextPacket(dcb,
@@ -1185,7 +1811,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                 static_cast<u32>(opcode), count);
             }
             if (!KeepsSubmitEpoch(opcode)) {
-                VideoCore::BumpSubmitEpoch(opcode);
+                BumpEpoch(opcode);
             }
             dcb = NextPacket(dcb, header->type3.NumWords() + 1);
             break;
@@ -1205,8 +1831,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 template <bool is_indirect>
 Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
+    // CP split draft: ASC packets are parsed on the front like the DCB, but their back work runs
+    // through synchronous Call records (OnBack), including the pipeline lookup inside
+    // DispatchDirect/Indirect. Sound at depth 0 only.
+    // SPLIT-TODO(depth>0): owned Dispatch records with the lookup on the front, as for gfx.
     if constexpr (!is_indirect) {
-        VideoCore::BumpSubmitEpoch(PM4ItOpcode::Nop);
+        BumpEpoch(PM4ItOpcode::Nop);
     }
     auto& queue = asc_queues[{vqid}];
     const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
@@ -1290,23 +1920,31 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 break;
             }
             if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
-                rasterizer->FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(), dma_data->data,
-                                       true);
+                OnBack([&] {
+                    rasterizer->FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(),
+                                           dma_data->data, true);
+                });
             } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
                         dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
                        dma_data->dst_sel == DmaDataDst::Gds) {
-                rasterizer->CopyBuffer(dma_data->dst_addr_lo, dma_data->SrcAddress<VAddr>(),
-                                       dma_data->NumBytes(), true, false);
+                OnBack([&] {
+                    rasterizer->CopyBuffer(dma_data->dst_addr_lo, dma_data->SrcAddress<VAddr>(),
+                                           dma_data->NumBytes(), true, false);
+                });
             } else if (dma_data->src_sel == DmaDataSrc::Data &&
                        (dma_data->dst_sel == DmaDataDst::Memory ||
                         dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                rasterizer->FillBuffer(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(),
-                                       dma_data->data, false);
+                OnBack([&] {
+                    rasterizer->FillBuffer(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(),
+                                           dma_data->data, false);
+                });
             } else if (dma_data->src_sel == DmaDataSrc::Gds &&
                        (dma_data->dst_sel == DmaDataDst::Memory ||
                         dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->src_addr_lo,
-                                       dma_data->NumBytes(), false, true);
+                OnBack([&] {
+                    rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->src_addr_lo,
+                                           dma_data->NumBytes(), false, true);
+                });
             } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
                         dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
                        (dma_data->dst_sel == DmaDataDst::Memory ||
@@ -1321,7 +1959,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     header->type == 3 && header->type3.opcode == PM4ItOpcode::DispatchDirect) {
                     indirect_patches.emplace_back(header, src_addr);
                 } else {
-                    rasterizer->CopyBuffer(dst_addr, src_addr, num_bytes, false, false);
+                    OnBack([&] {
+                        rasterizer->CopyBuffer(dst_addr, src_addr, num_bytes, false, false);
+                    });
                 }
             } else {
                 UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}",
@@ -1355,6 +1995,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             } else {
                 std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
                             header + 2, set_size);
+                JournalRegs(Regs::ShRegWordOffset + set_data->reg_offset,
+                            u32(set_size / sizeof(u32)));
             }
             break;
         }
@@ -1369,7 +2011,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (auto it = std::ranges::find(indirect_patches, header, &IndirectPatch::header);
                 it != indirect_patches.end()) {
                 const auto size = sizeof(PM4CmdDispatchIndirect::GroupDimensions);
-                rasterizer->DispatchIndirect(it->indirect_addr, 0, size);
+                OnBack([&] { rasterizer->DispatchIndirect(it->indirect_addr, 0, size); });
                 break;
             }
             auto& cs_program = GetCsRegs();
@@ -1382,15 +2024,17 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                                                cs_program);
             }
             if (rasterizer && (cs_program.dispatch_initiator & 1)) {
-                const auto cmd_address = reinterpret_cast<const void*>(header);
-                if (host_markers_enabled) {
-                    rasterizer->ScopeMarkerBegin(
-                        fmt::format("asc[{}]:{}:DispatchDirect", vqid, cmd_address));
-                    rasterizer->DispatchDirect();
-                    rasterizer->ScopeMarkerEnd();
-                } else {
-                    rasterizer->DispatchDirect();
-                }
+                OnBack([&] {
+                    const auto cmd_address = reinterpret_cast<const void*>(header);
+                    if (host_markers_enabled) {
+                        rasterizer->ScopeMarkerBegin(
+                            fmt::format("asc[{}]:{}:DispatchDirect", vqid, cmd_address));
+                        rasterizer->DispatchDirect();
+                        rasterizer->ScopeMarkerEnd();
+                    } else {
+                        rasterizer->DispatchDirect();
+                    }
+                });
             }
             break;
         }
@@ -1405,15 +2049,17 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                                                cs_program);
             }
             if (rasterizer && (cs_program.dispatch_initiator & 1)) {
-                const auto cmd_address = reinterpret_cast<const void*>(header);
-                if (host_markers_enabled) {
-                    rasterizer->ScopeMarkerBegin(
-                        fmt::format("asc[{}]:{}:DispatchIndirect", vqid, cmd_address));
-                    rasterizer->DispatchIndirect(ib_address, 0, size);
-                    rasterizer->ScopeMarkerEnd();
-                } else {
-                    rasterizer->DispatchIndirect(ib_address, 0, size);
-                }
+                OnBack([&] {
+                    const auto cmd_address = reinterpret_cast<const void*>(header);
+                    if (host_markers_enabled) {
+                        rasterizer->ScopeMarkerBegin(
+                            fmt::format("asc[{}]:{}:DispatchIndirect", vqid, cmd_address));
+                        rasterizer->DispatchIndirect(ib_address, 0, size);
+                        rasterizer->ScopeMarkerEnd();
+                    } else {
+                        rasterizer->DispatchIndirect(ib_address, 0, size);
+                    }
+                });
             }
             break;
         }
@@ -1421,24 +2067,27 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
-            g_cp_wait.NoteWrite(write_data->Address<void*>());
-            VideoCore::ProtectFence();
-            if (!write_data->wr_one_addr.Value()) {
-                std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
-            } else {
-                UNREACHABLE();
-            }
+            OnBack([&] {
+                g_cp_wait.NoteWrite(write_data->Address<void*>());
+                VideoCore::ProtectFence();
+                if (!write_data->wr_one_addr.Value()) {
+                    std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
+                } else {
+                    UNREACHABLE();
+                }
+            });
             break;
         }
         case PM4ItOpcode::MemSemaphore: {
             const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
             if (mem_semaphore->IsSignaling()) {
-                mem_semaphore->Signal();
+                OnBack([&] { mem_semaphore->Signal(); });
             } else {
+                FrontDrain();
                 while (!mem_semaphore->Signaled()) {
                     YIELD_ASC(vqid);
                 }
-                mem_semaphore->Decrement();
+                OnBack([&] { mem_semaphore->Decrement(); });
             }
             break;
         }
@@ -1448,8 +2097,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto wrm_start = Common::FaultMonitor::Now();
             const u64 wrm_ns0 = g_cp_wait.enabled ? CpWaitStats::Now() : 0;
             bool wrm_waited = false;
+            FrontDrain();
             if (FenceAtGpu() == 2 && rasterizer && !wait_reg_mem->Test(regs.reg_array)) {
-                rasterizer->FlushLazyFences();
+                OnBack([&] { rasterizer->FlushLazyFences(); });
             }
             while (!wait_reg_mem->Test(regs.reg_array)) {
                 wrm_waited = true;
@@ -1464,32 +2114,36 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::ReleaseMem: {
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
-            if (rasterizer) {
-                rasterizer->ProcessDownloadImages();
-            }
-            g_cp_wait.NoteWrite(release_mem->Address<void*>());
-            VideoCore::ProtectFence();
-            if ((FenceAtGpu() == 1 || FenceAtGpu() == 2) && rasterizer &&
-                release_mem->data_sel != DataSelect::GdsMemStore) {
-                rasterizer->DeferToGpu(
-                    [packet = *release_mem, pipe_id = queue.pipe_id] {
-                        packet.SignalFence(
-                            [pipe_id] {
-                                Platform::IrqC::Instance()->Signal(
-                                    static_cast<Platform::InterruptId>(pipe_id));
-                            },
-                            [](VAddr, u16, u16) {});
+            OnBack([&] {
+                if (rasterizer) {
+                    rasterizer->ProcessDownloadImages();
+                }
+                g_cp_wait.NoteWrite(release_mem->Address<void*>());
+                VideoCore::ProtectFence();
+                if ((FenceAtGpu() == 1 || FenceAtGpu() == 2) && rasterizer &&
+                    release_mem->data_sel != DataSelect::GdsMemStore) {
+                    rasterizer->DeferToGpu(
+                        [packet = *release_mem, pipe_id = queue.pipe_id] {
+                            packet.SignalFence(
+                                [pipe_id] {
+                                    Platform::IrqC::Instance()->Signal(
+                                        static_cast<Platform::InterruptId>(pipe_id));
+                                },
+                                [](VAddr, u16, u16) {});
+                        },
+                        FenceAtGpu() == 1);
+                    return;
+                }
+                release_mem->SignalFence(
+                    [pipe_id = queue.pipe_id] {
+                        Platform::IrqC::Instance()->Signal(
+                            static_cast<Platform::InterruptId>(pipe_id));
                     },
-                    FenceAtGpu() == 1);
-                break;
-            }
-            release_mem->SignalFence(
-                [pipe_id = queue.pipe_id] {
-                    Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
-                },
-                [this](VAddr dst, u16 gds_index, u16 num_dwords) {
-                    rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
-                });
+                    [this](VAddr dst, u16 gds_index, u16 num_dwords) {
+                        rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false,
+                                               true);
+                    });
+            });
             break;
         }
         case PM4ItOpcode::EventWrite: {
@@ -1502,7 +2156,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
 
         if (!KeepsSubmitEpoch(opcode)) {
-            VideoCore::BumpSubmitEpoch(opcode);
+            BumpEpoch(opcode);
         }
         acb = NextPacket(acb, next_dw_off);
 
