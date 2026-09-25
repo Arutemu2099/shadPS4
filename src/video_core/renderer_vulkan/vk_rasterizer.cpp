@@ -554,6 +554,30 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
 
+    {
+        // SHADPS4_EMPTY_DRAWS=1 counts direct draws with zero indices or zero instances (they render
+        // nothing but still bind every resource); =2 also skips them. Clears and resolves are
+        // handled in FilterDraw before this point.
+        static const int empty_draws = [] {
+            const char* value = std::getenv("SHADPS4_EMPTY_DRAWS");
+            return value ? value[0] - '0' : 0;
+        }();
+        if (empty_draws > 0) {
+            static u64 draws = 0, empty = 0;
+            const auto& r = liverpool->regs;
+            const bool is_empty = r.num_indices == 0 || r.num_instances.NumInstances() == 0;
+            ++draws;
+            empty += is_empty;
+            if ((draws & 0xfffff) == 0) {
+                LOG_INFO(Render_Vulkan, "EMPTY_DRAWS: {} of {} direct draws ({:.2f}%)", empty,
+                         draws, 100.0 * empty / draws);
+            }
+            if (is_empty && empty_draws == 2) {
+                return;
+            }
+        }
+    }
+
     const auto& regs = liverpool->regs;
     // Scoped timers: the stack scanner reports inclusive frequencies with false positives and
     // cannot apportion cost here. See Common::FaultMonitor for why these exist.
