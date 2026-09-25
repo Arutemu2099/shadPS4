@@ -259,6 +259,7 @@ namespace {
 // highest class on hybrid parts). Index 0..63 only; enough for this machine (20 threads).
 struct CpuClasses {
     std::array<u8, 64> cls{};
+    std::array<u8, 64> core{};
     std::array<ULONG, 64> ids{};
     u8 max_class{};
     size_t count{};
@@ -278,6 +279,7 @@ const CpuClasses& GetCpuClasses() {
             if (e->Type == CpuSetInformation && e->CpuSet.LogicalProcessorIndex < 64) {
                 const auto idx = e->CpuSet.LogicalProcessorIndex;
                 c.cls[idx] = e->CpuSet.EfficiencyClass;
+                c.core[idx] = e->CpuSet.CoreIndex;
                 c.ids[idx] = e->CpuSet.Id;
                 c.max_class = std::max<u8>(c.max_class, e->CpuSet.EfficiencyClass);
                 c.count = std::max<size_t>(c.count, idx + 1);
@@ -311,7 +313,37 @@ void ApplyCommandProcessorPlacement() {
     const bool prio_ok = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     bool sets_ok = true;
     size_t p_cores = 0;
-    if (mode >= 2) {
+    if (mode == 3) {
+        // A whole P-core for this thread: the last performance core's first logical processor
+        // for us, and every other thread (process default) kept off both of its siblings.
+        const auto& c = GetCpuClasses();
+        int chosen = -1;
+        for (size_t i = 0; i < c.count; ++i) {
+            if (c.cls[i] == c.max_class) {
+                chosen = int(i);
+            }
+        }
+        if (chosen >= 0) {
+            const u8 core = c.core[chosen];
+            int first = chosen;
+            while (first > 0 && c.core[first - 1] == core && c.cls[first - 1] == c.max_class) {
+                --first;
+            }
+            std::vector<ULONG> others;
+            for (size_t i = 0; i < c.count; ++i) {
+                if (c.core[i] != core || c.cls[i] != c.cls[first]) {
+                    others.push_back(c.ids[i]);
+                }
+            }
+            const ULONG mine = c.ids[first];
+            sets_ok = SetProcessDefaultCpuSets(GetCurrentProcess(), others.data(),
+                                               ULONG(others.size())) &&
+                      SetThreadSelectedCpuSets(GetCurrentThread(), &mine, 1);
+            p_cores = others.size();
+            LOG_INFO(Common, "SHADPS4_CP_QOS=3: CP on logical {} (core {}), {} logical for the rest",
+                     first, core, others.size());
+        }
+    } else if (mode >= 2) {
         const auto& c = GetCpuClasses();
         std::vector<ULONG> ids;
         for (size_t i = 0; i < c.count; ++i) {

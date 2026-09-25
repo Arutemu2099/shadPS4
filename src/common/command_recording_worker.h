@@ -3,6 +3,18 @@
 
 #pragma once
 
+#include <cstdlib>
+
+#include <cstdio>
+
+#include <string>
+
+#include <algorithm>
+
+#include <vector>
+
+#include <typeinfo>
+
 #include <array>
 #include <atomic>
 #include <cassert>
@@ -241,6 +253,57 @@ public:
     }
 
 private:
+    // SHADPS4_RECORD_BYTES_STATS=1 (diagnostic): bytes recorded per command type (producer only).
+    static bool RecordBytesStatsEnabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("SHADPS4_RECORD_BYTES_STATS");
+            return value && value[0] == '1';
+        }();
+        return enabled;
+    }
+    static void NoteRecordBytes(const char* type, std::size_t bytes) {
+        struct Entry {
+            const char* type;
+            std::uint64_t count;
+            std::uint64_t bytes;
+        };
+        static std::vector<Entry> entries;
+        static std::uint64_t total = 0;
+        auto it = std::find_if(entries.begin(), entries.end(),
+                               [type](const Entry& e) { return e.type == type; });
+        if (it == entries.end()) {
+            entries.push_back({type, 0, 0});
+            it = entries.end() - 1;
+        }
+        ++it->count;
+        it->bytes += bytes;
+        if ((++total & ((1u << 21) - 1)) != 0) {
+            return;
+        }
+        std::sort(entries.begin(), entries.end(),
+                  [](const Entry& a, const Entry& b) { return a.bytes > b.bytes; });
+        std::uint64_t all_bytes = 0;
+        for (const auto& e : entries) {
+            all_bytes += e.bytes;
+        }
+        std::string line = "RECORD_BYTES: records " + std::to_string(total) + " bytes " +
+                           std::to_string(all_bytes);
+        for (std::size_t i = 0; i < (std::min<std::size_t>)(entries.size(), 8); ++i) {
+            std::string name = entries[i].type;
+            if (name.size() > 90) {
+                name = name.substr(name.size() - 90);
+            }
+            line += " | " + std::to_string(entries[i].count) + "x " +
+                    std::to_string(entries[i].bytes / (std::max<std::uint64_t>)(entries[i].count, 1)) +
+                    "B " + name;
+        }
+        std::fprintf(stderr, "%s\n", line.c_str());
+        std::fflush(stderr);
+        for (auto& e : entries) {
+            e.count = e.bytes = 0;
+        }
+    }
+
     using Clock = std::chrono::steady_clock;
 
     static std::uint64_t ToNanoseconds(const Clock::duration duration) noexcept {
@@ -251,6 +314,9 @@ private:
     template <typename Callable, typename Construct>
     void RecordImpl(Construct&& construct, const std::size_t object_bytes,
                     const std::size_t object_alignment, const std::size_t payload_bytes) {
+        if (RecordBytesStatsEnabled()) {
+            NoteRecordBytes(typeid(Callable).name(), object_bytes + payload_bytes);
+        }
         if (TryRecordFast<Callable>(construct, object_bytes, object_alignment, payload_bytes)) {
             return;
         }

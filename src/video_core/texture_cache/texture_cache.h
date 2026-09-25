@@ -140,6 +140,28 @@ public:
     void RestoreStencilShadow(ImageId depth_id);
     void CopyStencilAspect(ImageId src_id, ImageId dst_id);
     std::unordered_map<VAddr, ImageId> stencil_shadows;
+    // SHADPS4_STENCIL_PLANE_MERGE=1: guest stencil addresses of bound depth targets. A storage
+    // write to the R8 placeholder at one of them (Pro depth+stencil resolve compute) is merged
+    // into the depth's stencil aspect when that depth is next bound as a depth target.
+    std::unordered_set<VAddr> stencil_plane_addrs;
+
+public:
+    static bool StencilPlaneMerge() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("SHADPS4_STENCIL_PLANE_MERGE");
+            return value && value[0] == '1';
+        }();
+        return enabled;
+    }
+    /// Called by the storage-image bind path for written images with no live depth association.
+    void NoteStorageWrite(Image& image) {
+        if (StencilPlaneMerge() && !image.info.props.is_depth &&
+            stencil_plane_addrs.contains(image.info.guest_address)) {
+            image.stencil_plane_written = true;
+        }
+    }
+
+public:
 
     [[nodiscard]] ImageId ResolveDepthOverlap(const ImageInfo& requested_info, BindingType binding,
                                               ImageId cache_img_id);

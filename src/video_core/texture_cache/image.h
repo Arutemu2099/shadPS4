@@ -157,6 +157,8 @@ public:
     VAddr track_addr_end = 0;
     ImageId depth_id{};
     u64 depth_uid{};
+    // SHADPS4_STENCIL_PLANE_MERGE: written as a storage image since its last merge into a depth.
+    bool stencil_plane_written{};
 
     // Resource state tracking
     vk::ImageUsageFlags usage_flags;

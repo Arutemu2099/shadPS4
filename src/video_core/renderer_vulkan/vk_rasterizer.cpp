@@ -1423,6 +1423,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                     image_id = depth_image_id;
                     image = &texture_cache.GetImage(image_id);
                 }
+            } else if (image_desc.is_written &&
+                       desc.type == VideoCore::TextureCache::BindingType::Storage) {
+                texture_cache.NoteStorageWrite(*image);
             }
             if (image->binding.is_bound) {
                 // The image is already bound. In case if it is about to be used as storage we
@@ -1952,7 +1955,40 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
 }
 
 void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
-    UpdateViewportScissorState();
+    // SHADPS4_VIEWPORT_MEMO=1: viewports and scissors are a pure function of context registers
+    // (and device limits), so skip recomputing them while no SET_CONTEXT_REG changed a byte.
+    // =2 recomputes anyway and checks the tracked values did not change.
+    static const int viewport_memo = [] {
+        const char* value = std::getenv("SHADPS4_VIEWPORT_MEMO");
+        return value ? value[0] - '0' : 0;
+    }();
+    const u64 epoch = liverpool->context_change_epoch;
+    if (viewport_memo == 1 && epoch == viewport_epoch) {
+        ++viewport_memo_skips;
+    } else if (viewport_memo == 2 && epoch == viewport_epoch) {
+        const auto& ds = scheduler.GetDynamicState();
+        const auto viewports = ds.viewports;
+        const auto scissors = ds.scissors;
+        UpdateViewportScissorState();
+        const auto& after = scheduler.GetDynamicState();
+        const bool same =
+            viewports.size() == after.viewports.size() && scissors.size() == after.scissors.size() &&
+            std::memcmp(viewports.data(), after.viewports.data(),
+                        viewports.size() * sizeof(viewports[0])) == 0 &&
+            std::memcmp(scissors.data(), after.scissors.data(),
+                        scissors.size() * sizeof(scissors[0])) == 0;
+        ++viewport_memo_skips;
+        if (!same) {
+            ++viewport_memo_mismatches;
+        }
+        if ((viewport_memo_skips & 0xfffff) == 0) {
+            LOG_INFO(Render_Vulkan, "VIEWPORT_MEMO verify: skippable {} mismatches {}",
+                     viewport_memo_skips, viewport_memo_mismatches);
+        }
+    } else {
+        UpdateViewportScissorState();
+        viewport_epoch = epoch;
+    }
     UpdateDepthStencilState();
 
     // Bounded read-only diagnostic: distinguish PS4 test/operation stencil values

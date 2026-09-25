@@ -1228,6 +1228,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     }
 
     // If there is a stencil attachment, link depth and stencil.
+    ImageId merge_stencil_id{};
     if (desc.info.stencil_addr != 0) {
         // Serialize the traversal's temporary Picked flags with FindImage, including
         // their cleanup. Also publish any new stencil mapping under that same lock.
@@ -1254,6 +1255,27 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
         // Inserting the placeholder can relocate SlotVector's storage, invalidating
         // the depth reference acquired above. Reacquire through its stable slot ID.
         stencil_image.AssociateDepth(image_id, slot_images[image_id].image_uid);
+        if (StencilPlaneMerge()) {
+            stencil_plane_addrs.insert(desc.info.stencil_addr);
+            const Image& depth = slot_images[image_id];
+            if (stencil_image.stencil_plane_written && stencil_id != image_id &&
+                !stencil_image.info.props.is_depth && depth.info.props.has_stencil &&
+                depth.info.num_samples == 1 && stencil_image.info.num_samples == 1 &&
+                stencil_image.info.size == depth.info.size) {
+                stencil_image.stencil_plane_written = false;
+                merge_stencil_id = stencil_id;
+            }
+        }
+    }
+    if (merge_stencil_id) {
+        CopyStencilAspect(merge_stencil_id, image_id);
+        static u64 merges = 0;
+        ++merges;
+        if (merges <= 16 || (merges & 1023) == 0) {
+            LOG_INFO(Render_Vulkan, "STENCIL_PLANE_MERGE: {:#x} -> depth {:#x} {}x{} (merge {})",
+                     desc.info.stencil_addr, desc.info.guest_address, desc.info.size.width,
+                     desc.info.size.height, merges);
+        }
     }
 
     return slot_images[image_id].FindView(desc.view_info, false);

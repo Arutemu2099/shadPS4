@@ -104,6 +104,9 @@ private:
 
     void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed) const;
     void UpdateViewportScissorState() const;
+    mutable u64 viewport_epoch{0};
+    mutable u64 viewport_memo_skips{0};
+    mutable u64 viewport_memo_mismatches{0};
     void UpdateDepthStencilState() const;
     void UpdatePrimitiveState(bool is_indexed) const;
     void UpdateRasterizationState() const;

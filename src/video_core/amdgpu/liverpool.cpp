@@ -28,6 +28,14 @@
 namespace AmdGpu {
 
 namespace {
+bool ViewportMemoEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_VIEWPORT_MEMO");
+        return value && value[0] >= '1';
+    }();
+    return enabled;
+}
+
 // SHADPS4_IB_TASK_FREE=1 (port of upstream PR #4996): an INDIRECT_BUFFER packet runs a nested
 // coroutine whose final_suspend keeps its frame alive; nothing destroyed it, so every IB packet
 // leaked one frame.
@@ -517,6 +525,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::ClearState: {
                 regs.SetDefaults();
+                ++context_change_epoch;
                 if constexpr (Common::FaultMonitor::DetailCountersEnabled) {
                     ++regs_generation;
                     ++regs_generation_ctx;
@@ -545,6 +554,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (Common::FaultMonitor::DetailCountersEnabled &&
                     std::memcmp(&regs.reg_array[reg_addr], payload, ctx_sz) != 0) {
                     ++regs_generation_ctx; // value-aware: only a real change dirties the key
+                }
+                if (ViewportMemoEnabled() &&
+                    std::memcmp(&regs.reg_array[reg_addr], payload, ctx_sz) != 0) {
+                    ++context_change_epoch;
                 }
                 std::memcpy(&regs.reg_array[reg_addr], payload, ctx_sz);
                 if constexpr (Common::FaultMonitor::DetailCountersEnabled) { ++regs_generation; }

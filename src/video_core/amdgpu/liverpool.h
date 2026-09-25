@@ -75,6 +75,9 @@ struct Liverpool {
     // across draws, a pipeline-key dirty flag on the context regs is viable; the probe's mismatch
     // count then says whether excluding SH program-address writes is safe. Measurement only.
     u64 regs_generation_ctx{0};
+    // SHADPS4_VIEWPORT_MEMO: bumped when a SET_CONTEXT_REG changes any byte, and on CLEAR_STATE.
+    // Only maintained while the flag is on (the value compare costs a memcmp per packet).
+    u64 context_change_epoch{1};
 
 public:
     explicit Liverpool();

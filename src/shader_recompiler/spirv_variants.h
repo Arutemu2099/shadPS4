@@ -31,8 +31,18 @@ inline bool MsaaSampleWrapEnabled() {
     return enabled;
 }
 
+/// SHADPS4_PATCH_SHADERS=1: apply user/shader/patch/*.spv like GPU.patch_shaders, without editing
+/// the config. Patches only apply when a module is compiled, so the cache is skipped as well.
+inline bool PatchShadersEnv() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_PATCH_SHADERS");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
 inline bool SpirvVariantActive() {
-    return SpirvCoherentEnabled() || MsaaSampleWrapEnabled();
+    return SpirvCoherentEnabled() || MsaaSampleWrapEnabled() || PatchShadersEnv();
 }
 
 } // namespace Shader

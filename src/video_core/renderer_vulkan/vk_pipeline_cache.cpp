@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <ranges>
 
+#include "shader_recompiler/spirv_variants.h"
 #include "common/fault_monitor.h"
 #include "common/hash.h"
 #include "common/io_file.h"
@@ -1076,7 +1077,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     vk::ShaderModule module;
 
     auto patch = GetShaderPatch(info.pgm_hash, info.stage, perm_idx, "spv");
-    const bool is_patched = patch && EmulatorSettings.IsPatchShaders();
+    const bool is_patched = patch && (EmulatorSettings.IsPatchShaders() || Shader::PatchShadersEnv());
     if (is_patched) {
         LOG_INFO(Loader, "Loaded patch for {} shader {:#x}", info.stage, info.pgm_hash);
         module = CompileSPV(*patch, instance.GetDevice());
