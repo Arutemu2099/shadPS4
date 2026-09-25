@@ -22,6 +22,7 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include "video_core/amdgpu/split_hazard.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -947,6 +948,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     rasterizer->ProcessDownloadImages();
                 }
                 g_cp_wait.NoteWrite(event_eos->Address());
+                SplitHazard::NoteWrite(reinterpret_cast<u64>(event_eos->Address()), 8);
                 VideoCore::ProtectFence();
                 if ((FenceAtGpu() == 1 || FenceAtGpu() == 2) && rasterizer &&
                     event_eos->command != PM4CmdEventWriteEos::Command::GdsStore) {
@@ -972,6 +974,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     rasterizer->ProcessDownloadImages();
                 }
                 g_cp_wait.NoteWrite(event_eop->Address<u32>());
+                SplitHazard::NoteWrite(reinterpret_cast<u64>(event_eop->Address<u32>()), 8);
                 VideoCore::ProtectFence();
                 if (FenceAtGpu() != 0 && rasterizer) {
                     rasterizer->DeferToGpu(
@@ -1036,6 +1039,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const u32 data_size = (header->type3.count.Value() - 2) * 4;
                 u64* address = write_data->Address<u64*>();
                 g_cp_wait.NoteWrite(address);
+                SplitHazard::NoteWrite(reinterpret_cast<u64>(address), data_size);
                 VideoCore::ProtectFence();
                 if (!write_data->wr_one_addr.Value()) {
                     std::memcpy(address, write_data->data, data_size);

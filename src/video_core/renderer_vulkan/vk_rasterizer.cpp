@@ -16,6 +16,7 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "shader_recompiler/runtime_info.h"
+#include "video_core/amdgpu/split_hazard.h"
 #include "video_core/host_shaders/neo_id_derive_comp.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -554,6 +555,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
 
+    AmdGpu::SplitHazard::NoteDraw(liverpool->regs.ps_program, liverpool->regs.vs_program);
     {
         // SHADPS4_EMPTY_DRAWS=1 counts direct draws with zero indices or zero instances (they render
         // nothing but still bind every resource); =2 also skips them. Clears and resolves are
@@ -2060,10 +2062,16 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
 }
 
 void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
+    if (!is_gds) {
+        AmdGpu::SplitHazard::NoteWrite(address, num_bytes);
+    }
     buffer_cache.FillBuffer(address, num_bytes, value, is_gds);
 }
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+    if (!dst_gds) {
+        AmdGpu::SplitHazard::NoteWrite(dst, num_bytes);
+    }
     buffer_cache.CopyBuffer(dst, src, num_bytes, dst_gds, src_gds);
 }
 
