@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <thread>
+#include <unordered_map>
 #include "common/alignment.h"
 #include "common/buffer_sample_probe.h"
 #include "common/debug.h"
@@ -177,6 +178,91 @@ static u64 StreamCopyMaxSize() {
     }();
     return value;
 }
+
+namespace {
+/// SHADPS4_BUFFER_TRAFFIC=1 (diagnostic, costs a tracker query per binding): buffer bindings
+/// per 16 MB guest region and per size class - kind, bytes bound, whether the range had
+/// CPU-modified pages at bind time, and bytes uploaded - logged every ~2 s. Sizes plan (b).
+struct BufferTraffic {
+    struct Region {
+        u64 calls[4]{}; // ro, ro_texel, written, other-caller share of ro
+        u64 bound{}, dirty{}, uploaded{};
+    };
+    std::unordered_map<u64, Region> regions;
+    u64 size_calls[6]{}, size_dirty[6]{}, size_bound[6]{}, size_uploaded[6]{};
+    u64 calls{}, last_frames{};
+    std::chrono::steady_clock::time_point last{std::chrono::steady_clock::now()};
+
+    static bool Enabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("SHADPS4_BUFFER_TRAFFIC");
+            return value && value[0] == '1';
+        }();
+        return enabled;
+    }
+
+    void Record(VAddr addr, u32 size, bool written, bool texel, bool other_caller, bool dirty,
+                u64 uploaded) {
+        auto& r = regions[addr >> 24];
+        ++r.calls[written ? 2 : texel ? 1 : 0];
+        r.calls[3] += (!written && !texel && other_caller);
+        r.bound += size;
+        r.dirty += dirty;
+        r.uploaded += uploaded;
+        const int b = size <= 256 ? 0 : size <= 4096 ? 1 : size <= 65536 ? 2
+                    : size <= (1u << 20) ? 3 : size <= (16u << 20) ? 4 : 5;
+        ++size_calls[b];
+        size_dirty[b] += dirty;
+        size_bound[b] += size;
+        size_uploaded[b] += uploaded;
+        if ((++calls & 1023) != 0) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last < std::chrono::seconds(2)) {
+            return;
+        }
+        const u64 frames_now = Common::FaultMonitor::presented_frames.load();
+        const double f = static_cast<double>(std::max<u64>(frames_now - last_frames, 1));
+        std::vector<std::pair<u64, Region>> sorted(regions.begin(), regions.end());
+        std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+            return a.second.calls[0] + a.second.calls[1] + a.second.calls[2] >
+                   b.second.calls[0] + b.second.calls[1] + b.second.calls[2];
+        });
+        u64 total = 0, total_dirty = 0, total_up = 0;
+        for (const auto& [base, reg] : sorted) {
+            total += reg.calls[0] + reg.calls[1] + reg.calls[2];
+            total_dirty += reg.dirty;
+            total_up += reg.uploaded;
+        }
+        std::string out = fmt::format(
+            "BufferTraffic: frames={:.0f} binds/frame={:.0f} dirty/frame={:.0f} "
+            "upload={:.0f}kB/frame regions={} | size(<=256,4K,64K,1M,16M,>16M) binds/frame",
+            f, total / f, total_dirty / f, total_up / 1024.0 / f, sorted.size());
+        for (int i = 0; i < 6; ++i) {
+            out += fmt::format(" {:.0f}(d{:.0f},up{:.0f}k)", size_calls[i] / f, size_dirty[i] / f,
+                               size_uploaded[i] / 1024.0 / f);
+        }
+        out += " | top regions base:ro/texel/written(other) dirty up_kB bound_MB per frame:";
+        for (size_t i = 0; i < std::min<size_t>(10, sorted.size()); ++i) {
+            const auto& reg = sorted[i].second;
+            out += fmt::format(" {:#x}:{:.0f}/{:.0f}/{:.0f}({:.0f}) d{:.0f} up{:.0f} b{:.1f}",
+                               sorted[i].first << 24, reg.calls[0] / f, reg.calls[1] / f,
+                               reg.calls[2] / f, reg.calls[3] / f, reg.dirty / f,
+                               reg.uploaded / 1024.0 / f, reg.bound / 1048576.0 / f);
+        }
+        LOG_INFO(Render, "{}", out);
+        regions.clear();
+        std::fill(std::begin(size_calls), std::end(size_calls), 0);
+        std::fill(std::begin(size_dirty), std::end(size_dirty), 0);
+        std::fill(std::begin(size_bound), std::end(size_bound), 0);
+        std::fill(std::begin(size_uploaded), std::end(size_uploaded), 0);
+        last = now;
+        last_frames = frames_now;
+    }
+};
+BufferTraffic g_buffer_traffic;
+} // namespace
 
 /// Expands a read fault to the selected window, clipped to the buffer that already covers it.
 /// The clip is what keeps this safe: `FindBuffer` has already run on the original range, so
@@ -1809,8 +1895,16 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     }
     const auto t_sync = Common::FaultMonitor::Now();
     const auto t_sample_sync = sample.Now();
+    const bool traffic = BufferTraffic::Enabled();
+    const bool traffic_dirty = traffic && memory_tracker->IsRegionCpuModified(device_addr, size);
+    last_sync_upload_bytes = 0;
     SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer,
                       sample.Active() ? &sample : nullptr);
+    if (traffic) {
+        g_buffer_traffic.Record(device_addr, size, is_written, is_texel_buffer,
+                                sample_caller == Common::BufferSampleCaller::Other, traffic_dirty,
+                                last_sync_upload_bytes);
+    }
     if (memo_entry) {
         // Epoch read before the walk: a clear during it makes the record miss next time.
         *memo_entry = {device_addr, size, memo_epoch};
@@ -2107,6 +2201,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             src_buffer = defer ? ReserveDeferredCopies(buffer, copies, total_size_bytes)
                                : UploadCopies(buffer, copies, total_size_bytes);
         });
+    last_sync_upload_bytes = total_size_bytes;
     if (defer) {
         PageManager::SetDeferredProtectSink(nullptr);
         if (!src_buffer && !deferred_protects.empty()) {

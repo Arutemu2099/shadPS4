@@ -423,6 +423,7 @@ private:
     FaultManager fault_manager;
     std::unique_ptr<MemoryTracker> memory_tracker;
     StreamBuffer staging_buffer;
+    u64 last_sync_upload_bytes{}; // SHADPS4_BUFFER_TRAFFIC: bytes the last SynchronizeBuffer uploaded
     StreamBuffer stream_buffer;
     StreamBuffer download_buffer;
     StreamBuffer device_buffer;

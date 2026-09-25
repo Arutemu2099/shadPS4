@@ -241,6 +241,21 @@ std::string WriteFaultPageReport(u64 frames, u64 d_gfx, u64 d_asc) {
     for (size_t i = 0; i < std::min<size_t>(6, spans.size()); ++i) {
         out += fmt::format(" {:#x}+{}p", spans[i].first << 12, spans[i].second);
     }
+    // Where the written pages live: 16 MB guest regions by fault count (plan b sizing).
+    std::unordered_map<u64, std::pair<u64, u64>> regions; // region -> pages, faults
+    for (const auto& [page, st] : pages) {
+        auto& r = regions[page >> 12];
+        ++r.first;
+        r.second += st.faults;
+    }
+    std::vector<std::pair<u64, std::pair<u64, u64>>> by_region(regions.begin(), regions.end());
+    std::sort(by_region.begin(), by_region.end(),
+              [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+    out += fmt::format(" regions16M={} top_regions:", by_region.size());
+    for (size_t i = 0; i < std::min<size_t>(8, by_region.size()); ++i) {
+        out += fmt::format(" {:#x}:{}p/{:.0f}f", by_region[i].first << 24,
+                           by_region[i].second.first, by_region[i].second.second / f);
+    }
     return out;
 }
 
