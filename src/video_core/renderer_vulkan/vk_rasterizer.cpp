@@ -6,6 +6,7 @@
 #include <string>
 #include <unordered_set>
 
+#include "common/thread.h"
 #include "common/debug.h"
 #include "common/buffer_sample_probe.h"
 #include "common/draw_sample_probe.h"
@@ -358,8 +359,48 @@ void Rasterizer::EliminateFastClear() {
     ScopeMarkerEnd();
 }
 
+// SHADPS4_REG_SCAN=<hex>[,<hex>...] (diagnostic): every 512th draw, scan all registers for the
+// given 32-bit values (e.g. a surface address >> 8) and log each register index that holds one,
+// once. Finds which register points at a surface the emulator does not model (Pro ID buffer).
+void Rasterizer::ScanRegistersForValue() {
+    static const std::vector<u32> targets = [] {
+        std::vector<u32> out;
+        const char* value = std::getenv("SHADPS4_REG_SCAN");
+        if (!value) {
+            return out;
+        }
+        std::string_view list{value};
+        while (!list.empty()) {
+            const size_t comma = list.find(',');
+            const auto item = list.substr(0, comma);
+            out.push_back(u32(std::strtoull(std::string(item).c_str(), nullptr, 16)));
+            list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
+        }
+        return out;
+    }();
+    if (targets.empty()) {
+        return;
+    }
+    static u64 draws = 0;
+    if ((draws++ & 511) != 0) {
+        return;
+    }
+    static std::unordered_set<u64> seen;
+    const auto& regs = liverpool->regs.reg_array;
+    for (u32 i = 0; i < regs.size(); ++i) {
+        for (const u32 target : targets) {
+            if (regs[i] == target && seen.insert((u64(i) << 32) | target).second) {
+                LOG_INFO(Render_Vulkan, "REG_SCAN: value {:#x} in register word {:#x} (draw {})",
+                         target, i, draws);
+            }
+        }
+    }
+}
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
+    Common::SampleCommandProcessorCore();
+    ScanRegistersForValue();
 
     auto sample = Common::DrawSampleProbe::Begin();
     const auto t_entry = Common::FaultMonitor::Now();

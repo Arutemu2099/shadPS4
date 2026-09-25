@@ -3,7 +3,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <cstdlib>
 #include <ctime>
+#include <vector>
 #include <string>
 #include <thread>
 
@@ -248,6 +252,117 @@ void AccurateTimer::End() {
     total_wait +=
         target_interval - std::chrono::duration_cast<std::chrono::nanoseconds>(now - start_time);
 }
+
+#ifdef _WIN32
+namespace {
+// Efficiency class per logical processor index from the CPU set list (P-cores report the
+// highest class on hybrid parts). Index 0..63 only; enough for this machine (20 threads).
+struct CpuClasses {
+    std::array<u8, 64> cls{};
+    std::array<ULONG, 64> ids{};
+    u8 max_class{};
+    size_t count{};
+};
+const CpuClasses& GetCpuClasses() {
+    static const CpuClasses classes = [] {
+        CpuClasses c{};
+        ULONG len = 0;
+        GetSystemCpuSetInformation(nullptr, 0, &len, GetCurrentProcess(), 0);
+        std::vector<u8> buf(len);
+        auto* info = reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buf.data());
+        if (!GetSystemCpuSetInformation(info, len, &len, GetCurrentProcess(), 0)) {
+            return c;
+        }
+        for (ULONG off = 0; off < len;) {
+            auto* e = reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buf.data() + off);
+            if (e->Type == CpuSetInformation && e->CpuSet.LogicalProcessorIndex < 64) {
+                const auto idx = e->CpuSet.LogicalProcessorIndex;
+                c.cls[idx] = e->CpuSet.EfficiencyClass;
+                c.ids[idx] = e->CpuSet.Id;
+                c.max_class = std::max<u8>(c.max_class, e->CpuSet.EfficiencyClass);
+                c.count = std::max<size_t>(c.count, idx + 1);
+            }
+            off += e->Size;
+        }
+        return c;
+    }();
+    return classes;
+}
+} // namespace
+
+void ApplyCommandProcessorPlacement() {
+    const char* value = std::getenv("SHADPS4_CP_QOS");
+    const int mode = value ? value[0] - '0' : 0;
+    if (mode <= 0) {
+        return;
+    }
+    PROCESS_POWER_THROTTLING_STATE throttling{};
+    throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    throttling.StateMask = 0; // always high QoS
+    const bool proc_ok = SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling,
+                                               &throttling, sizeof(throttling));
+    THREAD_POWER_THROTTLING_STATE thread_throttling{};
+    thread_throttling.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+    thread_throttling.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+    thread_throttling.StateMask = 0;
+    const bool thread_ok = SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling,
+                                                &thread_throttling, sizeof(thread_throttling));
+    const bool prio_ok = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    bool sets_ok = true;
+    size_t p_cores = 0;
+    if (mode >= 2) {
+        const auto& c = GetCpuClasses();
+        std::vector<ULONG> ids;
+        for (size_t i = 0; i < c.count; ++i) {
+            if (c.cls[i] == c.max_class) {
+                ids.push_back(c.ids[i]);
+            }
+        }
+        p_cores = ids.size();
+        sets_ok = !ids.empty() &&
+                  SetThreadSelectedCpuSets(GetCurrentThread(), ids.data(), ULONG(ids.size()));
+    }
+    LOG_INFO(Common, "SHADPS4_CP_QOS={}: process throttling off {}, thread {}, priority {}, "
+                     "P-core set {} ({} logical)",
+             mode, proc_ok, thread_ok, prio_ok, sets_ok, p_cores);
+}
+
+void SampleCommandProcessorCore() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_CP_CORE_STATS");
+        return value && value[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    static std::array<u64, 64> hits{};
+    static u64 samples = 0;
+    const DWORD cpu = GetCurrentProcessorNumber();
+    ++hits[cpu & 63];
+    if (++samples % 200000 != 0) {
+        return;
+    }
+    const auto& c = GetCpuClasses();
+    u64 p = 0;
+    std::string top;
+    for (size_t i = 0; i < 64; ++i) {
+        if (hits[i] && c.cls[i] == c.max_class) {
+            p += hits[i];
+        }
+        if (hits[i] * 20 >= samples) {
+            top += fmt::format(" cpu{}(c{}):{:.0f}%", i, c.cls[i], 100.0 * hits[i] / samples);
+        }
+    }
+    LOG_INFO(Common, "CP_CORE_STATS: samples {} on P-cores {:.1f}%{}", samples,
+             100.0 * p / samples, top);
+    hits.fill(0);
+    samples = 0;
+}
+#else
+void ApplyCommandProcessorPlacement() {}
+void SampleCommandProcessorCore() {}
+#endif
 
 std::string GetCurrentThreadName() {
     using namespace Libraries::Kernel;

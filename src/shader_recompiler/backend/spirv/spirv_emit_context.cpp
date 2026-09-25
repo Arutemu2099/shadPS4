@@ -756,7 +756,7 @@ void EmitContext::DefinePushDataBlock() {
 }
 
 EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_storage, bool is_written, u32 elem_shift,
-                                                 BufferType buffer_type, Id data_type) {
+                                                 BufferType buffer_type, Id data_type, bool is_coherent) {
     // Define array type.
     const Id max_num_items = ConstU32(u32(profile.max_ubo_size) >> elem_shift);
     const Id record_array_type{is_storage ? TypeRuntimeArray(data_type)
@@ -781,6 +781,10 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_storage, bool is_writte
     Decorate(id, spv::Decoration::DescriptorSet, 0U);
     if (is_storage && !is_written) {
         Decorate(id, spv::Decoration::NonWritable);
+    } else if (is_storage && is_coherent) {
+        // Port of upstream #4896: the guest V# MTYPE marks this buffer as shared between
+        // invocations; Coherent forbids caching its accesses across barriers.
+        Decorate(id, spv::Decoration::Coherent);
     }
     switch (buffer_type) {
     case BufferType::GdsBuffer:
@@ -813,6 +817,9 @@ void EmitContext::DefineBuffers() {
     for (const auto& desc : info.buffers) {
         const auto buf_sharp = desc.GetSharp(info);
         const bool is_storage = desc.IsStorage(buf_sharp);
+        // SHADPS4_SPIRV_COHERENT=1 (default off, disables the pipeline cache for the run).
+        const bool is_coherent = Shader::SpirvCoherentEnabled() &&
+                                 (desc.buffer_type == BufferType::SharedMemory || buf_sharp.mtype == 3);
 
         // Set indexes for special buffers.
         if (desc.buffer_type == BufferType::Flatbuf) {
@@ -827,23 +834,28 @@ void EmitContext::DefineBuffers() {
         auto& spv_buffer = buffers.emplace_back(binding.buffer++, desc.buffer_type);
         if (True(desc.used_types & IR::Type::U64)) {
             spv_buffer.Alias(PointerType::U64) =
-                DefineBuffer(is_storage, desc.is_written, 3, desc.buffer_type, U64);
+                DefineBuffer(is_storage, desc.is_written, 3, desc.buffer_type, U64,
+                             is_coherent);
         }
         if (True(desc.used_types & IR::Type::U32)) {
             spv_buffer.Alias(PointerType::U32) =
-                DefineBuffer(is_storage, desc.is_written, 2, desc.buffer_type, U32[1]);
+                DefineBuffer(is_storage, desc.is_written, 2, desc.buffer_type, U32[1],
+                             is_coherent);
         }
         if (True(desc.used_types & IR::Type::F32)) {
             spv_buffer.Alias(PointerType::F32) =
-                DefineBuffer(is_storage, desc.is_written, 2, desc.buffer_type, F32[1]);
+                DefineBuffer(is_storage, desc.is_written, 2, desc.buffer_type, F32[1],
+                             is_coherent);
         }
         if (True(desc.used_types & IR::Type::U16)) {
             spv_buffer.Alias(PointerType::U16) =
-                DefineBuffer(is_storage, desc.is_written, 1, desc.buffer_type, U16);
+                DefineBuffer(is_storage, desc.is_written, 1, desc.buffer_type, U16,
+                             is_coherent);
         }
         if (True(desc.used_types & IR::Type::U8)) {
             spv_buffer.Alias(PointerType::U8) =
-                DefineBuffer(is_storage, desc.is_written, 0, desc.buffer_type, U8);
+                DefineBuffer(is_storage, desc.is_written, 0, desc.buffer_type, U8,
+                             is_coherent);
         }
         ++binding.unified;
     }

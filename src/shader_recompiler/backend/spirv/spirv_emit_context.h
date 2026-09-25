@@ -11,6 +11,7 @@
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/value.h"
 #include "shader_recompiler/profile.h"
+#include "shader_recompiler/spirv_variants.h"
 
 namespace Shader::Backend::SPIRV {
 
@@ -401,7 +402,7 @@ private:
                                     bool output, bool loaded = false, bool array = false);
 
     BufferSpv DefineBuffer(bool is_storage, bool is_written, u32 elem_shift, BufferType buffer_type,
-                           Id data_type);
+                           Id data_type, bool is_coherent = false);
 
     Id DefineFloat32ToUfloatM5(u32 mantissa_bits, std::string_view name);
     Id DefineUfloatM5ToFloat32(u32 mantissa_bits, std::string_view name);

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <unordered_set>
 #include <cstdlib>
 #include <ranges>
 
@@ -876,6 +877,32 @@ bool PipelineCache::RefreshGraphicsKey() {
     // Force all color samples to match depth samples to avoid unsupported MSAA configuration
     if (color_samples != 0) {
         const bool depth_mismatch = db_enabled && color_samples != key.depth_samples;
+        // SHADPS4_MIXED_SAMPLES_LOG=1 (diagnostic): each distinct shader pair / sample-count
+        // combination that draws with color samples != depth samples, logged once. These are
+        // the pipelines VK_NV_framebuffer_mixed_samples keeps mixed (Pro skin edge highlights).
+        static const bool log_mixed = [] {
+            const char* value = std::getenv("SHADPS4_MIXED_SAMPLES_LOG");
+            return value && value[0] == '1';
+        }();
+        if (log_mixed && depth_mismatch && regs.ps_program.Address<u32*>() &&
+            regs.vs_program.Address<u32*>()) {
+            static std::unordered_set<u64> seen;
+            const u64 fs_hash = AmdGpu::GetParams(regs.ps_program).hash;
+            const u64 vs_hash = AmdGpu::GetParams(regs.vs_program).hash;
+            const u64 id = fs_hash ^ (vs_hash * 31) ^ (u64(color_samples) << 56) ^
+                           (u64(key.depth_samples) << 60) ^ (u64(std::bit_cast<u32>(regs.blend_control[0])) << 8);
+            if (seen.insert(id).second) {
+                LOG_INFO(Render_Vulkan,
+                         "MIXED_SAMPLES: fs {:#018x} vs {:#018x} color_samples {} depth_samples {} "
+                         "all_color_same {} blend0 {:#010x} mrt_mask {:#x} depth_test {} "
+                         "depth_write {} extension {}",
+                         fs_hash, vs_hash, color_samples, key.depth_samples,
+                         all_color_samples_same, std::bit_cast<u32>(regs.blend_control[0]), key.mrt_mask,
+                         bool(regs.depth_control.depth_enable),
+                         bool(regs.depth_control.depth_write_enable),
+                         instance.IsMixedDepthSamplesSupported());
+            }
+        }
         if (!all_color_samples_same && !instance.IsMixedAnySamplesSupported() ||
             all_color_samples_same && depth_mismatch && !instance.IsMixedDepthSamplesSupported()) {
             key.color_samples.fill(key.depth_samples);

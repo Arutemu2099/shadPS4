@@ -222,11 +222,19 @@ Id EmitImageRead(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod
     const auto& texture = ctx.images[handle & 0xFFFF];
     const Id color_type = texture.data_types->Get(4);
     ImageOperands operands;
-    operands.Add(spv::ImageOperandsMask::Sample, ms);
+    const bool wrap_ms = Shader::MsaaSampleWrapEnabled() && !texture.is_storage &&
+                         texture.view_type == AmdGpu::ImageType::Color2DMsaa && Sirit::ValidId(ms);
+    if (!wrap_ms) {
+        operands.Add(spv::ImageOperandsMask::Sample, ms);
+    }
     Id texel;
     if (!texture.is_storage) {
         const Id image = ctx.OpLoad(texture.image_type, texture.id);
-        if (texture.view_type != AmdGpu::ImageType::Color2DMsaa) {
+        if (wrap_ms) {
+            // GCN hardware wraps out-of-range MSAA sample indices (upstream c1d5b311).
+            const Id sample_count = ctx.OpImageQuerySamples(ctx.U32[1], image);
+            operands.Add(spv::ImageOperandsMask::Sample, ctx.OpUMod(ctx.U32[1], ms, sample_count));
+        } else if (texture.view_type != AmdGpu::ImageType::Color2DMsaa) {
             if (Sirit::ValidId(ms)) {
                 LOG_ERROR(Render_Recompiler, "image is not MS but ms operand is provided");
             }

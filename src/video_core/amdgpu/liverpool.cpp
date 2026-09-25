@@ -275,6 +275,7 @@ void Liverpool::Process(std::stop_token stoken) {
     gpu_id = std::this_thread::get_id();
     // Bill page faults taken on this thread separately: this thread's activity IS the frame.
     Common::FaultMonitor::MarkCpThread();
+    Common::ApplyCommandProcessorPlacement();
 
     while (!stoken.stop_requested()) {
         {

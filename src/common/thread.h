@@ -49,4 +49,12 @@ public:
 
 std::string GetCurrentThreadName();
 
+/// SHADPS4_CP_QOS=1: turn off process power throttling (EcoQoS) and raise this thread to
+/// THREAD_PRIORITY_HIGHEST; =2 additionally restricts it to the performance cores (highest CPU
+/// set efficiency class). Default off. Windows only; call on the thread itself.
+void ApplyCommandProcessorPlacement();
+/// SHADPS4_CP_CORE_STATS=1: sample the logical CPU this thread runs on (call often, it is cheap)
+/// and periodically log the share on performance vs efficiency cores. Diagnostic only.
+void SampleCommandProcessorCore();
+
 } // namespace Common

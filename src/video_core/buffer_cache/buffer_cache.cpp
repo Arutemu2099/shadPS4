@@ -1538,6 +1538,28 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     scheduler.EndRendering();
     auto command_access = scheduler.AcquireCommandBuffer();
     const auto cmdbuf = command_access.Handle();
+    // SHADPS4_DOWNLOAD_BARRIER=1 (port of upstream c1d5b311 / #4889): make earlier GPU writes of
+    // the buffer visible to this transfer read. Without it the copy may read data from before
+    // the dispatch or draw that produced it (upstream: all-zero shadow readbacks).
+    static const bool download_barrier = [] {
+        const char* value = std::getenv("SHADPS4_DOWNLOAD_BARRIER");
+        return value && value[0] == '1';
+    }();
+    if (download_barrier) {
+        const vk::BufferMemoryBarrier2 pre_barrier = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+            .buffer = buffer.buffer,
+            .offset = 0,
+            .size = buffer.SizeBytes(),
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers = &pre_barrier,
+        });
+    }
     cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(), copies);
     const auto write_data = [&]() {
         auto* memory = Core::Memory::Instance();
