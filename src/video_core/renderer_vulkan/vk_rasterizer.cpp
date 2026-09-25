@@ -39,7 +39,8 @@ namespace Vulkan {
 #define SHADPS4_BINDING_PROBE 0
 #endif
 #if SHADPS4_BINDING_PROBE
-static void ProbeBindingChanges(const Pipeline* pipeline) {
+static void ProbeBindingChanges(const Pipeline* pipeline,
+                                std::span<const Shader::BoundStage> bound_stages) {
     if (pipeline->IsCompute()) {
         return;
     }
@@ -53,7 +54,8 @@ static void ProbeBindingChanges(const Pipeline* pipeline) {
     static u64 draws{}, stages{}, same_program{}, buffers{}, same_buffers{}, special{}, images{},
         same_images{}, written{};
     ++draws;
-    for (const auto* stage : pipeline->GetStages()) {
+    for (const auto& bound : bound_stages) {
+        const auto* stage = bound.info;
         if (!stage) {
             continue;
         }
@@ -62,7 +64,7 @@ static void ProbeBindingChanges(const Pipeline* pipeline) {
         same_program += prev.info == stage;
         size_t i = 0;
         for (const auto& desc : stage->buffers) {
-            const auto sharp = desc.GetSharp(*stage);
+            const auto sharp = desc.GetSharp(bound);
             if (desc.IsSpecial()) {
                 ++special;
             } else {
@@ -76,7 +78,7 @@ static void ProbeBindingChanges(const Pipeline* pipeline) {
         prev.num_buffers = i;
         i = 0;
         for (const auto& desc : stage->images) {
-            const auto sharp = desc.GetSharp(*stage);
+            const auto sharp = desc.GetSharp(bound);
             ++images;
             same_images += prev.info && i < prev.num_images &&
                            std::memcmp(&sharp, &prev.images[i], sizeof(sharp)) == 0;
@@ -324,7 +326,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
 }
 
 static std::pair<u32, u32> GetDrawOffsets(
-    const AmdGpu::Regs& regs, const Shader::Info& info,
+    const AmdGpu::Regs& regs, const Shader::BoundStage& info,
     const Shader::Gcn::FetchShaderData* fetch_shader) {
     u32 vertex_offset = regs.index_offset;
     u32 instance_offset = 0;
@@ -591,6 +593,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     if (!pipeline) {
         return;
     }
+    BindStageData(pipeline);
 
     const auto t_prepare = Common::FaultMonitor::Now();
     sample.BeginPhase(Common::DrawSampleProbe::Phase::Prepare);
@@ -667,7 +670,8 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                                     Common::FaultMonitor::DiffNs(t_begin, t_vtxbuf));
 
     sample.BeginPhase(Common::DrawSampleProbe::Phase::VertexIndexBuffers);
-    buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers);
+    buffer_cache.BindVertexBuffers(*pipeline, GetBoundStage(Shader::LogicalStage::Vertex),
+                                   buffer_barriers);
     if (is_indexed) {
         buffer_cache.BindIndexBuffer(index_offset, buffer_barriers);
     }
@@ -688,7 +692,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     const auto t_emit = Common::FaultMonitor::Now();
 
     sample.BeginPhase(Common::DrawSampleProbe::Phase::ActualDraw);
-    const auto& vs_info = pipeline->GetStage(Shader::LogicalStage::Vertex);
+    const auto& vs_info = GetBoundStage(Shader::LogicalStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
     const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
 
@@ -760,6 +764,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (!pipeline) {
         return;
     }
+    BindStageData(pipeline);
 
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
@@ -767,7 +772,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     }
     const auto state = BeginRendering(pipeline);
 
-    buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers);
+    buffer_cache.BindVertexBuffers(*pipeline, GetBoundStage(Shader::LogicalStage::Vertex),
+                                   buffer_barriers);
     if (is_indexed) {
         buffer_cache.BindIndexBuffer(0, buffer_barriers);
     }
@@ -846,8 +852,9 @@ void Rasterizer::DispatchDirect() {
     if (!pipeline) {
         return;
     }
+    BindStageData(pipeline);
 
-    const auto& cs = pipeline->GetStage(Shader::LogicalStage::Compute);
+    const auto& cs = GetBoundStage(Shader::LogicalStage::Compute);
     if (ExecuteShaderHLE(cs, liverpool->BackRegs(), cs_program, *this)) {
         return;
     }
@@ -890,6 +897,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     if (!pipeline) {
         return;
     }
+    BindStageData(pipeline);
 
     if (!BindResources(pipeline)) {
         return;
@@ -994,7 +1002,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     }
 
 #if SHADPS4_BINDING_PROBE
-    ProbeBindingChanges(pipeline);
+    ProbeBindingChanges(pipeline, BoundStages(pipeline));
 #endif
 
     set_write_index = 0;
@@ -1008,7 +1016,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     // Bind resource buffers and textures.
     Shader::Backend::Bindings binding{};
     push_data = MakeUserData(liverpool->BackRegs());
-    for (const auto* stage : pipeline->GetStages()) {
+    for (const auto& bound : BoundStages(pipeline)) {
+        const auto* stage = bound.info;
         if (!stage) {
             continue;
         }
@@ -1016,13 +1025,13 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             set_writes.resize(set_writes.size() + stage->buffers.size() + stage->images.size() +
                               stage->samplers.size());
         }
-        stage->PushUd(binding, push_data);
+        bound.PushUd(binding, push_data);
         // Split measured because BindResources is 6.8 us of the 8.0 us spent per draw - 85% - and
         // a stack scan could not tell these two apart from anything else.
         const auto t_buf = Common::FaultMonitor::Now();
-        BindBuffers(*stage, binding, push_data);
+        BindBuffers(bound, binding, push_data);
         const auto t_tex = Common::FaultMonitor::Now();
-        BindTextures(*stage, binding);
+        BindTextures(bound, binding);
         Common::FaultMonitor::CountBindSplit(Common::FaultMonitor::DiffNs(t_buf, t_tex),
                                              Common::FaultMonitor::SinceNs(t_tex));
         uses_dma |= stage->uses_dma;
@@ -1069,10 +1078,11 @@ bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
     // intended to be consumed and in such rare cases (e.g. HTile introspection, CRAA) we
     // will need its full emulation anyways.
     const auto& info = pipeline->GetStage(Shader::LogicalStage::Compute);
+    const auto& bound = GetBoundStage(Shader::LogicalStage::Compute);
 
     // Assume if a shader reads metadata, it is a copy shader.
     for (const auto& desc : info.buffers) {
-        const VAddr address = desc.GetSharp(info).base_address;
+        const VAddr address = desc.GetSharp(bound).base_address;
         if (!desc.IsSpecial() && !desc.is_written && texture_cache.IsMeta(address)) {
             return false;
         }
@@ -1085,7 +1095,7 @@ bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
     if (!info.has_bitwise_xor) {
         // Assume if a shader writes metadata without address calculation, it is a clear shader.
         for (const auto& desc : info.buffers) {
-            const VAddr address = desc.GetSharp(info).base_address;
+            const VAddr address = desc.GetSharp(bound).base_address;
             if (!desc.IsSpecial() && desc.is_written && texture_cache.ClearMeta(address)) {
                 // Assume all slices were updates
                 LOG_TRACE(Render_Vulkan, "Metadata update skipped");
@@ -1104,6 +1114,7 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     // Ensure shader only has 2 bound buffers
     const auto& cs_pgm = liverpool->BackCsRegs();
     const auto& info = pipeline->GetStage(Shader::LogicalStage::Compute);
+    const auto& bound = GetBoundStage(Shader::LogicalStage::Compute);
     if (cs_pgm.num_thread_x.full != 64 || info.buffers.size() != 2 || !info.images.empty()) {
         return false;
     }
@@ -1116,8 +1127,8 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     }
 
     // Buffers must have the same size and each thread of the dispatch must copy 1 dword of data
-    const AmdGpu::Buffer buf0 = desc0.GetSharp(info);
-    const AmdGpu::Buffer buf1 = desc1.GetSharp(info);
+    const AmdGpu::Buffer buf0 = desc0.GetSharp(bound);
+    const AmdGpu::Buffer buf1 = desc1.GetSharp(bound);
     if (buf0.GetSize() != buf1.GetSize() || cs_pgm.dim_x != (buf0.GetSize() / 256)) {
         return false;
     }
@@ -1166,6 +1177,7 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     // Ensure shader only has 2 bound buffers
     const auto& cs_pgm = liverpool->BackCsRegs();
     const auto& info = pipeline->GetStage(Shader::LogicalStage::Compute);
+    const auto& bound = GetBoundStage(Shader::LogicalStage::Compute);
     if (cs_pgm.num_thread_x.full != 64 || info.buffers.size() != 2 || !info.images.empty()) {
         return false;
     }
@@ -1178,8 +1190,8 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     }
 
     // First buffer must have size of vec4 and second the size of a single layer
-    const AmdGpu::Buffer buf0 = desc0.GetSharp(info);
-    const AmdGpu::Buffer buf1 = desc1.GetSharp(info);
+    const AmdGpu::Buffer buf0 = desc0.GetSharp(bound);
+    const AmdGpu::Buffer buf1 = desc1.GetSharp(bound);
     const u32 buf1_bpp = AmdGpu::NumBitsPerBlock(buf1.GetDataFmt());
     if (buf0.GetSize() != 16 || (cs_pgm.dim_x * 128ULL * (buf1_bpp / 8)) != buf1.GetSize()) {
         return false;
@@ -1218,15 +1230,16 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     return true;
 }
 
-void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
+void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
+    const auto& stage = *bound.info;
     buffer_bindings.clear();
 
     // Pass 1 (FindBuffer) vs pass 2 (ObtainBuffer -> SynchronizeBuffer) timed separately: this
     // function is 62% of per-draw cost and a stack scan is not trustworthy for apportioning it.
     const auto t_find = Common::FaultMonitor::Now();
     for (const auto& desc : stage.buffers) {
-        const auto vsharp = desc.GetSharp(stage);
+        const auto vsharp = desc.GetSharp(bound);
         if (!desc.IsSpecial() && vsharp.base_address != 0 && vsharp.GetSize() > 0) {
             const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
             const auto buffer_id = buffer_cache.FindBuffer(vsharp.base_address, size);
@@ -1255,9 +1268,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 bound_buffer = gds_buf;
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
                 auto& vk_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
-                const u32 ubo_size = stage.flattened_ud_buf.size() * sizeof(u32);
+                const u32 ubo_size = bound.flattened_ud_buf.size() * sizeof(u32);
                 const u64 offset =
-                    vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
+                    vk_buffer.Copy(bound.flattened_ud_buf.data(), ubo_size, alignment);
                 buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
                 bound_buffer = &vk_buffer;
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
@@ -1422,7 +1435,9 @@ void Rasterizer::FlushStencilWritebacks() {
     pending_stencil_writebacks.clear();
 }
 
-void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
+void Rasterizer::BindTextures(const Shader::BoundStage& bound,
+                              Shader::Backend::Bindings& binding) {
+    const auto& stage = *bound.info;
     u32 lookup_count{};
     image_bindings.clear();
     const u32 first_image_idx = image_infos.size();
@@ -1445,7 +1460,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     }();
     for (size_t image_slot = 0; image_slot < stage.images.size(); ++image_slot) {
         const auto& image_desc = stage.images[image_slot];
-        const auto tsharp = image_desc.GetSharp(stage);
+        const auto tsharp = image_desc.GetSharp(bound);
         if (texture_cache.IsMeta(tsharp.Address())) {
             LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
         }
@@ -1457,7 +1472,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         }
 
         const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
-        const u32 num_bindings = image_desc.NumBindings(stage);
+        const u32 num_bindings = image_desc.NumBindings(bound);
 
         const VideoCore::TextureCache::ImageDesc* decoded = nullptr;
         if (cache_decoded_images) {
@@ -1755,9 +1770,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     }
 
     for (const auto& sampler : stage.samplers) {
-        auto ssharp = sampler.GetSharp(stage);
+        auto ssharp = sampler.GetSharp(bound);
         if (sampler.disable_aniso) {
-            const auto& tsharp = stage.images[sampler.associated_image].GetSharp(stage);
+            const auto& tsharp = stage.images[sampler.associated_image].GetSharp(bound);
             if (tsharp.base_level == 0 && tsharp.last_level == 0) {
                 ssharp.max_aniso.Assign(AmdGpu::AnisoRatio::One);
             }

@@ -12,15 +12,15 @@ namespace Vulkan {
 
 static constexpr u64 COPY_SHADER_HASH = 0xfefebf9f;
 
-static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program,
-                                 Rasterizer& rasterizer) {
+static bool ExecuteCopyShaderHLE(const Shader::BoundStage& stage,
+                                 const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer) {
     auto& scheduler = rasterizer.GetScheduler();
     auto& buffer_cache = rasterizer.GetBufferCache();
 
     // Copy shader defines three formatted buffers as inputs: control, source, and destination.
-    const auto ctl_buf_sharp = info.buffers[0].GetSharp(info);
-    const auto src_buf_sharp = info.buffers[1].GetSharp(info);
-    const auto dst_buf_sharp = info.buffers[2].GetSharp(info);
+    const auto ctl_buf_sharp = stage.info->buffers[0].GetSharp(stage);
+    const auto src_buf_sharp = stage.info->buffers[1].GetSharp(stage);
+    const auto dst_buf_sharp = stage.info->buffers[2].GetSharp(stage);
     const auto buf_stride = src_buf_sharp.GetStride();
     ASSERT(buf_stride == dst_buf_sharp.GetStride());
 
@@ -121,11 +121,11 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
     return true;
 }
 
-bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
+bool ExecuteShaderHLE(const Shader::BoundStage& stage, const AmdGpu::Regs& regs,
                       const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer) {
-    switch (info.pgm_hash) {
+    switch (stage.info->pgm_hash) {
     case COPY_SHADER_HASH:
-        return ExecuteCopyShaderHLE(info, cs_program, rasterizer);
+        return ExecuteCopyShaderHLE(stage, cs_program, rasterizer);
     default:
         return false;
     }

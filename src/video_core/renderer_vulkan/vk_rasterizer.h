@@ -121,10 +121,27 @@ private:
 
     bool FilterDraw();
 
-    void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
+    void BindBuffers(const Shader::BoundStage& bound, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
-    void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
+    void BindTextures(const Shader::BoundStage& bound, Shader::Backend::Bindings& binding);
     bool BindResources(const Pipeline* pipeline);
+
+    /// Fills bound_stages from the pipeline lookup result; called right after the lookup.
+    void BindStageData(const Pipeline* pipeline) {
+        const auto stages = pipeline->GetStages();
+        const u32 first = pipeline->IsCompute() ? u32(Shader::LogicalStage::Compute) : 0u;
+        for (u32 i = 0; i < stages.size(); ++i) {
+            bound_stages[first + i] = Shader::BoundStage{stages[i]};
+        }
+    }
+    /// The bound_stages entries of `pipeline`, in Pipeline::GetStages() order.
+    std::span<const Shader::BoundStage> BoundStages(const Pipeline* pipeline) const {
+        const auto all = std::span{bound_stages};
+        return pipeline->IsCompute() ? all.last(1) : all.first(Shader::MaxStageTypes - 1);
+    }
+    const Shader::BoundStage& GetBoundStage(Shader::LogicalStage stage) const {
+        return bound_stages[u32(stage)];
+    }
 
     /// SHADPS4_STENCIL_STORAGE=1: shader storage writes into a depth buffer's stencil plane
     /// (PS4 Pro checkerboard mask) go to an R8 scratch image that is seeded from and copied back
@@ -211,6 +228,9 @@ private:
     Pipeline::DescriptorWrites set_writes;
     Pipeline::BufferBarriers buffer_barriers;
     Shader::PushData push_data;
+    // Per-draw user data of each stage, indexed like Pipeline::stages (by LogicalStage). The back
+    // path reads user data only through these (CP front/back split, step 2).
+    std::array<Shader::BoundStage, Shader::MaxStageTypes> bound_stages{};
 
     using BufferBindingInfo = std::tuple<VideoCore::BufferId, AmdGpu::Buffer, u64>;
     boost::container::static_vector<BufferBindingInfo, Shader::NUM_BUFFERS> buffer_bindings;

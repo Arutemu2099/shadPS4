@@ -212,4 +212,51 @@ struct Info : InfoPersistent {
 };
 DECLARE_ENUM_FLAG_OPERATORS(Info::ReadConstType);
 
+/// One stage's user data as bound for a single draw or dispatch (CP front/back split,
+/// notes/cp-split-inventory-2026-09-25.md). The back path reads user data, the flattened buffer
+/// and pgm_base only through this, never through the shared Info, whose fields the next pipeline
+/// lookup rewrites. Today it aliases the Info's fields, so building one copies no data.
+struct BoundStage {
+    const Info* info{};
+    std::span<const u32> user_data;
+    std::span<const u32> flattened_ud_buf;
+    VAddr pgm_base{};
+
+    BoundStage() = default;
+    explicit BoundStage(const Info* info_) noexcept : info{info_} {
+        if (info) {
+            user_data = info->user_data;
+            flattened_ud_buf = info->flattened_ud_buf;
+            pgm_base = info->pgm_base;
+        }
+    }
+
+    template <typename T>
+    inline T ReadUdSharp(u32 sharp_idx) const noexcept {
+        return *reinterpret_cast<const T*>(&flattened_ud_buf[sharp_idx]);
+    }
+
+    template <typename T>
+    T ReadUdReg(u32 ptr_index, u32 dword_offset) const noexcept {
+        T data;
+        const u32* base = user_data.data();
+        if (ptr_index != IR::NumScalarRegs) {
+            std::memcpy(&base, &user_data[ptr_index], sizeof(base));
+            base = reinterpret_cast<const u32*>(VAddr(base) & 0xFFFFFFFFFFFFULL);
+        }
+        std::memcpy(&data, base + dword_offset, sizeof(T));
+        return data;
+    }
+
+    void PushUd(Backend::Bindings& bnd, PushData& push) const {
+        u32 mask = info->ud_mask.mask;
+        while (mask) {
+            const u32 index = std::countr_zero(mask);
+            ASSERT(bnd.user_data < NUM_USER_DATA_REGS && index < NUM_USER_DATA_REGS);
+            mask &= ~(1U << index);
+            push.ud_regs[bnd.user_data++] = user_data[index];
+        }
+    }
+};
+
 } // namespace Shader
