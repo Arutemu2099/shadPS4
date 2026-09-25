@@ -31,11 +31,12 @@ namespace AmdGpu {
 /// once the GPU reads guest memory at execution time (SHADPS4_HOST_MIRROR): with CP-time fences
 /// the game may reuse a buffer the host GPU has not read yet. GDS-sourced fences stay CP-time.
 /// Mode 1 submits the batch at every fence; mode 2 defers without submitting (see
-/// Rasterizer::DeferToGpu) and flushes before the CP waits on memory or goes idle.
+/// Rasterizer::DeferToGpu) and flushes before the CP waits on memory or goes idle; mode 3 is
+/// mode 1 for EVENT_WRITE_EOP only (EOS and RELEASE_MEM stay CP-time).
 static int FenceAtGpu() {
     static const int mode = [] {
         const char* value = std::getenv("SHADPS4_FENCE_AT_GPU");
-        return value && (value[0] == '1' || value[0] == '2') ? value[0] - '0' : 0;
+        return value && value[0] >= '1' && value[0] <= '3' ? value[0] - '0' : 0;
     }();
     return mode;
 }
@@ -888,7 +889,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 g_cp_wait.NoteWrite(event_eos->Address());
                 VideoCore::ProtectFence();
-                if (FenceAtGpu() && rasterizer &&
+                if ((FenceAtGpu() == 1 || FenceAtGpu() == 2) && rasterizer &&
                     event_eos->command != PM4CmdEventWriteEos::Command::GdsStore) {
                     rasterizer->DeferToGpu(
                         [packet = *event_eos] { packet.SignalFence(WriteFenceValue); },
@@ -913,7 +914,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 g_cp_wait.NoteWrite(event_eop->Address<u32>());
                 VideoCore::ProtectFence();
-                if (FenceAtGpu() && rasterizer) {
+                if (FenceAtGpu() != 0 && rasterizer) {
                     rasterizer->DeferToGpu(
                         [packet = *event_eop] {
                             packet.SignalFence(WriteFenceValue, [] {
@@ -921,7 +922,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                     Platform::InterruptId::GfxEop);
                             });
                         },
-                        FenceAtGpu() == 1);
+                        FenceAtGpu() != 2);
                     break;
                 }
                 event_eop->SignalFence(
@@ -1399,7 +1400,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             }
             g_cp_wait.NoteWrite(release_mem->Address<void*>());
             VideoCore::ProtectFence();
-            if (FenceAtGpu() && rasterizer &&
+            if ((FenceAtGpu() == 1 || FenceAtGpu() == 2) && rasterizer &&
                 release_mem->data_sel != DataSelect::GdsMemStore) {
                 rasterizer->DeferToGpu(
                     [packet = *release_mem, pipe_id = queue.pipe_id] {

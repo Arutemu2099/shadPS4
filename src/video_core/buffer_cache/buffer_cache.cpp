@@ -299,6 +299,9 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         }
         // "lo-hi" (hex ok): mirror every eligible binding inside this guest range, without the
         // per-bind dirty-page query (which walks the range a second time).
+        if (const char* texel = std::getenv("SHADPS4_HOST_MIRROR_TEXEL")) {
+            host_mirror_texel = texel[0] == '1';
+        }
         if (const char* range = std::getenv("SHADPS4_HOST_MIRROR_RANGE")) {
             char* end = nullptr;
             host_mirror_lo = std::strtoull(range, &end, 0);
@@ -374,6 +377,7 @@ BufferCache::~BufferCache() {
 }
 
 void BufferCache::BeginGpuUnmap(VAddr device_addr, u64 size) {
+    backing_span_generation.fetch_add(1, std::memory_order_release);
     if (!Offload::Enabled() || size == 0) {
         return;
     }
@@ -1865,9 +1869,10 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             return {&stream_buffer, offset};
         }
     }
-    if (host_mirror && !is_written && !is_texel_buffer &&
+    if (host_mirror && !is_written && (!is_texel_buffer || host_mirror_texel) &&
         sample_caller != Common::BufferSampleCaller::Other) {
-        if (const auto mirrored = TryHostMirror(device_addr, size); mirrored.first) {
+        if (const auto mirrored = TryHostMirror(device_addr, size, is_texel_buffer);
+            mirrored.first) {
             return mirrored;
         }
     }
@@ -1948,7 +1953,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     return {&buffer, buffer.Offset(device_addr)};
 }
 
-std::pair<Buffer*, u32> BufferCache::TryHostMirror(VAddr device_addr, u32 size) {
+std::pair<Buffer*, u32> BufferCache::TryHostMirror(VAddr device_addr, u32 size, bool is_texel) {
     ++hm_calls;
     std::pair<Buffer*, u32> result{};
     u64 backing = 0;
@@ -1962,19 +1967,19 @@ std::pair<Buffer*, u32> BufferCache::TryHostMirror(VAddr device_addr, u32 size) 
             ++hm_samples;
             LOG_INFO(Render_Vulkan, "HostMirror: too big {:#x}+{:#x}", device_addr, size);
         }
-    } else if (range_mode && (device_addr < host_mirror_lo || device_addr + size > host_mirror_hi)) {
+    } else if (range_mode && !overlaps_range) {
+        // Range mode: any binding that overlaps the range (the per-frame heap) is mirrored.
         ++hm_outside;
-        if (overlaps_range && hm_samples < 12) {
-            ++hm_samples;
-            LOG_INFO(Render_Vulkan, "HostMirror: partly outside {:#x}+{:#x}", device_addr, size);
-        }
+    } else if (is_texel && texture_cache.FindImageFromRange(device_addr, size)) {
+        // A cached image aliases this formatted buffer; its newest bytes may be in the image.
+        ++hm_image;
     } else if (!range_mode && !memory_tracker->IsRegionCpuModified(device_addr, size)) {
         // Clean: the tracked copy is current and in VRAM; keep using it.
         ++hm_clean;
     } else if (IsRegionGpuModified(device_addr, size)) {
         // Newest bytes are in a cache buffer, not in guest memory.
         ++hm_gpu;
-    } else if (!memory->BackingOffset(device_addr, size, backing)) {
+    } else if (!MirrorBackingOffset(device_addr, size, backing)) {
         ++hm_nobacking;
     } else if ((backing >> HostMirrorChunkBits) != ((backing + size - 1) >> HostMirrorChunkBits)) {
         ++hm_straddle;
@@ -1986,12 +1991,35 @@ std::pair<Buffer*, u32> BufferCache::TryHostMirror(VAddr device_addr, u32 size) 
     if ((hm_calls & 0xfffff) == 0) {
         LOG_INFO(Render_Vulkan,
                  "HostMirror: calls={} hits={} ({:.1f}%) clean={} gpu={} nobacking={} "
-                 "straddle={} toobig={} (max {:#x}) outside={} chunks={} avg_hit_bytes={:.0f}",
+                 "straddle={} toobig={} (max {:#x}) outside={} image={} chunks={} "
+                 "avg_hit_bytes={:.0f}",
                  hm_calls, hm_hits, 100.0 * double(hm_hits) / double(hm_calls), hm_clean, hm_gpu,
-                 hm_nobacking, hm_straddle, hm_toobig, hm_max_seen, hm_outside,
+                 hm_nobacking, hm_straddle, hm_toobig, hm_max_seen, hm_outside, hm_image,
                  host_mirror_chunks.size(), hm_hits ? double(hm_bytes) / double(hm_hits) : 0.0);
     }
     return result;
+}
+
+bool BufferCache::MirrorBackingOffset(VAddr device_addr, u32 size, u64& backing) {
+    // Spans are stable until an unmap (BeginGpuUnmap bumps the generation); four recent ones
+    // cover the per-frame heap without taking the memory manager's lock per binding.
+    const u64 generation = backing_span_generation.load(std::memory_order_acquire);
+    for (auto& span : backing_spans) {
+        if (span.generation == generation && device_addr >= span.start &&
+            device_addr + size <= span.end) {
+            backing = span.backing + (device_addr - span.start);
+            return true;
+        }
+    }
+    BackingSpanEntry entry{};
+    if (!memory->BackingSpan(device_addr, entry.start, entry.end, entry.backing) ||
+        device_addr + size > entry.end) {
+        return false;
+    }
+    entry.generation = generation;
+    backing_spans[backing_span_next++ & 3] = entry;
+    backing = entry.backing + (device_addr - entry.start);
+    return true;
 }
 
 Buffer* BufferCache::HostMirrorChunk(u64 index) {

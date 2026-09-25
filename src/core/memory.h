@@ -250,6 +250,9 @@ public:
     /// SHADPS4_HOST_MIRROR: offset of [virtual_addr, virtual_addr + size) in the physical backing
     /// view when one contiguous physical area backs the whole range; false otherwise.
     bool BackingOffset(VAddr virtual_addr, u64 size, u64& offset_out);
+    /// The largest [span_start, span_end) around virtual_addr that one physical area backs
+    /// contiguously, and the backing offset of span_start. False if virtual_addr is unbacked.
+    bool BackingSpan(VAddr virtual_addr, VAddr& span_start, VAddr& span_end, u64& backing_out);
 
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
 

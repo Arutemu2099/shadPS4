@@ -427,26 +427,37 @@ private:
 
     /**
      * SHADPS4_HOST_MIRROR=1 (plan b prototype, default off): read-only uniform/storage bindings
-     * (rasterizer BindBuffers, not texel, <= SHADPS4_HOST_MIRROR_MAX bytes, default 256 MB) whose
+     * (rasterizer BindBuffers, texel only with SHADPS4_HOST_MIRROR_TEXEL=1, <= SHADPS4_HOST_MIRROR_MAX
+     * bytes, default 256 MB; SHADPS4_HOST_MIRROR_RANGE=lo-hi instead mirrors bindings overlapping it) whose
      * range has CPU-modified pages and no GPU-modified pages are bound straight to guest memory:
      * the always-writable physical backing view is imported with VK_EXT_external_memory_host in
-     * 256 MB chunks and the binding becomes chunk + offset. No upload, no dirty-bit clear, no
+     * 1 GB chunks and the binding becomes chunk + offset. No upload, no dirty-bit clear, no
      * re-protect - the pages stay writable, so the game's next write does not fault, and the
      * tracked path (which still sees them CPU-dirty) uploads current data if it is used later.
      * GPU reads then happen at execution time, not at CP time: see SHADPS4_FENCE_AT_GPU.
      */
-    std::pair<Buffer*, u32> TryHostMirror(VAddr device_addr, u32 size);
+    std::pair<Buffer*, u32> TryHostMirror(VAddr device_addr, u32 size, bool is_texel);
     Buffer* HostMirrorChunk(u64 index);
+    bool MirrorBackingOffset(VAddr device_addr, u32 size, u64& backing);
+    struct BackingSpanEntry {
+        VAddr start{}, end{};
+        u64 backing{};
+        u64 generation{~0ULL};
+    };
+    std::array<BackingSpanEntry, 4> backing_spans{};
+    u32 backing_span_next{};
+    std::atomic<u64> backing_span_generation{0};
     struct HostMirrorSlot {
         std::unique_ptr<Buffer> buffer;
         bool failed{};
     };
-    static constexpr u32 HostMirrorChunkBits = 28;
+    static constexpr u32 HostMirrorChunkBits = 30;
     std::vector<HostMirrorSlot> host_mirror_chunks;
     bool host_mirror{};
     u32 host_mirror_max{};
     u64 hm_calls{}, hm_hits{}, hm_clean{}, hm_gpu{}, hm_nobacking{}, hm_straddle{}, hm_bytes{};
-    u64 hm_toobig{}, hm_max_seen{}, hm_outside{}, hm_samples{};
+    u64 hm_toobig{}, hm_max_seen{}, hm_outside{}, hm_samples{}, hm_image{};
+    bool host_mirror_texel{}; // SHADPS4_HOST_MIRROR_TEXEL=1: formatted buffers too
     VAddr host_mirror_lo{}, host_mirror_hi{}; // SHADPS4_HOST_MIRROR_RANGE
     StreamBuffer stream_buffer;
     StreamBuffer download_buffer;
