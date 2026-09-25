@@ -196,6 +196,31 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     return true;
 }
 
+bool MemoryManager::BackingOffset(VAddr virtual_addr, u64 size, u64& offset_out) {
+    std::shared_lock lk{mutex};
+    if (!IsValidMapping(virtual_addr, size)) {
+        return false;
+    }
+    const auto vma = FindVMA(virtual_addr);
+    const VirtualMemoryArea& area = vma->second;
+    if (!area.IsMapped() || !HasPhysicalBacking(area) || virtual_addr < area.base ||
+        virtual_addr + size > area.base + area.size) {
+        return false;
+    }
+    const u64 offset = virtual_addr - area.base;
+    auto phys = area.phys_areas.upper_bound(offset);
+    if (phys == area.phys_areas.begin()) {
+        return false;
+    }
+    --phys;
+    const u64 start_in = offset - phys->first;
+    if (start_in + size > phys->second.size) {
+        return false;
+    }
+    offset_out = phys->second.base + start_in;
+    return true;
+}
+
 bool MemoryManager::TryReadBacking(VAddr virtual_addr, u8* dest, u64 size) {
     std::shared_lock lk{mutex};
     if (!IsValidMapping(virtual_addr, size)) {

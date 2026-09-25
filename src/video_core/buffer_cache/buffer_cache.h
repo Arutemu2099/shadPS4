@@ -424,6 +424,28 @@ private:
     std::unique_ptr<MemoryTracker> memory_tracker;
     StreamBuffer staging_buffer;
     u64 last_sync_upload_bytes{}; // SHADPS4_BUFFER_TRAFFIC: bytes the last SynchronizeBuffer uploaded
+
+    /**
+     * SHADPS4_HOST_MIRROR=1 (plan b prototype, default off): read-only uniform/storage bindings
+     * (rasterizer BindBuffers, not texel, <= SHADPS4_HOST_MIRROR_MAX bytes, default 64 KB) whose
+     * range has CPU-modified pages and no GPU-modified pages are bound straight to guest memory:
+     * the always-writable physical backing view is imported with VK_EXT_external_memory_host in
+     * 64 MB chunks and the binding becomes chunk + offset. No upload, no dirty-bit clear, no
+     * re-protect - the pages stay writable, so the game's next write does not fault, and the
+     * tracked path (which still sees them CPU-dirty) uploads current data if it is used later.
+     * GPU reads then happen at execution time, not at CP time: see SHADPS4_FENCE_AT_GPU.
+     */
+    std::pair<Buffer*, u32> TryHostMirror(VAddr device_addr, u32 size);
+    Buffer* HostMirrorChunk(u64 index);
+    struct HostMirrorSlot {
+        std::unique_ptr<Buffer> buffer;
+        bool failed{};
+    };
+    static constexpr u32 HostMirrorChunkBits = 26;
+    std::vector<HostMirrorSlot> host_mirror_chunks;
+    bool host_mirror{};
+    u32 host_mirror_max{};
+    u64 hm_calls{}, hm_hits{}, hm_clean{}, hm_gpu{}, hm_nobacking{}, hm_straddle{}, hm_bytes{};
     StreamBuffer stream_buffer;
     StreamBuffer download_buffer;
     StreamBuffer device_buffer;

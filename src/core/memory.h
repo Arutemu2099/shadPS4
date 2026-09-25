@@ -247,6 +247,10 @@ public:
     /// CopySparseMemory. Used by deferred uploads on the recording thread (SHADPS4_DEFERRED_PROTECT).
     bool TryReadBacking(VAddr virtual_addr, u8* dest, u64 size);
 
+    /// SHADPS4_HOST_MIRROR: offset of [virtual_addr, virtual_addr + size) in the physical backing
+    /// view when one contiguous physical area backs the whole range; false otherwise.
+    bool BackingOffset(VAddr virtual_addr, u64 size, u64& offset_out);
+
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
 
     PAddr PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment);

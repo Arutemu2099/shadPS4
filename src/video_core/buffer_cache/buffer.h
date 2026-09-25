@@ -77,6 +77,11 @@ public:
                     MemoryUsage usage, VAddr cpu_addr_, vk::BufferUsageFlags flags,
                     u64 size_bytes_);
 
+    /// SHADPS4_HOST_MIRROR: wraps a VkBuffer bound to imported host memory
+    /// (VK_EXT_external_memory_host). The memory is not VMA's and lives until process exit.
+    explicit Buffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
+                    vk::Buffer imported, VAddr cpu_addr_, u64 size_bytes_);
+
     Buffer& operator=(const Buffer&) = delete;
     Buffer(const Buffer&) = delete;
 

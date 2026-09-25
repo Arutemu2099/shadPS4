@@ -32,6 +32,8 @@ public:
     [[nodiscard]] u8* BackingBase() const noexcept {
         return backing_base;
     }
+    /// Size of the physical backing view at BackingBase().
+    [[nodiscard]] u64 BackingSizeBytes() const noexcept;
 
     [[nodiscard]] VAddr SystemManagedVirtualBase() noexcept {
         return reinterpret_cast<VAddr>(system_managed_base);

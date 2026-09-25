@@ -832,6 +832,10 @@ AddressSpace::AddressSpace() : impl{std::make_unique<Impl>()} {
 
 AddressSpace::~AddressSpace() = default;
 
+u64 AddressSpace::BackingSizeBytes() const noexcept {
+    return BackingSize;
+}
+
 void* AddressSpace::Map(VAddr virtual_addr, u64 size, PAddr phys_addr, bool is_exec) {
 #if ARCH_X86_64
     const auto prot = is_exec ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;

@@ -291,6 +291,16 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       gds_buffer{instance, scheduler, MemoryUsage::Stream, 0, AllFlags, DataShareBufferSize},
       bda_pagetable_buffer{instance, scheduler, MemoryUsage::DeviceLocal,
                            0,        AllFlags,  BDA_PAGETABLE_SIZE} {
+    if (const char* mirror = std::getenv("SHADPS4_HOST_MIRROR"); mirror && mirror[0] == '1') {
+        host_mirror = instance.IsExternalMemoryHostEnabled();
+        host_mirror_max = 64_KB;
+        if (const char* max = std::getenv("SHADPS4_HOST_MIRROR_MAX")) {
+            host_mirror_max = static_cast<u32>(std::strtoul(max, nullptr, 0));
+        }
+        LOG_INFO(Render_Vulkan, "SHADPS4_HOST_MIRROR: {} (max binding {} bytes)",
+                 host_mirror ? "on" : "unavailable (VK_EXT_external_memory_host)",
+                 host_mirror_max);
+    }
     Vulkan::SetObjectName(instance.GetDevice(), gds_buffer.Handle(), "GDS Buffer");
     Vulkan::SetObjectName(instance.GetDevice(), bda_pagetable_buffer.Handle(),
                           "BDA Page Table Buffer");
@@ -1844,6 +1854,12 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             return {&stream_buffer, offset};
         }
     }
+    if (host_mirror && !is_written && !is_texel_buffer &&
+        sample_caller != Common::BufferSampleCaller::Other && size <= host_mirror_max) {
+        if (const auto mirrored = TryHostMirror(device_addr, size); mirrored.first) {
+            return mirrored;
+        }
+    }
     const bool buffer_id_fallback = IsBufferInvalid(buffer_id);
     sample.RecordBufferIdFallback(buffer_id_fallback);
     if (buffer_id_fallback) {
@@ -1919,6 +1935,120 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         Common::FaultMonitor::CountRangeAdd(gpu_modified_ranges.m_ranges_set.iterative_size());
     }
     return {&buffer, buffer.Offset(device_addr)};
+}
+
+std::pair<Buffer*, u32> BufferCache::TryHostMirror(VAddr device_addr, u32 size) {
+    ++hm_calls;
+    std::pair<Buffer*, u32> result{};
+    u64 backing = 0;
+    if (!memory_tracker->IsRegionCpuModified(device_addr, size)) {
+        // Clean: the tracked copy is current and in VRAM; keep using it.
+        ++hm_clean;
+    } else if (IsRegionGpuModified(device_addr, size)) {
+        // Newest bytes are in a cache buffer, not in guest memory.
+        ++hm_gpu;
+    } else if (!memory->BackingOffset(device_addr, size, backing)) {
+        ++hm_nobacking;
+    } else if ((backing >> HostMirrorChunkBits) != ((backing + size - 1) >> HostMirrorChunkBits)) {
+        ++hm_straddle;
+    } else if (Buffer* chunk = HostMirrorChunk(backing >> HostMirrorChunkBits)) {
+        ++hm_hits;
+        hm_bytes += size;
+        result = {chunk, static_cast<u32>(backing & ((u64{1} << HostMirrorChunkBits) - 1))};
+    }
+    if ((hm_calls & 0xfffff) == 0) {
+        LOG_INFO(Render_Vulkan,
+                 "HostMirror: calls={} hits={} ({:.1f}%) clean={} gpu={} nobacking={} "
+                 "straddle={} chunks={} avg_hit_bytes={:.0f}",
+                 hm_calls, hm_hits, 100.0 * double(hm_hits) / double(hm_calls), hm_clean, hm_gpu,
+                 hm_nobacking, hm_straddle, host_mirror_chunks.size(),
+                 hm_hits ? double(hm_bytes) / double(hm_hits) : 0.0);
+    }
+    return result;
+}
+
+Buffer* BufferCache::HostMirrorChunk(u64 index) {
+    if (index >= host_mirror_chunks.size()) {
+        host_mirror_chunks.resize(index + 1);
+    }
+    auto& slot = host_mirror_chunks[index];
+    if (slot.buffer || slot.failed) {
+        return slot.buffer.get();
+    }
+    slot.failed = true;
+    auto& space = memory->GetAddressSpace();
+    const u64 chunk_offset = index << HostMirrorChunkBits;
+    const u64 chunk_size = std::min<u64>(u64{1} << HostMirrorChunkBits,
+                                         space.BackingSizeBytes() - chunk_offset);
+    void* pointer = space.BackingBase() + chunk_offset;
+    const auto device = static_cast<VkDevice>(instance.GetDevice());
+    const auto& d = VULKAN_HPP_DEFAULT_DISPATCHER;
+    constexpr auto handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+    VkMemoryHostPointerPropertiesEXT props{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    VkResult r = d.vkGetMemoryHostPointerPropertiesEXT(device, handle_type, pointer, &props);
+    if (r != VK_SUCCESS || props.memoryTypeBits == 0) {
+        LOG_ERROR(Render_Vulkan, "HostMirror: chunk {} pointer properties failed ({}), bits={:#x}",
+                  index, static_cast<int>(r), props.memoryTypeBits);
+        return nullptr;
+    }
+    const auto& mem_props = instance.GetMemoryProperties();
+    u32 type_index = ~0u;
+    for (u32 i = 0; i < mem_props.memoryTypeCount; ++i) {
+        if ((props.memoryTypeBits & (1u << i)) &&
+            (mem_props.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eHostVisible)) {
+            type_index = i;
+            break;
+        }
+    }
+    if (type_index == ~0u) {
+        LOG_ERROR(Render_Vulkan, "HostMirror: no host-visible type in {:#x}", props.memoryTypeBits);
+        return nullptr;
+    }
+    const VkExternalMemoryBufferCreateInfo external_ci{
+        .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+        .handleTypes = handle_type,
+    };
+    const VkBufferCreateInfo buffer_ci{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .pNext = &external_ci,
+        .size = chunk_size,
+        .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    VkBuffer handle{};
+    r = d.vkCreateBuffer(device, &buffer_ci, nullptr, &handle);
+    if (r != VK_SUCCESS) {
+        LOG_ERROR(Render_Vulkan, "HostMirror: vkCreateBuffer failed ({})", static_cast<int>(r));
+        return nullptr;
+    }
+    const VkImportMemoryHostPointerInfoEXT import_info{
+        .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+        .handleType = handle_type,
+        .pHostPointer = pointer,
+    };
+    const VkMemoryAllocateInfo alloc_info{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = &import_info,
+        .allocationSize = chunk_size,
+        .memoryTypeIndex = type_index,
+    };
+    VkDeviceMemory device_memory{};
+    r = d.vkAllocateMemory(device, &alloc_info, nullptr, &device_memory);
+    if (r == VK_SUCCESS) {
+        r = d.vkBindBufferMemory(device, handle, device_memory, 0);
+    }
+    if (r != VK_SUCCESS) {
+        LOG_ERROR(Render_Vulkan, "HostMirror: import of chunk {} failed ({})", index,
+                  static_cast<int>(r));
+        d.vkDestroyBuffer(device, handle, nullptr);
+        return nullptr;
+    }
+    slot.buffer = std::make_unique<Buffer>(instance, scheduler, vk::Buffer{handle}, 0, chunk_size);
+    slot.failed = false;
+    LOG_INFO(Render_Vulkan, "HostMirror: imported backing chunk {} ({:#x}+{:#x}) as memory type {}",
+             index, chunk_offset, chunk_size, type_index);
+    return slot.buffer.get();
 }
 
 std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 size) {

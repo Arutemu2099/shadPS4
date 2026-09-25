@@ -114,6 +114,15 @@ void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usa
     }
 }
 
+Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
+               vk::Buffer imported, VAddr cpu_addr_, u64 size_bytes_)
+    : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, instance{&instance_}, scheduler{&scheduler_},
+      usage{MemoryUsage::Upload}, buffer{instance->GetDevice(), instance->GetAllocator()} {
+    // vmaDestroyBuffer with a null allocation only destroys the buffer.
+    buffer.buffer = imported;
+    is_coherent = true;
+}
+
 Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_, MemoryUsage usage_,
                VAddr cpu_addr_, vk::BufferUsageFlags flags, u64 size_bytes_)
     : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, instance{&instance_}, scheduler{&scheduler_},

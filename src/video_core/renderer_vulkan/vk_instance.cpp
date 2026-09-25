@@ -340,6 +340,9 @@ bool Instance::CreateDevice() {
     }
     image_view_min_lod = add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    if (const char* mirror = std::getenv("SHADPS4_HOST_MIRROR"); mirror && mirror[0] == '1') {
+        external_memory_host = add_extension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    }
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
 

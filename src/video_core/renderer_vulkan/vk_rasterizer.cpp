@@ -719,6 +719,12 @@ void Rasterizer::Finish() {
     scheduler.Finish();
 }
 
+void Rasterizer::DeferToGpu(Common::UniqueFunction<void>&& func) {
+    // Queued at the current tick first, then that tick is submitted.
+    scheduler.DeferPriorityOperation(std::move(func));
+    Flush();
+}
+
 void Rasterizer::OnSubmit() {
     {
         // Diagnostic: SHADPS4_DUMP_IMAGES=addr[,addr...] (hex) with SHADPS4_DUMP_IMAGES_AT_S=N

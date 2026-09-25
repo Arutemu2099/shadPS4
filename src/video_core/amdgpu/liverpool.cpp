@@ -25,6 +25,26 @@
 
 namespace AmdGpu {
 
+/// SHADPS4_FENCE_AT_GPU=1: end-of-pipe/end-of-shader fences (EVENT_WRITE_EOP, EVENT_WRITE_EOS,
+/// RELEASE_MEM) are written, and their interrupts raised, when the host GPU has actually
+/// finished the preceding work, as on the real GPU - not when the CP parses the packet. Needed
+/// once the GPU reads guest memory at execution time (SHADPS4_HOST_MIRROR): with CP-time fences
+/// the game may reuse a buffer the host GPU has not read yet. GDS-sourced fences stay CP-time.
+static bool FenceAtGpu() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_FENCE_AT_GPU");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
+static void WriteFenceValue(void* address, u64 data, u32 num_bytes) {
+    auto* memory = Core::Memory::Instance();
+    if (!memory->TryWriteBacking(address, &data, num_bytes)) {
+        memcpy(address, &data, num_bytes);
+    }
+}
+
 namespace {
 /// SHADPS4_CP_WAIT_STATS=1: where the command processor's wall time goes. WaitRegMem waits are
 /// split by whether the polled address is one the CP itself writes (EOS/EOP/RELEASE_MEM/
@@ -863,12 +883,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 g_cp_wait.NoteWrite(event_eos->Address());
                 VideoCore::ProtectFence();
-                event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
-                    auto* memory = Core::Memory::Instance();
-                    if (!memory->TryWriteBacking(address, &data, num_bytes)) {
-                        memcpy(address, &data, num_bytes);
-                    }
-                });
+                if (FenceAtGpu() && rasterizer &&
+                    event_eos->command != PM4CmdEventWriteEos::Command::GdsStore) {
+                    rasterizer->DeferToGpu(
+                        [packet = *event_eos] { packet.SignalFence(WriteFenceValue); });
+                } else {
+                    event_eos->SignalFence(WriteFenceValue);
+                }
                 if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
                     ASSERT(event_eos->size == 1);
                     if (rasterizer) {
@@ -886,6 +907,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 g_cp_wait.NoteWrite(event_eop->Address<u32>());
                 VideoCore::ProtectFence();
+                if (FenceAtGpu() && rasterizer) {
+                    rasterizer->DeferToGpu([packet = *event_eop] {
+                        packet.SignalFence(WriteFenceValue, [] {
+                            Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
+                        });
+                    });
+                    break;
+                }
                 event_eop->SignalFence(
                     [](void* address, u64 data, u32 num_bytes) {
                         auto* memory = Core::Memory::Instance();
@@ -1355,6 +1384,18 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             }
             g_cp_wait.NoteWrite(release_mem->Address<void*>());
             VideoCore::ProtectFence();
+            if (FenceAtGpu() && rasterizer &&
+                release_mem->data_sel != DataSelect::GdsMemStore) {
+                rasterizer->DeferToGpu([packet = *release_mem, pipe_id = queue.pipe_id] {
+                    packet.SignalFence(
+                        [pipe_id] {
+                            Platform::IrqC::Instance()->Signal(
+                                static_cast<Platform::InterruptId>(pipe_id));
+                        },
+                        [](VAddr, u16, u16) {});
+                });
+                break;
+            }
             release_mem->SignalFence(
                 [pipe_id = queue.pipe_id] {
                     Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));

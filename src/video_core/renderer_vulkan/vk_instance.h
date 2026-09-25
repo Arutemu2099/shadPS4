@@ -375,6 +375,11 @@ public:
     }
 
     /// Returns the memory properties of the physical device.
+    /// SHADPS4_HOST_MIRROR: VK_EXT_external_memory_host enabled on the device.
+    bool IsExternalMemoryHostEnabled() const noexcept {
+        return external_memory_host;
+    }
+
     const vk::PhysicalDeviceMemoryProperties& GetMemoryProperties() const noexcept {
         return memory_properties;
     }
@@ -509,6 +514,7 @@ private:
     vk::UniqueDevice device;
     vk::PhysicalDeviceProperties properties;
     vk::PhysicalDeviceMemoryProperties memory_properties;
+    bool external_memory_host{};
     vk::PhysicalDeviceVulkan11Properties vk11_props;
     vk::PhysicalDeviceVulkan12Properties vk12_props;
     vk::PhysicalDeviceVulkan13Properties vk13_props;
