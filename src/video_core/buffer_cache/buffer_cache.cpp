@@ -1611,18 +1611,7 @@ void BufferCache::BindVertexBuffers(
     pipeline.GetVertexInputs(attributes, bindings, divisors, guest_buffers,
                              regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
 
-    static const int push_dedupe = [] {
-        const char* value = std::getenv("SHADPS4_PUSH_DEDUPE");
-        return value ? value[0] - '0' : 0;
-    }();
-    const bool vi_same =
-        push_dedupe > 0 && instance.IsVertexInputDynamicState() &&
-        scheduler.VertexInputUnchanged(
-            std::span<const u8>{reinterpret_cast<const u8*>(bindings.data()),
-                                bindings.size() * sizeof(bindings[0])},
-            std::span<const u8>{reinterpret_cast<const u8*>(attributes.data()),
-                                attributes.size() * sizeof(attributes[0])});
-    if (instance.IsVertexInputDynamicState() && !(vi_same && push_dedupe == 1)) {
+    if (instance.IsVertexInputDynamicState()) {
         // Update current vertex inputs.
         scheduler.RecordArrays(
             [](vk::CommandBuffer cmdbuf, auto bindings, auto attributes) {

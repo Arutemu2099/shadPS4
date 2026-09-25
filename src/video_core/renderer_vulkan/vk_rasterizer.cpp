@@ -690,7 +690,6 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     const auto& fetch_shader = pipeline->GetFetchShader();
     const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
 
-    scheduler.NotePipelineBind(vk::PipelineBindPoint::eGraphics, pipeline->GetLayout());
     scheduler.Record([handle = pipeline->Handle(), is_indexed, count = regs.num_indices,
                       instances = regs.num_instances.NumInstances(), vertex_offset,
                       instance_offset](vk::CommandBuffer cmdbuf) {
@@ -800,7 +799,6 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
     ASSERT((is_indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand)) ==
            stride);
-    scheduler.NotePipelineBind(vk::PipelineBindPoint::eGraphics, pipeline->GetLayout());
     scheduler.Record([handle = pipeline->Handle(), buffer = buffer->Handle(), base,
                       count_handle = count_buffer ? count_buffer->Handle() : vk::Buffer{},
                       has_count = count_address != 0, count_base, max_count, stride,
@@ -859,7 +857,6 @@ void Rasterizer::DispatchDirect() {
     scheduler.EndRendering();
     EmitPipelineResources(pipeline);
 
-    scheduler.NotePipelineBind(vk::PipelineBindPoint::eCompute, pipeline->GetLayout());
     scheduler.Record([handle = pipeline->Handle(), x = cs_program.dim_x, y = cs_program.dim_y,
                       z = cs_program.dim_z](vk::CommandBuffer cmdbuf) {
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
@@ -906,7 +903,6 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     scheduler.EndRendering();
     EmitPipelineResources(pipeline);
 
-    scheduler.NotePipelineBind(vk::PipelineBindPoint::eCompute, pipeline->GetLayout());
     scheduler.Record(
         [handle = pipeline->Handle(), buffer = buffer->Handle(), base](vk::CommandBuffer cmdbuf) {
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
