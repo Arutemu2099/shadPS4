@@ -1115,7 +1115,13 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 texture_cache.DiagBufferWriteOverImages(vsharp.base_address, size,
                                                         desc.is_formatted);
             }
-            if (desc.is_written && desc.is_formatted) {
+            // SHADPS4_RAW_WRITE_INVALIDATE=1 (port of upstream #5092): raw storage-buffer writes
+            // can also make an aliased cached image stale, not only formatted ones.
+            static const bool raw_write_invalidate = [] {
+                const char* value = std::getenv("SHADPS4_RAW_WRITE_INVALIDATE");
+                return value && value[0] == '1';
+            }();
+            if (desc.is_written && (desc.is_formatted || raw_write_invalidate)) {
                 texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
             }
         }
