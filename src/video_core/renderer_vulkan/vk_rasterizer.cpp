@@ -157,28 +157,18 @@ void Rasterizer::CpSync() {
                            vk::DependencyFlagBits::eByRegion, ib_barrier, {}, {});
 }
 
-bool Rasterizer::FilterDraw() {
-    const auto& regs = liverpool->regs;
+Rasterizer::DrawClass Rasterizer::ClassifyDraw(const AmdGpu::Regs& regs) {
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::EliminateFastClear) {
-        // Clears the render target if FCE is launched before any draws
-        EliminateFastClear();
-        return false;
+        return DrawClass::EliminateFastClear;
     }
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::FmaskDecompress) {
-        // TODO: check for a valid MRT1 to promote the draw to the resolve pass.
-        LOG_TRACE(Render_Vulkan, "FMask decompression pass skipped");
-        ScopedMarkerInsert("FmaskDecompress");
-        return false;
+        return DrawClass::FmaskDecompress;
     }
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Resolve) {
-        LOG_TRACE(Render_Vulkan, "Resolve pass");
-        Resolve();
-        return false;
+        return DrawClass::Resolve;
     }
     if (regs.primitive_type == AmdGpu::PrimitiveType::None) {
-        LOG_TRACE(Render_Vulkan, "Primitive type 'None' skipped");
-        ScopedMarkerInsert("PrimitiveTypeNone");
-        return false;
+        return DrawClass::PrimitiveNone;
     }
 
     const bool cb_disabled =
@@ -193,15 +183,57 @@ bool Rasterizer::FilterDraw() {
         regs.depth_buffer.StencilWriteValid() &&
         regs.depth_buffer.StencilAddress() != regs.depth_buffer.StencilWriteAddress();
     if (cb_disabled && (depth_copy || stencil_copy)) {
+        return depth_copy && stencil_copy ? DrawClass::DepthStencilCopy
+               : depth_copy               ? DrawClass::DepthCopy
+                                          : DrawClass::StencilCopy;
+    }
+
+    return DrawClass::Draw;
+}
+
+void Rasterizer::ExecuteFilteredDraw(DrawClass draw_class) {
+    switch (draw_class) {
+    case DrawClass::Draw:
+        break;
+    case DrawClass::EliminateFastClear:
+        // Clears the render target if FCE is launched before any draws
+        EliminateFastClear();
+        break;
+    case DrawClass::FmaskDecompress:
+        // TODO: check for a valid MRT1 to promote the draw to the resolve pass.
+        LOG_TRACE(Render_Vulkan, "FMask decompression pass skipped");
+        ScopedMarkerInsert("FmaskDecompress");
+        break;
+    case DrawClass::Resolve:
+        LOG_TRACE(Render_Vulkan, "Resolve pass");
+        Resolve();
+        break;
+    case DrawClass::PrimitiveNone:
+        LOG_TRACE(Render_Vulkan, "Primitive type 'None' skipped");
+        ScopedMarkerInsert("PrimitiveTypeNone");
+        break;
+    case DrawClass::DepthCopy:
+    case DrawClass::StencilCopy:
+    case DrawClass::DepthStencilCopy:
         // Games may disable color buffer and enable force depth/stencil dirty and valid to
         // do a copy from one depth-stencil surface to another, without a pixel shader.
         // We need to detect this case and perform the copy, otherwise it will have no effect.
         LOG_TRACE(Render_Vulkan, "Performing depth-stencil override copy");
-        DepthStencilCopy(depth_copy, stencil_copy);
-        return false;
+        DepthStencilCopy(draw_class != DrawClass::StencilCopy,
+                         draw_class != DrawClass::DepthCopy);
+        break;
     }
+}
 
-    return true;
+bool Rasterizer::FilterDraw() {
+    // The classifier reads the front's registers (it runs where the pipeline lookup runs); the
+    // actions read the back's through BackRegs().
+    const DrawClass draw_class = ClassifyDraw(liverpool->regs);
+    if (draw_class == DrawClass::Draw) {
+        return true;
+    }
+    ExecuteFilteredDraw(draw_class);
+    return false;
 }
 
 static bool SamePreparedTarget(const VideoCore::TextureCache::ImageDesc& a,

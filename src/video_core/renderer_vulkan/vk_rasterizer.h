@@ -7,6 +7,7 @@
 #include "common/shared_first_mutex.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/cb_db_extent.h"
+#include "video_core/amdgpu/regs.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
@@ -45,6 +46,24 @@ public:
     [[nodiscard]] VideoCore::TextureCache& GetTextureCache() noexcept {
         return texture_cache;
     }
+
+    /// What a draw packet does, decided from registers alone (CP front/back split, step 3).
+    /// Everything except Draw replaces the draw with a back-side action or a marker.
+    enum class DrawClass : u8 {
+        Draw,               ///< An ordinary draw.
+        EliminateFastClear, ///< CB mode EliminateFastClear: EliminateFastClear() instead.
+        FmaskDecompress,    ///< CB mode FmaskDecompress: skipped (marker only).
+        Resolve,            ///< CB mode Resolve: Resolve() instead.
+        PrimitiveNone,      ///< Primitive type None: skipped (marker only).
+        DepthCopy,          ///< CB disabled + forced depth dirty/valid: DepthStencilCopy(1, 0).
+        StencilCopy,        ///< Same for stencil: DepthStencilCopy(0, 1).
+        DepthStencilCopy,   ///< Both: DepthStencilCopy(1, 1).
+    };
+    /// Pure: reads only `regs`, touches no cache, scheduler or Rasterizer member, so the CP front
+    /// can call it.
+    static DrawClass ClassifyDraw(const AmdGpu::Regs& regs);
+    /// The back-side action for a class other than Draw (texture cache work or a marker).
+    void ExecuteFilteredDraw(DrawClass draw_class);
 
     void Draw(bool is_indexed, u32 index_offset = 0);
     void ScanRegistersForValue();
