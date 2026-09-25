@@ -512,6 +512,7 @@ PipelineCache::PreparedPipelineEntry* PipelineCache::TryPreparedPipeline(
         }
 
         ++stats.hits;
+        entry.last_use = ++prepared_clock;
         if (PreparedPipelinesVerify()) {
             prepared_refresh_records[0].Save(fs_info);
             prepared_refresh_records[1].Save(vs_info);
@@ -602,7 +603,21 @@ void PipelineCache::SeedPreparedPipeline(const PreparedGraphicsState& state,
         }
     }
     if (!entry) {
-        entry = &set[prepared_pipeline_victim++ % num_ways];
+        // SHADPS4_PREPARED_LRU=1: evict the least recently hit way instead of round-robin.
+        static const bool lru = [] {
+            const char* value = std::getenv("SHADPS4_PREPARED_LRU");
+            return value && value[0] == '1';
+        }();
+        if (lru) {
+            entry = &set[0];
+            for (size_t way = 1; way < num_ways; ++way) {
+                if (set[way].last_use < entry->last_use) {
+                    entry = &set[way];
+                }
+            }
+        } else {
+            entry = &set[prepared_pipeline_victim++ % num_ways];
+        }
         ++prepared_stats.evictions;
     }
 
@@ -619,6 +634,7 @@ void PipelineCache::SeedPreparedPipeline(const PreparedGraphicsState& state,
     entry->fs_module = modules[fs_idx];
     entry->vs_module = modules[vs_idx];
     entry->fetch_shader = fetch_shader;
+    entry->last_use = ++prepared_clock;
     entry->valid = true;
     prepared_tags[entry - prepared_pipelines.data()] = state_hash;
     ++prepared_stats.seeds;

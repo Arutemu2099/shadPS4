@@ -136,6 +136,7 @@ private:
     struct PreparedPipelineEntry {
         bool valid{};
         u64 epoch{};
+        u64 last_use{}; // SHADPS4_PREPARED_LRU: prepared_clock at the last hit or seed
         PreparedGraphicsState state;
         Program* fs_program{};
         Program* vs_program{};
@@ -209,6 +210,7 @@ private:
     std::array<StageSelection, MaxShaderStages> stage_selections{};
     u64 prepared_pipeline_epoch{1};
     u32 prepared_pipeline_victim{};
+    u64 prepared_clock{};
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,
