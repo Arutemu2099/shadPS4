@@ -153,6 +153,26 @@ public:
         return mapped_queues[curr_qid].cs_state;
     }
 
+    // CP front/back split (notes/cp-split-inventory-2026-09-25.md): every register, render-target
+    // hint and compute-register read made by the back path (the rasterizer after the pipeline
+    // lookup, and the buffer cache) goes through these, so the back can later read its own mirror.
+    // Today they return the front's state. The pipeline cache and FilterDraw keep reading regs.
+    const Regs& BackRegs() const {
+        return regs;
+    }
+    const CbDbExtent& BackCbExtent(u32 cb) const {
+        return last_cb_extent[cb];
+    }
+    const CbDbExtent& BackDbExtent() const {
+        return last_db_extent;
+    }
+    u64 BackContextEpoch() const {
+        return context_change_epoch;
+    }
+    const ComputeProgram& BackCsRegs() const {
+        return mapped_queues[curr_qid].cs_state;
+    }
+
     struct AscQueueInfo {
         static constexpr size_t Pm4BufferSize = 1024;
         VAddr map_addr;

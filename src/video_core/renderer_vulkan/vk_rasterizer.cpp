@@ -243,7 +243,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     };
     // Prefetch render targets to handle overlaps with bound textures (e.g. mipgen)
     const auto& key = pipeline->GetGraphicsKey();
-    const auto& regs = liverpool->regs;
+    const auto& regs = liverpool->BackRegs();
     if (regs.color_control.degamma_enable) {
         LOG_WARNING(Render_Vulkan, "Color buffers require gamma correction");
     }
@@ -258,7 +258,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             image_id = {};
             continue;
         }
-        const auto& hint = liverpool->last_cb_extent[cb];
+        const auto& hint = liverpool->BackCbExtent(cb);
         if (prepared_targets) {
             auto& entry = prepared_color_targets[cb];
             const bool hit = entry.valid &&
@@ -285,7 +285,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     if ((regs.depth_control.depth_enable && regs.depth_buffer.DepthValid()) ||
         (regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid())) {
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
-        const auto& hint = liverpool->last_db_extent;
+        const auto& hint = liverpool->BackDbExtent();
         auto& [image_id, desc] = db_desc;
         if (prepared_targets) {
             auto& entry = prepared_depth_target;
@@ -340,11 +340,11 @@ static std::pair<u32, u32> GetDrawOffsets(
 }
 
 void Rasterizer::EliminateFastClear() {
-    auto& col_buf = liverpool->regs.color_buffers[0];
+    auto& col_buf = liverpool->BackRegs().color_buffers[0];
     if (!col_buf || !col_buf.info.fast_clear) {
         return;
     }
-    VideoCore::TextureCache::ImageDesc desc(col_buf, liverpool->last_cb_extent[0]);
+    VideoCore::TextureCache::ImageDesc desc(col_buf, liverpool->BackCbExtent(0));
     const auto image_id = texture_cache.FindImage(desc);
     const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
     if (!texture_cache.IsMetaCleared(col_buf.CmaskAddress(), col_buf.view.slice_start)) {
@@ -389,7 +389,7 @@ void Rasterizer::ScanRegistersForValue() {
         return;
     }
     static std::unordered_set<u64> seen;
-    const auto& regs = liverpool->regs.reg_array;
+    const auto& regs = liverpool->BackRegs().reg_array;
     for (u32 i = 0; i < regs.size(); ++i) {
         for (const u32 target : targets) {
             if (regs[i] == target && seen.insert((u64(i) << 32) | target).second) {
@@ -580,7 +580,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         }
     }
 
-    const auto& regs = liverpool->regs;
+    const auto& regs = liverpool->BackRegs();
     // Scoped timers: the stack scanner reports inclusive frequencies with false positives and
     // cannot apportion cost here. See Common::FaultMonitor for why these exist.
     const auto t_pipeline = Common::FaultMonitor::Now();
@@ -617,7 +617,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
             // Sample-location registers (PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0 .. X1Y1_0) and
             // PA_SC_AA_CONFIG: log each change with a timestamp (first 200), to see whether the
             // Pro checkerboard alternates sample positions per frame.
-            const auto& ra = liverpool->regs.reg_array;
+            const auto& ra = liverpool->BackRegs().reg_array;
             constexpr u32 base = AmdGpu::Regs::ContextRegWordOffset;
             const std::array<u32, 5> locs{ra[base + 0x2F8], ra[base + 0x2FE], ra[base + 0x302],
                                           ra[base + 0x306], ra[base + 0x30A]};
@@ -633,18 +633,18 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                             "NeoSampleLocs: t={}us AA_CONFIG={:#x} X0Y0={:#010x} X1Y0={:#010x} "
                             "X0Y1={:#010x} X1Y1={:#010x} rt0={}x{}",
                             us, locs[0], locs[1], locs[2], locs[3], locs[4],
-                            liverpool->regs.color_buffers[0].Pitch(),
-                            liverpool->regs.color_buffers[0].Height());
+                            liverpool->BackRegs().color_buffers[0].Pitch(),
+                            liverpool->BackRegs().color_buffers[0].Height());
             }
         }
-        if (neo_reg_diag && liverpool->regs.depth_buffer.DepthValid()) {
+        if (neo_reg_diag && liverpool->BackRegs().depth_buffer.DepthValid()) {
             static constexpr std::array<u32, 16> offsets{
                 0x000, 0x003, 0x010, 0x011, 0x012, 0x014, 0x016, 0x017,
                 0x201, 0x203, 0x292, 0x293, 0x2F8, 0x2F9, 0x31D, 0x31C};
             std::array<u32, 16> values{};
             for (size_t i = 0; i < offsets.size(); ++i) {
-                values[i] = liverpool->regs.reg_array[AmdGpu::Regs::ContextRegWordOffset +
-                                                      offsets[i]];
+                values[i] = liverpool->BackRegs().reg_array[AmdGpu::Regs::ContextRegWordOffset +
+                                                            offsets[i]];
             }
             static std::set<std::array<u32, 16>> seen;
             if (seen.size() < 60 && seen.insert(values).second) {
@@ -841,14 +841,14 @@ void Rasterizer::DispatchDirect() {
         native_bindings->BeginDraw();
     }
 
-    const auto& cs_program = liverpool->GetCsRegs();
+    const auto& cs_program = liverpool->BackCsRegs();
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
     if (!pipeline) {
         return;
     }
 
     const auto& cs = pipeline->GetStage(Shader::LogicalStage::Compute);
-    if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
+    if (ExecuteShaderHLE(cs, liverpool->BackRegs(), cs_program, *this)) {
         return;
     }
 
@@ -885,7 +885,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         native_bindings->BeginDraw();
     }
 
-    const auto& cs_program = liverpool->GetCsRegs();
+    const auto& cs_program = liverpool->BackCsRegs();
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
     if (!pipeline) {
         return;
@@ -1007,7 +1007,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 
     // Bind resource buffers and textures.
     Shader::Backend::Bindings binding{};
-    push_data = MakeUserData(liverpool->regs);
+    push_data = MakeUserData(liverpool->BackRegs());
     for (const auto* stage : pipeline->GetStages()) {
         if (!stage) {
             continue;
@@ -1102,7 +1102,7 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     }
 
     // Ensure shader only has 2 bound buffers
-    const auto& cs_pgm = liverpool->GetCsRegs();
+    const auto& cs_pgm = liverpool->BackCsRegs();
     const auto& info = pipeline->GetStage(Shader::LogicalStage::Compute);
     if (cs_pgm.num_thread_x.full != 64 || info.buffers.size() != 2 || !info.images.empty()) {
         return false;
@@ -1164,7 +1164,7 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     }
 
     // Ensure shader only has 2 bound buffers
-    const auto& cs_pgm = liverpool->GetCsRegs();
+    const auto& cs_pgm = liverpool->BackCsRegs();
     const auto& info = pipeline->GetStage(Shader::LogicalStage::Compute);
     if (cs_pgm.num_thread_x.full != 64 || info.buffers.size() != 2 || !info.images.empty()) {
         return false;
@@ -1263,13 +1263,13 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
                 // Permutations compiled without enabled planes never read the buffer, so the
                 // declared binding is satisfied with a null descriptor instead of a copy.
-                if (liverpool->regs.clipper_control.user_clip_plane_enable == 0) {
+                if (liverpool->BackRegs().clipper_control.user_clip_plane_enable == 0) {
                     buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
                 } else {
                     auto& vk_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
                     std::array<float, AmdGpu::NUM_CLIP_PLANES * 4> planes{};
                     for (u32 i = 0; i < AmdGpu::NUM_CLIP_PLANES; ++i) {
-                        const auto& plane = liverpool->regs.clip_user_data[i];
+                        const auto& plane = liverpool->BackRegs().clip_user_data[i];
                         planes[i * 4 + 0] = std::bit_cast<float>(plane.data_x);
                         planes[i * 4 + 1] = std::bit_cast<float>(plane.data_y);
                         planes[i * 4 + 2] = std::bit_cast<float>(plane.data_z);
@@ -1290,7 +1290,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 bound_buffer = fault_buffer;
             } else if (desc.buffer_type == Shader::BufferType::SharedMemory) {
                 auto& lds_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
-                const auto& cs_program = liverpool->GetCsRegs();
+                const auto& cs_program = liverpool->BackCsRegs();
                 const auto lds_size = cs_program.SharedMemSize() * cs_program.NumWorkgroups();
                 const auto [data, offset] = lds_buffer.Map(lds_size, alignment);
                 std::memset(data, 0, lds_size);
@@ -1763,8 +1763,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
         }
         u32 native_sampler_index{};
-        const auto vk_sampler = texture_cache.GetSampler(
-            ssharp, liverpool->regs.ta_bc_base, native_bindings ? &native_sampler_index : nullptr);
+        const auto vk_sampler =
+            texture_cache.GetSampler(ssharp, liverpool->BackRegs().ta_bc_base,
+                                     native_bindings ? &native_sampler_index : nullptr);
         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
         const u32 unified_binding = binding.unified++;
         if (native_bindings) {
@@ -1791,7 +1792,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     attachment_feedback_loop = false;
-    const auto& regs = liverpool->regs;
+    const auto& regs = liverpool->BackRegs();
     const auto& key = pipeline->GetGraphicsKey();
     RenderState state{};
     state.width = instance.GetMaxFramebufferWidth();
@@ -1986,36 +1987,36 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
 }
 
 void Rasterizer::Resolve() {
-    const auto& mrt0_hint = liverpool->last_cb_extent[0];
-    const auto& mrt1_hint = liverpool->last_cb_extent[1];
-    VideoCore::TextureCache::ImageDesc mrt0_desc{liverpool->regs.color_buffers[0], mrt0_hint};
-    VideoCore::TextureCache::ImageDesc mrt1_desc{liverpool->regs.color_buffers[1], mrt1_hint};
+    const auto& mrt0_hint = liverpool->BackCbExtent(0);
+    const auto& mrt1_hint = liverpool->BackCbExtent(1);
+    VideoCore::TextureCache::ImageDesc mrt0_desc{liverpool->BackRegs().color_buffers[0], mrt0_hint};
+    VideoCore::TextureCache::ImageDesc mrt1_desc{liverpool->BackRegs().color_buffers[1], mrt1_hint};
     auto& mrt0_image = texture_cache.GetImage(texture_cache.FindImage(mrt0_desc, true));
     auto& mrt1_image = texture_cache.GetImage(texture_cache.FindImage(mrt1_desc, true));
 
     ScopeMarkerBegin(fmt::format("Resolve:MRT0={:#x}:MRT1={:#x}",
-                                 liverpool->regs.color_buffers[0].Address(),
-                                 liverpool->regs.color_buffers[1].Address()));
+                                 liverpool->BackRegs().color_buffers[0].Address(),
+                                 liverpool->BackRegs().color_buffers[1].Address()));
     mrt1_image.Resolve(mrt0_image, mrt0_desc.view_info.range, mrt1_desc.view_info.range);
     ScopeMarkerEnd();
 }
 
 void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
-    auto& regs = liverpool->regs;
+    auto& regs = liverpool->BackRegs();
 
     auto read_desc = VideoCore::TextureCache::ImageDesc(
         regs.depth_buffer, regs.depth_view, regs.depth_control,
-        regs.depth_htile_data_base.GetAddress(), liverpool->last_db_extent, false);
+        regs.depth_htile_data_base.GetAddress(), liverpool->BackDbExtent(), false);
     auto write_desc = VideoCore::TextureCache::ImageDesc(
         regs.depth_buffer, regs.depth_view, regs.depth_control,
-        regs.depth_htile_data_base.GetAddress(), liverpool->last_db_extent, true);
+        regs.depth_htile_data_base.GetAddress(), liverpool->BackDbExtent(), true);
 
     auto& read_image = texture_cache.GetImage(texture_cache.FindImage(read_desc));
     auto& write_image = texture_cache.GetImage(texture_cache.FindImage(write_desc));
 
     VideoCore::SubresourceRange sub_range;
-    sub_range.base.layer = liverpool->regs.depth_view.slice_start;
-    sub_range.extent.layers = liverpool->regs.depth_view.NumSlices() - sub_range.base.layer;
+    sub_range.base.layer = liverpool->BackRegs().depth_view.slice_start;
+    sub_range.extent.layers = liverpool->BackRegs().depth_view.NumSlices() - sub_range.base.layer;
 
     ScopeMarkerBegin(fmt::format(
         "DepthStencilCopy:DR={:#x}:SR={:#x}:DW={:#x}:SW={:#x}", regs.depth_buffer.DepthAddress(),
@@ -2148,7 +2149,7 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
         const char* value = std::getenv("SHADPS4_VIEWPORT_MEMO");
         return value ? value[0] - '0' : 0;
     }();
-    const u64 epoch = liverpool->context_change_epoch;
+    const u64 epoch = liverpool->BackContextEpoch();
     if (viewport_memo == 1 && epoch == viewport_epoch) {
         ++viewport_memo_skips;
     } else if (viewport_memo == 2 && epoch == viewport_epoch) {
@@ -2188,7 +2189,7 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
         if (fs && (fs->pgm_hash == 0xe59a987f || fs->pgm_hash == 0x1540dfa9 ||
                    fs->pgm_hash == 0x86bb04f5 || fs->pgm_hash == 0x6f5258e8)) {
             static std::unordered_set<std::string> seen;
-            const auto& regs = liverpool->regs;
+            const auto& regs = liverpool->BackRegs();
             const auto state = fmt::format(
                 "fs={:#x} control={:#x} ops={:#x} front={:#x} back={:#x} shader={:#x} "
                 "render={:#x} stencil_valid={} depth_addr={:#x}",
@@ -2211,7 +2212,7 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
 }
 
 void Rasterizer::UpdateViewportScissorState() const {
-    const auto& regs = liverpool->regs;
+    const auto& regs = liverpool->BackRegs();
 
     const auto combined_scissor_value_tl = [](s16 scr, s16 win, s16 gen, s16 win_offset) {
         return std::max({scr, s16(win + win_offset), s16(gen + win_offset)});
@@ -2342,7 +2343,7 @@ void Rasterizer::UpdateViewportScissorState() const {
 }
 
 void Rasterizer::UpdateDepthStencilState() const {
-    const auto& regs = liverpool->regs;
+    const auto& regs = liverpool->BackRegs();
     auto& dynamic_state = scheduler.GetDynamicState();
 
     const auto depth_test_enabled =
@@ -2443,7 +2444,7 @@ void Rasterizer::UpdateDepthStencilState() const {
 }
 
 void Rasterizer::UpdatePrimitiveState(const bool is_indexed) const {
-    const auto& regs = liverpool->regs;
+    const auto& regs = liverpool->BackRegs();
     auto& dynamic_state = scheduler.GetDynamicState();
 
     const auto is_list_topology = [](const AmdGpu::PrimitiveType type) {
@@ -2480,13 +2481,13 @@ void Rasterizer::UpdatePrimitiveState(const bool is_indexed) const {
 }
 
 void Rasterizer::UpdateRasterizationState() const {
-    const auto& regs = liverpool->regs;
+    const auto& regs = liverpool->BackRegs();
     auto& dynamic_state = scheduler.GetDynamicState();
     dynamic_state.SetLineWidth(regs.line_control.Width());
 }
 
 void Rasterizer::UpdateColorBlendingState(const GraphicsPipeline* pipeline) const {
-    const auto& regs = liverpool->regs;
+    const auto& regs = liverpool->BackRegs();
     auto& dynamic_state = scheduler.GetDynamicState();
     dynamic_state.SetBlendConstants(regs.blend_constants);
     dynamic_state.SetColorWriteMasks(pipeline->GetGraphicsKey().write_masks);
