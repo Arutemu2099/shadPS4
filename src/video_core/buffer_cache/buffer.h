@@ -134,12 +134,13 @@ public:
     /// visible to the reading stage and access; a write waits for every earlier read and write.
     /// Measured 2026-09-24: ~490 buffer barrier calls per frame (each also ends the render pass)
     /// under the default "any change of access or stage" rule.
+    /// Read once at startup (a function-local static would add a guard check per binding).
+    static inline const bool smart_barriers_enabled = [] {
+        const char* value = std::getenv("SHADPS4_SMART_BUFFER_BARRIERS");
+        return value != nullptr && value[0] == '1';
+    }();
     static bool SmartBarriers() {
-        static const bool enabled = [] {
-            const char* value = std::getenv("SHADPS4_SMART_BUFFER_BARRIERS");
-            return value != nullptr && value[0] == '1';
-        }();
-        return enabled;
+        return smart_barriers_enabled;
     }
 
     std::optional<vk::BufferMemoryBarrier2> GetBarrier(vk::AccessFlags2 dst_acess_mask,

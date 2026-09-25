@@ -36,6 +36,12 @@
 
 namespace Common {
 
+/// SHADPS4_RECORD_BYTES_STATS=1, read once at startup (see RecordBytesStatsEnabled).
+inline const bool g_record_bytes_stats = [] {
+    const char* value = std::getenv("SHADPS4_RECORD_BYTES_STATS");
+    return value && value[0] == '1';
+}();
+
 /**
  * A bounded, single-producer command queue with one recording worker.
  *
@@ -254,12 +260,9 @@ public:
 
 private:
     // SHADPS4_RECORD_BYTES_STATS=1 (diagnostic): bytes recorded per command type (producer only).
+    // Namespace-scope flag: a function-local static would add a guard check to every Record.
     static bool RecordBytesStatsEnabled() {
-        static const bool enabled = [] {
-            const char* value = std::getenv("SHADPS4_RECORD_BYTES_STATS");
-            return value && value[0] == '1';
-        }();
-        return enabled;
+        return g_record_bytes_stats;
     }
     static void NoteRecordBytes(const char* type, std::size_t bytes) {
         struct Entry {

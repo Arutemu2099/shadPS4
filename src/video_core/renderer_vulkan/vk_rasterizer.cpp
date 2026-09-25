@@ -38,6 +38,55 @@
 
 namespace Vulkan {
 
+namespace {
+// Per-draw / per-binding environment flags, read once at startup. A function-local
+// `static const` flag costs a guard check on every call (under the MSVC ABI: load the guard,
+// _tls_index, gs:[0x58], the thread's TLS block, compare with _Init_thread_epoch); guard lines
+// drew ~2.5% of the command processor's stack samples (a19, 2026-09-25). Values unchanged.
+bool EnvIs1(const char* name) {
+    const char* value = std::getenv(name);
+    return value && value[0] == '1';
+}
+bool EnvExactly1(const char* name) {
+    const char* value = std::getenv(name);
+    return value && std::string_view{value} == "1";
+}
+const bool g_prepared_targets = EnvIs1("SHADPS4_PREPARED_TARGETS");
+const bool g_verify_targets = EnvIs1("SHADPS4_PREPARED_TARGETS_VERIFY");
+const bool g_raw_write_invalidate = EnvIs1("SHADPS4_RAW_WRITE_INVALIDATE");
+const bool g_cache_decoded_images = [] {
+    const char* value = std::getenv("SHADPS4_DECODE_IMAGE_CACHE");
+    return !value || value[0] != '0';
+}();
+const bool g_verify_decoded_images = EnvIs1("SHADPS4_DECODE_IMAGE_VERIFY");
+const std::vector<u64> g_trace_hashes = [] {
+    std::vector<u64> out;
+    if (const char* value = std::getenv("SHADPS4_TRACE_SHADER")) {
+        char* cursor = const_cast<char*>(value);
+        while (*cursor) {
+            out.push_back(std::strtoull(cursor, &cursor, 16));
+            if (*cursor == ',') {
+                ++cursor;
+            } else {
+                break;
+            }
+        }
+    }
+    return out;
+}();
+const s64 g_idbuf_fill = [] {
+    const char* value = std::getenv("SHADPS4_NEO_IDBUF_FILL");
+    return value ? static_cast<s64>(std::strtoll(value, nullptr, 0)) : s64{-1};
+}();
+const bool g_idbuf_derive = EnvIs1("SHADPS4_NEO_IDBUF_DERIVE");
+const int g_viewport_memo = [] {
+    const char* value = std::getenv("SHADPS4_VIEWPORT_MEMO");
+    return value ? value[0] - '0' : 0;
+}();
+const bool g_hair_stencil_trace = EnvExactly1("SHADPS4_HAIR_STENCIL_TRACE");
+const bool g_replace_op_reference = EnvExactly1("SHADPS4_STENCIL_REPLACE_OP");
+} // namespace
+
 // Shape-only diagnostic; enable for one run, then compile it out for FPS comparisons.
 #ifndef SHADPS4_BINDING_PROBE
 #define SHADPS4_BINDING_PROBE 0
@@ -268,14 +317,8 @@ static bool SamePreparedTarget(const VideoCore::TextureCache::ImageDesc& a,
 }
 
 void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
-    static const bool prepared_targets = [] {
-        const char* value = std::getenv("SHADPS4_PREPARED_TARGETS");
-        return value && value[0] == '1';
-    }();
-    static const bool verify_targets = [] {
-        const char* value = std::getenv("SHADPS4_PREPARED_TARGETS_VERIFY");
-        return value && value[0] == '1';
-    }();
+    const bool prepared_targets = g_prepared_targets;
+    const bool verify_targets = g_verify_targets;
     const auto verify = [](bool hit, const auto& prepared, const auto& reference) {
         ASSERT(SamePreparedTarget(prepared, reference));
         static thread_local u64 calls{}, hits{};
@@ -2078,10 +2121,7 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
             }
             // SHADPS4_RAW_WRITE_INVALIDATE=1 (port of upstream #5092): raw storage-buffer writes
             // can also make an aliased cached image stale, not only formatted ones.
-            static const bool raw_write_invalidate = [] {
-                const char* value = std::getenv("SHADPS4_RAW_WRITE_INVALIDATE");
-                return value && value[0] == '1';
-            }();
+            const bool raw_write_invalidate = g_raw_write_invalidate;
             if (desc.is_written && (desc.is_formatted || raw_write_invalidate)) {
                 texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
             }
@@ -2194,14 +2234,8 @@ void Rasterizer::BindTextures(const Shader::BoundStage& bound,
 
     const auto t_findimage = Common::FaultMonitor::Now();
 
-    static const bool cache_decoded_images = [] {
-        const char* value = std::getenv("SHADPS4_DECODE_IMAGE_CACHE");
-        return !value || value[0] != '0';
-    }();
-    static const bool verify_decoded_images = [] {
-        const char* value = std::getenv("SHADPS4_DECODE_IMAGE_VERIFY");
-        return value && value[0] == '1';
-    }();
+    const bool cache_decoded_images = g_cache_decoded_images;
+    const bool verify_decoded_images = g_verify_decoded_images;
     for (size_t image_slot = 0; image_slot < stage.images.size(); ++image_slot) {
         const auto& image_desc = stage.images[image_slot];
         const auto tsharp = image_desc.GetSharp(bound);
@@ -2286,21 +2320,7 @@ void Rasterizer::BindTextures(const Shader::BoundStage& bound,
             {
                 // Diagnostic SHADPS4_TRACE_SHADER=<hex pgm hash>: log texture bindings of that
                 // shader (first 16 binds): requested T# vs the cache image it resolved to.
-                static const std::vector<u64> trace_hashes = [] {
-                    std::vector<u64> out;
-                    if (const char* value = std::getenv("SHADPS4_TRACE_SHADER")) {
-                        char* cursor = const_cast<char*>(value);
-                        while (*cursor) {
-                            out.push_back(std::strtoull(cursor, &cursor, 16));
-                            if (*cursor == ',') {
-                                ++cursor;
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                    return out;
-                }();
+                const auto& trace_hashes = g_trace_hashes;
                 static u32 traced = 0;
                 const u64 trace_hash = stage.pgm_hash;
                 if (!trace_hashes.empty() && traced < 48 &&
@@ -2411,14 +2431,8 @@ void Rasterizer::BindTextures(const Shader::BoundStage& bound,
                 // 2-sample R32Uint surface written by the rasterizer) is not emulated; fill it with
                 // a constant before a shader samples it, to test whether it gates the checkerboard
                 // resolve. Not a fix.
-                static const s64 idbuf_fill = [] {
-                    const char* value = std::getenv("SHADPS4_NEO_IDBUF_FILL");
-                    return value ? static_cast<s64>(std::strtoll(value, nullptr, 0)) : s64{-1};
-                }();
-                static const bool idbuf_derive = [] {
-                    const char* value = std::getenv("SHADPS4_NEO_IDBUF_DERIVE");
-                    return value && value[0] == '1';
-                }();
+                const s64 idbuf_fill = g_idbuf_fill;
+                const bool idbuf_derive = g_idbuf_derive;
                 if (idbuf_derive && !is_storage && image.info.num_samples == 2 &&
                     image.info.pixel_format == vk::Format::eR32Uint) {
                     DeriveNeoIdBuffer(image);
@@ -2909,10 +2923,7 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
     // SHADPS4_VIEWPORT_MEMO=1: viewports and scissors are a pure function of context registers
     // (and device limits), so skip recomputing them while no SET_CONTEXT_REG changed a byte.
     // =2 recomputes anyway and checks the tracked values did not change.
-    static const int viewport_memo = [] {
-        const char* value = std::getenv("SHADPS4_VIEWPORT_MEMO");
-        return value ? value[0] - '0' : 0;
-    }();
+    const int viewport_memo = g_viewport_memo;
     const u64 epoch = liverpool->BackContextEpoch();
     if (viewport_memo == 1 && epoch == viewport_epoch) {
         ++viewport_memo_skips;
@@ -2944,10 +2955,7 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
 
     // Bounded read-only diagnostic: distinguish PS4 test/operation stencil values
     // before selecting any correction for the captured hair composite failure.
-    static const bool hair_stencil_trace = [] {
-        const char* value = std::getenv("SHADPS4_HAIR_STENCIL_TRACE");
-        return value && std::string{value} == "1";
-    }();
+    const bool hair_stencil_trace = g_hair_stencil_trace;
     if (hair_stencil_trace) {
         const auto* fs = pipeline->GetStages()[int(Shader::LogicalStage::Fragment)];
         if (fs && (fs->pgm_hash == 0xe59a987f || fs->pgm_hash == 0x1540dfa9 ||
@@ -3157,10 +3165,7 @@ void Rasterizer::UpdateDepthStencilState() const {
         const auto front = regs.stencil_ref_front;
         const auto back =
             regs.depth_control.backface_enable ? regs.stencil_ref_back : regs.stencil_ref_front;
-        static const bool replace_op_reference = [] {
-            const char* value = std::getenv("SHADPS4_STENCIL_REPLACE_OP");
-            return value && std::string{value} == "1";
-        }();
+        const bool replace_op_reference = g_replace_op_reference;
         const auto reference = [&](const AmdGpu::StencilRefMask& face, AmdGpu::CompareFunc compare,
                                    AmdGpu::StencilFunc fail, AmdGpu::StencilFunc pass,
                                    AmdGpu::StencilFunc depth_fail) -> u32 {

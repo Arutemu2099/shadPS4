@@ -30,27 +30,30 @@ inline bool EnvFlag(const char* name) {
     return env != nullptr && std::string_view{env} == "1";
 }
 
+// Read once at startup: these are checked on every fault and upload, and a function-local
+// static would add a guard check to each call.
+inline const bool g_enabled = EnvFlag("SHADPS4_READBACK_OFFLOAD");
+inline const bool g_verify_enabled = EnvFlag("SHADPS4_READBACK_OFFLOAD_VERIFY");
+inline const bool g_profile_enabled = EnvFlag("SHADPS4_READBACK_OFFLOAD_PROFILE");
+inline const bool g_latency_enabled = EnvFlag("SHADPS4_READBACK_LATENCY");
+
 inline bool Enabled() {
-    static const bool value = EnvFlag("SHADPS4_READBACK_OFFLOAD");
-    return value;
+    return g_enabled;
 }
 
 inline bool VerifyEnabled() {
-    static const bool value = EnvFlag("SHADPS4_READBACK_OFFLOAD_VERIFY");
-    return value;
+    return g_verify_enabled;
 }
 
 inline bool ProfileEnabled() {
-    static const bool value = EnvFlag("SHADPS4_READBACK_OFFLOAD_PROFILE");
-    return value;
+    return g_profile_enabled;
 }
 
 /// SHADPS4_READBACK_LATENCY=1: split each guest readback job's latency into CP pickup, prepare,
 /// flush (recorder drain + submit), GPU backlog, completion-to-wake and finish. Starts a thread
 /// that spins on the timeline semaphore to timestamp every tick; diagnostic only.
 inline bool LatencyEnabled() {
-    static const bool value = EnvFlag("SHADPS4_READBACK_LATENCY");
-    return value;
+    return g_latency_enabled;
 }
 
 /// SHADPS4_READBACK_SPIN_WAIT=N: a guest readback polls the timeline semaphore for up to N us

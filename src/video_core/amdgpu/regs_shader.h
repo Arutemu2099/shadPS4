@@ -212,23 +212,27 @@ struct ComputeProgram {
     }
 };
 
+// Both flags are read per draw per stage; namespace-scope so a read is a plain load rather than
+// a function-local-static guard check.
+inline const bool g_bininfo_memo_enabled = [] {
+    const char* env = std::getenv("SHADPS4_BININFO_MEMO");
+    return env != nullptr && env[0] == '1';
+}();
+
 inline bool BinaryInfoMemoEnabled() {
-    static const bool enabled = [] {
-        const char* env = std::getenv("SHADPS4_BININFO_MEMO");
-        return env != nullptr && env[0] == '1';
-    }();
-    return enabled;
+    return g_bininfo_memo_enabled;
 }
 
 // SHADPS4_PGM_PREFETCH=1: when the command processor sees a PS/VS program address written, it
 // prefetches the code and the BinaryInfo last found for that address, so GetParams on the next
 // draw does not wait on cold guest lines. Hints are only prefetch targets, never dereferenced.
+inline const bool g_pgm_prefetch_enabled = [] {
+    const char* env = std::getenv("SHADPS4_PGM_PREFETCH");
+    return env != nullptr && env[0] == '1';
+}();
+
 inline bool PgmPrefetchEnabled() {
-    static const bool enabled = [] {
-        const char* env = std::getenv("SHADPS4_PGM_PREFETCH");
-        return env != nullptr && env[0] == '1';
-    }();
-    return enabled;
+    return g_pgm_prefetch_enabled;
 }
 inline std::array<std::atomic<const void*>, 512> g_bininfo_hints{};
 inline size_t BinaryInfoHintSlot(const void* code) {

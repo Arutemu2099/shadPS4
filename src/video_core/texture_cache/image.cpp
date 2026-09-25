@@ -20,6 +20,13 @@ using namespace Vulkan;
 
 Common::IncrementalIdProvider<u64> Image::global_image_uid{};
 
+// SHADPS4_SMART_IMAGE_BARRIERS, read once at startup: GetBarriers runs per image transition, and
+// a function-local static would add a guard check to each call.
+static const bool g_smart_images = [] {
+    const char* value = std::getenv("SHADPS4_SMART_IMAGE_BARRIERS");
+    return value != nullptr && value[0] == '1';
+}();
+
 static vk::ImageUsageFlags ImageUsageFlags(const Vulkan::Instance* instance,
                                            const ImageInfo& info) {
     vk::ImageUsageFlags usage = vk::ImageUsageFlagBits::eTransferSrc |
@@ -243,10 +250,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
     // skips reads whose stage and access are already in the state; otherwise the barrier is kept
     // and the state becomes the union of the reads, so alternating read kinds settle after one
     // barrier each (a later write waits for every stage in the union).
-    static const bool smart_images = [] {
-        const char* value = std::getenv("SHADPS4_SMART_IMAGE_BARRIERS");
-        return value != nullptr && value[0] == '1';
-    }();
+    const bool smart_images = g_smart_images;
     constexpr auto any_writes = write_flags | vk::AccessFlagBits2::eShaderStorageWrite |
                                 vk::AccessFlagBits2::eColorAttachmentWrite |
                                 vk::AccessFlagBits2::eDepthStencilAttachmentWrite;

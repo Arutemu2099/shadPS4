@@ -28,16 +28,35 @@ namespace VideoCore {
 
 namespace Offload = Common::ReadbackOffload;
 
+namespace {
+// Flags checked per binding, per draw or per fault, read once at startup: a function-local
+// `static const` costs a guard check (a TLS epoch load chain under the MSVC ABI) on every call.
+bool EnvIs1(const char* name) {
+    const char* value = std::getenv(name);
+    return value && value[0] == '1';
+}
+const char g_prebatch_mode = [] {
+    const char* value = std::getenv("SHADPS4_READBACK_PREBATCH");
+    return value && (value[0] == '1' || value[0] == '2') ? value[0] : '0';
+}();
+const bool g_precise_producer = EnvIs1("SHADPS4_PRECISE_PRODUCER");
+const bool g_buffer_traffic_enabled = EnvIs1("SHADPS4_BUFFER_TRAFFIC");
+const bool g_fault_write_skip_settle = EnvIs1("SHADPS4_FAULT_WRITE_SKIP_SETTLE");
+const bool g_async_submit = EnvIs1("SHADPS4_ASYNC_SUBMIT");
+const bool g_readback_early_flush = EnvIs1("SHADPS4_READBACK_EARLY_FLUSH");
+const bool g_readback_producer_stats = EnvIs1("SHADPS4_READBACK_PRODUCER_STATS");
+const bool g_range_add_skip = EnvIs1("SHADPS4_RANGE_ADD_SKIP");
+const bool g_vb_repeat_stats = EnvIs1("SHADPS4_VB_REPEAT_STATS");
+const bool g_written_memo = EnvIs1("SHADPS4_WRITTEN_MEMO");
+const bool g_deferred_protect = EnvIs1("SHADPS4_DEFERRED_PROTECT");
+} // namespace
+
 /// SHADPS4_READBACK_PREBATCH: 1 = copies of data the recorded batch does not write go ahead of
 /// it; 2 = the same, and the batch is still submitted right after, as a fault always did.
 /// Measured 2026-09-24: mode 1 alone let batches grow (787 vs 650 draws) and the remaining
 /// in-batch readbacks waited 2.9 ms instead of 1.1 ms.
 static char PrebatchMode() {
-    static const char mode = [] {
-        const char* value = std::getenv("SHADPS4_READBACK_PREBATCH");
-        return value && (value[0] == '1' || value[0] == '2') ? value[0] : '0';
-    }();
-    return mode;
+    return g_prebatch_mode;
 }
 
 /// SHADPS4_PRECISE_PRODUCER=1 (with SHADPS4_READBACK_QUEUE=1 or 2, prebatch off): a readback
@@ -46,11 +65,7 @@ static char PrebatchMode() {
 /// floor made nearly every copy wait for the newest submitted batch). Measured 2026-09-24:
 /// early copies in queue order waited ~0.7 ms behind unrelated batches.
 static bool PreciseProducerEnabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("SHADPS4_PRECISE_PRODUCER");
-        return value && value[0] == '1';
-    }();
-    return enabled;
+    return g_precise_producer;
 }
 
 static bool PrebatchEnabled() {
@@ -194,11 +209,7 @@ struct BufferTraffic {
     std::chrono::steady_clock::time_point last{std::chrono::steady_clock::now()};
 
     static bool Enabled() {
-        static const bool enabled = [] {
-            const char* value = std::getenv("SHADPS4_BUFFER_TRAFFIC");
-            return value && value[0] == '1';
-        }();
-        return enabled;
+        return g_buffer_traffic_enabled;
     }
 
     void Record(VAddr addr, u32 size, bool written, bool texel, bool other_caller, bool dirty,
@@ -417,10 +428,7 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, InvalidateOrigin
     // ResolveFaultSync. A GPU write landing later bumps the region sequence and vetoes the job.
     // Measured 2026-09-23: this settle, reached from CP-thread DMA fast-path faults, blocked
     // the CP on the GPU for 3.9% of its wall time.
-    static const bool skip_fault_settle = [] {
-        const char* value = std::getenv("SHADPS4_FAULT_WRITE_SKIP_SETTLE");
-        return value && value[0] == '1';
-    }();
+    const bool skip_fault_settle = g_fault_write_skip_settle;
     if (Offload::Enabled() && !(skip_fault_settle && origin != InvalidateOrigin::Explicit) &&
         HasOverlappingFaultJob(device_addr, size)) {
         // InvalidateRegion marks CPU state on this thread wherever it finds no GPU bit, and an
@@ -1041,11 +1049,7 @@ void BufferCache::RecordFaultCopies(vk::CommandBuffer cmdbuf, Buffer& source, vk
 /// instead of draining it for a synchronous borrow (measured 2026-09-24: that drain was 2.8% of
 /// the CP's wall time). Access tracking of the source is still updated here, in order.
 bool BufferCache::AsyncFaultCopies() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("SHADPS4_ASYNC_SUBMIT");
-        return value && value[0] == '1';
-    }();
-    return enabled && scheduler.IsAsyncRecording();
+    return g_async_submit && scheduler.IsAsyncRecording();
 }
 
 void BufferCache::RecordFaultCopiesAsync(Buffer& source, vk::Buffer staging,
@@ -1105,19 +1109,11 @@ void BufferCache::RecordFaultCopiesAsync(Buffer& source, vk::Buffer staging,
 }
 
 static bool EarlyFlushEnabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("SHADPS4_READBACK_EARLY_FLUSH");
-        return value && value[0] == '1';
-    }();
-    return enabled;
+    return g_readback_early_flush;
 }
 
 static bool ProducerStatsEnabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("SHADPS4_READBACK_PRODUCER_STATS");
-        return value && value[0] == '1';
-    }();
-    return enabled;
+    return g_readback_producer_stats;
 }
 
 void BufferCache::NoteBatchWrite(VAddr addr, u64 size) {
@@ -1508,11 +1504,7 @@ namespace {
 // (one tree lookup instead of insert + join; the set stays identical). A direct-mapped memo of
 // ranges added since the last Subtract (gpu_clear_epoch) answers repeats without the lookup.
 bool RangeAddSkip() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("SHADPS4_RANGE_ADD_SKIP");
-        return value && value[0] == '1';
-    }();
-    return enabled;
+    return g_range_add_skip;
 }
 struct RangeAddMemo {
     VAddr addr;
@@ -1712,10 +1704,7 @@ void BufferCache::BindVertexBuffers(
 
     // SHADPS4_VB_REPEAT_STATS=1 (diagnostic): how often a draw binds exactly the merged vertex
     // ranges of the previous draw, i.e. the ceiling for reusing its ObtainBuffer results.
-    static const bool repeat_stats = [] {
-        const char* value = std::getenv("SHADPS4_VB_REPEAT_STATS");
-        return value && value[0] == '1';
-    }();
+    const bool repeat_stats = g_vb_repeat_stats;
     if (repeat_stats) {
         static std::vector<std::pair<VAddr, VAddr>> previous;
         static u64 draws = 0, repeats = 0, with_ranges = 0, range_total = 0;
@@ -1991,10 +1980,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     // readback job is pending (their write-sequence vote needs the marking). Then the walk
     // would upload nothing and change no bit: skip it, and the range add it would repeat.
     // Measured 2026-09-24: written bindings walk and lock every region with no fast path.
-    static const bool written_memo = [] {
-        const char* value = std::getenv("SHADPS4_WRITTEN_MEMO");
-        return value && value[0] == '1';
-    }();
+    const bool written_memo = g_written_memo;
     u64 memo_epoch = 0;
     WrittenMemoEntry* memo_entry = nullptr;
     if (written_memo && is_written) {
@@ -2488,10 +2474,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     // after it faults as usual. The copy reads the physical backing, so pages read-protected in
     // the meantime (readbacks) cannot fault on the recording thread.
     // Measured 2026-09-23: VirtualProtect was 10.2% and this copy ~2% of CP wall time.
-    static const bool deferred_protect = [] {
-        const char* value = std::getenv("SHADPS4_DEFERRED_PROTECT");
-        return value && value[0] == '1';
-    }();
+    const bool deferred_protect = g_deferred_protect;
     const bool defer = deferred_protect && scheduler.IsAsyncRecording();
     if (defer) {
         deferred_protects.clear();

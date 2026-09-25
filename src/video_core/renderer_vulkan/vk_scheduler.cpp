@@ -17,6 +17,19 @@
 
 namespace Vulkan {
 
+namespace {
+// Per-draw flags, read once at startup instead of through function-local statics (each of
+// those adds a guard check per call).
+const int g_skip_empty_dynstate = [] {
+    const char* value = std::getenv("SHADPS4_SKIP_EMPTY_DYNSTATE");
+    return value ? value[0] - '0' : 0;
+}();
+const bool g_pop_fastpath = [] {
+    const char* value = std::getenv("SHADPS4_POP_FASTPATH");
+    return value && value[0] == '1';
+}();
+} // namespace
+
 std::mutex Scheduler::submit_mutex;
 std::atomic<VkSemaphore> Scheduler::async_timeline{VK_NULL_HANDLE};
 std::atomic<u64> Scheduler::async_submitted_tick{0};
@@ -71,10 +84,7 @@ void Scheduler::CommitDynamicState() {
     // would emit nothing. Commit clears exactly the bits it emits, so it emits nothing iff the
     // postponed set computed below equals the current dirty set (padding bits only make the
     // comparison conservative). =2 also logs the skip rate every 2^20 calls.
-    static const int skip_empty = [] {
-        const char* value = std::getenv("SHADPS4_SKIP_EMPTY_DYNSTATE");
-        return value ? value[0] - '0' : 0;
-    }();
+    const int skip_empty = g_skip_empty_dynstate;
     auto& state = dynamic_state;
     const auto old_dirty = state.dirty_state;
     // Keep the conditional dirtiness which Commit deliberately postpones until
@@ -286,10 +296,7 @@ void Scheduler::PopPendingOperations() {
     // counter query when nothing is queued, and poll the counter only every 16th call while the
     // oldest operation is not yet known to be free. Measured 2026-09-24 on 386F5167: ~1.6% of the
     // CP's wall time. pending_ops is only touched on this thread.
-    static const bool fast = [] {
-        const char* value = std::getenv("SHADPS4_POP_FASTPATH");
-        return value && value[0] == '1';
-    }();
+    const bool fast = g_pop_fastpath;
     if (fast) {
         if (pending_ops.empty()) {
             return;

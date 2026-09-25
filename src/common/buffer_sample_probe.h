@@ -22,6 +22,13 @@ enum class BufferSampleCaller : u8 {
     Storage,
 };
 
+/// SHADPS4_BUFFER_SAMPLE, read once at startup: Enabled() runs per ObtainBuffer call, and a
+/// function-local static would add a guard check to each.
+inline const bool g_buffer_sample_enabled = [] {
+    const char* env = std::getenv("SHADPS4_BUFFER_SAMPLE");
+    return env != nullptr && std::atoi(env) != 0;
+}();
+
 /// A low-frequency, runtime-opt-in probe for the ordinary BufferCache path.
 ///
 /// The probe deliberately keeps its counters thread-local. ObtainBuffer is normally called on
@@ -46,11 +53,7 @@ public:
     };
 
     static bool Enabled() noexcept {
-        static const bool enabled = [] {
-            const char* env = std::getenv("SHADPS4_BUFFER_SAMPLE");
-            return env != nullptr && std::atoi(env) != 0;
-        }();
-        return enabled;
+        return g_buffer_sample_enabled;
     }
 
     static bool ShouldSample() noexcept {

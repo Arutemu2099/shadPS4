@@ -21,6 +21,21 @@
 
 namespace VideoCore {
 
+// Environment flags read on every upload walk or fault, read once at startup: a function-local
+// static costs a guard check per call.
+inline const bool g_upload_clean_skip = [] {
+    const char* env = std::getenv("SHADPS4_UPLOAD_CLEAN_SKIP");
+    return env == nullptr || std::atoi(env) != 0;
+}();
+inline const bool g_upload_precheck = [] {
+    const char* env = std::getenv("SHADPS4_UPLOAD_PRECHECK");
+    return env != nullptr && env[0] == '1';
+}();
+inline const bool g_fault_watch_outside = [] {
+    const char* env = std::getenv("SHADPS4_FAULT_WATCH_OUTSIDE");
+    return env != nullptr && env[0] == '1';
+}();
+
 class MemoryTracker {
 public:
     static constexpr size_t MAX_CPU_PAGE_BITS = 40;
@@ -130,16 +145,12 @@ public:
                           auto&& on_flush) noexcept {
         const bool defer = g_epoch_defer_upload;
         const u64 submit_epoch = defer ? g_submit_epoch.load(std::memory_order_acquire) : 0;
-        static const bool watch_outside = [] {
-            const char* env = std::getenv("SHADPS4_FAULT_WATCH_OUTSIDE");
-            return env != nullptr && env[0] == '1';
-        }();
         thread_local std::vector<DeferredWatch> deferred_watches;
         IteratePages<false>(
             cpu_addr, size,
             [&on_flush, defer, from_guest_fault, submit_epoch](RegionManager* manager, u64 offset,
                                                                size_t size) {
-                if (watch_outside && from_guest_fault) {
+                if (g_fault_watch_outside && from_guest_fault) {
                     g_deferred_watch = &deferred_watches;
                 }
                 const bool should_flush = [&] {
@@ -178,11 +189,7 @@ public:
     /// SHADPS4_UPLOAD_CLEAN_SKIP=0 disables the pre-lock skip, so the fix can be A/B'd against
     /// itself in one binary. Default on.
     static bool CleanSkipEnabled() {
-        static const bool enabled = [] {
-            const char* env = std::getenv("SHADPS4_UPLOAD_CLEAN_SKIP");
-            return env == nullptr || std::atoi(env) != 0;
-        }();
-        return enabled;
+        return g_upload_clean_skip;
     }
 
     /**
@@ -224,11 +231,7 @@ public:
     /// the exact range proves the locked work would do nothing. See RegionManager::
     /// CpuDirtyInRangeRelaxed / WrittenRangeSettled for why the reads are sound.
     static bool UploadPrecheckEnabled() {
-        static const bool enabled = [] {
-            const char* env = std::getenv("SHADPS4_UPLOAD_PRECHECK");
-            return env != nullptr && env[0] == '1';
-        }();
-        return enabled;
+        return g_upload_precheck;
     }
 
     /// Precheck counters (CP thread; logged under the flag). "visits" are region visits that

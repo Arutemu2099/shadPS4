@@ -330,28 +330,45 @@ PipelineCache::~PipelineCache() {
     scheduler.DrainRecording();
 }
 
+namespace {
+// Per-draw / per-stage environment flags, read once at startup. A function-local `static const`
+// costs a guard check (a TLS epoch load chain under the MSVC ABI) on every call.
+bool EnvExactly1(const char* name) {
+    const char* value = std::getenv(name);
+    return value && value[0] == '1' && value[1] == '\0';
+}
+bool EnvIs1(const char* name) {
+    const char* value = std::getenv(name);
+    return value && value[0] == '1';
+}
+const bool g_prepared_pipelines = EnvExactly1("SHADPS4_PREPARED_PIPELINES");
+const bool g_prepared_tags = EnvIs1("SHADPS4_PREPARED_TAGS");
+const bool g_prepared_pipelines_verify = EnvExactly1("SHADPS4_PREPARED_PIPELINES_VERIFY");
+const size_t g_prepared_ways_env = [] {
+    const char* value = std::getenv("SHADPS4_PREPARED_WAYS");
+    return value ? static_cast<size_t>(std::strtoull(value, nullptr, 10)) : size_t{4};
+}();
+const bool g_prepared_lru = EnvIs1("SHADPS4_PREPARED_LRU");
+const bool g_log_mixed_samples = EnvIs1("SHADPS4_MIXED_SAMPLES_LOG");
+const bool g_shared_fetch_verify = [] {
+    const char* value = std::getenv("SHADPS4_SHARED_FETCH_VERIFY");
+    return value && std::string_view{value} == "1";
+}();
+const bool g_prepared_programs = EnvExactly1("SHADPS4_PREPARED_PROGRAMS");
+const bool g_prepared_programs_verify = EnvExactly1("SHADPS4_PREPARED_PROGRAMS_VERIFY");
+const bool g_prepared_programs_two_entry = EnvExactly1("SHADPS4_PREPARED_PROGRAMS_TWO_ENTRY");
+} // namespace
+
 static bool PreparedPipelinesEnabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("SHADPS4_PREPARED_PIPELINES");
-        return value && value[0] == '1' && value[1] == '\0';
-    }();
-    return enabled;
+    return g_prepared_pipelines;
 }
 
 static bool PreparedTags() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("SHADPS4_PREPARED_TAGS");
-        return value && value[0] == '1';
-    }();
-    return enabled;
+    return g_prepared_tags;
 }
 
 static bool PreparedPipelinesVerify() {
-    static const bool verify = [] {
-        const char* value = std::getenv("SHADPS4_PREPARED_PIPELINES_VERIFY");
-        return value && value[0] == '1' && value[1] == '\0';
-    }();
-    return verify;
+    return g_prepared_pipelines_verify;
 }
 
 namespace {
@@ -409,12 +426,7 @@ static bool ShaderCollectCached() {
 }
 
 size_t PipelineCache::PreparedPipelineWays() {
-    static const size_t ways = [] {
-        const char* value = std::getenv("SHADPS4_PREPARED_WAYS");
-        const size_t v = value ? std::strtoull(value, nullptr, 10) : 4;
-        return std::clamp<size_t>(v, 1, PreparedPipelineMaxWays);
-    }();
-    return ways;
+    return std::clamp<size_t>(g_prepared_ways_env, 1, PreparedPipelineMaxWays);
 }
 
 PipelineCache::PreparedPipelineEntry* PipelineCache::TryPreparedPipeline(
@@ -604,10 +616,7 @@ void PipelineCache::SeedPreparedPipeline(const PreparedGraphicsState& state,
     }
     if (!entry) {
         // SHADPS4_PREPARED_LRU=1: evict the least recently hit way instead of round-robin.
-        static const bool lru = [] {
-            const char* value = std::getenv("SHADPS4_PREPARED_LRU");
-            return value && value[0] == '1';
-        }();
+        const bool lru = g_prepared_lru;
         if (lru) {
             entry = &set[0];
             for (size_t way = 1; way < num_ways; ++way) {
@@ -910,10 +919,7 @@ bool PipelineCache::RefreshGraphicsKey() {
         // SHADPS4_MIXED_SAMPLES_LOG=1 (diagnostic): each distinct shader pair / sample-count
         // combination that draws with color samples != depth samples, logged once. These are
         // the pipelines VK_NV_framebuffer_mixed_samples keeps mixed (Pro skin edge highlights).
-        static const bool log_mixed = [] {
-            const char* value = std::getenv("SHADPS4_MIXED_SAMPLES_LOG");
-            return value && value[0] == '1';
-        }();
+        const bool log_mixed = g_log_mixed_samples;
         if (log_mixed && depth_mismatch && regs.ps_program.Address<u32*>() &&
             regs.vs_program.Address<u32*>()) {
             static std::unordered_set<u64> seen;
@@ -1127,10 +1133,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
 
 static std::shared_ptr<const Shader::Gcn::FetchShaderData> SharedFetchMetadata(
     const Program::Module& module) {
-    static const bool verify = [] {
-        const char* value = std::getenv("SHADPS4_SHARED_FETCH_VERIFY");
-        return value && std::string_view{value} == "1";
-    }();
+    const bool verify = g_shared_fetch_verify;
     if (verify) {
         const auto& expected = module.spec.fetch_shader_data;
         const auto& actual = module.fetch_shader;
@@ -1187,18 +1190,9 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
     info.RefreshFlatBuf();
-    static const bool prepared_enabled = [] {
-        const char* value = std::getenv("SHADPS4_PREPARED_PROGRAMS");
-        return value && value[0] == '1' && value[1] == '\0';
-    }();
-    static const bool prepared_verify = [] {
-        const char* value = std::getenv("SHADPS4_PREPARED_PROGRAMS_VERIFY");
-        return value && value[0] == '1' && value[1] == '\0';
-    }();
-    static const bool prepared_two_entry_enabled = [] {
-        const char* value = std::getenv("SHADPS4_PREPARED_PROGRAMS_TWO_ENTRY");
-        return value && value[0] == '1' && value[1] == '\0';
-    }();
+    const bool prepared_enabled = g_prepared_programs;
+    const bool prepared_verify = g_prepared_programs_verify;
+    const bool prepared_two_entry_enabled = g_prepared_programs_two_entry;
     const bool eligible =
         prepared_enabled && Shader::PreparedSpecialization::Eligible(info, stage, l_stage);
     const auto start = binding;

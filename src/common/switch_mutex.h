@@ -55,15 +55,10 @@ inline u32 CurrentThreadIdFast() {
 template <const char* FlagName>
 class SwitchMutex {
 public:
+    // Read once at startup into a static data member: Mode() runs two or three times per lock and
+    // unlock, and a function-local static would add a guard check to each. Only TextureCache
+    // members use this class, and none is locked before main().
     static int Mode() {
-        static const int mode = [] {
-#ifdef _WIN32
-            const char* value = std::getenv(FlagName);
-            return value == nullptr ? 0 : value[0] == '1' ? 1 : value[0] == '2' ? 2 : 0;
-#else
-            return 0;
-#endif
-        }();
         return mode;
     }
     static bool Fast() {
@@ -151,6 +146,15 @@ private:
             FutexWait(&state, 2);
         }
     }
+
+    static inline const int mode = [] {
+#ifdef _WIN32
+        const char* value = std::getenv(FlagName);
+        return value == nullptr ? 0 : value[0] == '1' ? 1 : value[0] == '2' ? 2 : 0;
+#else
+        return 0;
+#endif
+    }();
 
     std::atomic<u32> state{0};
     std::atomic<u32> owner{0}; // Futex mode: owning thread id, 0 when free.
