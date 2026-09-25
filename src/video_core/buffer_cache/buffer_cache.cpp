@@ -1979,6 +1979,21 @@ std::pair<Buffer*, u32> BufferCache::TryHostMirror(VAddr device_addr, u32 size, 
     } else if (IsRegionGpuModified(device_addr, size)) {
         // Newest bytes are in a cache buffer, not in guest memory.
         ++hm_gpu;
+        if (is_texel && (hm_gpu & 0x3fff) == 1 && hm_samples < 16) {
+            // Which GPU-written ranges keep this formatted binding off the mirror.
+            ++hm_samples;
+            u64 count = 0, bytes = 0;
+            std::string first;
+            gpu_modified_ranges.ForEachInRange(device_addr, size, [&](VAddr lo, VAddr hi) {
+                ++count;
+                bytes += hi - lo;
+                if (count <= 4) {
+                    first += fmt::format(" {:#x}+{:#x}", lo, hi - lo);
+                }
+            });
+            LOG_INFO(Render_Vulkan, "HostMirror: texel {:#x}+{:#x} blocked by {} GPU ranges, {} KB:{}",
+                     device_addr, size, count, bytes / 1024, first);
+        }
     } else if (!MirrorBackingOffset(device_addr, size, backing)) {
         ++hm_nobacking;
     } else if ((backing >> HostMirrorChunkBits) != ((backing + size - 1) >> HostMirrorChunkBits)) {
