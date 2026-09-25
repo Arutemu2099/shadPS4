@@ -336,6 +336,14 @@ static bool PreparedPipelinesEnabled() {
     return enabled;
 }
 
+static bool PreparedTags() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_PREPARED_TAGS");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
 static bool PreparedPipelinesVerify() {
     static const bool verify = [] {
         const char* value = std::getenv("SHADPS4_PREPARED_PIPELINES_VERIFY");
@@ -432,12 +440,19 @@ PipelineCache::PreparedPipelineEntry* PipelineCache::TryPreparedPipeline(
 
     if (prepared_pipelines.empty()) {
         prepared_pipelines.resize(PreparedPipelineSets * PreparedPipelineWays);
+        prepared_tags.assign(PreparedPipelineSets * PreparedPipelineWays, 0);
     }
-    auto* set =
-        &prepared_pipelines[(state.Hash() & (PreparedPipelineSets - 1)) * PreparedPipelineWays];
+    const u64 state_hash = state.Hash();
+    const size_t set_base = (state_hash & (PreparedPipelineSets - 1)) * PreparedPipelineWays;
+    auto* set = &prepared_pipelines[set_base];
+    const u64* tags = &prepared_tags[set_base];
+    const bool use_tags = PreparedTags();
     const bool check_formats = !instance.IsVertexInputDynamicState();
     bool refreshed = false;
     for (size_t way = 0; way < PreparedPipelineWays; ++way) {
+        if (use_tags && tags[way] != state_hash) {
+            continue;
+        }
         auto& entry = set[way];
         if (!entry.valid || entry.state != state) {
             continue;
@@ -563,8 +578,9 @@ void PipelineCache::SeedPreparedPipeline(const PreparedGraphicsState& state,
         return;
     }
 
-    auto* set =
-        &prepared_pipelines[(state.Hash() & (PreparedPipelineSets - 1)) * PreparedPipelineWays];
+    const u64 state_hash = state.Hash();
+    const size_t set_base = (state_hash & (PreparedPipelineSets - 1)) * PreparedPipelineWays;
+    auto* set = &prepared_pipelines[set_base];
     PreparedPipelineEntry* entry = nullptr;
     for (size_t way = 0; way < PreparedPipelineWays && !entry; ++way) {
         if (!set[way].valid || set[way].epoch != prepared_pipeline_epoch) {
@@ -589,6 +605,7 @@ void PipelineCache::SeedPreparedPipeline(const PreparedGraphicsState& state,
     entry->vs_module = modules[vs_idx];
     entry->fetch_shader = fetch_shader;
     entry->valid = true;
+    prepared_tags[entry - prepared_pipelines.data()] = state_hash;
     ++prepared_stats.seeds;
 }
 

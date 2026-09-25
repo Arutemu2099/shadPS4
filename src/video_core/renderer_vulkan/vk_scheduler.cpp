@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstdlib>
+#include <cstring>
 
 #include "common/assert.h"
 #include "common/debug.h"
@@ -66,29 +67,52 @@ void Scheduler::CommitDynamicState() {
         dynamic_state.Commit(instance, current_cmdbuf);
         return;
     }
+    // SHADPS4_SKIP_EMPTY_DYNSTATE=1: do not record a ~0.8 KB DynamicState snapshot when Commit
+    // would emit nothing. Commit clears exactly the bits it emits, so it emits nothing iff the
+    // postponed set computed below equals the current dirty set (padding bits only make the
+    // comparison conservative). =2 also logs the skip rate every 2^20 calls.
+    static const int skip_empty = [] {
+        const char* value = std::getenv("SHADPS4_SKIP_EMPTY_DYNSTATE");
+        return value ? value[0] - '0' : 0;
+    }();
     auto& state = dynamic_state;
     const auto old_dirty = state.dirty_state;
+    // Keep the conditional dirtiness which Commit deliberately postpones until
+    // its corresponding test is enabled. All values in the packet are owned.
+    decltype(state.dirty_state) kept{};
+    kept.depth_compare_op = old_dirty.depth_compare_op && !state.depth_test_enabled;
+    kept.depth_bounds = old_dirty.depth_bounds && !state.depth_bounds_test_enabled;
+    kept.depth_bias = old_dirty.depth_bias && !state.depth_bias_enabled;
+    if (!state.stencil_test_enabled) {
+        kept.stencil_front_ops = old_dirty.stencil_front_ops;
+        kept.stencil_back_ops = old_dirty.stencil_back_ops;
+        kept.stencil_front_reference = old_dirty.stencil_front_reference;
+        kept.stencil_back_reference = old_dirty.stencil_back_reference;
+        kept.stencil_front_write_mask = old_dirty.stencil_front_write_mask;
+        kept.stencil_back_write_mask = old_dirty.stencil_back_write_mask;
+        kept.stencil_front_compare_mask = old_dirty.stencil_front_compare_mask;
+        kept.stencil_back_compare_mask = old_dirty.stencil_back_compare_mask;
+    }
+    kept.feedback_loop_enabled =
+        old_dirty.feedback_loop_enabled && !instance.IsAttachmentFeedbackLoopLayoutSupported();
+    if (skip_empty > 0) {
+        const bool empty = std::memcmp(&kept, &old_dirty, sizeof(kept)) == 0;
+        if (skip_empty == 2) {
+            static u64 calls = 0, skipped = 0;
+            skipped += empty;
+            if ((++calls & ((1u << 20) - 1)) == 0) {
+                LOG_INFO(Render_Vulkan, "SKIP_EMPTY_DYNSTATE: skipped {} of {} commits ({:.1f}%)",
+                         skipped, calls, 100.0 * skipped / calls);
+            }
+        }
+        if (empty) {
+            return;
+        }
+    }
     Record([snapshot = state, instance = &instance](vk::CommandBuffer cmdbuf) mutable {
         snapshot.Commit(*instance, cmdbuf);
     });
-    // Keep the conditional dirtiness which Commit deliberately postpones until
-    // its corresponding test is enabled. All values in the packet are owned.
-    state.dirty_state = {};
-    state.dirty_state.depth_compare_op = old_dirty.depth_compare_op && !state.depth_test_enabled;
-    state.dirty_state.depth_bounds = old_dirty.depth_bounds && !state.depth_bounds_test_enabled;
-    state.dirty_state.depth_bias = old_dirty.depth_bias && !state.depth_bias_enabled;
-    if (!state.stencil_test_enabled) {
-        state.dirty_state.stencil_front_ops = old_dirty.stencil_front_ops;
-        state.dirty_state.stencil_back_ops = old_dirty.stencil_back_ops;
-        state.dirty_state.stencil_front_reference = old_dirty.stencil_front_reference;
-        state.dirty_state.stencil_back_reference = old_dirty.stencil_back_reference;
-        state.dirty_state.stencil_front_write_mask = old_dirty.stencil_front_write_mask;
-        state.dirty_state.stencil_back_write_mask = old_dirty.stencil_back_write_mask;
-        state.dirty_state.stencil_front_compare_mask = old_dirty.stencil_front_compare_mask;
-        state.dirty_state.stencil_back_compare_mask = old_dirty.stencil_back_compare_mask;
-    }
-    state.dirty_state.feedback_loop_enabled =
-        old_dirty.feedback_loop_enabled && !instance.IsAttachmentFeedbackLoopLayoutSupported();
+    state.dirty_state = kept;
 }
 
 void Scheduler::PushDescriptors(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,

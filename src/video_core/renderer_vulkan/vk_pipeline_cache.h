@@ -200,6 +200,10 @@ private:
     // Allocated on first use when SHADPS4_PREPARED_PIPELINES=1. The epoch invalidates every
     // entry at once whenever a pipeline is erased or a module handle is replaced.
     std::vector<PreparedPipelineEntry> prepared_pipelines;
+    // SHADPS4_PREPARED_TAGS=1: state hash per way, written at seeding, so a lookup only
+    // touches the (large, ~1 KB apart) entries whose hash matches. A stale tag only costs the
+    // full compare the lookup did before.
+    std::vector<u64> prepared_tags;
     std::array<StageSelection, MaxShaderStages> stage_selections{};
     u64 prepared_pipeline_epoch{1};
     u32 prepared_pipeline_victim{};

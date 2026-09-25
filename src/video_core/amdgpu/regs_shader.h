@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include "common/assert.h"
 #include "common/types.h"
@@ -219,11 +220,32 @@ inline bool BinaryInfoMemoEnabled() {
     return enabled;
 }
 
+// SHADPS4_PGM_PREFETCH=1: when the command processor sees a PS/VS program address written, it
+// prefetches the code and the BinaryInfo last found for that address, so GetParams on the next
+// draw does not wait on cold guest lines. Hints are only prefetch targets, never dereferenced.
+inline bool PgmPrefetchEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADPS4_PGM_PREFETCH");
+        return env != nullptr && env[0] == '1';
+    }();
+    return enabled;
+}
+inline std::array<std::atomic<const void*>, 512> g_bininfo_hints{};
+inline size_t BinaryInfoHintSlot(const void* code) {
+    return (reinterpret_cast<uintptr_t>(code) >> 8) % g_bininfo_hints.size();
+}
+inline void NoteBinaryInfoHint(const u32* code, const BinaryInfo* info) {
+    if (PgmPrefetchEnabled()) {
+        g_bininfo_hints[BinaryInfoHintSlot(code)].store(info, std::memory_order_relaxed);
+    }
+}
+
 inline const BinaryInfo& SearchBinaryInfo(const u32* code) {
     constexpr u32 token_mov_vcchi = 0xBEEB03FF;
     if (code[0] == token_mov_vcchi) {
         const auto* info = std::bit_cast<const BinaryInfo*>(code + (code[1] + 1) * 2);
         if (info->Valid()) {
+            NoteBinaryInfoHint(code, info);
             return *info;
         }
     }
@@ -249,6 +271,7 @@ inline const BinaryInfo& SearchBinaryInfo(const u32* code) {
             if (use_memo) {
                 slot = {code, info};
             }
+            NoteBinaryInfoHint(code, info);
             return *info;
         }
     }

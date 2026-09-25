@@ -1640,6 +1640,37 @@ void BufferCache::BindVertexBuffers(
         }
     }
 
+    // SHADPS4_VB_REPEAT_STATS=1 (diagnostic): how often a draw binds exactly the merged vertex
+    // ranges of the previous draw, i.e. the ceiling for reusing its ObtainBuffer results.
+    static const bool repeat_stats = [] {
+        const char* value = std::getenv("SHADPS4_VB_REPEAT_STATS");
+        return value && value[0] == '1';
+    }();
+    if (repeat_stats) {
+        static std::vector<std::pair<VAddr, VAddr>> previous;
+        static u64 draws = 0, repeats = 0, with_ranges = 0, range_total = 0;
+        bool same = previous.size() == ranges_merged.size();
+        for (size_t i = 0; same && i < ranges_merged.size(); ++i) {
+            same = previous[i].first == ranges_merged[i].base_address &&
+                   previous[i].second == ranges_merged[i].end_address;
+        }
+        previous.clear();
+        for (const auto& range : ranges_merged) {
+            previous.emplace_back(range.base_address, range.end_address);
+        }
+        ++draws;
+        with_ranges += !ranges_merged.empty();
+        repeats += same && !ranges_merged.empty();
+        range_total += ranges_merged.size();
+        if ((draws & ((1u << 18) - 1)) == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "VB_REPEAT_STATS: draws {} with_ranges {} same_as_previous {} ({:.1f}%) "
+                     "ranges/draw {:.2f}",
+                     draws, with_ranges, repeats, 100.0 * repeats / std::max<u64>(with_ranges, 1),
+                     double(range_total) / draws);
+        }
+    }
+
     // Map buffers for merged ranges
     for (auto& range : ranges_merged) {
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());

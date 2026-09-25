@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <cstddef>
+#include <immintrin.h>
 #include <unordered_set>
 #include <boost/preprocessor/stringize.hpp>
 
@@ -24,6 +26,46 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace AmdGpu {
+
+namespace {
+// SHADPS4_IB_TASK_FREE=1 (port of upstream PR #4996): an INDIRECT_BUFFER packet runs a nested
+// coroutine whose final_suspend keeps its frame alive; nothing destroyed it, so every IB packet
+// leaked one frame.
+bool IbTaskFree() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_IB_TASK_FREE");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
+void PrefetchProgram(const ShaderProgram& program) {
+    const auto* code = program.Address<const char*>();
+    if (!code) {
+        return;
+    }
+    _mm_prefetch(code, _MM_HINT_T0);
+    const void* info = g_bininfo_hints[BinaryInfoHintSlot(code)].load(std::memory_order_relaxed);
+    if (info) {
+        _mm_prefetch(static_cast<const char*>(info), _MM_HINT_T0);
+        _mm_prefetch(static_cast<const char*>(info) + 63, _MM_HINT_T0);
+    }
+}
+
+// Called after SET_SH_REG wrote words [offset, offset + count) of the SH register space.
+void PrefetchProgramsOnWrite(const Regs& regs, u32 offset, u32 count) {
+    constexpr u32 ps_lo = offsetof(Regs, ps_program) / sizeof(u32) - Regs::ShRegWordOffset;
+    constexpr u32 vs_lo = offsetof(Regs, vs_program) / sizeof(u32) - Regs::ShRegWordOffset;
+    const u32 end = offset + count;
+    // The 40-bit address spans the LO and HI words.
+    if (offset <= ps_lo + 1 && ps_lo < end) {
+        PrefetchProgram(regs.ps_program);
+    }
+    if (offset <= vs_lo + 1 && vs_lo < end) {
+        PrefetchProgram(regs.vs_program);
+    }
+}
+} // namespace
 
 /// SHADPS4_FENCE_AT_GPU=1: end-of-pipe/end-of-shader fences (EVENT_WRITE_EOP, EVENT_WRITE_EOS,
 /// RELEASE_MEM) are written, and their interrupts raised, when the host GPU has actually
@@ -586,6 +628,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
                                 header + 2, set_size);
                     if constexpr (Common::FaultMonitor::DetailCountersEnabled) { ++regs_generation; }
+                    if (PgmPrefetchEnabled()) {
+                        PrefetchProgramsOnWrite(regs, set_data->reg_offset, count - 1);
+                    }
                 }
                 break;
             }
@@ -1069,6 +1114,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     YIELD_GFX();
                     RESUME_GFX(task);
                 }
+                if (IbTaskFree()) {
+                    task.handle.destroy();
+                }
                 break;
             }
             case PM4ItOpcode::IncrementDeCounter: {
@@ -1212,6 +1260,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             while (!task.handle.done()) {
                 YIELD_ASC(vqid);
                 RESUME_ASC(task, vqid);
+            }
+            if (IbTaskFree()) {
+                task.handle.destroy();
             }
             break;
         }
