@@ -52,7 +52,12 @@ const bool g_readback_producer_stats = EnvIs1("SHADPS4_READBACK_PRODUCER_STATS")
 /// guest CPU rewrites next no longer each cost their own synchronous download. Train-dip captures
 /// (2026-09-26): ~10 consecutive 4 KB record pages, patched by cs_a16fa93a copies and then
 /// rewritten by the CPU, cost ~10 extra submits and GPU waits per frame.
-const bool g_write_fault_widen = EnvIs1("SHADPS4_WRITE_FAULT_WIDEN");
+/// =2: the window spans every buffer in it (the train records are split into 16 KB buffers), all
+/// downloaded with one submit and one wait.
+const char g_write_fault_widen = [] {
+    const char* value = std::getenv("SHADPS4_WRITE_FAULT_WIDEN");
+    return value && (value[0] == '1' || value[0] == '2') ? value[0] : '0';
+}();
 const bool g_range_add_skip = EnvIs1("SHADPS4_RANGE_ADD_SKIP");
 const bool g_vb_repeat_stats = EnvIs1("SHADPS4_VB_REPEAT_STATS");
 const bool g_written_memo = EnvIs1("SHADPS4_WRITTEN_MEMO");
@@ -678,12 +683,104 @@ std::pair<VAddr, u64> BufferCache::ResolveFaultWindow(const Buffer& buffer, VAdd
     return {wide_addr, wide_size};
 }
 
+bool BufferCache::DownloadWindowMultiBuffer(VAddr window_addr, u64 window_size) {
+    struct Part {
+        Buffer* buffer;
+        vk::BufferCopy copy;
+    };
+    boost::container::small_vector<Part, 32> parts;
+    boost::container::small_vector<BufferId, 8> seen;
+    boost::container::small_vector<std::pair<VAddr, VAddr>, 8> spans;
+    u64 total_size_bytes = 0;
+    ForEachBufferInRange(window_addr, window_size, [&](BufferId id, Buffer& buffer) {
+        if (std::ranges::find(seen, id) != seen.end()) {
+            return;
+        }
+        seen.push_back(id);
+        const VAddr lo = std::max(window_addr, buffer.CpuAddr());
+        const VAddr hi = std::min(window_addr + window_size, buffer.CpuAddr() + buffer.SizeBytes());
+        if (hi <= lo) {
+            return;
+        }
+        spans.emplace_back(lo, hi);
+        memory_tracker->ForEachDownloadRange<false>(
+            lo, hi - lo, [&](u64 range_addr, u64 range_size) {
+                gpu_modified_ranges.ForEachInRange(
+                    range_addr, range_size, [&](VAddr start, VAddr end) {
+                        parts.push_back(Part{&buffer, vk::BufferCopy{
+                                                          .srcOffset = start - buffer.CpuAddr(),
+                                                          .dstOffset = total_size_bytes,
+                                                          .size = end - start,
+                                                      }});
+                        total_size_bytes += (end - start + 63) & ~63ULL;
+                    });
+                gpu_modified_ranges.Subtract(range_addr, range_size);
+                MemoryTracker::gpu_clear_epoch.fetch_add(1, std::memory_order_acq_rel);
+                Common::FaultMonitor::CountRangeSubtract(
+                    gpu_modified_ranges.m_ranges_set.iterative_size());
+            });
+    });
+    if (total_size_bytes == 0) {
+        return false;
+    }
+    // Write faults reach here with 64 KiB windows; a larger explicit invalidation that exceeds the
+    // staging ring would have failed in DownloadBufferMemory as well.
+    ASSERT(total_size_bytes <= DownloadBufferSize);
+    Common::FaultMonitor::CountReadbackDownload(total_size_bytes);
+    const auto [download, offset] = download_buffer.Map(total_size_bytes);
+    download_buffer.Commit();
+    scheduler.EndRendering();
+    {
+        auto command_access = scheduler.AcquireCommandBuffer();
+        const auto cmdbuf = command_access.Handle();
+        if (EnvIs1("SHADPS4_DOWNLOAD_BARRIER")) {
+            // As in DownloadBufferMemory: make earlier GPU writes visible to the transfer read.
+            const vk::MemoryBarrier2 pre_barrier = {
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask =
+                    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .memoryBarrierCount = 1,
+                .pMemoryBarriers = &pre_barrier,
+            });
+        }
+        for (const Part& part : parts) {
+            vk::BufferCopy copy = part.copy;
+            copy.dstOffset += offset;
+            cmdbuf.copyBuffer(part.buffer->buffer, download_buffer.Handle(), copy);
+        }
+    }
+    scheduler.Finish();
+    auto* memory = Core::Memory::Instance();
+    for (const Part& part : parts) {
+        memory->TryWriteBacking(
+            std::bit_cast<u8*>(part.buffer->CpuAddr() + part.copy.srcOffset),
+            download + part.copy.dstOffset, part.copy.size);
+    }
+    // Only the spans inside the downloaded buffers: the rest of the window may be GPU-modified
+    // image memory that was not downloaded here.
+    for (const auto& [lo, hi] : spans) {
+        memory_tracker->UnmarkRegionAsGpuModified(lo, hi - lo);
+    }
+    return true;
+}
+
 void BufferCache::ResolveFaultSync(VAddr device_addr, u64 size, bool is_write,
                                    Offload::Origin origin) {
     const auto [settle_addr, settle_size] = FaultSettleSpan(device_addr, size, is_write);
     SettleOverlappingJobs(settle_addr, settle_size);
     Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
-    if (is_write && g_write_fault_widen && Offload::Enabled()) {
+    if (is_write && g_write_fault_widen == '2' && Offload::Enabled()) {
+        const VAddr begin = Common::AlignDown(device_addr, DefaultReadFaultWidenSize);
+        const VAddr end = Common::AlignUp(device_addr + size, DefaultReadFaultWidenSize);
+        SettleOverlappingJobs(begin, end - begin);
+        if (DownloadWindowMultiBuffer(begin, end - begin)) {
+            Offload::CountSyncResolve(origin, Offload::SyncTiming{});
+        }
+    } else if (is_write && g_write_fault_widen == '1' && Offload::Enabled()) {
         // Download the read-fault window as a read (it contains the faulting range). The exact
         // write path below then finds no GPU data left and completes as an empty write fault,
         // marking only the faulting range CPU modified.

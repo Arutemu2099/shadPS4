@@ -225,6 +225,9 @@ private:
     template <bool async>
     bool DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size, bool is_write,
                               Common::ReadbackOffload::SyncTiming* timing = nullptr);
+    /// SHADPS4_WRITE_FAULT_WIDEN=2: downloads every GPU-modified range of the window, across all
+    /// buffers in it, with one submit and wait. Returns false when nothing was GPU-modified.
+    bool DownloadWindowMultiBuffer(VAddr window_addr, u64 window_size);
 
     // Readback wait offload (SHADPS4_READBACK_OFFLOAD, default off). A guest fault is split
     // into two command processor steps around a GPU wait taken on the faulting thread.
