@@ -384,6 +384,8 @@ private:
     u64 split_verify_dispatches{0}; ///< Front: posting-eligible dispatches with VERIFY on.
     u64 split_relookup_checks{0};   ///< Back, VERIFY: synced dispatches re-looked-up.
     u64 split_relookup_diffs{0};    ///< Back, VERIFY: ... whose re-lookup disagreed.
+    u64 split_draw_relookup_checks{0}; ///< Back, run-ahead VERIFY: synced draws re-looked-up.
+    u64 split_draw_relookup_diffs{0};  ///< Back, run-ahead VERIFY: ... whose re-lookup disagreed.
     bool back_in_call{false};    ///< Back: inside a Call record (the front is parked).
     std::unique_ptr<CpSplit::Channel> split;
     std::unique_ptr<CpSplit::BackMirror> mirror;

@@ -343,6 +343,96 @@ bool DispatchRelookupMatches(Vulkan::Rasterizer& rasterizer,
            std::ranges::equal(carried.flattened_ud_buf, info->flattened_ud_buf);
 }
 
+/// What DrawRelookup found. `what` is null when the re-lookup agrees with the record.
+struct DrawRelookupDiff {
+    const char* what{};
+    u32 stage{};       ///< LogicalStage, for the per-stage differences.
+    u32 index{};       ///< First differing dword (user data / flat buffer).
+    u32 carried_dw{};  ///< Dword count the record carries.
+    u32 relooked_dw{}; ///< Dword count the re-lookup produced.
+};
+
+u32 FirstDifferingDword(std::span<const u32> a, std::span<const u32> b) {
+    const size_t n = std::min(a.size(), b.size());
+    size_t i = 0;
+    while (i < n && a[i] == b[i]) {
+        ++i;
+    }
+    return static_cast<u32>(i);
+}
+
+/// The draw equivalent of DispatchRelookupMatches. VERIFY at run-ahead, on the periodic
+/// synchronous draw record: the front is parked on this record and the back has executed every
+/// record published before it, so guest memory now holds what that earlier posted work writes (a
+/// GPU-side write is marked GPU-modified, and reading it here takes the ordinary back-thread
+/// read fault and download, as the unsplit path would at this stream position). The front's
+/// lookup for this draw ran BEFORE its Sync (EmitDraw), while that work could still be
+/// outstanding; so a stale read of user-data / SRT tables, fetch V# tables or shader code there
+/// shows up as a difference here. The guest CPU writing those tables between the two lookups
+/// shows up too, so the caller logs instead of asserting.
+///
+/// `regs` is the FRONT's register file (what GetGraphicsPipeline reads); VerifyMirror has just
+/// proven it equal to the back's mirror. Re-runs the pure classifier and the pipeline lookup only
+/// (Rasterizer::RelookupDrawFront): not the hazard note or the empty-draw counters (the skip
+/// decision is a pure function of the registers, so it cannot differ). Side effects, sound only
+/// while the front is parked (as for DispatchRelookupMatches): it rewrites the pipeline cache's
+/// scratch selection (key, infos, modules, fetch shader) and the stages' Info user data / flat
+/// buffer / pgm_base, all of which the front's next lookup rewrites and which the back reads
+/// only from records; it may bump prepared-pipeline LRU/stat counters or seed a prepared entry
+/// (guarded memo: performance-only), and on a difference it may compile a pipeline (the cache
+/// is keyed by content). The Info comparison must therefore run after VerifyStages.
+DrawRelookupDiff DrawRelookup(Vulkan::Rasterizer& rasterizer, const Regs& regs,
+                              const Vulkan::Rasterizer::SplitDraw& carried_draw,
+                              const std::array<Shader::BoundStage, Shader::MaxStageTypes>& carried) {
+    using Vulkan::Rasterizer;
+    if (Rasterizer::ClassifyDraw(regs) != carried_draw.draw_class) {
+        return {.what = "draw class"};
+    }
+    if (carried_draw.draw_class != Rasterizer::DrawClass::Draw || carried_draw.skip) {
+        // The front ran no lookup (EmitDraw carried no stages).
+        return {};
+    }
+    const Vulkan::GraphicsPipeline* pipeline = rasterizer.RelookupDrawFront();
+    if (pipeline != carried_draw.pipeline) {
+        return {.what = "pipeline"};
+    }
+    if (!pipeline) {
+        return {};
+    }
+    const auto infos = pipeline->GetStages();
+    for (u32 i = 0; i < infos.size() && i < carried.size(); ++i) {
+        const Shader::Info* info = infos[i];
+        const Shader::BoundStage& bound = carried[i];
+        if (bound.info != info) {
+            return {.what = "stage Info", .stage = i};
+        }
+        if (!info) {
+            continue;
+        }
+        if (bound.pgm_base != info->pgm_base) {
+            return {.what = "pgm_base", .stage = i};
+        }
+        const std::span<const u32> ud = info->user_data;
+        if (!std::ranges::equal(bound.user_data, ud)) {
+            return {.what = "user data",
+                    .stage = i,
+                    .index = FirstDifferingDword(bound.user_data, ud),
+                    .carried_dw = static_cast<u32>(bound.user_data.size()),
+                    .relooked_dw = static_cast<u32>(ud.size())};
+        }
+        const std::span<const u32> flat{info->flattened_ud_buf.data(),
+                                        info->flattened_ud_buf.size()};
+        if (!std::ranges::equal(bound.flattened_ud_buf, flat)) {
+            return {.what = "flat buffer",
+                    .stage = i,
+                    .index = FirstDifferingDword(bound.flattened_ud_buf, flat),
+                    .carried_dw = static_cast<u32>(bound.flattened_ud_buf.size()),
+                    .relooked_dw = static_cast<u32>(flat.size())};
+        }
+    }
+    return {};
+}
+
 /// A NOP whose payload has a back-side effect (flip IRQ, guest markers). Other NOPs (CB/DB
 /// extent hints and the like) are front-only.
 bool NopHasBackEffect(const PM4Header* header, bool guest_markers_enabled) {
@@ -656,6 +746,25 @@ void Liverpool::ExecuteDrawRecord(const CpSplit::RecordHeader& record) {
     if (rec.verify & DrawVerifyFull) {
         VerifyMirror("draw", record.seq, nullptr);
         VerifyStages(stages, record.seq);
+        if (split_run_ahead) {
+            // Posted work before this record has now executed: does the lookup still agree?
+            // (Depth 0 posts nothing, so there it could only see guest CPU writes.)
+            ++split_draw_relookup_checks;
+            const DrawRelookupDiff diff = DrawRelookup(*rasterizer, regs, rec.draw, stages);
+            if (diff.what && ++split_draw_relookup_diffs <= 16) {
+                LOG_WARNING(Render,
+                            "CpSplit VERIFY: draw record {}: re-lookup on the back differs from "
+                            "the front's: {} (stage {}, first dword {}, carried {} dw, re-lookup "
+                            "{} dw)",
+                            record.seq, diff.what, diff.stage, diff.index, diff.carried_dw,
+                            diff.relooked_dw);
+            }
+            if ((split_draw_relookup_checks & 0xfff) == 0) {
+                LOG_INFO(Render,
+                         "CpSplit VERIFY: {} synced draws re-looked-up on the back, {} differed",
+                         split_draw_relookup_checks, split_draw_relookup_diffs);
+            }
+        }
     } else if (rec.verify & DrawVerifySnapshot) {
         VerifySnapshot(stages_end, record.seq);
     }
@@ -930,6 +1039,9 @@ void Liverpool::RunAscPacket(const PM4Header* header, std::span<const u32> rest,
 void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_marker,
                          const CpSplit::DrawArgs& args) {
     Vulkan::Rasterizer::SplitDraw draw{.args = args};
+    // Keep this lookup before the Sync below, also for the periodic VERIFY draw: the back's
+    // re-lookup of that draw (DrawRelookup) is only meaningful because this one ran while
+    // earlier posted records could still be outstanding. A drain before this line would blind it.
     rasterizer->PrepareDrawFront(draw);
     const bool has_stages = draw.pipeline && draw.draw_class ==
                                                  Vulkan::Rasterizer::DrawClass::Draw &&

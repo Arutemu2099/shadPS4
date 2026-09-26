@@ -86,6 +86,10 @@ public:
     void PrepareDrawFront(SplitDraw& draw);
     /// Front thread: compute pipeline lookup against the current queue's cs registers.
     const ComputePipeline* PrepareDispatchFront();
+    /// CP split run-ahead VERIFY, back thread, only while the front is parked on a synchronous
+    /// draw record: the graphics pipeline lookup of PrepareDrawFront alone (no hazard note, no
+    /// empty-draw counters), against the front's registers and pipeline cache.
+    const GraphicsPipeline* RelookupDrawFront();
     /// Back thread: runs a draw the front prepared, with the per-stage user data it copied
     /// (indexed by LogicalStage). Registers come from Liverpool::BackRegs().
     void ExecuteDraw(const SplitDraw& draw,

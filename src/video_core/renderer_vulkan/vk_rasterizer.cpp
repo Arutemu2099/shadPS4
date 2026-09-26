@@ -722,6 +722,12 @@ const ComputePipeline* Rasterizer::PrepareDispatchFront() {
     return pipeline_cache.GetComputePipeline();
 }
 
+const GraphicsPipeline* Rasterizer::RelookupDrawFront() {
+    // Liverpool::ExecuteDrawRecord (VERIFY): the front is parked, so its registers and the
+    // pipeline cache are stable and published to this thread (see DrawRelookup).
+    return pipeline_cache.GetGraphicsPipeline();
+}
+
 void Rasterizer::ExecuteDraw(const SplitDraw& draw,
                              const std::array<Shader::BoundStage, Shader::MaxStageTypes>& stages) {
     // CP split, back thread: Draw/DrawIndirect with the front's classification, lookup and
