@@ -908,7 +908,9 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     scheduler.Record([handle = pipeline->Handle(), is_indexed, count = regs.num_indices,
                       instances = regs.num_instances.NumInstances(), vertex_offset,
                       instance_offset](vk::CommandBuffer cmdbuf) {
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+        if (!GraphicsBindTracker::Enabled() || GraphicsBindTracker::NeedBind(cmdbuf, handle)) {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+        }
         if (is_indexed) {
             cmdbuf.drawIndexed(count, instances, 0, s32(vertex_offset), instance_offset);
         } else {
@@ -1025,7 +1027,9 @@ void Rasterizer::DrawIndirectTail(const GraphicsPipeline* pipeline, bool is_inde
                       count_handle = count_buffer ? count_buffer->Handle() : vk::Buffer{},
                       has_count = count_address != 0, count_base, max_count, stride,
                       is_indexed](vk::CommandBuffer cmdbuf) {
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+        if (!GraphicsBindTracker::Enabled() || GraphicsBindTracker::NeedBind(cmdbuf, handle)) {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+        }
         if (is_indexed) {
             if (has_count) {
                 cmdbuf.drawIndexedIndirectCount(buffer, base, count_handle, count_base, max_count,
@@ -1885,7 +1889,24 @@ struct TexMemoRecord {
     std::vector<Img> imgs;
     std::vector<vk::Sampler> samplers;
     std::vector<size_t> sampler_lru;
+    u64 last_use{}; ///< SHADPS4_TEX_MEMO_WAYS: LRU stamp of this way.
 };
+
+/// SHADPS4_TEX_MEMO_WAYS=N (1-8, default 1): each (pipeline, stage) keeps N records, so a shader
+/// that alternates between materials hits on each of them instead of missing on the key.
+struct TexMemoSet {
+    static constexpr u32 MaxWays = 8;
+    std::array<TexMemoRecord, MaxWays> ways{};
+};
+
+static u32 TexMemoWays() {
+    static const u32 ways = [] {
+        const char* value = std::getenv("SHADPS4_TEX_MEMO_WAYS");
+        const u32 v = value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 1u;
+        return std::clamp<u32>(v, 1u, TexMemoSet::MaxWays);
+    }();
+    return ways;
+}
 
 namespace {
 
@@ -1992,9 +2013,10 @@ void Rasterizer::BindTexturesMemo(const Pipeline* pipeline, const Shader::BoundS
     }
     auto& slot = pipeline->tex_bind_memo[static_cast<u32>(stage.l_stage)];
     if (!slot) {
-        slot = std::make_shared<TexMemoRecord>();
+        slot = std::make_shared<TexMemoSet>();
     }
-    auto& rec = *static_cast<TexMemoRecord*>(slot.get());
+    auto& set = *static_cast<TexMemoSet*>(slot.get());
+    const u32 ways = TexMemoWays();
 
     // Key: every T#, every S# after BindTextures' aniso adjustment, the border colour base.
     st.tsharps.clear();
@@ -2013,6 +2035,24 @@ void Rasterizer::BindTexturesMemo(const Pipeline* pipeline, const Shader::BoundS
         st.ssharps.push_back(ssharp);
     }
     const u64 border = liverpool->BackRegs().ta_bc_base.base_addr;
+
+    // The way whose key matches, else the least recently used (or an empty) way, which then
+    // misses on the key below and is re-recorded by the full path.
+    TexMemoRecord* found = nullptr;
+    TexMemoRecord* victim = &set.ways[0];
+    for (u32 w = 0; w < ways; ++w) {
+        auto& cand = set.ways[w];
+        if (cand.valid && border == cand.border && SameBytes(st.tsharps, cand.tsharps) &&
+            SameBytes(st.ssharps, cand.ssharps)) {
+            found = &cand;
+            break;
+        }
+        if (!cand.valid ? victim->valid : (victim->valid && cand.last_use < victim->last_use)) {
+            victim = &cand;
+        }
+    }
+    auto& rec = found ? *found : *victim;
+    rec.last_use = st.total_stages;
 
     // Validation (design section 3). Image checks and the LRU touches a hit keeps run inside
     // one memo section, so a foreign structural change cannot interleave with them; the

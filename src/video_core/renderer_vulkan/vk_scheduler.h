@@ -13,6 +13,7 @@
 #include <queue>
 
 #include "common/command_recording_worker.h"
+#include "common/logging/log.h"
 
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
@@ -349,6 +350,45 @@ struct DynamicState {
             dirty_state.feedback_loop_enabled = true;
         }
     }
+};
+
+/// SHADPS4_SKIP_REBIND=1: the draw paths skip vkCmdBindPipeline(graphics) when the same pipeline
+/// is already bound in the same command buffer. Updated in recording order (the recording worker,
+/// or the back after a drain). Every command-buffer begin and every other graphics bind into a
+/// scheduler command buffer (blit helper, post-process pass) invalidates it, so a missed case
+/// can only cost an extra bind.
+struct GraphicsBindTracker {
+    static bool Enabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("SHADPS4_SKIP_REBIND");
+            return value != nullptr && value[0] == '1';
+        }();
+        return enabled;
+    }
+    static void Invalidate() {
+        last_pipeline.store(VkPipeline{}, std::memory_order_relaxed);
+    }
+    /// True if the draw must bind `pipeline` into `cmdbuf`; records it as bound.
+    static bool NeedBind(vk::CommandBuffer cmdbuf, vk::Pipeline pipeline) {
+        const VkCommandBuffer cb = cmdbuf;
+        const VkPipeline pl = pipeline;
+        if ((++binds & 0xfffff) == 0) {
+            LOG_INFO(Render_Vulkan, "SkipRebind: {} graphics binds, {} skipped ({:.1f}%)", binds,
+                     skipped, 100.0 * double(skipped) / double(binds));
+        }
+        if (last_cmdbuf.load(std::memory_order_relaxed) == cb &&
+            last_pipeline.load(std::memory_order_relaxed) == pl) {
+            ++skipped;
+            return false;
+        }
+        last_cmdbuf.store(cb, std::memory_order_relaxed);
+        last_pipeline.store(pl, std::memory_order_relaxed);
+        return true;
+    }
+    static inline std::atomic<VkCommandBuffer> last_cmdbuf{};
+    static inline std::atomic<VkPipeline> last_pipeline{};
+    static inline u64 binds{};   ///< Recording order only (no concurrent writers).
+    static inline u64 skipped{};
 };
 
 class Scheduler {

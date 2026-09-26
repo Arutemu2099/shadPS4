@@ -237,6 +237,7 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
     };
 
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+    GraphicsBindTracker::Invalidate(); // Draw scheduler's command buffer (Presenter::Present).
 
     const std::array viewports = {
         vk::Viewport{

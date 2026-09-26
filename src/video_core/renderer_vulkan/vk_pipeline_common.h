@@ -85,8 +85,8 @@ public:
                              const BufferBarriers& buffer_barriers,
                              const Shader::PushData& push_data) const;
 
-    /// SHADPS4_TEX_BIND_MEMO (vk_rasterizer.cpp): one texture-binding memo record per logical
-    /// stage, owned by the pipeline so a record can never outlive, or be reused for, a different
+    /// SHADPS4_TEX_BIND_MEMO (vk_rasterizer.cpp): texture-binding memo records per logical stage
+    /// (one, or SHADPS4_TEX_MEMO_WAYS), owned by the pipeline so a record can never outlive, or be reused for, a different
     /// Shader::Info. Type-erased (the record type is private to vk_rasterizer.cpp); touched only
     /// by the thread that binds resources.
     mutable std::array<std::shared_ptr<void>, Shader::MaxStageTypes> tex_bind_memo{};

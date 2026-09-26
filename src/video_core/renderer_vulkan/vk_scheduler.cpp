@@ -322,6 +322,7 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 
     current_cmdbuf = command_pool.Commit();
     Check(current_cmdbuf.begin(begin_info));
+    GraphicsBindTracker::Invalidate();
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
@@ -388,6 +389,7 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
         Check(current_cmdbuf.begin(vk::CommandBufferBeginInfo{
             .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
         }));
+        GraphicsBindTracker::Invalidate();
         if (batch_timer) {
             batch_timer->Begin(current_cmdbuf);
         }
@@ -678,6 +680,9 @@ void DynamicState::Commit(const Instance& instance, const vk::CommandBuffer& cmd
         cmdbuf.setAttachmentFeedbackLoopEnableEXT(feedback_loop_enabled
                                                       ? vk::ImageAspectFlagBits::eColor
                                                       : vk::ImageAspectFlagBits::eNone);
+        // Not dynamic in the graphics pipelines: only the next bind overrides it, so the next
+        // draw must bind even if its pipeline is already bound (SHADPS4_SKIP_REBIND).
+        GraphicsBindTracker::Invalidate();
     }
 }
 
