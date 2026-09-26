@@ -107,6 +107,14 @@ u32 DoneBatch() {
     return batch;
 }
 
+bool RegBatch() {
+    static const bool batch = [] {
+        const char* value = std::getenv("SHADPS4_CP_SPLIT_REG_BATCH");
+        return value && value[0] == '1';
+    }();
+    return batch;
+}
+
 Channel::Channel(u32 ring_bytes) {
     ASSERT_MSG(ring_bytes >= (64u << 10) && (ring_bytes & (ring_bytes - 1)) == 0,
                "CP split ring size must be a power of two >= 64 KB");
@@ -118,6 +126,7 @@ Channel::Channel(u32 ring_bytes) {
     storage = reinterpret_cast<u8*>((base + 63) & ~std::uintptr_t{63});
     depth = RunAhead() ? Depth() : 1;
     done_batch = DoneBatch();
+    reg_batch = RegBatch();
     posted_seqs = std::make_unique<u64[]>(PostSlots);
     log_window_start_ns = NowNs();
     log_window_start_ticks = Ticks();
@@ -203,11 +212,47 @@ void Channel::SyncIfPostedPackets(DrainReason reason) {
 
 void Channel::EmitRegWrite(u32 word_offset, const u32* data, u32 count) {
     ASSERT(u64{word_offset} + count <= Regs::NumRegs);
-    auto* payload =
-        Reserve<RegWritePayload>(RecordType::RegWrite, u32(sizeof(RegWritePayload)) + count * 4);
+    if (count == 0) {
+        return; // Nothing to copy; a count-0 segment would also end a batched record early.
+    }
+    const u32 seg = u32(sizeof(RegWritePayload)) + count * 4;
+    if (reg_batch && !record_open && reg_seq == emitted && reg_seq != 0) {
+        // Append to the newest record if it is our RegWrite and still unpublished: the back cannot
+        // see it until write_pos passes it, so growing it in place is invisible. Only when it fits
+        // without wrapping and without waiting for space (a wait could publish it).
+        const u32 offset = u32(reg_pos & mask);
+        const u32 used = reg_used + seg;
+        const u32 size = AlignUp(used, RecordAlign);
+        if (write_pos.load(std::memory_order_relaxed) <= reg_pos && offset + size <= capacity &&
+            size <= MaxRegBatchBytes && reg_pos + size - cached_read <= capacity) {
+            auto* header = reinterpret_cast<RecordHeader*>(storage + offset);
+            auto* payload = reinterpret_cast<RegWritePayload*>(storage + offset + reg_used);
+            payload->word_offset = word_offset;
+            payload->count = count;
+            std::memcpy(payload + 1, data, std::size_t{count} * 4);
+            if (size - used >= sizeof(RegWritePayload)) {
+                *reinterpret_cast<RegWritePayload*>(storage + offset + used) = {0, 0};
+            }
+            counters.bytes += size - header->size;
+            header->size = size;
+            reg_used = used;
+            reserve_pos = committed_pos = reg_pos + size;
+            ++counters.reg_appends;
+            return;
+        }
+    }
+    auto* payload = Reserve<RegWritePayload>(RecordType::RegWrite, seg);
     payload->word_offset = word_offset;
     payload->count = count;
     std::memcpy(payload + 1, data, std::size_t{count} * 4);
+    auto* header = reinterpret_cast<RecordHeader*>(payload) - 1;
+    const u32 used = u32(sizeof(RecordHeader)) + seg;
+    if (header->size - used >= sizeof(RegWritePayload)) {
+        *reinterpret_cast<RegWritePayload*>(reinterpret_cast<u8*>(header) + used) = {0, 0};
+    }
+    reg_pos = reserve_pos - header->size;
+    reg_seq = header->seq;
+    reg_used = used;
     Commit();
 }
 
@@ -408,11 +453,11 @@ void Channel::MaybeLog() {
              "CpSplit: window_s={:.1f} mode={} depth={} records={} bytes={} posted_draws={} "
              "posted_pkts={} drains={} drain_waits={} front_wait_ms={:.1f} drain_ms={:.1f} "
              "depth_wait_ms={:.1f} depth_waits={} max_lead={} max_lead_records={} "
-             "back_idle_ms={:.1f} full_waits={} front_parks={}",
+             "back_idle_ms={:.1f} full_waits={} front_parks={} reg_appends={}",
              double(now - log_window_start_ns) / 1e9, Mode(), depth, c.records, c.bytes,
              c.posted_draws, c.posted_packets, drains, drain_waits,
              ms(drain_ticks + c.depth_wait_ticks), ms(drain_ticks), ms(c.depth_wait_ticks),
-             c.depth_waits, c.max_lead, c.max_lead_seq, ms(idle), c.full_waits, c.front_parks);
+             c.depth_waits, c.max_lead, c.max_lead_seq, ms(idle), c.full_waits, c.front_parks, c.reg_appends);
     LOG_INFO(Render, "CpSplit drains (n/waited/ms):{}", per_reason);
     counters = {};
     log_window_start_ns = now;

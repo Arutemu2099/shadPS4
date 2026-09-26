@@ -551,9 +551,17 @@ void Liverpool::ExecuteRecord(const CpSplit::RecordHeader& record) {
     const auto* payload = reinterpret_cast<const u8*>(&record + 1);
     switch (record.type) {
     case CpSplit::RecordType::RegWrite: {
-        const auto* write = reinterpret_cast<const CpSplit::RegWritePayload*>(payload);
-        std::memcpy(&mirror->regs.reg_array[write->word_offset], write + 1,
-                    size_t{write->count} * sizeof(u32));
+        const u8* end = reinterpret_cast<const u8*>(&record) + record.size;
+        const u8* p = payload;
+        while (p + sizeof(CpSplit::RegWritePayload) <= end) {
+            const auto* write = reinterpret_cast<const CpSplit::RegWritePayload*>(p);
+            if (write->count == 0) {
+                break;
+            }
+            std::memcpy(&mirror->regs.reg_array[write->word_offset], write + 1,
+                        size_t{write->count} * sizeof(u32));
+            p += sizeof(CpSplit::RegWritePayload) + size_t{write->count} * sizeof(u32);
+        }
         break;
     }
     case CpSplit::RecordType::ClearState:

@@ -81,6 +81,9 @@ u32 VerifyEvery();
 /// SHADPS4_CP_SPLIT_DONE_BATCH (default 1, max 1024): the back publishes done_seq every N records,
 /// and always when it has consumed everything it has seen published.
 u32 DoneBatch();
+/// SHADPS4_CP_SPLIT_REG_BATCH=1: consecutive register writes are appended to the newest RegWrite
+/// record while it is unpublished (one record, several segments). Default off.
+bool RegBatch();
 
 /// True on the front thread (set by Liverpool::FrontProcess). The fault handlers use it to drain
 /// before a read fault downloads GPU data (inventory 4.6).
@@ -96,7 +99,8 @@ struct BackMirror {
 
 enum class RecordType : u16 {
     Wrap,       ///< Filler to the end of the ring; the next record starts at offset 0.
-    RegWrite,   ///< RegWritePayload + count dwords, copied into the back's mirror.
+    RegWrite,   ///< Segments of RegWritePayload + count dwords, copied into the back's mirror;
+                ///< a count-0 segment (or less than a segment left) ends the record.
     ClearState, ///< mirror.regs.SetDefaults().
     Extent,     ///< ExtentPayload.
     EpochBump,  ///< EpochPayload: VideoCore::BumpSubmitEpoch in stream order.
@@ -142,6 +146,8 @@ struct RecordHeader {
 static_assert(sizeof(RecordHeader) == 16);
 
 constexpr u32 RecordAlign = 16;
+/// Largest RegWrite record grown by SHADPS4_CP_SPLIT_REG_BATCH appends.
+constexpr u32 MaxRegBatchBytes = 4096;
 
 struct RegWritePayload {
     u32 word_offset;
@@ -269,7 +275,7 @@ public:
     static constexpr u32 NumDrainReasons = static_cast<u32>(DrainReason::Count);
     /// Front-owned counters, logged and reset every ~10 s by MaybeLog. Times are in TSC ticks.
     struct Counters {
-        u64 records{}, bytes{}, full_waits{}, front_parks{};
+        u64 records{}, bytes{}, full_waits{}, front_parks{}, reg_appends{};
         u64 posted_draws{}, posted_packets{}, depth_waits{}, depth_wait_ticks{};
         u64 max_lead{};       ///< Most posted records outstanding at a post (after the bound).
         u64 max_lead_seq{};   ///< Most records (any type) published but not done, at a post.
@@ -298,6 +304,10 @@ private:
     u64 reserve_pos{0};
     u64 committed_pos{0};
     u64 committed_seq{0};
+    bool reg_batch{false};
+    u64 reg_pos{~0ull};  ///< Ring position of the newest RegWrite record header.
+    u64 reg_seq{0};      ///< Its seq; appending is allowed only while it is the newest record.
+    u32 reg_used{0};     ///< Bytes of it in use (header + segments), before alignment padding.
     u64 cached_read{0};
     u64 emitted{0};
     bool record_open{false};
