@@ -98,6 +98,15 @@ u32 VerifyEvery() {
     return every;
 }
 
+u32 DoneBatch() {
+    static const u32 batch = [] {
+        const char* value = std::getenv("SHADPS4_CP_SPLIT_DONE_BATCH");
+        const unsigned long long v = value ? std::strtoull(value, nullptr, 10) : 1ull;
+        return static_cast<u32>(std::clamp<unsigned long long>(v, 1ull, 1024ull));
+    }();
+    return batch;
+}
+
 Channel::Channel(u32 ring_bytes) {
     ASSERT_MSG(ring_bytes >= (64u << 10) && (ring_bytes & (ring_bytes - 1)) == 0,
                "CP split ring size must be a power of two >= 64 KB");
@@ -108,6 +117,7 @@ Channel::Channel(u32 ring_bytes) {
     const auto base = reinterpret_cast<std::uintptr_t>(storage_owner.get());
     storage = reinterpret_cast<u8*>((base + 63) & ~std::uintptr_t{63});
     depth = RunAhead() ? Depth() : 1;
+    done_batch = DoneBatch();
     posted_seqs = std::make_unique<u64[]>(PostSlots);
     log_window_start_ns = NowNs();
     log_window_start_ticks = Ticks();
@@ -286,6 +296,10 @@ const RecordHeader* Channel::Next() {
         if (read == cached_write) {
             cached_write = write_pos.load(std::memory_order_acquire);
             if (read == cached_write) {
+                // Nothing more to run: publish any batched done before the back can park.
+                if (done_count != 0) {
+                    PublishDone(pending_done);
+                }
                 return nullptr;
             }
         }
@@ -302,6 +316,18 @@ void Channel::Done(const RecordHeader* record) {
     const u64 seq = record->seq;
     read += record->size;
     read_pos.store(read, std::memory_order_release);
+    // Batched publication: the front only waits for seqs it has published, and the back always
+    // publishes once it has consumed everything it has seen (read == cached_write), so every wait
+    // is released within at most done_batch - 1 further records of back work.
+    pending_done = seq;
+    if (++done_count < done_batch && read != cached_write) {
+        return;
+    }
+    PublishDone(seq);
+}
+
+void Channel::PublishDone(u64 seq) {
+    done_count = 0;
     // seq_cst: pairs with the front's store of front_parked / load of done_seq in WaitDone.
     done_seq.store(seq, std::memory_order_seq_cst);
     if (front_parked.load(std::memory_order_seq_cst)) {

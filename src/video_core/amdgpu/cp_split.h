@@ -78,6 +78,9 @@ bool PostDma();
 bool Verify();
 /// SHADPS4_CP_SPLIT_VERIFY_EVERY: run-ahead VERIFY syncs one draw in this many (default 256).
 u32 VerifyEvery();
+/// SHADPS4_CP_SPLIT_DONE_BATCH (default 1, max 1024): the back publishes done_seq every N records,
+/// and always when it has consumed everything it has seen published.
+u32 DoneBatch();
 
 /// True on the front thread (set by Liverpool::FrontProcess). The fault handlers use it to drain
 /// before a read fault downloads GPU data (inventory 4.6).
@@ -283,6 +286,7 @@ private:
     /// Waits until done_seq >= seq. Returns the ticks spent waiting (0 if it was already done).
     u64 WaitDone(u64 seq);
     bool BackHasWork(const std::atomic<u32>& num_commands) const;
+    void PublishDone(u64 seq);
 
     std::unique_ptr<u8[]> storage_owner;
     u8* storage{};
@@ -312,6 +316,9 @@ private:
     alignas(64) std::atomic<u64> read_pos{0};
     u64 read{0};
     u64 cached_write{0};
+    u64 pending_done{0}; ///< Newest executed seq not yet published in done_seq.
+    u32 done_batch{1};
+    u32 done_count{0};
     std::atomic<u64> back_idle_ticks{0}; ///< Written by the back, read and reset by MaybeLog.
 
     alignas(64) std::atomic<u64> done_seq{0};
