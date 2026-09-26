@@ -52,7 +52,12 @@ constexpr std::array<const char*, static_cast<size_t>(DrainReason::Count)> Drain
     "depth0",   "verify_full", "dispatch", "pkt_dma",  "pkt_dma_guard", "pkt_fence",
     "pkt_wdata", "pkt_other",  "call",     "idle_tail", "wait_reg_mem", "cond_exec",
     "mem_sem",  "task_done",   "ib_start", "front_fault", "front_exit",
+    "verify_disp", "asc_dma_guard", "asc_wdata_guard", "asc_ib_start",
+    "call_asc_disp", "call_asc_disp_ind", "call_asc_disp_patch", "call_asc_dma",
+    "call_asc_wdata", "call_asc_release", "call_asc_sem", "call_ce_dump",
+    "ib_end", "disp_after_pkt",
 };
+static_assert(DrainNames.back() != nullptr, "DrainNames must name every DrainReason");
 } // namespace
 
 int Mode() {
@@ -79,6 +84,28 @@ bool PostDma() {
         return value && value[0] == '1';
     }();
     return post;
+}
+
+bool PostAsc() {
+    static const bool post = [] {
+        const char* value = std::getenv("SHADPS4_CP_SPLIT_POST_ASC");
+        return value && value[0] == '1';
+    }();
+    return post;
+}
+
+u32 PostAscMask() {
+    static const u32 mask = [] {
+        if (!PostAsc()) {
+            return 0u;
+        }
+        const char* value = std::getenv("SHADPS4_CP_SPLIT_POST_ASC_MASK");
+        const unsigned long long v =
+            value ? std::strtoull(value, nullptr, 0)
+                  : static_cast<unsigned long long>(PostAscDefaultMask);
+        return static_cast<u32>(v & 0xfu);
+    }();
+    return mask;
 }
 
 bool Verify() {
@@ -176,12 +203,10 @@ void Channel::Sync(DrainReason reason) {
     }
 }
 
-void Channel::PostRunAhead(bool is_draw) {
+void Channel::PostRunAhead(PostKind kind) {
     ASSERT(!record_open);
-    if (is_draw) {
-        ++counters.posted_draws;
-    } else {
-        ++counters.posted_packets;
+    ++counters.posted[static_cast<u32>(kind)];
+    if (kind == PostKind::GfxPacket || kind == PostKind::AscPacket) {
         last_posted_packet_seq = committed_seq;
     }
     posted_seqs[posts & (PostSlots - 1)] = committed_seq;
@@ -453,11 +478,16 @@ void Channel::MaybeLog() {
              "CpSplit: window_s={:.1f} mode={} depth={} records={} bytes={} posted_draws={} "
              "posted_pkts={} drains={} drain_waits={} front_wait_ms={:.1f} drain_ms={:.1f} "
              "depth_wait_ms={:.1f} depth_waits={} max_lead={} max_lead_records={} "
-             "back_idle_ms={:.1f} full_waits={} front_parks={} reg_appends={}",
+             "back_idle_ms={:.1f} full_waits={} front_parks={} reg_appends={} posted_gfx_disp={} "
+             "posted_asc_disp={} posted_asc_pkts={}",
              double(now - log_window_start_ns) / 1e9, Mode(), depth, c.records, c.bytes,
-             c.posted_draws, c.posted_packets, drains, drain_waits,
+             c.posted[static_cast<u32>(PostKind::Draw)],
+             c.posted[static_cast<u32>(PostKind::GfxPacket)], drains, drain_waits,
              ms(drain_ticks + c.depth_wait_ticks), ms(drain_ticks), ms(c.depth_wait_ticks),
-             c.depth_waits, c.max_lead, c.max_lead_seq, ms(idle), c.full_waits, c.front_parks, c.reg_appends);
+             c.depth_waits, c.max_lead, c.max_lead_seq, ms(idle), c.full_waits, c.front_parks,
+             c.reg_appends, c.posted[static_cast<u32>(PostKind::GfxDispatch)],
+             c.posted[static_cast<u32>(PostKind::AscDispatch)],
+             c.posted[static_cast<u32>(PostKind::AscPacket)]);
     LOG_INFO(Render, "CpSplit drains (n/waited/ms):{}", per_reason);
     counters = {};
     log_window_start_ns = now;

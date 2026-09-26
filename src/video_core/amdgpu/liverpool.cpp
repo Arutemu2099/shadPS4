@@ -219,8 +219,9 @@ constexpr u32 VerifySnapshotBytes =
 static_assert(VerifyWindows[0].begin < VerifyWindows[0].end &&
               VerifyWindows[2].end <= Regs::NumRegs);
 
-/// A gfx-queue dispatch. `cs` is the front's cs registers at the packet (GetCsRegs() depends on
-/// the front's curr_qid; inventory section 0.3). Followed by at most one stage block.
+/// A dispatch (gfx queue, or ASC with POST_ASC). `cs` is the front's cs registers at the packet
+/// (GetCsRegs() depends on the front's curr_qid; inventory section 0.3). Followed by at most one
+/// stage block, then (VERIFY snapshot only) the register-window copy.
 struct SplitDispatchRecord {
     ComputeProgram cs;
     const Vulkan::ComputePipeline* pipeline;
@@ -231,6 +232,8 @@ struct SplitDispatchRecord {
     u32 size;
     u32 is_indirect;
     u32 stage_count;
+    u32 queue;  ///< mapped_queues index: 0 = gfx, vqid + 1 = ASC.
+    u32 verify; ///< DrawVerifyFull / DrawVerifySnapshot (VERIFY only), else 0.
 };
 static_assert(sizeof(SplitDispatchRecord) % 8 == 0);
 
@@ -312,6 +315,32 @@ void VerifyStages(const std::array<Shader::BoundStage, Shader::MaxStageTypes>& s
                    "CpSplit VERIFY: stage {} data differs from its Info at record {}",
                    static_cast<u32>(info.l_stage), seq);
     }
+}
+
+/// VERIFY with POST_ASC, on a synchronous dispatch record (the front is parked on it, and the back
+/// has executed everything published before it): re-runs the front's compute lookup on the back
+/// and compares it with what the record carries. A difference means the front's lookup read
+/// inputs (user-data / SRT tables or shader code in guest memory) that earlier posted work had not
+/// written yet: the run-ahead read hazard. The guest CPU writing those tables in between also
+/// shows up here, so the caller logs instead of asserting. Reads the front's pipeline cache and
+/// cs_state (GetCsRegs), which is sound only while the front is parked.
+bool DispatchRelookupMatches(Vulkan::Rasterizer& rasterizer,
+                             const Vulkan::ComputePipeline* carried_pipeline,
+                             const Shader::BoundStage& carried) {
+    const Vulkan::ComputePipeline* pipeline = rasterizer.PrepareDispatchFront();
+    if (pipeline != carried_pipeline) {
+        return false;
+    }
+    if (!pipeline) {
+        return true;
+    }
+    const Shader::Info* info = pipeline->GetStages()[0];
+    if (!info) {
+        return carried.info == nullptr;
+    }
+    return carried.info == info && carried.pgm_base == info->pgm_base &&
+           std::ranges::equal(carried.user_data, info->user_data) &&
+           std::ranges::equal(carried.flattened_ud_buf, info->flattened_ud_buf);
 }
 
 /// A NOP whose payload has a back-side effect (flip IRQ, guest markers). Other NOPs (CB/DB
@@ -446,6 +475,18 @@ Liverpool::Liverpool() {
             LOG_WARNING(Render, "CpSplit: POST_DMA off, SHADPS4_SPLIT_HAZARD_STATS is on");
             split_post_dma = false;
         }
+        split_post_asc = split_run_ahead ? CpSplit::PostAscMask() : 0u;
+        if (split_post_asc != 0 && SplitHazard::Enabled()) {
+            // Same race as POST_DMA: posted ASC DMAs note writes on the back.
+            LOG_WARNING(Render, "CpSplit: POST_ASC off, SHADPS4_SPLIT_HAZARD_STATS is on");
+            split_post_asc = 0;
+        }
+        if ((split_post_asc & CpSplit::PostAscWriteData) && g_cp_wait.enabled) {
+            // ExecuteGfxPacket's WRITE_DATA notes the address in g_cp_wait on the back, which the
+            // front reads: only race-free while WRITE_DATA is synchronous.
+            LOG_WARNING(Render, "CpSplit: POST_ASC WRITE_DATA off, SHADPS4_CP_WAIT_STATS is on");
+            split_post_asc &= ~u32{CpSplit::PostAscWriteData};
+        }
         split_verify_every = split_run_ahead ? CpSplit::VerifyEvery() : 1u;
         split = std::make_unique<CpSplit::Channel>();
         mirror = std::make_unique<CpSplit::BackMirror>();
@@ -458,8 +499,10 @@ Liverpool::Liverpool() {
         back_db_extent = &mirror->db_extent;
         back_ctx_epoch = &mirror->ctx_epoch;
         if (split_run_ahead) {
-            LOG_INFO(Render, "CpSplit: on (run-ahead, depth {}{}){}", CpSplit::Depth(),
+            LOG_INFO(Render, "CpSplit: on (run-ahead, depth {}{}{}){}", CpSplit::Depth(),
                      split_post_dma ? ", POST_DMA" : "",
+                     split_post_asc ? fmt::format(", POST_ASC mask {:#x}", split_post_asc)
+                                    : std::string{},
                      split_verify ? fmt::format(", VERIFY every {}", split_verify_every)
                                   : std::string{});
         } else {
@@ -628,14 +671,43 @@ void Liverpool::ExecuteDrawRecord(const CpSplit::RecordHeader& record) {
 void Liverpool::ExecuteDispatchRecord(const CpSplit::RecordHeader& record) {
     const auto& rec = *reinterpret_cast<const SplitDispatchRecord*>(&record + 1);
     std::array<Shader::BoundStage, Shader::MaxStageTypes> stages{};
-    ReadStages(reinterpret_cast<const u8*>(&rec + 1), rec.stage_count, stages);
+    const u8* stages_end =
+        ReadStages(reinterpret_cast<const u8*>(&rec + 1), rec.stage_count, stages);
+    if (rec.verify & DrawVerifyFull) {
+        // The front is parked on this record: its cs_state for this queue, registers and the
+        // Info its lookup just refreshed must equal the record (this is what the Call path read).
+        VerifyMirror("dispatch", record.seq, &rec.cs, rec.queue);
+        VerifyStages(stages, record.seq);
+        if (split_post_asc != 0) {
+            // Posted work before this record has now executed: does the lookup still agree?
+            ++split_relookup_checks;
+            const auto& carried = stages[static_cast<u32>(Shader::LogicalStage::Compute)];
+            if (!DispatchRelookupMatches(*rasterizer, rec.pipeline, carried) &&
+                ++split_relookup_diffs <= 16) {
+                LOG_WARNING(Render,
+                            "CpSplit VERIFY: dispatch record {} (queue {}): re-lookup on the back "
+                            "differs from the front's (pipeline or user data / flat buffer)",
+                            record.seq, rec.queue);
+            }
+            if ((split_relookup_checks & 0xfff) == 0) {
+                LOG_INFO(Render,
+                         "CpSplit VERIFY: {} synced dispatches re-looked-up on the back, {} "
+                         "differed",
+                         split_relookup_checks, split_relookup_diffs);
+            }
+        }
+    } else if (rec.verify & DrawVerifySnapshot) {
+        VerifySnapshot(stages_end, record.seq);
+    }
     // BackCsRegs() returns the snapshot while this dispatch runs (HLE, IsCompute*, BindBuffers).
     back_cs = &rec.cs;
-    if (split_verify) {
-        VerifyMirror("dispatch", record.seq, &rec.cs);
-        VerifyStages(stages, record.seq);
-    }
-    if (rec.marker) {
+    if (rec.marker && rec.queue != GfxQueueId) {
+        rasterizer->ScopeMarkerBegin(
+            fmt::format("asc[{}]:{}:{}", rec.queue - 1, rec.cmd_address, rec.marker));
+        rasterizer->ExecuteDispatch(rec.pipeline, stages, rec.is_indirect != 0, rec.address,
+                                    rec.offset, rec.size);
+        rasterizer->ScopeMarkerEnd();
+    } else if (rec.marker) {
         rasterizer->ScopeMarkerBegin(fmt::format("gfx:{}:{}", rec.cmd_address, rec.marker));
         rasterizer->ExecuteDispatch(rec.pipeline, stages, rec.is_indirect != 0, rec.address,
                                     rec.offset, rec.size);
@@ -647,7 +719,8 @@ void Liverpool::ExecuteDispatchRecord(const CpSplit::RecordHeader& record) {
     back_cs = nullptr;
 }
 
-void Liverpool::VerifyMirror(const char* what, u64 seq, const ComputeProgram* cs) const {
+void Liverpool::VerifyMirror(const char* what, u64 seq, const ComputeProgram* cs,
+                             u32 cs_queue) const {
     // Only for records the front is parked on (Sync): depth 0, dispatches, and the periodic
     // synchronous run-ahead draw. The front's state is then stable and published to this thread
     // (release store of write_pos, acquire load in Next).
@@ -674,8 +747,12 @@ void Liverpool::VerifyMirror(const char* what, u64 seq, const ComputeProgram* cs
     ASSERT_MSG(cs || mirror->ctx_epoch == context_change_epoch,
                "CpSplit VERIFY: context epoch differs at {} record {}", what, seq);
     if (cs) {
-        ASSERT_MSG(std::memcmp(cs, &mapped_queues[GfxQueueId].cs_state, sizeof(*cs)) == 0,
-                   "CpSplit VERIFY: cs registers differ at {} record {}", what, seq);
+        // The Call path read mapped_queues[curr_qid] on the back; the record copied GetCsRegs()
+        // on the front. Both must be this queue's state.
+        ASSERT_MSG(cs_queue < NumTotalQueues && s32(cs_queue) == curr_qid &&
+                       std::memcmp(cs, &mapped_queues[cs_queue].cs_state, sizeof(*cs)) == 0,
+                   "CpSplit VERIFY: cs registers differ at {} record {} (queue {}, curr_qid {})",
+                   what, seq, cs_queue, curr_qid);
     }
     static u64 checks = 0;
     if ((++checks & 0xffff) == 0) {
@@ -690,10 +767,10 @@ void Liverpool::VerifySnapshot(const u8* snapshot, u64 seq) const {
     const auto* words = reinterpret_cast<const u32*>(snapshot);
     for (u32 cb = 0; cb < NUM_COLOR_BUFFERS; ++cb) {
         ASSERT_MSG(mirror->cb_extent[cb].raw == words[cb],
-                   "CpSplit VERIFY: CB{} extent differs at posted draw record {}", cb, seq);
+                   "CpSplit VERIFY: CB{} extent differs at posted record {}", cb, seq);
     }
     ASSERT_MSG(mirror->db_extent.raw == words[NUM_COLOR_BUFFERS],
-               "CpSplit VERIFY: DB extent differs at posted draw record {}", seq);
+               "CpSplit VERIFY: DB extent differs at posted record {}", seq);
     words += NUM_COLOR_BUFFERS + 1;
     for (const auto& window : VerifyWindows) {
         const u32 count = window.end - window.begin;
@@ -703,7 +780,7 @@ void Liverpool::VerifySnapshot(const u8* snapshot, u64 seq) const {
             while (back[i] == words[i]) {
                 ++i;
             }
-            UNREACHABLE_MSG("CpSplit VERIFY: register word {:#x} differs at posted draw record "
+            UNREACHABLE_MSG("CpSplit VERIFY: register word {:#x} differs at posted record "
                             "{}: back {:#x} front {:#x}",
                             window.begin + i, seq, back[i], words[i]);
         }
@@ -711,7 +788,7 @@ void Liverpool::VerifySnapshot(const u8* snapshot, u64 seq) const {
     }
     static u64 checks = 0;
     if ((++checks & 0xffff) == 0) {
-        LOG_INFO(Render, "CpSplit VERIFY: {} posted draws checked (register windows), 0 mismatches",
+        LOG_INFO(Render, "CpSplit VERIFY: {} posted draws/dispatches checked (register windows), 0 mismatches",
                  checks);
     }
 }
@@ -821,7 +898,33 @@ void Liverpool::RunGfxDma(const PM4Header* header, bool guest_markers_enabled,
                                 guest_markers_enabled ? CpSplit::GuestMarkers : 0);
     std::memcpy(copy, header, dwords * sizeof(u32));
     split->Commit();
-    split->PostRunAhead(false);
+    split->PostRunAhead(CpSplit::PostKind::GfxPacket);
+}
+
+void Liverpool::RunAscPacket(const PM4Header* header, std::span<const u32> rest, VAddr dst,
+                             u64 bytes, CpSplit::DrainReason guard_reason) {
+    // POST_ASC: the same argument as RunGfxDma. What the front reads after this packet:
+    //  - the rest of this ASC command buffer (the title patches dispatch dims this way; that
+    //    case is the front's indirect_patches and never gets here): guarded, synchronous if
+    //    [dst, dst + bytes) overlaps it;
+    //  - nested ASC IBs: IndirectBuffer syncs while posted packets are outstanding;
+    //  - guest memory read by later pipeline lookups: unmeasured for ASC (SPLIT-TODO); the
+    //    VERIFY re-lookup on synced dispatches is the check;
+    //  - WAIT_REG_MEM / semaphores / RELEASE_MEM / task done / faults: those drain anyway.
+    // The packet is copied: the front advances the ring's read_addr right after parsing it, so
+    // the guest may reuse the slot before the back runs it.
+    const u32 dwords = header->type3.NumWords() + 1;
+    void* copy = split->Reserve(CpSplit::RecordType::Packet, dwords * sizeof(u32), 0);
+    std::memcpy(copy, header, dwords * sizeof(u32));
+    split->Commit();
+    const auto lo = reinterpret_cast<VAddr>(rest.data());
+    const VAddr hi = lo + rest.size_bytes();
+    if (bytes != 0 && dst < hi && lo < dst + bytes) {
+        split->Sync(guard_reason);
+        return;
+    }
+    split->PostRunAhead(CpSplit::PostKind::AscPacket);
+    split->MaybeLog();
 }
 
 void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_marker,
@@ -882,18 +985,46 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
         split->Sync(split_run_ahead ? CpSplit::DrainReason::VerifyFull
                                     : CpSplit::DrainReason::DepthZero);
     } else {
-        split->PostRunAhead(true);
+        split->PostRunAhead(CpSplit::PostKind::Draw);
     }
     split->MaybeLog();
 }
 
 void Liverpool::EmitDispatch(const PM4Header* header, const char* name, bool host_marker,
-                             bool is_indirect, VAddr address, u32 offset, u32 size) {
+                             bool is_indirect, VAddr address, u32 offset, u32 size, u32 queue) {
+    // POST_ASC (run-ahead): posted like draws. The record owns everything the back reads besides
+    // the register mirror: the cs registers (copied here; the back's BackCsRegs() returns the
+    // copy), the stage's user data / flat buffer / pgm_base, the pipeline pointer (stable) and
+    // the indirect address. The ASC ring slot may be reused once the front moves on.
+    const u32 post_bit =
+        queue == GfxQueueId ? u32{CpSplit::PostGfxDispatch} : u32{CpSplit::PostAscDispatch};
+    bool post = (split_post_asc & post_bit) != 0;
+    u32 verify = 0;
+    if (split_verify) {
+        if (!post || (++split_verify_dispatches % split_verify_every) == 0) {
+            verify = DrawVerifyFull;
+        } else {
+            verify = DrawVerifySnapshot;
+        }
+    }
+    const bool verify_sync = post && verify == DrawVerifyFull;
+    post = post && !verify_sync;
+    if (post) {
+        // The front lookup below reads guest memory (user data tables, flat buffer) that a posted
+        // DMA_DATA / WRITE_DATA may not have written yet.
+        split->SyncIfPostedPackets(CpSplit::DrainReason::DispatchAfterPkt);
+    }
     const Vulkan::ComputePipeline* pipeline = rasterizer->PrepareDispatchFront();
     const Shader::Info* info = pipeline ? pipeline->GetStages()[0] : nullptr;
-    const u32 bytes = sizeof(SplitDispatchRecord) + (info ? StageBytes(*info) : 0u);
+    const u32 stage_bytes = info ? StageBytes(*info) : 0u;
+    u32 bytes = sizeof(SplitDispatchRecord) + stage_bytes;
+    if (verify == DrawVerifySnapshot) {
+        bytes += VerifySnapshotBytes;
+    }
     auto* rec = split->Reserve<SplitDispatchRecord>(CpSplit::RecordType::Dispatch, bytes);
     std::memcpy(&rec->cs, &GetCsRegs(), sizeof(ComputeProgram));
+    rec->queue = queue;
+    rec->verify = verify;
     rec->pipeline = pipeline;
     rec->marker = host_marker ? name : nullptr;
     rec->cmd_address = header;
@@ -902,15 +1033,24 @@ void Liverpool::EmitDispatch(const PM4Header* header, const char* name, bool hos
     rec->size = size;
     rec->is_indirect = is_indirect ? 1u : 0u;
     rec->stage_count = 0;
+    auto* out = reinterpret_cast<u8*>(rec + 1);
     if (info) {
-        WriteStage(reinterpret_cast<u8*>(rec + 1), *info, u32(Shader::LogicalStage::Compute));
+        out = WriteStage(out, *info, u32(Shader::LogicalStage::Compute));
         rec->stage_count = 1;
     }
+    if (verify == DrawVerifySnapshot) {
+        WriteVerifySnapshot(out, regs, last_cb_extent, last_db_extent);
+    }
     split->Commit();
-    // Synchronous at every depth in this version. The record is already self-contained (cs
-    // snapshot, stage copy, pipeline pointer); the drain counter says whether posting pays.
-    // SPLIT-TODO(run-ahead): post them like draws once run-ahead draws are proven.
-    split->Sync(CpSplit::DrainReason::Dispatch);
+    if (post) {
+        split->PostRunAhead(queue == GfxQueueId ? CpSplit::PostKind::GfxDispatch
+                                                : CpSplit::PostKind::AscDispatch);
+    } else {
+        // Without POST_ASC (or for the periodic VERIFY dispatch) synchronous, as before.
+        split->Sync(verify_sync ? CpSplit::DrainReason::VerifyDispatch
+                                : CpSplit::DrainReason::Dispatch);
+    }
+    split->MaybeLog();
 }
 
 void Liverpool::ExecuteGfxPacket(const PM4Header* header, bool guest_markers_enabled) {
@@ -984,8 +1124,10 @@ void Liverpool::ExecuteGfxPacket(const PM4Header* header, bool guest_markers_ena
         }
         // g_cp_wait and SplitHazard are front-side diagnostics noted here on the back. Race-free
         // because fence/WRITE_DATA packets stay synchronous at every depth (front parked), and
-        // POST_DMA is refused while SplitHazard is on. SPLIT-TODO(run-ahead): note these writes
-        // at parse time if these packets are ever posted (inventory section 3).
+        // POST_DMA is refused while SplitHazard is on. POST_ASC is refused with SplitHazard, and
+        // its WRITE_DATA bit (posted ASC WRITE_DATA runs the WRITE_DATA case below) with
+        // CP_WAIT_STATS. SPLIT-TODO(run-ahead): note these writes at parse time if these packets
+        // are ever posted (inventory section 3).
         g_cp_wait.NoteWrite(event_eos->Address());
         SplitHazard::NoteWrite(reinterpret_cast<u64>(event_eos->Address()), 8);
         VideoCore::ProtectFence();
@@ -1244,7 +1386,7 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
             OnBack([&] {
                 memcpy(dump_const->Address<void*>(),
                        cblock.constants_heap.data() + dump_const->Offset(), dump_const->Size());
-            });
+            }, CpSplit::DrainReason::CallDumpConstRam);
             // A CP-side guest memory write: later draws may read it (submit_epoch.h).
             BumpEpoch(PM4ItOpcode::DumpConstRam);
             break;
@@ -1766,7 +1908,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (split_enabled) {
                     if (rasterizer && (cs_program.dispatch_initiator & 1)) {
                         EmitDispatch(header, "DispatchDirect", host_markers_enabled, false, 0, 0,
-                                     0);
+                                     0, GfxQueueId);
                     }
                     break;
                 }
@@ -1796,7 +1938,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (split_enabled) {
                     if (rasterizer && (cs_program.dispatch_initiator & 1)) {
                         EmitDispatch(header, "DispatchIndirect", host_markers_enabled, true,
-                                     indirect_args_addr, offset, size);
+                                     indirect_args_addr, offset, size, GfxQueueId);
                     }
                     break;
                 }
@@ -1959,7 +2101,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::IndirectBuffer: {
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
-                if (split_post_dma) [[unlikely]] {
+                if (split_post_dma || (split_post_asc & CpSplit::PostAscDma) ||
+                    (split_post_asc & CpSplit::PostAscWriteData)) [[unlikely]] {
                     // A posted DMA may still be writing the IB about to be parsed.
                     split->SyncIfPostedPackets(CpSplit::DrainReason::IbStart);
                 }
@@ -1971,6 +2114,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 while (!task.handle.done()) {
                     YIELD_GFX();
                     RESUME_GFX(task);
+                }
+                if (split_post_dma || (split_post_asc & CpSplit::PostAscWriteData)) [[unlikely]] {
+                    // A posted DMA inside the IB may patch the rest of the parent level.
+                    split->SyncIfPostedPackets(CpSplit::DrainReason::IbEnd);
                 }
                 if (IbTaskFree()) {
                     task.handle.destroy();
@@ -2041,11 +2188,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 template <bool is_indirect>
 Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
-    // CP split draft: ASC packets are parsed on the front like the DCB, but their back work runs
-    // through Call records (OnBack), including the pipeline lookup inside DispatchDirect/
-    // Indirect. A Call is a full drain at every depth (the front stays parked until it returns),
-    // so this stays sound with run-ahead; each one costs a round trip.
-    // SPLIT-TODO(run-ahead): owned Dispatch records with the lookup on the front, as for gfx.
+    // CP split: ASC packets are parsed on the front like the DCB. Their back work runs through
+    // Call records (OnBack), including the pipeline lookup inside DispatchDirect/Indirect. A
+    // Call is a full drain at every depth (the front stays parked until it returns), so this
+    // stays sound with run-ahead; each one costs a round trip. With POST_ASC (run-ahead),
+    // dispatches are owned Dispatch records with the lookup on the front (EmitDispatch), and
+    // DMA_DATA (and optionally WRITE_DATA) owned Packet records (RunAscPacket), all posted.
+    // RELEASE_MEM, MEM_SEMAPHORE and WAIT_REG_MEM stay synchronous.
     if constexpr (!is_indirect) {
         BumpEpoch(PM4ItOpcode::Nop);
     }
@@ -2112,6 +2261,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::IndirectBuffer: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+            if (split_post_dma || (split_post_asc & CpSplit::PostAscDma) ||
+                (split_post_asc & CpSplit::PostAscWriteData)) [[unlikely]] {
+                // A posted DMA / WRITE_DATA may still be writing the IB about to be parsed.
+                split->SyncIfPostedPackets(CpSplit::DrainReason::AscIbStart);
+            }
             auto task = ProcessCompute<true>(
                 {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, vqid);
             RESUME_ASC(task, vqid);
@@ -2119,6 +2273,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             while (!task.handle.done()) {
                 YIELD_ASC(vqid);
                 RESUME_ASC(task, vqid);
+            }
+            if ((split_post_asc & CpSplit::PostAscDma) ||
+                (split_post_asc & CpSplit::PostAscWriteData)) [[unlikely]] {
+                // A posted DMA / WRITE_DATA inside the IB may patch the rest of the parent level.
+                split->SyncIfPostedPackets(CpSplit::DrainReason::IbEnd);
             }
             if (IbTaskFree()) {
                 task.handle.destroy();
@@ -2130,32 +2289,66 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (dma_data->dst_addr_lo == 0x3022C || !rasterizer) {
                 break;
             }
+            if (split_post_asc & CpSplit::PostAscDma) [[unlikely]] {
+                // POST_ASC: the back runs ExecuteGfxPacket's DMA_DATA body, which is this one
+                // minus the indirect-patch detection below (front-only bookkeeping, kept here).
+                const bool src_mem = dma_data->src_sel == DmaDataSrc::Memory ||
+                                     dma_data->src_sel == DmaDataSrc::MemoryUsingL2;
+                const bool dst_mem = dma_data->dst_sel == DmaDataDst::Memory ||
+                                     dma_data->dst_sel == DmaDataDst::MemoryUsingL2;
+                if (src_mem && dst_mem) {
+                    const VAddr dst_addr = dma_data->DstAddress<VAddr>();
+                    const auto* patched =
+                        reinterpret_cast<const PM4Header*>(dst_addr - sizeof(PM4Header));
+                    if (dst_addr >= base_addr && dst_addr < base_addr + acb_size &&
+                        dma_data->NumBytes() == sizeof(PM4CmdDispatchIndirect::GroupDimensions) &&
+                        patched->type == 3 &&
+                        patched->type3.opcode == PM4ItOpcode::DispatchDirect) {
+                        indirect_patches.emplace_back(patched, dma_data->SrcAddress<VAddr>());
+                        break;
+                    }
+                }
+                RunAscPacket(header, acb, dst_mem ? dma_data->DstAddress<VAddr>() : VAddr{0},
+                             dst_mem ? dma_data->NumBytes() : 0u,
+                             CpSplit::DrainReason::AscDmaGuard);
+                break;
+            }
             if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
-                OnBack([&] {
-                    rasterizer->FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(),
-                                           dma_data->data, true);
-                });
+                OnBack(
+                    [&] {
+                        rasterizer->FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(),
+                                               dma_data->data, true);
+                    },
+                    CpSplit::DrainReason::CallAscDma);
             } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
                         dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
                        dma_data->dst_sel == DmaDataDst::Gds) {
-                OnBack([&] {
-                    rasterizer->CopyBuffer(dma_data->dst_addr_lo, dma_data->SrcAddress<VAddr>(),
-                                           dma_data->NumBytes(), true, false);
-                });
+                OnBack(
+                    [&] {
+                        rasterizer->CopyBuffer(dma_data->dst_addr_lo,
+                                               dma_data->SrcAddress<VAddr>(),
+                                               dma_data->NumBytes(), true, false);
+                    },
+                    CpSplit::DrainReason::CallAscDma);
             } else if (dma_data->src_sel == DmaDataSrc::Data &&
                        (dma_data->dst_sel == DmaDataDst::Memory ||
                         dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                OnBack([&] {
-                    rasterizer->FillBuffer(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(),
-                                           dma_data->data, false);
-                });
+                OnBack(
+                    [&] {
+                        rasterizer->FillBuffer(dma_data->DstAddress<VAddr>(),
+                                               dma_data->NumBytes(), dma_data->data, false);
+                    },
+                    CpSplit::DrainReason::CallAscDma);
             } else if (dma_data->src_sel == DmaDataSrc::Gds &&
                        (dma_data->dst_sel == DmaDataDst::Memory ||
                         dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                OnBack([&] {
-                    rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->src_addr_lo,
-                                           dma_data->NumBytes(), false, true);
-                });
+                OnBack(
+                    [&] {
+                        rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(),
+                                               dma_data->src_addr_lo, dma_data->NumBytes(),
+                                               false, true);
+                    },
+                    CpSplit::DrainReason::CallAscDma);
             } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
                         dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
                        (dma_data->dst_sel == DmaDataDst::Memory ||
@@ -2170,9 +2363,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     header->type == 3 && header->type3.opcode == PM4ItOpcode::DispatchDirect) {
                     indirect_patches.emplace_back(header, src_addr);
                 } else {
-                    OnBack([&] {
-                        rasterizer->CopyBuffer(dst_addr, src_addr, num_bytes, false, false);
-                    });
+                    OnBack(
+                        [&] {
+                            rasterizer->CopyBuffer(dst_addr, src_addr, num_bytes, false, false);
+                        },
+                        CpSplit::DrainReason::CallAscDma);
                 }
             } else {
                 UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}",
@@ -2222,7 +2417,15 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (auto it = std::ranges::find(indirect_patches, header, &IndirectPatch::header);
                 it != indirect_patches.end()) {
                 const auto size = sizeof(PM4CmdDispatchIndirect::GroupDimensions);
-                OnBack([&] { rasterizer->DispatchIndirect(it->indirect_addr, 0, size); });
+                if ((split_post_asc & CpSplit::PostAscDispatch) && rasterizer) [[unlikely]] {
+                    // As the Call below: the queue's cs_state as it is (dims not updated), no
+                    // host marker. The back reads the patched dims in stream order.
+                    EmitDispatch(header, "DispatchIndirect", false, true, it->indirect_addr, 0,
+                                 u32(size), vqid + 1);
+                    break;
+                }
+                OnBack([&] { rasterizer->DispatchIndirect(it->indirect_addr, 0, size); },
+                       CpSplit::DrainReason::CallAscDispatchPatched);
                 break;
             }
             auto& cs_program = GetCsRegs();
@@ -2235,17 +2438,24 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                                                cs_program);
             }
             if (rasterizer && (cs_program.dispatch_initiator & 1)) {
-                OnBack([&] {
-                    const auto cmd_address = reinterpret_cast<const void*>(header);
-                    if (host_markers_enabled) {
-                        rasterizer->ScopeMarkerBegin(
-                            fmt::format("asc[{}]:{}:DispatchDirect", vqid, cmd_address));
-                        rasterizer->DispatchDirect();
-                        rasterizer->ScopeMarkerEnd();
-                    } else {
-                        rasterizer->DispatchDirect();
-                    }
-                });
+                if (split_post_asc & CpSplit::PostAscDispatch) [[unlikely]] {
+                    EmitDispatch(header, "DispatchDirect", host_markers_enabled, false, 0, 0, 0,
+                                 vqid + 1);
+                    break;
+                }
+                OnBack(
+                    [&] {
+                        const auto cmd_address = reinterpret_cast<const void*>(header);
+                        if (host_markers_enabled) {
+                            rasterizer->ScopeMarkerBegin(
+                                fmt::format("asc[{}]:{}:DispatchDirect", vqid, cmd_address));
+                            rasterizer->DispatchDirect();
+                            rasterizer->ScopeMarkerEnd();
+                        } else {
+                            rasterizer->DispatchDirect();
+                        }
+                    },
+                    CpSplit::DrainReason::CallAscDispatch);
             }
             break;
         }
@@ -2260,17 +2470,24 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                                                cs_program);
             }
             if (rasterizer && (cs_program.dispatch_initiator & 1)) {
-                OnBack([&] {
-                    const auto cmd_address = reinterpret_cast<const void*>(header);
-                    if (host_markers_enabled) {
-                        rasterizer->ScopeMarkerBegin(
-                            fmt::format("asc[{}]:{}:DispatchIndirect", vqid, cmd_address));
-                        rasterizer->DispatchIndirect(ib_address, 0, size);
-                        rasterizer->ScopeMarkerEnd();
-                    } else {
-                        rasterizer->DispatchIndirect(ib_address, 0, size);
-                    }
-                });
+                if (split_post_asc & CpSplit::PostAscDispatch) [[unlikely]] {
+                    EmitDispatch(header, "DispatchIndirect", host_markers_enabled, true,
+                                 ib_address, 0, u32(size), vqid + 1);
+                    break;
+                }
+                OnBack(
+                    [&] {
+                        const auto cmd_address = reinterpret_cast<const void*>(header);
+                        if (host_markers_enabled) {
+                            rasterizer->ScopeMarkerBegin(
+                                fmt::format("asc[{}]:{}:DispatchIndirect", vqid, cmd_address));
+                            rasterizer->DispatchIndirect(ib_address, 0, size);
+                            rasterizer->ScopeMarkerEnd();
+                        } else {
+                            rasterizer->DispatchIndirect(ib_address, 0, size);
+                        }
+                    },
+                    CpSplit::DrainReason::CallAscDispatchIndirect);
             }
             break;
         }
@@ -2278,27 +2495,43 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
-            OnBack([&] {
-                g_cp_wait.NoteWrite(write_data->Address<void*>());
-                VideoCore::ProtectFence();
-                if (!write_data->wr_one_addr.Value()) {
-                    std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
-                } else {
-                    UNREACHABLE();
-                }
-            });
+            if (split_post_asc & CpSplit::PostAscWriteData) [[unlikely]] {
+                // POST_ASC: ExecuteGfxPacket's WRITE_DATA body, which adds SplitHazard::
+                // NoteWrite (off: POST_ASC is refused with it) and g_cp_wait.NoteWrite (this bit
+                // is refused with CP_WAIT_STATS). Readers of the label (WAIT_REG_MEM, semaphore
+                // waits, task done) drain first; the guest CPU sees it later, never earlier.
+                RunAscPacket(header, acb,
+                             reinterpret_cast<VAddr>(write_data->Address<const void*>()),
+                             data_size, CpSplit::DrainReason::AscWriteDataGuard);
+                break;
+            }
+            OnBack(
+                [&] {
+                    g_cp_wait.NoteWrite(write_data->Address<void*>());
+                    VideoCore::ProtectFence();
+                    if (!write_data->wr_one_addr.Value()) {
+                        std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
+                    } else {
+                        UNREACHABLE();
+                    }
+                },
+                CpSplit::DrainReason::CallAscWriteData);
             break;
         }
         case PM4ItOpcode::MemSemaphore: {
+            // Stays synchronous under POST_ASC (a Call waits for everything posted). Posting the
+            // signal would keep stream order, and its readers drain first, but it is not
+            // measured to matter yet (call_asc_sem says). SPLIT-TODO(run-ahead).
             const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
             if (mem_semaphore->IsSignaling()) {
-                OnBack([&] { mem_semaphore->Signal(); });
+                OnBack([&] { mem_semaphore->Signal(); }, CpSplit::DrainReason::CallAscSemaphore);
             } else {
                 FrontDrain(CpSplit::DrainReason::MemSemaphore);
                 while (!mem_semaphore->Signaled()) {
                     YIELD_ASC(vqid);
                 }
-                OnBack([&] { mem_semaphore->Decrement(); });
+                OnBack([&] { mem_semaphore->Decrement(); },
+                       CpSplit::DrainReason::CallAscSemaphore);
             }
             break;
         }
@@ -2354,7 +2587,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                         rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false,
                                                true);
                     });
-            });
+            },
+            // Stays synchronous under POST_ASC: a fence + IRQ (and g_cp_wait's label set).
+            CpSplit::DrainReason::CallAscRelease);
             break;
         }
         case PM4ItOpcode::EventWrite: {

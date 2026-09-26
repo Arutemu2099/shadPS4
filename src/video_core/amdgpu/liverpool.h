@@ -189,11 +189,11 @@ public:
         if (back_cs) {
             return *back_cs;
         }
-        // ASC dispatches run through Call records, which are synchronous at every depth, and
-        // read the front's mapped_queues[curr_qid] here while the front is parked. With
-        // run-ahead any other caller (a posted draw reaching the SharedMemory binding) would
-        // race the front, so it asserts instead.
-        // SPLIT-TODO(run-ahead): owned ASC dispatch records to take them off the drain path.
+        // Without POST_ASC, ASC dispatches run through Call records, which are synchronous at
+        // every depth, and read the front's mapped_queues[curr_qid] here while the front is
+        // parked. With POST_ASC they are Dispatch records and never get here (back_cs is set).
+        // With run-ahead any other caller (a posted draw reaching the SharedMemory binding)
+        // would race the front, so it asserts instead.
         ASSERT_MSG(!split_run_ahead || back_in_call,
                    "CpSplit: BackCsRegs outside a dispatch record or Call record");
         return mapped_queues[curr_qid].cs_state;
@@ -274,8 +274,11 @@ private:
     void ExecuteRecord(const CpSplit::RecordHeader& record);
     void ExecuteDrawRecord(const CpSplit::RecordHeader& record);
     void ExecuteDispatchRecord(const CpSplit::RecordHeader& record);
-    void VerifyMirror(const char* what, u64 seq, const ComputeProgram* cs) const;
-    /// Run-ahead VERIFY: compares the mirror with the register windows a posted draw carries.
+    /// `cs` (dispatches): compared with mapped_queues[cs_queue].cs_state.
+    void VerifyMirror(const char* what, u64 seq, const ComputeProgram* cs,
+                      u32 cs_queue = 0) const;
+    /// Run-ahead VERIFY: compares the mirror with the register windows a posted draw or
+    /// dispatch carries.
     void VerifySnapshot(const u8* snapshot, u64 seq) const;
     /// The back-side part of the gfx packets that have one (fences, DMA, WRITE_DATA, markers,
     /// flip IRQ, ZPASS_DONE, PFP_SYNC_ME, MEM_SEMAPHORE signal/decrement). The inline path calls
@@ -288,6 +291,11 @@ private:
     /// `rest` (the unparsed part of the current command buffer); otherwise RunGfxPacket.
     void RunGfxDma(const PM4Header* header, bool guest_markers_enabled,
                    std::span<const u32> rest);
+    /// POST_ASC: an ASC DMA_DATA / WRITE_DATA as a Packet record (ExecuteGfxPacket has the
+    /// same body). Posted, unless [dst, dst + bytes) overlaps `rest` (the unparsed part of the
+    /// current ASC command buffer): then synchronous with `guard_reason`.
+    void RunAscPacket(const PM4Header* header, std::span<const u32> rest, VAddr dst, u64 bytes,
+                      CpSplit::DrainReason guard_reason);
     /// Inline: fn() now. Split: fn() on the back while the front waits (a drain at any depth).
     template <typename F>
     void OnBack(F&& fn, CpSplit::DrainReason reason = CpSplit::DrainReason::Call);
@@ -308,8 +316,9 @@ private:
     void BumpEpoch(PM4ItOpcode opcode);
     void EmitDraw(const PM4Header* header, const char* name, bool host_marker,
                   const CpSplit::DrawArgs& args);
+    /// `queue`: 0 = gfx, vqid + 1 = ASC (the mapped_queues index whose cs_state is copied).
     void EmitDispatch(const PM4Header* header, const char* name, bool host_marker,
-                      bool is_indirect, VAddr address, u32 offset, u32 size);
+                      bool is_indirect, VAddr address, u32 offset, u32 size, u32 queue);
     /// Publishes and waits for everything emitted so far. Called where the front reads what the
     /// back produces (inventory section 4.6). At depth 0 it only flushes register records.
     void FrontDrain(CpSplit::DrainReason reason) {
@@ -369,8 +378,12 @@ private:
     bool split_verify{false};
     bool split_run_ahead{false}; ///< SHADPS4_CP_SPLIT=2: draws (and POST_DMA DMAs) are posted.
     bool split_post_dma{false};  ///< Run-ahead + SHADPS4_CP_SPLIT_POST_DMA=1.
+    u32 split_post_asc{0};       ///< Run-ahead + POST_ASC: CpSplit::PostAscBits, else 0.
     u32 split_verify_every{1};   ///< Run-ahead VERIFY: one synchronous draw in this many.
     u64 split_verify_draws{0};   ///< Front: draws emitted with VERIFY on.
+    u64 split_verify_dispatches{0}; ///< Front: posting-eligible dispatches with VERIFY on.
+    u64 split_relookup_checks{0};   ///< Back, VERIFY: synced dispatches re-looked-up.
+    u64 split_relookup_diffs{0};    ///< Back, VERIFY: ... whose re-lookup disagreed.
     bool back_in_call{false};    ///< Back: inside a Call record (the front is parked).
     std::unique_ptr<CpSplit::Channel> split;
     std::unique_ptr<CpSplit::BackMirror> mirror;

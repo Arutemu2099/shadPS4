@@ -43,7 +43,10 @@
  * front keeps parsing while the back executes them, bounded by SHADPS4_CP_SPLIT_DEPTH outstanding
  * posted records (default 64). Everything else still syncs, as at depth 0 (a Sync waits for the
  * back to finish EVERYTHING published, so it is a full drain). With SHADPS4_CP_SPLIT_POST_DMA=1,
- * gfx DMA_DATA packets are posted too (see Liverpool::PostGfxPacket for the guards).
+ * gfx DMA_DATA packets are posted too (see Liverpool::RunGfxDma for the guards). With
+ * SHADPS4_CP_SPLIT_POST_ASC=1, dispatches (gfx and ASC) are posted as owned Dispatch records
+ * (ComputeProgram copy, stage copy, pipeline pointer), and ASC DMA_DATA (and optionally
+ * WRITE_DATA) as Packet records, with the same rest-of-buffer guard (Liverpool::RunAscPacket).
  * Drain points (Sync with a DrainReason) are where the front reads what the back produces:
  * WAIT_REG_MEM, COND_EXEC, MEM_SEMAPHORE waits, the VO label wait, task done (num_submits is the
  * guest's "GPU idle"), the idle tail, every Call record, and read faults taken on the front
@@ -68,6 +71,19 @@ constexpr u32 MaxDepth = 1024;
 u32 Depth();
 /// SHADPS4_CP_SPLIT_POST_DMA=1: run-ahead also posts gfx DMA_DATA (default: they sync).
 bool PostDma();
+/// SHADPS4_CP_SPLIT_POST_ASC=1: run-ahead also posts dispatches (ASC and gfx) and ASC packets as
+/// owned records instead of synchronous Call records (default off). Which classes is set by
+/// SHADPS4_CP_SPLIT_POST_ASC_MASK (PostAscBits, default PostAscDefaultMask), for bisecting.
+bool PostAsc();
+enum PostAscBits : u32 {
+    PostAscDispatch = 1u << 0,  ///< ASC DISPATCH_DIRECT / DISPATCH_INDIRECT (incl. DMA-patched).
+    PostGfxDispatch = 1u << 1,  ///< Gfx-queue DISPATCH_DIRECT / DISPATCH_INDIRECT.
+    PostAscDma = 1u << 2,       ///< ASC DMA_DATA (guarded like gfx POST_DMA).
+    PostAscWriteData = 1u << 3, ///< ASC WRITE_DATA (guarded like gfx POST_DMA). Not default.
+};
+constexpr u32 PostAscDefaultMask = PostAscDispatch | PostGfxDispatch | PostAscDma;
+/// SHADPS4_CP_SPLIT_POST_ASC_MASK (decimal or 0x hex). 0 when POST_ASC is off.
+u32 PostAscMask();
 /// SHADPS4_CP_SPLIT_VERIFY=1. Depth 0: at every draw/dispatch record (the front is parked) the
 /// back compares its whole register mirror, CB/DB extents, context epoch and cs snapshot with the
 /// front's, and each copied stage (user data, flat buffer, pgm_base) with the Info the front's
@@ -125,7 +141,7 @@ enum class DrainReason : u8 {
     PacketFence,     ///< EVENT_WRITE_EOP / EOS.
     PacketWriteData, ///< Gfx WRITE_DATA.
     PacketOther,     ///< Flip / guest-marker NOP, ZPASS_DONE, PFP_SYNC_ME.
-    Call,            ///< ASC work, DumpConstRam (Call records).
+    Call,            ///< Untagged Call records (the tagged ones are the Call* reasons below).
     IdleTail,        ///< The submission loop's idle tail (Call).
     WaitRegMem,      ///< Gfx/ASC WAIT_REG_MEM (and the VO label wait).
     CondExec,
@@ -134,6 +150,32 @@ enum class DrainReason : u8 {
     IbStart,         ///< POST_DMA: an INDIRECT_BUFFER while posted packets are outstanding.
     FrontFault,      ///< A fault taken on the front (DrainForFrontFault).
     FrontExit,
+    // POST_ASC (run-ahead):
+    VerifyDispatch,    ///< VERIFY: the periodic synchronous dispatch.
+    AscDmaGuard,       ///< An ASC DMA_DATA writing into the rest of its command buffer.
+    AscWriteDataGuard, ///< An ASC WRITE_DATA writing into the rest of its command buffer.
+    AscIbStart,        ///< An ASC INDIRECT_BUFFER while posted packets are outstanding.
+    // Call records, by origin (together they are what the plain `call` counter used to be).
+    CallAscDispatch,         ///< ASC DISPATCH_DIRECT.
+    CallAscDispatchIndirect, ///< ASC DISPATCH_INDIRECT.
+    CallAscDispatchPatched,  ///< ASC DISPATCH_DIRECT whose dims a DMA patched (indirect).
+    CallAscDma,              ///< ASC DMA_DATA.
+    CallAscWriteData,        ///< ASC WRITE_DATA.
+    CallAscRelease,          ///< ASC RELEASE_MEM.
+    CallAscSemaphore,        ///< ASC MEM_SEMAPHORE signal / decrement.
+    CallDumpConstRam,        ///< CE DUMP_CONST_RAM.
+    IbEnd,            ///< After an INDIRECT_BUFFER task: posted packets may patch the parent level.
+    DispatchAfterPkt, ///< POST_ASC: a posted dispatch's front lookup after posted DMA/WRITE_DATA.
+    Count,
+};
+
+/// What a posted record is (counters). The packet kinds also arm SyncIfPostedPackets.
+enum class PostKind : u8 {
+    Draw,
+    GfxPacket,   ///< Gfx DMA_DATA (POST_DMA).
+    GfxDispatch, ///< POST_ASC.
+    AscDispatch, ///< POST_ASC.
+    AscPacket,   ///< ASC DMA_DATA / WRITE_DATA (POST_ASC).
     Count,
 };
 
@@ -229,9 +271,9 @@ public:
     /// Publishes everything committed and waits until the back has executed all of it.
     void Sync(DrainReason reason);
     /// Run-ahead: publishes everything committed without waiting, then waits only while more
-    /// than Depth() posted records are outstanding. `is_draw` selects the counter.
-    void PostRunAhead(bool is_draw);
-    /// Sync(reason) if a posted non-draw record (POST_DMA) may not have executed yet.
+    /// than Depth() posted records are outstanding. `kind` selects the counter.
+    void PostRunAhead(PostKind kind);
+    /// Sync(reason) if a posted packet record (POST_DMA / POST_ASC) may not have executed yet.
     void SyncIfPostedPackets(DrainReason reason);
 
     void EmitRegWrite(u32 word_offset, const u32* data, u32 count);
@@ -273,10 +315,12 @@ public:
     void WakeBack();
 
     static constexpr u32 NumDrainReasons = static_cast<u32>(DrainReason::Count);
+    static constexpr u32 NumPostKinds = static_cast<u32>(PostKind::Count);
     /// Front-owned counters, logged and reset every ~10 s by MaybeLog. Times are in TSC ticks.
     struct Counters {
         u64 records{}, bytes{}, full_waits{}, front_parks{}, reg_appends{};
-        u64 posted_draws{}, posted_packets{}, depth_waits{}, depth_wait_ticks{};
+        std::array<u64, NumPostKinds> posted{};
+        u64 depth_waits{}, depth_wait_ticks{};
         u64 max_lead{};       ///< Most posted records outstanding at a post (after the bound).
         u64 max_lead_seq{};   ///< Most records (any type) published but not done, at a post.
         std::array<u64, NumDrainReasons> drains{};
