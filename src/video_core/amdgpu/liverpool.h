@@ -32,6 +32,7 @@ struct VideoOutPort;
 namespace AmdGpu {
 
 union PM4Header;
+struct PM4CmdReleaseMem;
 enum class PM4ItOpcode : u32;
 
 struct Liverpool {
@@ -291,6 +292,9 @@ private:
     /// TASK_GUARD: drains if an outstanding posted write overlaps the unparsed rest of any active
     /// command buffer (every registered span), before ProcessLoop resumes a task.
     void SplitGuardActive();
+    /// True if [lo, hi) overlaps the unparsed rest of any active command buffer (every registered
+    /// span), or if some level is untracked (conservative).
+    bool SplitSpansOverlap(VAddr lo, VAddr hi) const;
     void FrontProcess(std::stop_token stoken);
     void BackLoop(std::stop_token stoken);
     void ExecuteRecord(const CpSplit::RecordHeader& record);
@@ -318,6 +322,13 @@ private:
     /// current ASC command buffer): then synchronous with `guard_reason`.
     void RunAscPacket(const PM4Header* header, std::span<const u32> rest, VAddr dst, u64 bytes,
                       CpSplit::DrainReason guard_reason);
+    /// POST_FENCE: a fence packet (gfx EOP / EOS, or ASC RELEASE_MEM with `flags` =
+    /// AscReleaseMem | pipe << 8) posted as a Packet record, its label noted in the write log.
+    /// Synchronous with `sync_reason` if the label lies in `rest`.
+    void RunFence(const PM4Header* header, std::span<const u32> rest, VAddr label, u16 flags,
+                  CpSplit::DrainReason sync_reason);
+    /// ASC RELEASE_MEM body (back): download images, fence value, interrupt on `pipe_id`.
+    void ExecuteAscReleaseMem(const PM4CmdReleaseMem* release_mem, u32 pipe_id);
     /// Inline: fn() now. Split: fn() on the back while the front waits (a drain at any depth).
     template <typename F>
     void OnBack(F&& fn, CpSplit::DrainReason reason = CpSplit::DrainReason::Call);
@@ -405,6 +416,8 @@ private:
     u32 split_post_asc{0};       ///< Run-ahead + POST_ASC: CpSplit::PostAscBits, else 0.
     bool split_post_task_done{false}; ///< Run-ahead + SHADPS4_CP_SPLIT_POST_TASK_DONE=1.
     u32 split_task_guard{0}; ///< POST_TASK_DONE + SHADPS4_CP_SPLIT_TASK_GUARD (1-3), else 0.
+    bool split_post_fence{false}; ///< TASK_GUARD + SHADPS4_CP_SPLIT_POST_FENCE=1.
+    bool split_disp_guard{true};  ///< SHADPS4_CP_SPLIT_DISP_GUARD (default 1).
     /// TASK_GUARD (front): spans of the active Process* levels of every queue (SplitSpanScope);
     /// null = free. A level that finds no free slot counts in split_span_untracked, and resume
     /// checks drain conservatively while it is non-zero.

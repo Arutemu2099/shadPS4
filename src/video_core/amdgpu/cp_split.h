@@ -97,6 +97,19 @@ bool PostTaskDone();
 ///  2: + the IB-start guards (gfx IbStart, AscIbStart) become the IB's own entry check.
 ///  3: + the IB-end guards (IbEnd) check only the parent's unparsed rest.
 u32 TaskGuard();
+/// SHADPS4_CP_SPLIT_POST_FENCE=1 (only with TASK_GUARD): gfx EVENT_WRITE_EOP / EVENT_WRITE_EOS and
+/// ASC RELEASE_MEM are posted instead of synchronous. The label write and the interrupt happen on
+/// the back in stream order, as before; only the front no longer waits for them. Every front
+/// reader of a label (WAIT_REG_MEM, COND_EXEC, semaphores) drains first; the label is noted in
+/// the TASK_GUARD write log, and a label inside the unparsed rest of its own buffer syncs.
+/// GDS-sourced fences stay synchronous.
+bool PostFence();
+/// SHADPS4_CP_SPLIT_DISP_GUARD=0 drops POST_ASC's drain before a posted dispatch's front lookup
+/// when posted DMA / WRITE_DATA is outstanding (disp_after_pkt), as draws never had it. Default 1.
+/// The drain also covered the user data / flat buffer / pgm_base copied into the record. VERIFY's
+/// periodic synced dispatch never took this drain (it is not posted), so its back re-lookup
+/// already measures the unguarded case at either setting.
+bool DispGuard();
 /// SHADPS4_CP_SPLIT_VERIFY=1. Depth 0: at every draw/dispatch record (the front is parked) the
 /// back compares its whole register mirror, CB/DB extents, context epoch and cs snapshot with the
 /// front's, and each copied stage (user data, flat buffer, pgm_base) with the Info the front's
@@ -144,6 +157,7 @@ enum class RecordType : u16 {
 /// Flags for Packet records.
 enum RecordFlags : u16 {
     GuestMarkers = 1 << 0,
+    AscReleaseMem = 1 << 1, ///< POST_FENCE: an ASC RELEASE_MEM; bits 8-15 hold the pipe id.
 };
 
 /// Why the front waited for the back to finish everything published (counters only).
@@ -196,6 +210,7 @@ enum class PostKind : u8 {
     GfxDispatch, ///< POST_ASC.
     AscDispatch, ///< POST_ASC.
     AscPacket,   ///< ASC DMA_DATA / WRITE_DATA (POST_ASC).
+    Fence,       ///< POST_FENCE: gfx EOP / EOS, ASC RELEASE_MEM. Does not arm SyncIfPostedPackets.
     Count,
 };
 

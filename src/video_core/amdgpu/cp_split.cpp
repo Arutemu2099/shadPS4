@@ -112,6 +112,22 @@ u32 TaskGuard() {
     return level;
 }
 
+bool PostFence() {
+    static const bool post = [] {
+        const char* value = std::getenv("SHADPS4_CP_SPLIT_POST_FENCE");
+        return value && value[0] == '1';
+    }();
+    return post;
+}
+
+bool DispGuard() {
+    static const bool guard = [] {
+        const char* value = std::getenv("SHADPS4_CP_SPLIT_DISP_GUARD");
+        return !(value && value[0] == '0');
+    }();
+    return guard;
+}
+
 u32 PostAscMask() {
     static const u32 mask = [] {
         if (!PostAsc()) {
@@ -557,7 +573,7 @@ void Channel::MaybeLog() {
              "posted_pkts={} drains={} drain_waits={} front_wait_ms={:.1f} drain_ms={:.1f} "
              "depth_wait_ms={:.1f} depth_waits={} max_lead={} max_lead_records={} "
              "back_idle_ms={:.1f} full_waits={} front_parks={} reg_appends={} posted_gfx_disp={} "
-             "posted_asc_disp={} posted_asc_pkts={}",
+             "posted_asc_disp={} posted_asc_pkts={} posted_fences={}",
              double(now - log_window_start_ns) / 1e9, Mode(), depth, c.records, c.bytes,
              c.posted[static_cast<u32>(PostKind::Draw)],
              c.posted[static_cast<u32>(PostKind::GfxPacket)], drains, drain_waits,
@@ -565,7 +581,8 @@ void Channel::MaybeLog() {
              c.depth_waits, c.max_lead, c.max_lead_seq, ms(idle), c.full_waits, c.front_parks,
              c.reg_appends, c.posted[static_cast<u32>(PostKind::GfxDispatch)],
              c.posted[static_cast<u32>(PostKind::AscDispatch)],
-             c.posted[static_cast<u32>(PostKind::AscPacket)]);
+             c.posted[static_cast<u32>(PostKind::AscPacket)],
+             c.posted[static_cast<u32>(PostKind::Fence)]);
     std::string guard_checks;
     for (u32 r = 0; r < NumDrainReasons; ++r) {
         if (c.guard_checks[r] != 0) {

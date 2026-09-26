@@ -582,6 +582,17 @@ Liverpool::Liverpool() {
         if (CpSplit::TaskGuard() != 0 && !split_post_task_done) {
             LOG_WARNING(Render, "CpSplit: TASK_GUARD ignored without run-ahead POST_TASK_DONE");
         }
+        split_post_fence = split_task_guard != 0 && CpSplit::PostFence();
+        if (CpSplit::PostFence() && split_task_guard == 0) {
+            LOG_WARNING(Render, "CpSplit: POST_FENCE ignored without TASK_GUARD");
+        }
+        if (split_post_fence && (SplitHazard::Enabled() || g_cp_wait.enabled)) {
+            // The fence bodies note the label in SplitHazard / g_cp_wait on the back, which the
+            // front reads: only race-free while fences are synchronous.
+            LOG_WARNING(Render, "CpSplit: POST_FENCE off, SPLIT_HAZARD_STATS or CP_WAIT_STATS on");
+            split_post_fence = false;
+        }
+        split_disp_guard = CpSplit::DispGuard();
         split_verify_every = split_run_ahead ? CpSplit::VerifyEvery() : 1u;
         split = std::make_unique<CpSplit::Channel>();
         mirror = std::make_unique<CpSplit::BackMirror>();
@@ -601,11 +612,15 @@ Liverpool::Liverpool() {
                      split_post_task_done
                          ? fmt::format(", POST_TASK_DONE{}",
                                        split_task_guard
-                                           ? fmt::format(" TASK_GUARD {}", split_task_guard)
+                                           ? fmt::format(" TASK_GUARD {}{}", split_task_guard,
+                                                         split_post_fence ? ", POST_FENCE" : "")
                                            : std::string{})
                          : std::string{},
                      split_verify ? fmt::format(", VERIFY every {}", split_verify_every)
                                   : std::string{});
+            if (!split_disp_guard) {
+                LOG_INFO(Render, "CpSplit: DISP_GUARD 0 (no disp_after_pkt drain)");
+            }
         } else {
             LOG_INFO(Render, "CpSplit: on (depth 0){}", split_verify ? ", VERIFY" : "");
         }
@@ -732,6 +747,11 @@ void Liverpool::ExecuteRecord(const CpSplit::RecordHeader& record) {
         ExecuteDispatchRecord(record);
         break;
     case CpSplit::RecordType::Packet:
+        if (record.flags & CpSplit::AscReleaseMem) [[unlikely]] {
+            ExecuteAscReleaseMem(reinterpret_cast<const PM4CmdReleaseMem*>(payload),
+                                 record.flags >> 8);
+            break;
+        }
         ExecuteGfxPacket(reinterpret_cast<const PM4Header*>(payload),
                          (record.flags & CpSplit::GuestMarkers) != 0);
         break;
@@ -1065,6 +1085,61 @@ void Liverpool::RunAscPacket(const PM4Header* header, std::span<const u32> rest,
     split->MaybeLog();
 }
 
+void Liverpool::RunFence(const PM4Header* header, std::span<const u32> rest, VAddr label,
+                         u16 flags, CpSplit::DrainReason sync_reason) {
+    // POST_FENCE: the label is written (and the interrupt raised) when the back reaches this
+    // record, exactly when the synchronous path wrote it; the front just does not wait.
+    // Front readers of the label drain first (WAIT_REG_MEM, COND_EXEC, semaphores); a label in
+    // another buffer is caught by the TASK_GUARD checks; one in this buffer's rest syncs here.
+    // The copy: the guest may reuse the command memory once the front has moved on.
+    // Fences do not arm SyncIfPostedPackets, so the IB-end guards do not cover a label in a
+    // parent level's rest: check every active level here (`rest` is the innermost one).
+    constexpr u64 LabelBytes = 8; // 32- or 64-bit value; 8 covers both.
+    const u32 dwords = header->type3.NumWords() + 1;
+    void* copy = split->Reserve(CpSplit::RecordType::Packet, dwords * sizeof(u32), flags);
+    std::memcpy(copy, header, dwords * sizeof(u32));
+    split->Commit();
+    const auto lo = reinterpret_cast<VAddr>(rest.data());
+    const VAddr hi = lo + rest.size_bytes();
+    if ((label < hi && lo < label + LabelBytes) ||
+        SplitSpansOverlap(label, label + LabelBytes)) {
+        split->Sync(sync_reason);
+        return;
+    }
+    split->NotePostedWrite(label, LabelBytes);
+    split->PostRunAhead(CpSplit::PostKind::Fence);
+    split->MaybeLog();
+}
+
+void Liverpool::ExecuteAscReleaseMem(const PM4CmdReleaseMem* release_mem, u32 pipe_id) {
+    if (rasterizer) {
+        rasterizer->ProcessDownloadImages();
+    }
+    g_cp_wait.NoteWrite(release_mem->Address<void*>());
+    VideoCore::ProtectFence();
+    if ((FenceAtGpu() == 1 || FenceAtGpu() == 2) && rasterizer &&
+        release_mem->data_sel != DataSelect::GdsMemStore) {
+        rasterizer->DeferToGpu(
+            [packet = *release_mem, pipe_id] {
+                packet.SignalFence(
+                    [pipe_id] {
+                        Platform::IrqC::Instance()->Signal(
+                            static_cast<Platform::InterruptId>(pipe_id));
+                    },
+                    [](VAddr, u16, u16) {});
+            },
+            FenceAtGpu() == 1);
+        return;
+    }
+    release_mem->SignalFence(
+        [pipe_id] {
+            Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
+        },
+        [this](VAddr dst, u16 gds_index, u16 num_dwords) {
+            rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
+        });
+}
+
 Liverpool::SplitSpanScope::SplitSpanScope(Liverpool& liverpool, const std::span<const u32>* span,
                                           CpSplit::DrainReason entry_reason) {
     if (liverpool.split_task_guard == 0) [[likely]] {
@@ -1124,6 +1199,21 @@ void Liverpool::SplitGuardActive() {
             }
         }
     }
+}
+
+bool Liverpool::SplitSpansOverlap(VAddr lo, VAddr hi) const {
+    if (split_span_untracked != 0) {
+        return true;
+    }
+    for (u32 i = 0; i < split_span_hwm; ++i) {
+        if (const auto* span = split_spans[i]) {
+            const auto s_lo = reinterpret_cast<VAddr>(span->data());
+            if (lo < s_lo + span->size_bytes() && s_lo < hi) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_marker,
@@ -1211,9 +1301,9 @@ void Liverpool::EmitDispatch(const PM4Header* header, const char* name, bool hos
     }
     const bool verify_sync = post && verify == DrawVerifyFull;
     post = post && !verify_sync;
-    if (post) {
+    if (post && split_disp_guard) {
         // The front lookup below reads guest memory (user data tables, flat buffer) that a posted
-        // DMA_DATA / WRITE_DATA may not have written yet.
+        // DMA_DATA / WRITE_DATA may not have written yet. DISP_GUARD=0 drops this, as for draws.
         split->SyncIfPostedPackets(CpSplit::DrainReason::DispatchAfterPkt);
     }
     const Vulkan::ComputePipeline* pipeline = rasterizer->PrepareDispatchFront();
@@ -2235,6 +2325,23 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             // ExecuteGfxPacket. Synchronous at every depth, except DMA_DATA under POST_DMA.
             case PM4ItOpcode::EventWriteEos:
             case PM4ItOpcode::EventWriteEop: {
+                if (split_post_fence) [[unlikely]] {
+                    VAddr label = 0;
+                    if (opcode == PM4ItOpcode::EventWriteEop) {
+                        label = reinterpret_cast<VAddr>(
+                            reinterpret_cast<const PM4CmdEventWriteEop*>(header)->Address<u32>());
+                    } else if (const auto* eos =
+                                   reinterpret_cast<const PM4CmdEventWriteEos*>(header);
+                               eos->command != PM4CmdEventWriteEos::Command::GdsStore) {
+                        label = eos->Address<VAddr>();
+                    }
+                    if (label != 0) {
+                        RunFence(header, dcb, label,
+                                 guest_markers_enabled ? u16{CpSplit::GuestMarkers} : u16{0},
+                                 CpSplit::DrainReason::PacketFence);
+                        break;
+                    }
+                }
                 RunGfxPacket(header, guest_markers_enabled, CpSplit::DrainReason::PacketFence);
                 break;
             }
@@ -2369,6 +2476,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::WaitOnCeCounter: {
                 while (cblock.ce_count <= cblock.de_count && !ce_task.handle.done()) {
+                    if (split_task_guard) [[unlikely]] {
+                        // The DE resumes the CE directly, not through ProcessLoop: check the
+                        // CE's unparsed rest against this task's posted writes.
+                        SplitGuardActive();
+                    }
                     RESUME_GFX(ce_task);
                 }
                 break;
@@ -2416,6 +2528,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 
     if (ce_task.handle) {
         while (!ce_task.handle.done()) {
+            if (split_task_guard) [[unlikely]] {
+                SplitGuardActive(); // As at WAIT_ON_CE_COUNTER.
+            }
             RESUME_GFX(ce_task);
         }
         ce_task.handle.destroy();
@@ -2807,38 +2922,17 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::ReleaseMem: {
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
-            OnBack([&] {
-                if (rasterizer) {
-                    rasterizer->ProcessDownloadImages();
-                }
-                g_cp_wait.NoteWrite(release_mem->Address<void*>());
-                VideoCore::ProtectFence();
-                if ((FenceAtGpu() == 1 || FenceAtGpu() == 2) && rasterizer &&
-                    release_mem->data_sel != DataSelect::GdsMemStore) {
-                    rasterizer->DeferToGpu(
-                        [packet = *release_mem, pipe_id = queue.pipe_id] {
-                            packet.SignalFence(
-                                [pipe_id] {
-                                    Platform::IrqC::Instance()->Signal(
-                                        static_cast<Platform::InterruptId>(pipe_id));
-                                },
-                                [](VAddr, u16, u16) {});
-                        },
-                        FenceAtGpu() == 1);
-                    return;
-                }
-                release_mem->SignalFence(
-                    [pipe_id = queue.pipe_id] {
-                        Platform::IrqC::Instance()->Signal(
-                            static_cast<Platform::InterruptId>(pipe_id));
-                    },
-                    [this](VAddr dst, u16 gds_index, u16 num_dwords) {
-                        rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false,
-                                               true);
-                    });
-            },
-            // Stays synchronous under POST_ASC: a fence + IRQ (and g_cp_wait's label set).
-            CpSplit::DrainReason::CallAscRelease);
+            if (split_post_fence && release_mem->data_sel != DataSelect::GdsMemStore)
+                [[unlikely]] {
+                ASSERT(queue.pipe_id <= 0xff);
+                RunFence(header, acb, release_mem->Address<VAddr>(),
+                         static_cast<u16>(CpSplit::AscReleaseMem | (queue.pipe_id << 8)),
+                         CpSplit::DrainReason::CallAscRelease);
+                break;
+            }
+            // Synchronous under POST_ASC alone: a fence + IRQ (and g_cp_wait's label set).
+            OnBack([&] { ExecuteAscReleaseMem(release_mem, queue.pipe_id); },
+                   CpSplit::DrainReason::CallAscRelease);
             break;
         }
         case PM4ItOpcode::EventWrite: {
