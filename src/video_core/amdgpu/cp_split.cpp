@@ -94,6 +94,14 @@ bool PostAsc() {
     return post;
 }
 
+bool PostTaskDone() {
+    static const bool post = [] {
+        const char* value = std::getenv("SHADPS4_CP_SPLIT_POST_TASK_DONE");
+        return value && value[0] == '1';
+    }();
+    return post;
+}
+
 u32 PostAscMask() {
     static const u32 mask = [] {
         if (!PostAsc()) {
@@ -298,6 +306,12 @@ void Channel::EmitEpochBump(u32 opcode) {
     payload->opcode = opcode;
     payload->pad = 0;
     Commit();
+}
+
+void Channel::PostRetire() {
+    Reserve(RecordType::Retire, 0);
+    Commit();
+    Publish();
 }
 
 void Channel::FrontExited() {

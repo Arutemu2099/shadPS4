@@ -84,6 +84,9 @@ enum PostAscBits : u32 {
 constexpr u32 PostAscDefaultMask = PostAscDispatch | PostGfxDispatch | PostAscDma;
 /// SHADPS4_CP_SPLIT_POST_ASC_MASK (decimal or 0x hex). 0 when POST_ASC is off.
 u32 PostAscMask();
+/// SHADPS4_CP_SPLIT_POST_TASK_DONE=1 (run-ahead only): a finished submission posts a Retire record
+/// instead of draining; the guest-visible idle state waits for the back to retire it.
+bool PostTaskDone();
 /// SHADPS4_CP_SPLIT_VERIFY=1. Depth 0: at every draw/dispatch record (the front is parked) the
 /// back compares its whole register mirror, CB/DB extents, context epoch and cs snapshot with the
 /// front's, and each copied stage (user data, flat buffer, pgm_base) with the Info the front's
@@ -124,6 +127,8 @@ enum class RecordType : u16 {
     Dispatch,   ///< Liverpool's dispatch record + one stage (defined in liverpool.cpp).
     Packet,     ///< A verbatim copy of one gfx PM4 type-3 packet, run by ExecuteGfxPacket.
     Call,       ///< CallPayload: a function on the front's stack. Always synchronous.
+    Retire,     ///< No payload: a guest submission is complete (POST_TASK_DONE); the back
+                ///< retires it for WaitGpuIdle.
 };
 
 /// Flags for Packet records.
@@ -294,6 +299,8 @@ public:
 
     /// The front thread is about to return; lets the back leave its loop.
     void FrontExited();
+    /// Posts a Retire record and publishes it (run-ahead POST_TASK_DONE).
+    void PostRetire();
 
     // ---- Back (the only consumer) ----
 

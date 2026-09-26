@@ -577,6 +577,7 @@ Liverpool::Liverpool() {
             LOG_WARNING(Render, "CpSplit: POST_ASC WRITE_DATA off, SHADPS4_CP_WAIT_STATS is on");
             split_post_asc &= ~u32{CpSplit::PostAscWriteData};
         }
+        split_post_task_done = split_run_ahead && CpSplit::PostTaskDone();
         split_verify_every = split_run_ahead ? CpSplit::VerifyEvery() : 1u;
         split = std::make_unique<CpSplit::Channel>();
         mirror = std::make_unique<CpSplit::BackMirror>();
@@ -729,6 +730,14 @@ void Liverpool::ExecuteRecord(const CpSplit::RecordHeader& record) {
         back_in_call = true;
         call->invoke(call->context);
         back_in_call = false;
+        break;
+    }
+    case CpSplit::RecordType::Retire: {
+        {
+            std::scoped_lock lock{submit_mutex};
+            pending_retire.fetch_sub(1, std::memory_order_seq_cst);
+        }
+        submit_cv.notify_all();
         break;
     }
     case CpSplit::RecordType::Wrap:
@@ -1406,8 +1415,18 @@ void Liverpool::ProcessLoop(std::stop_token stoken) {
 
             if (task.done()) {
                 // CP split: the guest reads num_submits == 0 as "GPU idle", so the back must
-                // have finished the submission first.
-                FrontDrain(CpSplit::DrainReason::TaskDone);
+                // have finished the submission first. POST_TASK_DONE: instead of draining, count
+                // it pending and post a Retire record; WaitGpuIdle/IsGpuIdle also wait for
+                // pending_retire, which the back decrements when it reaches the record.
+                if (split_post_task_done) {
+                    // The old drain also made this task's posted DMA / WRITE_DATA land before the
+                    // next top-level buffer is parsed (the nested-IB guards cover only IBs).
+                    split->SyncIfPostedPackets(CpSplit::DrainReason::TaskDone);
+                    pending_retire.fetch_add(1, std::memory_order_seq_cst);
+                    split->PostRetire();
+                } else {
+                    FrontDrain(CpSplit::DrainReason::TaskDone);
+                }
                 task.destroy();
 
                 std::scoped_lock lock{queue.m_access};

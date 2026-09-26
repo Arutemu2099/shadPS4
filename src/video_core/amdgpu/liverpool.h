@@ -100,11 +100,12 @@ public:
 
     void WaitGpuIdle() noexcept {
         std::unique_lock lk{submit_mutex};
-        submit_cv.wait(lk, [this] { return num_submits == 0; });
+        // POST_TASK_DONE: a submission the front finished is idle only once the back retired it.
+        submit_cv.wait(lk, [this] { return num_submits == 0 && pending_retire == 0; });
     }
 
     bool IsGpuIdle() const {
-        return num_submits == 0;
+        return num_submits == 0 && pending_retire == 0;
     }
 
     void SetVoPort(Libraries::VideoOut::VideoOutPort* port) {
@@ -365,6 +366,8 @@ private:
     Libraries::VideoOut::VideoOutPort* vo_port{};
     std::jthread process_thread{};
     std::atomic<u32> num_submits{};
+    /// POST_TASK_DONE: submissions the front finished whose Retire record the back has not run.
+    std::atomic<u32> pending_retire{};
     std::atomic<u32> num_commands{};
     std::atomic<bool> submit_done{};
     std::mutex submit_mutex;
@@ -379,6 +382,7 @@ private:
     bool split_run_ahead{false}; ///< SHADPS4_CP_SPLIT=2: draws (and POST_DMA DMAs) are posted.
     bool split_post_dma{false};  ///< Run-ahead + SHADPS4_CP_SPLIT_POST_DMA=1.
     u32 split_post_asc{0};       ///< Run-ahead + POST_ASC: CpSplit::PostAscBits, else 0.
+    bool split_post_task_done{false}; ///< Run-ahead + SHADPS4_CP_SPLIT_POST_TASK_DONE=1.
     u32 split_verify_every{1};   ///< Run-ahead VERIFY: one synchronous draw in this many.
     u64 split_verify_draws{0};   ///< Front: draws emitted with VERIFY on.
     u64 split_verify_dispatches{0}; ///< Front: posting-eligible dispatches with VERIFY on.
