@@ -47,6 +47,12 @@ const bool g_fault_write_skip_settle = EnvIs1("SHADPS4_FAULT_WRITE_SKIP_SETTLE")
 const bool g_async_submit = EnvIs1("SHADPS4_ASYNC_SUBMIT");
 const bool g_readback_early_flush = EnvIs1("SHADPS4_READBACK_EARLY_FLUSH");
 const bool g_readback_producer_stats = EnvIs1("SHADPS4_READBACK_PRODUCER_STATS");
+/// SHADPS4_WRITE_FAULT_WIDEN=1: a write fault on GPU-modified memory first downloads the same
+/// widened window a read fault would (one submit and wait), so neighbouring GPU-patched pages the
+/// guest CPU rewrites next no longer each cost their own synchronous download. Train-dip captures
+/// (2026-09-26): ~10 consecutive 4 KB record pages, patched by cs_a16fa93a copies and then
+/// rewritten by the CPU, cost ~10 extra submits and GPU waits per frame.
+const bool g_write_fault_widen = EnvIs1("SHADPS4_WRITE_FAULT_WIDEN");
 const bool g_range_add_skip = EnvIs1("SHADPS4_RANGE_ADD_SKIP");
 const bool g_vb_repeat_stats = EnvIs1("SHADPS4_VB_REPEAT_STATS");
 const bool g_written_memo = EnvIs1("SHADPS4_WRITTEN_MEMO");
@@ -677,6 +683,22 @@ void BufferCache::ResolveFaultSync(VAddr device_addr, u64 size, bool is_write,
     const auto [settle_addr, settle_size] = FaultSettleSpan(device_addr, size, is_write);
     SettleOverlappingJobs(settle_addr, settle_size);
     Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
+    if (is_write && g_write_fault_widen && Offload::Enabled()) {
+        // Download the read-fault window as a read (it contains the faulting range). The exact
+        // write path below then finds no GPU data left and completes as an empty write fault,
+        // marking only the faulting range CPU modified.
+        const auto [wide_addr, wide_bytes] = ResolveFaultWindow(buffer, device_addr, size, false);
+        if (wide_bytes > size) {
+            SettleOverlappingJobs(wide_addr, wide_bytes);
+            Offload::SyncTiming wide_timing{};
+            const bool wide_downloaded = DownloadBufferMemory<false>(
+                buffer, wide_addr, wide_bytes, false,
+                Offload::ProfileEnabled() ? &wide_timing : nullptr);
+            if (wide_downloaded) {
+                Offload::CountSyncResolve(origin, wide_timing);
+            }
+        }
+    }
     const auto [addr, bytes] = ResolveFaultWindow(buffer, device_addr, size, is_write);
     Offload::SyncTiming timing{};
     const bool downloaded = DownloadBufferMemory<false>(
