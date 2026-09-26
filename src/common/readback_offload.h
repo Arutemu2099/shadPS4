@@ -140,6 +140,10 @@ struct Counters {
     /// Jobs vetoed because no independent second readback could be made. Never published.
     std::atomic<u64> verify_skips{};
     std::atomic<u64> verify_mismatches{};
+    /// SHADPS4_WRITE_FAULT_OFFLOAD: write-fault jobs admitted (also counted in jobs), and vetoed
+    /// write jobs whose fallback was left to an unmap that began over the range meanwhile.
+    std::atomic<u64> write_jobs{};
+    std::atomic<u64> write_map_skips{};
     std::atomic<u64> next_log_ns{};
 };
 
@@ -251,7 +255,8 @@ inline void MaybeLog() {
              "sync_fallback={} cap_fallback={} cap_wait_ns={} empty={} cp_settles={} "
              "guest_wait_ns={} verify={} verify_skip={} verify_bad={} cp_sync_submit_ns={} "
              "cp_sync_gpu_wait_ns={} guest_sync_submit_ns={} guest_sync_gpu_wait_ns={} "
-             "cp_settle_wait_ns={} inval_hops={} write_marks={} alias_bumps={} map_fallback={}",
+             "cp_settle_wait_ns={} inval_hops={} write_marks={} alias_bumps={} map_fallback={} "
+             "write_jobs={} write_map_skip={}",
              Enabled(), get(s.faults[0]), get(s.sync_downloads[0]), get(s.sync_wait_ns[0]),
              get(s.faults[1]), get(s.sync_downloads[1]), get(s.sync_wait_ns[1]), get(s.jobs),
              get(s.successes), get(s.seq_vetoes), get(s.list_vetoes), get(s.sync_fallbacks),
@@ -260,7 +265,7 @@ inline void MaybeLog() {
              get(s.verify_mismatches), get(s.sync_submit_ns[0]), get(s.sync_gpu_wait_ns[0]),
              get(s.sync_submit_ns[1]), get(s.sync_gpu_wait_ns[1]), get(s.cp_settle_wait_ns),
              get(s.invalidate_settle_hops), get(s.write_marks), get(s.alias_bumps),
-             get(s.mapping_fallbacks));
+             get(s.mapping_fallbacks), get(s.write_jobs), get(s.write_map_skips));
 }
 
 } // namespace Common::ReadbackOffload

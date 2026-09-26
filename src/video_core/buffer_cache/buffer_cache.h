@@ -138,7 +138,10 @@ public:
     void EndGpuMap(VAddr device_addr, u64 size);
 
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
-    void ReadMemory(VAddr device_addr, u64 size, bool is_write = false);
+    /// `offload_write`: a guest thread's write fault may become an asynchronous job
+    /// (SHADPS4_WRITE_FAULT_OFFLOAD); every other write stays synchronous.
+    void ReadMemory(VAddr device_addr, u64 size, bool is_write = false,
+                    bool offload_write = false);
 
     /// Binds host vertex buffers for the current draw.
     void BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline, const Shader::BoundStage& vs,
@@ -265,6 +268,12 @@ private:
         bool on_readback_queue{};
         u64 total_bytes{};
         std::vector<FaultCopy> copies;
+        /// Buffer spans the copies were collected in, in order: [addr, addr + size) for a read
+        /// job, one span per buffer of the window for a write job (SHADPS4_WRITE_FAULT_OFFLOAD).
+        std::vector<std::pair<VAddr, VAddr>> spans;
+        /// A write job's exact faulting range, CPU-marked at publication.
+        VAddr mark_addr{};
+        u64 mark_size{};
         std::vector<u64> seqs;
         std::unique_ptr<Buffer> staging;
     };
@@ -341,6 +350,7 @@ private:
                                              bool is_write);
 
     /// The existing synchronous fault download, after settling overlapping jobs.
+    void NoteWriteFaultOverlap(VAddr device_addr, u64 size);
     void ResolveFaultSync(VAddr device_addr, u64 size, bool is_write,
                           Common::ReadbackOffload::Origin origin);
 
@@ -371,7 +381,9 @@ private:
     bool PublishFaultJob(FaultJob& job);
 
     /// Same walk and staging layout as DownloadBufferMemory, without subtracting anything.
-    u64 CollectFaultCopies(VAddr device_addr, u64 size, std::vector<FaultCopy>& copies);
+    /// Staging offsets continue from `total_size_bytes`; returns the new total.
+    u64 CollectFaultCopies(VAddr device_addr, u64 size, std::vector<FaultCopy>& copies,
+                           u64 total_size_bytes = 0);
 
     std::unique_ptr<Buffer> AcquireFaultStaging();
 

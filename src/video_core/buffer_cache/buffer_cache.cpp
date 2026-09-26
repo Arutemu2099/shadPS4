@@ -58,6 +58,14 @@ const char g_write_fault_widen = [] {
     const char* value = std::getenv("SHADPS4_WRITE_FAULT_WIDEN");
     return value && (value[0] == '1' || value[0] == '2') ? value[0] : '0';
 }();
+/// SHADPS4_WRITE_FAULT_OFFLOAD=1 (with WRITE_FAULT_WIDEN=2 and READBACK_OFFLOAD=1, default off): a
+/// guest thread's write fault on GPU-modified memory becomes a readback job over the same window
+/// the synchronous =2 path downloads. The command processor records the copies and moves on; the
+/// faulting thread waits for the job tick, and publication writes the bytes back, clears the
+/// window's GPU state and CPU-marks the exact faulting range, before the guest write proceeds.
+/// Measured 2026-09-26 (a25 dip anatomy): the dip adds ~2.5 command processor GPU waits per frame.
+const bool g_write_fault_offload =
+    g_write_fault_widen == '2' && EnvIs1("SHADPS4_WRITE_FAULT_OFFLOAD");
 const bool g_range_add_skip = EnvIs1("SHADPS4_RANGE_ADD_SKIP");
 const bool g_vb_repeat_stats = EnvIs1("SHADPS4_VB_REPEAT_STATS");
 const bool g_written_memo = EnvIs1("SHADPS4_WRITTEN_MEMO");
@@ -453,9 +461,11 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, InvalidateOrigin
             [this, device_addr, size] { SettleOverlappingJobs(device_addr, size); });
     }
     const bool from_guest_fault = origin == InvalidateOrigin::GuestWriteFault;
-    memory_tracker->InvalidateRegion(device_addr, size, from_guest_fault, [this, device_addr, size] {
-        ReadMemory(device_addr, size, true);
-    });
+    const bool offload_write = from_guest_fault && g_write_fault_offload;
+    memory_tracker->InvalidateRegion(device_addr, size, from_guest_fault,
+                                     [this, device_addr, size, offload_write] {
+                                         ReadMemory(device_addr, size, true, offload_write);
+                                     });
 }
 
 /// Span of the tracker pages a range touches. Publication and tracker clears act on whole
@@ -514,15 +524,39 @@ static std::pair<VAddr, u64> FaultSettleSpan(VAddr device_addr, u64 size, bool i
     return {begin, end - begin};
 }
 
-void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
+/// SHADPS4_WRITE_FAULT_WIDEN=2: the window a write fault downloads, and settles before that.
+static std::pair<VAddr, u64> WriteFaultWindow(VAddr device_addr, u64 size) {
+    const VAddr begin = Common::AlignDown(device_addr, DefaultReadFaultWidenSize);
+    const VAddr end = Common::AlignUp(device_addr + size, DefaultReadFaultWidenSize);
+    return {begin, end - begin};
+}
+
+/// Calls func(first, count) for each run of equal consecutive entries of sources[0, size): the
+/// copies of one source buffer, which a fault job lists together in address order.
+template <typename T, typename Func>
+static void ForEachSourceRun(const T* sources, size_t size, Func&& func) {
+    for (size_t first = 0; first < size;) {
+        size_t last = first + 1;
+        while (last < size && sources[last] == sources[first]) {
+            ++last;
+        }
+        func(first, last - first);
+        first = last;
+    }
+}
+
+void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool offload_write) {
     const bool cp_self = liverpool->IsGpuThread();
     const auto origin = cp_self ? Offload::Origin::CpSelf : Offload::Origin::Guest;
     Offload::CountFault(origin);
-    if (!Offload::Enabled() || cp_self || is_write) {
+    if (!Offload::Enabled() || cp_self || (is_write && !offload_write)) {
         // A command processor fault cannot leave its own thread: the wait would land there
         // anyway, and a second step queued to it could never run while it is blocked here.
         // Write invalidations also stay synchronous: an offloaded write job could mark CPU
         // state over clean pages after a concurrent unmap. Read jobs never make that mark.
+        // SHADPS4_WRITE_FAULT_OFFLOAD admits guest write faults: a write job CPU-marks only in
+        // its publication, which an unmap settles while the range is still mapped, and a vetoed
+        // write job's fallback is skipped once an unmap has blocked the range (FinishFaultDownload).
         liverpool->SendCommand<true>([this, device_addr, size, is_write, origin] {
             ResolveFaultSync(device_addr, size, is_write, origin);
         });
@@ -768,8 +802,50 @@ bool BufferCache::DownloadWindowMultiBuffer(VAddr window_addr, u64 window_size) 
     return true;
 }
 
+/// SHADPS4_WRITE_FAULT_OVERLAP_STATS=1 (diagnostic, command-processor thread): for each write
+/// fault that reaches a download, does the faulting 8-byte write land on GPU-written bytes, or only
+/// share its 4 KiB page (or 64 KiB window) with them? If writes rarely hit GPU bytes, the download
+/// is avoidable in principle (the CPU and GPU halves of the page could be merged instead).
+void BufferCache::NoteWriteFaultOverlap(VAddr device_addr, u64 size) {
+    static const bool enabled = EnvIs1("SHADPS4_WRITE_FAULT_OVERLAP_STATS");
+    if (!enabled) {
+        return;
+    }
+    static u64 faults = 0, on_gpu = 0, page_gpu = 0, page_gpu_bytes = 0, window_gpu_bytes = 0;
+    static u64 same_page_as_last = 0, last_page = 0;
+    u64 hit = 0, page_bytes = 0, window_bytes = 0;
+    gpu_modified_ranges.ForEachInRange(device_addr, size,
+                                       [&](VAddr start, VAddr end) { hit += end - start; });
+    const VAddr page = Common::AlignDown(device_addr, 4096);
+    gpu_modified_ranges.ForEachInRange(page, 4096,
+                                       [&](VAddr start, VAddr end) { page_bytes += end - start; });
+    const VAddr window = Common::AlignDown(device_addr, DefaultReadFaultWidenSize);
+    gpu_modified_ranges.ForEachInRange(
+        window, DefaultReadFaultWidenSize,
+        [&](VAddr start, VAddr end) { window_bytes += end - start; });
+    ++faults;
+    on_gpu += hit != 0;
+    page_gpu += page_bytes != 0;
+    page_gpu_bytes += page_bytes;
+    window_gpu_bytes += window_bytes;
+    same_page_as_last += page == last_page;
+    last_page = page;
+    if ((faults & 0x3ff) == 0) {
+        LOG_INFO(Render, "WriteFaultOverlap: faults={} write_on_gpu_bytes={} ({:.1f}%) page_has_gpu={} "
+                         "({:.1f}%) avg_gpu_bytes/page={:.0f} avg_gpu_bytes/64KiB={:.0f} "
+                         "same_page_as_previous={:.1f}%",
+                 faults, on_gpu, 100.0 * double(on_gpu) / double(faults), page_gpu,
+                 100.0 * double(page_gpu) / double(faults),
+                 double(page_gpu_bytes) / double(faults), double(window_gpu_bytes) / double(faults),
+                 100.0 * double(same_page_as_last) / double(faults));
+    }
+}
+
 void BufferCache::ResolveFaultSync(VAddr device_addr, u64 size, bool is_write,
                                    Offload::Origin origin) {
+    if (is_write) {
+        NoteWriteFaultOverlap(device_addr, size);
+    }
     const auto [settle_addr, settle_size] = FaultSettleSpan(device_addr, size, is_write);
     SettleOverlappingJobs(settle_addr, settle_size);
     Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
@@ -807,8 +883,8 @@ void BufferCache::ResolveFaultSync(VAddr device_addr, u64 size, bool is_write,
     }
 }
 
-u64 BufferCache::CollectFaultCopies(VAddr device_addr, u64 size, std::vector<FaultCopy>& copies) {
-    u64 total_size_bytes = 0;
+u64 BufferCache::CollectFaultCopies(VAddr device_addr, u64 size, std::vector<FaultCopy>& copies,
+                                    u64 total_size_bytes) {
     memory_tracker->ForEachDownloadRange<false>(
         device_addr, size, [&](u64 device_addr_out, u64 range_size) {
             gpu_modified_ranges.ForEachInRange(
@@ -857,8 +933,14 @@ void BufferCache::ReleaseFaultStaging(std::unique_ptr<Buffer> staging) {
 
 BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u64 size,
                                                            bool is_write) {
-    ASSERT_MSG(!is_write, "Only read faults may use the readback offload prototype");
-    const auto [settle_addr, settle_size] = FaultSettleSpan(device_addr, size, is_write);
+    ASSERT_MSG(!is_write || g_write_fault_offload,
+               "Write faults use the readback offload only with SHADPS4_WRITE_FAULT_OFFLOAD");
+    if (is_write) {
+        NoteWriteFaultOverlap(device_addr, size);
+    }
+    // A write job covers the whole WIDEN=2 window, so the window is what must be free of jobs.
+    const auto [settle_addr, settle_size] = is_write ? WriteFaultWindow(device_addr, size)
+                                                     : FaultSettleSpan(device_addr, size, is_write);
     // SHADPS4_FAULT_OVERLAP_RETRY=1: a read fault inside a pending job's window no longer makes
     // the command processor wait on the GPU for that job. The faulting guest thread waits for
     // the job's tick itself, has it settled (no GPU wait left by then) and retries from the
@@ -885,11 +967,49 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
     } else {
         SettleOverlappingJobs(settle_addr, settle_size);
     }
-    Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
-    const auto [addr, bytes] = ResolveFaultWindow(buffer, device_addr, size, is_write);
+    const BufferId buffer_id = FindBuffer(device_addr, size);
+    Buffer& buffer = slot_buffers[buffer_id];
+    auto [addr, bytes] = is_write ? std::pair<VAddr, u64>{settle_addr, settle_size}
+                                  : ResolveFaultWindow(buffer, device_addr, size, is_write);
 
     std::vector<FaultCopy> copies;
-    const u64 total_size_bytes = CollectFaultCopies(addr, bytes, copies);
+    std::vector<std::pair<VAddr, VAddr>> spans;
+    boost::container::small_vector<BufferId, 8> sources; // Source buffer of each copy.
+    u64 total_size_bytes = 0;
+    if (is_write) {
+        // DownloadWindowMultiBuffer's walk, without subtracting anything: every buffer of the
+        // window, in address order, clipped to it.
+        boost::container::small_vector<BufferId, 8> seen;
+        ForEachBufferInRange(addr, bytes, [&](BufferId id, Buffer& window_buffer) {
+            if (std::ranges::find(seen, id) != seen.end()) {
+                return;
+            }
+            seen.push_back(id);
+            const VAddr lo = std::max(addr, window_buffer.CpuAddr());
+            const VAddr hi =
+                std::min(addr + bytes, window_buffer.CpuAddr() + window_buffer.SizeBytes());
+            if (hi <= lo) {
+                return;
+            }
+            spans.emplace_back(lo, hi);
+            total_size_bytes = CollectFaultCopies(lo, hi - lo, copies, total_size_bytes);
+            sources.resize(copies.size(), id);
+        });
+        // The job's window is the hull of what its publication touches: the buffer spans and
+        // the faulting range. Snapshot, admission and overlap checks all use it.
+        VAddr hull_begin = device_addr;
+        VAddr hull_end = device_addr + size;
+        for (const auto& [lo, hi] : spans) {
+            hull_begin = std::min(hull_begin, lo);
+            hull_end = std::max(hull_end, hi);
+        }
+        addr = hull_begin;
+        bytes = hull_end - hull_begin;
+    } else {
+        spans.emplace_back(addr, addr + bytes);
+        total_size_bytes = CollectFaultCopies(addr, bytes, copies);
+        sources.resize(copies.size(), buffer_id);
+    }
     if (total_size_bytes == 0) {
         // DownloadBufferMemory returns here too, without touching the tracker.
         Offload::Add(Offload::State().prepare_empty);
@@ -911,6 +1031,13 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
         staging = AcquireFaultStaging();
     }
     if (!staging) {
+        if (is_write) {
+            // Nothing was mutated above and no job overlaps the window: the synchronous
+            // WIDEN=2 download, exactly as a write fault without the offload takes it.
+            Offload::Add(Offload::State().capacity_fallbacks);
+            ResolveFaultSync(device_addr, size, is_write, Offload::Origin::Guest);
+            return {};
+        }
         // Out of job slots or staging, or too large for a job. Nothing was mutated above, and
         // the list just collected is not empty, so this download marks what is_write needs.
         Offload::SyncTiming timing{};
@@ -924,12 +1051,15 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
     }
 
     boost::container::small_vector<vk::BufferCopy, 8> vk_copies;
-    for (const FaultCopy& copy : copies) {
+    boost::container::small_vector<vk::Buffer, 8> vk_sources;
+    for (size_t i = 0; i < copies.size(); ++i) {
+        const Buffer& source = slot_buffers[sources[i]];
         vk_copies.push_back(vk::BufferCopy{
-            .srcOffset = copy.addr - buffer.CpuAddr(),
-            .dstOffset = copy.staging_offset,
-            .size = copy.size,
+            .srcOffset = copies[i].addr - source.CpuAddr(),
+            .dstOffset = copies[i].staging_offset,
+            .size = copies[i].size,
         });
+        vk_sources.push_back(source.Handle());
     }
 
     // Snapshot and copy list are taken in one uninterrupted step on this thread, which also
@@ -962,6 +1092,9 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
         job->tick = tick;
         job->total_bytes = total_size_bytes;
         job->copies = std::move(copies);
+        job->spans = std::move(spans);
+        job->mark_addr = device_addr;
+        job->mark_size = size;
         job->staging = std::move(staging);
         std::scoped_lock lk{fault_window_mutex};
         const auto [window_begin, window_end] = TrackerPageSpan(addr, bytes);
@@ -978,6 +1111,9 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
     }
     const vk::Buffer staging_handle = job->staging->Handle();
     Offload::Add(Offload::State().jobs);
+    if (is_write) {
+        Offload::Add(Offload::State().write_jobs);
+    }
     Common::FaultMonitor::CountReadbackDownload(total_size_bytes);
 
     job->on_readback_queue = false;
@@ -1001,12 +1137,17 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
                 // submitted yet, so the recording worker submits the copy when it gets here.
                 side_tick = readback_queue->ReserveTick();
                 std::vector<vk::BufferCopy> owned(vk_copies.begin(), vk_copies.end());
-                scheduler.Record([this, rq = readback_queue.get(), side_tick,
-                                  src = buffer.Handle(), staging_handle,
-                                  owned = std::move(owned)](vk::CommandBuffer) {
+                std::vector<vk::Buffer> owned_src(vk_sources.begin(), vk_sources.end());
+                scheduler.Record([this, rq = readback_queue.get(), side_tick, staging_handle,
+                                  owned = std::move(owned),
+                                  owned_src = std::move(owned_src)](vk::CommandBuffer) {
                     rq->SubmitReserved(side_tick, [&](vk::CommandBuffer cmd) {
-                        RecordFaultCopiesOnReadbackQueue(cmd, src, staging_handle,
-                                                         {owned.data(), owned.size()}, true);
+                        ForEachSourceRun(owned_src.data(), owned_src.size(),
+                                         [&](size_t first, size_t count) {
+                                             RecordFaultCopiesOnReadbackQueue(
+                                                 cmd, owned_src[first], staging_handle,
+                                                 {owned.data() + first, count}, true);
+                                         });
                     });
                 });
                 scheduler.PublishRecording();
@@ -1014,9 +1155,12 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
                 side_tick = readback_queue->Submit(
                     scheduler.GetMasterSemaphore()->Handle(), producer,
                     [&](vk::CommandBuffer cmd) {
-                        RecordFaultCopiesOnReadbackQueue(cmd, buffer.Handle(), staging_handle,
-                                                         {vk_copies.data(), vk_copies.size()},
-                                                         prebatch);
+                        ForEachSourceRun(vk_sources.data(), vk_sources.size(),
+                                         [&](size_t first, size_t count) {
+                                             RecordFaultCopiesOnReadbackQueue(
+                                                 cmd, vk_sources[first], staging_handle,
+                                                 {vk_copies.data() + first, count}, prebatch);
+                                         });
                     });
             }
             job->tick = side_tick;
@@ -1043,11 +1187,16 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
 
     scheduler.EndRendering();
     if (AsyncFaultCopies()) {
-        RecordFaultCopiesAsync(buffer, staging_handle, {vk_copies.data(), vk_copies.size()});
+        ForEachSourceRun(sources.data(), sources.size(), [&](size_t first, size_t count) {
+            RecordFaultCopiesAsync(slot_buffers[sources[first]], staging_handle,
+                                   {vk_copies.data() + first, count});
+        });
     } else {
         auto command_access = scheduler.AcquireCommandBuffer();
-        RecordFaultCopies(command_access.Handle(), buffer, staging_handle,
-                          {vk_copies.data(), vk_copies.size()});
+        ForEachSourceRun(sources.data(), sources.size(), [&](size_t first, size_t count) {
+            RecordFaultCopies(command_access.Handle(), slot_buffers[sources[first]],
+                              staging_handle, {vk_copies.data() + first, count});
+        });
     }
     if (Offload::LatencyEnabled()) {
         FaultTicket ticket{.id = id, .tick = tick};
@@ -1428,6 +1577,15 @@ void BufferCache::FinishFaultDownload(u64 id, VAddr device_addr, u64 size, bool 
         }
     }
     if (vetoed) {
+        if (is_write && !fault_mapping_gate.TryAdmit(device_addr, size, [] {})) {
+            // A write job was admitted with this range unblocked, so an unmap has begun over it
+            // since. That unmap's own invalidation flushes and CPU-marks the whole range while
+            // it is still mapped; a fallback here could CPU-mark it after the unmap. If the
+            // guest's write finds the page still protected it faults again, and that fault is
+            // not admitted as a job and resolves synchronously.
+            Offload::Add(Offload::State().write_map_skips);
+            return;
+        }
         // Exactly one synchronous fallback per vetoed job, and no retry.
         Offload::Add(Offload::State().sync_fallbacks);
         ResolveFaultSync(device_addr, size, is_write, Offload::Origin::Guest);
@@ -1482,6 +1640,7 @@ void BufferCache::FinalizeFaultJob(FaultJob& job) {
     }
     ReleaseFaultStaging(std::move(job.staging));
     job.copies.clear();
+    job.spans.clear();
     job.seqs.clear();
     {
         // After the publication or veto, never before: an invalidation that no longer sees
@@ -1509,7 +1668,10 @@ bool BufferCache::PublishFaultJob(FaultJob& job) {
     }
     // Compare BEFORE subtracting: on a mismatch the sync fallback must find the ranges.
     std::vector<FaultCopy> current;
-    const u64 current_bytes = CollectFaultCopies(job.addr, job.size, current);
+    u64 current_bytes = 0;
+    for (const auto& [lo, hi] : job.spans) {
+        current_bytes = CollectFaultCopies(lo, hi - lo, current, current_bytes);
+    }
     if (current_bytes != job.total_bytes || current != job.copies) {
         // A nested synchronous download took part of the window while this job settled.
         LOG_ERROR(Render, "ReadbackOffload: copy list changed for {:#x}:{:#x}; falling back",
@@ -1517,12 +1679,14 @@ bool BufferCache::PublishFaultJob(FaultJob& job) {
         Offload::Add(Offload::State().list_vetoes);
         return false;
     }
-    memory_tracker->ForEachDownloadRange<false>(
-        job.addr, job.size, [&](u64 device_addr_out, u64 range_size) {
-            gpu_modified_ranges.Subtract(device_addr_out, range_size); MemoryTracker::gpu_clear_epoch.fetch_add(1, std::memory_order_acq_rel);
-            Common::FaultMonitor::CountRangeSubtract(
-                gpu_modified_ranges.m_ranges_set.iterative_size());
-        });
+    for (const auto& [lo, hi] : job.spans) {
+        memory_tracker->ForEachDownloadRange<false>(
+            lo, hi - lo, [&](u64 device_addr_out, u64 range_size) {
+                gpu_modified_ranges.Subtract(device_addr_out, range_size); MemoryTracker::gpu_clear_epoch.fetch_add(1, std::memory_order_acq_rel);
+                Common::FaultMonitor::CountRangeSubtract(
+                    gpu_modified_ranges.m_ranges_set.iterative_size());
+            });
+    }
     if (!job.staging->is_coherent) {
         vmaInvalidateAllocation(instance.GetAllocator(), job.staging->buffer.allocation, 0,
                                 job.total_bytes);
@@ -1533,9 +1697,16 @@ bool BufferCache::PublishFaultJob(FaultJob& job) {
         memory->TryWriteBacking(std::bit_cast<u8*>(copy.addr), download + copy.staging_offset,
                                 copy.size);
     }
-    memory_tracker->UnmarkRegionAsGpuModified(job.addr, job.size);
-    if (job.is_write) {
-        memory_tracker->MarkRegionAsCpuModified(job.addr, job.size);
+    // Only the buffer spans: for a write job the rest of the window may be GPU-modified image
+    // memory that was not downloaded (as in DownloadWindowMultiBuffer).
+    for (const auto& [lo, hi] : job.spans) {
+        memory_tracker->UnmarkRegionAsGpuModified(lo, hi - lo);
+    }
+    if (job.is_write &&
+        !memory_tracker->IsRegionGpuModified(job.mark_addr, job.mark_size)) {
+        // What the synchronous WIDEN=2 path ends in: its exact download finds nothing left and
+        // CompleteEmptyWriteFault CPU-marks the faulting range, never the window.
+        memory_tracker->MarkRegionAsCpuModified(job.mark_addr, job.mark_size);
     }
     return true;
 }
@@ -1549,26 +1720,29 @@ BufferCache::VerifyResult BufferCache::VerifyFaultJob(FaultJob& job) {
         Offload::Add(Offload::State().seq_vetoes);
         return VerifyResult::Unverified;
     }
-    // Look the buffer up without creating or merging anything. The source has to be the
-    // cache's current buffer for these bytes, found independently of the job.
-    const BufferId buffer_id = page_table[job.addr >> CACHING_PAGEBITS].buffer_id;
+    // Look the buffers up without creating or merging anything. The source of each copy has to
+    // be the cache's current buffer for those bytes, found independently of the job. A write
+    // job's copies can come from several buffers.
     std::unique_ptr<Buffer> second;
     boost::container::small_vector<vk::BufferCopy, 8> vk_copies;
-    if (!IsBufferInvalid(buffer_id)) {
-        const Buffer& buffer = slot_buffers[buffer_id];
-        const bool in_bounds = std::ranges::all_of(job.copies, [&](const FaultCopy& copy) {
-            return buffer.IsInBounds(copy.addr, copy.size);
-        });
-        if (in_bounds) {
-            second = AcquireFaultStaging();
-            for (const FaultCopy& copy : job.copies) {
-                vk_copies.push_back(vk::BufferCopy{
-                    .srcOffset = copy.addr - buffer.CpuAddr(),
-                    .dstOffset = copy.staging_offset,
-                    .size = copy.size,
-                });
-            }
+    boost::container::small_vector<BufferId, 8> sources;
+    bool in_bounds = true;
+    for (const FaultCopy& copy : job.copies) {
+        const BufferId buffer_id = page_table[copy.addr >> CACHING_PAGEBITS].buffer_id;
+        if (IsBufferInvalid(buffer_id) ||
+            !slot_buffers[buffer_id].IsInBounds(copy.addr, copy.size)) {
+            in_bounds = false;
+            break;
         }
+        sources.push_back(buffer_id);
+        vk_copies.push_back(vk::BufferCopy{
+            .srcOffset = copy.addr - slot_buffers[buffer_id].CpuAddr(),
+            .dstOffset = copy.staging_offset,
+            .size = copy.size,
+        });
+    }
+    if (in_bounds && !job.copies.empty()) {
+        second = AcquireFaultStaging();
     }
     if (!second) {
         // No source buffer spans the list any more, or no second staging is left. The job is
@@ -1583,8 +1757,10 @@ BufferCache::VerifyResult BufferCache::VerifyFaultJob(FaultJob& job) {
     scheduler.EndRendering();
     {
         auto command_access = scheduler.AcquireCommandBuffer();
-        RecordFaultCopies(command_access.Handle(), slot_buffers[buffer_id], second->Handle(),
-                          {vk_copies.data(), vk_copies.size()});
+        ForEachSourceRun(sources.data(), sources.size(), [&](size_t first, size_t count) {
+            RecordFaultCopies(command_access.Handle(), slot_buffers[sources[first]],
+                              second->Handle(), {vk_copies.data() + first, count});
+        });
     }
     scheduler.Finish();
     VerifyResult result = VerifyResult::Unverified;
