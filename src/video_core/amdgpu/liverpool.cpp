@@ -175,12 +175,49 @@ namespace {
 struct SplitDrawRecord {
     Vulkan::Rasterizer::SplitDraw draw;
     u64 ctx_epoch;           ///< Liverpool::context_change_epoch at the draw (viewport memo).
-    const char* marker;      ///< Host marker packet name (static string), or null.
-    const void* cmd_address; ///< For the host marker text only.
+    const char* marker;      ///< Host marker packet name (static string), never dereferenced
+                             ///< on the front's behalf; null = no marker.
+    const void* cmd_address; ///< For the host marker text only (formatted, never read).
     u32 stage_count;
-    u32 pad;
+    u32 verify;              ///< DrawVerifyFull / DrawVerifySnapshot (VERIFY only), else 0.
 };
 static_assert(sizeof(SplitDrawRecord) % 8 == 0);
+
+/// SplitDrawRecord::verify. Full: the front is parked on this record (depth 0, or the periodic
+/// synchronous run-ahead draw), so the back compares against the front's live state. Snapshot:
+/// a posted draw; a register-window copy follows the stage blocks.
+constexpr u32 DrawVerifyFull = 1u << 0;
+constexpr u32 DrawVerifySnapshot = 1u << 1;
+
+/// Run-ahead VERIFY: the register ranges the back's draw path reads (inventory 4.3), copied by
+/// the front into each posted draw. Gfx SH (ps_program .. cs_program), all context registers,
+/// and uconfig up to the VGT draw state (primitive type, num_indices, num_instances, TF base).
+/// cs registers never go through regs (they live in mapped_queues[].cs_state).
+struct RegWindow {
+    u32 begin;
+    u32 end;
+};
+constexpr u32 WordOf(size_t byte_offset) {
+    return static_cast<u32>(byte_offset / sizeof(u32));
+}
+constexpr std::array<RegWindow, 3> VerifyWindows{{
+    {WordOf(offsetof(Regs, ps_program)), WordOf(offsetof(Regs, cs_program))},
+    {Regs::ContextRegWordOffset, Regs::ContextRegWordOffset + 0x400},
+    {Regs::UconfigRegWordOffset,
+     WordOf(offsetof(Regs, vgt_tf_memory_base) + sizeof(Regs::vgt_tf_memory_base))},
+}};
+constexpr u32 VerifyWindowDwords() {
+    u32 dwords = 0;
+    for (const auto& window : VerifyWindows) {
+        dwords += window.end - window.begin;
+    }
+    return dwords;
+}
+/// Extents (8 CB + 1 DB) then the windows, padded to 8 bytes.
+constexpr u32 VerifySnapshotBytes =
+    ((NUM_COLOR_BUFFERS + 1 + VerifyWindowDwords()) * sizeof(u32) + 7) & ~u32{7};
+static_assert(VerifyWindows[0].begin < VerifyWindows[0].end &&
+              VerifyWindows[2].end <= Regs::NumRegs);
 
 /// A gfx-queue dispatch. `cs` is the front's cs registers at the packet (GetCsRegs() depends on
 /// the front's curr_qid; inventory section 0.3). Followed by at most one stage block.
@@ -224,9 +261,10 @@ u8* WriteStage(u8* out, const Shader::Info& info, u32 logical_stage) {
     return out + StageBytes(info);
 }
 
-/// The back's BoundStages, pointing into the record (valid until Channel::Done).
-void ReadStages(const u8* in, u32 count,
-                std::array<Shader::BoundStage, Shader::MaxStageTypes>& out) {
+/// The back's BoundStages, pointing into the record (valid until Channel::Done). Returns the
+/// end of the last stage block.
+const u8* ReadStages(const u8* in, u32 count,
+                     std::array<Shader::BoundStage, Shader::MaxStageTypes>& out) {
     for (u32 i = 0; i < count; ++i) {
         const auto* stage = reinterpret_cast<const CpSplit::StagePayload*>(in);
         const auto* dwords = reinterpret_cast<const u32*>(stage + 1);
@@ -240,9 +278,28 @@ void ReadStages(const u8* in, u32 count,
                              (size_t{stage->ud_dw} + stage->flat_dw) * sizeof(u32);
         in += (bytes + 7) & ~size_t{7};
     }
+    return in;
 }
 
-/// VERIFY: at depth 0 the Info still holds what the front's lookup left there.
+/// Run-ahead VERIFY, front: the extents and register windows the back must match (see
+/// VerifyWindows). `out` is 8-aligned (stage blocks end 8-aligned).
+void WriteVerifySnapshot(u8* out, const Regs& regs,
+                         const std::array<CbDbExtent, NUM_COLOR_BUFFERS>& cb_extent,
+                         const CbDbExtent& db_extent) {
+    auto* words = reinterpret_cast<u32*>(out);
+    for (u32 cb = 0; cb < NUM_COLOR_BUFFERS; ++cb) {
+        *words++ = cb_extent[cb].raw;
+    }
+    *words++ = db_extent.raw;
+    for (const auto& window : VerifyWindows) {
+        const u32 count = window.end - window.begin;
+        std::memcpy(words, &regs.reg_array[window.begin], size_t{count} * sizeof(u32));
+        words += count;
+    }
+}
+
+/// VERIFY: the Info still holds what the front's lookup left there. Only valid while the front
+/// is parked on this very record (VerifyFull): at run-ahead the front's later lookups rewrite it.
 void VerifyStages(const std::array<Shader::BoundStage, Shader::MaxStageTypes>& stages, u64 seq) {
     for (const auto& bound : stages) {
         if (!bound.info) {
@@ -278,9 +335,10 @@ bool NopHasBackEffect(const PM4Header* header, bool guest_markers_enabled) {
 } // namespace
 
 template <typename F>
-void Liverpool::OnBack(F&& fn) {
+void Liverpool::OnBack(F&& fn, CpSplit::DrainReason reason) {
     if (split_enabled) [[unlikely]] {
-        split->CallSync(fn);
+        // Synchronous at every depth: fn and what it captures live on the front's stack.
+        split->CallSync(fn, reason);
     } else {
         fn();
     }
@@ -380,6 +438,15 @@ Liverpool::Liverpool() {
     if (CpSplit::Enabled()) {
         split_enabled = true;
         split_verify = CpSplit::Verify();
+        split_run_ahead = CpSplit::RunAhead();
+        split_post_dma = split_run_ahead && CpSplit::PostDma();
+        if (split_post_dma && SplitHazard::Enabled()) {
+            // SplitHazard's page map is written by NoteWrite (DMA CPU paths, back) and read by
+            // NoteDraw (front): only race-free while DMAs are synchronous.
+            LOG_WARNING(Render, "CpSplit: POST_DMA off, SHADPS4_SPLIT_HAZARD_STATS is on");
+            split_post_dma = false;
+        }
+        split_verify_every = split_run_ahead ? CpSplit::VerifyEvery() : 1u;
         split = std::make_unique<CpSplit::Channel>();
         mirror = std::make_unique<CpSplit::BackMirror>();
         std::memcpy(&mirror->regs, &regs, sizeof(Regs));
@@ -390,7 +457,14 @@ Liverpool::Liverpool() {
         back_cb_extent = mirror->cb_extent.data();
         back_db_extent = &mirror->db_extent;
         back_ctx_epoch = &mirror->ctx_epoch;
-        LOG_INFO(Render, "CpSplit: on (depth 0){}", split_verify ? ", VERIFY" : "");
+        if (split_run_ahead) {
+            LOG_INFO(Render, "CpSplit: on (run-ahead, depth {}{}){}", CpSplit::Depth(),
+                     split_post_dma ? ", POST_DMA" : "",
+                     split_verify ? fmt::format(", VERIFY every {}", split_verify_every)
+                                  : std::string{});
+        } else {
+            LOG_INFO(Render, "CpSplit: on (depth 0){}", split_verify ? ", VERIFY" : "");
+        }
     }
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
 }
@@ -439,6 +513,7 @@ void Liverpool::Process(std::stop_token stoken) {
 
 void Liverpool::FrontProcess(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandFront");
+    CpSplit::t_is_front = true;
     // SPLIT-TODO: placement. ApplyCommandProcessorPlacement pins the back; the front wants its
     // own P-core (with the recording worker and Game:Main, 4 hot threads on 6 P-cores).
     ProcessLoop(stoken);
@@ -510,7 +585,9 @@ void Liverpool::ExecuteRecord(const CpSplit::RecordHeader& record) {
         break;
     case CpSplit::RecordType::Call: {
         const auto* call = reinterpret_cast<const CpSplit::CallPayload*>(payload);
+        back_in_call = true;
         call->invoke(call->context);
+        back_in_call = false;
         break;
     }
     case CpSplit::RecordType::Wrap:
@@ -523,10 +600,13 @@ void Liverpool::ExecuteDrawRecord(const CpSplit::RecordHeader& record) {
     const auto& rec = *reinterpret_cast<const SplitDrawRecord*>(&record + 1);
     mirror->ctx_epoch = rec.ctx_epoch;
     std::array<Shader::BoundStage, Shader::MaxStageTypes> stages{};
-    ReadStages(reinterpret_cast<const u8*>(&rec + 1), rec.stage_count, stages);
-    if (split_verify) {
+    const u8* stages_end =
+        ReadStages(reinterpret_cast<const u8*>(&rec + 1), rec.stage_count, stages);
+    if (rec.verify & DrawVerifyFull) {
         VerifyMirror("draw", record.seq, nullptr);
         VerifyStages(stages, record.seq);
+    } else if (rec.verify & DrawVerifySnapshot) {
+        VerifySnapshot(stages_end, record.seq);
     }
     if (rec.marker) {
         rasterizer->ScopeMarkerBegin(fmt::format("gfx:{}:{}", rec.cmd_address, rec.marker));
@@ -560,10 +640,10 @@ void Liverpool::ExecuteDispatchRecord(const CpSplit::RecordHeader& record) {
 }
 
 void Liverpool::VerifyMirror(const char* what, u64 seq, const ComputeProgram* cs) const {
-    // Depth 0: the front is parked in Channel::WaitDone for this very record, so its state is
-    // stable and published to this thread (release store of write_pos, acquire load in Next).
+    // Only for records the front is parked on (Sync): depth 0, dispatches, and the periodic
+    // synchronous run-ahead draw. The front's state is then stable and published to this thread
+    // (release store of write_pos, acquire load in Next).
     // A full memcmp rather than a hash: same pass over 213 KB, exact, and it names the word.
-    // SPLIT-TODO(depth>0): rolling hash per register write carried in the record (4.5).
     const auto& back = mirror->regs.reg_array;
     const auto& front = regs.reg_array;
     if (std::memcmp(back.data(), front.data(), sizeof(back)) != 0) {
@@ -592,6 +672,38 @@ void Liverpool::VerifyMirror(const char* what, u64 seq, const ComputeProgram* cs
     static u64 checks = 0;
     if ((++checks & 0xffff) == 0) {
         LOG_INFO(Render, "CpSplit VERIFY: {} draw/dispatch records checked, 0 mismatches",
+                 checks);
+    }
+}
+
+void Liverpool::VerifySnapshot(const u8* snapshot, u64 seq) const {
+    // Run-ahead: the front has moved on, so compare against the copy it made at this draw.
+    // Registers outside the windows are covered by the periodic full check (VerifyMirror).
+    const auto* words = reinterpret_cast<const u32*>(snapshot);
+    for (u32 cb = 0; cb < NUM_COLOR_BUFFERS; ++cb) {
+        ASSERT_MSG(mirror->cb_extent[cb].raw == words[cb],
+                   "CpSplit VERIFY: CB{} extent differs at posted draw record {}", cb, seq);
+    }
+    ASSERT_MSG(mirror->db_extent.raw == words[NUM_COLOR_BUFFERS],
+               "CpSplit VERIFY: DB extent differs at posted draw record {}", seq);
+    words += NUM_COLOR_BUFFERS + 1;
+    for (const auto& window : VerifyWindows) {
+        const u32 count = window.end - window.begin;
+        const u32* back = &mirror->regs.reg_array[window.begin];
+        if (std::memcmp(back, words, size_t{count} * sizeof(u32)) != 0) {
+            u32 i = 0;
+            while (back[i] == words[i]) {
+                ++i;
+            }
+            UNREACHABLE_MSG("CpSplit VERIFY: register word {:#x} differs at posted draw record "
+                            "{}: back {:#x} front {:#x}",
+                            window.begin + i, seq, back[i], words[i]);
+        }
+        words += count;
+    }
+    static u64 checks = 0;
+    if ((++checks & 0xffff) == 0) {
+        LOG_INFO(Render, "CpSplit VERIFY: {} posted draws checked (register windows), 0 mismatches",
                  checks);
     }
 }
@@ -653,17 +765,55 @@ void Liverpool::BumpEpoch(PM4ItOpcode opcode) {
     VideoCore::BumpSubmitEpoch(opcode);
 }
 
-void Liverpool::RunGfxPacket(const PM4Header* header, bool guest_markers_enabled) {
+void Liverpool::RunGfxPacket(const PM4Header* header, bool guest_markers_enabled,
+                             CpSplit::DrainReason reason) {
     if (!split_enabled) [[likely]] {
         ExecuteGfxPacket(header, guest_markers_enabled);
         return;
     }
-    // Verbatim copy: the guest may reuse the DCB once the front has moved on (depth > 0).
+    // Verbatim copy: the guest may reuse the DCB once the front has moved on (run-ahead).
+    // The copy reads guest memory between Reserve and Commit; a fault there is safe because a
+    // fault drain never publishes the open record (Channel).
     const u32 dwords = header->type3.NumWords() + 1;
     void* copy = split->Reserve(CpSplit::RecordType::Packet, dwords * sizeof(u32),
                                 guest_markers_enabled ? CpSplit::GuestMarkers : 0);
     std::memcpy(copy, header, dwords * sizeof(u32));
-    split->Commit(true);
+    split->Commit();
+    split->Sync(reason);
+}
+
+void Liverpool::RunGfxDma(const PM4Header* header, bool guest_markers_enabled,
+                          std::span<const u32> rest) {
+    if (!split_post_dma) [[likely]] {
+        RunGfxPacket(header, guest_markers_enabled, CpSplit::DrainReason::PacketDma);
+        return;
+    }
+    // POST_DMA (run-ahead): nothing the front reads after this packet is produced by it, except
+    //  - guest memory read by later pipeline lookups (shader code, SRT tables, fetch V# tables):
+    //    measured 0 of ~4 M top-level checks against DMA CPU-path writes (SPLIT_HAZARD_STATS,
+    //    2026-09-25); nested tables unmeasured (SPLIT-TODO);
+    //  - the rest of this command buffer (a GPU-patched packet, as ASC does for dispatch dims):
+    //    guarded here, synchronous if the destination overlaps it;
+    //  - nested IBs: IndirectBuffer syncs while posted packets are outstanding;
+    //  - WAIT_REG_MEM / COND_EXEC / semaphores / faults: those drain anyway.
+    // SPLIT-TODO: only the innermost DCB level is guarded; a parent level's remainder is not.
+    const auto* dma = reinterpret_cast<const PM4DmaData*>(header);
+    if (dma->dst_sel == DmaDataDst::Memory || dma->dst_sel == DmaDataDst::MemoryUsingL2) {
+        const VAddr dst = dma->DstAddress<VAddr>();
+        const VAddr dst_end = dst + dma->NumBytes();
+        const auto lo = reinterpret_cast<VAddr>(rest.data());
+        const VAddr hi = lo + rest.size_bytes();
+        if (dst < hi && lo < dst_end) {
+            RunGfxPacket(header, guest_markers_enabled, CpSplit::DrainReason::PacketDmaGuard);
+            return;
+        }
+    }
+    const u32 dwords = header->type3.NumWords() + 1;
+    void* copy = split->Reserve(CpSplit::RecordType::Packet, dwords * sizeof(u32),
+                                guest_markers_enabled ? CpSplit::GuestMarkers : 0);
+    std::memcpy(copy, header, dwords * sizeof(u32));
+    split->Commit();
+    split->PostRunAhead(false);
 }
 
 void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_marker,
@@ -673,6 +823,18 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
     const bool has_stages = draw.pipeline && draw.draw_class ==
                                                  Vulkan::Rasterizer::DrawClass::Draw &&
                             !draw.skip;
+    // Run-ahead: posted, except the periodic VERIFY draw, which syncs for the full check.
+    // Depth 0: every draw syncs.
+    bool sync = !split_run_ahead;
+    u32 verify = 0;
+    if (split_verify) {
+        if (!split_run_ahead || (++split_verify_draws % split_verify_every) == 0) {
+            sync = true;
+            verify = DrawVerifyFull;
+        } else {
+            verify = DrawVerifySnapshot;
+        }
+    }
     u32 bytes = sizeof(SplitDrawRecord);
     if (has_stages) {
         for (const Shader::Info* info : draw.pipeline->GetStages()) {
@@ -681,16 +843,21 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
             }
         }
     }
+    if (verify == DrawVerifySnapshot) {
+        bytes += VerifySnapshotBytes;
+    }
     auto* rec = split->Reserve<SplitDrawRecord>(CpSplit::RecordType::Draw, bytes);
     rec->draw = draw;
     rec->ctx_epoch = context_change_epoch;
     rec->marker = host_marker ? name : nullptr;
     rec->cmd_address = header;
     rec->stage_count = 0;
-    rec->pad = 0;
+    rec->verify = verify;
+    // Copied now: the front's next lookup rewrites these Info fields (inventory 4.4). With
+    // run-ahead this is what makes the record self-contained: the back reads user data, flat
+    // buffer and pgm_base only from here, and the Info only for its immutable part.
+    auto* out = reinterpret_cast<u8*>(rec + 1);
     if (has_stages) {
-        // Copied now: the front's next lookup rewrites these Info fields (inventory 4.4).
-        auto* out = reinterpret_cast<u8*>(rec + 1);
         const auto stages = draw.pipeline->GetStages();
         for (u32 i = 0; i < stages.size(); ++i) {
             if (stages[i]) {
@@ -699,8 +866,16 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
             }
         }
     }
-    // Depth 0: wait for the back. SPLIT-TODO(depth>0): do not wait; bound by the depth.
-    split->Commit(true);
+    if (verify == DrawVerifySnapshot) {
+        WriteVerifySnapshot(out, regs, last_cb_extent, last_db_extent);
+    }
+    split->Commit();
+    if (sync) {
+        split->Sync(split_run_ahead ? CpSplit::DrainReason::VerifyFull
+                                    : CpSplit::DrainReason::DepthZero);
+    } else {
+        split->PostRunAhead(true);
+    }
     split->MaybeLog();
 }
 
@@ -723,7 +898,11 @@ void Liverpool::EmitDispatch(const PM4Header* header, const char* name, bool hos
         WriteStage(reinterpret_cast<u8*>(rec + 1), *info, u32(Shader::LogicalStage::Compute));
         rec->stage_count = 1;
     }
-    split->Commit(true);
+    split->Commit();
+    // Synchronous at every depth in this version. The record is already self-contained (cs
+    // snapshot, stage copy, pipeline pointer); the drain counter says whether posting pays.
+    // SPLIT-TODO(run-ahead): post them like draws once run-ahead draws are proven.
+    split->Sync(CpSplit::DrainReason::Dispatch);
 }
 
 void Liverpool::ExecuteGfxPacket(const PM4Header* header, bool guest_markers_enabled) {
@@ -795,8 +974,10 @@ void Liverpool::ExecuteGfxPacket(const PM4Header* header, bool guest_markers_ena
         if (rasterizer) {
             rasterizer->ProcessDownloadImages();
         }
-        // SPLIT-TODO(depth>0): g_cp_wait and SplitHazard are front-side diagnostics; note these
-        // writes at parse time instead (inventory section 3).
+        // g_cp_wait and SplitHazard are front-side diagnostics noted here on the back. Race-free
+        // because fence/WRITE_DATA packets stay synchronous at every depth (front parked), and
+        // POST_DMA is refused while SplitHazard is on. SPLIT-TODO(run-ahead): note these writes
+        // at parse time if these packets are ever posted (inventory section 3).
         g_cp_wait.NoteWrite(event_eos->Address());
         SplitHazard::NoteWrite(reinterpret_cast<u64>(event_eos->Address()), 8);
         VideoCore::ProtectFence();
@@ -964,7 +1145,7 @@ void Liverpool::ProcessLoop(std::stop_token stoken) {
             if (task.done()) {
                 // CP split: the guest reads num_submits == 0 as "GPU idle", so the back must
                 // have finished the submission first.
-                FrontDrain();
+                FrontDrain(CpSplit::DrainReason::TaskDone);
                 task.destroy();
 
                 std::scoped_lock lock{queue.m_access};
@@ -983,17 +1164,19 @@ void Liverpool::ProcessLoop(std::stop_token stoken) {
             if (flush_submit) {
                 submit_done = false;
             }
-            OnBack([&] {
-                if (FenceAtGpu() == 2 && rasterizer) {
-                    rasterizer->FlushLazyFences();
-                }
-                if (flush_submit && rasterizer) {
-                    rasterizer->OnSubmit();
-                    rasterizer->Flush();
-                }
-                VideoCore::ProtectFence();
-                Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
-            });
+            OnBack(
+                [&] {
+                    if (FenceAtGpu() == 2 && rasterizer) {
+                        rasterizer->FlushLazyFences();
+                    }
+                    if (flush_submit && rasterizer) {
+                        rasterizer->OnSubmit();
+                        rasterizer->Flush();
+                    }
+                    VideoCore::ProtectFence();
+                    Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
+                },
+                CpSplit::DrainReason::IdleTail);
             continue;
         }
         if (FenceAtGpu() == 2 && rasterizer) {
@@ -1047,7 +1230,8 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         case PM4ItOpcode::DumpConstRam: {
             const auto* dump_const = reinterpret_cast<const PM4DumpConstRam*>(header);
             // CP split: a CP-side guest-memory write, so it runs on the back (fault identity).
-            // SPLIT-TODO(depth>0): copy the heap slice into an owned record instead of reading
+            // A Call record: synchronous at every depth, so reading the front's heap is sound.
+            // SPLIT-TODO(run-ahead): copy the heap slice into an owned record instead of reading
             // the front's constants_heap from the back.
             OnBack([&] {
                 memcpy(dump_const->Address<void*>(),
@@ -1140,7 +1324,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // Flip IRQ and guest markers are back work; the body is in ExecuteGfxPacket.
                 if (split_enabled) {
                     if (NopHasBackEffect(header, guest_markers_enabled)) {
-                        RunGfxPacket(header, guest_markers_enabled);
+                        RunGfxPacket(header, guest_markers_enabled,
+                                     CpSplit::DrainReason::PacketOther);
                     }
                     break;
                 }
@@ -1660,18 +1845,29 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 } else if (event->event_index.Value() == EventIndex::ZpassDone &&
                            event->event_type.Value() == EventType::PixelPipeStatDump) {
                     // Occlusion counter write into guest memory: back work.
-                    RunGfxPacket(header, guest_markers_enabled);
+                    RunGfxPacket(header, guest_markers_enabled,
+                                 CpSplit::DrainReason::PacketOther);
                 }
                 break;
             }
+            // Fences, DMA, CP memory writes and the CP sync barrier: back work, bodies in
+            // ExecuteGfxPacket. Synchronous at every depth, except DMA_DATA under POST_DMA.
             case PM4ItOpcode::EventWriteEos:
-            case PM4ItOpcode::EventWriteEop:
-            case PM4ItOpcode::DmaData:
-            case PM4ItOpcode::WriteData:
+            case PM4ItOpcode::EventWriteEop: {
+                RunGfxPacket(header, guest_markers_enabled, CpSplit::DrainReason::PacketFence);
+                break;
+            }
+            case PM4ItOpcode::DmaData: {
+                RunGfxDma(header, guest_markers_enabled, dcb);
+                break;
+            }
+            case PM4ItOpcode::WriteData: {
+                RunGfxPacket(header, guest_markers_enabled,
+                             CpSplit::DrainReason::PacketWriteData);
+                break;
+            }
             case PM4ItOpcode::PfpSyncMe: {
-                // Fences, DMA, CP memory writes and the CP sync barrier: back work, bodies in
-                // ExecuteGfxPacket.
-                RunGfxPacket(header, guest_markers_enabled);
+                RunGfxPacket(header, guest_markers_enabled, CpSplit::DrainReason::PacketOther);
                 break;
             }
             case PM4ItOpcode::CopyData: {
@@ -1688,13 +1884,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
                 if (!mem_semaphore->IsSignaling()) {
                     // The front reads guest memory the back may still write: drain first.
-                    FrontDrain();
+                    FrontDrain(CpSplit::DrainReason::MemSemaphore);
                     while (!mem_semaphore->Signaled()) {
                         YIELD_GFX();
                     }
                 }
                 // Signal() or Decrement(), in ExecuteGfxPacket.
-                RunGfxPacket(header, guest_markers_enabled);
+                RunGfxPacket(header, guest_markers_enabled, CpSplit::DrainReason::MemSemaphore);
                 break;
             }
             case PM4ItOpcode::AcquireMem: {
@@ -1722,7 +1918,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
                 // CP split: the back may still owe writes this wait reads (inventory 0.6), so
                 // drain before testing. At depth 0 this only flushes register records.
-                FrontDrain();
+                FrontDrain(CpSplit::DrainReason::WaitRegMem);
                 if (vo_port->IsVoLabel(wait_addr) &&
                     num_submits == mapped_queues[GfxQueueId].submits.size()) {
                     const auto vo_start = Common::FaultMonitor::Now();
@@ -1735,7 +1931,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const u64 wrm_ns0 = g_cp_wait.enabled ? CpWaitStats::Now() : 0;
                 bool wrm_waited = false;
                 if (FenceAtGpu() == 2 && rasterizer && !wait_reg_mem->Test(regs.reg_array)) {
-                    OnBack([&] { rasterizer->FlushLazyFences(); });
+                    OnBack([&] { rasterizer->FlushLazyFences(); },
+                           CpSplit::DrainReason::WaitRegMem);
                 }
                 while (!wait_reg_mem->Test(regs.reg_array)) {
                     wrm_waited = true;
@@ -1754,6 +1951,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::IndirectBuffer: {
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+                if (split_post_dma) [[unlikely]] {
+                    // A posted DMA may still be writing the IB about to be parsed.
+                    split->SyncIfPostedPackets(CpSplit::DrainReason::IbStart);
+                }
                 auto task = ProcessGraphics(
                     {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
                 starting_indirect_gfx = true;
@@ -1797,7 +1998,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (cond_exec->command.Value() != 0) {
                     LOG_WARNING(Render, "IT_COND_EXEC used a reserved command");
                 }
-                FrontDrain(); // reads guest memory the back may write
+                // Reads guest memory the back may write.
+                FrontDrain(CpSplit::DrainReason::CondExec);
                 const auto skip = *cond_exec->Address() == false;
                 if (skip) {
                     dcb = NextPacket(dcb,
@@ -1832,9 +2034,10 @@ template <bool is_indirect>
 Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
     // CP split draft: ASC packets are parsed on the front like the DCB, but their back work runs
-    // through synchronous Call records (OnBack), including the pipeline lookup inside
-    // DispatchDirect/Indirect. Sound at depth 0 only.
-    // SPLIT-TODO(depth>0): owned Dispatch records with the lookup on the front, as for gfx.
+    // through Call records (OnBack), including the pipeline lookup inside DispatchDirect/
+    // Indirect. A Call is a full drain at every depth (the front stays parked until it returns),
+    // so this stays sound with run-ahead; each one costs a round trip.
+    // SPLIT-TODO(run-ahead): owned Dispatch records with the lookup on the front, as for gfx.
     if constexpr (!is_indirect) {
         BumpEpoch(PM4ItOpcode::Nop);
     }
@@ -2083,7 +2286,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (mem_semaphore->IsSignaling()) {
                 OnBack([&] { mem_semaphore->Signal(); });
             } else {
-                FrontDrain();
+                FrontDrain(CpSplit::DrainReason::MemSemaphore);
                 while (!mem_semaphore->Signaled()) {
                     YIELD_ASC(vqid);
                 }
@@ -2097,9 +2300,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto wrm_start = Common::FaultMonitor::Now();
             const u64 wrm_ns0 = g_cp_wait.enabled ? CpWaitStats::Now() : 0;
             bool wrm_waited = false;
-            FrontDrain();
+            FrontDrain(CpSplit::DrainReason::WaitRegMem);
             if (FenceAtGpu() == 2 && rasterizer && !wait_reg_mem->Test(regs.reg_array)) {
-                OnBack([&] { rasterizer->FlushLazyFences(); });
+                OnBack([&] { rasterizer->FlushLazyFences(); }, CpSplit::DrainReason::WaitRegMem);
             }
             while (!wait_reg_mem->Test(regs.reg_array)) {
                 wrm_waited = true;

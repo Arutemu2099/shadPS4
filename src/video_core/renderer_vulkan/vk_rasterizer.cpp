@@ -726,6 +726,12 @@ void Rasterizer::ExecuteDraw(const SplitDraw& draw,
                              const std::array<Shader::BoundStage, Shader::MaxStageTypes>& stages) {
     // CP split, back thread: Draw/DrawIndirect with the front's classification, lookup and
     // per-stage data. Registers come from the back's mirror through BackRegs().
+    // With run-ahead the front runs concurrently: nothing here may read front state (regs,
+    // Info::user_data/flattened_ud_buf/pgm_base, pipeline-cache tables). Indirect args are read
+    // here, in stream order, so they need no front drain.
+    // SPLIT-TODO(run-ahead): FaultMonitor's single-writer counters must keep one writer each
+    // (checked: draw/dispatch counts are back-only, WaitRegMem/CpWait/CpActive front-only; the
+    // other Count* sites are unchecked).
     RENDERER_TRACE;
     // Same prologue as the inline Draw/DrawIndirect, minus what the front already did.
     const auto begin = [&] {
@@ -3357,6 +3363,9 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, VideoCore::InvalidateOri
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
+    // CP split run-ahead: a fault on the front must not download or invalidate ahead of the
+    // draws it has posted. No lock is held here. No-op on every other thread.
+    liverpool->DrainForFrontFault();
     buffer_cache.InvalidateMemory(addr, size, origin);
     texture_cache.InvalidateMemory(addr, size);
     return true;
@@ -3367,6 +3376,10 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
+    // CP split run-ahead: see InvalidateMemory. SPLIT-TODO: a drain here waits for posted draws
+    // the way today's guest faults wait for the CP's current packet (SendCommand<true>), so it
+    // should add no new lock cycle - inferred, not checked at run time.
+    liverpool->DrainForFrontFault();
     buffer_cache.ReadMemory(addr, size);
     return true;
 }

@@ -1,11 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <string>
 #include <thread>
 #include <immintrin.h>
+#include <fmt/format.h>
 
 #include "common/logging/log.h"
 #include "video_core/amdgpu/cp_split.h"
@@ -19,6 +22,11 @@ u64 NowNs() {
     return static_cast<u64>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch())
             .count());
+}
+
+/// Cheap timestamp for the wait counters (converted to ms at log time against steady_clock).
+u64 Ticks() {
+    return __rdtsc();
 }
 
 /// How long either side spins before parking. At depth 0 a hand-over happens every ~1-2 us
@@ -35,16 +43,42 @@ u64 SpinNs() {
 constexpr u32 AlignUp(u32 value, u32 align) {
     return (value + align - 1) & ~(align - 1);
 }
+
+/// posted_seqs slots: a power of two > MaxDepth, so the record MaxDepth + 1 posts back is kept.
+constexpr u64 PostSlots = 2048;
+static_assert(PostSlots > MaxDepth && (PostSlots & (PostSlots - 1)) == 0);
+
+constexpr std::array<const char*, static_cast<size_t>(DrainReason::Count)> DrainNames{
+    "depth0",   "verify_full", "dispatch", "pkt_dma",  "pkt_dma_guard", "pkt_fence",
+    "pkt_wdata", "pkt_other",  "call",     "idle_tail", "wait_reg_mem", "cond_exec",
+    "mem_sem",  "task_done",   "ib_start", "front_fault", "front_exit",
+};
 } // namespace
 
 int Mode() {
     static const int mode = [] {
         const char* value = std::getenv("SHADPS4_CP_SPLIT");
         const int v = value ? std::atoi(value) : 0;
-        // SPLIT-TODO(depth>0): n >= 2 = run-ahead depth n-1. Until then every n >= 1 is depth 0.
-        return v > 0 ? 1 : 0;
+        return v <= 0 ? 0 : v == 1 ? 1 : 2;
     }();
     return mode;
+}
+
+u32 Depth() {
+    static const u32 depth = [] {
+        const char* value = std::getenv("SHADPS4_CP_SPLIT_DEPTH");
+        const unsigned long long v = value ? std::strtoull(value, nullptr, 10) : 64ull;
+        return static_cast<u32>(std::clamp<unsigned long long>(v, 1ull, MaxDepth));
+    }();
+    return depth;
+}
+
+bool PostDma() {
+    static const bool post = [] {
+        const char* value = std::getenv("SHADPS4_CP_SPLIT_POST_DMA");
+        return value && value[0] == '1';
+    }();
+    return post;
 }
 
 bool Verify() {
@@ -53,6 +87,15 @@ bool Verify() {
         return value && value[0] == '1';
     }();
     return verify;
+}
+
+u32 VerifyEvery() {
+    static const u32 every = [] {
+        const char* value = std::getenv("SHADPS4_CP_SPLIT_VERIFY_EVERY");
+        const unsigned long long v = value ? std::strtoull(value, nullptr, 10) : 256ull;
+        return static_cast<u32>(std::clamp<unsigned long long>(v, 1ull, 1ull << 20));
+    }();
+    return every;
 }
 
 Channel::Channel(u32 ring_bytes) {
@@ -64,12 +107,16 @@ Channel::Channel(u32 ring_bytes) {
     storage_owner = std::make_unique<u8[]>(std::size_t{ring_bytes} + 64);
     const auto base = reinterpret_cast<std::uintptr_t>(storage_owner.get());
     storage = reinterpret_cast<u8*>((base + 63) & ~std::uintptr_t{63});
+    depth = RunAhead() ? Depth() : 1;
+    posted_seqs = std::make_unique<u64[]>(PostSlots);
     log_window_start_ns = NowNs();
+    log_window_start_ticks = Ticks();
 }
 
 Channel::~Channel() = default;
 
 void* Channel::Reserve(RecordType type, u32 payload_bytes, u16 flags) {
+    ASSERT_MSG(!record_open, "CP split: Reserve before the previous record was committed");
     const u32 bytes = AlignUp(u32(sizeof(RecordHeader)) + payload_bytes, RecordAlign);
     ASSERT_MSG(bytes <= capacity / 2, "CP split record of {} bytes does not fit the ring", bytes);
     u64 pos = reserve_pos;
@@ -87,23 +134,61 @@ void* Channel::Reserve(RecordType type, u32 payload_bytes, u16 flags) {
     auto* header = reinterpret_cast<RecordHeader*>(storage + (pos & mask));
     *header = RecordHeader{type, flags, bytes, ++emitted};
     reserve_pos = pos + bytes;
+    record_open = true;
     ++counters.records;
     counters.bytes += bytes;
     return header + 1;
 }
 
-void Channel::Commit(bool sync) {
-    if (!sync) {
-        return;
-    }
-    ++counters.syncs;
-    Publish();
-    WaitDone(emitted);
+void Channel::Commit() {
+    committed_pos = reserve_pos;
+    committed_seq = emitted;
+    record_open = false;
 }
 
-void Channel::Drain() {
+void Channel::Sync(DrainReason reason) {
+    const auto r = static_cast<u32>(reason);
+    ++counters.drains[r];
     Publish();
-    WaitDone(emitted);
+    const u64 ticks = WaitDone(committed_seq);
+    if (ticks != 0) {
+        ++counters.drain_waits[r];
+        counters.drain_ticks[r] += ticks;
+    }
+}
+
+void Channel::PostRunAhead(bool is_draw) {
+    ASSERT(!record_open);
+    if (is_draw) {
+        ++counters.posted_draws;
+    } else {
+        ++counters.posted_packets;
+        last_posted_packet_seq = committed_seq;
+    }
+    posted_seqs[posts & (PostSlots - 1)] = committed_seq;
+    ++posts;
+    Publish();
+    u64 done = done_seq.load(std::memory_order_acquire);
+    while (oldest_post < posts && posted_seqs[oldest_post & (PostSlots - 1)] <= done) {
+        ++oldest_post;
+    }
+    if (posts - oldest_post > depth) {
+        // Wait until at most `depth` posted records are outstanding: the one `depth + 1` posts
+        // back (the newest that must be done) is kept because PostSlots > MaxDepth.
+        const u64 target = posted_seqs[(posts - depth - 1) & (PostSlots - 1)];
+        ++counters.depth_waits;
+        counters.depth_wait_ticks += WaitDone(target);
+        oldest_post = posts - depth;
+        done = done_seq.load(std::memory_order_acquire);
+    }
+    counters.max_lead = std::max(counters.max_lead, posts - oldest_post);
+    counters.max_lead_seq = std::max(counters.max_lead_seq, committed_seq - done);
+}
+
+void Channel::SyncIfPostedPackets(DrainReason reason) {
+    if (last_posted_packet_seq > done_seq.load(std::memory_order_acquire)) {
+        Sync(reason);
+    }
 }
 
 void Channel::EmitRegWrite(u32 word_offset, const u32* data, u32 count) {
@@ -113,41 +198,41 @@ void Channel::EmitRegWrite(u32 word_offset, const u32* data, u32 count) {
     payload->word_offset = word_offset;
     payload->count = count;
     std::memcpy(payload + 1, data, std::size_t{count} * 4);
-    Commit(false);
+    Commit();
 }
 
 void Channel::EmitClearState() {
     Reserve(RecordType::ClearState, 0);
-    Commit(false);
+    Commit();
 }
 
 void Channel::EmitExtent(u32 slot, u32 raw) {
     auto* payload = Reserve<ExtentPayload>(RecordType::Extent);
     payload->slot = slot;
     payload->raw = raw;
-    Commit(false);
+    Commit();
 }
 
 void Channel::EmitEpochBump(u32 opcode) {
     auto* payload = Reserve<EpochPayload>(RecordType::EpochBump);
     payload->opcode = opcode;
     payload->pad = 0;
-    Commit(false);
+    Commit();
 }
 
 void Channel::FrontExited() {
-    Drain();
+    Sync(DrainReason::FrontExit);
     front_exited.store(true, std::memory_order_release);
     WakeBack();
 }
 
 void Channel::Publish() {
-    if (write_pos.load(std::memory_order_relaxed) == reserve_pos) {
+    if (write_pos.load(std::memory_order_relaxed) == committed_pos) {
         return;
     }
     // seq_cst store, then seq_cst load of back_parked: with the back's store of back_parked and
     // load of write_pos in WaitForWork, one of the two always sees the other (no lost wake-up).
-    write_pos.store(reserve_pos, std::memory_order_seq_cst);
+    write_pos.store(committed_pos, std::memory_order_seq_cst);
     WakeBackIfParked();
 }
 
@@ -168,14 +253,15 @@ void Channel::WaitForSpace(u64 end) {
     }
 }
 
-void Channel::WaitDone(u64 seq) {
+u64 Channel::WaitDone(u64 seq) {
     if (done_seq.load(std::memory_order_acquire) >= seq) {
-        return;
+        return 0;
     }
+    const u64 t0 = Ticks();
     const u64 deadline = NowNs() + SpinNs();
     for (u32 spins = 1;; ++spins) {
         if (done_seq.load(std::memory_order_acquire) >= seq) {
-            return;
+            return Ticks() - t0;
         }
         if ((spins & 63) == 0 && NowNs() > deadline) {
             break;
@@ -192,6 +278,7 @@ void Channel::WaitDone(u64 seq) {
         done_seq.wait(current, std::memory_order_acquire);
     }
     front_parked.store(false, std::memory_order_relaxed);
+    return Ticks() - t0;
 }
 
 const RecordHeader* Channel::Next() {
@@ -231,9 +318,14 @@ void Channel::WaitForWork(const std::atomic<u32>& num_commands, const std::stop_
     const auto done = [&] {
         return BackHasWork(num_commands) || stoken.stop_requested() || FrontHasExited();
     };
+    if (done()) {
+        return;
+    }
+    const u64 t0 = Ticks();
     const u64 deadline = NowNs() + SpinNs();
     for (u32 spins = 1;; ++spins) {
         if (done()) {
+            back_idle_ticks.fetch_add(Ticks() - t0, std::memory_order_relaxed);
             return;
         }
         if ((spins & 63) == 0 && NowNs() > deadline) {
@@ -247,6 +339,7 @@ void Channel::WaitForWork(const std::atomic<u32>& num_commands, const std::stop_
         doorbell.wait(ticket, std::memory_order_acquire);
     }
     back_parked.store(false, std::memory_order_relaxed);
+    back_idle_ticks.fetch_add(Ticks() - t0, std::memory_order_relaxed);
 }
 
 void Channel::WakeBackIfParked() {
@@ -261,21 +354,43 @@ void Channel::WakeBack() {
 }
 
 void Channel::MaybeLog() {
-    // SPLIT-TODO: per-record-type counts, RegWrite dwords/draw, flat_dw histogram, drains by
-    // cause (inventory section 4.5, "counters every window").
-    if ((counters.records & 0xffff) != 0) {
+    if ((++log_calls & 1023) != 0) {
         return;
     }
     const u64 now = NowNs();
     if (now - log_window_start_ns < 10'000'000'000ull) {
         return;
     }
-    LOG_INFO(Render, "CpSplit: window_s={:.1f} records={} syncs={} bytes={} full_waits={} "
-             "front_parks={}",
-             double(now - log_window_start_ns) / 1e9, counters.records, counters.syncs,
-             counters.bytes, counters.full_waits, counters.front_parks);
+    const u64 ticks_now = Ticks();
+    const double ns_per_tick = double(now - log_window_start_ns) /
+                               double(std::max<u64>(1, ticks_now - log_window_start_ticks));
+    const auto ms = [ns_per_tick](u64 ticks) { return double(ticks) * ns_per_tick / 1e6; };
+    const auto& c = counters;
+    u64 drains = 0, drain_waits = 0, drain_ticks = 0;
+    std::string per_reason;
+    for (u32 r = 0; r < NumDrainReasons; ++r) {
+        drains += c.drains[r];
+        drain_waits += c.drain_waits[r];
+        drain_ticks += c.drain_ticks[r];
+        if (c.drains[r] != 0) {
+            per_reason += fmt::format(" {}={}/{}/{:.1f}", DrainNames[r], c.drains[r],
+                                      c.drain_waits[r], ms(c.drain_ticks[r]));
+        }
+    }
+    const u64 idle = back_idle_ticks.exchange(0, std::memory_order_relaxed);
+    LOG_INFO(Render,
+             "CpSplit: window_s={:.1f} mode={} depth={} records={} bytes={} posted_draws={} "
+             "posted_pkts={} drains={} drain_waits={} front_wait_ms={:.1f} drain_ms={:.1f} "
+             "depth_wait_ms={:.1f} depth_waits={} max_lead={} max_lead_records={} "
+             "back_idle_ms={:.1f} full_waits={} front_parks={}",
+             double(now - log_window_start_ns) / 1e9, Mode(), depth, c.records, c.bytes,
+             c.posted_draws, c.posted_packets, drains, drain_waits,
+             ms(drain_ticks + c.depth_wait_ticks), ms(drain_ticks), ms(c.depth_wait_ticks),
+             c.depth_waits, c.max_lead, c.max_lead_seq, ms(idle), c.full_waits, c.front_parks);
+    LOG_INFO(Render, "CpSplit drains (n/waited/ms):{}", per_reason);
     counters = {};
     log_window_start_ns = now;
+    log_window_start_ticks = ticks_now;
 }
 
 } // namespace AmdGpu::CpSplit
