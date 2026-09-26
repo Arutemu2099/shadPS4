@@ -55,7 +55,8 @@ constexpr std::array<const char*, static_cast<size_t>(DrainReason::Count)> Drain
     "verify_disp", "asc_dma_guard", "asc_wdata_guard", "asc_ib_start",
     "call_asc_disp", "call_asc_disp_ind", "call_asc_disp_patch", "call_asc_dma",
     "call_asc_wdata", "call_asc_release", "call_asc_sem", "call_ce_dump",
-    "ib_end", "disp_after_pkt",
+    "ib_end", "disp_after_pkt", "task_guard", "task_guard_ib", "task_guard_resume",
+    "task_guard_ovf",
 };
 static_assert(DrainNames.back() != nullptr, "DrainNames must name every DrainReason");
 } // namespace
@@ -100,6 +101,15 @@ bool PostTaskDone() {
         return value && value[0] == '1';
     }();
     return post;
+}
+
+u32 TaskGuard() {
+    static const u32 level = [] {
+        const char* value = std::getenv("SHADPS4_CP_SPLIT_TASK_GUARD");
+        const unsigned long long v = value ? std::strtoull(value, nullptr, 10) : 0ull;
+        return static_cast<u32>(std::min<unsigned long long>(v, 3ull));
+    }();
+    return level;
 }
 
 u32 PostAscMask() {
@@ -163,6 +173,7 @@ Channel::Channel(u32 ring_bytes) {
     done_batch = DoneBatch();
     reg_batch = RegBatch();
     posted_seqs = std::make_unique<u64[]>(PostSlots);
+    posted_writes = std::make_unique<PostedWrite[]>(PostedWriteSlots);
     log_window_start_ns = NowNs();
     log_window_start_ticks = Ticks();
 }
@@ -241,6 +252,59 @@ void Channel::SyncIfPostedPackets(DrainReason reason) {
     if (last_posted_packet_seq > done_seq.load(std::memory_order_acquire)) {
         Sync(reason);
     }
+}
+
+void Channel::PrunePostedWrites(u64 done) {
+    while (pw_head != pw_tail && posted_writes[pw_head & (PostedWriteSlots - 1)].seq <= done) {
+        ++pw_head;
+    }
+}
+
+void Channel::NotePostedWrite(VAddr dst, u64 bytes) {
+    ASSERT(!record_open);
+    if (bytes == 0) {
+        return;
+    }
+    PrunePostedWrites(done_seq.load(std::memory_order_acquire));
+    if (pw_tail - pw_head == PostedWriteSlots) {
+        // Full of outstanding writes: forget the oldest, and let every check drain while it may
+        // still be outstanding (GuardSpan). Seqs grow along the log, so the newest dropped seq
+        // bounds all dropped ones.
+        pw_overflow_seq = posted_writes[pw_head & (PostedWriteSlots - 1)].seq;
+        ++pw_head;
+        ++counters.write_log_overflows;
+    }
+    posted_writes[pw_tail & (PostedWriteSlots - 1)] =
+        PostedWrite{committed_seq, dst, dst + bytes};
+    ++pw_tail;
+    counters.write_log_max = std::max(counters.write_log_max, pw_tail - pw_head);
+}
+
+bool Channel::BeginGuardCheck(DrainReason reason) {
+    ++counters.guard_checks[static_cast<u32>(reason)];
+    const u64 done = done_seq.load(std::memory_order_acquire);
+    PrunePostedWrites(done);
+    return pw_head != pw_tail || pw_overflow_seq > done;
+}
+
+bool Channel::GuardSpan(VAddr lo, VAddr hi, DrainReason reason) {
+    if (lo >= hi) {
+        return false;
+    }
+    // done_seq only grows, so everything BeginGuardCheck kept may still be outstanding; a write
+    // that finished since is compared needlessly, which can only cost a drain.
+    if (pw_overflow_seq > done_seq.load(std::memory_order_acquire)) {
+        Sync(DrainReason::TaskGuardOverflow);
+        return true;
+    }
+    for (u64 i = pw_head; i != pw_tail; ++i) {
+        const PostedWrite& write = posted_writes[i & (PostedWriteSlots - 1)];
+        if (write.lo < hi && lo < write.hi) {
+            Sync(reason);
+            return true;
+        }
+    }
+    return false;
 }
 
 void Channel::EmitRegWrite(u32 word_offset, const u32* data, u32 count) {
@@ -502,7 +566,18 @@ void Channel::MaybeLog() {
              c.reg_appends, c.posted[static_cast<u32>(PostKind::GfxDispatch)],
              c.posted[static_cast<u32>(PostKind::AscDispatch)],
              c.posted[static_cast<u32>(PostKind::AscPacket)]);
-    LOG_INFO(Render, "CpSplit drains (n/waited/ms):{}", per_reason);
+    std::string guard_checks;
+    for (u32 r = 0; r < NumDrainReasons; ++r) {
+        if (c.guard_checks[r] != 0) {
+            guard_checks += fmt::format(" {}={}", DrainNames[r], c.guard_checks[r]);
+        }
+    }
+    if (!guard_checks.empty()) {
+        // TASK_GUARD: checks per reason; the hits are the drains of the same name above.
+        guard_checks = fmt::format(" | guard_checks:{} write_log_max={} write_log_overflows={}",
+                                   guard_checks, c.write_log_max, c.write_log_overflows);
+    }
+    LOG_INFO(Render, "CpSplit drains (n/waited/ms):{}{}", per_reason, guard_checks);
     counters = {};
     log_window_start_ns = now;
     log_window_start_ticks = ticks_now;

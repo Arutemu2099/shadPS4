@@ -259,7 +259,7 @@ private:
     Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb);
     /// Set by the IndirectBuffer packet just before it first resumes the nested task.
     bool starting_indirect_gfx{false};
-    Task ProcessCeUpdate(std::span<const u32> ccb);
+    Task ProcessCeUpdate(std::span<const u32> ccb, bool is_indirect = false);
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
 
@@ -270,6 +270,27 @@ private:
     void ProcessLoop(std::stop_token stoken);
 
     // ---- CP front/back split (cp_split.h). All no-ops or unused when split_enabled is false.
+    /// TASK_GUARD: registers a Process* coroutine's own command-buffer span (which it shrinks as
+    /// it parses, so the registry always sees the unparsed rest) for the life of the coroutine
+    /// body, and checks the whole span against outstanding posted writes at entry. Front only;
+    /// does nothing unless split_task_guard.
+    class SplitSpanScope {
+    public:
+        SplitSpanScope(Liverpool& liverpool, const std::span<const u32>* span,
+                       CpSplit::DrainReason entry_reason);
+        ~SplitSpanScope();
+        SplitSpanScope(const SplitSpanScope&) = delete;
+        SplitSpanScope& operator=(const SplitSpanScope&) = delete;
+
+    private:
+        Liverpool* lp{};
+        s32 slot{-1};
+    };
+    /// TASK_GUARD: drains if an outstanding posted write overlaps `span`.
+    void SplitGuardSpan(std::span<const u32> span, CpSplit::DrainReason reason);
+    /// TASK_GUARD: drains if an outstanding posted write overlaps the unparsed rest of any active
+    /// command buffer (every registered span), before ProcessLoop resumes a task.
+    void SplitGuardActive();
     void FrontProcess(std::stop_token stoken);
     void BackLoop(std::stop_token stoken);
     void ExecuteRecord(const CpSplit::RecordHeader& record);
@@ -383,6 +404,14 @@ private:
     bool split_post_dma{false};  ///< Run-ahead + SHADPS4_CP_SPLIT_POST_DMA=1.
     u32 split_post_asc{0};       ///< Run-ahead + POST_ASC: CpSplit::PostAscBits, else 0.
     bool split_post_task_done{false}; ///< Run-ahead + SHADPS4_CP_SPLIT_POST_TASK_DONE=1.
+    u32 split_task_guard{0}; ///< POST_TASK_DONE + SHADPS4_CP_SPLIT_TASK_GUARD (1-3), else 0.
+    /// TASK_GUARD (front): spans of the active Process* levels of every queue (SplitSpanScope);
+    /// null = free. A level that finds no free slot counts in split_span_untracked, and resume
+    /// checks drain conservatively while it is non-zero.
+    static constexpr u32 SplitSpanSlots = 64;
+    std::array<const std::span<const u32>*, SplitSpanSlots> split_spans{};
+    u32 split_span_hwm{0}; ///< Slots [split_span_hwm, SplitSpanSlots) are free.
+    u32 split_span_untracked{0};
     u32 split_verify_every{1};   ///< Run-ahead VERIFY: one synchronous draw in this many.
     u64 split_verify_draws{0};   ///< Front: draws emitted with VERIFY on.
     u64 split_verify_dispatches{0}; ///< Front: posting-eligible dispatches with VERIFY on.

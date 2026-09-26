@@ -578,6 +578,10 @@ Liverpool::Liverpool() {
             split_post_asc &= ~u32{CpSplit::PostAscWriteData};
         }
         split_post_task_done = split_run_ahead && CpSplit::PostTaskDone();
+        split_task_guard = split_post_task_done ? CpSplit::TaskGuard() : 0u;
+        if (CpSplit::TaskGuard() != 0 && !split_post_task_done) {
+            LOG_WARNING(Render, "CpSplit: TASK_GUARD ignored without run-ahead POST_TASK_DONE");
+        }
         split_verify_every = split_run_ahead ? CpSplit::VerifyEvery() : 1u;
         split = std::make_unique<CpSplit::Channel>();
         mirror = std::make_unique<CpSplit::BackMirror>();
@@ -590,10 +594,16 @@ Liverpool::Liverpool() {
         back_db_extent = &mirror->db_extent;
         back_ctx_epoch = &mirror->ctx_epoch;
         if (split_run_ahead) {
-            LOG_INFO(Render, "CpSplit: on (run-ahead, depth {}{}{}){}", CpSplit::Depth(),
+            LOG_INFO(Render, "CpSplit: on (run-ahead, depth {}{}{}{}){}", CpSplit::Depth(),
                      split_post_dma ? ", POST_DMA" : "",
                      split_post_asc ? fmt::format(", POST_ASC mask {:#x}", split_post_asc)
                                     : std::string{},
+                     split_post_task_done
+                         ? fmt::format(", POST_TASK_DONE{}",
+                                       split_task_guard
+                                           ? fmt::format(" TASK_GUARD {}", split_task_guard)
+                                           : std::string{})
+                         : std::string{},
                      split_verify ? fmt::format(", VERIFY every {}", split_verify_every)
                                   : std::string{});
         } else {
@@ -1001,6 +1011,8 @@ void Liverpool::RunGfxDma(const PM4Header* header, bool guest_markers_enabled,
     //  - WAIT_REG_MEM / COND_EXEC / semaphores / faults: those drain anyway.
     // SPLIT-TODO: only the innermost DCB level is guarded; a parent level's remainder is not.
     const auto* dma = reinterpret_cast<const PM4DmaData*>(header);
+    VAddr write_dst = 0;
+    u64 write_bytes = 0; ///< 0: a GDS destination, which no command buffer can be in.
     if (dma->dst_sel == DmaDataDst::Memory || dma->dst_sel == DmaDataDst::MemoryUsingL2) {
         const VAddr dst = dma->DstAddress<VAddr>();
         const VAddr dst_end = dst + dma->NumBytes();
@@ -1010,12 +1022,17 @@ void Liverpool::RunGfxDma(const PM4Header* header, bool guest_markers_enabled,
             RunGfxPacket(header, guest_markers_enabled, CpSplit::DrainReason::PacketDmaGuard);
             return;
         }
+        write_dst = dst;
+        write_bytes = dst_end - dst;
     }
     const u32 dwords = header->type3.NumWords() + 1;
     void* copy = split->Reserve(CpSplit::RecordType::Packet, dwords * sizeof(u32),
                                 guest_markers_enabled ? CpSplit::GuestMarkers : 0);
     std::memcpy(copy, header, dwords * sizeof(u32));
     split->Commit();
+    if (split_task_guard) [[unlikely]] {
+        split->NotePostedWrite(write_dst, write_bytes);
+    }
     split->PostRunAhead(CpSplit::PostKind::GfxPacket);
 }
 
@@ -1041,8 +1058,72 @@ void Liverpool::RunAscPacket(const PM4Header* header, std::span<const u32> rest,
         split->Sync(guard_reason);
         return;
     }
+    if (split_task_guard) [[unlikely]] {
+        split->NotePostedWrite(dst, bytes); // bytes == 0 (GDS destination): nothing to note.
+    }
     split->PostRunAhead(CpSplit::PostKind::AscPacket);
     split->MaybeLog();
+}
+
+Liverpool::SplitSpanScope::SplitSpanScope(Liverpool& liverpool, const std::span<const u32>* span,
+                                          CpSplit::DrainReason entry_reason) {
+    if (liverpool.split_task_guard == 0) [[likely]] {
+        return;
+    }
+    lp = &liverpool;
+    for (u32 i = 0; i < SplitSpanSlots; ++i) {
+        if (!lp->split_spans[i]) {
+            lp->split_spans[i] = span;
+            slot = static_cast<s32>(i);
+            lp->split_span_hwm = std::max(lp->split_span_hwm, i + 1);
+            break;
+        }
+    }
+    if (slot < 0) {
+        ++lp->split_span_untracked;
+    }
+    // Nothing of this buffer has been parsed yet.
+    lp->SplitGuardSpan(*span, entry_reason);
+}
+
+Liverpool::SplitSpanScope::~SplitSpanScope() {
+    if (!lp) {
+        return;
+    }
+    if (slot < 0) {
+        --lp->split_span_untracked;
+        return;
+    }
+    lp->split_spans[slot] = nullptr;
+    while (lp->split_span_hwm > 0 && !lp->split_spans[lp->split_span_hwm - 1]) {
+        --lp->split_span_hwm;
+    }
+}
+
+void Liverpool::SplitGuardSpan(std::span<const u32> span, CpSplit::DrainReason reason) {
+    if (split->BeginGuardCheck(reason)) {
+        const auto lo = reinterpret_cast<VAddr>(span.data());
+        split->GuardSpan(lo, lo + span.size_bytes(), reason);
+    }
+}
+
+void Liverpool::SplitGuardActive() {
+    if (!split->BeginGuardCheck(CpSplit::DrainReason::TaskGuardResume)) {
+        return;
+    }
+    if (split_span_untracked != 0) {
+        split->Sync(CpSplit::DrainReason::TaskGuardOverflow);
+        return;
+    }
+    for (u32 i = 0; i < split_span_hwm; ++i) {
+        if (const auto* span = split_spans[i]) {
+            const auto lo = reinterpret_cast<VAddr>(span->data());
+            if (split->GuardSpan(lo, lo + span->size_bytes(),
+                                 CpSplit::DrainReason::TaskGuardResume)) {
+                return;
+            }
+        }
+    }
 }
 
 void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_marker,
@@ -1411,6 +1492,12 @@ void Liverpool::ProcessLoop(std::stop_token stoken) {
                 }
                 task = queue.submits.front();
             }
+            if (split_task_guard) [[unlikely]] {
+                // TASK_GUARD: a finished task no longer drains, so a DMA / WRITE_DATA it posted
+                // may still be outstanding when the front resumes a task that is part-way through
+                // its buffers. A task not started yet checks its own buffer at entry instead.
+                SplitGuardActive();
+            }
             task.resume();
 
             if (task.done()) {
@@ -1419,9 +1506,14 @@ void Liverpool::ProcessLoop(std::stop_token stoken) {
                 // it pending and post a Retire record; WaitGpuIdle/IsGpuIdle also wait for
                 // pending_retire, which the back decrements when it reaches the record.
                 if (split_post_task_done) {
-                    // The old drain also made this task's posted DMA / WRITE_DATA land before the
-                    // next top-level buffer is parsed (the nested-IB guards cover only IBs).
-                    split->SyncIfPostedPackets(CpSplit::DrainReason::TaskDone);
+                    if (!split_task_guard) {
+                        // The old drain also made this task's posted DMA / WRITE_DATA land before
+                        // the next top-level buffer is parsed (the nested-IB guards cover only
+                        // IBs). TASK_GUARD checks each buffer against the posted writes instead,
+                        // when the front starts it (SplitSpanScope) or resumes a task
+                        // (SplitGuardActive above).
+                        split->SyncIfPostedPackets(CpSplit::DrainReason::TaskDone);
+                    }
                     pending_retire.fetch_add(1, std::memory_order_seq_cst);
                     split->PostRetire();
                 } else {
@@ -1482,8 +1574,12 @@ void Liverpool::ProcessLoop(std::stop_token stoken) {
     }
 }
 
-Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
+Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb, bool is_indirect) {
     FIBER_ENTER(ccb_task_name);
+    // TASK_GUARD: covers the top-level CCB and CE IBs (which had no posted-write guard before).
+    SplitSpanScope split_span{*this, &ccb,
+                              is_indirect ? CpSplit::DrainReason::TaskGuardIb
+                                          : CpSplit::DrainReason::TaskGuard};
 
     while (!ccb.empty()) {
         ProcessCommands();
@@ -1535,8 +1631,8 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
         case PM4ItOpcode::IndirectBufferConst: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
-            auto task =
-                ProcessCeUpdate({indirect_buffer->Address<const u32>(), indirect_buffer->ib_size});
+            auto task = ProcessCeUpdate(
+                {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, true);
             RESUME_CE(task);
 
             while (!task.handle.done()) {
@@ -1560,9 +1656,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     FIBER_ENTER(dcb_task_name);
     // Everything the guest wrote before this submission is now due (submit_epoch.h). An indirect
     // buffer is part of its parent submission, so it does not reopen the window.
-    if (!std::exchange(starting_indirect_gfx, false)) {
+    const bool is_indirect_gfx = std::exchange(starting_indirect_gfx, false);
+    if (!is_indirect_gfx) {
         BumpEpoch(PM4ItOpcode::Nop);
     }
+    SplitSpanScope split_span{*this, &dcb,
+                              is_indirect_gfx ? CpSplit::DrainReason::TaskGuardIb
+                                              : CpSplit::DrainReason::TaskGuard};
 
     cblock.Reset();
 
@@ -2232,9 +2332,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::IndirectBuffer: {
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
-                if (split_post_dma || (split_post_asc & CpSplit::PostAscDma) ||
-                    (split_post_asc & CpSplit::PostAscWriteData)) [[unlikely]] {
-                    // A posted DMA may still be writing the IB about to be parsed.
+                if (split_task_guard < 2 &&
+                    (split_post_dma || (split_post_asc & CpSplit::PostAscDma) ||
+                     (split_post_asc & CpSplit::PostAscWriteData))) [[unlikely]] {
+                    // A posted DMA may still be writing the IB about to be parsed. TASK_GUARD >= 2:
+                    // the IB's own entry check (SplitSpanScope) does this for its span only.
                     split->SyncIfPostedPackets(CpSplit::DrainReason::IbStart);
                 }
                 auto task = ProcessGraphics(
@@ -2248,7 +2350,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 if (split_post_dma || (split_post_asc & CpSplit::PostAscWriteData)) [[unlikely]] {
                     // A posted DMA inside the IB may patch the rest of the parent level.
-                    split->SyncIfPostedPackets(CpSplit::DrainReason::IbEnd);
+                    // TASK_GUARD 3: only a write into that rest drains (`dcb` still starts at
+                    // this packet); higher levels check theirs at their own IB end.
+                    if (split_task_guard >= 3) {
+                        SplitGuardSpan(dcb, CpSplit::DrainReason::IbEnd);
+                    } else {
+                        split->SyncIfPostedPackets(CpSplit::DrainReason::IbEnd);
+                    }
                 }
                 if (IbTaskFree()) {
                     task.handle.destroy();
@@ -2329,6 +2437,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     if constexpr (!is_indirect) {
         BumpEpoch(PM4ItOpcode::Nop);
     }
+    SplitSpanScope split_span{*this, &acb,
+                              is_indirect ? CpSplit::DrainReason::TaskGuardIb
+                                          : CpSplit::DrainReason::TaskGuard};
     auto& queue = asc_queues[{vqid}];
     const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
 
@@ -2392,9 +2503,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::IndirectBuffer: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
-            if (split_post_dma || (split_post_asc & CpSplit::PostAscDma) ||
-                (split_post_asc & CpSplit::PostAscWriteData)) [[unlikely]] {
+            if (split_task_guard < 2 &&
+                (split_post_dma || (split_post_asc & CpSplit::PostAscDma) ||
+                 (split_post_asc & CpSplit::PostAscWriteData))) [[unlikely]] {
                 // A posted DMA / WRITE_DATA may still be writing the IB about to be parsed.
+                // TASK_GUARD >= 2: the IB's own entry check (SplitSpanScope) does this.
                 split->SyncIfPostedPackets(CpSplit::DrainReason::AscIbStart);
             }
             auto task = ProcessCompute<true>(
@@ -2408,7 +2521,12 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if ((split_post_asc & CpSplit::PostAscDma) ||
                 (split_post_asc & CpSplit::PostAscWriteData)) [[unlikely]] {
                 // A posted DMA / WRITE_DATA inside the IB may patch the rest of the parent level.
-                split->SyncIfPostedPackets(CpSplit::DrainReason::IbEnd);
+                // TASK_GUARD 3: only a write into that rest drains.
+                if (split_task_guard >= 3) {
+                    SplitGuardSpan(acb, CpSplit::DrainReason::IbEnd);
+                } else {
+                    split->SyncIfPostedPackets(CpSplit::DrainReason::IbEnd);
+                }
             }
             if (IbTaskFree()) {
                 task.handle.destroy();

@@ -87,6 +87,16 @@ u32 PostAscMask();
 /// SHADPS4_CP_SPLIT_POST_TASK_DONE=1 (run-ahead only): a finished submission posts a Retire record
 /// instead of draining; the guest-visible idle state waits for the back to retire it.
 bool PostTaskDone();
+/// SHADPS4_CP_SPLIT_TASK_GUARD (0-3, only with POST_TASK_DONE): replaces POST_TASK_DONE's
+/// task-end SyncIfPostedPackets with range checks. The front logs the destination of every posted
+/// DMA_DATA / WRITE_DATA (NotePostedWrite) and drains only when an outstanding one overlaps a
+/// command buffer it is about to parse or resume.
+///  1: task end no longer drains; every Process* level checks its buffer at entry; ProcessLoop
+///     checks the unparsed rest of every active buffer before resuming a task. Nested-IB guards
+///     unchanged (conservative).
+///  2: + the IB-start guards (gfx IbStart, AscIbStart) become the IB's own entry check.
+///  3: + the IB-end guards (IbEnd) check only the parent's unparsed rest.
+u32 TaskGuard();
 /// SHADPS4_CP_SPLIT_VERIFY=1. Depth 0: at every draw/dispatch record (the front is parked) the
 /// back compares its whole register mirror, CB/DB extents, context epoch and cs snapshot with the
 /// front's, and each copied stage (user data, flat buffer, pgm_base) with the Info the front's
@@ -171,6 +181,11 @@ enum class DrainReason : u8 {
     CallDumpConstRam,        ///< CE DUMP_CONST_RAM.
     IbEnd,            ///< After an INDIRECT_BUFFER task: posted packets may patch the parent level.
     DispatchAfterPkt, ///< POST_ASC: a posted dispatch's front lookup after posted DMA/WRITE_DATA.
+    // TASK_GUARD (a posted write overlaps a command buffer about to be parsed):
+    TaskGuard,         ///< At the entry of a top-level DCB / CCB / ACB.
+    TaskGuardIb,       ///< At the entry of a nested IB (gfx, CE, ASC).
+    TaskGuardResume,   ///< An active buffer's unparsed rest, before ProcessLoop resumes a task.
+    TaskGuardOverflow, ///< The write log (or span registry) overflowed: conservative drain.
     Count,
 };
 
@@ -281,6 +296,18 @@ public:
     /// Sync(reason) if a posted packet record (POST_DMA / POST_ASC) may not have executed yet.
     void SyncIfPostedPackets(DrainReason reason);
 
+    /// TASK_GUARD: the packet record committed last (about to be posted) writes [dst, dst+bytes).
+    /// Call it for every posted packet with a memory destination (GDS destinations cannot overlap
+    /// guest memory). Entries are dropped once done_seq passes them; if PostedWriteSlots are
+    /// outstanding the oldest is dropped and checks turn conservative until it is done.
+    void NotePostedWrite(VAddr dst, u64 bytes);
+    /// TASK_GUARD: counts a check under `reason`, forgets executed writes, and returns whether any
+    /// noted write may still be outstanding (false: nothing to compare, no drain needed).
+    bool BeginGuardCheck(DrainReason reason);
+    /// After BeginGuardCheck returned true: if an outstanding write overlaps [lo, hi), Sync(reason)
+    /// (Sync(TaskGuardOverflow) if the log overflowed) and return true.
+    bool GuardSpan(VAddr lo, VAddr hi, DrainReason reason);
+
     void EmitRegWrite(u32 word_offset, const u32* data, u32 count);
     void EmitClearState();
     void EmitExtent(u32 slot, u32 raw);
@@ -333,6 +360,9 @@ public:
         std::array<u64, NumDrainReasons> drains{};
         std::array<u64, NumDrainReasons> drain_waits{}; ///< Drains that found the back busy.
         std::array<u64, NumDrainReasons> drain_ticks{};
+        std::array<u64, NumDrainReasons> guard_checks{}; ///< TASK_GUARD checks, by hit reason.
+        u64 write_log_max{};       ///< Most outstanding noted writes (TASK_GUARD).
+        u64 write_log_overflows{}; ///< Noted writes dropped while outstanding.
     };
     /// Front only. Checks the clock every 1024 calls; logs and resets every ~10 s.
     void MaybeLog();
@@ -368,6 +398,22 @@ private:
     u64 posts{0};        ///< Records posted so far.
     u64 oldest_post{0};  ///< Index of the oldest post not known to be done.
     u64 last_posted_packet_seq{0};
+    // TASK_GUARD write log: destinations of posted packets, oldest first, pruned by done_seq.
+    struct PostedWrite {
+        u64 seq;
+        VAddr lo;
+        VAddr hi;
+    };
+    /// Outstanding noted writes are posted records, so at most Depth() + 1 (the one being noted):
+    /// with MaxDepth 1024 the log cannot overflow; the fallback stays as a guard.
+    static constexpr u64 PostedWriteSlots = 2048;
+    static_assert(PostedWriteSlots > MaxDepth + 1);
+    std::unique_ptr<PostedWrite[]> posted_writes;
+    u64 pw_head{0};
+    u64 pw_tail{0};
+    u64 pw_overflow_seq{0}; ///< Newest seq dropped from the full log (checks are conservative
+                            ///< while it is outstanding).
+    void PrunePostedWrites(u64 done);
     Counters counters{};
     u64 log_window_start_ns{0};
     u64 log_window_start_ticks{0};
