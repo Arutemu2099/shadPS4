@@ -29,7 +29,14 @@
 #include "common/error.h"
 #endif
 #else
+#include <array>
+#include <atomic>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <string>
 #include <windows.h>
+#include "common/path_util.h"
 #include "common/spin_lock.h"
 #endif
 
@@ -43,6 +50,155 @@ namespace VideoCore {
 
 constexpr size_t PM_PAGE_SIZE = 4_KB;
 constexpr size_t PM_PAGE_BITS = 12;
+
+#ifdef _WIN64
+// SHADPS4_READ_FAULT_RIP=1 (diagnostic, default off): one line per guest read fault with the
+// faulting instruction, the eboot return-address candidates found on the guest stack (a scan, so
+// stale slots appear too), the thread and the first 32 bytes around the address after the
+// download. Joined offline by fault address with the CP's "ReadProducerFault" lines
+// (SHADPS4_READ_PRODUCER_STATS=1). The decrypted eboot code segment is written once to
+// log/eboot_code_800000000.bin for offline disassembly.
+static bool ReadFaultRipEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADPS4_READ_FAULT_RIP");
+        return env != nullptr && env[0] == '1';
+    }();
+    return enabled;
+}
+
+/// The faulting 4 KiB page as guest memory held it before the download (backing view, no
+/// protection); has_pre false if the page lacks backing.
+struct ReadFaultPrePage {
+    std::array<u8, 4096> bytes;
+    bool has_pre;
+};
+static thread_local ReadFaultPrePage t_read_fault_pre{};
+
+static void SnapshotReadFaultPage(VAddr addr) {
+    t_read_fault_pre.has_pre = Core::Memory::Instance()->TryReadBacking(
+        addr & ~VAddr{4095}, t_read_fault_pre.bytes.data(), t_read_fault_pre.bytes.size());
+}
+
+static void LogReadFaultRip(void* context, VAddr addr) {
+    constexpr u64 CodeBegin = 0x800000000ULL; // eboot segment 0 (R_X), REFERENCE.md
+    constexpr u64 CodeEnd = 0x800cc8000ULL;
+    constexpr u64 MaxLines = 200000;
+    static std::atomic<u64> seq{0};
+    const u64 n = seq.fetch_add(1, std::memory_order_relaxed);
+    if (n >= MaxLines) {
+        return;
+    }
+    static std::once_flag dump_once;
+    std::call_once(dump_once, [] {
+        const auto path =
+            Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "eboot_code_800000000.bin";
+        std::FILE* file = _wfopen(path.c_str(), L"wb");
+        if (file != nullptr) {
+            std::fwrite(reinterpret_cast<const void*>(CodeBegin), 1, CodeEnd - CodeBegin, file);
+            std::fclose(file);
+        }
+        LOG_INFO(Render, "ReadFaultRip: eboot code dump {} ({})", path.string(),
+                 file != nullptr ? "ok" : "failed");
+    });
+    const CONTEXT* ctx = static_cast<EXCEPTION_POINTERS*>(context)->ContextRecord;
+    std::array<u64, 8> frames{};
+    size_t num_frames = 0;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(reinterpret_cast<LPCVOID>(ctx->Rsp), &mbi, sizeof(mbi)) != 0 &&
+        mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0) {
+        const u64 region_end = reinterpret_cast<u64>(mbi.BaseAddress) + mbi.RegionSize;
+        for (u64 slot = ctx->Rsp; slot + 8 <= region_end && slot < ctx->Rsp + 2048 * 8 &&
+                                  num_frames < frames.size();
+             slot += 8) {
+            const u64 value = *reinterpret_cast<const u64*>(slot);
+            if (value >= CodeBegin && value < CodeEnd) {
+                frames[num_frames++] = value;
+            }
+        }
+    }
+    // Frame-pointer chain: guest functions that keep rbp (e.g. eboot+0x3fed00) put their return
+    // address at [rbp+8]. Each step must stay inside the committed stack region found above.
+    std::string rbp_chain;
+    if (mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0) {
+        const u64 region_begin = reinterpret_cast<u64>(mbi.BaseAddress);
+        const u64 region_end = region_begin + mbi.RegionSize;
+        u64 frame = ctx->Rbp;
+        for (int depth = 0; depth < 6; ++depth) {
+            if (frame < ctx->Rsp || frame < region_begin || frame + 16 > region_end ||
+                (frame & 7) != 0) {
+                break;
+            }
+            const u64 ret = *reinterpret_cast<const u64*>(frame + 8);
+            rbp_chain += fmt::format(" {:#x}", ret);
+            const u64 next = *reinterpret_cast<const u64*>(frame);
+            if (next <= frame) {
+                break;
+            }
+            frame = next;
+        }
+    }
+    thread_local std::string thread_name = [] {
+        std::string name;
+        PWSTR desc = nullptr;
+        if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &desc)) && desc != nullptr) {
+            for (const wchar_t* c = desc; *c != 0; ++c) {
+                name.push_back(*c < 128 && *c > 32 ? static_cast<char>(*c) : '_');
+            }
+            LocalFree(desc);
+        }
+        return name.empty() ? std::string("?") : name;
+    }();
+    std::string stack;
+    for (size_t i = 0; i < num_frames; ++i) {
+        stack += fmt::format(" {:#x}", frames[i]);
+    }
+    std::string bytes = "unreadable";
+    const auto* data = reinterpret_cast<const u8*>(addr & ~VAddr{31});
+    MEMORY_BASIC_INFORMATION data_mbi{};
+    if (VirtualQuery(data, &data_mbi, sizeof(data_mbi)) != 0 && data_mbi.State == MEM_COMMIT &&
+        (data_mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ |
+                             PAGE_EXECUTE_READWRITE)) != 0 &&
+        (data_mbi.Protect & PAGE_GUARD) == 0) {
+        bytes.clear();
+        for (size_t i = 0; i < 32; ++i) {
+            bytes += fmt::format("{:02x}", data[i]);
+        }
+    }
+    // Bytes the download changed: in the page, and in the 96 bytes from the 32-byte block.
+    s64 page_diff = -1;
+    s64 near_diff = -1;
+    u32 dword_pre = 0;
+    u32 dword_post = 0;
+    if (t_read_fault_pre.has_pre) {
+        std::array<u8, 4096> post{};
+        if (Core::Memory::Instance()->TryReadBacking(addr & ~VAddr{4095}, post.data(),
+                                                     post.size())) {
+            page_diff = 0;
+            near_diff = 0;
+            const size_t near_begin = (addr & 4095) & ~size_t{31};
+            const size_t at = std::min<size_t>(addr & 4095, 4092);
+            std::memcpy(&dword_pre, t_read_fault_pre.bytes.data() + at, 4);
+            std::memcpy(&dword_post, post.data() + at, 4);
+            for (size_t i = 0; i < post.size(); ++i) {
+                const bool diff = post[i] != t_read_fault_pre.bytes[i];
+                page_diff += diff;
+                near_diff += diff && i >= near_begin && i < near_begin + 96;
+            }
+        }
+    }
+    const u64 exe_base = reinterpret_cast<u64>(GetModuleHandleW(nullptr));
+    LOG_INFO(Render,
+             "ReadFaultRip: n={} addr={:#x} rip={:#x} exe_off={:#x} thread={} tid={} rax={:#x} "
+             "rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x} r8={:#x} r9={:#x} "
+             "r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x} rsp={:#x} stack:{} rbpchain:{} "
+             "data32@{:#x}={} page_diff={} near96_diff={} dword_pre={:#x} dword_post={:#x}",
+             n, addr, ctx->Rip, ctx->Rip - exe_base, thread_name, GetCurrentThreadId(), ctx->Rax,
+             ctx->Rbx, ctx->Rcx, ctx->Rdx, ctx->Rsi, ctx->Rdi, ctx->Rbp, ctx->R8, ctx->R9, ctx->R10,
+             ctx->R11, ctx->R12, ctx->R13, ctx->R14, ctx->R15, ctx->Rsp, stack, rbp_chain,
+             addr & ~VAddr{31},
+             bytes, page_diff, near_diff, dword_pre, dword_post);
+}
+#endif
 
 /// See PageManager::SetDeferredProtectSink. Only write-protect (track, !is_read) requests go
 /// here; unprotects and read protection always reach the OS immediately.
@@ -235,9 +391,15 @@ struct PageManager::Impl {
         } else {
             // Read faults only exist under Precise readbacks - it is the only mode that
             // read-protects guest pages holding GPU-modified data.
+            if (ReadFaultRipEnabled()) [[unlikely]] {
+                SnapshotReadFaultPage(addr);
+            }
             const bool handled = rasterizer->ReadMemory(addr, 8);
             Common::FaultMonitor::CountGuestReadFault(handled, Common::FaultMonitor::SinceNs(start),
                                                       addr);
+            if (handled && ReadFaultRipEnabled()) [[unlikely]] {
+                LogReadFaultRip(context, addr);
+            }
             return handled;
         }
     }

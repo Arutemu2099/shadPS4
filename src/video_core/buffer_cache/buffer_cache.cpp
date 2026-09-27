@@ -1463,6 +1463,24 @@ void BufferCache::NoteDiagRead(VAddr addr) {
     const auto it = diag_window_writer.find(addr >> 16);
     const u64 producer = it == diag_window_writer.end() ? 0 : it->second;
     ++diag_read_hist[producer];
+    // SHADPS4_READ_FAULT_RIP=1: one line per call for the offline join with the guest-side
+    // "ReadFaultRip" lines (page_manager.cpp); a fault can reach here more than once.
+    static const bool per_fault = EnvIs1("SHADPS4_READ_FAULT_RIP");
+    if (per_fault && diag_reads < 400000) {
+        // Was the last writable binding over this window already complete on the GPU? If so the
+        // readback only waits for queue order, not for its data.
+        const auto tick_it = diag_window_tick.find(addr >> 16);
+        const u64 ptick = tick_it == diag_window_tick.end() ? 0 : tick_it->second;
+        const u64 current = scheduler.CurrentTick();
+        const bool done = ptick != 0 && scheduler.IsFree(ptick);
+        if (producer == 0xc73c37c1ULL) { // the 2026-09-27 question; writers of its windows only
+            ++diag_faulted_windows[addr >> 16];
+        }
+        LOG_INFO(Render,
+                 "ReadProducerFault: k={} addr={:#x} producer={:#x} ptick={} cur={} gpu={} done={}",
+                 diag_reads, addr, producer, ptick, current,
+                 scheduler.GetMasterSemaphore()->KnownGpuTick(), done ? 1 : 0);
+    }
     if ((++diag_reads & 0x3ff) != 0) {
         return;
     }
@@ -1483,6 +1501,30 @@ void BufferCache::NoteGpuWrite(VAddr addr, u64 size) {
         const u64 last = std::min((addr + size - 1) >> 16, first + 1023);
         for (u64 w = first; w <= last; ++w) {
             diag_window_writer[w] = diag_producer;
+        }
+        static const bool per_fault = EnvIs1("SHADPS4_READ_FAULT_RIP");
+        if (per_fault) {
+            const u64 tick = scheduler.CurrentTick();
+            bool covers_faulted = false;
+            for (u64 w = first; w <= last; ++w) {
+                diag_window_tick[w] = tick;
+                covers_faulted |= diag_faulted_windows.contains(w);
+            }
+            if (covers_faulted) {
+                const u64 seen = diag_fault_window_writers[{diag_producer, addr, size}]++;
+                if ((seen & (seen + 1)) == 0) { // seen = 0, 1, 3, 7, ...
+                    LOG_INFO(Render,
+                             "ReadFaultWindowWriter: producer={:#x} addr={:#x} size={:#x} "
+                             "seen={} tick={}",
+                             diag_producer, addr, size, seen, tick);
+                }
+            }
+            static std::unordered_map<u64, u64> writes_per_producer; // CP back thread only
+            const u64 count = writes_per_producer[diag_producer]++;
+            if (count < 64 || (count & 0xfff) == 0) {
+                LOG_INFO(Render, "ReadProducerWrite: producer={:#x} n={} addr={:#x} size={:#x}",
+                         diag_producer, count, addr, size);
+            }
         }
     }
     if ((!ProducerStatsEnabled() && !readback_queue && !EarlyFlushEnabled()) || size == 0 ||

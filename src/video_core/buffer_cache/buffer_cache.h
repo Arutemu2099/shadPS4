@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <map>
+#include <tuple>
+
 #include <array>
 #include <atomic>
 #include <memory>
@@ -450,6 +453,11 @@ private:
     u64 diag_producer{};
     std::unordered_map<u64, u64> diag_window_writer;
     std::unordered_map<u64, u64> diag_read_hist;
+    /// SHADPS4_READ_FAULT_RIP=1: tick of the last writable binding per 64 KiB window, the windows
+    /// read-faulted so far, and per (pgm, addr, size) how often a writable binding covered one.
+    std::unordered_map<u64, u64> diag_window_tick;
+    std::unordered_map<u64, u64> diag_faulted_windows;
+    std::map<std::tuple<u64, u64, u64>, u64> diag_fault_window_writers;
     u64 diag_reads{};
     struct WrittenMemoEntry {
         VAddr addr{};
