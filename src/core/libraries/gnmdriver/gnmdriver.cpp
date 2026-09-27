@@ -1,9 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <cstdlib>
 #include "gnm_error.h"
 #include "gnmdriver.h"
 
+#include "common/fence_watch.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
@@ -77,15 +80,39 @@ static u32 asc_next_offs_dw[Liverpool::NumComputeRings];
 static VAddr tessellation_factors_ring_addr = -1;
 static constexpr u32 tessellation_offchip_buffer_size = 0x800000u;
 
+/// SHADPS4_SUBMIT_LOCK_FIX=1: sceGnmSubmitDone checks the GPU and sets submission_lock under m_submission. Without
+/// it the GpuIdle reset can land between the check and the set; the lock then stays set with the GPU idle, no later
+/// reset comes, and every WaitGpuIdle (DingDong, submits) blocks forever (notes/freeze-2026-09-27.md).
+static bool SubmitLockFix() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADPS4_SUBMIT_LOCK_FIX");
+        return env != nullptr && env[0] == '1';
+    }();
+    return enabled;
+}
+static std::atomic<u64> submission_resets{0};
+
 static void ResetSubmissionLock(Platform::InterruptId irq) {
     std::unique_lock lock{m_submission};
     submission_lock = 0;
+    submission_resets.fetch_add(1, std::memory_order_relaxed);
+    if (Common::FenceWatch::Enabled()) {
+        Common::FenceWatch::Get().gnm_lock.store(0, std::memory_order_relaxed);
+        Common::FenceWatch::Get().gnm_resets.fetch_add(1, std::memory_order_relaxed);
+    }
     cv_lock.notify_all();
 }
 
 static void WaitGpuIdle() {
     HLE_TRACE;
     std::unique_lock lock{m_submission};
+    if (Common::FenceWatch::Enabled() && submission_lock != 0) [[unlikely]] {
+        auto& fw = Common::FenceWatch::Get();
+        fw.gnm_waiters.fetch_add(1, std::memory_order_relaxed);
+        cv_lock.wait(lock, [] { return submission_lock == 0; });
+        fw.gnm_waiters.fetch_sub(1, std::memory_order_relaxed);
+        return;
+    }
     cv_lock.wait(lock, [] { return submission_lock == 0; });
 }
 
@@ -2314,8 +2341,30 @@ int PS4_SYSV_ABI sceGnmSubmitDone() {
     HLE_TRACE;
     LOG_DEBUG(Lib_GnmDriver, "called");
     WaitGpuIdle();
-    if (!liverpool->IsGpuIdle()) {
-        submission_lock = true;
+    if (SubmitLockFix()) {
+        std::unique_lock lock{m_submission};
+        if (!liverpool->IsGpuIdle()) {
+            submission_lock = true;
+        }
+    } else {
+        const u64 resets_before = submission_resets.load(std::memory_order_acquire);
+        if (!liverpool->IsGpuIdle()) {
+            submission_lock = true;
+            if (submission_resets.load(std::memory_order_acquire) != resets_before) [[unlikely]] {
+                // The GpuIdle reset ran between the idle check and the set: the lock may now stay set.
+                LOG_WARNING(Lib_GnmDriver,
+                            "SubmitLockRace: GpuIdle reset landed between the idle check and the lock "
+                            "set (resets {} -> {}); lock now {}, gpu idle {} (1 and true = stuck)",
+                            resets_before, submission_resets.load(), submission_lock,
+                            liverpool->IsGpuIdle());
+                if (Common::FenceWatch::Enabled()) {
+                    Common::FenceWatch::Get().gnm_races.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+    }
+    if (Common::FenceWatch::Enabled()) {
+        Common::FenceWatch::Get().gnm_lock.store(submission_lock, std::memory_order_relaxed);
     }
     liverpool->SubmitDone();
     send_init_packet = true;

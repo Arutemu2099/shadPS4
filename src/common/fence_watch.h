@@ -47,6 +47,11 @@ struct State {
     std::array<Slot, NumSlots + NumPinned> slots;
     std::atomic<u64> last_release_ns{0};
     std::atomic<u64> covering_writes{0};
+    /// gnmdriver submission gate (sceGnmSubmitDone / ResetSubmissionLock / WaitGpuIdle), mirrored for the watchdog.
+    std::atomic<u32> gnm_lock{0};
+    std::atomic<u32> gnm_waiters{0};
+    std::atomic<u64> gnm_resets{0};
+    std::atomic<u64> gnm_races{0};
 };
 
 inline State& Get() {

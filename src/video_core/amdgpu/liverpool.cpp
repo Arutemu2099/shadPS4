@@ -97,9 +97,11 @@ void NoteRelease(VAddr addr, u64 value, u32 size) {
                 reported_for = last;
                 last_report_ns = now;
                 LOG_WARNING(Render, "FenceWatch: no frame-fence release for {:.1f} s (any compute release {:.1f} s ago); "
-                            "covering download writes {}",
+                            "covering download writes {}; gnm submission_lock {} waiters {} resets {} races {}",
                             double(now - last) / 1e9,
-                            double(now - w.last_release_ns.load()) / 1e9, w.covering_writes.load());
+                            double(now - w.last_release_ns.load()) / 1e9, w.covering_writes.load(),
+                            w.gnm_lock.load(), w.gnm_waiters.load(), w.gnm_resets.load(),
+                            w.gnm_races.load());
                 for (const Slot& s : w.slots) {
                     const VAddr a = s.addr.load(std::memory_order_acquire);
                     if (a == 0) {
