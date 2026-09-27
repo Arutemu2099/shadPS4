@@ -6,6 +6,7 @@
 #include <cstring>
 #include <optional>
 #include <thread>
+#include <immintrin.h>
 #include <unordered_map>
 #include "common/alignment.h"
 #include "common/buffer_sample_probe.h"
@@ -27,6 +28,17 @@
 #include <vk_mem_alloc.h>
 
 namespace VideoCore {
+
+namespace {
+// SHADPS4_DRAW_COST=1 (diagnostic): ObtainBufferForImage path and cycle split for calls over
+// ~100 us (SynchronizeBuffer: dirty-page walk vs rest); first 8 lines per address.
+const bool g_image_buffer_cost = [] {
+    const char* value = std::getenv("SHADPS4_DRAW_COST");
+    return value != nullptr && value[0] == '1';
+}();
+thread_local u64 g_sync_walk_cyc = 0;
+thread_local u64 g_sync_rest_cyc = 0;
+} // namespace
 
 namespace Offload = Common::ReadbackOffload;
 
@@ -2602,18 +2614,44 @@ Buffer* BufferCache::HostMirrorChunk(u64 index) {
 }
 
 std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 size) {
+    const u64 ibc_t0 = g_image_buffer_cost ? __rdtsc() : 0;
+    const auto note = [&](const char* path, const Buffer* buf) {
+        if (!g_image_buffer_cost) {
+            return;
+        }
+        const u64 cyc = __rdtsc() - ibc_t0;
+        if (cyc < 350000) {
+            return;
+        }
+        static thread_local std::unordered_map<VAddr, u32> logged;
+        if (logged[gpu_addr]++ < 8) {
+            LOG_INFO(Render_Vulkan,
+                     "ImageBufferCost: {:#x} size={} path={} total={} sync_walk={} sync_rest={} "
+                     "cyc buffer={:#x} buffer_size={}",
+                     gpu_addr, size, path, cyc, g_sync_walk_cyc, g_sync_rest_cyc,
+                     buf ? buf->CpuAddr() : 0, buf ? buf->SizeBytes() : 0);
+        }
+    };
+    g_sync_walk_cyc = 0;
+    g_sync_rest_cyc = 0;
     // Check if any buffer contains the full requested range.
     const BufferId buffer_id = page_table[gpu_addr >> CACHING_PAGEBITS].buffer_id;
     if (buffer_id) {
         if (Buffer& buffer = slot_buffers[buffer_id]; buffer.IsInBounds(gpu_addr, size)) {
             SynchronizeBuffer(buffer, gpu_addr, size, false, false, nullptr);
+            note("cached", &buffer);
             return {&buffer, buffer.Offset(gpu_addr)};
         }
     }
     // If some buffer within was GPU modified create a full buffer to avoid losing GPU data.
     if (IsRegionGpuModified(gpu_addr, size)) {
-        return ObtainBuffer(gpu_addr, size, false, false);
+        auto result = ObtainBuffer(gpu_addr, size, false, false);
+        note("gpu_modified", result.first);
+        return result;
     }
+    SCOPE_EXIT {
+        note("staging", nullptr);
+    };
     // In all other cases, just do a CPU copy to the staging buffer.
     const auto [data, offset] = staging_buffer.Map(size, 16);
     memory->CopySparseMemory(gpu_addr, data, size);
@@ -2874,6 +2912,12 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
         deferred_copies.clear();
         PageManager::SetDeferredProtectSink(&deferred_protects);
     }
+    const u64 ibc_t0 = g_image_buffer_cost ? __rdtsc() : 0;
+    SCOPE_EXIT {
+        if (g_image_buffer_cost) {
+            g_sync_rest_cyc = __rdtsc() - ibc_t0 - g_sync_walk_cyc;
+        }
+    };
     const auto upload_path = memory_tracker->ForEachUploadRange(
         device_addr, size, is_written,
         [&](u64 device_addr_out, u64 range_size) {
@@ -2884,6 +2928,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             src_buffer = defer ? ReserveDeferredCopies(buffer, copies, total_size_bytes)
                                : UploadCopies(buffer, copies, total_size_bytes);
         });
+    if (g_image_buffer_cost) {
+        g_sync_walk_cyc = __rdtsc() - ibc_t0;
+    }
     last_sync_upload_bytes = total_size_bytes;
     sync_upload_bytes_total += total_size_bytes;
     if (defer) {
