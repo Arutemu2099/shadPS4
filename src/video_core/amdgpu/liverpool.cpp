@@ -153,6 +153,10 @@ void NoteGuestWrite(VAddr addr, const void* data, u64 size, const char* who) {
 
 namespace AmdGpu {
 
+/// SHADPS4_DRAW_COST=1: cycles the CP back spent in WaitForWork (read and reset by NoteDrawCost).
+thread_local u64 g_back_idle_cyc = 0;
+
+
 namespace {
 bool ViewportMemoEnabled() {
     static const bool enabled = [] {
@@ -825,7 +829,18 @@ void Liverpool::BackLoop(std::stop_token stoken) {
             stop_forwarded = true;
             front_thread.request_stop();
         }
-        split->WaitForWork(num_commands, stoken);
+        {
+            // SHADPS4_DRAW_COST=1 (diagnostic): back idle time, reported by NoteDrawCost.
+            static const bool draw_cost = [] {
+                const char* value = std::getenv("SHADPS4_DRAW_COST");
+                return value != nullptr && value[0] == '1';
+            }();
+            const u64 idle_t0 = draw_cost ? __rdtsc() : 0;
+            split->WaitForWork(num_commands, stoken);
+            if (draw_cost) {
+                g_back_idle_cyc += __rdtsc() - idle_t0;
+            }
+        }
     }
     front_thread.join();
 }

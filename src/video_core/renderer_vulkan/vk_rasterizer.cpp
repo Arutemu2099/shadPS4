@@ -40,6 +40,10 @@
 #undef MemoryBarrier
 #endif
 
+namespace AmdGpu {
+extern thread_local u64 g_back_idle_cyc; // liverpool.cpp, SHADPS4_DRAW_COST
+}
+
 namespace Vulkan {
 
 namespace {
@@ -110,6 +114,8 @@ constexpr std::array<const char*, DcCount> kDrawCostNames{
     "prep", "buf", "tex", "bind_other", "begin", "vtx_idx", "emit", "tail"};
 thread_local u64 g_dc_bind_buf = 0;
 thread_local u64 g_dc_bind_tex = 0;
+thread_local u64 g_dc_disp_cyc = 0; // ExecuteDispatch on the back (direct + indirect)
+thread_local u64 g_dc_disp_n = 0;
 // Inside BindTextures (DRAW_COST only): [0] first pass (FindImage per binding), [1] FindTexture
 // (view lookup, refresh/upload), [2] Transit (layout changes, may end rendering), plus the single
 // slowest FindTexture+Transit image of the draw. DrawTail logs the split for draws whose texture
@@ -212,6 +218,15 @@ void NoteDrawCost(const GraphicsPipeline* pipeline, const std::array<u64, DcCoun
              "DrawCost: window {:.0f} ms, {} draws, draw time {:.1f}% of wall, {:.0f} ns/draw;{}",
              wall_ns / 1e6, draws, 100.0 * double(all_cyc) * ns_per_cyc / wall_ns,
              double(all_cyc) * ns_per_cyc / double(draws), phases(all_phase, draws));
+    LOG_INFO(Render_Vulkan,
+             "DrawCost: back idle (WaitForWork) {:.1f}% of wall; dispatches {} = {:.1f}% of wall, "
+             "{:.0f} ns each",
+             100.0 * double(AmdGpu::g_back_idle_cyc) * ns_per_cyc / wall_ns, g_dc_disp_n,
+             100.0 * double(g_dc_disp_cyc) * ns_per_cyc / wall_ns,
+             g_dc_disp_n ? double(g_dc_disp_cyc) * ns_per_cyc / double(g_dc_disp_n) : 0.0);
+    AmdGpu::g_back_idle_cyc = 0;
+    g_dc_disp_cyc = 0;
+    g_dc_disp_n = 0;
     LOG_INFO(Render_Vulkan,
              "DrawCost: depth-only/no-image class: {} draws ({:.1f}%), {:.1f}% of draw time, "
              "{:.0f} ns/draw;{}",
@@ -1148,8 +1163,13 @@ void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
     // points Liverpool::BackCsRegs() at the record's ComputeProgram snapshot.
     RENDERER_TRACE;
     const auto t_dispatch = Common::FaultMonitor::Now();
+    const u64 dc_disp_t0 = g_draw_cost ? __rdtsc() : 0;
     SCOPE_EXIT {
         Common::FaultMonitor::CountDispatch(Common::FaultMonitor::SinceNs(t_dispatch));
+        if (g_draw_cost) {
+            g_dc_disp_cyc += __rdtsc() - dc_disp_t0;
+            ++g_dc_disp_n;
+        }
     };
     scheduler.PopPendingOperations();
     if (native_bindings) {
