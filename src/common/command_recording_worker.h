@@ -64,7 +64,8 @@ inline const bool g_record_bytes_stats = [] {
  * span; the queue treats that span as raw storage and keeps it alive until the callable is
  * destroyed.
  */
-template <std::size_t ChunkCount = 10, std::size_t ChunkBytes = 64 * 1024>
+// ChunkCount is the capacity; SHADPS4_REC_CHUNKS (default 10, the old fixed count) sets how many chunks are used.
+template <std::size_t ChunkCount = 64, std::size_t ChunkBytes = 64 * 1024>
 class CommandRecordingWorker {
     static_assert(ChunkCount >= 2, "The command worker needs at least two chunks");
     static_assert(ChunkBytes > 0, "The command worker needs non-empty chunks");
@@ -118,6 +119,9 @@ class CommandRecordingWorker {
 
 public:
     static constexpr std::size_t DefaultChunkCount = ChunkCount;
+    [[nodiscard]] std::size_t ActiveChunks() const noexcept {
+        return active_chunks_;
+    }
     static constexpr std::size_t DefaultChunkBytes = ChunkBytes;
 
     struct Counters {
@@ -491,12 +495,25 @@ private:
     }
 
     [[nodiscard]] bool HasFreeChunkLocked() const {
-        for (const auto& chunk : chunks_) {
-            if (chunk.state == ChunkState::Free) {
+        for (std::size_t i = 0; i < active_chunks_; ++i) {
+            if (chunks_[i].state == ChunkState::Free) {
                 return true;
             }
         }
         return false;
+    }
+
+    /// SHADPS4_REC_CHUNKS=N (2..ChunkCount, default 10): chunks the producer may fill before it
+    /// waits for the worker. More chunks let the command processor run further ahead of the
+    /// recording thread (fire scene: the CP back waited 6-10% on a full ring, 2026-09-27).
+    static std::size_t ReadActiveChunks() {
+        const char* value = std::getenv("SHADPS4_REC_CHUNKS");
+        unsigned long long n = value ? std::strtoull(value, nullptr, 10) : 10ull;
+        if (n == 0) {
+            n = 10; // unparseable or 0: the default, not the 2-chunk floor
+        }
+        return static_cast<std::size_t>(
+            std::clamp<unsigned long long>(n, 2ull, static_cast<unsigned long long>(ChunkCount)));
     }
 
     Chunk* AcquireCurrentLocked(std::unique_lock<std::mutex>& lock) {
@@ -512,7 +529,8 @@ private:
                 space_cv_.wait(lock, can_acquire);
             }
             CheckAcceptingLocked();
-            for (auto& chunk : chunks_) {
+            for (std::size_t i = 0; i < active_chunks_; ++i) {
+                auto& chunk = chunks_[i];
                 if (chunk.state == ChunkState::Free) {
                     chunk.state = ChunkState::Building;
                     current_ = &chunk;
@@ -723,6 +741,7 @@ private:
     std::condition_variable space_cv_;
     std::array<Chunk, ChunkCount> chunks_{};
     std::array<Chunk*, ChunkCount> published_queue_{};
+    const std::size_t active_chunks_{ReadActiveChunks()};
     Chunk* current_{};
     std::size_t published_head_{};
     std::size_t published_size_{};
