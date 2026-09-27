@@ -227,6 +227,198 @@ void NoteDrawCost(const GraphicsPipeline* pipeline, const std::array<u64, DcCoun
     win_tsc = __rdtsc();
     win_start = std::chrono::steady_clock::now();
 }
+
+// SHADPS4_MERGE_PROBE=1 (diagnostic, default off): for each direct draw that uses the same
+// graphics pipeline as the previous direct draw, record which inputs differ from that draw.
+// Bits: user-data regs, flattened user data, buffer V# base, buffer V# size/stride, image T#,
+// vertex V# base, index base, index offset (VGT index_offset / vertex offset), index count,
+// instance count, render-target change (a BeginRendering in between). Per pipeline: draws,
+// same-pipeline repeats, top diff masks, OR of differing user-data regs and buffer slots.
+// Logged every 2^20 draws. Answers whether consecutive draws can merge into one call.
+const bool g_merge_probe = EnvIs1("SHADPS4_MERGE_PROBE");
+enum MergeDiffBit : u32 {
+    MdUserData = 1u << 0,
+    MdFlatUd = 1u << 1,
+    MdBufBase = 1u << 2,
+    MdBufShape = 1u << 3,
+    MdImage = 1u << 4,
+    MdVertexBase = 1u << 5,
+    MdIndexBase = 1u << 6,
+    MdIndexOffset = 1u << 7,
+    MdCount = 1u << 8,
+    MdInstances = 1u << 9,
+    MdTarget = 1u << 10,
+};
+constexpr std::array<const char*, 11> kMergeDiffNames{
+    "ud", "flat", "bufbase", "bufshape", "img", "vbase", "ibase", "ioff", "count", "inst", "rt"};
+
+struct MergeSig {
+    const GraphicsPipeline* pipeline{};
+    std::vector<u32> ud;
+    std::vector<u32> flat;
+    std::vector<u64> buf_base;
+    std::vector<u64> buf_shape;
+    std::vector<u64> img;
+    std::vector<u64> vbase;
+    u64 ibase{};
+    u32 ioff{};
+    u32 count{};
+    u32 inst{};
+    u64 rt_epoch{};
+};
+
+struct MergeStats {
+    u64 n{};
+    u64 repeats{};
+    u32 ud_regs{};  // OR of differing user-data register indices (VS in low 16, FS in high 16)
+    u64 buf_slots{}; // OR of differing buffer slots (VS slots 0-31, FS slots 32-63)
+    std::unordered_map<u32, u64> masks;
+};
+
+u64 g_merge_rt_epoch = 0; // bumped by BeginRendering changes (draw thread only)
+
+void NoteMergeProbe(const GraphicsPipeline* pipeline, std::span<const Shader::BoundStage> stages,
+                    const AmdGpu::Regs& regs, bool is_indexed, u32 index_offset) {
+    thread_local MergeSig prev;
+    thread_local MergeSig cur;
+    thread_local std::unordered_map<const GraphicsPipeline*, MergeStats> stats;
+    thread_local u64 draws = 0;
+    cur.pipeline = pipeline;
+    cur.ud.clear();
+    cur.flat.clear();
+    cur.buf_base.clear();
+    cur.buf_shape.clear();
+    cur.img.clear();
+    cur.vbase.clear();
+    u32 ud_diff = 0;
+    u64 slot_diff = 0;
+    const bool comparable = prev.pipeline == pipeline;
+    u32 stage_no = 0;
+    for (const auto& bound : stages) {
+        const auto* info = bound.info;
+        if (!info) {
+            continue;
+        }
+        const bool is_vs = info->l_stage == Shader::LogicalStage::Vertex;
+        const u32 ud_begin = static_cast<u32>(cur.ud.size());
+        for (u32 i = 0; i < bound.user_data.size() && i < 16; ++i) {
+            cur.ud.push_back(bound.user_data[i]);
+        }
+        cur.flat.insert(cur.flat.end(), bound.flattened_ud_buf.begin(),
+                        bound.flattened_ud_buf.end());
+        const u32 buf_begin = static_cast<u32>(cur.buf_base.size());
+        for (const auto& desc : info->buffers) {
+            const auto vsharp = desc.GetSharp(bound);
+            cur.buf_base.push_back(vsharp.base_address);
+            cur.buf_shape.push_back(u64(vsharp.GetSize()) << 32 | vsharp.GetStride());
+        }
+        for (const auto& desc : info->images) {
+            const auto tsharp = desc.GetSharp(bound);
+            u64 h = 0;
+            const auto* words = reinterpret_cast<const u64*>(&tsharp);
+            for (size_t w = 0; w < sizeof(tsharp) / sizeof(u64); ++w) {
+                h = h * 0x9E3779B97F4A7C15ULL ^ words[w];
+            }
+            cur.img.push_back(h);
+        }
+        if (is_vs) {
+            if (const auto* fetch = pipeline->GetFetchShader()) {
+                for (const auto& attrib : fetch->attributes) {
+                    cur.vbase.push_back(attrib.GetSharp(bound).base_address);
+                }
+            }
+        }
+        if (comparable) {
+            for (u32 i = ud_begin; i < cur.ud.size() && i < prev.ud.size(); ++i) {
+                if (cur.ud[i] != prev.ud[i]) {
+                    ud_diff |= 1u << ((i - ud_begin) + (is_vs ? 0 : 16));
+                }
+            }
+            for (u32 i = buf_begin; i < cur.buf_base.size() && i < prev.buf_base.size(); ++i) {
+                if (cur.buf_base[i] != prev.buf_base[i] || cur.buf_shape[i] != prev.buf_shape[i]) {
+                    slot_diff |= u64{1} << (((i - buf_begin) & 31) + (is_vs ? 0 : 32));
+                }
+            }
+        }
+        ++stage_no;
+    }
+    cur.ibase = is_indexed ? regs.index_base_address.Address() : 0;
+    cur.ioff = index_offset;
+    cur.count = regs.num_indices;
+    cur.inst = regs.num_instances.NumInstances();
+    cur.rt_epoch = g_merge_rt_epoch;
+    auto& st = stats[pipeline];
+    ++st.n;
+    if (comparable) {
+        u32 mask = 0;
+        mask |= cur.ud != prev.ud ? MdUserData : 0;
+        mask |= cur.flat != prev.flat ? MdFlatUd : 0;
+        mask |= cur.buf_base != prev.buf_base ? MdBufBase : 0;
+        mask |= cur.buf_shape != prev.buf_shape ? MdBufShape : 0;
+        mask |= cur.img != prev.img ? MdImage : 0;
+        mask |= cur.vbase != prev.vbase ? MdVertexBase : 0;
+        mask |= cur.ibase != prev.ibase ? MdIndexBase : 0;
+        mask |= cur.ioff != prev.ioff ? MdIndexOffset : 0;
+        mask |= cur.count != prev.count ? MdCount : 0;
+        mask |= cur.inst != prev.inst ? MdInstances : 0;
+        mask |= cur.rt_epoch != prev.rt_epoch ? MdTarget : 0;
+        ++st.repeats;
+        ++st.masks[mask];
+        st.ud_regs |= ud_diff;
+        st.buf_slots |= slot_diff;
+    }
+    std::swap(prev, cur);
+    if ((++draws & 0xFFFFF) != 0) {
+        return;
+    }
+    std::vector<std::pair<const GraphicsPipeline*, const MergeStats*>> order;
+    for (const auto& [p, s] : stats) {
+        order.emplace_back(p, &s);
+    }
+    std::sort(order.begin(), order.end(),
+              [](const auto& a, const auto& b) { return a.second->n > b.second->n; });
+    const auto mask_name = [](u32 mask) {
+        if (mask == 0) {
+            return std::string("none");
+        }
+        std::string out;
+        for (u32 b = 0; b < kMergeDiffNames.size(); ++b) {
+            if (mask & (1u << b)) {
+                out += out.empty() ? "" : "+";
+                out += kMergeDiffNames[b];
+            }
+        }
+        return out;
+    };
+    for (size_t k = 0; k < std::min<size_t>(order.size(), 16); ++k) {
+        const auto* p = order[k].first;
+        const auto& s = *order[k].second;
+        u64 vs = 0;
+        u64 fs = 0;
+        for (const auto* stage : p->GetStages()) {
+            if (stage && stage->l_stage == Shader::LogicalStage::Vertex) {
+                vs = stage->pgm_hash;
+            } else if (stage && stage->l_stage == Shader::LogicalStage::Fragment) {
+                fs = stage->pgm_hash;
+            }
+        }
+        std::vector<std::pair<u32, u64>> masks(s.masks.begin(), s.masks.end());
+        std::sort(masks.begin(), masks.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+        std::string top;
+        for (size_t m = 0; m < std::min<size_t>(masks.size(), 5); ++m) {
+            top += fmt::format(" {}:{:.1f}%", mask_name(masks[m].first),
+                               100.0 * double(masks[m].second) / double(s.repeats));
+        }
+        LOG_INFO(Render_Vulkan,
+                 "MergeProbe: #{} fs_{:08x} vs_{:08x} n={} repeats={} ({:.1f}%) ud_regs={:#010x} "
+                 "buf_slots={:#018x} masks:{}",
+                 k, fs, vs, s.n, s.repeats, 100.0 * double(s.repeats) / double(s.n), s.ud_regs,
+                 s.buf_slots, top);
+    }
+    stats.clear();
+    draws = 0;
+}
 } // namespace
 
 // SHADPS4_FLUSH_EVERY_OPS=N: submit once N draws + dispatches have been recorded since the last
@@ -1047,6 +1239,14 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     const auto state = BeginRendering(pipeline);
     sample.EndPhase(Common::DrawSampleProbe::Phase::BuildRenderingState);
     dc_lap(DcBeginRendering);
+    if (g_merge_probe) {
+        thread_local RenderState last_state{};
+        if (!(state == last_state)) {
+            ++g_merge_rt_epoch;
+            last_state = state;
+        }
+        NoteMergeProbe(pipeline, BoundStages(pipeline), regs, is_indexed, index_offset);
+    }
     const auto t_vtxbuf = Common::FaultMonitor::Now();
     Common::FaultMonitor::CountDraw(pipeline_ns, bindres_ns,
                                     Common::FaultMonitor::DiffNs(t_begin, t_vtxbuf));
