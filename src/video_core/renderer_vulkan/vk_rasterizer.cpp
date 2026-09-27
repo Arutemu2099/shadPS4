@@ -262,6 +262,71 @@ void NoteDrawCost(const GraphicsPipeline* pipeline, const std::array<u64, DcCoun
     win_start = std::chrono::steady_clock::now();
 }
 
+// SHADPS4_DRAW_COST=1, dispatches: per compute pipeline, total cycles and the BindResources
+// buffer/texture split (from BindResources' own counters); top 20 every 2^18 dispatches.
+struct DispatchCostStats {
+    u64 n = 0;
+    u64 total = 0;
+    u64 buf = 0;
+    u64 tex = 0;
+};
+void NoteDispatchCost(const ComputePipeline* pipeline, u64 total, u64 buf, u64 tex) {
+    thread_local std::unordered_map<const ComputePipeline*, DispatchCostStats> stats;
+    thread_local u64 dispatches = 0;
+    thread_local u64 win_tsc = 0;
+    thread_local std::chrono::steady_clock::time_point win_start{};
+    if (win_tsc == 0) {
+        win_tsc = __rdtsc();
+        win_start = std::chrono::steady_clock::now();
+    }
+    auto& st = stats[pipeline];
+    ++st.n;
+    st.total += total;
+    st.buf += buf;
+    st.tex += tex;
+    if ((++dispatches & 0x3FFFF) != 0) {
+        return;
+    }
+    const double wall_ns = double(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - win_start)
+                                      .count());
+    const double ns_per_cyc = wall_ns / double(__rdtsc() - win_tsc);
+    std::vector<std::pair<const ComputePipeline*, const DispatchCostStats*>> order;
+    u64 all = 0;
+    for (const auto& [p, v] : stats) {
+        order.emplace_back(p, &v);
+        all += v.total;
+    }
+    std::sort(order.begin(), order.end(),
+              [](const auto& a, const auto& b) { return a.second->total > b.second->total; });
+    LOG_INFO(Render_Vulkan, "DispatchCost: window {:.0f} ms, {} dispatches, {:.1f}% of wall, {:.0f} ns each",
+             wall_ns / 1e6, dispatches, 100.0 * double(all) * ns_per_cyc / wall_ns,
+             double(all) * ns_per_cyc / double(dispatches));
+    for (size_t k = 0; k < std::min<size_t>(order.size(), 20); ++k) {
+        const auto* p = order[k].first;
+        const auto& v = *order[k].second;
+        u64 cs = 0;
+        for (const auto* stage : p->GetStages()) {
+            if (stage) {
+                cs = stage->pgm_hash;
+            }
+        }
+        LOG_INFO(Render_Vulkan,
+                 "DispatchCost: #{} cs_{:08x} n={} share={:.1f}% ns/disp={:.0f} buf={:.0f} tex={:.0f} "
+                 "other={:.0f} buffers={} images={}",
+                 k, cs, v.n, all ? 100.0 * double(v.total) / double(all) : 0.0,
+                 double(v.total) * ns_per_cyc / double(v.n), double(v.buf) * ns_per_cyc / double(v.n),
+                 double(v.tex) * ns_per_cyc / double(v.n),
+                 double(v.total - v.buf - v.tex) * ns_per_cyc / double(v.n),
+                 p->GetStages()[0] ? p->GetStages()[0]->buffers.size() : 0,
+                 p->GetStages()[0] ? p->GetStages()[0]->images.size() : 0);
+    }
+    stats.clear();
+    dispatches = 0;
+    win_tsc = __rdtsc();
+    win_start = std::chrono::steady_clock::now();
+}
+
 // SHADPS4_MERGE_PROBE=1 (diagnostic, default off): for each direct draw that uses the same
 // graphics pipeline as the previous direct draw, record which inputs differ from that draw.
 // Bits: user-data regs, flattened user data, buffer V# base, buffer V# size/stride, image T#,
@@ -1164,11 +1229,19 @@ void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
     RENDERER_TRACE;
     const auto t_dispatch = Common::FaultMonitor::Now();
     const u64 dc_disp_t0 = g_draw_cost ? __rdtsc() : 0;
+    if (g_draw_cost) {
+        g_dc_bind_buf = 0; // an HLE dispatch skips BindResources, which resets these
+        g_dc_bind_tex = 0;
+    }
     SCOPE_EXIT {
         Common::FaultMonitor::CountDispatch(Common::FaultMonitor::SinceNs(t_dispatch));
         if (g_draw_cost) {
-            g_dc_disp_cyc += __rdtsc() - dc_disp_t0;
+            const u64 cyc = __rdtsc() - dc_disp_t0;
+            g_dc_disp_cyc += cyc;
             ++g_dc_disp_n;
+            if (pipeline) {
+                NoteDispatchCost(pipeline, cyc, g_dc_bind_buf, g_dc_bind_tex);
+            }
         }
     };
     scheduler.PopPendingOperations();
