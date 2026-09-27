@@ -64,7 +64,14 @@ void MasterSemaphore::Wait(u64 tick) {
         .pValues = &tick,
     };
 
-    while (instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT) != vk::Result::eSuccess) {
+    while (true) {
+        const vk::Result result = instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT);
+        if (result == vk::Result::eSuccess) {
+            break;
+        }
+        // A lost device used to spin here forever with nothing in the log (review 2026-09-27).
+        ASSERT_MSG(result != vk::Result::eErrorDeviceLost, "Device lost in semaphore wait (tick {})",
+                   tick);
     }
     Refresh();
 }

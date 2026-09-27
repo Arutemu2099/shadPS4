@@ -1144,8 +1144,15 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
         const u64 producer = prebatch                   ? 0
                              : PreciseProducerEnabled() ? PreciseProducer(job->copies)
                                                         : ProducerTick(addr, bytes);
+        // With SHADPS4_ASYNC_SUBMIT, `producer < tick` means the CP flushed that batch, not that
+        // the recording worker has called vkQueueSubmit for it; only wait on signals already
+        // submitted (the scheduler guards the same-queue case likewise). Review 2026-09-27.
+        const VkSemaphore async_timeline = Vulkan::Scheduler::async_timeline.load();
+        const bool producer_submitted =
+            async_timeline == VK_NULL_HANDLE ||
+            producer <= Vulkan::Scheduler::async_submitted_tick.load(std::memory_order_acquire);
         const bool side_ok = prebatch ? !BatchWritesAny(job->copies)
-                                      : (producer != 0 && producer < tick);
+                                      : (producer != 0 && producer < tick && producer_submitted);
         if (side_ok) {
             static std::atomic<u64> side{0}, total{0};
             u64 side_tick = 0;
@@ -3275,7 +3282,20 @@ void BufferCache::TouchBuffer(const Buffer& buffer) {
 void BufferCache::DeleteBuffer(BufferId buffer_id) {
     Buffer& buffer = slot_buffers[buffer_id];
     Unregister(buffer_id);
-    scheduler.DeferOperation([this, buffer_id] { slot_buffers.erase(buffer_id); });
+    // SHADPS4_READBACK_QUEUE=1/2: a copy on the separate readback queue waits only for its
+    // producer tick, not for this deletion tick, so it can still be queued when the main queue
+    // passes the deletion and the buffer is freed (review 2026-09-27, use-after-free). Before
+    // freeing, wait for every readback-queue copy submitted up to now; each waits on a producer
+    // below the deletion tick, which has completed when this deferred operation runs.
+    const u64 rq_tick = readback_queue && !readback_queue->InQueueOrder()
+                            ? readback_queue->Semaphore().CurrentTick() - 1
+                            : 0;
+    scheduler.DeferOperation([this, buffer_id, rq_tick] {
+        if (rq_tick != 0) {
+            readback_queue->Semaphore().Wait(rq_tick);
+        }
+        slot_buffers.erase(buffer_id);
+    });
     buffer.is_deleted = true;
 }
 
