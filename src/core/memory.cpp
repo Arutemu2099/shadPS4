@@ -12,6 +12,7 @@
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/kernel/process.h"
 #include "core/memory.h"
+#include "common/fence_watch.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace Core {
@@ -155,6 +156,9 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
 
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     const VAddr virtual_addr = std::bit_cast<VAddr>(address);
+    if (Common::FenceWatch::Enabled()) [[unlikely]] {
+        Common::FenceWatch::NoteGuestWrite(virtual_addr, data, size, "TryWriteBacking");
+    }
     std::shared_lock lk{mutex};
     ASSERT_MSG(IsValidMapping(virtual_addr, size), "Attempted to access invalid address {:#x}",
                virtual_addr);

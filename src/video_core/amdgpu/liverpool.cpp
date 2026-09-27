@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <cstring>
+#include <mutex>
+#include <thread>
 #include <chrono>
 #include <cstddef>
 #include <immintrin.h>
@@ -11,6 +15,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/fault_monitor.h"
+#include "common/fence_watch.h"
 #include "video_core/buffer_cache/protect_queue.h"
 #include "video_core/buffer_cache/submit_epoch.h"
 #include "common/polyfill_thread.h"
@@ -26,6 +31,123 @@
 #include "video_core/amdgpu/split_hazard.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+
+namespace Common::FenceWatch {
+
+void NoteRelease(VAddr addr, u64 value, u32 size) {
+    auto& st = Get();
+    const u64 now = NowNs();
+    Slot* slot = nullptr;
+    Slot* oldest = &st.slots[0];
+    if (addr >= State::PinnedBase && addr < State::PinnedBase + State::NumPinned * 8) {
+        slot = &st.slots[State::NumSlots + (addr - State::PinnedBase) / 8];
+    }
+    for (size_t i = 0; slot == nullptr && i < State::NumSlots; ++i) {
+        Slot& s = st.slots[i];
+        const u64 a = s.addr.load(std::memory_order_relaxed);
+        if (a == addr || a == 0) {
+            slot = &s;
+            break;
+        }
+        if (s.written_ns.load(std::memory_order_relaxed) <
+            oldest->written_ns.load(std::memory_order_relaxed)) {
+            oldest = &s;
+        }
+    }
+    if (slot == nullptr) {
+        slot = oldest;
+        slot->releases.store(0, std::memory_order_relaxed);
+    }
+    slot->value.store(value, std::memory_order_relaxed);
+    slot->size.store(size, std::memory_order_relaxed);
+    slot->written_ns.store(now, std::memory_order_relaxed);
+    slot->addr.store(addr, std::memory_order_release);
+    slot->releases.fetch_add(1, std::memory_order_relaxed);
+    st.last_release_ns.store(now, std::memory_order_release);
+    static std::atomic<u64> total{0};
+    const u64 n = total.fetch_add(1, std::memory_order_relaxed);
+    if (n == 0 || (n & 0x3fff) == 0) {
+        LOG_INFO(Render, "FenceWatch: armed; compute releases {} (latest {:#x} <- {:#x})", n + 1, addr, value);
+    }
+    static std::once_flag started;
+    std::call_once(started, [] {
+        std::thread([] {
+            u64 reported_for = 0;
+            u64 last_report_ns = 0;
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                auto& w = Get();
+                // The newest write among busy frame-fence slots; without one, any compute release.
+                u64 last = 0;
+                for (size_t i = State::NumSlots; i < w.slots.size(); ++i) {
+                    if (w.slots[i].releases.load(std::memory_order_relaxed) > 100) {
+                        last = std::max(last, w.slots[i].written_ns.load(std::memory_order_acquire));
+                    }
+                }
+                if (last == 0) {
+                    last = w.last_release_ns.load(std::memory_order_acquire);
+                }
+                const u64 now = NowNs();
+                if (last == 0 || now - last < 2'000'000'000ULL) {
+                    continue;
+                }
+                if (last == reported_for && now - last_report_ns < 10'000'000'000ULL) {
+                    continue;
+                }
+                reported_for = last;
+                last_report_ns = now;
+                LOG_WARNING(Render, "FenceWatch: no frame-fence release for {:.1f} s (any compute release {:.1f} s ago); "
+                            "covering download writes {}",
+                            double(now - last) / 1e9,
+                            double(now - w.last_release_ns.load()) / 1e9, w.covering_writes.load());
+                for (const Slot& s : w.slots) {
+                    const VAddr a = s.addr.load(std::memory_order_acquire);
+                    if (a == 0) {
+                        continue;
+                    }
+                    const u32 sz = s.size.load(std::memory_order_relaxed);
+                    const u64 v = s.value.load(std::memory_order_relaxed);
+                    u64 live = 0;
+                    const bool ok = Core::Memory::Instance()->TryReadBacking(
+                        a, reinterpret_cast<u8*>(&live), sz);
+                    const char* verdict = !ok          ? "unreadable"
+                                          : live == v  ? "equal"
+                                          : live < v   ? "LOWER (clobbered?)"
+                                                       : "HIGHER";
+                    LOG_WARNING(Render,
+                                "FenceWatch:   {:#x} last signalled {:#x} ({} B, {:.1f} s ago, {} releases); "
+                                "live {:#x}: {}",
+                                a, v, sz, double(now - s.written_ns.load()) / 1e9, s.releases.load(),
+                                live, verdict);
+                }
+            }
+        }).detach();
+    });
+}
+
+void NoteGuestWrite(VAddr addr, const void* data, u64 size, const char* who) {
+    auto& st = Get();
+    for (const Slot& s : st.slots) {
+        const VAddr fence = s.addr.load(std::memory_order_acquire);
+        const u32 sz = s.size.load(std::memory_order_relaxed);
+        if (fence == 0 || fence < addr || fence + sz > addr + size) {
+            continue;
+        }
+        const u64 n = st.covering_writes.fetch_add(1, std::memory_order_relaxed);
+        u64 incoming = 0;
+        std::memcpy(&incoming, static_cast<const u8*>(data) + (fence - addr), sz);
+        const u64 last = s.value.load(std::memory_order_relaxed);
+        if (incoming != last || n < 16) {
+            LOG_WARNING(Render,
+                        "FenceWatch: {} writes {:#x} over fence {:#x} (last signalled {:#x}, {:.3f} ms ago){}",
+                        who, incoming, fence, last,
+                        double(NowNs() - s.written_ns.load(std::memory_order_relaxed)) / 1e6,
+                        incoming != last ? " CLOBBER" : "");
+        }
+    }
+}
+
+} // namespace Common::FenceWatch
 
 namespace AmdGpu {
 
@@ -1111,6 +1233,24 @@ void Liverpool::RunFence(const PM4Header* header, std::span<const u32> rest, VAd
     split->MaybeLog();
 }
 
+
+
+static void NoteAscFence(const PM4CmdReleaseMem& packet) {
+    if (!Common::FenceWatch::Enabled()) {
+        return;
+    }
+    switch (packet.data_sel.Value()) {
+    case DataSelect::Data32Low:
+        Common::FenceWatch::NoteRelease(packet.Address<VAddr>(), packet.DataDWord(), 4);
+        break;
+    case DataSelect::Data64:
+        Common::FenceWatch::NoteRelease(packet.Address<VAddr>(), packet.DataQWord(), 8);
+        break;
+    default:
+        break;
+    }
+}
+
 void Liverpool::ExecuteAscReleaseMem(const PM4CmdReleaseMem* release_mem, u32 pipe_id) {
     if (rasterizer) {
         rasterizer->ProcessDownloadImages();
@@ -1127,6 +1267,7 @@ void Liverpool::ExecuteAscReleaseMem(const PM4CmdReleaseMem* release_mem, u32 pi
                             static_cast<Platform::InterruptId>(pipe_id));
                     },
                     [](VAddr, u16, u16) {});
+                NoteAscFence(packet);
             },
             FenceAtGpu() == 1);
         return;
@@ -1138,6 +1279,7 @@ void Liverpool::ExecuteAscReleaseMem(const PM4CmdReleaseMem* release_mem, u32 pi
         [this](VAddr dst, u16 gds_index, u16 num_dwords) {
             rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
         });
+    NoteAscFence(*release_mem);
 }
 
 Liverpool::SplitSpanScope::SplitSpanScope(Liverpool& liverpool, const std::span<const u32>* span,
