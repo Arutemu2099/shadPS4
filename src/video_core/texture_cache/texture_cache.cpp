@@ -28,6 +28,17 @@
 
 namespace VideoCore {
 
+namespace {
+// SHADPS4_DRAW_COST=1 (diagnostic): cycle split of UpdateImage/RefreshImage for refreshes over
+// ~100 us (lock wait, hash checks, EndRendering, ObtainBufferForImage, detile, upload); first 5
+// lines per image address. Finds why a 64x64 texture costs ~0.3 ms per frame (frame map 09-27).
+const bool g_refresh_cost = [] {
+    const char* value = std::getenv("SHADPS4_DRAW_COST");
+    return value != nullptr && value[0] == '1';
+}();
+thread_local u64 g_refresh_lock_cyc = 0;
+} // namespace
+
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
 
@@ -1140,7 +1151,11 @@ void TextureCache::UpdateImage(ImageId image_id) {
     if (lockfree_hit && Common::FaultMonitor::t_is_cp_thread && UpdateImageLockFree(image_id)) {
         return;
     }
+    const u64 lock_t0 = g_refresh_cost ? __rdtsc() : 0;
     CacheLock lock{*this};
+    if (g_refresh_cost) {
+        g_refresh_lock_cyc = __rdtsc() - lock_t0;
+    }
     Image& image = slot_images[image_id];
     TrackImage(image_id);
     TouchImage(image);
@@ -1307,6 +1322,16 @@ void TextureCache::RefreshImage(Image& image) {
 
     RENDERER_TRACE;
     TRACE_HINT(fmt::format("{:x}:{:x}", image.info.guest_address, image.info.guest_size));
+    std::array<u64, 6> rc{}; // hash, end_rendering, obtain_buffer, detile, upload, total
+    const u64 rc_t0 = g_refresh_cost ? __rdtsc() : 0;
+    u64 rc_t = rc_t0;
+    const auto rc_lap = [&](u32 i) {
+        if (g_refresh_cost) {
+            const u64 now = __rdtsc();
+            rc[i] = now - rc_t;
+            rc_t = now;
+        }
+    };
 
     if (True(image.flags & ImageFlagBits::MaybeCpuDirty) &&
         False(image.flags & ImageFlagBits::CpuDirty)) {
@@ -1373,7 +1398,9 @@ void TextureCache::RefreshImage(Image& image) {
         return;
     }
 
+    rc_lap(0);
     scheduler.EndRendering();
+    rc_lap(1);
 
     const auto [in_buffer, in_offset] =
         buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
@@ -1396,13 +1423,29 @@ void TextureCache::RefreshImage(Image& image) {
         }
     }
 
+    rc_lap(2);
     const auto [buffer, offset] =
         tile_manager.DetileImage(in_buffer->Handle(), in_offset, image.info);
     for (auto& copy : image_copies) {
         copy.bufferOffset += offset;
     }
+    rc_lap(3);
 
     image.Upload(image_copies, buffer, offset);
+    rc_lap(4);
+    if (g_refresh_cost && rc_t - rc_t0 + g_refresh_lock_cyc > 350000) {
+        static thread_local std::unordered_map<u64, u32> logged;
+        if (logged[image.info.guest_address]++ < 5) {
+            LOG_INFO(Render_Vulkan,
+                     "RefreshCost: {:#x} {}x{} {} size={} flags={:#x} lock={} hash={} "
+                     "end_rendering={} obtain_buffer={} detile={} upload={} cyc",
+                     image.info.guest_address, image.info.size.width, image.info.size.height,
+                     vk::to_string(image.info.pixel_format), image.info.guest_size,
+                     static_cast<u32>(image.flags), g_refresh_lock_cyc, rc[0], rc[1], rc[2],
+                     rc[3], rc[4]);
+        }
+    }
+    g_refresh_lock_cyc = 0;
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
