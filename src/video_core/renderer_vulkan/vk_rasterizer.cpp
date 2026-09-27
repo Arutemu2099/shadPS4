@@ -114,6 +114,12 @@ constexpr std::array<const char*, DcCount> kDrawCostNames{
     "prep", "buf", "tex", "bind_other", "begin", "vtx_idx", "emit", "tail"};
 thread_local u64 g_dc_bind_buf = 0;
 thread_local u64 g_dc_bind_tex = 0;
+// Buffer bindings (BindBuffers, draws and dispatches): [0] read-only, [1] written; phases:
+// 0 find pass (per stage, split evenly), 1 sync walk, 2 sync rest, 3 other ObtainBuffer work,
+// 4 barrier + written-branch invalidation + descriptor info; plus counts and special bindings.
+thread_local std::array<std::array<u64, 5>, 2> g_bb_cyc{};
+thread_local std::array<u64, 2> g_bb_n{};
+thread_local u64 g_bb_special_n = 0;
 thread_local u64 g_dc_disp_cyc = 0; // ExecuteDispatch on the back (direct + indirect)
 thread_local u64 g_dc_disp_n = 0;
 // Inside BindTextures (DRAW_COST only): [0] first pass (FindImage per binding), [1] FindTexture
@@ -224,6 +230,24 @@ void NoteDrawCost(const GraphicsPipeline* pipeline, const std::array<u64, DcCoun
              100.0 * double(AmdGpu::g_back_idle_cyc) * ns_per_cyc / wall_ns, g_dc_disp_n,
              100.0 * double(g_dc_disp_cyc) * ns_per_cyc / wall_ns,
              g_dc_disp_n ? double(g_dc_disp_cyc) * ns_per_cyc / double(g_dc_disp_n) : 0.0);
+    for (u32 w = 0; w < 2; ++w) {
+        const double n = double(std::max<u64>(g_bb_n[w], 1));
+        const auto& c = g_bb_cyc[w];
+        LOG_INFO(Render_Vulkan,
+                 "DrawCost: buffer bindings {}: {} ({:.0f}/draw) ns each: find={:.0f} walk={:.0f} "
+                 "sync_rest={:.0f} obtain_other={:.0f} barrier_written={:.0f} total={:.0f}; "
+                 "{:.1f}% of wall",
+                 w ? "written" : "read", g_bb_n[w], double(g_bb_n[w]) / double(draws),
+                 double(c[0]) * ns_per_cyc / n, double(c[1]) * ns_per_cyc / n,
+                 double(c[2]) * ns_per_cyc / n, double(c[3]) * ns_per_cyc / n,
+                 double(c[4]) * ns_per_cyc / n,
+                 double(c[0] + c[1] + c[2] + c[3] + c[4]) * ns_per_cyc / n,
+                 100.0 * double(c[0] + c[1] + c[2] + c[3] + c[4]) * ns_per_cyc / wall_ns);
+    }
+    LOG_INFO(Render_Vulkan, "DrawCost: special (non-cache) buffer bindings {}", g_bb_special_n);
+    g_bb_cyc = {};
+    g_bb_n = {};
+    g_bb_special_n = 0;
     AmdGpu::g_back_idle_cyc = 0;
     g_dc_disp_cyc = 0;
     g_dc_disp_n = 0;
@@ -3093,6 +3117,7 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
     // Pass 1 (FindBuffer) vs pass 2 (ObtainBuffer -> SynchronizeBuffer) timed separately: this
     // function is 62% of per-draw cost and a stack scan is not trustworthy for apportioning it.
     const auto t_find = Common::FaultMonitor::Now();
+    const u64 bb_find_t0 = g_draw_cost ? __rdtsc() : 0;
     for (const auto& desc : stage.buffers) {
         const auto vsharp = desc.GetSharp(bound);
         if (!desc.IsSpecial() && vsharp.base_address != 0 && vsharp.GetSize() > 0) {
@@ -3105,6 +3130,8 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
     }
     const u64 find_ns = Common::FaultMonitor::SinceNs(t_find);
     u64 obtain_ns = 0;
+    const u64 bb_find_cyc = g_draw_cost ? __rdtsc() - bb_find_t0 : 0;
+    const u64 bb_find_each = buffer_bindings.empty() ? 0 : bb_find_cyc / buffer_bindings.size();
 
     // Second pass to re-bind buffers that were updated after binding
     for (u32 i = 0; i < buffer_bindings.size(); i++) {
@@ -3173,11 +3200,18 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
         } else {
             const auto t_obtain = Common::FaultMonitor::Now();
             const u64 memo_uploads = bind_memo_active ? buffer_cache.SyncUploadBytesTotal() : 0;
+            u64 bb_t0 = 0;
+            if (g_draw_cost) {
+                VideoCore::DiagSyncWalkCycles() = 0;
+                VideoCore::DiagSyncRestCycles() = 0;
+                bb_t0 = __rdtsc();
+            }
             const auto [vk_buffer, offset] = buffer_cache.ObtainBuffer(
                 vsharp.base_address, size, desc.is_written, desc.is_formatted, buffer_id,
                 is_storage ? Common::BufferSampleCaller::Storage
                            : Common::BufferSampleCaller::Uniform);
             obtain_ns += Common::FaultMonitor::SinceNs(t_obtain);
+            const u64 bb_t1 = g_draw_cost ? __rdtsc() : 0;
             if (bind_memo_active) {
                 bind_memo_uploaded[i] = buffer_cache.SyncUploadBytesTotal() != memo_uploads;
             }
@@ -3203,6 +3237,21 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
             if (desc.is_written && (desc.is_formatted || raw_write_invalidate)) {
                 texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
             }
+            if (g_draw_cost) {
+                const u32 w = desc.is_written ? 1 : 0;
+                const u64 walk = VideoCore::DiagSyncWalkCycles();
+                const u64 rest = VideoCore::DiagSyncRestCycles();
+                const u64 obtain = bb_t1 - bb_t0;
+                g_bb_cyc[w][0] += bb_find_each;
+                g_bb_cyc[w][1] += walk;
+                g_bb_cyc[w][2] += rest;
+                g_bb_cyc[w][3] += obtain > walk + rest ? obtain - walk - rest : 0;
+                g_bb_cyc[w][4] += __rdtsc() - bb_t1;
+                ++g_bb_n[w];
+            }
+        }
+        if (g_draw_cost && !buffer_id) {
+            ++g_bb_special_n;
         }
 
         const u32 unified_binding = binding.unified++;

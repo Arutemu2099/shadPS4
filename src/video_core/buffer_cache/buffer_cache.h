@@ -53,6 +53,11 @@ struct SyncTiming;
 
 namespace VideoCore {
 
+/// SHADPS4_DRAW_COST=1 (diagnostic): cycles of the last SynchronizeBuffer on this thread, split into
+/// the dirty-page walk (ForEachUploadRange) and the rest; callers reset them before a call.
+u64& DiagSyncWalkCycles();
+u64& DiagSyncRestCycles();
+
 using BufferId = Common::SlotId;
 
 class TextureCache;

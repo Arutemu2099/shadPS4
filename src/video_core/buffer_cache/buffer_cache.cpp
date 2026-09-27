@@ -40,6 +40,13 @@ thread_local u64 g_sync_walk_cyc = 0;
 thread_local u64 g_sync_rest_cyc = 0;
 } // namespace
 
+u64& DiagSyncWalkCycles() {
+    return g_sync_walk_cyc;
+}
+u64& DiagSyncRestCycles() {
+    return g_sync_rest_cyc;
+}
+
 namespace Offload = Common::ReadbackOffload;
 
 namespace {
