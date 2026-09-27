@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <immintrin.h>
 #include <set>
 #include <chrono>
 #include <cstdlib>
@@ -86,6 +89,144 @@ const int g_viewport_memo = [] {
 }();
 const bool g_hair_stencil_trace = EnvExactly1("SHADPS4_HAIR_STENCIL_TRACE");
 const bool g_replace_op_reference = EnvExactly1("SHADPS4_STENCIL_REPLACE_OP");
+
+// SHADPS4_DRAW_COST=1 (diagnostic, default off): rdtsc cycles of each DrawTail phase per graphics
+// pipeline on the thread that executes draws (the CP back with the split), logged every 2^17
+// draws as the top pipelines by total cost plus a depth-only/no-image class total. Answers which
+// kinds of draws the CP time goes to (frame map 2026-09-27). Direct draws only (DrawTail).
+const bool g_draw_cost = EnvIs1("SHADPS4_DRAW_COST");
+enum DrawCostPhase : u32 {
+    DcPrepare,
+    DcBindBuffers,
+    DcBindTextures,
+    DcBindOther,
+    DcBeginRendering,
+    DcVertexIndex,
+    DcEmitResources,
+    DcRecordTail,
+    DcCount
+};
+constexpr std::array<const char*, DcCount> kDrawCostNames{
+    "prep", "buf", "tex", "bind_other", "begin", "vtx_idx", "emit", "tail"};
+thread_local u64 g_dc_bind_buf = 0;
+thread_local u64 g_dc_bind_tex = 0;
+
+struct DrawCostStats {
+    u64 n = 0;
+    std::array<u64, DcCount> cyc{};
+};
+
+bool IsDepthOnlyNoImage(const GraphicsPipeline* pipeline) {
+    if (pipeline->GetGraphicsKey().mrt_mask != 0) {
+        return false;
+    }
+    for (const auto* stage : pipeline->GetStages()) {
+        if (stage && !stage->images.empty()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void NoteDrawCost(const GraphicsPipeline* pipeline, const std::array<u64, DcCount>& cyc) {
+    thread_local std::unordered_map<const GraphicsPipeline*, DrawCostStats> stats;
+    thread_local u64 draws = 0;
+    thread_local u64 win_tsc = 0;
+    thread_local std::chrono::steady_clock::time_point win_start{};
+    if (win_tsc == 0) {
+        win_tsc = __rdtsc();
+        win_start = std::chrono::steady_clock::now();
+    }
+    auto& s = stats[pipeline];
+    ++s.n;
+    for (u32 i = 0; i < DcCount; ++i) {
+        s.cyc[i] += cyc[i];
+    }
+    if ((++draws & 0x1FFFF) != 0) {
+        return;
+    }
+    const u64 now_tsc = __rdtsc();
+    const double wall_ns = double(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - win_start)
+                                      .count());
+    const double ns_per_cyc = wall_ns / double(now_tsc - win_tsc);
+    std::vector<std::pair<const GraphicsPipeline*, const DrawCostStats*>> order;
+    order.reserve(stats.size());
+    u64 all_cyc = 0;
+    u64 depth_cyc = 0;
+    u64 depth_n = 0;
+    std::array<u64, DcCount> all_phase{};
+    std::array<u64, DcCount> depth_phase{};
+    for (const auto& [p, st] : stats) {
+        order.emplace_back(p, &st);
+        const bool depth_only = IsDepthOnlyNoImage(p);
+        for (u32 i = 0; i < DcCount; ++i) {
+            all_cyc += st.cyc[i];
+            all_phase[i] += st.cyc[i];
+            if (depth_only) {
+                depth_cyc += st.cyc[i];
+                depth_phase[i] += st.cyc[i];
+            }
+        }
+        if (depth_only) {
+            depth_n += st.n;
+        }
+    }
+    const auto total_of = [](const DrawCostStats& st) {
+        u64 t = 0;
+        for (const u64 c : st.cyc) {
+            t += c;
+        }
+        return t;
+    };
+    std::sort(order.begin(), order.end(),
+              [&](const auto& a, const auto& b) { return total_of(*a.second) > total_of(*b.second); });
+    const auto phases = [&](const std::array<u64, DcCount>& ph, u64 n) {
+        std::string out;
+        for (u32 i = 0; i < DcCount; ++i) {
+            out += fmt::format(" {}={:.0f}", kDrawCostNames[i],
+                               n ? double(ph[i]) * ns_per_cyc / double(n) : 0.0);
+        }
+        return out;
+    };
+    LOG_INFO(Render_Vulkan,
+             "DrawCost: window {:.0f} ms, {} draws, draw time {:.1f}% of wall, {:.0f} ns/draw;{}",
+             wall_ns / 1e6, draws, 100.0 * double(all_cyc) * ns_per_cyc / wall_ns,
+             double(all_cyc) * ns_per_cyc / double(draws), phases(all_phase, draws));
+    LOG_INFO(Render_Vulkan,
+             "DrawCost: depth-only/no-image class: {} draws ({:.1f}%), {:.1f}% of draw time, "
+             "{:.0f} ns/draw;{}",
+             depth_n, 100.0 * double(depth_n) / double(draws),
+             all_cyc ? 100.0 * double(depth_cyc) / double(all_cyc) : 0.0,
+             depth_n ? double(depth_cyc) * ns_per_cyc / double(depth_n) : 0.0,
+             phases(depth_phase, depth_n));
+    for (size_t k = 0; k < std::min<size_t>(order.size(), 30); ++k) {
+        const auto* p = order[k].first;
+        const auto& st = *order[k].second;
+        u64 vs = 0;
+        u64 fs = 0;
+        for (const auto* stage : p->GetStages()) {
+            if (!stage) {
+                continue;
+            }
+            if (stage->l_stage == Shader::LogicalStage::Vertex) {
+                vs = stage->pgm_hash;
+            } else if (stage->l_stage == Shader::LogicalStage::Fragment) {
+                fs = stage->pgm_hash;
+            }
+        }
+        LOG_INFO(Render_Vulkan,
+                 "DrawCost: #{} fs_{:08x} vs_{:08x} mrt={:#x} depth_only={} n={} share={:.1f}% "
+                 "ns/draw={:.0f};{}",
+                 k, fs, vs, p->GetGraphicsKey().mrt_mask, IsDepthOnlyNoImage(p) ? 1 : 0, st.n,
+                 all_cyc ? 100.0 * double(total_of(st)) / double(all_cyc) : 0.0,
+                 double(total_of(st)) * ns_per_cyc / double(st.n), phases(st.cyc, st.n));
+    }
+    stats.clear();
+    draws = 0;
+    win_tsc = __rdtsc();
+    win_start = std::chrono::steady_clock::now();
+}
 } // namespace
 
 // SHADPS4_FLUSH_EVERY_OPS=N: submit once N draws + dispatches have been recorded since the last
@@ -819,10 +960,20 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
                           std::chrono::steady_clock::time_point t_entry,
                           std::chrono::steady_clock::time_point t_pipeline, u64 pipeline_ns) {
     const auto& regs = liverpool->BackRegs();
+    std::array<u64, DcCount> dc{};
+    u64 dc_t = g_draw_cost ? __rdtsc() : 0;
+    const auto dc_lap = [&](DrawCostPhase phase) {
+        if (g_draw_cost) {
+            const u64 now = __rdtsc();
+            dc[phase] += now - dc_t;
+            dc_t = now;
+        }
+    };
     const auto t_prepare = Common::FaultMonitor::Now();
     sample.BeginPhase(Common::DrawSampleProbe::Phase::Prepare);
     PrepareRenderState(pipeline);
     sample.EndPhase(Common::DrawSampleProbe::Phase::Prepare);
+    dc_lap(DcPrepare);
     const auto t_bindres = Common::FaultMonitor::Now();
     sample.BeginPhase(Common::DrawSampleProbe::Phase::BindResources);
     const bool bound = BindResources(pipeline);
@@ -830,6 +981,12 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     const auto bindres_ns = Common::FaultMonitor::SinceNs(t_bindres);
     if (!bound) {
         return;
+    }
+    if (g_draw_cost) {
+        dc_lap(DcBindOther);
+        dc[DcBindBuffers] = g_dc_bind_buf;
+        dc[DcBindTextures] = g_dc_bind_tex;
+        dc[DcBindOther] -= std::min(dc[DcBindOther], g_dc_bind_buf + g_dc_bind_tex);
     }
     const auto t_begin = Common::FaultMonitor::Now();
     sample.BeginPhase(Common::DrawSampleProbe::Phase::BuildRenderingState);
@@ -889,6 +1046,7 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     }
     const auto state = BeginRendering(pipeline);
     sample.EndPhase(Common::DrawSampleProbe::Phase::BuildRenderingState);
+    dc_lap(DcBeginRendering);
     const auto t_vtxbuf = Common::FaultMonitor::Now();
     Common::FaultMonitor::CountDraw(pipeline_ns, bindres_ns,
                                     Common::FaultMonitor::DiffNs(t_begin, t_vtxbuf));
@@ -900,11 +1058,13 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
         buffer_cache.BindIndexBuffer(index_offset, buffer_barriers);
     }
     sample.EndPhase(Common::DrawSampleProbe::Phase::VertexIndexBuffers);
+    dc_lap(DcVertexIndex);
     const auto t_descwrite = Common::FaultMonitor::Now();
 
     sample.BeginPhase(Common::DrawSampleProbe::Phase::PipelineResources);
     EmitPipelineResources(pipeline);
     sample.EndPhase(Common::DrawSampleProbe::Phase::PipelineResources);
+    dc_lap(DcEmitResources);
     const auto t_dynstate = Common::FaultMonitor::Now();
     sample.BeginPhase(Common::DrawSampleProbe::Phase::DynamicState);
     UpdateDynamicState(pipeline, is_indexed);
@@ -940,6 +1100,10 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     ResetBindings();
     sample.EndPhase(Common::DrawSampleProbe::Phase::ResetImageBindings);
     sample.Finish();
+    if (g_draw_cost) {
+        dc_lap(DcRecordTail);
+        NoteDrawCost(pipeline, dc);
+    }
 
     // SHADPS4_FLUSH_EVERY_DRAWS=N: hand recorded work to the GPU every N draws. Guest readback
     // faults wait for everything queued before their copy; measured 2026-09-23 Game:Main spent
@@ -1256,6 +1420,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     buffer_barriers.clear();
     buffer_infos.clear();
     image_infos.clear();
+    g_dc_bind_buf = 0;
+    g_dc_bind_tex = 0;
 
     bool uses_dma = false;
 
@@ -1283,12 +1449,18 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             if (VideoCore::BufferCache::ReadProducerStatsEnabled()) [[unlikely]] {
                 buffer_cache.SetDiagProducer(stage->pgm_hash);
             }
+            const u64 dc0 = g_draw_cost ? __rdtsc() : 0;
             BindBuffers(bound, binding, push_data);
+            const u64 dc1 = g_draw_cost ? __rdtsc() : 0;
             const auto t_tex = Common::FaultMonitor::Now();
             if (tex_bind_memo) {
                 BindTexturesMemo(pipeline, bound, binding);
             } else {
                 BindTextures(bound, binding);
+            }
+            if (g_draw_cost) {
+                g_dc_bind_buf += dc1 - dc0;
+                g_dc_bind_tex += __rdtsc() - dc1;
             }
             Common::FaultMonitor::CountBindSplit(Common::FaultMonitor::DiffNs(t_buf, t_tex),
                                                  Common::FaultMonitor::SinceNs(t_tex));
