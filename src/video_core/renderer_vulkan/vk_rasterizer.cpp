@@ -91,7 +91,7 @@ const bool g_hair_stencil_trace = EnvExactly1("SHADPS4_HAIR_STENCIL_TRACE");
 const bool g_replace_op_reference = EnvExactly1("SHADPS4_STENCIL_REPLACE_OP");
 
 // SHADPS4_DRAW_COST=1 (diagnostic, default off): rdtsc cycles of each DrawTail phase per graphics
-// pipeline on the thread that executes draws (the CP back with the split), logged every 2^17
+// pipeline on the thread that executes draws (the CP back with the split), logged every 2^20
 // draws as the top pipelines by total cost plus a depth-only/no-image class total. Answers which
 // kinds of draws the CP time goes to (frame map 2026-09-27). Direct draws only (DrawTail).
 const bool g_draw_cost = EnvIs1("SHADPS4_DRAW_COST");
@@ -110,6 +110,23 @@ constexpr std::array<const char*, DcCount> kDrawCostNames{
     "prep", "buf", "tex", "bind_other", "begin", "vtx_idx", "emit", "tail"};
 thread_local u64 g_dc_bind_buf = 0;
 thread_local u64 g_dc_bind_tex = 0;
+// Inside BindTextures (DRAW_COST only): [0] first pass (FindImage per binding), [1] FindTexture
+// (view lookup, refresh/upload), [2] Transit (layout changes, may end rendering), plus the single
+// slowest FindTexture+Transit image of the draw. DrawTail logs the split for draws whose texture
+// phase exceeds ~50 us (first 40 such draws).
+thread_local std::array<u64, 3> g_dc_tex_sub{};
+struct SlowImage {
+    u64 cyc{};
+    u64 addr{};
+    u32 w{};
+    u32 h{};
+    u32 layers{};
+    u32 fmt{};
+    bool depth{};
+    bool tiled{};
+    u32 layout_before{};
+};
+thread_local SlowImage g_dc_slow_img{};
 
 struct DrawCostStats {
     u64 n = 0;
@@ -117,7 +134,9 @@ struct DrawCostStats {
 };
 
 bool IsDepthOnlyNoImage(const GraphicsPipeline* pipeline) {
-    if (pipeline->GetGraphicsKey().mrt_mask != 0) {
+    // mrt_mask is the shader's export mask (0x1 even for the empty depth-only shader); the
+    // attachment count is what the capture shows as "no colour output".
+    if (pipeline->GetGraphicsKey().num_color_attachments != 0) {
         return false;
     }
     for (const auto* stage : pipeline->GetStages()) {
@@ -142,7 +161,7 @@ void NoteDrawCost(const GraphicsPipeline* pipeline, const std::array<u64, DcCoun
     for (u32 i = 0; i < DcCount; ++i) {
         s.cyc[i] += cyc[i];
     }
-    if ((++draws & 0x1FFFF) != 0) {
+    if ((++draws & 0xFFFFF) != 0) {
         return;
     }
     const u64 now_tsc = __rdtsc();
@@ -1303,6 +1322,25 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     if (g_draw_cost) {
         dc_lap(DcRecordTail);
         NoteDrawCost(pipeline, dc);
+        // ~50 us at ~3.5 GHz TSC: log where a slow texture phase went (first 40 draws).
+        static thread_local u32 slow_logged = 0;
+        if (dc[DcBindTextures] > 175000 && slow_logged < 40) {
+            ++slow_logged;
+            u64 fs = 0;
+            for (const auto* stage : pipeline->GetStages()) {
+                if (stage && stage->l_stage == Shader::LogicalStage::Fragment) {
+                    fs = stage->pgm_hash;
+                }
+            }
+            const auto& si = g_dc_slow_img;
+            LOG_INFO(Render_Vulkan,
+                     "DrawCostSlowTex: fs_{:08x} tex={} cyc first_pass={} find_texture={} "
+                     "transit={} | slowest image {:#x} {}x{}x{} fmt={} depth={} tiled={} "
+                     "layout_before={} cyc={}",
+                     fs, dc[DcBindTextures], g_dc_tex_sub[0], g_dc_tex_sub[1], g_dc_tex_sub[2],
+                     si.addr, si.w, si.h, si.layers, vk::to_string(vk::Format(si.fmt)), si.depth,
+                     si.tiled, vk::to_string(vk::ImageLayout(si.layout_before)), si.cyc);
+        }
     }
 
     // SHADPS4_FLUSH_EVERY_DRAWS=N: hand recorded work to the GPU every N draws. Guest readback
@@ -1622,6 +1660,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     image_infos.clear();
     g_dc_bind_buf = 0;
     g_dc_bind_tex = 0;
+    g_dc_tex_sub = {};
+    g_dc_slow_img = {};
 
     bool uses_dma = false;
 
@@ -3165,6 +3205,7 @@ void Rasterizer::FlushStencilWritebacks() {
 
 void Rasterizer::BindTextures(const Shader::BoundStage& bound,
                               Shader::Backend::Bindings& binding) {
+    const u64 dc_tex_t0 = g_draw_cost ? __rdtsc() : 0;
     const auto& stage = *bound.info;
     u32 lookup_count{};
     image_bindings.clear();
@@ -3347,6 +3388,9 @@ void Rasterizer::BindTextures(const Shader::BoundStage& bound,
     const auto t_view = Common::FaultMonitor::Now();
     u64 findtex_ns = 0;
     u64 transit_ns = 0;
+    if (g_draw_cost) {
+        g_dc_tex_sub[0] += __rdtsc() - dc_tex_t0;
+    }
 
     // Second pass to re-bind images that were updated after binding
     for (auto& [image_id, desc] : image_bindings) {
@@ -3370,8 +3414,12 @@ void Rasterizer::BindTextures(const Shader::BoundStage& bound,
 
             auto& image = texture_cache.GetImage(image_id);
             const auto t_ft = Common::FaultMonitor::Now();
+            const u64 dc_ft0 = g_draw_cost ? __rdtsc() : 0;
+            const u32 dc_layout_before =
+                g_draw_cost ? static_cast<u32>(image.backing->state.layout) : 0;
             auto& image_view = is_scratch ? image.FindView(desc.view_info)
                                           : texture_cache.FindTexture(image_id, desc);
+            const u64 dc_ft1 = g_draw_cost ? __rdtsc() : 0;
             {
                 // Experiment SHADPS4_NEO_IDBUF_FILL=<u32>: the PS4 Pro hardware ID buffer (a
                 // 2-sample R32Uint surface written by the rasterizer) is not emulated; fill it with
@@ -3431,6 +3479,22 @@ void Rasterizer::BindTextures(const Shader::BoundStage& bound,
                 }
             }
             transit_ns += Common::FaultMonitor::SinceNs(t_tr);
+            if (g_draw_cost) {
+                const u64 dc_ft2 = __rdtsc();
+                g_dc_tex_sub[1] += dc_ft1 - dc_ft0;
+                g_dc_tex_sub[2] += dc_ft2 - dc_ft1;
+                if (dc_ft2 - dc_ft0 > g_dc_slow_img.cyc) {
+                    g_dc_slow_img = {dc_ft2 - dc_ft0,
+                                     image.info.guest_address,
+                                     image.info.size.width,
+                                     image.info.size.height,
+                                     image.info.resources.layers,
+                                     static_cast<u32>(image.info.pixel_format),
+                                     image.info.props.is_depth != 0,
+                                     image.info.props.is_tiled != 0,
+                                     dc_layout_before};
+                }
+            }
             image.usage.storage |= is_storage;
             image.usage.texture |= !is_storage;
 
