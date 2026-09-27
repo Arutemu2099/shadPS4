@@ -1,11 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
+#include <cstdlib>
 #include "common/alignment.h"
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/memory_patcher.h"
+#include "common/path_util.h"
 #include "common/sha1.h"
 #include "common/string_util.h"
 #include "core/aerolib/aerolib.h"
@@ -170,6 +173,22 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             ASSERT_MSG(result == ORBIS_OK, "Failed to map segment at {:#x} for module {}",
                        segment_vaddr, name);
             elf.LoadSegment(segment_vaddr, phdr.p_offset, phdr.p_filesz);
+            // SHADPS4_DUMP_MODULE_SEGMENTS=1 (diagnostic, default off): write each loaded segment as
+            // the file holds it (before instruction patching and relocation) to
+            // log/segment_<module>_<address>.bin, for offline disassembly without the red-zone jmps.
+            static const bool dump_segments = [] {
+                const char* env = std::getenv("SHADPS4_DUMP_MODULE_SEGMENTS");
+                return env != nullptr && env[0] == '1';
+            }();
+            if (dump_segments && phdr.p_filesz != 0) {
+                const auto path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) /
+                                  fmt::format("segment_{}_{:x}.bin", name, segment_vaddr);
+                if (std::FILE* file = std::fopen(path.string().c_str(), "wb")) {
+                    std::fwrite(reinterpret_cast<const void*>(segment_vaddr), 1, phdr.p_filesz, file);
+                    std::fclose(file);
+                }
+                LOG_INFO(Core_Linker, "segment dump {} size {:#x}", path.string(), phdr.p_filesz);
+            }
         }
         if (info.num_segments < 4) {
             auto& segment = info.segments[info.num_segments++];
