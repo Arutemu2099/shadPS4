@@ -551,6 +551,15 @@ public:
     /// Draws recorded since the last submission, and in the last submitted batch (diagnostic).
     void NoteDraw() noexcept {
         ++batch_draws;
+        ++batch_ops;
+    }
+    /// Draws plus dispatches recorded since the last submission of any kind (SHADPS4_FLUSH_EVERY_OPS);
+    /// NoteDraw counts direct draws, NoteOp dispatches and indirect draws.
+    void NoteOp() noexcept {
+        ++batch_ops;
+    }
+    [[nodiscard]] u32 BatchOps() const noexcept {
+        return batch_ops;
     }
     [[nodiscard]] u32 LastBatchDraws() const noexcept {
         return last_batch_draws;
@@ -617,6 +626,7 @@ private:
     void SubmitExecutionAsync(SubmitInfo& info);
     u32 batch_draws = 0;
     u32 last_batch_draws = 0;
+    u32 batch_ops = 0;
     MasterSemaphore master_semaphore;
     CommandPool command_pool;
     DynamicState dynamic_state;

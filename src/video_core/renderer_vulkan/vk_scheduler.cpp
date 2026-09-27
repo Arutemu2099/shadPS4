@@ -353,6 +353,7 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
     }
     const u32 draws = batch_draws;
     batch_draws = 0;
+    batch_ops = 0;
     recording_worker->Record([this, info, signal_value, draws]() mutable {
         if (batch_timer) {
             batch_timer->End(current_cmdbuf, signal_value, draws);
@@ -445,6 +446,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     const u64 signal_value = master_semaphore.NextTick();
     last_batch_draws = batch_draws;
     batch_draws = 0;
+    batch_ops = 0;
 
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();

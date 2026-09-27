@@ -88,6 +88,21 @@ const bool g_hair_stencil_trace = EnvExactly1("SHADPS4_HAIR_STENCIL_TRACE");
 const bool g_replace_op_reference = EnvExactly1("SHADPS4_STENCIL_REPLACE_OP");
 } // namespace
 
+// SHADPS4_FLUSH_EVERY_OPS=N: submit once N draws + dispatches have been recorded since the last
+// submission of any kind (a fault flush resets the count too). A readback copy runs after
+// everything submitted before it; measured 2026-09-27 in the fire scene's slow mode, readbacks
+// queued behind ~5 ms batches. SHADPS4_FLUSH_EVERY_DRAWS counts draws only and is not reset by
+// other flushes. 0 (default) = off. Runs on the command processor thread that records.
+static void MaybeFlushEveryOps(Scheduler& scheduler) {
+    static const u32 flush_every_ops = [] {
+        const char* value = std::getenv("SHADPS4_FLUSH_EVERY_OPS");
+        return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0u;
+    }();
+    if (flush_every_ops != 0 && scheduler.BatchOps() >= flush_every_ops) {
+        scheduler.Flush();
+    }
+}
+
 // Shape-only diagnostic; enable for one run, then compile it out for FPS comparisons.
 #ifndef SHADPS4_BINDING_PROBE
 #define SHADPS4_BINDING_PROBE 0
@@ -948,6 +963,7 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
         ++early_flushes;
         scheduler.Flush();
     }
+    MaybeFlushEveryOps(scheduler);
 
     Common::FaultMonitor::CountDrawTail(Common::FaultMonitor::DiffNs(t_entry, t_pipeline) +
                                             Common::FaultMonitor::DiffNs(t_prepare, t_bindres),
@@ -1046,8 +1062,10 @@ void Rasterizer::DrawIndirectTail(const GraphicsPipeline* pipeline, bool is_inde
         }
     });
     DebugState.IncDrawCall();
+    scheduler.NoteOp();
 
     ResetBindings();
+    MaybeFlushEveryOps(scheduler);
 }
 
 void Rasterizer::DispatchDirect() {
@@ -1093,11 +1111,13 @@ void Rasterizer::DispatchDirectTail(const ComputePipeline* pipeline) {
         cmdbuf.dispatch(x, y, z);
     });
     DebugState.IncDispatch();
+    scheduler.NoteOp();
 
     ResetBindings();
     if (buffer_cache.TakeReadbackFlushRequest()) {
         scheduler.Flush();
     }
+    MaybeFlushEveryOps(scheduler);
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
@@ -1143,8 +1163,10 @@ void Rasterizer::DispatchIndirectTail(const ComputePipeline* pipeline, VAddr add
             cmdbuf.dispatchIndirect(buffer, base);
         });
     DebugState.IncDispatch();
+    scheduler.NoteOp();
 
     ResetBindings();
+    MaybeFlushEveryOps(scheduler);
 }
 
 u64 Rasterizer::Flush() {
