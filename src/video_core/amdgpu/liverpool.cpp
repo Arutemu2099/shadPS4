@@ -1901,6 +1901,129 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb, bool is_ind
     FIBER_EXIT;
 }
 
+
+namespace {
+/// SHADPS4_DISPATCH_SYNC_STATS=1 (diagnostic, default off, front thread only): for every dispatch,
+/// which guest sync-type packets the same queue issued since its previous dispatch. Decides whether
+/// the game orders its back-to-back compute dispatches itself (CS_PARTIAL_FLUSH / ACQUIRE_MEM /
+/// RELEASE_MEM / WAIT_REG_MEM) or relies on GCN overlapping them (2026-09-27, fire particles).
+struct DispatchSyncStats {
+    enum Bit : u32 {
+        EvCsFlush = 1u << 0,
+        EvCacheFlush = 1u << 1,
+        EvOther = 1u << 2,
+        Acquire = 1u << 3,
+        Release = 1u << 4,
+        WaitReg = 1u << 5,
+        Dma = 1u << 6,
+        WriteData = 1u << 7,
+        EopEos = 1u << 8,
+        Draw = 1u << 9,
+        Count = 10
+    };
+    bool enabled = [] {
+        const char* v = std::getenv("SHADPS4_DISPATCH_SYNC_STATS");
+        return v && v[0] == '1';
+    }();
+    std::array<u32, 65> since{};          // per queue key: bits seen since its last dispatch
+    std::array<bool, 65> had_dispatch{};  // queue key has dispatched before
+    std::array<std::array<u64, Count>, 2> bit_hits{}; // [gfx=0/asc=1][bit]
+    std::array<u64, 2> dispatches{}, back_to_back{}, first{};
+    std::array<u64, 64> ev_types{};
+    u64 total{};
+
+    void Note(u32 key, PM4ItOpcode op, const PM4Header* header) {
+        if (!enabled) {
+            return;
+        }
+        u32 bit = 0;
+        switch (op) {
+        case PM4ItOpcode::EventWrite: {
+            const auto type =
+                static_cast<u32>(reinterpret_cast<const PM4CmdEventWrite*>(header)->event_type.Value());
+            ++ev_types[type & 63];
+            bit = type == static_cast<u32>(EventType::CsPartialFlush) ? EvCsFlush
+                  : (type == static_cast<u32>(EventType::CacheFlush) ||
+                     type == static_cast<u32>(EventType::CacheFlushTs))
+                      ? EvCacheFlush
+                      : EvOther;
+            break;
+        }
+        case PM4ItOpcode::AcquireMem:
+            bit = Acquire;
+            break;
+        case PM4ItOpcode::ReleaseMem:
+            bit = Release;
+            break;
+        case PM4ItOpcode::WaitRegMem:
+            bit = WaitReg;
+            break;
+        case PM4ItOpcode::DmaData:
+            bit = Dma;
+            break;
+        case PM4ItOpcode::WriteData:
+            bit = WriteData;
+            break;
+        case PM4ItOpcode::EventWriteEop:
+        case PM4ItOpcode::EventWriteEos:
+            bit = EopEos;
+            break;
+        case PM4ItOpcode::DrawIndex2:
+        case PM4ItOpcode::DrawIndexAuto:
+        case PM4ItOpcode::DrawIndexOffset2:
+        case PM4ItOpcode::DrawIndexIndirect:
+        case PM4ItOpcode::DrawIndirect:
+        case PM4ItOpcode::DrawIndexIndirectMulti:
+            bit = Draw;
+            break;
+        case PM4ItOpcode::DispatchDirect:
+        case PM4ItOpcode::DispatchIndirect: {
+            const u32 q = key == 64 ? 0 : 1;
+            ++dispatches[q];
+            if (!had_dispatch[key]) {
+                had_dispatch[key] = true;
+                ++first[q];
+            } else if (since[key] == 0) {
+                ++back_to_back[q];
+            } else {
+                for (u32 b = 0; b < Count; ++b) {
+                    bit_hits[q][b] += (since[key] >> b) & 1;
+                }
+            }
+            since[key] = 0;
+            if ((++total & 0x7fff) == 0) {
+                Log();
+            }
+            return;
+        }
+        default:
+            return;
+        }
+        since[key] |= bit;
+    }
+
+    void Log() const {
+        std::string ev;
+        for (u32 t = 0; t < 64; ++t) {
+            if (ev_types[t]) {
+                ev += fmt::format(" {}:{}", t, ev_types[t]);
+            }
+        }
+        for (u32 q = 0; q < 2; ++q) {
+            const auto& h = bit_hits[q];
+            LOG_INFO(Render,
+                     "DispatchSync: queue={} dispatches={} back_to_back={} first={} with_sync: "
+                     "cs_flush={} cache_flush={} ev_other={} acquire={} release={} wait_reg={} "
+                     "dma={} write_data={} eop_eos={} draw={}",
+                     q ? "asc" : "gfx", dispatches[q], back_to_back[q], first[q], h[0], h[1], h[2],
+                     h[3], h[4], h[5], h[6], h[7], h[8], h[9]);
+        }
+        LOG_INFO(Render, "DispatchSync: event types (type:count){}", ev);
+    }
+};
+DispatchSyncStats g_dispatch_sync;
+} // namespace
+
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
     FIBER_ENTER(dcb_task_name);
     // Everything the guest wrote before this submission is now due (submit_epoch.h). An indirect
@@ -1949,6 +2072,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
+            g_dispatch_sync.Note(64, opcode, header);
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 // Flip IRQ and guest markers are back work; the body is in ExecuteGfxPacket.
@@ -2768,6 +2892,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+        g_dispatch_sync.Note(vqid & 63, opcode, header);
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
