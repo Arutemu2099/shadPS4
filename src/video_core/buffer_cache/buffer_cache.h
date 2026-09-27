@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <unordered_map>
 #include <vector>
 #include <boost/container/small_vector.hpp>
 #include "common/lru_cache.h"
@@ -313,6 +314,15 @@ private:
 
 public:
     /// True once per GPU write into a recently read-back 1 MB slot since the last call.
+    /// SHADPS4_READ_PRODUCER_STATS=1 (diagnostic, CP back thread): the shader (pgm hash) whose
+    /// buffer binding last wrote each 64 KiB window, and per read fault a histogram of those
+    /// producers ("0" = written by no tracked shader binding, e.g. CP DMA or images).
+    void SetDiagProducer(u64 pgm_hash) {
+        diag_producer = pgm_hash;
+    }
+    static bool ReadProducerStatsEnabled();
+    void NoteDiagRead(VAddr addr);
+
     bool TakeReadbackFlushRequest() {
         return std::exchange(readback_flush_requested, false);
     }
@@ -437,6 +447,10 @@ private:
     /// measure whether readback data is already complete when a fault asks for it.
     std::unique_ptr<u64[]> producer_ticks;
     void NoteGpuWrite(VAddr addr, u64 size);
+    u64 diag_producer{};
+    std::unordered_map<u64, u64> diag_window_writer;
+    std::unordered_map<u64, u64> diag_read_hist;
+    u64 diag_reads{};
     struct WrittenMemoEntry {
         VAddr addr{};
         u64 size{};

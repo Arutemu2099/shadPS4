@@ -1258,6 +1258,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             // Split measured because BindResources is 6.8 us of the 8.0 us spent per draw - 85% -
             // and a stack scan could not tell these two apart from anything else.
             const auto t_buf = Common::FaultMonitor::Now();
+            if (VideoCore::BufferCache::ReadProducerStatsEnabled()) [[unlikely]] {
+                buffer_cache.SetDiagProducer(stage->pgm_hash);
+            }
             BindBuffers(bound, binding, push_data);
             const auto t_tex = Common::FaultMonitor::Now();
             if (tex_bind_memo) {
@@ -1271,6 +1274,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         uses_dma |= stage->uses_dma;
     }
     native_bound_count = binding.unified;
+    if (VideoCore::BufferCache::ReadProducerStatsEnabled()) [[unlikely]] {
+        buffer_cache.SetDiagProducer(0); // Later written bindings (DMA, HLE, fills): untracked.
+    }
     if (bind_memo_stats) {
         BindMemoEndDraw(pipeline->IsCompute(), memo_draw_bits);
     }

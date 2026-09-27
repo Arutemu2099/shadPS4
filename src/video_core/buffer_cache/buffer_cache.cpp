@@ -845,6 +845,8 @@ void BufferCache::ResolveFaultSync(VAddr device_addr, u64 size, bool is_write,
                                    Offload::Origin origin) {
     if (is_write) {
         NoteWriteFaultOverlap(device_addr, size);
+    } else {
+        NoteDiagRead(device_addr);
     }
     const auto [settle_addr, settle_size] = FaultSettleSpan(device_addr, size, is_write);
     SettleOverlappingJobs(settle_addr, settle_size);
@@ -933,6 +935,9 @@ void BufferCache::ReleaseFaultStaging(std::unique_ptr<Buffer> staging) {
 
 BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u64 size,
                                                            bool is_write) {
+    if (!is_write) {
+        NoteDiagRead(device_addr);
+    }
     ASSERT_MSG(!is_write || g_write_fault_offload,
                "Write faults use the readback offload only with SHADPS4_WRITE_FAULT_OFFLOAD");
     if (is_write) {
@@ -1446,8 +1451,40 @@ bool BufferCache::BatchWritesAny(std::span<const FaultCopy> copies) {
     return false;
 }
 
+bool BufferCache::ReadProducerStatsEnabled() {
+    static const bool enabled = EnvIs1("SHADPS4_READ_PRODUCER_STATS");
+    return enabled;
+}
+
+void BufferCache::NoteDiagRead(VAddr addr) {
+    if (!ReadProducerStatsEnabled()) {
+        return;
+    }
+    const auto it = diag_window_writer.find(addr >> 16);
+    const u64 producer = it == diag_window_writer.end() ? 0 : it->second;
+    ++diag_read_hist[producer];
+    if ((++diag_reads & 0x3ff) != 0) {
+        return;
+    }
+    std::vector<std::pair<u64, u64>> top(diag_read_hist.begin(), diag_read_hist.end());
+    std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::string line;
+    for (size_t i = 0; i < std::min<size_t>(top.size(), 10); ++i) {
+        line += fmt::format(" {:#x}={}", top[i].first, top[i].second);
+    }
+    LOG_INFO(Render, "ReadProducer: {} read faults, {} producers, windows tracked {}; top:{}", diag_reads,
+             top.size(), diag_window_writer.size(), line);
+}
+
 void BufferCache::NoteGpuWrite(VAddr addr, u64 size) {
     NoteBatchWrite(addr, size);
+    if (ReadProducerStatsEnabled() && size != 0) [[unlikely]] {
+        const u64 first = addr >> 16;
+        const u64 last = std::min((addr + size - 1) >> 16, first + 1023);
+        for (u64 w = first; w <= last; ++w) {
+            diag_window_writer[w] = diag_producer;
+        }
+    }
     if ((!ProducerStatsEnabled() && !readback_queue && !EarlyFlushEnabled()) || size == 0 ||
         PreciseProducerEnabled()) {
         return;
