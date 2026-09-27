@@ -1322,16 +1322,17 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     if (g_draw_cost) {
         dc_lap(DcRecordTail);
         NoteDrawCost(pipeline, dc);
-        // ~50 us at ~3.5 GHz TSC: log where a slow texture phase went (first 40 draws).
-        static thread_local u32 slow_logged = 0;
-        if (dc[DcBindTextures] > 175000 && slow_logged < 40) {
-            ++slow_logged;
-            u64 fs = 0;
+        // ~50 us at ~3.5 GHz TSC: log where a slow texture phase went (first 5 per shader).
+        static thread_local std::unordered_map<u64, u32> slow_logged;
+        u64 fs = 0;
+        if (dc[DcBindTextures] > 175000) {
             for (const auto* stage : pipeline->GetStages()) {
                 if (stage && stage->l_stage == Shader::LogicalStage::Fragment) {
                     fs = stage->pgm_hash;
                 }
             }
+        }
+        if (dc[DcBindTextures] > 175000 && slow_logged[fs]++ < 5) {
             const auto& si = g_dc_slow_img;
             LOG_INFO(Render_Vulkan,
                      "DrawCostSlowTex: fs_{:08x} tex={} cyc first_pass={} find_texture={} "
