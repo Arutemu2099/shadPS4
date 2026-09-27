@@ -25,6 +25,7 @@
 #include "core/memory.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/split_hazard.h"
+#include "video_core/buffer_cache/dirty_epoch.h"
 #include "video_core/host_shaders/neo_id_derive_comp.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -120,6 +121,33 @@ thread_local u64 g_dc_bind_tex = 0;
 thread_local std::array<std::array<u64, 5>, 2> g_bb_cyc{};
 thread_local std::array<u64, 2> g_bb_n{};
 thread_local u64 g_bb_special_n = 0;
+// Repeat census for read bindings (DRAW_COST): same (buffer, base, size) already bound since the
+// last scheduler tick change (= submission), and whether the dirty epoch is unchanged since then.
+thread_local u64 g_rep_total = 0;
+thread_local u64 g_rep_hit = 0;
+thread_local u64 g_rep_hit_clean = 0;
+thread_local u64 g_rep_distinct = 0;
+void NoteReadBindingRepeat(u64 tick, u32 buffer_id, u64 base, u64 size) {
+    thread_local u64 last_tick = 0;
+    thread_local std::unordered_map<u64, u64> seen; // key -> dirty epoch at first bind
+    if (tick != last_tick) {
+        g_rep_distinct += seen.size();
+        seen.clear();
+        last_tick = tick;
+    }
+    const u64 key = (base * 0x9E3779B97F4A7C15ULL) ^ (size << 20) ^ buffer_id;
+    const u64 epoch = VideoCore::g_dirty_epoch.load(std::memory_order_relaxed);
+    ++g_rep_total;
+    const auto [it, inserted] = seen.try_emplace(key, epoch);
+    if (!inserted) {
+        ++g_rep_hit;
+        if (it->second == epoch) {
+            ++g_rep_hit_clean;
+        } else {
+            it->second = epoch;
+        }
+    }
+}
 thread_local u64 g_dc_disp_cyc = 0; // ExecuteDispatch on the back (direct + indirect)
 thread_local u64 g_dc_disp_n = 0;
 // Inside BindTextures (DRAW_COST only): [0] first pass (FindImage per binding), [1] FindTexture
@@ -245,6 +273,13 @@ void NoteDrawCost(const GraphicsPipeline* pipeline, const std::array<u64, DcCoun
                  100.0 * double(c[0] + c[1] + c[2] + c[3] + c[4]) * ns_per_cyc / wall_ns);
     }
     LOG_INFO(Render_Vulkan, "DrawCost: special (non-cache) buffer bindings {}", g_bb_special_n);
+    LOG_INFO(Render_Vulkan,
+             "DrawCost: read-binding repeats within a submission: {} of {} ({:.1f}%), with no dirty-epoch "
+             "change since the previous bind {} ({:.1f}%); distinct per submission (summed) {}",
+             g_rep_hit, g_rep_total, 100.0 * double(g_rep_hit) / double(std::max<u64>(g_rep_total, 1)),
+             g_rep_hit_clean, 100.0 * double(g_rep_hit_clean) / double(std::max<u64>(g_rep_total, 1)),
+             g_rep_distinct);
+    g_rep_total = g_rep_hit = g_rep_hit_clean = g_rep_distinct = 0;
     g_bb_cyc = {};
     g_bb_n = {};
     g_bb_special_n = 0;
@@ -3248,6 +3283,10 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
                 g_bb_cyc[w][3] += obtain > walk + rest ? obtain - walk - rest : 0;
                 g_bb_cyc[w][4] += __rdtsc() - bb_t1;
                 ++g_bb_n[w];
+                if (!w) {
+                    NoteReadBindingRepeat(scheduler.CurrentTick(), buffer_id.index,
+                                          vsharp.base_address, size);
+                }
             }
         }
         if (g_draw_cost && !buffer_id) {
