@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/fault_monitor.h"
@@ -234,6 +236,15 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
     return 0;
 }
 
+/// SHADPS4_VO_EARLY_RELEASE=1 (see SubmitFlipInternal).
+static bool VoEarlyRelease() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_VO_EARLY_RELEASE");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
 void VideoOutDriver::Flip(const Request& req) {
     // Update HDR status before presenting.
     presenter->SetHDR(req.port->is_hdr);
@@ -272,8 +283,10 @@ void VideoOutDriver::Flip(const Request& req) {
         }
     }
 
-    // Reset prev flip label
-    if (port->prev_index != -1) {
+    // Reset prev flip label. With VO_EARLY_RELEASE it was released at submission, and the guest
+    // may already have re-armed it for its next frame (label = 1 before that flip's IRQ):
+    // resetting it here would trip the "Out of order flip IRQ" assert.
+    if (!VoEarlyRelease() && port->prev_index != -1) {
         port->buffer_labels[port->prev_index] = 0;
         port->SignalVoLabel();
     }
@@ -328,6 +341,17 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         ASSERT_MSG(buffer.group_index >= 0, "Trying to flip an unregistered buffer!");
         const auto& group = port->groups[buffer.group_index];
         frame = presenter->PrepareFrame(group, buffer.address_left);
+        // SHADPS4_VO_EARLY_RELEASE=1: the presenter shows its own copy of the guest display
+        // buffer, and PrepareFrame has just recorded that copy on the draw scheduler, ahead of
+        // any later guest rendering into the buffer. So the buffer is free for the guest now,
+        // not when the next flip is presented: its label (which the guest's command buffers wait
+        // on before rendering into it) is released here. With the title's two display buffers
+        // this turns "frame N+2 waits until N+1 is presented" into no wait. Flip status, flip
+        // and vblank events are unchanged.
+        if (VoEarlyRelease()) {
+            port->buffer_labels[index] = 0;
+            port->SignalVoLabel();
+        }
     }
 
     std::scoped_lock lock{mutex};
