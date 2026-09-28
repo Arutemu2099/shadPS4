@@ -352,7 +352,11 @@ static u64 GetGpuClock64() {
 /// previous timestamp written anywhere. inFAMOUS Second Son measures its particle draw time on the
 /// GPU and switches to a lower-resolution particle buffer when it is "too long" (GDC 2014 particle
 /// talk, slide 62); here these values are CP-time host clocks.
+/// SHADPS4_TIMESTAMP_READER=1 (diagnostic, Windows): find the guest code that reads the timestamp.
+void ArmTimestampReaderProbe(const void* address);
+
 inline void NoteGpuTimestamp(const void* address, u64 value, const char* kind) {
+    ArmTimestampReaderProbe(address);
     static const bool enabled = [] {
         const char* v = std::getenv("SHADPS4_GPU_TIMESTAMP_STATS");
         return v && v[0] == '1';

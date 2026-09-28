@@ -794,3 +794,51 @@ template void PageManager::UpdatePageWatchersForRegion<false, false>(VAddr base_
                                                                      RegionBits& mask) const;
 
 } // namespace VideoCore
+
+#ifdef _WIN32
+namespace AmdGpu {
+// SHADPS4_TIMESTAMP_READER=1 (diagnostic, see pm4_cmds.h NoteGpuTimestamp): after a guest GPU-timestamp
+// label write, a one-shot PAGE_GUARD is ORed into that page's current protection (the emulator's own
+// protection is restored by Windows when the guard fires). The first access raises a guard violation,
+// logged here with the faulting RIP when it is guest code (eboot 0x800000000..0x800cc8000).
+static LONG CALLBACK TimestampGuardHandler(EXCEPTION_POINTERS* ep) {
+    if (ep->ExceptionRecord->ExceptionCode != STATUS_GUARD_PAGE_VIOLATION) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const u64 rip = ep->ContextRecord->Rip;
+    const u64 addr = ep->ExceptionRecord->ExceptionInformation[1];
+    const bool write = ep->ExceptionRecord->ExceptionInformation[0] == 1;
+    static std::atomic<u64> guest{0}, other{0};
+    if (rip >= 0x800000000ULL && rip < 0x800cc8000ULL) {
+        const u64 n = guest.fetch_add(1, std::memory_order_relaxed);
+        if (n < 400 || (n & 0x3ff) == 0) {
+            LOG_INFO(Render, "TimestampReader: n={} exe_off={:#x} addr={:#x} write={} tid={} other={}",
+                     n, rip - 0x800000000ULL, addr, write, GetCurrentThreadId(), other.load());
+        }
+    } else {
+        other.fetch_add(1, std::memory_order_relaxed);
+    }
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+void ArmTimestampReaderProbe(const void* address) {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SHADPS4_TIMESTAMP_READER");
+        return v && v[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    static std::once_flag once;
+    std::call_once(once, [] { AddVectoredExceptionHandler(1, TimestampGuardHandler); });
+    void* page = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(address) & ~uintptr_t{4095});
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(page, &mbi, sizeof(mbi)) == 0 || (mbi.Protect & PAGE_GUARD) ||
+        (mbi.Protect & (PAGE_NOACCESS | PAGE_EXECUTE)) != 0) {
+        return;
+    }
+    DWORD old{};
+    VirtualProtect(page, 4096, mbi.Protect | PAGE_GUARD, &old);
+}
+} // namespace AmdGpu
+#endif
