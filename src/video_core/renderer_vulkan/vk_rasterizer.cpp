@@ -1391,6 +1391,10 @@ void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
         s_prev_end_seq[s] = scheduler.RecordSeqOf(s);
         s_prev_end_batch[s] = StreamBatchId(s);
         if (s == 1) {
+            // Stamp the dispatch's ASC accesses with the segment that holds its tail.
+            const u64 asc_value = scheduler.OpenAscValue();
+            ASSERT(asc_value != 0 || buffer_cache.pending_asc.empty());
+            buffer_cache.StampPendingAsc(asc_value);
             ++asc_dispatches;
             if ((asc_dispatches & 0xffff) == 0) {
                 LOG_INFO(Render_Vulkan,
@@ -3524,6 +3528,13 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
             if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
                 const auto* gds_buf = buffer_cache.GetGdsBuffer();
                 gds_buf->NoteMainAccess(scheduler.CurrentTick(), true);
+                if (VideoCore::g_record_stream == 0) {
+                    gds_buf->CheckMainVsAsc(gds_buf->CpuAddr(), gds_buf->SizeBytes(), true);
+                } else if (VideoCore::BufferCache::AscDepsEnabled()) {
+                    buffer_cache.pending_asc.push_back({VideoCore::BufferId{}, gds_buf,
+                                                        gds_buf->CpuAddr(), gds_buf->SizeBytes(),
+                                                        true});
+                }
                 buffer_infos.emplace_back(gds_buf->Handle(), 0, gds_buf->SizeBytes());
                 bound_buffer = gds_buf;
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {

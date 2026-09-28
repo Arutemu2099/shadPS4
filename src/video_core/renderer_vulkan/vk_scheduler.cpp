@@ -300,6 +300,42 @@ void Scheduler::Wait(u64 tick) {
     }
 }
 
+u64 Scheduler::AscMainWaitValue(bool no_i1) {
+    // SHADPS4_ASC_I1 (notes/asc-i1-relax-design-2026-09-28.md): unset/1 -> I1, the last ASC value
+    // submitted; 2 -> I1 plus counters of the precise value; 0 -> the precise value only: the
+    // newest unretired ASC segment an access recorded in this batch depends on (RAW/WAR/WAW),
+    // always <= the value just submitted by SubmitAscSegment, so never an unsubmitted value.
+    static const char mode = [] {
+        const char* value = std::getenv("SHADPS4_ASC_I1");
+        return value ? value[0] : '1';
+    }();
+    const u64 last = asc_last_submitted.load(std::memory_order_relaxed);
+    const u64 precise = std::min(VideoCore::g_main_wait_asc, last);
+    VideoCore::g_main_wait_asc = 0;
+    asc_semaphore->Refresh();
+    VideoCore::g_asc_known = asc_semaphore->KnownGpuTick();
+    // The batch being flushed took the tick NextTick() is about to return; accesses from now on
+    // belong to the next one (+1). Only the falsifier reads it.
+    VideoCore::g_asc_open_tick = master_semaphore.CurrentTick() + 1;
+    if (mode == '0' || mode == '2') {
+        static u64 flushes = 0, i1_waits = 0, precise_waits = 0;
+        ++flushes;
+        i1_waits += last > asc_waited_by_main && last > VideoCore::g_asc_known;
+        precise_waits += precise > asc_waited_by_main && precise > VideoCore::g_asc_known;
+        if ((flushes & 0xffff) == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "AscDeps: mode={} main_flushes={} i1_unfinished_waits={} precise_waits={} "
+                     "slow_checks={} hook_miss={} whole_buffers={}",
+                     mode, flushes, i1_waits, precise_waits, VideoCore::g_asc_dep_slow,
+                     VideoCore::g_asc_hook_miss, VideoCore::g_asc_whole_buffers);
+        }
+    }
+    if (no_i1) {
+        return 0;
+    }
+    return mode == '0' ? precise : last;
+}
+
 void Scheduler::WaitMain(u64 tick) {
     if (tick >= master_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
@@ -377,11 +413,12 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
             const char* value = std::getenv("SHADPS4_ASC_NO_I1");
             return value && value[0] == '1';
         }();
-        if (!no_i1 && asc_last_submitted > asc_waited_by_main) {
+        const u64 need = AscMainWaitValue(no_i1);
+        if (need > asc_waited_by_main) {
             // Wait masks are per index (index 1 = colour output): only index 0 or 2 is AllCommands.
             ASSERT(info.num_wait_semas != 1);
-            info.AddWait(asc_semaphore->Handle(), asc_last_submitted);
-            asc_waited_by_main = asc_last_submitted;
+            info.AddWait(asc_semaphore->Handle(), need);
+            asc_waited_by_main = need;
         }
     }
     const u64 signal_value = master_semaphore.NextTick();
@@ -526,9 +563,10 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     DrainRecording();
     if (asc_enabled) {
         SubmitAscSegment(); // Drained: runs on this thread.
-        if (asc_last_submitted > asc_waited_by_main) {
-            info.AddWait(asc_semaphore->Handle(), asc_last_submitted);
-            asc_waited_by_main = asc_last_submitted;
+        const u64 need = AscMainWaitValue(false);
+        if (need > asc_waited_by_main) {
+            info.AddWait(asc_semaphore->Handle(), need);
+            asc_waited_by_main = need;
         }
     }
     if (recording_worker && ++recording_submits % 1000 == 0) {

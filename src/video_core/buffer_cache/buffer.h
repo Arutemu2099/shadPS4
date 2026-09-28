@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdlib>
 #include <memory>
@@ -10,6 +11,7 @@
 #include <utility>
 #include <vector>
 #include "common/fault_monitor.h"
+#include "common/logging/log.h"
 #include "common/types.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/resource.h"
@@ -19,6 +21,16 @@ namespace VideoCore {
 /// SHADPS4_ASC_STREAM: the command stream being recorded (0 main, 1 ASC); CP thread only.
 /// Buffer barrier state is kept per stream (Buffer::SelectStreamState).
 inline u32 g_record_stream = 0;
+/// SHADPS4_ASC_I1 (CP thread): the ASC semaphore's known value, refreshed at each main flush,
+/// and the newest ASC value the open main batch depends on (precise replacement for I1).
+inline u64 g_asc_known = 0;
+inline u64 g_main_wait_asc = 0;
+inline u64 g_asc_dep_slow = 0;
+/// SHADPS4_ASC_I1 completeness falsifier: the open main tick (set at each flush) and misses.
+inline bool g_asc_deps_active = false;
+inline u64 g_asc_open_tick = 0;
+inline u64 g_asc_hook_miss = 0;
+inline u64 g_asc_whole_buffers = 0;
 } // namespace VideoCore
 
 namespace Vulkan {
@@ -157,6 +169,16 @@ public:
     std::optional<vk::BufferMemoryBarrier2> GetBarrier(vk::AccessFlags2 dst_acess_mask,
                                                        vk::PipelineStageFlagBits2 dst_stage,
                                                        u32 offset = 0, u64 run = 0) {
+        if (g_asc_deps_active && g_record_stream == 0 && asc_log &&
+            asc_log->touch > g_asc_known && asc_checked_tick != g_asc_open_tick) [[unlikely]] {
+            // A main access to a Buffer with unretired ASC work that no dependency check saw in
+            // this batch (design sec. 3.5): the batch may not wait the ASC segment it needs.
+            const u64 n = ++g_asc_hook_miss;
+            if ((n & (n - 1)) == 0) {
+                LOG_CRITICAL(Render_Vulkan, "AscHookMiss: Buffer {:#x}+{:#x} (n={})", cpu_addr,
+                             size_bytes, n);
+            }
+        }
         SelectStreamState();
         if (SmartBarriers()) {
             return GetHazardBarrier(dst_acess_mask, vk::PipelineStageFlags2{dst_stage}, offset,
@@ -391,6 +413,82 @@ public:
         }
     }
 
+    /// SHADPS4_ASC_I1 (notes/asc-i1-relax-design-2026-09-28.md sec. 3): what the ASC stream
+    /// accessed, keyed by ASC value, so a later main access can wait exactly the segment it
+    /// depends on (RAW / WAR / WAW) instead of I1's blanket wait. CP thread only.
+    struct AscLog {
+        struct Entry {
+            VAddr lo;
+            VAddr hi;
+            bool write;
+            u64 value;
+        };
+        std::vector<Entry> entries;
+        u64 touch = 0; ///< newest ASC value that accessed any part
+        u64 write = 0; ///< newest ASC value that wrote any part
+        bool whole = false;
+    };
+    mutable std::unique_ptr<AscLog> asc_log;
+    void NoteAscAccess(VAddr lo, u64 size, bool write, u64 value) const {
+        if (!asc_log) {
+            asc_log = std::make_unique<AscLog>();
+        }
+        auto& log = *asc_log;
+        if (log.touch <= g_asc_known) {
+            // Everything logged has retired: start clean (a whole fallback does not stick).
+            log.entries.clear();
+            g_asc_whole_buffers -= log.whole;
+            log.whole = false;
+        }
+        log.touch = std::max(log.touch, value);
+        if (write) {
+            log.write = std::max(log.write, value);
+        }
+        if (log.whole) {
+            return;
+        }
+        // Drop retired entries, then merge an identical range (raise its value).
+        const u64 known = g_asc_known;
+        std::erase_if(log.entries, [known](const AscLog::Entry& e) { return e.value <= known; });
+        const VAddr hi = lo + size;
+        for (auto& e : log.entries) {
+            if (e.lo == lo && e.hi == hi && e.write == write) {
+                e.value = std::max(e.value, value);
+                return;
+            }
+        }
+        if (log.entries.size() >= 256) {
+            log.whole = true; // fall back to the per-Buffer values (conservative)
+            ++g_asc_whole_buffers;
+            return;
+        }
+        log.entries.push_back({lo, hi, write, value});
+    }
+    /// Main access check: raises g_main_wait_asc to the newest unretired ASC value this access
+    /// depends on (RAW: ASC wrote; WAR: main writes what ASC read; WAW).
+    mutable u64 asc_checked_tick = ~0ULL;
+    void CheckMainVsAsc(VAddr lo, u64 size, bool write) const {
+        asc_checked_tick = g_asc_open_tick;
+        if (!asc_log || asc_log->touch <= g_asc_known) {
+            return;
+        }
+        if (!write && asc_log->write <= g_asc_known) {
+            return;
+        }
+        ++g_asc_dep_slow;
+        const auto& log = *asc_log;
+        if (log.whole) {
+            g_main_wait_asc = std::max(g_main_wait_asc, write ? log.touch : log.write);
+            return;
+        }
+        const VAddr hi = lo + size;
+        for (const auto& e : log.entries) {
+            if (e.value > g_asc_known && e.lo < hi && lo < e.hi && (e.write || write)) {
+                g_main_wait_asc = std::max(g_main_wait_asc, e.value);
+            }
+        }
+    }
+
     /// SHADPS4_ASC_V2_CENSUS=2 (shadow range tracker, notes/asc-stream-v2-design-2026-09-28.md
     /// step 2): exact guest ranges the open main batch read or wrote, kept only for Buffers an
     /// ASC candidate has bound (asc_bound). Counts only; no decision uses it.
@@ -424,6 +522,9 @@ public:
         return range_log.get();
     }
     void NoteMainRange(u64 tick, bool write, VAddr lo, u64 size, u8 kind, u64 id) const {
+        if (g_record_stream == 0) {
+            CheckMainVsAsc(lo, size, write);
+        }
         MainRangeLog* log = OpenRangeLog(tick);
         if (!log || log->whole) {
             return;
@@ -453,6 +554,9 @@ public:
         log->entries.push_back({lo, hi, write, kind, id});
     }
     void NoteMainWhole(u64 tick, u8 kind) const {
+        if (g_record_stream == 0) {
+            CheckMainVsAsc(cpu_addr, size_bytes, true);
+        }
         if (MainRangeLog* log = OpenRangeLog(tick); log && !log->whole) {
             log->whole = true;
             log->whole_kind = kind;

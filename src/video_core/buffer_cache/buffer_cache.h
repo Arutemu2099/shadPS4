@@ -364,6 +364,30 @@ public:
     /// SHADPS4_ASC_RANGE=1 (needs ASC_STREAM): the ASC decision uses the open batch's exact
     /// ranges (RangeConflict) instead of the per-Buffer tick. Range notes are then always on.
     [[nodiscard]] static bool AscRangeEnabled();
+    /// SHADPS4_ASC_I1=0/2: ASC accesses of the dispatch being recorded, stamped with the
+    /// segment value after its tail (a flush inside pass 2 reopens the segment).
+    struct PendingAscAccess {
+        BufferId id;          ///< cache Buffer (ids survive slot_buffers growth)
+        const Buffer* fixed;  ///< non-slot Buffers (GDS), else null
+        VAddr lo;
+        u64 size;
+        bool write;
+    };
+    std::vector<PendingAscAccess> pending_asc;
+    void StampPendingAsc(u64 value) {
+        for (const auto& a : pending_asc) {
+            const Buffer* buffer = a.fixed;
+            if (!buffer) {
+                if (IsBufferInvalid(a.id)) {
+                    continue; // deleted: its memory is retired by R0 before reuse
+                }
+                buffer = &slot_buffers[a.id];
+            }
+            buffer->NoteAscAccess(a.lo, a.size, a.write, value);
+        }
+        pending_asc.clear();
+    }
+    [[nodiscard]] static bool AscDepsEnabled();
     /// Marks a Buffer as bound by an ASC candidate (its main accesses are noted by range).
     /// A Buffer bound for the first time in the middle of a batch has no range log for the
     /// accesses already made in it: those count as whole-Buffer (conservative).

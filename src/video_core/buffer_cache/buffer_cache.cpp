@@ -117,7 +117,16 @@ const bool g_asc_range_shadow = [] {
 const bool g_asc_census = EnvIs1("SHADPS4_ASC_V2_CENSUS") || g_asc_range_shadow;
 /// SHADPS4_ASC_RANGE=1: see BufferCache::AscRangeEnabled. Range notes feed a decision then.
 const bool g_asc_range = EnvIs1("SHADPS4_ASC_RANGE");
-const bool g_range_notes = g_asc_range_shadow || g_asc_range;
+/// SHADPS4_ASC_I1: unset/1 = I1 (every main submission waits the last ASC segment); 2 = I1 plus
+/// the precise dependency tracking in shadow (counters); 0 = precise waits only. Either turns
+/// the range notes on (the main-side checks run from them; Opus review 2026-09-28).
+const bool g_asc_deps = [] {
+    const char* value = std::getenv("SHADPS4_ASC_I1");
+    const bool on = value && (value[0] == '0' || value[0] == '2');
+    VideoCore::g_asc_deps_active = on;
+    return on;
+}();
+const bool g_range_notes = g_asc_range_shadow || g_asc_range || g_asc_deps;
 /// SHADPS4_WRITTEN_RUN_MEMO: 0 off, 1 on, 2 verify. See ObtainBuffer.
 const int g_written_run_memo = [] {
     const char* value = std::getenv("SHADPS4_WRITTEN_RUN_MEMO");
@@ -926,6 +935,15 @@ bool BufferCache::DownloadWindowMultiBuffer(VAddr window_addr, u64 window_size) 
     // Write faults reach here with 64 KiB windows; a larger explicit invalidation that exceeds the
     // staging ring would have failed in DownloadBufferMemory as well.
     ASSERT(total_size_bytes <= DownloadBufferSize);
+    for (const Part& part : parts) {
+        // A main read of each source (it was un-noted; Opus review 2026-09-28).
+        part.buffer->NoteMainAccess(scheduler.CurrentTick(), false);
+        if (g_range_notes) {
+            part.buffer->NoteMainRange(scheduler.CurrentTick(), false,
+                                       part.buffer->CpuAddr() + part.copy.srcOffset,
+                                       part.copy.size, 14, 0);
+        }
+    }
     Common::FaultMonitor::CountReadbackDownload(total_size_bytes);
     const auto [download, offset] = download_buffer.Map(total_size_bytes);
     download_buffer.Commit();
@@ -1012,6 +1030,10 @@ void BufferCache::ResolveFaultSync(VAddr device_addr, u64 size, bool is_write,
     // SHADPS4_ASC_STREAM: a CP-self fault inside an ASC dispatch runs inline; its download must be
     // ordered after main-stream producers, so record it on the main stream.
     const u32 prev_stream = scheduler.ActiveStream();
+    if (prev_stream == 1 && g_asc_deps) {
+        // The dispatch's ASC accesses so far must be visible to this fault's main accesses.
+        StampPendingAsc(scheduler.OpenAscValue());
+    }
     scheduler.SwitchStream(0);
     SCOPE_EXIT {
         scheduler.SwitchStream(prev_stream);
@@ -1340,6 +1362,12 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
             });
             scheduler.SwitchStream(0);
             const u64 asc_value = scheduler.SubmitAscSegment();
+            if (g_asc_deps) {
+                for (size_t k = 0; k < job->copies.size() && k < sources.size(); ++k) {
+                    slot_buffers[sources[k]].NoteAscAccess(job->copies[k].addr,
+                                                           job->copies[k].size, false, asc_value);
+                }
+            }
             job->tick = asc_value;
             job->on_readback_queue = true;
             job->on_asc = true;
@@ -2022,6 +2050,10 @@ bool BufferCache::AscRangeEnabled() {
     return g_asc_range;
 }
 
+bool BufferCache::AscDepsEnabled() {
+    return g_asc_deps;
+}
+
 void BufferCache::MarkAscBound(BufferId buffer_id) const {
     const Buffer& buffer = slot_buffers[buffer_id];
     if (buffer.asc_bound) {
@@ -2522,6 +2554,13 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     }
     Common::FaultMonitor::CountReadbackDownload(total_size_bytes);
     const auto [download, offset] = download_buffer.Map(total_size_bytes);
+    buffer.NoteMainAccess(scheduler.CurrentTick(), false);
+    if (g_range_notes) {
+        for (const auto& copy : copies) {
+            buffer.NoteMainRange(scheduler.CurrentTick(), false, buffer.CpuAddr() + copy.srcOffset,
+                                 copy.size, 14, 0);
+        }
+    }
     for (auto& copy : copies) {
         // Modify copies to have the staging offset in mind
         copy.dstOffset += offset;
@@ -2780,6 +2819,9 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
         return buffer;
     }();
     buffer->NoteMainAccess(scheduler.CurrentTick(), true);
+    if (is_gds && g_record_stream == 0) {
+        buffer->CheckMainVsAsc(buffer->CpuAddr(), buffer->SizeBytes(), true);
+    }
     if (g_range_notes && !is_gds) {
         buffer->NoteMainRange(scheduler.CurrentTick(), true, address, num_bytes, 8, 0);
     }
@@ -2829,6 +2871,14 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         }
         if (!dst_gds) {
             dst_buffer.NoteMainRange(scheduler.CurrentTick(), true, dst, num_bytes, 4, 0);
+        }
+    }
+    if (g_record_stream == 0) {
+        if (src_gds) {
+            src_buffer.CheckMainVsAsc(src_buffer.CpuAddr(), src_buffer.SizeBytes(), false);
+        }
+        if (dst_gds) {
+            dst_buffer.CheckMainVsAsc(dst_buffer.CpuAddr(), dst_buffer.SizeBytes(), true);
         }
     }
     const vk::BufferCopy region = {
@@ -2959,6 +3009,9 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     if (g_range_notes) {
         buffer.NoteMainRange(scheduler.CurrentTick(), is_written, device_addr, size, census_kind,
                              census_id);
+    }
+    if (g_asc_deps && g_record_stream == 1) {
+        pending_asc.push_back({buffer_id, nullptr, device_addr, size, is_written});
     }
     // SHADPS4_READ_BIND_MEMO: a read-only range is synchronized when no page of it is CPU-dirty,
     // and g_dirty_epoch is bumped after every CPU-dirty publication (the invariant the tracker's
@@ -3737,6 +3790,12 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
         // An upload is a main write of the Buffer (SynchronizeBuffersInRange reaches here without
         // any other note; Opus review 2026-09-28). Skipped on the ASC stream by NoteMainAccess.
         buffer.NoteMainAccess(scheduler.CurrentTick(), true);
+        if (g_asc_deps && g_record_stream == 1) {
+            for (const auto& copy : copies) {
+                pending_asc.push_back({page_table[buffer_start >> CACHING_PAGEBITS].buffer_id,
+                                       nullptr, buffer_start + copy.dstOffset, copy.size, true});
+            }
+        }
     }
     if (g_range_notes && total_size_bytes != 0) {
         for (const auto& copy : copies) {

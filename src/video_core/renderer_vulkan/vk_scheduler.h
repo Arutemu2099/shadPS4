@@ -411,6 +411,8 @@ public:
     void Wait(u64 tick);
     /// Main timeline only (see IsFreeMain).
     void WaitMain(u64 tick);
+    /// The ASC value the batch being flushed must wait (I1 or precise; SHADPS4_ASC_I1).
+    u64 AscMainWaitValue(bool no_i1);
 
     /// Attempts to execute operations whose tick the GPU has caught up with.
     void PopPendingOperations();
