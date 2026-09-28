@@ -15,6 +15,7 @@
 #include "common/lean.h"
 #include "common/readback_offload.h"
 #include "common/scope_exit.h"
+#include "common/thread.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -108,6 +109,7 @@ const bool g_buffer_ranges_table = [] {
     const char* value = std::getenv("SHADPS4_BUFFER_RANGES_LOCK");
     return value && value[0] == '2';
 }();
+const bool g_thread_assert = EnvIs1("SHADPS4_THREAD_ASSERT");
 /// SHADPS4_WRITTEN_RUN_MEMO: 0 off, 1 on, 2 verify. See ObtainBuffer.
 const int g_written_run_memo = [] {
     const char* value = std::getenv("SHADPS4_WRITTEN_RUN_MEMO");
@@ -3380,8 +3382,26 @@ void BufferCache::Unregister(BufferId buffer_id) {
     ChangeRegister<false>(buffer_id);
 }
 
+void BufferCache::CheckCpThread(int site) const {
+    if (!g_thread_assert || !liverpool || !liverpool->GpuThreadStarted() ||
+        liverpool->IsGpuThread()) {
+        return;
+    }
+    static std::atomic<u32> reported{0};
+    static std::atomic<u64> violations[2]{};
+    const u64 n = violations[site].fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((reported.fetch_or(1u << site, std::memory_order_relaxed) & (1u << site)) == 0) {
+        LOG_CRITICAL(Render, "ThreadAssert: buffer_ranges {} off the command processor, thread '{}'",
+                     site == 0 ? "edited (ChangeRegister)" : "walked (ForEachBufferInRange)",
+                     Common::GetCurrentThreadName());
+    } else if ((n & (n - 1)) == 0) {
+        LOG_WARNING(Render, "ThreadAssert: site {} violations={}", site, n);
+    }
+}
+
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId buffer_id) {
+    CheckCpThread(0);
     // SHADPS4_BIND_MEMO_STATS: every CreateBuffer, JoinOverlap and DeleteBuffer passes here.
     BumpStructGeneration();
     Buffer& buffer = slot_buffers[buffer_id];

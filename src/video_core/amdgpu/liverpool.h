@@ -119,6 +119,11 @@ public:
         rasterizer = rasterizer_;
     }
 
+    /// False until Process() has recorded its thread id (diagnostic checks skip startup).
+    bool GpuThreadStarted() const {
+        return gpu_id != std::thread::id{};
+    }
+
     /// True on the command processor thread, where SendCommand runs its callback inline.
     bool IsGpuThread() const {
         return std::this_thread::get_id() == gpu_id;

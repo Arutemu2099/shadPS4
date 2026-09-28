@@ -224,12 +224,19 @@ public:
 private:
     template <typename Func>
     void ForEachBufferInRange(VAddr device_addr, u64 size, Func&& func) {
+        CheckCpThread(1);
         buffer_ranges.ForEachInRange(device_addr, size,
                                      [&](u64 page_start, u64 page_end, BufferId id) {
                                          Buffer& buffer = slot_buffers[id];
                                          func(id, buffer);
                                      });
     }
+
+    /// SHADPS4_THREAD_ASSERT=1 (diagnostic): logs one Critical line per site the first time
+    /// buffer_ranges is walked (site 1, ForEachBufferInRange) or edited (site 0, ChangeRegister)
+    /// off the command processor thread. Those users take no lock; only IsRegionRegistered may
+    /// run on guest threads (see buffer_ranges_mutex). No-op when the flag is off.
+    void CheckCpThread(int site) const;
 
     inline bool IsBufferInvalid(BufferId buffer_id) const {
         return !buffer_id || slot_buffers[buffer_id].is_deleted;
