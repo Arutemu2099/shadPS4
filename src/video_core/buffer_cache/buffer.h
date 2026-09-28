@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdlib>
+#include <memory>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -373,14 +374,88 @@ public:
     /// uploads, copies, fault copies). An ASC segment binding it waits for that main batch; if it
     /// is the batch still being recorded the dispatch stays on the main stream.
     mutable u64 main_access_tick{};
+    mutable u64 prev_access_tick{};
     mutable u64 main_write_tick{};
     void NoteMainAccess(u64 tick, bool write) const {
         if (g_record_stream != 0) {
             return;
         }
+        if (tick != main_access_tick) {
+            // SHADPS4_ASC_RANGE: the newest main batch before `tick` that touched this Buffer,
+            // the wait target of an ASC segment that has no range conflict with the open batch.
+            prev_access_tick = main_access_tick;
+        }
         main_access_tick = tick;
         if (write) {
             main_write_tick = tick;
+        }
+    }
+
+    /// SHADPS4_ASC_V2_CENSUS=2 (shadow range tracker, notes/asc-stream-v2-design-2026-09-28.md
+    /// step 2): exact guest ranges the open main batch read or wrote, kept only for Buffers an
+    /// ASC candidate has bound (asc_bound). Counts only; no decision uses it.
+    struct MainRangeLog {
+        struct Entry {
+            VAddr lo;
+            VAddr hi;
+            bool write;
+            u8 kind;
+            u64 id;
+        };
+        u64 tick = ~0ULL;
+        bool whole = false;
+        u8 whole_kind = 0;
+        std::vector<Entry> entries;
+    };
+    mutable std::unique_ptr<MainRangeLog> range_log;
+    mutable bool asc_bound = false;
+    MainRangeLog* OpenRangeLog(u64 tick) const {
+        if (g_record_stream != 0 || !asc_bound) {
+            return nullptr;
+        }
+        if (!range_log) {
+            range_log = std::make_unique<MainRangeLog>();
+        }
+        if (range_log->tick != tick) {
+            range_log->tick = tick;
+            range_log->whole = false;
+            range_log->entries.clear();
+        }
+        return range_log.get();
+    }
+    void NoteMainRange(u64 tick, bool write, VAddr lo, u64 size, u8 kind, u64 id) const {
+        MainRangeLog* log = OpenRangeLog(tick);
+        if (!log || log->whole) {
+            return;
+        }
+        const VAddr hi = lo + size;
+        // Repeated bindings of the same range in one batch are the common case: skip exact
+        // repeats among the last few entries, and extend the last entry when contiguous.
+        const size_t n = log->entries.size();
+        for (size_t k = n > 8 ? n - 8 : 0; k < n; ++k) {
+            const auto& e = log->entries[k];
+            if (e.lo <= lo && hi <= e.hi && (e.write || !write)) {
+                return;
+            }
+        }
+        if (n != 0) {
+            auto& last = log->entries.back();
+            if (last.write == write && last.kind == kind && last.hi == lo) {
+                last.hi = hi;
+                return;
+            }
+        }
+        if (n >= 1024) {
+            log->whole = true;
+            log->whole_kind = 100 + kind; // overflow, not a whole-Buffer access
+            return;
+        }
+        log->entries.push_back({lo, hi, write, kind, id});
+    }
+    void NoteMainWhole(u64 tick, u8 kind) const {
+        if (MainRangeLog* log = OpenRangeLog(tick); log && !log->whole) {
+            log->whole = true;
+            log->whole_kind = kind;
         }
     }
     int stream_score = 0;

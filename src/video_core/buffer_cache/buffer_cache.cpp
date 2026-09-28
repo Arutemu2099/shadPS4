@@ -110,7 +110,14 @@ const bool g_buffer_ranges_table = [] {
     return value && value[0] == '2';
 }();
 const bool g_thread_assert = EnvIs1("SHADPS4_THREAD_ASSERT");
-const bool g_asc_census = EnvIs1("SHADPS4_ASC_V2_CENSUS");
+const bool g_asc_range_shadow = [] {
+    const char* value = std::getenv("SHADPS4_ASC_V2_CENSUS");
+    return value && value[0] == '2';
+}();
+const bool g_asc_census = EnvIs1("SHADPS4_ASC_V2_CENSUS") || g_asc_range_shadow;
+/// SHADPS4_ASC_RANGE=1: see BufferCache::AscRangeEnabled. Range notes feed a decision then.
+const bool g_asc_range = EnvIs1("SHADPS4_ASC_RANGE");
+const bool g_range_notes = g_asc_range_shadow || g_asc_range;
 /// SHADPS4_WRITTEN_RUN_MEMO: 0 off, 1 on, 2 verify. See ObtainBuffer.
 const int g_written_run_memo = [] {
     const char* value = std::getenv("SHADPS4_WRITTEN_RUN_MEMO");
@@ -1573,6 +1580,12 @@ void BufferCache::RecordFaultCopiesOnReadbackQueue(vk::CommandBuffer cmdbuf, vk:
 void BufferCache::RecordFaultCopies(vk::CommandBuffer cmdbuf, Buffer& source, vk::Buffer staging,
                                     std::span<const vk::BufferCopy> copies) {
     source.NoteMainAccess(scheduler.CurrentTick(), false);
+    if (g_range_notes) {
+        for (const auto& copy : copies) {
+            source.NoteMainRange(scheduler.CurrentTick(), false, source.CpuAddr() + copy.srcOffset,
+                                 copy.size, 10, 0);
+        }
+    }
     // A nested verification can run while a binding's barriers have been collected but not
     // recorded. The tracked access may already describe that future binding, so use an
     // explicit all-writes source dependency rather than trusting it for this readback.
@@ -1633,6 +1646,12 @@ bool BufferCache::AsyncFaultCopies() {
 void BufferCache::RecordFaultCopiesAsync(Buffer& source, vk::Buffer staging,
                                          std::span<const vk::BufferCopy> copies) {
     source.NoteMainAccess(scheduler.CurrentTick(), false);
+    if (g_range_notes) {
+        for (const auto& copy : copies) {
+            source.NoteMainRange(scheduler.CurrentTick(), false, source.CpuAddr() + copy.srcOffset,
+                                 copy.size, 10, 0);
+        }
+    }
     const vk::Buffer src = source.Handle();
     const u64 src_size = source.SizeBytes();
     (void)source.GetBarrier(vk::AccessFlagBits2::eTransferRead,
@@ -1708,7 +1727,16 @@ void BufferCache::NoteBatchWrite(VAddr addr, u64 size) {
             asc_write_hist[i].clear();
             asc_write_hist_value[i] = value;
         }
-        asc_write_hist[i].emplace_back(addr, addr + size);
+        // The particle chain rebinds the same written windows dispatch after dispatch: skip a
+        // range the last few entries already cover (the history is scanned on every fault).
+        auto& hist = asc_write_hist[i];
+        const VAddr end = addr + size;
+        for (size_t k = hist.size() > 8 ? hist.size() - 8 : 0; k < hist.size(); ++k) {
+            if (hist[k].first <= addr && end <= hist[k].second) {
+                return;
+            }
+        }
+        hist.emplace_back(addr, end);
         return;
     }
     if (PreciseProducerEnabled() || Offload::LatencyEnabled() || FastLaneEnabled()) {
@@ -1740,26 +1768,27 @@ Vulkan::MasterSemaphore& BufferCache::JobSemaphore(bool on_fast_lane, bool on_as
 }
 
 u64 BufferCache::NewestAscWriter(std::span<const FaultCopy> copies) const {
-    u64 newest = 0;
+    // Slots hold consecutive ASC values (value % size): walk from the newest value down and
+    // return the first writer (was a scan of all 64 slots: 11% of the CP back with ASC_TEXEL,
+    // run threads-stack-fire-ascrange-on-20260928-a).
+    u64 top = 0;
     for (size_t i = 0; i < asc_write_hist.size(); ++i) {
-        if (asc_write_hist_value[i] <= newest) {
+        top = std::max(top, asc_write_hist_value[i]);
+    }
+    for (u64 v = top; v != 0 && top - v < asc_write_hist.size(); --v) {
+        const size_t i = v % asc_write_hist.size();
+        if (asc_write_hist_value[i] != v) {
             continue;
         }
         for (const auto& [begin, end] : asc_write_hist[i]) {
-            bool hit = false;
             for (const FaultCopy& copy : copies) {
                 if (begin < copy.addr + copy.size && copy.addr < end) {
-                    hit = true;
-                    break;
+                    return v;
                 }
-            }
-            if (hit) {
-                newest = asc_write_hist_value[i];
-                break;
             }
         }
     }
-    return newest;
+    return 0;
 }
 
 bool BufferCache::BatchesWriteAny(std::span<const FaultCopy> copies, u64 first,
@@ -1960,6 +1989,7 @@ void BufferCache::CensusAscBinding(BufferId buffer_id, VAddr addr, u64 size, boo
     }
     if (buffer_id) {
         const Buffer& buffer = slot_buffers[buffer_id];
+        MarkAscBound(buffer_id);
         auto& e = by_buffer[buffer_id.index];
         e.base = buffer.CpuAddr();
         e.buffer_size = buffer.SizeBytes();
@@ -1982,6 +2012,60 @@ void BufferCache::CensusAscBinding(BufferId buffer_id, VAddr addr, u64 size, boo
     }
     LOG_INFO(Render, "AscCensusBind: bindings={} buffers={} in_texel_span={} written_in_span={} top:{}",
              bindings, by_buffer.size(), in_texel_span, written_in_texel_span, line);
+}
+
+bool BufferCache::RangeShadowEnabled() {
+    return g_asc_range_shadow;
+}
+
+bool BufferCache::AscRangeEnabled() {
+    return g_asc_range;
+}
+
+void BufferCache::MarkAscBound(BufferId buffer_id) const {
+    const Buffer& buffer = slot_buffers[buffer_id];
+    if (buffer.asc_bound) {
+        return;
+    }
+    buffer.asc_bound = true;
+    const u64 now = scheduler.CurrentTick();
+    if (buffer.main_access_tick >= now) {
+        buffer.NoteMainWhole(now, 13);
+    }
+}
+
+u8 BufferCache::RangeConflict(BufferId buffer_id, VAddr addr, u64 size, bool written, u64 now,
+                              u64& id) const {
+    id = 0;
+    const Buffer& buffer = slot_buffers[buffer_id];
+    const auto* log = buffer.range_log.get();
+    if (!log || log->tick != now) {
+        // No range was noted in the open batch (the Buffer may have been bound by an ASC
+        // candidate only after its main accesses, which then count as whole-Buffer).
+        return buffer.main_access_tick >= now ? 254 : 0;
+    }
+    if (log->whole) {
+        id = log->whole_kind; // 6 JoinOverlap, 100+kind overflow
+        return 255;
+    }
+    const VAddr end = addr + size;
+    // Pass 2 uploads whole tracker pages: the upload-WAR test uses the page-rounded range.
+    const VAddr page_lo = Common::AlignDown(addr, TRACKER_BYTES_PER_PAGE);
+    const VAddr page_hi = Common::AlignUp(end, TRACKER_BYTES_PER_PAGE);
+    bool page_overlap = false;
+    for (const auto& e : log->entries) {
+        if (e.lo < end && addr < e.hi && (e.write || written)) {
+            id = e.id;
+            return e.kind == 0 ? 253 : e.kind;
+        }
+        page_overlap |= e.lo < page_hi && page_lo < e.hi;
+    }
+    // Upload WAR (design step 4): if the pages are CPU-dirty, the ASC dispatch's pass 2 uploads
+    // them on the ASC stream, which runs before the open batch's accesses to those pages.
+    if (page_overlap && memory_tracker->IsRegionCpuModified(page_lo, page_hi - page_lo)) {
+        return 12;
+    }
+    return 0;
 }
 
 void BufferCache::NoteGpuWrite(VAddr addr, u64 size) {
@@ -2694,6 +2778,9 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
         return buffer;
     }();
     buffer->NoteMainAccess(scheduler.CurrentTick(), true);
+    if (g_range_notes && !is_gds) {
+        buffer->NoteMainRange(scheduler.CurrentTick(), true, address, num_bytes, 8, 0);
+    }
     buffer->Fill(buffer->Offset(address), num_bytes, value);
 }
 
@@ -2734,6 +2821,14 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
     }();
     src_buffer.NoteMainAccess(scheduler.CurrentTick(), false);
     dst_buffer.NoteMainAccess(scheduler.CurrentTick(), true);
+    if (g_range_notes) {
+        if (!src_gds) {
+            src_buffer.NoteMainRange(scheduler.CurrentTick(), false, src, num_bytes, 4, 0);
+        }
+        if (!dst_gds) {
+            dst_buffer.NoteMainRange(scheduler.CurrentTick(), true, dst, num_bytes, 4, 0);
+        }
+    }
     const vk::BufferCopy region = {
         .srcOffset = src_buffer.Offset(src),
         .dstOffset = dst_buffer.Offset(dst),
@@ -2859,6 +2954,10 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     }
     Buffer& buffer = slot_buffers[buffer_id];
     buffer.NoteMainAccess(scheduler.CurrentTick(), is_written);
+    if (g_range_notes) {
+        buffer.NoteMainRange(scheduler.CurrentTick(), is_written, device_addr, size, census_kind,
+                             census_id);
+    }
     // SHADPS4_READ_BIND_MEMO: a read-only range is synchronized when no page of it is CPU-dirty,
     // and g_dirty_epoch is bumped after every CPU-dirty publication (the invariant the tracker's
     // own clean memo, MemoSaysClean, already relies on). So if this exact (buffer, range) ran in
@@ -3279,6 +3378,9 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 si
             // The image upload reads this range on main (and SynchronizeBuffer may upload into it):
             // an ASC dispatch on the same Buffer must see the access (Opus review 2026-09-28).
             buffer.NoteMainAccess(scheduler.CurrentTick(), true);
+            if (g_range_notes) {
+                buffer.NoteMainRange(scheduler.CurrentTick(), true, gpu_addr, size, 11, 0);
+            }
             SynchronizeBuffer(buffer, gpu_addr, size, false, false, nullptr);
             note("cached", &buffer);
             return {&buffer, buffer.Offset(gpu_addr)};
@@ -3436,6 +3538,10 @@ void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
     NoteBatchWrite(overlap.CpuAddr(), overlap.SizeBytes());
     new_buffer.NoteMainAccess(scheduler.CurrentTick(), true);
     overlap.NoteMainAccess(scheduler.CurrentTick(), false);
+    if (g_range_notes) {
+        new_buffer.NoteMainWhole(scheduler.CurrentTick(), 6);
+        overlap.NoteMainWhole(scheduler.CurrentTick(), 6);
+    }
     if (accumulate_stream_score) {
         new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
     }
@@ -3625,6 +3731,39 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     }
     last_sync_upload_bytes = total_size_bytes;
     sync_upload_bytes_total += total_size_bytes;
+    if (total_size_bytes != 0) {
+        // An upload is a main write of the Buffer (SynchronizeBuffersInRange reaches here without
+        // any other note; Opus review 2026-09-28). Skipped on the ASC stream by NoteMainAccess.
+        buffer.NoteMainAccess(scheduler.CurrentTick(), true);
+    }
+    if (g_range_notes && total_size_bytes != 0) {
+        for (const auto& copy : copies) {
+            buffer.NoteMainRange(scheduler.CurrentTick(), true, buffer_start + copy.dstOffset,
+                                 copy.size, 9, 0);
+        }
+        if (g_record_stream == 1 && buffer.range_log &&
+            buffer.range_log->tick == scheduler.CurrentTick()) [[unlikely]] {
+            // SHADPS4_ASC_RANGE falsifier: an ASC-stream upload over a range the open main batch
+            // accessed (the pre-check raced a guest write, or a note is missing).
+            for (const auto& copy : copies) {
+                const VAddr lo = buffer_start + copy.dstOffset;
+                const VAddr hi = lo + copy.size;
+                bool hit = buffer.range_log->whole;
+                for (const auto& e : buffer.range_log->entries) {
+                    hit |= e.lo < hi && lo < e.hi;
+                }
+                if (hit) {
+                    static std::atomic<u64> late{0};
+                    const u64 n = late.fetch_add(1) + 1;
+                    if ((n & (n - 1)) == 0) {
+                        LOG_CRITICAL(Render, "AscRange: late upload WAR at {:#x}+{:#x} (n={})", lo,
+                                     copy.size, n);
+                    }
+                    break;
+                }
+            }
+        }
+    }
     if (defer) {
         PageManager::SetDeferredProtectSink(nullptr);
         if (!src_buffer && !deferred_protects.empty()) {
@@ -3780,6 +3919,9 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, u32 size) {
     WriterTagScope census_tag{*this, 7};
     buffer.NoteMainAccess(scheduler.CurrentTick(), true);
+    if (g_range_notes) {
+        buffer.NoteMainRange(scheduler.CurrentTick(), true, device_addr, size, 7, 0);
+    }
     // TIER-2 SPLIT PROBE: the ob_sync gap (ob_sync - scan/copy/mark = ~7.7 ms/frame) is untimed and
     // was GUESSED to be lock/framing. This path (read-only texel buffers) is the prime suspect.
     // Split it: FindImageFromRange (texture-cache lookup under TextureCache::mutex) vs TileImage
@@ -3816,6 +3958,9 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, 
         }
     }
     ++sfi_found;
+    if (g_range_notes) {
+        buffer.NoteMainWhole(scheduler.CurrentTick(), 7); // TileImage writes the image extent
+    }
     Image& image = texture_cache.GetImage(image_id);
     ASSERT_MSG(device_addr == image.info.guest_address,
                "Texel buffer aliases image subresources {:x} : {:x}", device_addr,
@@ -3890,6 +4035,9 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* val
     WriterTagScope census_tag{*this, 5};
     NoteBatchWrite(address, num_bytes);
     buffer.NoteMainAccess(scheduler.CurrentTick(), true);
+    if (g_range_notes) {
+        buffer.NoteMainRange(scheduler.CurrentTick(), true, address, num_bytes, 5, 0);
+    }
     vk::BufferCopy copy = {
         .srcOffset = 0,
         .dstOffset = buffer.Offset(address),

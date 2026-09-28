@@ -596,10 +596,12 @@ u64 Scheduler::SubmitAscSegment() {
         submit();
     }
     if (active_stream == 1) {
-        // Still recording ASC work: continue in a new segment.
+        // Still recording ASC work: continue in a new segment. It keeps the main wait: the rest
+        // of the dispatch being recorded depends on the same main batches (Opus review
+        // 2026-09-28: a mid-pass-2 flush otherwise left it unordered after them).
         open_asc_value = asc_semaphore->NextTick();
         asc_dirty = true;
-        asc_wait_main = 0;
+        asc_wait_main = wait_main;
     }
     return value;
 }

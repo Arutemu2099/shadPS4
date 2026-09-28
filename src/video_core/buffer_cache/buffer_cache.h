@@ -360,6 +360,18 @@ public:
     [[nodiscard]] static bool CensusEnabled();
     /// Census (b): one ASC candidate binding (before the stream decision).
     void CensusAscBinding(BufferId buffer_id, VAddr addr, u64 size, bool written);
+    [[nodiscard]] static bool RangeShadowEnabled();
+    /// SHADPS4_ASC_RANGE=1 (needs ASC_STREAM): the ASC decision uses the open batch's exact
+    /// ranges (RangeConflict) instead of the per-Buffer tick. Range notes are then always on.
+    [[nodiscard]] static bool AscRangeEnabled();
+    /// Marks a Buffer as bound by an ASC candidate (its main accesses are noted by range).
+    /// A Buffer bound for the first time in the middle of a batch has no range log for the
+    /// accesses already made in it: those count as whole-Buffer (conservative).
+    void MarkAscBound(BufferId buffer_id) const;
+    /// Census mode 2: does the open main batch really touch this ASC binding's range? Returns 0
+    /// (no), else the writer kind of the first overlapping access (255 = whole-Buffer note).
+    u8 RangeConflict(BufferId buffer_id, VAddr addr, u64 size, bool written, u64 now,
+                     u64& id) const;
 
     void SetAscIndirectArgs(VAddr addr, u64 size) noexcept {
         asc_indirect_addr = addr;

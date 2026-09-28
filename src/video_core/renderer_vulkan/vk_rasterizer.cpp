@@ -3323,6 +3323,60 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
                                               stage.buffers[i].is_written);
             }
         }
+        if (VideoCore::BufferCache::RangeShadowEnabled()) {
+            // Step 2 shadow: per-Buffer open-batch conflicts vs real range overlaps (RAW: main wrote
+            // a range this dispatch touches; WAR: main read a range it writes).
+            struct Stats {
+                u64 dispatches = 0, per_buffer = 0, range = 0;
+                std::array<u64, 256> by_kind{};
+                std::unordered_map<u64, u64> by_id;
+            };
+            static Stats st;
+            const u64 now = scheduler.CurrentTick();
+            bool pb = false;
+            u8 first_kind = 0;
+            u64 first_id = 0;
+            for (u32 i = 0; i < buffer_bindings.size(); ++i) {
+                const auto& [buffer_id, vsharp, size] = buffer_bindings[i];
+                if (!buffer_id || size == 0) {
+                    continue;
+                }
+                pb |= buffer_cache.GetBuffer(buffer_id).main_access_tick >= now;
+                if (first_kind == 0) {
+                    u64 id = 0;
+                    first_kind = buffer_cache.RangeConflict(buffer_id, vsharp.base_address, size,
+                                                            stage.buffers[i].is_written, now, id);
+                    first_id = id;
+                }
+            }
+            ++st.dispatches;
+            st.per_buffer += pb;
+            if (first_kind != 0) {
+                ++st.range;
+                ++st.by_kind[first_kind];
+                ++st.by_id[(u64(first_kind) << 56) ^ first_id];
+            }
+            if ((st.dispatches & 0xffff) == 0) {
+                std::string kinds;
+                for (size_t k = 0; k < st.by_kind.size(); ++k) {
+                    if (st.by_kind[k] != 0) {
+                        kinds += fmt::format(" k{}={}", k, st.by_kind[k]);
+                    }
+                }
+                std::vector<std::pair<u64, u64>> top(st.by_id.begin(), st.by_id.end());
+                std::sort(top.begin(), top.end(),
+                          [](const auto& a, const auto& b) { return a.second > b.second; });
+                std::string ids;
+                for (size_t k = 0; k < std::min<size_t>(top.size(), 8); ++k) {
+                    ids += fmt::format(" k{}:{:08x}={}", top[k].first >> 56,
+                                       top[k].first & 0x00ffffffffffffffULL, top[k].second);
+                }
+                LOG_INFO(Render_Vulkan,
+                         "AscRangeShadow: candidates={} per_buffer_open_conflicts={} "
+                         "range_open_conflicts={} kinds:{} top:{}",
+                         st.dispatches, st.per_buffer, st.range, kinds, ids);
+            }
+        }
     }
     if (binding_compute && scheduler.HasAscStream()) {
         // SHADPS4_ASC_STREAM: the buffers are known now. A candidate goes to the ASC stream only if
@@ -3347,14 +3401,34 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
                     break;
                 }
             }
-            for (const auto& [buffer_id, vsharp, size] : buffer_bindings) {
+            static const bool asc_range = VideoCore::BufferCache::AscRangeEnabled();
+            for (u32 i = 0; i < buffer_bindings.size(); ++i) {
                 if (!ok) {
                     break;
                 }
+                const auto& [buffer_id, vsharp, size] = buffer_bindings[i];
                 if (!buffer_id) {
                     continue;
                 }
                 const auto& buffer = buffer_cache.GetBuffer(buffer_id);
+                if (asc_range) {
+                    // SHADPS4_ASC_RANGE: conflict only if the open batch touched this binding's
+                    // range (RAW / WAR / upload WAR); otherwise wait on the newest flushed batch
+                    // that touched the Buffer (never on the open one: the ASC segment is
+                    // submitted before it, I1).
+                    buffer_cache.MarkAscBound(buffer_id);
+                    u64 id = 0;
+                    const u8 kind = buffer_cache.RangeConflict(
+                        buffer_id, vsharp.base_address, size, stage.buffers[i].is_written, now, id);
+                    ok = kind == 0;
+                    if (!ok) {
+                        reason = buffer.main_write_tick >= now ? 2 : 3;
+                    }
+                    const u64 flushed = buffer.main_access_tick < now ? buffer.main_access_tick
+                                                                      : buffer.prev_access_tick;
+                    wait_main = std::max(wait_main, flushed);
+                    continue;
+                }
                 ok = buffer.main_access_tick < now;
                 if (!ok) {
                     reason = buffer.main_write_tick >= now ? 2 : 3;
