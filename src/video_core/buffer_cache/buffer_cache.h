@@ -510,6 +510,22 @@ private:
         u64 epoch{};
     };
     std::array<WrittenMemoEntry, 4096> written_memo_table{};
+    /// SHADPS4_READ_BIND_MEMO (default off): a read-only, non-texel ObtainBuffer of exactly this
+    /// (buffer, range) ran in full at dirty epoch `epoch` with the cache structure at `gen`.
+    struct ReadMemoEntry {
+        VAddr addr{};
+        u64 size{};
+        u64 epoch{};
+        u64 gen{};
+        u32 buffer_index{};
+    };
+    std::array<ReadMemoEntry, 8192> read_memo_table{};
+    u64 read_memo_calls{};
+    u64 read_memo_verify_bad{};
+    u64 buffer_memo_serial{};
+    /// [0] BindBuffers (uniform/storage) [1] other callers: calls, hits, key miss, epoch miss,
+    /// guard (generation or serial) miss.
+    std::array<std::array<u64, 5>, 2> read_memo_stats{};
     bool AsyncFaultCopies();
     void RecordFaultCopiesAsync(Buffer& source, vk::Buffer staging,
                                 std::span<const vk::BufferCopy> copies);

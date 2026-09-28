@@ -365,6 +365,9 @@ public:
     /// SHADPS4_ASC_SPAN_STATS: newest main-timeline tick that accessed / wrote this buffer from
     /// a graphics-queue binding (diagnostic).
     u64 diag_main_access_tick{};
+    /// SHADPS4_READ_BIND_MEMO=3|4: unique per created cache buffer (0 for special buffers), so a
+    /// memo entry cannot match a new buffer that reused a slot.
+    u64 memo_serial{};
     u64 diag_main_write_tick{};
     /// SHADPS4_ASC_STREAM: newest main-stream tick that accessed / wrote this buffer (bindings,
     /// uploads, copies, fault copies). An ASC segment binding it waits for that main batch; if it

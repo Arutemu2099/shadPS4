@@ -367,7 +367,16 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
     }
     const u64 signal_value = master_semaphore.NextTick();
     info.AddSignal(master_semaphore.Handle(), signal_value);
-    {
+    // SHADPS4_SUBMIT_LOCK_SKIP=1: take the global submit lock for the overlay's texture uploads
+    // only when one is queued. The recorder holds this lock across vkQueueSubmit, the readback
+    // prebatch queue and the presenter take it too, and a30 stacks showed the command processor
+    // blocked here 3.4% (fire) / 6.9% (forest) of its wall time with nothing to upload
+    // (runs threads-stack-*-a30-20260928-a).
+    static const bool submit_lock_skip = [] {
+        const char* value = std::getenv("SHADPS4_SUBMIT_LOCK_SKIP");
+        return value && value[0] == '1';
+    }();
+    if (!submit_lock_skip || ImGui::Core::TextureManager::HasPendingUploads()) {
         std::scoped_lock lk{submit_mutex};
         ImGui::Core::TextureManager::Submit();
     }

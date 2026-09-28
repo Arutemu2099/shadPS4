@@ -89,6 +89,20 @@ const bool g_write_fault_offload =
 const bool g_range_add_skip = EnvIs1("SHADPS4_RANGE_ADD_SKIP");
 const bool g_vb_repeat_stats = EnvIs1("SHADPS4_VB_REPEAT_STATS");
 const bool g_written_memo = EnvIs1("SHADPS4_WRITTEN_MEMO");
+/// SHADPS4_READ_BIND_MEMO: 0 off, 1 on, 2 verify (a hit still runs the full path and checks that
+/// it uploaded nothing; the returned pair is identical by construction); 3 / 4 the same with the
+/// buffer's creation serial as the structure guard instead of the global StructGeneration. Off
+/// under SHADPS4_EPOCH_DEFER_UPLOAD, which can leave a synchronized read range dirty on purpose.
+/// A hit returns before the ASC_SPAN_STATS / BUFFER_TRAFFIC / sample-probe accounting: take those
+/// censuses with the memo off (Opus review 2026-09-28).
+const int g_read_bind_memo = [] {
+    const char* value = std::getenv("SHADPS4_READ_BIND_MEMO");
+    const char* defer = std::getenv("SHADPS4_EPOCH_DEFER_UPLOAD");
+    if (!value || value[0] < '1' || value[0] > '4' || (defer && defer[0] == '1')) {
+        return 0;
+    }
+    return value[0] - '0';
+}();
 const bool g_deferred_protect = EnvIs1("SHADPS4_DEFERRED_PROTECT");
 } // namespace
 
@@ -2684,6 +2698,57 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     }
     Buffer& buffer = slot_buffers[buffer_id];
     buffer.NoteMainAccess(scheduler.CurrentTick(), is_written);
+    // SHADPS4_READ_BIND_MEMO: a read-only range is synchronized when no page of it is CPU-dirty,
+    // and g_dirty_epoch is bumped after every CPU-dirty publication (the invariant the tracker's
+    // own clean memo, MemoSaysClean, already relies on). So if this exact (buffer, range) ran in
+    // full at the current epoch and no buffer was created, joined, deleted, mapped or unmapped
+    // since (StructGeneration), SynchronizeBuffer would upload nothing and change no state: skip
+    // it and everything around it. GPU writes need no upload for a GPU read (the caller's
+    // GetBarrier orders them). Texel reads also sync from images and are excluded; the stream
+    // and host-mirror paths returned above. 58.9% of read bindings in fire repeat at an unchanged
+    // epoch within a submission (DRAW_COST census, run diag-fire-a30-drawcost-20260928-t).
+    ReadMemoEntry* read_memo = nullptr;
+    u64 read_memo_epoch = 0;
+    u64 read_memo_gen = 0;
+    bool read_memo_verify = false;
+    u64 read_memo_bytes_before = 0;
+    if (g_read_bind_memo != 0 && !is_written && !is_texel_buffer) {
+        read_memo_epoch = g_dirty_epoch.load(std::memory_order_acquire);
+        const bool serial_guard = g_read_bind_memo >= 3;
+        read_memo_gen = serial_guard ? buffer.memo_serial : StructGeneration();
+        const u64 h = (device_addr * 0x9E3779B97F4A7C15ULL) ^ (u64(size) * 0xC2B2AE3D27D4EB4FULL) ^
+                      u64(buffer_id.index);
+        read_memo = &read_memo_table[(h ^ (h >> 31)) & (read_memo_table.size() - 1)];
+        auto& st = read_memo_stats[sample_caller == Common::BufferSampleCaller::Other ? 1 : 0];
+        ++st[0];
+        const bool key = read_memo->addr == device_addr && read_memo->size == size &&
+                         read_memo->buffer_index == buffer_id.index;
+        const bool epoch_ok = read_memo->epoch == read_memo_epoch;
+        const bool guard_ok = read_memo->gen == read_memo_gen && (!serial_guard || read_memo_gen);
+        if (!key) {
+            ++st[2];
+        } else if (!epoch_ok) {
+            ++st[3];
+        } else if (!guard_ok) {
+            ++st[4];
+        } else {
+            ++st[1];
+            if (g_read_bind_memo == 1 || g_read_bind_memo == 3) {
+                return {&buffer, buffer.Offset(device_addr)};
+            }
+            read_memo_verify = true;
+            read_memo_bytes_before = sync_upload_bytes_total;
+        }
+        if ((++read_memo_calls & 0x3fffff) == 0) {
+            const auto& b = read_memo_stats[0];
+            const auto& o = read_memo_stats[1];
+            LOG_INFO(Render,
+                     "ReadBindMemo: bind calls={} hits={} miss key/epoch/guard={}/{}/{} | other "
+                     "calls={} hits={} miss key/epoch/guard={}/{}/{} | verify_bad={}",
+                     b[0], b[1], b[2], b[3], b[4], o[0], o[1], o[2], o[3], o[4],
+                     read_memo_verify_bad);
+        }
+    }
     if (Offload::AscSpanStatsEnabled()) [[unlikely]] {
         auto& span = Offload::AscSpan();
         const u64 now = scheduler.CurrentTick();
@@ -2754,6 +2819,17 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     if (memo_entry) {
         // Epoch read before the walk: a clear during it makes the record miss next time.
         *memo_entry = {device_addr, size, memo_epoch};
+    }
+    if (read_memo) {
+        // SHADPS4_READ_BIND_MEMO=2: a hit must have been a no-op.
+        if (read_memo_verify && sync_upload_bytes_total != read_memo_bytes_before) {
+            if (++read_memo_verify_bad <= 20) {
+                LOG_ERROR(Render, "ReadBindMemo verify: hit uploaded {} bytes at {:#x}+{:#x}",
+                          sync_upload_bytes_total - read_memo_bytes_before, device_addr, size);
+            }
+        }
+        // Epoch and generation read before the walk: a change during it misses next time.
+        *read_memo = {device_addr, size, read_memo_epoch, read_memo_gen, buffer_id.index};
     }
     if (sample) {
         sample->AddSyncNs(sample->SinceNs(t_sample_sync));
@@ -3159,6 +3235,7 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
         slot_buffers.insert(instance, scheduler, MemoryUsage::DeviceLocal, overlap.begin,
                             AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size);
     auto& new_buffer = slot_buffers[new_buffer_id];
+    new_buffer.memo_serial = ++buffer_memo_serial;
     for (const BufferId overlap_id : overlap.ids) {
         JoinOverlap(new_buffer_id, overlap_id, !overlap.has_stream_leap);
     }

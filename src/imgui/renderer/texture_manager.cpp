@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <deque>
 #include <utility>
 
@@ -120,6 +121,9 @@ static std::deque<Job> g_job_list;
 
 static std::mutex g_upload_mtx;
 static std::deque<UploadJob> g_upload_list;
+// Mirrors !g_upload_list.empty(), written under g_upload_mtx after every change; read without it
+// by HasPendingUploads (a stale false only delays an upload to the next submit).
+static std::atomic<bool> g_upload_pending{false};
 
 namespace Core::TextureManager {
 
@@ -130,6 +134,7 @@ Inner::~Inner() {
             .data = this->upload_data,
             .tick = 2,
         });
+        g_upload_pending.store(true, std::memory_order_relaxed);
     }
 }
 
@@ -185,6 +190,7 @@ void WorkerLoop() {
             g_upload_list.emplace_back(UploadJob{
                 .core = core,
             });
+            g_upload_pending.store(true, std::memory_order_relaxed);
         }
     }
 }
@@ -223,6 +229,10 @@ void DecodePngFile(std::filesystem::path path, Inner* core) {
     g_worker_cv.notify_one();
 }
 
+bool HasPendingUploads() {
+    return g_upload_pending.load(std::memory_order_relaxed);
+}
+
 void Submit() {
     UploadJob upload;
     {
@@ -238,6 +248,7 @@ void Submit() {
             g_upload_list.emplace_back(upload);
             return;
         }
+        g_upload_pending.store(!g_upload_list.empty(), std::memory_order_relaxed);
     }
     if (upload.core != nullptr) {
         upload.core->upload_data.Upload();

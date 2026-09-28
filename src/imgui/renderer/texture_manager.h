@@ -27,4 +27,7 @@ void DecodePngFile(std::filesystem::path path, Inner* core);
 
 void Submit();
 
+/// True when an upload is queued (may be briefly stale): lets a caller skip taking the queue lock.
+bool HasPendingUploads();
+
 }; // namespace ImGui::Core::TextureManager
