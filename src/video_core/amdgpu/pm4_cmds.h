@@ -3,7 +3,10 @@
 
 #pragma once
 
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
+#include "common/logging/log.h"
 #include "common/assert.h"
 #include "common/bit_field.h"
 #include "common/types.h"
@@ -344,6 +347,29 @@ static u64 GetGpuClock64() {
     return static_cast<u64>(ticks);
 }
 
+/// SHADPS4_GPU_TIMESTAMP_STATS=1 (diagnostic): logs guest GPU-timestamp label writes (EOP / EOS /
+/// RELEASE_MEM with GpuClock64 or PerfCounter data): address, kind, value, and the delta to the
+/// previous timestamp written anywhere. inFAMOUS Second Son measures its particle draw time on the
+/// GPU and switches to a lower-resolution particle buffer when it is "too long" (GDC 2014 particle
+/// talk, slide 62); here these values are CP-time host clocks.
+inline void NoteGpuTimestamp(const void* address, u64 value, const char* kind) {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SHADPS4_GPU_TIMESTAMP_STATS");
+        return v && v[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    static std::atomic<u64> count{0};
+    static std::atomic<u64> last{0};
+    const u64 n = count.fetch_add(1, std::memory_order_relaxed);
+    const u64 prev = last.exchange(value, std::memory_order_relaxed);
+    if (n < 400 || (n & 0xfff) == 0) {
+        LOG_INFO(Render, "GpuTimestamp: n={} kind={} addr={:#x} value={} delta_prev={}", n, kind,
+                 reinterpret_cast<u64>(address), value, static_cast<s64>(value - prev));
+    }
+}
+
 static u64 GetGpuPerfCounter() {
     const auto cpu_freq = Libraries::Kernel::sceKernelGetTscFrequency();
     const auto gpu_freq = Libraries::GnmDriver::sceGnmGetGpuCoreClockFrequency();
@@ -480,11 +506,15 @@ struct PM4CmdEventWriteEop {
             break;
         }
         case DataSelect::GpuClock64: {
-            write_mem(address, GetGpuClock64(), sizeof(u64));
+            const u64 value = GetGpuClock64();
+            NoteGpuTimestamp(address, value, "eop_clock64");
+            write_mem(address, value, sizeof(u64));
             break;
         }
         case DataSelect::PerfCounter: {
-            write_mem(address, GetGpuPerfCounter(), sizeof(u64));
+            const u64 value = GetGpuPerfCounter();
+            NoteGpuTimestamp(address, value, "eop_perf");
+            write_mem(address, value, sizeof(u64));
             break;
         }
         default: {
@@ -945,11 +975,15 @@ struct PM4CmdReleaseMem {
             break;
         }
         case DataSelect::GpuClock64: {
-            *Address<u64*>() = GetGpuClock64();
+            const u64 value = GetGpuClock64();
+            NoteGpuTimestamp(Address<void*>(), value, "rel_clock64");
+            *Address<u64*>() = value;
             break;
         }
         case DataSelect::PerfCounter: {
-            *Address<u64*>() = GetGpuPerfCounter();
+            const u64 value = GetGpuPerfCounter();
+            NoteGpuTimestamp(Address<void*>(), value, "rel_perf");
+            *Address<u64*>() = value;
             break;
         }
         case DataSelect::GdsMemStore: {

@@ -738,7 +738,8 @@ void BufferCache::RecordFaultLatency(const FaultTicket& ticket, u32 passes, u64 
                                .own_tick = ticket.own_tick,
                                .producer = ticket.producer,
                                .flush_ns = ticket.mix_flush_ns,
-                               .cls = ClassifyReadbackAddr(device_addr)});
+                               .cls = ClassifyReadbackAddr(device_addr),
+                               .label_tick = ticket.label_tick});
         }
     }
     const u64 t_done = Offload::NowNs();
@@ -1277,6 +1278,7 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
                 lane_ticket.last_ahead = tick - 1;
                 lane_ticket.producer = producer;
                 lane_ticket.mix_flush_ns = Vulkan::GpuBatchTimer::NowNs();
+                lane_ticket.label_tick = Offload::g_last_gfx_label_tick.load(std::memory_order_relaxed);
             }
             if (PrebatchMode() == '2') {
                 // Same batch cutting as a prebatched copy.
@@ -1354,6 +1356,7 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
                 side_ticket.last_ahead = tick - 1;
                 side_ticket.producer = PreciseProducer(job->copies);
                 side_ticket.mix_flush_ns = Vulkan::GpuBatchTimer::NowNs();
+                side_ticket.label_tick = Offload::g_last_gfx_label_tick.load(std::memory_order_relaxed);
             }
             if (prebatch && PrebatchMode() == '2') {
                 // After the copy's submission, so the copy does not wait for this batch.
@@ -1397,6 +1400,7 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
         ticket.own_tick = tick;
         ticket.prep_end_ns = Offload::NowNs();
         ticket.mix_flush_ns = Vulkan::GpuBatchTimer::NowNs();
+        ticket.label_tick = Offload::g_last_gfx_label_tick.load(std::memory_order_relaxed);
         scheduler.Flush();
         ticket.flush_end_ns = Offload::NowNs();
         ticket.batch_draws = scheduler.LastBatchDraws();
@@ -2577,6 +2581,21 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         }
     }
     Buffer& buffer = slot_buffers[buffer_id];
+    if (Offload::AscSpanStatsEnabled()) [[unlikely]] {
+        auto& span = Offload::AscSpan();
+        const u64 now = scheduler.CurrentTick();
+        if (span.in_asc_dispatch) {
+            span.w_access = std::max(span.w_access, buffer.diag_main_access_tick);
+            span.w_write = std::max(span.w_write, buffer.diag_main_write_tick);
+            ++span.binds;
+            span.max_buffer_mb = std::max<u64>(span.max_buffer_mb, buffer.SizeBytes() >> 20);
+        } else {
+            buffer.diag_main_access_tick = now;
+            if (is_written) {
+                buffer.diag_main_write_tick = now;
+            }
+        }
+    }
     // SHADPS4_WRITTEN_MEMO=1: a GPU-written binding of exactly this range was fully synchronized
     // and marked GPU-modified before, and since then no GPU-modified bit was cleared anywhere
     // (download/publication bump the epoch), no page in its regions became CPU-dirty, and no

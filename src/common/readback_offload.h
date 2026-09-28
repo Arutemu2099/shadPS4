@@ -61,6 +61,31 @@ inline bool LatencyEnabled() {
 inline thread_local u64 t_read_fault_rip = 0;
 /// SHADPS4_READBACK_LATENCY: set while this thread runs the HLE memset (libc_internal).
 inline thread_local bool t_in_hle_memset = false;
+/// SHADPS4_READBACK_LATENCY: main-timeline tick of the batch that held the newest graphics-queue
+/// label write (EOP / EOS / WRITE_DATA), set on the CP back. A separate async-compute stream
+/// could only overtake the unfinished work after it (the game may have seen everything before).
+inline std::atomic<u64> g_last_gfx_label_tick{0};
+
+/// SHADPS4_ASC_SPAN_STATS=1 (diagnostic, CP back only): for each guest ASC span (the ASC dispatches
+/// between two ASC RELEASE_MEMs), the newest main-timeline batch that accessed (c) or wrote (b) any
+/// buffer those dispatches bind, before them. An ASC stream could overtake only the unfinished
+/// batches after that. Per VkBuffer granularity (what a first ASC-stream version would track).
+inline bool AscSpanStatsEnabled() {
+    static const bool enabled = EnvFlag("SHADPS4_ASC_SPAN_STATS");
+    return enabled;
+}
+struct AscSpanState {
+    bool in_asc_dispatch = false;
+    u64 w_access = 0, w_write = 0, binds = 0, max_buffer_mb = 0;
+    // Window counters.
+    u64 spans = 0, empty = 0, unfinished_sum = 0, over_access_sum = 0, over_write_sum = 0;
+    u64 access_is_current = 0, write_is_current = 0, big_buffer_spans = 0;
+    std::array<u64, 5> over_access_hist{}; ///< overtakeable batches 0, 1, 2-3, 4-7, 8+
+};
+inline AscSpanState& AscSpan() {
+    static AscSpanState s;
+    return s;
+}
 
 /// SHADPS4_READBACK_SPIN_WAIT=N: a guest readback polls the timeline semaphore for up to N us
 /// before falling back to vkWaitSemaphores.

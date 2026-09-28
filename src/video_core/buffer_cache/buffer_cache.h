@@ -313,6 +313,7 @@ private:
         u64 own_tick{};
         u64 producer{};
         u64 mix_flush_ns{};
+        u64 label_tick{};
     };
     void RecordFaultLatency(const FaultTicket& ticket, u32 passes, u64 t_fault, u64 t_cp,
                             u64 t_wait, u64 t_woke, bool free_at_wait, VAddr device_addr);

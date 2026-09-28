@@ -28,9 +28,11 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include "common/readback_offload.h"
 #include "video_core/amdgpu/split_hazard.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Common::FenceWatch {
 
@@ -1076,6 +1078,7 @@ void Liverpool::ExecuteDispatchRecord(const CpSplit::RecordHeader& record) {
     // BackCsRegs() returns the snapshot while this dispatch runs (HLE, IsCompute*, BindBuffers).
     back_cs = &rec.cs;
     rasterizer->SetDispatchRun(rec.run);
+    Common::ReadbackOffload::AscSpan().in_asc_dispatch = rec.queue != GfxQueueId;
     if (rec.marker && rec.queue != GfxQueueId) {
         rasterizer->ScopeMarkerBegin(
             fmt::format("asc[{}]:{}:{}", rec.queue - 1, rec.cmd_address, rec.marker));
@@ -1092,6 +1095,7 @@ void Liverpool::ExecuteDispatchRecord(const CpSplit::RecordHeader& record) {
                                     rec.offset, rec.size);
     }
     rasterizer->SetDispatchRun(0);
+    Common::ReadbackOffload::AscSpan().in_asc_dispatch = false;
     back_cs = nullptr;
 }
 
@@ -1357,9 +1361,70 @@ static void NoteAscFence(const PM4CmdReleaseMem& packet) {
     }
 }
 
+/// SHADPS4_ASC_RELEASE_FLUSH=1: cut and submit the batch being recorded when an ASC RELEASE_MEM
+/// runs on the back. The label is written at CP time, so the guest's poll (Second Son's 0x1695e0
+/// particle wait) passes at once; without a cut the producing dispatches stay in the unsubmitted
+/// batch until the guest's first readback fault cuts it (46% of control-block jobs, run
+/// diag-fire-fastlane3-20260928-i, Fable review 2026-09-28).
+static bool AscReleaseFlush() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_ASC_RELEASE_FLUSH");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
 void Liverpool::ExecuteAscReleaseMem(const PM4CmdReleaseMem* release_mem, u32 pipe_id) {
     if (rasterizer) {
         rasterizer->ProcessDownloadImages();
+    }
+    if (AscReleaseFlush() && rasterizer) {
+        auto& sched = rasterizer->GetScheduler();
+        sched.EndRendering();
+        sched.Flush();
+    }
+    if (Common::ReadbackOffload::AscSpanStatsEnabled() && rasterizer) [[unlikely]] {
+        auto& sp = Common::ReadbackOffload::AscSpan();
+        auto& sched = rasterizer->GetScheduler();
+        auto* ms = sched.GetMasterSemaphore();
+        ms->Refresh();
+        const u64 cur = sched.CurrentTick();
+        const u64 known = ms->KnownGpuTick();
+        ++sp.spans;
+        if (sp.binds == 0) {
+            ++sp.empty;
+        } else {
+            const u64 floor_a = std::max(sp.w_access, known);
+            const u64 floor_w = std::max(sp.w_write, known);
+            // Unfinished batches newer than the newest one the span depends on (the open batch
+            // included: an ASC submission could go ahead of it).
+            const u64 over_a = cur > floor_a ? cur - floor_a : 0;
+            const u64 over_w = cur > floor_w ? cur - floor_w : 0;
+            sp.unfinished_sum += cur > known ? cur - known : 0;
+            sp.over_access_sum += over_a;
+            sp.over_write_sum += over_w;
+            sp.access_is_current += sp.w_access == cur;
+            sp.write_is_current += sp.w_write == cur;
+            sp.big_buffer_spans += sp.max_buffer_mb >= 16;
+            ++sp.over_access_hist[over_a == 0 ? 0 : over_a == 1 ? 1 : over_a < 4 ? 2 : over_a < 8 ? 3 : 4];
+        }
+        sp.w_access = sp.w_write = sp.binds = sp.max_buffer_mb = 0;
+        if ((sp.spans & 0x7ff) == 0) {
+            const double n = double(std::max<u64>(1, sp.spans - sp.empty));
+            LOG_INFO(Render,
+                     "AscSpan: spans={} empty={} unfinished_batches={:.2f} overtakeable_by_access="
+                     "{:.2f} overtakeable_by_write={:.2f} access_newest_is_current={} "
+                     "write_newest_is_current={} spans_binding_>=16MB={} "
+                     "hist_overtake_access[0,1,2-3,4-7,8+]={}/{}/{}/{}/{}",
+                     sp.spans, sp.empty, double(sp.unfinished_sum) / n,
+                     double(sp.over_access_sum) / n, double(sp.over_write_sum) / n,
+                     sp.access_is_current, sp.write_is_current, sp.big_buffer_spans,
+                     sp.over_access_hist[0], sp.over_access_hist[1], sp.over_access_hist[2],
+                     sp.over_access_hist[3], sp.over_access_hist[4]);
+            const auto keep = sp.in_asc_dispatch;
+            sp = {};
+            sp.in_asc_dispatch = keep;
+        }
     }
     g_cp_wait.NoteWrite(release_mem->Address<void*>());
     VideoCore::ProtectFence();
@@ -1834,6 +1899,10 @@ void Liverpool::ExecuteGfxPacket(const PM4Header* header, bool guest_markers_ena
         // are ever posted (inventory section 3).
         g_cp_wait.NoteWrite(event_eos->Address());
         SplitHazard::NoteWrite(reinterpret_cast<u64>(event_eos->Address()), 8);
+        if (Common::ReadbackOffload::LatencyEnabled() && rasterizer) [[unlikely]] {
+            Common::ReadbackOffload::g_last_gfx_label_tick.store(
+                rasterizer->GetScheduler().CurrentTick(), std::memory_order_relaxed);
+        }
         VideoCore::ProtectFence();
         if ((FenceAtGpu() == 1 || FenceAtGpu() == 2) && rasterizer &&
             event_eos->command != PM4CmdEventWriteEos::Command::GdsStore) {
@@ -1859,6 +1928,10 @@ void Liverpool::ExecuteGfxPacket(const PM4Header* header, bool guest_markers_ena
         }
         g_cp_wait.NoteWrite(event_eop->Address<u32>());
         SplitHazard::NoteWrite(reinterpret_cast<u64>(event_eop->Address<u32>()), 8);
+        if (Common::ReadbackOffload::LatencyEnabled() && rasterizer) [[unlikely]] {
+            Common::ReadbackOffload::g_last_gfx_label_tick.store(
+                rasterizer->GetScheduler().CurrentTick(), std::memory_order_relaxed);
+        }
         VideoCore::ProtectFence();
         if (FenceAtGpu() != 0 && rasterizer) {
             rasterizer->DeferToGpu(
@@ -1922,6 +1995,10 @@ void Liverpool::ExecuteGfxPacket(const PM4Header* header, bool guest_markers_ena
         u64* address = write_data->Address<u64*>();
         g_cp_wait.NoteWrite(address);
         SplitHazard::NoteWrite(reinterpret_cast<u64>(address), data_size);
+        if (Common::ReadbackOffload::LatencyEnabled() && rasterizer) [[unlikely]] {
+            Common::ReadbackOffload::g_last_gfx_label_tick.store(
+                rasterizer->GetScheduler().CurrentTick(), std::memory_order_relaxed);
+        }
         VideoCore::ProtectFence();
         if (!write_data->wr_one_addr.Value()) {
             std::memcpy(address, write_data->data, data_size);

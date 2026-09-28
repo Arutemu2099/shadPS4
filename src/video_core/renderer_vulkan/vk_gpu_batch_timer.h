@@ -223,6 +223,7 @@ public:
         u64 producer;
         u64 flush_ns;
         u32 cls;
+        u64 label_tick; ///< Newest graphics label batch at the flush (0 unknown).
     };
     void RequestMix(const MixRequest& request) {
         std::scoped_lock lk{mix_mutex};
@@ -257,6 +258,8 @@ private:
         std::array<u64, 4> ahead_ns{};    ///< GPU time of batches ahead, by kind.
         std::array<u64, 4> ahead_count{}; ///< Batches ahead, by kind.
         u64 before_producer_ns = 0;       ///< Ahead and older than the producer batch.
+        u64 fenced_ns = 0;                ///< Ahead, at or before the newest graphics label.
+        u64 tail_ns = 0;                  ///< Ahead, after it (overtakable by an ASC stream).
         u64 producer_ahead = 0;           ///< Producer among the batches ahead.
         u64 producer_own = 0;             ///< Producer is the copy's own batch.
         u64 producer_done = 0;            ///< Producer known complete at flush.
@@ -298,6 +301,9 @@ private:
                 ++a.ahead_count[k];
                 if (r.producer != 0 && t < r.producer) {
                     a.before_producer_ns += info.duration_ns;
+                }
+                if (r.label_tick != 0) {
+                    (t <= r.label_tick ? a.fenced_ns : a.tail_ns) += info.duration_ns;
                 }
                 if (r.flush_ns > info.submit_ns) {
                     a.age_weighted += (r.flush_ns - info.submit_ns) / 1000 * info.duration_ns;
@@ -348,7 +354,8 @@ private:
                      "neither_us={:.1f} n_gfx/disp/mixed/neither={:.2f}/{:.2f}/{:.2f}/{:.2f} "
                      "before_producer_us={:.1f} producer_done/ahead/own={}/{}/{} "
                      "ahead_age_ms_gpu_weighted={:.2f} own_us={:.1f} own_draws={:.1f} "
-                     "own_disp={:.1f} hist[0,1,2,3,4-7,8-15,16-31,32+]={}/{}/{}/{}/{}/{}/{}/{}",
+                     "own_disp={:.1f} hist[0,1,2,3,4-7,8-15,16-31,32+]={}/{}/{}/{}/{}/{}/{}/{} "
+                     "fenced_us={:.1f} tail_us={:.1f}",
                      names[c], a.jobs, a.own_jobs, double(a.ahead_batches) / j,
                      double(a.untimed) / j, double(ahead_total) / j / 1000.0,
                      double(a.ahead_ns[0]) / j / 1000.0, double(a.ahead_ns[1]) / j / 1000.0,
@@ -361,7 +368,8 @@ private:
                      double(a.own_ns) / ot / 1000.0, double(a.own_draws) / ot,
                      double(a.own_dispatches) / ot, a.ahead_hist[0], a.ahead_hist[1],
                      a.ahead_hist[2], a.ahead_hist[3], a.ahead_hist[4], a.ahead_hist[5],
-                     a.ahead_hist[6], a.ahead_hist[7]);
+                     a.ahead_hist[6], a.ahead_hist[7], double(a.fenced_ns) / j / 1000.0,
+                     double(a.tail_ns) / j / 1000.0);
             a = MixAccum{};
         }
     }

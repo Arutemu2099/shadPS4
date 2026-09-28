@@ -321,6 +321,10 @@ public:
     bool is_picked{};
     bool is_coherent{};
     bool is_deleted{};
+    /// SHADPS4_ASC_SPAN_STATS: newest main-timeline tick that accessed / wrote this buffer from
+    /// a graphics-queue binding (diagnostic).
+    u64 diag_main_access_tick{};
+    u64 diag_main_write_tick{};
     int stream_score = 0;
     size_t size_bytes = 0;
     u64 lru_id = 0;
