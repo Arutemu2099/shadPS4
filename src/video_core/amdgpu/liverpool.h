@@ -406,6 +406,11 @@ private:
     /// SHADPS4_ASC_YIELD: bumped by SubmitAsc; the graphics task yields when it changed.
     std::atomic<u64> asc_submit_seq{};
     u64 gfx_seen_asc_seq{};
+    /// ASC submissions not yet finished (SubmitAsc ++, the round-robin's pop --), and the number
+    /// the front finished (front only): after one finishes with more queued, graphics yields again.
+    std::atomic<u32> asc_outstanding{};
+    u64 asc_done_seq{};
+    u64 gfx_seen_asc_done{};
     /// SHADPS4_ASC_START_STATS: submit times of queued top-level ASC buffers per mapped queue
     /// (under that queue's m_access), consumed when the buffer's task first runs.
     /// Low bit set: the queue already held an unfinished submission when this one arrived.

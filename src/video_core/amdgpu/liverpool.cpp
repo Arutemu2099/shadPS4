@@ -2025,6 +2025,10 @@ void Liverpool::ProcessLoop(std::stop_token stoken) {
 
                 std::scoped_lock lock{queue.m_access};
                 queue.submits.pop();
+                if (curr_qid != static_cast<s32>(GfxQueueId)) {
+                    asc_outstanding.fetch_sub(1, std::memory_order_release);
+                    ++asc_done_seq;
+                }
 
                 --num_submits;
                 std::scoped_lock lock2{submit_mutex};
@@ -2187,9 +2191,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         ProcessCommands();
 
         if (asc_yield) {
+            // A new ASC submission, or one finished while more are queued (the round-robin
+            // returns here after each finished submission). A blocked ASC task finishes nothing,
+            // so this yields at most once per ASC submission.
             const u64 seq = asc_submit_seq.load(std::memory_order_acquire);
-            if (seq != gfx_seen_asc_seq) {
+            const bool next_queued = asc_done_seq != gfx_seen_asc_done &&
+                                     asc_outstanding.load(std::memory_order_acquire) != 0;
+            if (seq != gfx_seen_asc_seq || next_queued) {
                 gfx_seen_asc_seq = seq;
+                gfx_seen_asc_done = asc_done_seq;
                 ++g_asc_start.yields;
                 YIELD_GFX();
             }
@@ -3470,6 +3480,7 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     std::scoped_lock lk{submit_mutex};
     num_mapped_queues = std::max(num_mapped_queues, gnm_vqid + 1);
     ++num_submits;
+    asc_outstanding.fetch_add(1, std::memory_order_release);
     asc_submit_seq.fetch_add(1, std::memory_order_release);
     submit_cv.notify_one();
 }
