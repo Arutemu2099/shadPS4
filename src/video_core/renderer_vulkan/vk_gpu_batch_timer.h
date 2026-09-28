@@ -213,7 +213,9 @@ public:
     /// `producer` is the newest batch that GPU-wrote the copied bytes (0 unknown).
     /// By faulting guest function (SHADPS4_BATCH_MIX_SS): control-block reader, mesh snap,
     /// exposure sum, anything else, and faults with no guest RIP (CP / offloaded paths).
-    enum MixClass : u32 { MixArena, MixPool, MixOther, MixExposure, MixMemset, NumMixClasses };
+    enum MixClass : u32 {
+        MixArena, MixPool, MixOther, MixExposure, MixMemset, MixWriteFault, NumMixClasses
+    };
     struct MixRequest {
         u64 done_tick;
         u64 last_ahead;
@@ -327,7 +329,8 @@ private:
 
     void LogMix() {
         static constexpr std::array<const char*, NumMixClasses> names = {
-            "ctrl_3f3ed0", "snap_3fed00", "other", "exposure_171610", "hle_memset"};
+            "ctrl_3f3ed0", "snap_3fed00", "other", "exposure_171610", "hle_memset",
+            "write_fault"};
         for (u32 c = 0; c < NumMixClasses; ++c) {
             MixAccum& a = mix[c];
             if (a.jobs == 0) {

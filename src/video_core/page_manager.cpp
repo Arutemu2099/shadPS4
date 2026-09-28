@@ -377,12 +377,18 @@ struct PageManager::Impl {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
         const auto start = Common::FaultMonitor::Now();
         if (Common::IsWriteError(context)) {
+            // Batch-mix diagnostic: the write-fault RIP too (low bit set marks a write).
+            if (Common::ReadbackOffload::LatencyEnabled()) [[unlikely]] {
+                Common::ReadbackOffload::t_read_fault_rip =
+                    static_cast<EXCEPTION_POINTERS*>(context)->ContextRecord->Rip | 1ULL << 63;
+            }
             // A fault taken by the CP itself is part of the command stream it is executing, so
             // only guest threads' faults may be deferred (submit_epoch.h).
             const bool handled = rasterizer->InvalidateMemory(
                 addr, 8,
                 Common::FaultMonitor::t_is_cp_thread ? VideoCore::InvalidateOrigin::CpWriteFault
                                                      : VideoCore::InvalidateOrigin::GuestWriteFault);
+            Common::ReadbackOffload::t_read_fault_rip = 0;
             Common::FaultMonitor::CountGuestWriteFault(handled,
                                                        Common::FaultMonitor::SinceNs(start));
             if (handled && Common::FaultMonitor::WriteFaultPagesEnabled()) {

@@ -142,9 +142,11 @@ static u32 ClassifyReadbackAddr(VAddr addr) {
     if (Offload::t_in_hle_memset) {
         return Timer::MixMemset;
     }
-    if (const u64 rip = Offload::t_read_fault_rip; rip != 0) {
+    if (const u64 tagged = Offload::t_read_fault_rip; tagged != 0) {
+        const bool write = (tagged >> 63) != 0;
+        const u64 rip = tagged & ~(1ULL << 63);
         const u64 off = rip - 0x800000000ULL;
-        u32 by_rip = Timer::MixOther;
+        u32 by_rip = write ? Timer::MixWriteFault : Timer::MixOther;
         if (off >= 0x3f3ed0 && off < 0x3f4800) {
             by_rip = Timer::MixArena;
         } else if (off >= 0x3fed00 && off < 0x400000) {
@@ -153,10 +155,10 @@ static u32 ClassifyReadbackAddr(VAddr addr) {
             by_rip = Timer::MixExposure;
         }
         static std::atomic<u32> other_samples{0};
-        if (by_rip == Timer::MixOther &&
-            other_samples.fetch_add(1, std::memory_order_relaxed) < 64) {
-            LOG_INFO(Render_Vulkan, "BatchMixOtherRip: rip={:#x} off={:#x} addr={:#x}", rip, off,
-                     addr);
+        if ((by_rip == Timer::MixOther || by_rip == Timer::MixWriteFault) &&
+            other_samples.fetch_add(1, std::memory_order_relaxed) < 256) {
+            LOG_INFO(Render_Vulkan, "BatchMixOtherRip: write={} rip={:#x} off={:#x} addr={:#x}",
+                     write, rip, off, addr);
         }
         return by_rip;
     }
@@ -1240,15 +1242,17 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
         // The newest batch that GPU-wrote any copied byte; batches before it completed first
         // (one queue), batches after it wrote none of these bytes. If it has completed, nothing
         // unfinished stands between the data and this copy.
-        // A write is stamped at bind time and could be recorded into the next batch if a
-        // flush ran in between (Opus review 2026-09-28): require the batch after it done too.
-        const u64 producer = PreciseProducer(job->copies);
+        // Eligible when no batch from the newest completed one on wrote any copied byte: the
+        // newest writer p then satisfies p + 1 <= completed (a write is stamped at bind time and
+        // could be recorded into the next batch if a flush ran in between; Opus review
+        // 2026-09-28). Only the unfinished batches are scanned (the CP back is the forest's
+        // limiter; a 64-batch scan per fault measured -1.8% there, screen s64).
         auto* master = scheduler.GetMasterSemaphore();
-        bool done = producer + 1 < tick && master->IsFree(producer + 1);
-        if (!done && producer + 1 < tick) {
-            master->Refresh();
-            done = master->IsFree(producer + 1);
-        }
+        master->Refresh();
+        const u64 completed = master->KnownGpuTick();
+        const bool done = completed != 0 && completed < tick &&
+                          !BatchesWriteAny(job->copies, completed, tick);
+        const u64 producer = completed;
         if (done) {
             const u64 lane_tick = fast_lane->Submit(
                 master->Handle(), producer, [&](vk::CommandBuffer cmd) {
@@ -1600,6 +1604,29 @@ void BufferCache::NoteBatchWrite(VAddr addr, u64 size) {
         batch_writes_tick = tick;
     }
     batch_writes.emplace_back(addr, addr + size);
+}
+
+bool BufferCache::BatchesWriteAny(std::span<const FaultCopy> copies, u64 first,
+                                  u64 last) const {
+    // A batch missing from the history (older than WriteHistory or never recorded) counts as a
+    // writer, so the answer is conservative.
+    for (u64 t = first; t <= last; ++t) {
+        const u64 i = t % WriteHistory;
+        if (last - t >= WriteHistory) {
+            return true;
+        }
+        if (write_hist_tick[i] != t) {
+            continue; // No GPU write was noted in batch t.
+        }
+        for (const auto& [begin, end] : write_hist[i]) {
+            for (const FaultCopy& copy : copies) {
+                if (begin < copy.addr + copy.size && copy.addr < end) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
 }
 
 u64 BufferCache::PreciseProducer(std::span<const FaultCopy> copies) const {

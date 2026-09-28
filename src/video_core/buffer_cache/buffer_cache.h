@@ -499,6 +499,8 @@ private:
     std::array<u64, WriteHistory> write_hist_tick{};
     /// Newest batch tick that wrote any of the copies; 0 when none of the last WriteHistory did.
     u64 PreciseProducer(std::span<const FaultCopy> copies) const;
+    /// SHADPS4_READBACK_FAST_LANE: true if a batch in [first, last] GPU-wrote any copied byte.
+    bool BatchesWriteAny(std::span<const FaultCopy> copies, u64 first, u64 last) const;
     void NoteBatchWrite(VAddr addr, u64 size);
     bool BatchWritesAny(std::span<const FaultCopy> copies);
     void NoteReadbackProducer(VAddr addr, u64 size);

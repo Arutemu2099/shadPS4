@@ -30,7 +30,7 @@ void* PS4_SYSV_ABI internal_memset(void* s, int c, size_t n) {
         while (d > m && !max_ns.compare_exchange_weak(m, d, std::memory_order_relaxed)) {
         }
         const u64 k = calls.fetch_add(1, std::memory_order_relaxed) + 1;
-        if ((k & 0x3fff) == 0) {
+        if ((k & 0x3ff) == 0) {
             LOG_INFO(Lib_LibcInternal,
                      "HleMemsetLarge: calls={} mean_bytes={} total_ms={:.1f} mean_us={:.2f} "
                      "max_us={:.1f} (cumulative; n >= 4096)",
