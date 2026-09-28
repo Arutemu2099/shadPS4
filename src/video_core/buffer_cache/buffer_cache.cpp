@@ -118,8 +118,8 @@ static bool PrebatchEnabled() {
 /// history) has already completed is copied at once on a second queue instead of behind the
 /// unfinished main-queue batches; every other readback keeps the prebatch path. On PS4 the CPU
 /// reads finished GPU results in place; measured 2026-09-27 (ASC_YIELD on) such copies waited
-/// ~1.4 ms of unrelated GPU work. The next main-queue submission waits for the copy, so later
-/// work cannot write the bytes while it reads them.
+/// ~1.4 ms of unrelated GPU work. Use READBACK_QUEUE=3 (compute family): a second graphics-family
+/// queue time-slices the graphics engine on NVIDIA.
 static bool FastLaneEnabled() {
     static const bool enabled = EnvIs1("SHADPS4_READBACK_FAST_LANE");
     return enabled;
@@ -439,8 +439,12 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                           "BDA Page Table Buffer");
 
     memory_tracker = std::make_unique<MemoryTracker>(tracker);
-    if (FastLaneEnabled() && instance.HasReadbackQueue() && PrebatchEnabled() &&
-        Offload::Enabled()) {
+    // Same family (READBACK_QUEUE=1) or a CONCURRENT one (3); never EXCLUSIVE across families.
+    const bool lane_queue_ok =
+        instance.HasReadbackQueue() &&
+        (instance.GetReadbackQueueFamilyIndex() == instance.GetGraphicsQueueFamilyIndex() ||
+         instance.BuffersShareReadbackFamily());
+    if (FastLaneEnabled() && lane_queue_ok && PrebatchEnabled() && Offload::Enabled()) {
         readback_queue = std::make_unique<ReadbackQueue>(
             instance, instance.GetGraphicsQueue(), instance.GetGraphicsQueueFamilyIndex(),
             &Vulkan::Scheduler::submit_mutex);
@@ -1236,12 +1240,14 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
         // The newest batch that GPU-wrote any copied byte; batches before it completed first
         // (one queue), batches after it wrote none of these bytes. If it has completed, nothing
         // unfinished stands between the data and this copy.
+        // A write is stamped at bind time and could be recorded into the next batch if a
+        // flush ran in between (Opus review 2026-09-28): require the batch after it done too.
         const u64 producer = PreciseProducer(job->copies);
         auto* master = scheduler.GetMasterSemaphore();
-        bool done = producer < tick && master->IsFree(producer);
-        if (!done && producer < tick) {
+        bool done = producer + 1 < tick && master->IsFree(producer + 1);
+        if (!done && producer + 1 < tick) {
             master->Refresh();
-            done = master->IsFree(producer);
+            done = master->IsFree(producer + 1);
         }
         if (done) {
             const u64 lane_tick = fast_lane->Submit(
@@ -1253,9 +1259,9 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
                                              {vk_copies.data() + first, count}, false);
                                      });
                 });
-            // Later main-queue work (including the batch still being recorded) must not write
-            // these bytes while the copy reads them.
-            scheduler.AddNextSubmitWait(fast_lane->Semaphore().Handle(), lane_tick);
+            // No main-queue wait on the copy: a GPU write to the window marked before
+            // publication changes its write sequence and vetoes the job (PublishFaultJob), and
+            // one marked after it comes after the guest waited for this copy (Opus review).
             job->tick = lane_tick;
             job->on_readback_queue = true;
             job->on_fast_lane = true;
@@ -2579,6 +2585,8 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                      miss_jobs, miss_cpu);
         }
         if (hit) {
+            // The write history (prebatch / fast lane) must still see this GPU write.
+            NoteBatchWrite(device_addr, size);
             return {&buffer, buffer.Offset(device_addr)};
         }
     }
