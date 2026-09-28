@@ -2193,7 +2193,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         if (asc_yield) {
             // A new ASC submission, or one finished while more are queued (the round-robin
             // returns here after each finished submission). A blocked ASC task finishes nothing,
-            // so this yields at most once per ASC submission.
+            // so this yields at most once per ASC submit and once per ASC completion.
             const u64 seq = asc_submit_seq.load(std::memory_order_acquire);
             const bool next_queued = asc_done_seq != gfx_seen_asc_done &&
                                      asc_outstanding.load(std::memory_order_acquire) != 0;
@@ -3469,6 +3469,8 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     const auto& task = ProcessCompute(acb, vqid);
     {
         std::scoped_lock lock{queue.m_access};
+        // Before the push: the front may run and pop this task before this function returns.
+        asc_outstanding.fetch_add(1, std::memory_order_relaxed);
         queue.submits.emplace(task.handle);
         if (AscStartStats()) [[unlikely]] {
             // Low bit: an earlier submission of this queue is still queued or running.
@@ -3480,7 +3482,6 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     std::scoped_lock lk{submit_mutex};
     num_mapped_queues = std::max(num_mapped_queues, gnm_vqid + 1);
     ++num_submits;
-    asc_outstanding.fetch_add(1, std::memory_order_release);
     asc_submit_seq.fetch_add(1, std::memory_order_release);
     submit_cv.notify_one();
 }
