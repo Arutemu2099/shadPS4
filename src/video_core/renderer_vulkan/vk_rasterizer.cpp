@@ -1395,10 +1395,10 @@ void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
             if ((asc_dispatches & 0xffff) == 0) {
                 LOG_INFO(Render_Vulkan,
                          "AscStream: dispatches={} demoted_to_main={} reasons[struct/written/"
-                         "read/args/gds]={}/{}/{}/{}/{} main_flushes={}",
+                         "read/args/gds/texel_image]={}/{}/{}/{}/{}/{} main_flushes={}",
                          asc_dispatches, asc_demoted, asc_demote_reason[1], asc_demote_reason[2],
                          asc_demote_reason[3], asc_demote_reason[4], asc_demote_reason[5],
-                         asc_flushes);
+                         asc_demote_reason[6], asc_flushes);
             }
         }
         dispatch_target = 0;
@@ -1444,8 +1444,17 @@ bool Rasterizer::AscCandidate(const ComputePipeline* pipeline) const {
     if (!info || !info->images.empty() || !info->samplers.empty() || info->uses_dma) {
         return false;
     }
+    // SHADPS4_ASC_TEXEL=1: formatted (texel) buffers are allowed; BindBuffers keeps a dispatch on
+    // main only if a read texel binding starts where a cached image does (the one case whose
+    // SynchronizeBufferFromImage records an image->buffer copy). Census 2026-09-28: most particle
+    // shaders bind one formatted buffer, and the smoke sort's formatted output on main blocked
+    // 38% of the control-block copies from the ASC path.
+    static const bool asc_texel = [] {
+        const char* value = std::getenv("SHADPS4_ASC_TEXEL");
+        return value && value[0] == '1';
+    }();
     for (const auto& desc : info->buffers) {
-        if (desc.is_formatted) {
+        if (desc.is_formatted && !asc_texel) {
             return false;
         }
         if (desc.IsSpecial() && desc.buffer_type != Shader::BufferType::GdsBuffer &&
@@ -3325,6 +3334,19 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
             const u64 now = scheduler.CurrentTick();
             bool ok = buffer_cache.StructGeneration() == struct_gen_before;
             u32 reason = ok ? 0 : 1;
+            // SHADPS4_ASC_TEXEL: a read texel binding over a cached image needs an image->buffer
+            // copy (images are main-stream only). Checked unconditionally: mode 2's flush must not
+            // send such a dispatch to the ASC stream (Opus review 2026-09-28).
+            bool texel_block = false;
+            for (u32 i = 0; i < buffer_bindings.size(); ++i) {
+                const auto& desc = stage.buffers[i];
+                const auto& [buffer_id, vsharp, size] = buffer_bindings[i];
+                if (desc.is_formatted && !desc.is_written && buffer_id && size != 0 &&
+                    texture_cache.FindImageFromRange(vsharp.base_address, size)) {
+                    texel_block = true;
+                    break;
+                }
+            }
             for (const auto& [buffer_id, vsharp, size] : buffer_bindings) {
                 if (!ok) {
                     break;
@@ -3370,12 +3392,17 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
                 const char* value = std::getenv("SHADPS4_ASC_STREAM");
                 return value && value[0] == '2';
             }();
-            if (!ok && reason != 1 && flush_mode) {
+            // A texel read over an image must stay on main: a flush cannot move its copy.
+            if (!ok && reason != 1 && !texel_block && flush_mode) {
                 const u64 flushed = scheduler.CurrentTick();
                 scheduler.Flush();
                 wait_main = std::max(wait_main, flushed);
                 ok = true;
                 ++asc_flushes;
+            }
+            if (texel_block) {
+                ok = false;
+                reason = 6;
             }
             if (!ok) {
                 target = 0;
@@ -3384,7 +3411,7 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
                 ++asc_demoted;
                 // Reasons: 1 pass 1 created/joined, 2 binding written by the open main batch,
                 // 3 binding only read by it, 4 indirect args, 5 GDS.
-                ++asc_demote_reason[std::min<u32>(reason, 5)];
+                ++asc_demote_reason[std::min<u32>(reason, 6)];
             }
         }
         scheduler.SwitchStream(target);

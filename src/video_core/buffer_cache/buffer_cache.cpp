@@ -3276,6 +3276,9 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 si
     const BufferId buffer_id = page_table[gpu_addr >> CACHING_PAGEBITS].buffer_id;
     if (buffer_id) {
         if (Buffer& buffer = slot_buffers[buffer_id]; buffer.IsInBounds(gpu_addr, size)) {
+            // The image upload reads this range on main (and SynchronizeBuffer may upload into it):
+            // an ASC dispatch on the same Buffer must see the access (Opus review 2026-09-28).
+            buffer.NoteMainAccess(scheduler.CurrentTick(), true);
             SynchronizeBuffer(buffer, gpu_addr, size, false, false, nullptr);
             note("cached", &buffer);
             return {&buffer, buffer.Offset(gpu_addr)};
@@ -3801,6 +3804,16 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, 
     if (!image_id) {
         sfi_report();
         return false;
+    }
+    if (g_record_stream != 0) [[unlikely]] {
+        // SHADPS4_ASC_TEXEL falsifier: an image->buffer copy must never be recorded on the ASC
+        // stream (BindBuffers keeps such dispatches on main).
+        static std::atomic<u64> on_asc{0};
+        const u64 n = on_asc.fetch_add(1) + 1;
+        if ((n & (n - 1)) == 0) {
+            LOG_CRITICAL(Render, "AscTexel: image->buffer copy on the ASC stream at {:#x} (n={})",
+                         device_addr, n);
+        }
     }
     ++sfi_found;
     Image& image = texture_cache.GetImage(image_id);

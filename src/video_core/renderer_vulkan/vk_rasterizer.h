@@ -254,7 +254,7 @@ private:
     std::array<u64, 2> s_prev_end_batch{};
     u64 asc_dispatches{};
     u64 asc_demoted{};
-    std::array<u64, 6> asc_demote_reason{};
+    std::array<u64, 7> asc_demote_reason{};
     u64 asc_flushes{};
     bool AscCandidate(const ComputePipeline* pipeline) const;
     u64 StreamBatchId(u32 stream) const;
