@@ -779,6 +779,7 @@ private:
     u64 open_asc_value = 0;
     u64 asc_wait_main = 0;
     std::atomic<u64> asc_last_submitted{0};
+    std::array<u64, 4> asc_wait_dist{};
     u64 asc_waited_by_main = 0;
     std::array<u64, 2> stream_seq{};
     void AscSubmitOnWorker(u64 value, u64 wait_main);

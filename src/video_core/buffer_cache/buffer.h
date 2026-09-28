@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <memory>
 #include <optional>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include "common/fault_monitor.h"
@@ -31,6 +32,17 @@ inline bool g_asc_deps_active = false;
 inline u64 g_asc_open_tick = 0;
 inline u64 g_asc_hook_miss = 0;
 inline u64 g_asc_whole_buffers = 0;
+/// Counters: raises of g_main_wait_asc by cause, and per Buffer base (CP thread only).
+inline u64 g_asc_raise_whole = 0;
+inline u64 g_asc_raise_entry = 0;
+inline std::unordered_map<u64, u64>* g_asc_raise_by_base = nullptr;
+inline void CountAscRaise(bool whole, VAddr base) {
+    (whole ? g_asc_raise_whole : g_asc_raise_entry)++;
+    if (!g_asc_raise_by_base) {
+        g_asc_raise_by_base = new std::unordered_map<u64, u64>();
+    }
+    ++(*g_asc_raise_by_base)[base];
+}
 } // namespace VideoCore
 
 namespace Vulkan {
@@ -397,6 +409,7 @@ public:
     /// is the batch still being recorded the dispatch stays on the main stream.
     mutable u64 main_access_tick{};
     mutable u64 prev_access_tick{};
+    mutable u64 prev_write_tick{};
     mutable u64 main_write_tick{};
     void NoteMainAccess(u64 tick, bool write) const {
         if (g_record_stream != 0) {
@@ -409,6 +422,9 @@ public:
         }
         main_access_tick = tick;
         if (write) {
+            if (tick != main_write_tick) {
+                prev_write_tick = main_write_tick; // ASC reads wait flushed main writes only
+            }
             main_write_tick = tick;
         }
     }
@@ -427,7 +443,61 @@ public:
         u64 touch = 0; ///< newest ASC value that accessed any part
         u64 write = 0; ///< newest ASC value that wrote any part
         bool whole = false;
+        /// Paged mode (after the entry list overflows): newest ASC read / write value per 4 KiB
+        /// page, with 256 KiB block maxima (the heap is read in ~1.8 M small slices per run).
+        bool paged = false;
+        std::vector<u64> page_rd, page_wr, blk_rd, blk_wr;
     };
+    static constexpr u64 AscPageBits = 12;
+    static constexpr u64 AscBlockBits = 18;
+    void AscPagedNote(AscLog& log, VAddr lo, u64 size, bool write, u64 value) const {
+        const VAddr clo = std::max(lo, cpu_addr);
+        const VAddr chi = std::min<VAddr>(lo + size, cpu_addr + size_bytes);
+        if (size == 0 || chi <= clo) {
+            return;
+        }
+        const u64 first = (clo - cpu_addr) >> AscPageBits;
+        const u64 last = std::min<u64>((chi - 1 - cpu_addr) >> AscPageBits,
+                                       log.page_rd.size() - 1);
+        auto& pages = write ? log.page_wr : log.page_rd;
+        auto& blocks = write ? log.blk_wr : log.blk_rd;
+        for (u64 pg = first; pg <= last; ++pg) {
+            pages[pg] = std::max(pages[pg], value);
+            auto& b = blocks[pg >> (AscBlockBits - AscPageBits)];
+            b = std::max(b, value);
+        }
+    }
+    u64 AscPagedMax(const AscLog& log, VAddr lo, u64 size, bool include_reads) const {
+        const u64 first = (std::max(lo, cpu_addr) - cpu_addr) >> AscPageBits;
+        const u64 end_addr = std::min<u64>(lo + size, cpu_addr + size_bytes);
+        if (end_addr <= cpu_addr + (first << AscPageBits)) {
+            return 0;
+        }
+        const u64 last = std::min<u64>((end_addr - 1 - cpu_addr) >> AscPageBits,
+                                       log.page_rd.size() - 1);
+        constexpr u64 per_block = 1ULL << (AscBlockBits - AscPageBits);
+        u64 need = 0;
+        u64 pg = first;
+        while (pg <= last) {
+            const u64 blk = pg / per_block;
+            const u64 blk_first = blk * per_block;
+            const u64 blk_last = blk_first + per_block - 1;
+            if (pg == blk_first && blk_last <= last) {
+                need = std::max(need, log.blk_wr[blk]);
+                if (include_reads) {
+                    need = std::max(need, log.blk_rd[blk]);
+                }
+                pg = blk_last + 1;
+                continue;
+            }
+            need = std::max(need, log.page_wr[pg]);
+            if (include_reads) {
+                need = std::max(need, log.page_rd[pg]);
+            }
+            ++pg;
+        }
+        return need;
+    }
     mutable std::unique_ptr<AscLog> asc_log;
     void NoteAscAccess(VAddr lo, u64 size, bool write, u64 value) const {
         if (!asc_log) {
@@ -444,6 +514,10 @@ public:
         if (write) {
             log.write = std::max(log.write, value);
         }
+        if (log.paged) {
+            AscPagedNote(log, lo, size, write, value);
+            return;
+        }
         if (log.whole) {
             return;
         }
@@ -458,8 +532,22 @@ public:
             }
         }
         if (log.entries.size() >= 256) {
-            log.whole = true; // fall back to the per-Buffer values (conservative)
+            // Switch to per-page values (stays paged for the Buffer's life; values <= known are
+            // ignored by the check, so no pruning is needed).
+            const u64 pages = (size_bytes + (1ULL << AscPageBits) - 1) >> AscPageBits;
+            const u64 blocks = (pages + (1ULL << (AscBlockBits - AscPageBits)) - 1) >>
+                               (AscBlockBits - AscPageBits);
+            log.page_rd.assign(pages, 0);
+            log.page_wr.assign(pages, 0);
+            log.blk_rd.assign(blocks, 0);
+            log.blk_wr.assign(blocks, 0);
+            log.paged = true;
             ++g_asc_whole_buffers;
+            for (const auto& e : log.entries) {
+                AscPagedNote(log, e.lo, e.hi - e.lo, e.write, e.value);
+            }
+            log.entries.clear();
+            AscPagedNote(log, lo, size, write, value);
             return;
         }
         log.entries.push_back({lo, hi, write, value});
@@ -477,14 +565,28 @@ public:
         }
         ++g_asc_dep_slow;
         const auto& log = *asc_log;
+        if (log.paged) {
+            const u64 need = AscPagedMax(log, lo, size, write);
+            if (need > g_asc_known && need > g_main_wait_asc) {
+                g_main_wait_asc = need;
+                CountAscRaise(false, cpu_addr);
+            }
+            return;
+        }
         if (log.whole) {
-            g_main_wait_asc = std::max(g_main_wait_asc, write ? log.touch : log.write);
+            const u64 need = write ? log.touch : log.write;
+            if (need > g_main_wait_asc) {
+                g_main_wait_asc = need;
+                CountAscRaise(true, cpu_addr);
+            }
             return;
         }
         const VAddr hi = lo + size;
         for (const auto& e : log.entries) {
-            if (e.value > g_asc_known && e.lo < hi && lo < e.hi && (e.write || write)) {
-                g_main_wait_asc = std::max(g_main_wait_asc, e.value);
+            if (e.value > g_asc_known && e.lo < hi && lo < e.hi && (e.write || write) &&
+                e.value > g_main_wait_asc) {
+                g_main_wait_asc = e.value;
+                CountAscRaise(false, cpu_addr);
             }
         }
     }

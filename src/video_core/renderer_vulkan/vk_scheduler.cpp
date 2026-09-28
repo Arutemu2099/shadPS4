@@ -325,9 +325,25 @@ u64 Scheduler::AscMainWaitValue(bool no_i1) {
         if ((flushes & 0xffff) == 0) {
             LOG_INFO(Render_Vulkan,
                      "AscDeps: mode={} main_flushes={} i1_unfinished_waits={} precise_waits={} "
-                     "slow_checks={} hook_miss={} whole_buffers={}",
+                     "slow_checks={} hook_miss={} whole_buffers={} raises whole/entry={}/{} "
+                     "segment_wait_distance[none/1/2-3/4+]={}/{}/{}/{} top:{}",
                      mode, flushes, i1_waits, precise_waits, VideoCore::g_asc_dep_slow,
-                     VideoCore::g_asc_hook_miss, VideoCore::g_asc_whole_buffers);
+                     VideoCore::g_asc_hook_miss, VideoCore::g_asc_whole_buffers,
+                     VideoCore::g_asc_raise_whole, VideoCore::g_asc_raise_entry, asc_wait_dist[0],
+                     asc_wait_dist[1], asc_wait_dist[2], asc_wait_dist[3], [] {
+                         std::string top;
+                         if (!VideoCore::g_asc_raise_by_base) {
+                             return top;
+                         }
+                         std::vector<std::pair<u64, u64>> v(VideoCore::g_asc_raise_by_base->begin(),
+                                                            VideoCore::g_asc_raise_by_base->end());
+                         std::sort(v.begin(), v.end(),
+                                   [](const auto& a, const auto& b) { return a.second > b.second; });
+                         for (size_t k = 0; k < std::min<size_t>(v.size(), 5); ++k) {
+                             top += fmt::format(" {:#x}={}", v[k].first, v[k].second);
+                         }
+                         return top;
+                     }());
         }
     }
     if (no_i1) {
@@ -685,6 +701,12 @@ u64 Scheduler::SubmitAscSegment() {
     }
     const u64 value = open_asc_value;
     const u64 wait_main = asc_wait_main;
+    {
+        // I2 coupling: how far back is the main batch this segment waits (0 = none).
+        const u64 now = master_semaphore.CurrentTick();
+        const u64 d = wait_main == 0 ? 0 : now - std::min(now, wait_main);
+        ++asc_wait_dist[wait_main == 0 ? 0 : d <= 1 ? 1 : d <= 3 ? 2 : 3];
+    }
     asc_dirty = false;
     asc_last_submitted = value;
     auto submit = [this, value, wait_main] { AscSubmitOnWorker(value, wait_main); };

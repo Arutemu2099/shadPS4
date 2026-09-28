@@ -3437,8 +3437,17 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
                     if (!ok) {
                         reason = buffer.main_write_tick >= now ? 2 : 3;
                     }
-                    const u64 flushed = buffer.main_access_tick < now ? buffer.main_access_tick
-                                                                      : buffer.prev_access_tick;
+                    // Step 3 (I2 precision): a read binding only depends on flushed main WRITES
+                    // (RAW); a written one also on flushed reads (WAR) - the heap is read by every
+                    // graphics batch, so access ticks made every segment chase main.
+                    // A read binding over CPU-dirty pages uploads on the ASC stream (a write):
+                    // it keeps the access-based wait (WAR vs flushed main reads).
+                    const bool written =
+                        stage.buffers[i].is_written ||
+                        buffer_cache.IsRegionCpuModified(vsharp.base_address, size);
+                    const u64 last = written ? buffer.main_access_tick : buffer.main_write_tick;
+                    const u64 prev = written ? buffer.prev_access_tick : buffer.prev_write_tick;
+                    const u64 flushed = last < now ? last : prev;
                     wait_main = std::max(wait_main, flushed);
                     continue;
                 }
