@@ -1318,6 +1318,9 @@ void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
     }
     bound_stages = stages;
     dispatch_target = asc_stream && dispatch_queue != 0 && AscCandidate(pipeline) ? 1u : 0u;
+    dispatch_on_asc = false;
+    // An indirect dispatch reads its argument buffer: BindBuffers checks it with the bindings.
+    buffer_cache.SetAscIndirectArgs(is_indirect ? address + offset : 0, is_indirect ? size : 0);
     const u32 ts = dispatch_target;
     // SHADPS4_GUEST_DISPATCH_ORDER: continue the previous dispatch's run only if the guest issued
     // no sync packet or draw in between (same nonzero guest run) and nothing was recorded since
@@ -1363,8 +1366,8 @@ void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
     // sequence check could not see what they recorded (Opus review 2026-09-27): end the run.
     const bool flushed = scheduler.CurrentTick() != tick_before_tail;
     if (asc_stream) {
-        // dispatch_target is 0 if BindBuffers kept the dispatch on the main stream.
-        const u32 s = dispatch_target;
+        // dispatch_on_asc: BindBuffers really moved it (HLE / skipped dispatches never get there).
+        const u32 s = dispatch_on_asc ? 1u : 0u;
         s_prev_run[s] = (cur_dispatch_run != 0 && !flushed) ? dispatch_run : 0;
         s_prev_effective[s] = cur_dispatch_run;
         s_prev_end_seq[s] = scheduler.RecordSeqOf(s);
@@ -1377,7 +1380,11 @@ void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
             }
         }
         dispatch_target = 0;
+        dispatch_on_asc = false;
         cur_dispatch_run = 0;
+        buffer_cache.SetAscIndirectArgs(0, 0);
+        // Nothing between records may land in the ASC stream (markers, CP-self work).
+        scheduler.SwitchStream(0);
         return;
     }
     prev_dispatch_run = (cur_dispatch_run != 0 && !flushed) ? dispatch_run : 0;
@@ -3280,6 +3287,16 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
                 ok = buffer.main_access_tick < now;
                 wait_main = std::max(wait_main, buffer.main_access_tick);
             }
+            if (ok && buffer_cache.asc_indirect_size != 0) {
+                const auto args_id = buffer_cache.FindBuffer(buffer_cache.asc_indirect_addr,
+                                                             buffer_cache.asc_indirect_size);
+                ok = buffer_cache.StructGeneration() == struct_gen_before;
+                if (ok) {
+                    const auto& args = buffer_cache.GetBuffer(args_id);
+                    ok = args.main_access_tick < now;
+                    wait_main = std::max(wait_main, args.main_access_tick);
+                }
+            }
             for (const auto& desc : stage.buffers) {
                 if (ok && desc.buffer_type == Shader::BufferType::GdsBuffer) {
                     const u64 gds_tick = buffer_cache.GetGdsBuffer()->main_access_tick;
@@ -3297,6 +3314,7 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
         scheduler.SwitchStream(target);
         if (target == 1) {
             scheduler.AddAscWaitMain(wait_main);
+            dispatch_on_asc = true;
         }
     }
     u64 obtain_ns = 0;

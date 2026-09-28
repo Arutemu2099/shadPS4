@@ -336,9 +336,18 @@ private:
     ReadbackQueue& LaneOf(bool on_fast_lane) {
         return on_fast_lane ? *fast_lane : *readback_queue;
     }
-    Vulkan::MasterSemaphore& JobSemaphore(bool on_fast_lane, bool on_asc) {
-        return on_asc ? *scheduler.GetAscSemaphore() : LaneOf(on_fast_lane).Semaphore();
+public:
+    /// SHADPS4_ASC_STREAM: an indirect dispatch's argument range, checked with its bindings.
+    void SetAscIndirectArgs(VAddr addr, u64 size) noexcept {
+        asc_indirect_addr = addr;
+        asc_indirect_size = size;
     }
+    VAddr asc_indirect_addr{};
+    u64 asc_indirect_size{};
+private:
+    /// SHADPS4_ASC_STREAM: newest ASC value whose history slot was overwritten.
+    u64 asc_hist_evicted{};
+    Vulkan::MasterSemaphore& JobSemaphore(bool on_fast_lane, bool on_asc);
     /// SHADPS4_ASC_STREAM: GPU write ranges recorded in the last WriteHistory ASC segments.
     std::array<std::vector<std::pair<VAddr, VAddr>>, 64> asc_write_hist;
     std::array<u64, 64> asc_write_hist_value{};

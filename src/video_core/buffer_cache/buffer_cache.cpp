@@ -770,8 +770,8 @@ void BufferCache::RecordFaultLatency(const FaultTicket& ticket, u32 passes, u64 
     add(l.inflight, ticket.inflight);
     add(l.free_at_wait, free_at_wait ? 1 : 0);
     if (g_tick_poller) {
-        const u64 own_done = g_tick_poller->DoneNs(ticket.tick);
-        const u64 prev_done = g_tick_poller->DoneNs(ticket.tick - 1);
+        const u64 own_done = ticket.on_asc ? 0 : g_tick_poller->DoneNs(ticket.tick);
+        const u64 prev_done = ticket.on_asc ? 0 : g_tick_poller->DoneNs(ticket.tick - 1);
         if (own_done != 0 && own_done <= t_woke + 1'000'000) {
             add(l.timed_jobs, 1);
             const u64 start = std::max(ticket.flush_end_ns, prev_done);
@@ -957,6 +957,13 @@ void BufferCache::NoteWriteFaultOverlap(VAddr device_addr, u64 size) {
 
 void BufferCache::ResolveFaultSync(VAddr device_addr, u64 size, bool is_write,
                                    Offload::Origin origin) {
+    // SHADPS4_ASC_STREAM: a CP-self fault inside an ASC dispatch runs inline; its download must be
+    // ordered after main-stream producers, so record it on the main stream.
+    const u32 prev_stream = scheduler.ActiveStream();
+    scheduler.SwitchStream(0);
+    SCOPE_EXIT {
+        scheduler.SwitchStream(prev_stream);
+    };
     if (is_write) {
         NoteWriteFaultOverlap(device_addr, size);
     } else {
@@ -1245,13 +1252,20 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
     u64 asc_producer = 0;
     bool asc_done = true;
     if (scheduler.HasAscStream()) {
+        auto* asc_sem = scheduler.GetAscSemaphore();
         asc_producer = NewestAscWriter(job->copies);
+        if (asc_hist_evicted != 0 && !asc_sem->IsFree(asc_hist_evicted)) {
+            // A history slot of an unfinished segment was overwritten: assume it wrote here.
+            asc_producer = std::max(asc_producer, asc_hist_evicted);
+        }
         if (asc_producer != 0) {
-            auto* asc_sem = scheduler.GetAscSemaphore();
-            asc_done = asc_sem->IsFree(asc_producer);
+            // +1: a flush inside a dispatch's pass 2 reopens the segment, so the dispatch can land
+            // one segment later than its history stamp (Opus review 2026-09-28).
+            const u64 need = asc_producer + 1;
+            asc_done = asc_sem->IsFree(need);
             if (!asc_done) {
                 asc_sem->Refresh();
-                asc_done = asc_sem->IsFree(asc_producer);
+                asc_done = asc_sem->IsFree(need);
             }
         }
     }
@@ -1268,8 +1282,8 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
                 RecordFaultCopiesAsync(slot_buffers[sources[first]], staging_handle,
                                        {vk_copies.data() + first, count});
             });
-            const u64 asc_value = scheduler.SubmitAscSegment();
             scheduler.SwitchStream(0);
+            const u64 asc_value = scheduler.SubmitAscSegment();
             job->tick = asc_value;
             job->on_readback_queue = true;
             job->on_asc = true;
@@ -1641,6 +1655,7 @@ void BufferCache::NoteBatchWrite(VAddr addr, u64 size) {
         const u64 value = scheduler.OpenAscValue();
         const u64 i = value % asc_write_hist.size();
         if (asc_write_hist_value[i] != value) {
+            asc_hist_evicted = std::max(asc_hist_evicted, asc_write_hist_value[i]);
             asc_write_hist[i].clear();
             asc_write_hist_value[i] = value;
         }
@@ -1665,6 +1680,10 @@ void BufferCache::NoteBatchWrite(VAddr addr, u64 size) {
         batch_writes_tick = tick;
     }
     batch_writes.emplace_back(addr, addr + size);
+}
+
+Vulkan::MasterSemaphore& BufferCache::JobSemaphore(bool on_fast_lane, bool on_asc) {
+    return on_asc ? *scheduler.GetAscSemaphore() : LaneOf(on_fast_lane).Semaphore();
 }
 
 u64 BufferCache::NewestAscWriter(std::span<const FaultCopy> copies) const {

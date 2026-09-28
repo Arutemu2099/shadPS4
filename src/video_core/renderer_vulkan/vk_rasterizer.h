@@ -243,6 +243,7 @@ private:
     u32 dispatch_queue{};
     u32 dispatch_target{};
     bool binding_compute{};
+    bool dispatch_on_asc{};
     std::array<u64, 2> s_prev_run{};
     std::array<u64, 2> s_prev_effective{};
     std::array<u64, 2> s_prev_end_seq{~u64{0}, ~u64{0}};

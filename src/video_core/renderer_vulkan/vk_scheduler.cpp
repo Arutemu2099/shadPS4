@@ -359,6 +359,8 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
         // I1: the ASC work recorded before this batch is submitted first and waited on.
         SubmitAscSegment();
         if (asc_last_submitted > asc_waited_by_main) {
+            // Wait masks are per index (index 1 = colour output): only index 0 or 2 is AllCommands.
+            ASSERT(info.num_wait_semas != 1);
             info.AddWait(asc_semaphore->Handle(), asc_last_submitted);
             asc_waited_by_main = asc_last_submitted;
         }
