@@ -13,6 +13,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 #include <thread>
+#include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_gpu_batch_timer.h"
 
 namespace Vulkan {
@@ -57,6 +58,13 @@ Scheduler::Scheduler(const Instance& instance, bool allow_recording_worker)
                 batch_timer = std::make_unique<GpuBatchTimer>(instance, master_semaphore);
             }
         }
+    }
+    if (async_submit && instance.HasAscQueue()) {
+        asc_enabled = true;
+        asc_semaphore = std::make_unique<MasterSemaphore>(instance);
+        asc_pool = std::make_unique<CommandPool>(instance, &master_semaphore,
+                                                 instance.GetReadbackQueueFamilyIndex());
+        LOG_INFO(Render_Vulkan, "AscStream: enabled");
     }
     AllocateWorkerCommandBuffers();
     priority_pending_ops_thread =
@@ -321,8 +329,9 @@ void Scheduler::AllocateWorkerCommandBuffers() {
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
     };
 
-    current_cmdbuf = command_pool.Commit();
-    Check(current_cmdbuf.begin(begin_info));
+    main_cmdbuf = command_pool.Commit();
+    Check(main_cmdbuf.begin(begin_info));
+    current_cmdbuf = worker_stream == 1 ? asc_cmdbuf : main_cmdbuf;
     GraphicsBindTracker::Invalidate();
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
@@ -346,6 +355,14 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
     // worker for submits/borrows and ~1.6% inside vkQueueSubmit.
     Common::FaultMonitor::CountGpuSubmit();
     EndRendering();
+    if (asc_enabled) {
+        // I1: the ASC work recorded before this batch is submitted first and waited on.
+        SubmitAscSegment();
+        if (asc_last_submitted > asc_waited_by_main) {
+            info.AddWait(asc_semaphore->Handle(), asc_last_submitted);
+            asc_waited_by_main = asc_last_submitted;
+        }
+    }
     const u64 signal_value = master_semaphore.NextTick();
     info.AddSignal(master_semaphore.Handle(), signal_value);
     {
@@ -359,9 +376,9 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
     batch_ops = 0;
     recording_worker->Record([this, info, signal_value, draws, dispatches]() mutable {
         if (batch_timer) {
-            batch_timer->End(current_cmdbuf, signal_value, draws, dispatches);
+            batch_timer->End(main_cmdbuf, signal_value, draws, dispatches);
         }
-        Check(current_cmdbuf.end());
+        Check(main_cmdbuf.end());
         static constexpr std::array<vk::PipelineStageFlags, 3> wait_stage_masks = {
             vk::PipelineStageFlagBits::eAllCommands,
             vk::PipelineStageFlagBits::eColorAttachmentOutput,
@@ -379,7 +396,7 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
             .pWaitSemaphores = info.wait_semas.data(),
             .pWaitDstStageMask = wait_stage_masks.data(),
             .commandBufferCount = 1U,
-            .pCommandBuffers = &current_cmdbuf,
+            .pCommandBuffers = &main_cmdbuf,
             .signalSemaphoreCount = info.num_signal_semas,
             .pSignalSemaphores = info.signal_semas.data(),
         };
@@ -389,13 +406,16 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
             ASSERT_MSG(result != vk::Result::eErrorDeviceLost, "Device lost during submit");
             async_submitted_tick.store(signal_value, std::memory_order_release);
         }
-        current_cmdbuf = command_pool.Commit();
-        Check(current_cmdbuf.begin(vk::CommandBufferBeginInfo{
+        main_cmdbuf = command_pool.Commit();
+        Check(main_cmdbuf.begin(vk::CommandBufferBeginInfo{
             .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
         }));
+        if (worker_stream == 0) {
+            current_cmdbuf = main_cmdbuf;
+        }
         GraphicsBindTracker::Invalidate();
         if (batch_timer) {
-            batch_timer->Begin(current_cmdbuf);
+            batch_timer->Begin(main_cmdbuf);
         }
     });
     // A partial chunk is otherwise only handed over when full or drained; a waiter on this tick
@@ -433,6 +453,13 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     Common::FaultMonitor::CountGpuSubmit();
     EndRendering();
     DrainRecording();
+    if (asc_enabled) {
+        SubmitAscSegment(); // Drained: runs on this thread.
+        if (asc_last_submitted > asc_waited_by_main) {
+            info.AddWait(asc_semaphore->Handle(), asc_last_submitted);
+            asc_waited_by_main = asc_last_submitted;
+        }
+    }
     if (recording_worker && ++recording_submits % 1000 == 0) {
         const auto counts = recording_worker->GetCounters();
         LOG_INFO(
@@ -461,14 +488,15 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 #endif
 
     EndRendering();
-    Check(current_cmdbuf.end());
+    Check(main_cmdbuf.end());
 
     const vk::Semaphore timeline = master_semaphore.Handle();
     info.AddSignal(timeline, signal_value);
 
-    static constexpr std::array<vk::PipelineStageFlags, 2> wait_stage_masks = {
+    static constexpr std::array<vk::PipelineStageFlags, 3> wait_stage_masks = {
         vk::PipelineStageFlagBits::eAllCommands,
         vk::PipelineStageFlagBits::eColorAttachmentOutput,
+        vk::PipelineStageFlagBits::eAllCommands,
     };
 
     const vk::TimelineSemaphoreSubmitInfo timeline_si = {
@@ -484,7 +512,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         .pWaitSemaphores = info.wait_semas.data(),
         .pWaitDstStageMask = wait_stage_masks.data(),
         .commandBufferCount = 1U,
-        .pCommandBuffers = &current_cmdbuf,
+        .pCommandBuffers = &main_cmdbuf,
         .signalSemaphoreCount = info.num_signal_semas,
         .pSignalSemaphores = info.signal_semas.data(),
     };
@@ -502,6 +530,101 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     // Apply pending operations
     PopPendingOperations();
+}
+
+void Scheduler::BeginAscCmdbufOnWorker() {
+    asc_cmdbuf = asc_pool->Commit();
+    Check(asc_cmdbuf.begin(vk::CommandBufferBeginInfo{
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+    }));
+}
+
+void Scheduler::SwitchStream(u32 stream) {
+    if (!asc_enabled || stream == active_stream) {
+        return;
+    }
+    if (active_stream == 0) {
+        // A render pass lives in the main command buffer only.
+        EndRendering();
+    }
+    if (stream == 1 && !asc_dirty) {
+        open_asc_value = asc_semaphore->NextTick();
+        asc_dirty = true;
+        asc_wait_main = 0;
+    }
+    active_stream = stream;
+    native_heaps_bound = false;
+    VideoCore::g_record_stream = stream;
+    auto apply = [this, stream] {
+        if (stream == 1 && !asc_cmdbuf) {
+            BeginAscCmdbufOnWorker();
+        }
+        worker_stream = stream;
+        current_cmdbuf = stream == 1 ? asc_cmdbuf : main_cmdbuf;
+    };
+    if (IsAsyncRecording()) {
+        recording_worker->Record(std::move(apply));
+    } else {
+        apply();
+    }
+}
+
+u64 Scheduler::SubmitAscSegment() {
+    if (!asc_enabled || !asc_dirty) {
+        return 0;
+    }
+    const u64 value = open_asc_value;
+    const u64 wait_main = asc_wait_main;
+    asc_dirty = false;
+    asc_last_submitted = value;
+    auto submit = [this, value, wait_main] { AscSubmitOnWorker(value, wait_main); };
+    if (IsAsyncRecording()) {
+        recording_worker->Record(std::move(submit));
+        recording_worker->Publish();
+    } else {
+        submit();
+    }
+    if (active_stream == 1) {
+        // Still recording ASC work: continue in a new segment.
+        open_asc_value = asc_semaphore->NextTick();
+        asc_dirty = true;
+        asc_wait_main = 0;
+    }
+    return value;
+}
+
+void Scheduler::AscSubmitOnWorker(u64 value, u64 wait_main) {
+    if (!asc_cmdbuf) {
+        BeginAscCmdbufOnWorker(); // An empty segment still signals its value.
+    }
+    Check(asc_cmdbuf.end());
+    const vk::Semaphore wait_sema = master_semaphore.Handle();
+    const vk::Semaphore signal_sema = asc_semaphore->Handle();
+    const vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eAllCommands;
+    const u32 wait_count = wait_main != 0 ? 1u : 0u;
+    const vk::TimelineSemaphoreSubmitInfo timeline_si = {
+        .waitSemaphoreValueCount = wait_count,
+        .pWaitSemaphoreValues = &wait_main,
+        .signalSemaphoreValueCount = 1,
+        .pSignalSemaphoreValues = &value,
+    };
+    const vk::SubmitInfo submit_info = {
+        .pNext = &timeline_si,
+        .waitSemaphoreCount = wait_count,
+        .pWaitSemaphores = &wait_sema,
+        .pWaitDstStageMask = &wait_stage,
+        .commandBufferCount = 1U,
+        .pCommandBuffers = &asc_cmdbuf,
+        .signalSemaphoreCount = 1,
+        .pSignalSemaphores = &signal_sema,
+    };
+    const auto result = instance.GetAscQueue().submit(submit_info);
+    ASSERT_MSG(result != vk::Result::eErrorDeviceLost, "Device lost during ASC submit");
+    asc_cmdbuf = nullptr;
+    if (worker_stream == 1) {
+        BeginAscCmdbufOnWorker();
+        current_cmdbuf = asc_cmdbuf;
+    }
 }
 
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {

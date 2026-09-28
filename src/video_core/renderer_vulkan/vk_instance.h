@@ -87,6 +87,13 @@ public:
 
     /// SHADPS4_READBACK_QUEUE=3: the readback queue is in another family, so buffers are
     /// created VK_SHARING_MODE_CONCURRENT between the graphics and readback families.
+    /// SHADPS4_ASC_STREAM: second queue of the compute-only family for guest async compute.
+    bool HasAscQueue() const {
+        return has_asc_queue;
+    }
+    vk::Queue GetAscQueue() const {
+        return asc_queue;
+    }
     bool BuffersShareReadbackFamily() const {
         return readback_family_concurrent;
     }
@@ -542,6 +549,8 @@ private:
     vk::Queue readback_queue;
     bool has_readback_queue{};
     bool readback_family_concurrent{};
+    bool has_asc_queue{};
+    vk::Queue asc_queue{};
     u32 readback_queue_family{};
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;

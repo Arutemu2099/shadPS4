@@ -103,6 +103,10 @@ public:
     void SetDispatchRun(u64 run) {
         dispatch_run = run;
     }
+    /// SHADPS4_ASC_STREAM: guest queue of the dispatch record being executed (0 = graphics).
+    void SetDispatchQueue(u32 queue) {
+        dispatch_queue = queue;
+    }
 
     void Draw(bool is_indexed, u32 index_offset = 0);
     void ScanRegistersForValue();
@@ -234,6 +238,19 @@ private:
     u64 prev_effective_run{};
     u64 prev_dispatch_end_seq{~u64{0}};
     u64 prev_dispatch_end_tick{};
+    // SHADPS4_ASC_STREAM: per command stream copies of the run state above, the queue of the
+    // dispatch being executed and the stream it is headed for (decided after buffer pass 1).
+    u32 dispatch_queue{};
+    u32 dispatch_target{};
+    bool binding_compute{};
+    std::array<u64, 2> s_prev_run{};
+    std::array<u64, 2> s_prev_effective{};
+    std::array<u64, 2> s_prev_end_seq{~u64{0}, ~u64{0}};
+    std::array<u64, 2> s_prev_end_batch{};
+    u64 asc_dispatches{};
+    u64 asc_demoted{};
+    bool AscCandidate(const ComputePipeline* pipeline) const;
+    u64 StreamBatchId(u32 stream) const;
     u64 effective_run_counter{};
     bool bind_memo_rebound{};  // BindTextures re-found a needs_rebind image
 

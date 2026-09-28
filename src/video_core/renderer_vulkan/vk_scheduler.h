@@ -442,6 +442,7 @@ public:
             scheduler.native_heaps_bound = false;
             ++scheduler.synchronous_scopes;
             ++scheduler.synchronous_borrows;
+            ++scheduler.stream_seq[scheduler.active_stream];
             if (scheduler.recording_measure_timing) {
                 ++scheduler.recording_borrow_counts[location.function_name()];
             }
@@ -500,6 +501,7 @@ public:
 
     template <typename F>
     void Record(F&& command) {
+        ++stream_seq[active_stream];
         if (!IsAsyncRecording()) {
             command(current_cmdbuf);
             return;
@@ -516,6 +518,7 @@ public:
     template <typename F, typename... T>
     void RecordArrays(F&& command, std::span<const T>... arrays) {
         static_assert((std::is_trivially_copyable_v<T> && ...));
+        ++stream_seq[active_stream];
         if (!IsAsyncRecording()) {
             command(current_cmdbuf, arrays...);
             return;
@@ -566,8 +569,46 @@ public:
     }
     /// A compute dispatch: NoteOp plus the per-batch dispatch count (SHADPS4_GPU_BATCH_TIMING).
     void NoteDispatch() noexcept {
+        if (active_stream != 0) {
+            return; // ASC stream: its segments are cut at guest ASC RELEASE_MEMs.
+        }
         ++batch_ops;
         ++batch_dispatches;
+    }
+
+    /**
+     * SHADPS4_ASC_STREAM=1 (with SHADPS4_ASYNC_SUBMIT=1, SHADPS4_READBACK_QUEUE=3): eligible guest
+     * async-compute dispatches are recorded into a second command stream submitted on a
+     * compute-only queue (design notes/asc-stream-design-2026-09-28.md). Stream 0 = main,
+     * 1 = ASC. Streams switch in recording order (the worker applies a marker), so everything
+     * recorded in between lands in that stream's command buffer.
+     * I1: every main submission waits on the ASC value last submitted before it, so a main tick
+     * completing still implies all work recorded before it completed (tick lifetimes hold).
+     * I2: an ASC segment waits on the newest main batch its bindings depend on (AddAscWaitMain);
+     * only values already flushed on the CP are ever waited on (no cycle).
+     */
+    bool HasAscStream() const noexcept {
+        return asc_enabled;
+    }
+    u32 ActiveStream() const noexcept {
+        return active_stream;
+    }
+    void SwitchStream(u32 stream);
+    void AddAscWaitMain(u64 main_tick) noexcept {
+        asc_wait_main = std::max(asc_wait_main, main_tick);
+    }
+    /// Submits the open ASC segment (if any) and returns its timeline value, else 0.
+    u64 SubmitAscSegment();
+    /// Value the open ASC segment will signal (0 if none is open).
+    u64 OpenAscValue() const noexcept {
+        return asc_dirty ? open_asc_value : 0;
+    }
+    MasterSemaphore* GetAscSemaphore() noexcept {
+        return asc_semaphore.get();
+    }
+    /// Commands recorded into one stream (switch markers excluded).
+    u64 RecordSeqOf(u32 stream) const noexcept {
+        return stream_seq[stream];
     }
     /// SHADPS4_GPU_BATCH_TIMING timer, or null (diagnostic).
     [[nodiscard]] class GpuBatchTimer* BatchTimer() const noexcept {
@@ -641,6 +682,23 @@ private:
     void SubmitExecutionAsync(SubmitInfo& info);
     u32 batch_draws = 0;
     u32 batch_dispatches = 0;
+    // SHADPS4_ASC_STREAM state. Worker side (or the CP while drained): main_cmdbuf, asc_cmdbuf,
+    // worker_stream. CP side: the rest.
+    bool asc_enabled = false;
+    std::unique_ptr<MasterSemaphore> asc_semaphore;
+    std::unique_ptr<CommandPool> asc_pool;
+    vk::CommandBuffer main_cmdbuf;
+    vk::CommandBuffer asc_cmdbuf;
+    u32 worker_stream = 0;
+    u32 active_stream = 0;
+    bool asc_dirty = false;
+    u64 open_asc_value = 0;
+    u64 asc_wait_main = 0;
+    u64 asc_last_submitted = 0;
+    u64 asc_waited_by_main = 0;
+    std::array<u64, 2> stream_seq{};
+    void AscSubmitOnWorker(u64 value, u64 wait_main);
+    void BeginAscCmdbufOnWorker();
 
     u32 last_batch_draws = 0;
     u32 batch_ops = 0;

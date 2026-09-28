@@ -51,7 +51,9 @@ protected:
 
 class CommandPool final : public ResourcePool {
 public:
-    explicit CommandPool(const Instance& instance, MasterSemaphore* master_semaphore);
+    /// `family` ~0u = the graphics family.
+    explicit CommandPool(const Instance& instance, MasterSemaphore* master_semaphore,
+                         u32 family = ~0u);
     ~CommandPool() override;
 
     void Allocate(std::size_t begin, std::size_t end) override;

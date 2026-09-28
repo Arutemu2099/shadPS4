@@ -700,7 +700,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool of
             free_at_wait = !ticket.on_readback_queue && semaphore->IsFree(ticket.tick);
         }
         if (ticket.on_readback_queue) {
-            LaneOf(ticket.on_fast_lane).Semaphore().Wait(ticket.tick);
+            JobSemaphore(ticket.on_fast_lane, ticket.on_asc).Wait(ticket.tick);
         } else if (spin_ns != 0) {
             semaphore->SpinWait(ticket.tick, spin_ns);
         } else {
@@ -1081,6 +1081,7 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
                 if (job_begin < end && begin < job_end) {
                     FaultTicket retry_ticket{job.id, job.tick, true, job.on_readback_queue};
                     retry_ticket.on_fast_lane = job.on_fast_lane;
+                    retry_ticket.on_asc = job.on_asc;
                     return retry_ticket;
                 }
             }
@@ -1239,7 +1240,50 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
 
     job->on_readback_queue = false;
     job->on_fast_lane = false;
-    if (fast_lane) {
+    job->on_asc = false;
+    // SHADPS4_ASC_STREAM: the newest ASC-stream writer of the window and whether it completed.
+    u64 asc_producer = 0;
+    bool asc_done = true;
+    if (scheduler.HasAscStream()) {
+        asc_producer = NewestAscWriter(job->copies);
+        if (asc_producer != 0) {
+            auto* asc_sem = scheduler.GetAscSemaphore();
+            asc_done = asc_sem->IsFree(asc_producer);
+            if (!asc_done) {
+                asc_sem->Refresh();
+                asc_done = asc_sem->IsFree(asc_producer);
+            }
+        }
+    }
+    if (!asc_done && fast_lane) {
+        // The producer is still on the ASC stream: copy right behind it there, so the guest waits
+        // for the particle work only, not for the graphics queued on the main queue. No unfinished
+        // main batch may write the window (it would not be ordered before this copy).
+        auto* master = scheduler.GetMasterSemaphore();
+        master->Refresh();
+        const u64 completed = master->KnownGpuTick();
+        if (completed != 0 && completed < tick && !BatchesWriteAny(job->copies, completed, tick)) {
+            scheduler.SwitchStream(1);
+            ForEachSourceRun(sources.data(), sources.size(), [&](size_t first, size_t count) {
+                RecordFaultCopiesAsync(slot_buffers[sources[first]], staging_handle,
+                                       {vk_copies.data() + first, count});
+            });
+            const u64 asc_value = scheduler.SubmitAscSegment();
+            scheduler.SwitchStream(0);
+            job->tick = asc_value;
+            job->on_readback_queue = true;
+            job->on_asc = true;
+            FaultTicket asc_ticket{id, asc_value, false, true};
+            asc_ticket.on_asc = true;
+            static std::atomic<u64> asc_jobs{0};
+            if (((asc_jobs.fetch_add(1) + 1) & 0x3ff) == 0) {
+                LOG_INFO(Render_Vulkan, "AscStream: {} readback copies on the ASC stream",
+                         asc_jobs.load());
+            }
+            return asc_ticket;
+        }
+    }
+    if (fast_lane && asc_done) {
         // The newest batch that GPU-wrote any copied byte; batches before it completed first
         // (one queue), batches after it wrote none of these bytes. If it has completed, nothing
         // unfinished stands between the data and this copy.
@@ -1293,7 +1337,7 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
             return lane_ticket;
         }
     }
-    if (readback_queue) {
+    if (readback_queue && asc_done) {
         // Every GPU write into this window was recorded no later than `producer`. If that batch
         // is already submitted, copy on the readback queue after it alone.
         // SHADPS4_READBACK_PREBATCH: the queue is the main queue, so submission order already
@@ -1465,6 +1509,7 @@ void BufferCache::RecordFaultCopiesOnReadbackQueue(vk::CommandBuffer cmdbuf, vk:
 
 void BufferCache::RecordFaultCopies(vk::CommandBuffer cmdbuf, Buffer& source, vk::Buffer staging,
                                     std::span<const vk::BufferCopy> copies) {
+    source.NoteMainAccess(scheduler.CurrentTick(), false);
     // A nested verification can run while a binding's barriers have been collected but not
     // recorded. The tracked access may already describe that future binding, so use an
     // explicit all-writes source dependency rather than trusting it for this readback.
@@ -1524,6 +1569,7 @@ bool BufferCache::AsyncFaultCopies() {
 
 void BufferCache::RecordFaultCopiesAsync(Buffer& source, vk::Buffer staging,
                                          std::span<const vk::BufferCopy> copies) {
+    source.NoteMainAccess(scheduler.CurrentTick(), false);
     const vk::Buffer src = source.Handle();
     const u64 src_size = source.SizeBytes();
     (void)source.GetBarrier(vk::AccessFlagBits2::eTransferRead,
@@ -1590,6 +1636,17 @@ void BufferCache::NoteBatchWrite(VAddr addr, u64 size) {
     if (size == 0) {
         return;
     }
+    if (g_record_stream == 1) {
+        // SHADPS4_ASC_STREAM: keyed by the open ASC segment's value, not a main tick.
+        const u64 value = scheduler.OpenAscValue();
+        const u64 i = value % asc_write_hist.size();
+        if (asc_write_hist_value[i] != value) {
+            asc_write_hist[i].clear();
+            asc_write_hist_value[i] = value;
+        }
+        asc_write_hist[i].emplace_back(addr, addr + size);
+        return;
+    }
     if (PreciseProducerEnabled() || Offload::LatencyEnabled() || FastLaneEnabled()) {
         const u64 tick = scheduler.CurrentTick();
         const u64 i = tick % WriteHistory;
@@ -1608,6 +1665,29 @@ void BufferCache::NoteBatchWrite(VAddr addr, u64 size) {
         batch_writes_tick = tick;
     }
     batch_writes.emplace_back(addr, addr + size);
+}
+
+u64 BufferCache::NewestAscWriter(std::span<const FaultCopy> copies) const {
+    u64 newest = 0;
+    for (size_t i = 0; i < asc_write_hist.size(); ++i) {
+        if (asc_write_hist_value[i] <= newest) {
+            continue;
+        }
+        for (const auto& [begin, end] : asc_write_hist[i]) {
+            bool hit = false;
+            for (const FaultCopy& copy : copies) {
+                if (begin < copy.addr + copy.size && copy.addr < end) {
+                    hit = true;
+                    break;
+                }
+            }
+            if (hit) {
+                newest = asc_write_hist_value[i];
+                break;
+            }
+        }
+    }
+    return newest;
 }
 
 bool BufferCache::BatchesWriteAny(std::span<const FaultCopy> copies, u64 first,
@@ -1790,7 +1870,7 @@ u64 BufferCache::ProducerTick(VAddr addr, u64 size) const {
 
 void BufferCache::WaitFaultJob(const FaultJob& job) {
     if (job.on_readback_queue) {
-        LaneOf(job.on_fast_lane).Semaphore().Wait(job.tick);
+        JobSemaphore(job.on_fast_lane, job.on_asc).Wait(job.tick);
         return;
     }
     if (!scheduler.IsFree(job.tick)) {
@@ -2420,6 +2500,7 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
         const auto [buffer, offset] = ObtainBuffer(address, num_bytes, true);
         return buffer;
     }();
+    buffer->NoteMainAccess(scheduler.CurrentTick(), true);
     buffer->Fill(buffer->Offset(address), num_bytes, value);
 }
 
@@ -2457,6 +2538,8 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         Common::FaultMonitor::CountRangeAdd(gpu_modified_ranges.m_ranges_set.iterative_size());
         return buffer;
     }();
+    src_buffer.NoteMainAccess(scheduler.CurrentTick(), false);
+    dst_buffer.NoteMainAccess(scheduler.CurrentTick(), true);
     const vk::BufferCopy region = {
         .srcOffset = src_buffer.Offset(src),
         .dstOffset = dst_buffer.Offset(dst),
@@ -2581,6 +2664,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         }
     }
     Buffer& buffer = slot_buffers[buffer_id];
+    buffer.NoteMainAccess(scheduler.CurrentTick(), is_written);
     if (Offload::AscSpanStatsEnabled()) [[unlikely]] {
         auto& span = Offload::AscSpan();
         const u64 now = scheduler.CurrentTick();
@@ -2994,6 +3078,8 @@ void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
     Buffer& new_buffer = slot_buffers[new_buffer_id];
     Buffer& overlap = slot_buffers[overlap_id];
     NoteBatchWrite(overlap.CpuAddr(), overlap.SizeBytes());
+    new_buffer.NoteMainAccess(scheduler.CurrentTick(), true);
+    overlap.NoteMainAccess(scheduler.CurrentTick(), false);
     if (accumulate_stream_score) {
         new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
     }
@@ -3309,6 +3395,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 }
 
 bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, u32 size) {
+    buffer.NoteMainAccess(scheduler.CurrentTick(), true);
     // TIER-2 SPLIT PROBE: the ob_sync gap (ob_sync - scan/copy/mark = ~7.7 ms/frame) is untimed and
     // was GUESSED to be lock/framing. This path (read-only texel buffers) is the prime suspect.
     // Split it: FindImageFromRange (texture-cache lookup under TextureCache::mutex) vs TileImage
@@ -3407,6 +3494,7 @@ void BufferCache::SynchronizeBuffersInRange(VAddr device_addr, u64 size) {
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* value, u32 num_bytes) {
     NoteBatchWrite(address, num_bytes);
+    buffer.NoteMainAccess(scheduler.CurrentTick(), true);
     vk::BufferCopy copy = {
         .srcOffset = 0,
         .dstOffset = buffer.Offset(address),

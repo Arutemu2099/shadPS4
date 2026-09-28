@@ -14,6 +14,12 @@
 #include "video_core/amdgpu/resource.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
+namespace VideoCore {
+/// SHADPS4_ASC_STREAM: the command stream being recorded (0 main, 1 ASC); CP thread only.
+/// Buffer barrier state is kept per stream (Buffer::SelectStreamState).
+inline u32 g_record_stream = 0;
+} // namespace VideoCore
+
 namespace Vulkan {
 class Instance;
 class Scheduler;
@@ -150,6 +156,7 @@ public:
     std::optional<vk::BufferMemoryBarrier2> GetBarrier(vk::AccessFlags2 dst_acess_mask,
                                                        vk::PipelineStageFlagBits2 dst_stage,
                                                        u32 offset = 0, u64 run = 0) {
+        SelectStreamState();
         if (SmartBarriers()) {
             return GetHazardBarrier(dst_acess_mask, vk::PipelineStageFlags2{dst_stage}, offset,
                                     run);
@@ -305,6 +312,40 @@ private:
         return barrier;
     }
 
+    /// SHADPS4_ASC_STREAM: barriers order work inside one command stream only; the other stream's
+    /// accesses are ordered by semaphores (I1/I2). The fields below hold the state of
+    /// `state_stream`; the other stream's state is parked here and swapped in on demand.
+    struct ParkedBarrierState {
+        vk::PipelineStageFlags2 hz_write_stages{vk::PipelineStageFlagBits2::eAllCommands};
+        vk::AccessFlags2 hz_write_access{vk::AccessFlagBits2::eMemoryWrite};
+        vk::PipelineStageFlags2 hz_read_stages{};
+        vk::PipelineStageFlags2 hz_visible_stages{};
+        vk::AccessFlags2 hz_visible_access{};
+        u64 hz_run{};
+        bool hz_run_wrote{};
+        vk::Flags<vk::AccessFlagBits2> access_mask{
+            vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
+            vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite};
+        vk::PipelineStageFlagBits2 stage{vk::PipelineStageFlagBits2::eAllCommands};
+    };
+    ParkedBarrierState parked_state{};
+    u32 state_stream = 0;
+    void SelectStreamState() {
+        if (state_stream == g_record_stream) [[likely]] {
+            return;
+        }
+        std::swap(hz_write_stages, parked_state.hz_write_stages);
+        std::swap(hz_write_access, parked_state.hz_write_access);
+        std::swap(hz_read_stages, parked_state.hz_read_stages);
+        std::swap(hz_visible_stages, parked_state.hz_visible_stages);
+        std::swap(hz_visible_access, parked_state.hz_visible_access);
+        std::swap(hz_run, parked_state.hz_run);
+        std::swap(hz_run_wrote, parked_state.hz_run_wrote);
+        std::swap(access_mask, parked_state.access_mask);
+        std::swap(stage, parked_state.stage);
+        state_stream = g_record_stream;
+    }
+
     // Hazard state for SmartBarriers(); starts as "unknown write by anything".
     vk::PipelineStageFlags2 hz_write_stages{vk::PipelineStageFlagBits2::eAllCommands};
     vk::AccessFlags2 hz_write_access{vk::AccessFlagBits2::eMemoryWrite};
@@ -325,6 +366,20 @@ public:
     /// a graphics-queue binding (diagnostic).
     u64 diag_main_access_tick{};
     u64 diag_main_write_tick{};
+    /// SHADPS4_ASC_STREAM: newest main-stream tick that accessed / wrote this buffer (bindings,
+    /// uploads, copies, fault copies). An ASC segment binding it waits for that main batch; if it
+    /// is the batch still being recorded the dispatch stays on the main stream.
+    mutable u64 main_access_tick{};
+    mutable u64 main_write_tick{};
+    void NoteMainAccess(u64 tick, bool write) const {
+        if (g_record_stream != 0) {
+            return;
+        }
+        main_access_tick = tick;
+        if (write) {
+            main_write_tick = tick;
+        }
+    }
     int stream_score = 0;
     size_t size_bytes = 0;
     u64 lru_id = 0;

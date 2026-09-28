@@ -423,6 +423,12 @@ bool Instance::CreateDevice() {
         }
     }
     const bool separate_family = has_readback_queue && readback_queue_family != queue_family_index;
+    // SHADPS4_ASC_STREAM=1 (with READBACK_QUEUE=3): queue 1 of the compute-only family records the
+    // guest's async compute (see Scheduler::SwitchStream).
+    has_asc_queue = [] {
+        const char* value = std::getenv("SHADPS4_ASC_STREAM");
+        return value && value[0] == '1';
+    }() && readback_family_concurrent && family_properties[readback_queue_family].queueCount >= 2;
     const std::array queue_infos = {
         vk::DeviceQueueCreateInfo{
             .queueFamilyIndex = queue_family_index,
@@ -431,7 +437,7 @@ bool Instance::CreateDevice() {
         },
         vk::DeviceQueueCreateInfo{
             .queueFamilyIndex = readback_queue_family,
-            .queueCount = 1u,
+            .queueCount = has_asc_queue ? 2u : 1u,
             .pQueuePriorities = queue_priorities.data(),
         },
     };
@@ -685,6 +691,11 @@ bool Instance::CreateDevice() {
     if (has_readback_queue) {
         const u32 index = readback_queue_family == queue_family_index ? 1u : 0u;
         readback_queue = device->getQueue(readback_queue_family, index);
+        if (has_asc_queue) {
+            asc_queue = device->getQueue(readback_queue_family, 1);
+            LOG_INFO(Render_Vulkan, "AscStream: guest async compute on queue 1 of family {}",
+                     readback_queue_family);
+        }
         LOG_INFO(Render_Vulkan, "ReadbackQueue: using queue {} of family {}", index,
                  readback_queue_family);
     }

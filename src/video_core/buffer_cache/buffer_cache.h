@@ -277,6 +277,8 @@ private:
         bool on_readback_queue{};
         /// With on_readback_queue: the timeline is the fast lane's (SHADPS4_READBACK_FAST_LANE).
         bool on_fast_lane{};
+        /// With on_readback_queue: the ASC stream's timeline (SHADPS4_ASC_STREAM).
+        bool on_asc{};
         u64 total_bytes{};
         std::vector<FaultCopy> copies;
         /// Buffer spans the copies were collected in, in order: [addr, addr + size) for a read
@@ -300,6 +302,8 @@ private:
         bool on_readback_queue{};
         /// With on_readback_queue: the fast lane's timeline.
         bool on_fast_lane{};
+        /// With on_readback_queue: the ASC stream's timeline.
+        bool on_asc{};
         /// SHADPS4_READBACK_LATENCY diagnostics, set by PrepareFaultDownload.
         u64 prep_end_ns{};
         u64 flush_end_ns{};
@@ -332,6 +336,14 @@ private:
     ReadbackQueue& LaneOf(bool on_fast_lane) {
         return on_fast_lane ? *fast_lane : *readback_queue;
     }
+    Vulkan::MasterSemaphore& JobSemaphore(bool on_fast_lane, bool on_asc) {
+        return on_asc ? *scheduler.GetAscSemaphore() : LaneOf(on_fast_lane).Semaphore();
+    }
+    /// SHADPS4_ASC_STREAM: GPU write ranges recorded in the last WriteHistory ASC segments.
+    std::array<std::vector<std::pair<VAddr, VAddr>>, 64> asc_write_hist;
+    std::array<u64, 64> asc_write_hist_value{};
+    /// Newest ASC segment value that wrote any copied byte (0 = none in the history).
+    u64 NewestAscWriter(std::span<const FaultCopy> copies) const;
     u64 producer_floor = 0; ///< Tick of the newest write too large to record per slot.
     /// SHADPS4_READBACK_EARLY_FLUSH: main tick of the last readback job per 1 MB slot, and a
     /// request raised when a GPU write lands in a recently read-back slot.

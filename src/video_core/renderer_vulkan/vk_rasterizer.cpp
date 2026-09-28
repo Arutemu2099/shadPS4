@@ -1303,6 +1303,12 @@ void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
             }
         }
     };
+    const bool asc_stream = scheduler.HasAscStream();
+    if (asc_stream) {
+        // Pending operations, HLE shaders, stencil writebacks and buffer creation/joins (pass 1)
+        // record on the main stream; BindBuffers moves an eligible dispatch to the ASC stream.
+        scheduler.SwitchStream(0);
+    }
     scheduler.PopPendingOperations();
     if (native_bindings) {
         native_bindings->BeginDraw();
@@ -1311,17 +1317,24 @@ void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
         return;
     }
     bound_stages = stages;
+    dispatch_target = asc_stream && dispatch_queue != 0 && AscCandidate(pipeline) ? 1u : 0u;
+    const u32 ts = dispatch_target;
     // SHADPS4_GUEST_DISPATCH_ORDER: continue the previous dispatch's run only if the guest issued
     // no sync packet or draw in between (same nonzero guest run) and nothing was recorded since
     // that dispatch ended (no copy, upload, readback, pending operation or borrowed buffer).
+    // With the ASC stream the state is per command stream (barriers order one stream only).
     if (dispatch_run != 0 && scheduler.IsAsyncRecording()) {
-        const bool same_guest = dispatch_run == prev_dispatch_run;
-        const u64 seq = scheduler.RecordSeq();
+        const bool same_guest = dispatch_run == (asc_stream ? s_prev_run[ts] : prev_dispatch_run);
+        const u64 seq = asc_stream ? scheduler.RecordSeqOf(ts) : scheduler.RecordSeq();
         // A flush between the two dispatches may run pending operations without moving the
         // record sequence (Opus review 2026-09-27, ASC_YIELD): require the same batch too.
-        const bool cont = same_guest && seq == prev_dispatch_end_seq &&
-                          scheduler.CurrentTick() == prev_dispatch_end_tick;
-        cur_dispatch_run = cont ? prev_effective_run : ++effective_run_counter;
+        const bool cont =
+            asc_stream ? same_guest && seq == s_prev_end_seq[ts] &&
+                             StreamBatchId(ts) == s_prev_end_batch[ts]
+                       : same_guest && seq == prev_dispatch_end_seq &&
+                             scheduler.CurrentTick() == prev_dispatch_end_tick;
+        const u64 prev_eff = asc_stream ? s_prev_effective[ts] : prev_effective_run;
+        cur_dispatch_run = cont ? prev_eff : ++effective_run_counter;
         // Counters (log only): continued runs vs breaks by cause, and recorded commands between.
         static u64 n_cont = 0, n_guest = 0, n_seq = 0, seq_gap = 0, n_all = 0;
         ++n_all;
@@ -1329,7 +1342,7 @@ void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
         n_guest += !same_guest;
         if (same_guest && !cont) {
             ++n_seq;
-            seq_gap += seq - prev_dispatch_end_seq;
+            seq_gap += seq - (asc_stream ? s_prev_end_seq[ts] : prev_dispatch_end_seq);
         }
         if ((n_all & 0xffff) == 0) {
             LOG_INFO(Render_Vulkan,
@@ -1349,11 +1362,54 @@ void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
     // A flush inside the tail runs pending operations after the dispatch; the next dispatch's
     // sequence check could not see what they recorded (Opus review 2026-09-27): end the run.
     const bool flushed = scheduler.CurrentTick() != tick_before_tail;
+    if (asc_stream) {
+        // dispatch_target is 0 if BindBuffers kept the dispatch on the main stream.
+        const u32 s = dispatch_target;
+        s_prev_run[s] = (cur_dispatch_run != 0 && !flushed) ? dispatch_run : 0;
+        s_prev_effective[s] = cur_dispatch_run;
+        s_prev_end_seq[s] = scheduler.RecordSeqOf(s);
+        s_prev_end_batch[s] = StreamBatchId(s);
+        if (s == 1) {
+            ++asc_dispatches;
+            if ((asc_dispatches & 0xffff) == 0) {
+                LOG_INFO(Render_Vulkan, "AscStream: dispatches={} demoted_to_main={}",
+                         asc_dispatches, asc_demoted);
+            }
+        }
+        dispatch_target = 0;
+        cur_dispatch_run = 0;
+        return;
+    }
     prev_dispatch_run = (cur_dispatch_run != 0 && !flushed) ? dispatch_run : 0;
     prev_effective_run = cur_dispatch_run;
     prev_dispatch_end_seq = scheduler.RecordSeq();
     prev_dispatch_end_tick = scheduler.CurrentTick();
     cur_dispatch_run = 0;
+}
+
+u64 Rasterizer::StreamBatchId(u32 stream) const {
+    return stream == 1 ? scheduler.OpenAscValue() : scheduler.CurrentTick();
+}
+
+bool Rasterizer::AscCandidate(const ComputePipeline* pipeline) const {
+    // Buffers only: no images, samplers, texel buffers (may alias images), DMA / fault / BDA
+    // buffers. HLE shaders and image copy / clear shaders never reach BindResources.
+    (void)pipeline;
+    const auto* info = bound_stages[static_cast<u32>(Shader::LogicalStage::Compute)].info;
+    if (!info || !info->images.empty() || !info->samplers.empty() || info->uses_dma) {
+        return false;
+    }
+    for (const auto& desc : info->buffers) {
+        if (desc.is_formatted) {
+            return false;
+        }
+        if (desc.IsSpecial() && desc.buffer_type != Shader::BufferType::GdsBuffer &&
+            desc.buffer_type != Shader::BufferType::Flatbuf &&
+            desc.buffer_type != Shader::BufferType::SharedMemory) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset,
@@ -1855,6 +1911,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     g_dc_slow_img = {};
 
     bool uses_dma = false;
+    binding_compute = pipeline->IsCompute();
 
     // Bind resource buffers and textures.
     Shader::Backend::Bindings binding{};
@@ -3186,6 +3243,7 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
                              Shader::PushData& push_data) {
     const auto& stage = *bound.info;
     buffer_bindings.clear();
+    const u64 struct_gen_before = buffer_cache.StructGeneration();
 
     // Pass 1 (FindBuffer) vs pass 2 (ObtainBuffer -> SynchronizeBuffer) timed separately: this
     // function is 62% of per-draw cost and a stack scan is not trustworthy for apportioning it.
@@ -3202,6 +3260,45 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
         }
     }
     const u64 find_ns = Common::FaultMonitor::SinceNs(t_find);
+    if (binding_compute && scheduler.HasAscStream()) {
+        // SHADPS4_ASC_STREAM: the buffers are known now. A candidate goes to the ASC stream only if
+        // no buffer it binds was touched by the main batch still being recorded (an ASC segment
+        // may only wait on main batches already flushed) and pass 1 created or joined nothing.
+        u32 target = dispatch_target;
+        u64 wait_main = 0;
+        if (target == 1) {
+            const u64 now = scheduler.CurrentTick();
+            bool ok = buffer_cache.StructGeneration() == struct_gen_before;
+            for (const auto& [buffer_id, vsharp, size] : buffer_bindings) {
+                if (!ok) {
+                    break;
+                }
+                if (!buffer_id) {
+                    continue;
+                }
+                const auto& buffer = buffer_cache.GetBuffer(buffer_id);
+                ok = buffer.main_access_tick < now;
+                wait_main = std::max(wait_main, buffer.main_access_tick);
+            }
+            for (const auto& desc : stage.buffers) {
+                if (ok && desc.buffer_type == Shader::BufferType::GdsBuffer) {
+                    const u64 gds_tick = buffer_cache.GetGdsBuffer()->main_access_tick;
+                    ok = gds_tick < now;
+                    wait_main = std::max(wait_main, gds_tick);
+                }
+            }
+            if (!ok) {
+                target = 0;
+                dispatch_target = 0;
+                cur_dispatch_run = 0; // Its run state was the ASC stream's.
+                ++asc_demoted;
+            }
+        }
+        scheduler.SwitchStream(target);
+        if (target == 1) {
+            scheduler.AddAscWaitMain(wait_main);
+        }
+    }
     u64 obtain_ns = 0;
     const u64 bb_find_cyc = g_draw_cost ? __rdtsc() - bb_find_t0 : 0;
     const u64 bb_find_each = buffer_bindings.empty() ? 0 : bb_find_cyc / buffer_bindings.size();
@@ -3222,6 +3319,7 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
         if (!buffer_id) {
             if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
                 const auto* gds_buf = buffer_cache.GetGdsBuffer();
+                gds_buf->NoteMainAccess(scheduler.CurrentTick(), true);
                 buffer_infos.emplace_back(gds_buf->Handle(), 0, gds_buf->SizeBytes());
                 bound_buffer = gds_buf;
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {

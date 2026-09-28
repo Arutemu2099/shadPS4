@@ -865,6 +865,9 @@ void Liverpool::ProcessCommands() {
             command_queue.pop();
             --num_commands;
         }
+        if (rasterizer) {
+            rasterizer->GetScheduler().SwitchStream(0);
+        }
         callback();
     }
 }
@@ -969,12 +972,17 @@ void Liverpool::ExecuteRecord(const CpSplit::RecordHeader& record) {
         break;
     }
     case CpSplit::RecordType::Draw:
+        rasterizer->GetScheduler().SwitchStream(0);
         ExecuteDrawRecord(record);
         break;
     case CpSplit::RecordType::Dispatch:
         ExecuteDispatchRecord(record);
         break;
     case CpSplit::RecordType::Packet:
+        // SHADPS4_ASC_STREAM: packets (DMA, WRITE_DATA, fences, flips) record on the main stream.
+        if (rasterizer) {
+            rasterizer->GetScheduler().SwitchStream(0);
+        }
         if (record.flags & CpSplit::AscReleaseMem) [[unlikely]] {
             ExecuteAscReleaseMem(reinterpret_cast<const PM4CmdReleaseMem*>(payload),
                                  record.flags >> 8);
@@ -985,6 +993,9 @@ void Liverpool::ExecuteRecord(const CpSplit::RecordHeader& record) {
         break;
     case CpSplit::RecordType::Call: {
         const auto* call = reinterpret_cast<const CpSplit::CallPayload*>(payload);
+        if (rasterizer) {
+            rasterizer->GetScheduler().SwitchStream(0);
+        }
         back_in_call = true;
         call->invoke(call->context);
         back_in_call = false;
@@ -1078,6 +1089,7 @@ void Liverpool::ExecuteDispatchRecord(const CpSplit::RecordHeader& record) {
     // BackCsRegs() returns the snapshot while this dispatch runs (HLE, IsCompute*, BindBuffers).
     back_cs = &rec.cs;
     rasterizer->SetDispatchRun(rec.run);
+    rasterizer->SetDispatchQueue(rec.queue);
     Common::ReadbackOffload::AscSpan().in_asc_dispatch = rec.queue != GfxQueueId;
     if (rec.marker && rec.queue != GfxQueueId) {
         rasterizer->ScopeMarkerBegin(
@@ -1095,6 +1107,7 @@ void Liverpool::ExecuteDispatchRecord(const CpSplit::RecordHeader& record) {
                                     rec.offset, rec.size);
     }
     rasterizer->SetDispatchRun(0);
+    rasterizer->SetDispatchQueue(0);
     Common::ReadbackOffload::AscSpan().in_asc_dispatch = false;
     back_cs = nullptr;
 }
@@ -1382,6 +1395,11 @@ void Liverpool::ExecuteAscReleaseMem(const PM4CmdReleaseMem* release_mem, u32 pi
         auto& sched = rasterizer->GetScheduler();
         sched.EndRendering();
         sched.Flush();
+    }
+    if (rasterizer && rasterizer->GetScheduler().HasAscStream()) {
+        // SHADPS4_ASC_STREAM: the guest's compute label. Hand the ASC work recorded so far to its
+        // queue now (its own queue: this does not deepen the main one).
+        rasterizer->GetScheduler().SubmitAscSegment();
     }
     if (Common::ReadbackOffload::AscSpanStatsEnabled() && rasterizer) [[unlikely]] {
         auto& sp = Common::ReadbackOffload::AscSpan();
