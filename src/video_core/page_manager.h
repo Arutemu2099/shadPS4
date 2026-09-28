@@ -15,6 +15,10 @@ namespace Vulkan {
 class Rasterizer;
 }
 
+namespace Core {
+enum class MemoryPermission : u32;
+}
+
 namespace VideoCore {
 
 class PageManager {
@@ -36,6 +40,10 @@ public:
 
     /// Unregister a range of gpu memory that was unmapped.
     void OnGpuUnmap(VAddr address, size_t size);
+
+    /// A CPU protection change the page manager does not own (guest mprotect, file-map
+    /// protects). Serialized with its own protects when SHADPS4_PAGE_OS_SHADOW is on.
+    void ExternalProtect(VAddr address, u64 size, Core::MemoryPermission perms) const;
 
     /// Updates watches in the pages touching the specified region.
     template <bool track>

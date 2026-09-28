@@ -895,7 +895,11 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
         if (True(mp & MemoryProt::CpuExec)) {
             perms |= Core::MemoryPermission::Execute;
         }
-        impl.Protect(reinterpret_cast<VAddr>(addr), sz, perms);
+        if (rasterizer) {
+            rasterizer->ExternalProtect(reinterpret_cast<VAddr>(addr), sz, perms);
+        } else {
+            impl.Protect(reinterpret_cast<VAddr>(addr), sz, perms);
+        }
     };
 
     file->handle->Map(reinterpret_cast<u8*>(mapped_addr), size, phys_addr, std::bit_cast<u32>(prot),
@@ -1182,9 +1186,14 @@ s64 MemoryManager::ProtectBytes(VAddr addr, VirtualMemoryArea& vma_base, u64 siz
         return adjusted_size;
     }
 
-    // Perform address-space memory protections if needed.
+    // Perform address-space memory protections if needed. Through the rasterizer so the page
+    // manager's protection shadow (SHADPS4_PAGE_OS_SHADOW) sees the change.
     if (new_prot != old_prot) {
-        impl.Protect(addr, adjusted_size, perms);
+        if (rasterizer) {
+            rasterizer->ExternalProtect(addr, adjusted_size, perms);
+        } else {
+            impl.Protect(addr, adjusted_size, perms);
+        }
     }
 
     return adjusted_size;

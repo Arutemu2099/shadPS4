@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include <memory>
 #include <boost/icl/separate_interval_set.hpp>
 #include "common/arch.h"
@@ -86,12 +88,35 @@ public:
     /// Protects requested region.
     void Protect(VAddr virtual_addr, u64 size, MemoryPermission perms);
 
+    /// SHADPS4_PAGE_OS_SHADOW: bumped before and after every Map / MapFile / Unmap and every
+    /// protection change made outside the page manager (BeginRemap / EndRemap), so the page
+    /// manager's protection shadow can tell that the OS state may have changed under it.
+    /// remaps_active counts changes in progress. Both sequentially consistent.
+    [[nodiscard]] u64 RemapEpoch() const noexcept {
+        return remap_epoch.load();
+    }
+    [[nodiscard]] u32 RemapsActive() const noexcept {
+        return remaps_active.load();
+    }
+    void BeginRemap() noexcept {
+        remap_epoch.fetch_add(1);
+        remaps_active.fetch_add(1);
+    }
+    void EndRemap() noexcept {
+        // Epoch before active (Opus review): a reader that loads active == 0 after this remap
+        // must then load the bumped epoch (readers load active first).
+        remap_epoch.fetch_add(1);
+        remaps_active.fetch_sub(1);
+    }
+
     // Returns an interval set containing all usable regions.
     boost::icl::interval_set<VAddr> GetUsableRegions();
 
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;
+    std::atomic<u64> remap_epoch{0};
+    std::atomic<u32> remaps_active{0};
     u8* backing_base{};
     u8* system_managed_base{};
     u64 system_managed_size{};

@@ -3,6 +3,7 @@
 
 #include <map>
 #include <shared_mutex>
+#include "common/scope_exit.h"
 #include "common/alignment.h"
 #include "common/arch.h"
 #include "common/assert.h"
@@ -837,6 +838,10 @@ u64 AddressSpace::BackingSizeBytes() const noexcept {
 }
 
 void* AddressSpace::Map(VAddr virtual_addr, u64 size, PAddr phys_addr, bool is_exec) {
+    BeginRemap();
+    SCOPE_EXIT {
+        EndRemap();
+    };
 #if ARCH_X86_64
     const auto prot = is_exec ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
 #else
@@ -848,6 +853,10 @@ void* AddressSpace::Map(VAddr virtual_addr, u64 size, PAddr phys_addr, bool is_e
 }
 
 void* AddressSpace::MapFile(VAddr virtual_addr, u64 size, u64 offset, u32 prot, uintptr_t fd) {
+    BeginRemap();
+    SCOPE_EXIT {
+        EndRemap();
+    };
 #ifdef _WIN32
     return impl->Map(virtual_addr, offset, size,
                      ToWindowsProt(std::bit_cast<Core::MemoryProt>(prot)), fd);
@@ -858,6 +867,10 @@ void* AddressSpace::MapFile(VAddr virtual_addr, u64 size, u64 offset, u32 prot, 
 }
 
 void AddressSpace::Unmap(VAddr virtual_addr, u64 size) {
+    BeginRemap();
+    SCOPE_EXIT {
+        EndRemap();
+    };
     impl->Unmap(virtual_addr, size);
 }
 

@@ -4,6 +4,7 @@
 #include <bit>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <boost/container/small_vector.hpp>
 #include "common/assert.h"
 #include "common/debug.h"
@@ -357,7 +358,7 @@ struct PageManager::Impl {
     }
 
     void OnMap(VAddr address, size_t size) {
-        // No-op
+        // No-op (the protection shadow follows AddressSpace::RemapEpoch).
     }
 
     void OnUnmap(VAddr address, size_t size) {
@@ -595,7 +596,7 @@ struct PageManager::Impl {
             return;
         }
         if (os_lock_mode) {
-            ReconcileOs(first, end);
+            ReconcileOs(first, end, 1);
             return;
         }
         auto lk = LockPages(first, end);
@@ -676,14 +677,110 @@ struct PageManager::Impl {
         lk.unlock();
         // One reconcile over the whole span (ranges are pushed in ascending order): gap pages
         // get Perms(counts) as well, which is their state already.
-        ReconcileOs(pending.front().first, pending.back().second);
+        ReconcileOs(pending.front().first, pending.back().second, 0);
     }
 
-    void ReconcileOs(size_t first, size_t end) {
+    /**
+     * SHADPS4_PAGE_OS_SHADOW (needs PAGE_OS_LOCK): a byte per page remembering the protection
+     * last applied to it (0 = unknown), read and written only under the page's OS stripe by
+     * ReconcileOs. Invalidation: AddressSpace bumps RemapEpoch around every Map / MapFile / Unmap
+     * (a partial unmap re-maps neighbouring pages read-write, SplitRegion) and ExternalProtect
+     * (MemoryManager's own protects); ValidateStripes clears a stripe's shadow whenever the epoch
+     * moved since the stripe was last validated or a change is in progress (Opus review
+     * 2026-09-28: without it a skip could leave a re-mapped page writable).
+     * =1 counts, per caller (0 = watcher updates: fault handlers, CP, Protector; 1 = the
+     * recorder's deferred protects), the runs whose syscall would change nothing. =2 also skips
+     * those syscalls. Measured 2026-09-28 (a35, =1): 67-68% of the recorder's runs unchanged
+     * (fire and forest), 0.2% of watcher runs. 2^28 bytes committed; only touched pages use RAM.
+     * Soundness (inferred): a skip decided before a remap begins is equivalent to a syscall made
+     * just before it (today's behaviour); any shadow written before a remap ends is discarded at
+     * the next ValidateStripes. Other bypasses (TIMESTAMP_READER) are diagnostic only.
+     */
+    const bool os_shadow_mode =
+        os_lock_mode && (EnvIs("SHADPS4_PAGE_OS_SHADOW", '1') || EnvIs("SHADPS4_PAGE_OS_SHADOW", '2'));
+    const bool os_shadow_skip = os_lock_mode && EnvIs("SHADPS4_PAGE_OS_SHADOW", '2');
+    u8* const os_shadow = [this]() -> u8* {
+#ifdef _WIN32
+        if (os_shadow_mode) {
+            return static_cast<u8*>(VirtualAlloc(nullptr, NUM_ADDRESS_PAGES,
+                                                 MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        }
+#endif
+        return nullptr;
+    }();
+    struct ShadowStats {
+        std::atomic<u64> runs{0}, pages{0}, same_runs{0}, same_pages{0}, calls{0};
+    };
+    std::array<ShadowStats, 2> shadow_stats{};
+    /// RemapEpoch value each OS stripe's shadow was validated at (~0 = never trust); only
+    /// touched under that stripe.
+    const std::unique_ptr<u64[]> os_stripe_epoch =
+        os_shadow_mode ? std::make_unique<u64[]>(NUM_ADDRESS_LOCKS) : nullptr;
+    std::atomic<u64> shadow_invalidations{0};
+
+    /// Under the OS stripes of [first, end): drop the shadow of every stripe whose validation is
+    /// older than the address space's last remap, or while a remap is in progress.
+    void ValidateStripes(size_t first, size_t end) {
+        auto& address_space = Core::Memory::Instance()->GetAddressSpace();
+        // Active first, then the epoch (pairs with EndRemap's order).
+        const bool active = address_space.RemapsActive() != 0;
+        const u64 epoch = address_space.RemapEpoch();
+        const size_t s_end = Common::DivCeil(end, PAGES_PER_LOCK);
+        for (size_t stripe = first / PAGES_PER_LOCK; stripe < s_end; ++stripe) {
+            if (!active && os_stripe_epoch[stripe] == epoch) {
+                continue;
+            }
+            std::memset(os_shadow + stripe * PAGES_PER_LOCK, 0, PAGES_PER_LOCK);
+            os_stripe_epoch[stripe] = active ? ~0ULL : epoch;
+            shadow_invalidations.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    /// A protection change made outside the page manager (MemoryManager): bracketed by the remap
+    /// epoch so ReconcileOs never trusts a shadow this call may have overwritten.
+    void ExternalProtect(VAddr address, u64 size, Core::MemoryPermission perms) {
+        auto& address_space = Core::Memory::Instance()->GetAddressSpace();
+        if (!os_shadow) {
+            address_space.Protect(address, size, perms);
+            return;
+        }
+        address_space.BeginRemap();
+        address_space.Protect(address, size, perms);
+        address_space.EndRemap();
+    }
+
+    /// Under the OS stripe. True when every page of the run already has `perms` applied.
+    bool ShadowSame(size_t first, size_t end, Core::MemoryPermission perms) const {
+        const u8 value = static_cast<u8>(static_cast<u32>(perms) + 1);
+        for (size_t page = first; page < end; ++page) {
+            if (os_shadow[page] != value) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void CountShadow(int caller, size_t first, size_t end, Core::MemoryPermission perms,
+                     bool same) {
+        const u8 value = static_cast<u8>(static_cast<u32>(perms) + 1);
+        std::memset(os_shadow + first, value, end - first);
+        auto& st = shadow_stats[caller];
+        st.runs.fetch_add(1, std::memory_order_relaxed);
+        st.pages.fetch_add(end - first, std::memory_order_relaxed);
+        if (same) {
+            st.same_runs.fetch_add(1, std::memory_order_relaxed);
+            st.same_pages.fetch_add(end - first, std::memory_order_relaxed);
+        }
+    }
+
+    void ReconcileOs(size_t first, size_t end, int caller) {
         RENDERER_TRACE;
         Common::RangeLockGuard<LockType*> os_lk(os_locks.get() + first / PAGES_PER_LOCK,
                                                 os_locks.get() +
                                                     Common::DivCeil(end, PAGES_PER_LOCK));
+        if (os_shadow) [[unlikely]] {
+            ValidateStripes(first, end);
+        }
         // Run starts and their perms; a run ends where the next starts (or at `end`).
         boost::container::small_vector<std::pair<size_t, Core::MemoryPermission>, 8> runs;
         {
@@ -700,8 +797,15 @@ struct PageManager::Impl {
         }
         for (size_t i = 0; i < runs.size(); ++i) {
             const size_t run_end = i + 1 < runs.size() ? runs[i + 1].first : end;
-            Protect(runs[i].first << PM_PAGE_BITS, (run_end - runs[i].first) << PM_PAGE_BITS,
-                    runs[i].second);
+            // Still under the OS stripe: the shadow changes only under it (see os_shadow_mode).
+            const bool same = os_shadow && ShadowSame(runs[i].first, run_end, runs[i].second);
+            if (!(same && os_shadow_skip)) {
+                Protect(runs[i].first << PM_PAGE_BITS, (run_end - runs[i].first) << PM_PAGE_BITS,
+                        runs[i].second);
+            }
+            if (os_shadow) [[unlikely]] {
+                CountShadow(caller, runs[i].first, run_end, runs[i].second, same);
+            }
 #ifdef _WIN32
             if (os_verify) [[unlikely]] {
                 VerifyPage(runs[i].first, runs[i].second);
@@ -710,6 +814,26 @@ struct PageManager::Impl {
 #endif
         }
         os_lk.unlock();
+        if (os_shadow) [[unlikely]] {
+            const u64 calls =
+                shadow_stats[caller].calls.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((calls & ((1ULL << 20) - 1)) == 0) {
+                const auto& st = shadow_stats[caller];
+                const u64 r = st.runs.load(std::memory_order_relaxed);
+                const u64 pg = st.pages.load(std::memory_order_relaxed);
+                const u64 sr = st.same_runs.load(std::memory_order_relaxed);
+                const u64 sp = st.same_pages.load(std::memory_order_relaxed);
+                LOG_INFO(Render,
+                         "PageOsShadow: caller={} calls={} runs={} pages={} unchanged_runs={} "
+                         "({:.1f}%) unchanged_pages={} ({:.1f}%) pages/run={:.1f} skip={} "
+                         "stripe_invalidations={}",
+                         caller == 0 ? "watch" : "recorder", calls, r, pg, sr,
+                         100.0 * double(sr) / double(std::max<u64>(r, 1)), sp,
+                         100.0 * double(sp) / double(std::max<u64>(pg, 1)),
+                         double(pg) / double(std::max<u64>(r, 1)), os_shadow_skip,
+                         shadow_invalidations.load(std::memory_order_relaxed));
+            }
+        }
         os_syscalls.fetch_add(runs.size(), std::memory_order_relaxed);
         const u64 n = os_reconciles.fetch_add(1, std::memory_order_relaxed) + 1;
         if ((n & ((1ULL << 22) - 1)) == 0) {
@@ -914,6 +1038,14 @@ void PageManager::OnGpuMap(VAddr address, size_t size) {
 
 void PageManager::OnGpuUnmap(VAddr address, size_t size) {
     impl->OnUnmap(address, size);
+}
+
+void PageManager::ExternalProtect(VAddr address, u64 size, Core::MemoryPermission perms) const {
+#ifdef ENABLE_USERFAULTFD
+    Core::Memory::Instance()->GetAddressSpace().Protect(address, size, perms);
+#else
+    impl->ExternalProtect(address, size, perms);
+#endif
 }
 
 template <bool track>

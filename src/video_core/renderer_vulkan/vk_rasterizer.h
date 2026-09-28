@@ -139,6 +139,10 @@ public:
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
     void UnmapMemory(VAddr addr, u64 size);
+    /// MemoryManager's own protection changes (see PageManager::ExternalProtect).
+    void ExternalProtect(VAddr addr, u64 size, Core::MemoryPermission perms) {
+        page_manager.ExternalProtect(addr, size, perms);
+    }
 
     void CpSync();
     u64 Flush();
