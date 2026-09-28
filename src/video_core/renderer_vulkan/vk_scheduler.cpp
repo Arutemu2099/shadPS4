@@ -358,7 +358,13 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
     if (asc_enabled) {
         // I1: the ASC work recorded before this batch is submitted first and waited on.
         SubmitAscSegment();
-        if (asc_last_submitted > asc_waited_by_main) {
+        // SHADPS4_ASC_NO_I1=1: DIAGNOSTIC ONLY, UNSAFE (data races, resource reuse): skip the
+        // wait, to measure the upper bound of relaxing I1 (notes/asc-i1-relax-design-2026-09-28.md).
+        static const bool no_i1 = [] {
+            const char* value = std::getenv("SHADPS4_ASC_NO_I1");
+            return value && value[0] == '1';
+        }();
+        if (!no_i1 && asc_last_submitted > asc_waited_by_main) {
             // Wait masks are per index (index 1 = colour output): only index 0 or 2 is AllCommands.
             ASSERT(info.num_wait_semas != 1);
             info.AddWait(asc_semaphore->Handle(), asc_last_submitted);
