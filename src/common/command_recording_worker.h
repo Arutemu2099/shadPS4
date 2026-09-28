@@ -122,6 +122,10 @@ public:
     [[nodiscard]] std::size_t ActiveChunks() const noexcept {
         return active_chunks_;
     }
+    /// Commands accepted so far. Producer thread only (it is the only writer).
+    [[nodiscard]] std::uint64_t AcceptedCommandsProducer() const noexcept {
+        return accepted_commands_;
+    }
     static constexpr std::size_t DefaultChunkBytes = ChunkBytes;
 
     struct Counters {

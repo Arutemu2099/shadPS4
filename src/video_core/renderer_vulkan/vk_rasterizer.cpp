@@ -1311,11 +1311,25 @@ void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
         return;
     }
     bound_stages = stages;
+    // SHADPS4_GUEST_DISPATCH_ORDER: continue the previous dispatch's run only if the guest issued
+    // no sync packet or draw in between (same nonzero guest run) and nothing was recorded since
+    // that dispatch ended (no copy, upload, readback, pending operation or borrowed buffer).
+    if (dispatch_run != 0 && scheduler.IsAsyncRecording()) {
+        const bool cont = dispatch_run == prev_dispatch_run &&
+                          scheduler.RecordSeq() == prev_dispatch_end_seq;
+        cur_dispatch_run = cont ? prev_effective_run : ++effective_run_counter;
+    } else {
+        cur_dispatch_run = 0;
+    }
     if (is_indirect) {
         DispatchIndirectTail(pipeline, address, offset, size);
     } else {
         DispatchDirectTail(pipeline);
     }
+    prev_dispatch_run = cur_dispatch_run != 0 ? dispatch_run : 0;
+    prev_effective_run = cur_dispatch_run;
+    prev_dispatch_end_seq = scheduler.RecordSeq();
+    cur_dispatch_run = 0;
 }
 
 void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset,
@@ -3259,7 +3273,8 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
             if (auto barrier =
                     vk_buffer->GetBarrier(desc.is_written ? vk::AccessFlagBits2::eShaderWrite
                                                           : vk::AccessFlagBits2::eShaderRead,
-                                          vk::PipelineStageFlagBits2::eAllCommands)) {
+                                          vk::PipelineStageFlagBits2::eAllCommands, 0,
+                                          cur_dispatch_run)) {
                 buffer_barriers.emplace_back(*barrier);
             }
             if (desc.is_written && VideoCore::TextureCache::BufferImageAliasDiag()) {

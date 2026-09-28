@@ -479,6 +479,12 @@ public:
     bool IsAsyncRecording() const {
         return recording_worker && synchronous_scopes == 0;
     }
+    /// Command-processor thread: moves whenever anything is recorded (worker commands) or the
+    /// command buffer is borrowed directly. Equal values = nothing recorded in between.
+    u64 RecordSeq() const {
+        return (recording_worker ? recording_worker->AcceptedCommandsProducer() : 0) +
+               synchronous_borrows;
+    }
 
     /// Descriptor heap binds are invalidated by legacy descriptor state and do not survive a
     /// command buffer. Tracked in recording order on the command-processor thread.

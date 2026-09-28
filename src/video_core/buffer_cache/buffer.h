@@ -143,11 +143,16 @@ public:
         return smart_barriers_enabled;
     }
 
+    /// `run` (SHADPS4_GUEST_DISPATCH_ORDER, smart barriers only): nonzero for a dispatch binding;
+    /// equal values mean consecutive dispatches of one guest queue with no guest sync packet and
+    /// nothing else recorded in between. GCN overlaps such dispatches (the game orders dependent
+    /// ones with RELEASE_MEM / WAIT_REG_MEM / ACQUIRE_MEM / events), so no barrier among them.
     std::optional<vk::BufferMemoryBarrier2> GetBarrier(vk::AccessFlags2 dst_acess_mask,
                                                        vk::PipelineStageFlagBits2 dst_stage,
-                                                       u32 offset = 0) {
+                                                       u32 offset = 0, u64 run = 0) {
         if (SmartBarriers()) {
-            return GetHazardBarrier(dst_acess_mask, vk::PipelineStageFlags2{dst_stage}, offset);
+            return GetHazardBarrier(dst_acess_mask, vk::PipelineStageFlags2{dst_stage}, offset,
+                                    run);
         }
         if (dst_acess_mask == access_mask && stage == dst_stage) {
             return {};
@@ -182,7 +187,51 @@ private:
 
     std::optional<vk::BufferMemoryBarrier2> GetHazardBarrier(vk::AccessFlags2 dst_access,
                                                              vk::PipelineStageFlags2 dst_stages,
-                                                             u32 offset) {
+                                                             u32 offset, u64 run) {
+        if (run != 0 && run == hz_run) {
+            // Same guest dispatch run: no barrier; fold the access into the hazard state so the
+            // first access outside the run orders against all of it.
+            if (dst_access & WriteAccessBits) {
+                hz_write_stages |= dst_stages;
+                hz_write_access |= dst_access & WriteAccessBits;
+                hz_visible_stages = {};
+                hz_visible_access = {};
+            } else {
+                hz_read_stages |= dst_stages;
+            }
+            return {};
+        }
+        hz_run = run;
+        if (run != 0) {
+            // First access of a run: the run's later bindings of this buffer skip their barriers,
+            // so order it as a read and a write against all earlier work (no write-repeat
+            // shortcut: a guest sync may separate this run from the previous writer), and record
+            // the buffer as written by the run (conservative for the next access outside it).
+            const vk::AccessFlags2 access =
+                dst_access | vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+            std::optional<vk::BufferMemoryBarrier2> barrier{};
+            if (hz_write_access || hz_read_stages) {
+                vk::PipelineStageFlags2 src_stages = hz_write_stages | hz_read_stages;
+                if (!src_stages) {
+                    src_stages = vk::PipelineStageFlagBits2::eAllCommands;
+                }
+                barrier = vk::BufferMemoryBarrier2{
+                    .srcStageMask = src_stages,
+                    .srcAccessMask = hz_write_access,
+                    .dstStageMask = dst_stages,
+                    .dstAccessMask = access,
+                    .buffer = buffer.buffer,
+                    .offset = offset,
+                    .size = size_bytes - offset,
+                };
+            }
+            hz_write_stages = dst_stages;
+            hz_write_access = vk::AccessFlagBits2::eShaderWrite;
+            hz_read_stages = dst_stages;
+            hz_visible_stages = {};
+            hz_visible_access = {};
+            return barrier;
+        }
         const bool is_write = bool(dst_access & WriteAccessBits);
         if (!is_write) {
             const bool covered = (hz_visible_stages & dst_stages) == dst_stages &&
@@ -237,6 +286,7 @@ private:
     vk::PipelineStageFlags2 hz_read_stages{};
     vk::PipelineStageFlags2 hz_visible_stages{};
     vk::AccessFlags2 hz_visible_access{};
+    u64 hz_run{}; ///< guest dispatch run of the last access (0 = not a dispatch run)
 
 public:
 

@@ -99,6 +99,10 @@ public:
     void ExecuteDispatch(const ComputePipeline* pipeline,
                          const std::array<Shader::BoundStage, Shader::MaxStageTypes>& stages,
                          bool is_indirect, VAddr address, u32 offset, u32 size);
+    /// SHADPS4_GUEST_DISPATCH_ORDER: the guest run id of the dispatch about to execute (0 = none).
+    void SetDispatchRun(u64 run) {
+        dispatch_run = run;
+    }
 
     void Draw(bool is_indexed, u32 index_offset = 0);
     void ScanRegistersForValue();
@@ -221,6 +225,15 @@ private:
     void RecordTexMemo(TexMemoRecord& rec, const Shader::Info& stage, u64 tex_gen, u64 smp_gen,
                        u64 border, size_t img_begin, u32 sw_begin);
     u8 tex_bind_memo{};        // 0 off, 1 memo, 2 verify; read once in the constructor
+    // SHADPS4_GUEST_DISPATCH_ORDER state (back thread): the guest run of the next dispatch, the
+    // effective run passed to buffer barriers while a dispatch binds (0 = draws / no run), and the
+    // previous dispatch's guest run, effective run and recording sequence at its end.
+    u64 dispatch_run{};
+    u64 cur_dispatch_run{};
+    u64 prev_dispatch_run{};
+    u64 prev_effective_run{};
+    u64 prev_dispatch_end_seq{~u64{0}};
+    u64 effective_run_counter{};
     bool bind_memo_rebound{};  // BindTextures re-found a needs_rebind image
 
     /// Fills bound_stages from the pipeline lookup result; called right after the lookup.
