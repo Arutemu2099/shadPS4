@@ -186,11 +186,13 @@ public:
     }
 
     /// Recording worker, just before ending a batch submitted with `signal_value`.
-    void End(vk::CommandBuffer cmdbuf, u64 signal_value, u32 draws, u32 dispatches) {
+    void End(vk::CommandBuffer cmdbuf, u64 signal_value, u32 draws, u32 dispatches,
+             bool asc_wait = false) {
         if (!began) {
             return;
         }
         const u64 slot = write_seq % Slots;
+        batch_asc_wait[slot] = asc_wait;
         cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, query_pool,
                               u32(slot * 2 + 1));
         signal_values[slot] = signal_value;
@@ -379,6 +381,9 @@ private:
         u64 read_seq = 0;
         u64 prev_end = 0;
         u64 busy = 0, gaps = 0, gap_count = 0, batches = 0, draws = 0, max_batch = 0;
+        // ASC I1 split (design notes/asc-i1-relax-design-2026-09-28.md step 0b): the gap before a
+        // batch that waited an ASC value (I1) vs before one that did not.
+        u64 gaps_asc = 0, gap_count_asc = 0, batches_asc = 0;
         auto window_start = std::chrono::steady_clock::now();
         while (!stop.stop_requested()) {
             if (read_seq >= written.load(std::memory_order_acquire)) {
@@ -406,9 +411,14 @@ private:
             ResolveMix(value);
             busy += duration;
             max_batch = std::max(max_batch, duration);
+            batches_asc += batch_asc_wait[slot];
             if (prev_end != 0 && start > prev_end && start - prev_end < 50'000'000) {
                 gaps += start - prev_end;
                 ++gap_count;
+                if (batch_asc_wait[slot]) {
+                    gaps_asc += start - prev_end;
+                    ++gap_count_asc;
+                }
             }
             prev_end = end;
             ++batches;
@@ -434,6 +444,20 @@ private:
                          GpuBreaks().image_barrier_calls.exchange(0),
                          GpuBreaks().image_barriers.exchange(0));
                 LOG_INFO(Render_Vulkan, "GpuBreakSites:{}", GpuBreakSites().Report());
+                if (batches_asc != 0) {
+                    LOG_INFO(Render_Vulkan,
+                             "GpuBatchI1: batches={} with_asc_wait={} gap_ms_asc_wait={:.1f} "
+                             "gap_ms_other={:.1f} gap_us_asc_wait={:.1f} gap_us_other={:.1f} "
+                             "(per 10 s window)",
+                             batches, batches_asc, double(gaps_asc) / 1e6,
+                             double(gaps - gaps_asc) / 1e6,
+                             gap_count_asc ? double(gaps_asc) / double(gap_count_asc) / 1000.0 : 0.0,
+                             gap_count > gap_count_asc
+                                 ? double(gaps - gaps_asc) / double(gap_count - gap_count_asc) /
+                                       1000.0
+                                 : 0.0);
+                }
+                gaps_asc = gap_count_asc = batches_asc = 0;
                 LogMix();
                 busy = gaps = gap_count = batches = draws = max_batch = 0;
                 window_start = now;
@@ -441,6 +465,7 @@ private:
         }
     }
 
+    std::array<u8, Slots> batch_asc_wait{};
     const Instance& instance;
     MasterSemaphore& semaphore;
     vk::QueryPool query_pool;

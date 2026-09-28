@@ -393,7 +393,11 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
     batch_ops = 0;
     recording_worker->Record([this, info, signal_value, draws, dispatches]() mutable {
         if (batch_timer) {
-            batch_timer->End(main_cmdbuf, signal_value, draws, dispatches);
+            bool asc_wait = false;
+            for (u32 i = 0; i < info.num_wait_semas; ++i) {
+                asc_wait |= asc_enabled && info.wait_semas[i] == asc_semaphore->Handle();
+            }
+            batch_timer->End(main_cmdbuf, signal_value, draws, dispatches, asc_wait);
         }
         Check(main_cmdbuf.end());
         static constexpr std::array<vk::PipelineStageFlags, 3> wait_stage_masks = {
