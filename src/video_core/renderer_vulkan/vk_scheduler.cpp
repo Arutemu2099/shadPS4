@@ -417,6 +417,42 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
             .signalSemaphoreCount = info.num_signal_semas,
             .pSignalSemaphores = info.signal_semas.data(),
         };
+        // SHADPS4_ASC_I1_STATS=1 (diagnostic, notes/asc-i1-relax-design-2026-09-28.md step 0b): at
+        // submit time, is the ASC value this batch waits on (I1) still unfinished, and is the main
+        // queue then already idle (previous batch done) so the wait certainly stalls it?
+        static const bool i1_stats = [] {
+            const char* value = std::getenv("SHADPS4_ASC_I1_STATS");
+            return value && value[0] == '1';
+        }();
+        if (i1_stats && asc_enabled) [[unlikely]] {
+            static u64 submits = 0, asc_waits = 0, pending = 0, pending_main_idle = 0,
+                       backlog_sum = 0;
+            ++submits;
+            for (u32 i = 0; i < info.num_wait_semas; ++i) {
+                if (info.wait_semas[i] != asc_semaphore->Handle()) {
+                    continue;
+                }
+                ++asc_waits;
+                asc_semaphore->Refresh();
+                const u64 known = asc_semaphore->KnownGpuTick();
+                if (known < info.wait_ticks[i]) {
+                    ++pending;
+                    backlog_sum += info.wait_ticks[i] - known;
+                    master_semaphore.Refresh();
+                    if (master_semaphore.IsFree(signal_value - 1)) {
+                        ++pending_main_idle;
+                    }
+                }
+            }
+            if (submits % 10000 == 0) {
+                LOG_INFO(Render_Vulkan,
+                         "AscI1Stats: main_submits={} with_asc_wait={} asc_unfinished_at_submit={} "
+                         "({:.1f}%) of_which_main_idle={} mean_asc_backlog={:.2f}",
+                         submits, asc_waits, pending, 100.0 * double(pending) / double(submits),
+                         pending_main_idle,
+                         pending ? double(backlog_sum) / double(pending) : 0.0);
+            }
+        }
         {
             std::scoped_lock lk{submit_mutex};
             const auto result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
