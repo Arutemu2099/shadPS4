@@ -1259,6 +1259,15 @@ void Rasterizer::ExecuteDraw(const SplitDraw& draw,
             return false;
         }
         bound_stages = stages;
+        if (VideoCore::BufferCache::CensusEnabled()) [[unlikely]] {
+            u64 id = 0;
+            for (const auto* stage : draw.pipeline->GetStages()) {
+                if (stage && stage->l_stage == Shader::LogicalStage::Fragment) {
+                    id = stage->pgm_hash;
+                }
+            }
+            buffer_cache.SetWriterTag(1, id);
+        }
         return true;
     };
     if (draw.args.is_indirect) {
@@ -1318,6 +1327,15 @@ void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
     }
     bound_stages = stages;
     dispatch_target = asc_stream && dispatch_queue != 0 && AscCandidate(pipeline) ? 1u : 0u;
+    if (VideoCore::BufferCache::CensusEnabled()) [[unlikely]] {
+        u64 id = 0;
+        for (const auto* stage : pipeline->GetStages()) {
+            if (stage) {
+                id = stage->pgm_hash;
+            }
+        }
+        buffer_cache.SetWriterTag(dispatch_queue == 0 ? 2 : 3, id);
+    }
     dispatch_on_asc = false;
     // An indirect dispatch reads its argument buffer: BindBuffers checks it with the bindings.
     buffer_cache.SetAscIndirectArgs(is_indirect ? address + offset : 0, is_indirect ? size : 0);
@@ -1407,6 +1425,22 @@ bool Rasterizer::AscCandidate(const ComputePipeline* pipeline) const {
     // buffers. HLE shaders and image copy / clear shaders never reach BindResources.
     (void)pipeline;
     const auto* info = bound_stages[static_cast<u32>(Shader::LogicalStage::Compute)].info;
+    if (info && VideoCore::BufferCache::CensusEnabled()) [[unlikely]] {
+        // SHADPS4_ASC_V2_CENSUS: why an async-queue pipeline is not eligible, once per shader.
+        static std::unordered_set<u64> logged;
+        if (logged.insert(info->pgm_hash).second) {
+            std::string bufs;
+            for (const auto& desc : info->buffers) {
+                bufs += fmt::format(" [type={} formatted={} written={}]",
+                                    static_cast<u32>(desc.buffer_type), desc.is_formatted,
+                                    desc.is_written);
+            }
+            LOG_INFO(Render_Vulkan, "AscCensusPipe: cs_{:08x} images={} samplers={} uses_dma={} "
+                                    "buffers:{}",
+                     info->pgm_hash, info->images.size(), info->samplers.size(), info->uses_dma,
+                     bufs);
+        }
+    }
     if (!info || !info->images.empty() || !info->samplers.empty() || info->uses_dma) {
         return false;
     }
@@ -3271,6 +3305,16 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
         }
     }
     const u64 find_ns = Common::FaultMonitor::SinceNs(t_find);
+    if (binding_compute && dispatch_target == 1 && VideoCore::BufferCache::CensusEnabled())
+        [[unlikely]] {
+        for (u32 i = 0; i < buffer_bindings.size(); ++i) {
+            const auto& [buffer_id, vsharp, size] = buffer_bindings[i];
+            if (size != 0) {
+                buffer_cache.CensusAscBinding(buffer_id, vsharp.base_address, size,
+                                              stage.buffers[i].is_written);
+            }
+        }
+    }
     if (binding_compute && scheduler.HasAscStream()) {
         // SHADPS4_ASC_STREAM: the buffers are known now. A candidate goes to the ASC stream only if
         // no buffer it binds was touched by the main batch still being recorded (an ASC segment

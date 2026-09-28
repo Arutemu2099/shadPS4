@@ -110,6 +110,7 @@ const bool g_buffer_ranges_table = [] {
     return value && value[0] == '2';
 }();
 const bool g_thread_assert = EnvIs1("SHADPS4_THREAD_ASSERT");
+const bool g_asc_census = EnvIs1("SHADPS4_ASC_V2_CENSUS");
 /// SHADPS4_WRITTEN_RUN_MEMO: 0 off, 1 on, 2 verify. See ObtainBuffer.
 const int g_written_run_memo = [] {
     const char* value = std::getenv("SHADPS4_WRITTEN_RUN_MEMO");
@@ -1314,6 +1315,9 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
             }
         }
     }
+    if (g_asc_census && scheduler.HasAscStream()) {
+        CensusCtrlJob(job->copies, tick, asc_producer, asc_done);
+    }
     if (!asc_done && fast_lane) {
         // The producer is still on the ASC stream: copy right behind it there, so the guest waits
         // for the particle work only, not for the graphics queued on the main queue. No unfinished
@@ -1712,9 +1716,13 @@ void BufferCache::NoteBatchWrite(VAddr addr, u64 size) {
         const u64 i = tick % WriteHistory;
         if (write_hist_tick[i] != tick) {
             write_hist[i].clear();
+            write_hist_tag[i].clear();
             write_hist_tick[i] = tick;
         }
         write_hist[i].emplace_back(addr, addr + size);
+        if (g_asc_census) {
+            write_hist_tag[i].emplace_back(census_kind, census_id);
+        }
     }
     if (!PrebatchEnabled()) {
         return;
@@ -1854,6 +1862,126 @@ void BufferCache::NoteDiagRead(VAddr addr) {
     }
     LOG_INFO(Render, "ReadProducer: {} read faults, {} producers, windows tracked {}; top:{}", diag_reads,
              top.size(), diag_window_writer.size(), line);
+}
+
+bool BufferCache::CensusEnabled() {
+    return g_asc_census;
+}
+
+std::pair<u8, u64> BufferCache::NewestMainWriterTag(std::span<const FaultCopy> copies, u64 first,
+                                                    u64 last) const {
+    for (u64 t = last; t >= first && t != 0; --t) {
+        if (last - t >= WriteHistory) {
+            return {255, 0};
+        }
+        const u64 i = t % WriteHistory;
+        if (write_hist_tick[i] != t) {
+            continue;
+        }
+        const auto& hist = write_hist[i];
+        const auto& tags = write_hist_tag[i];
+        for (size_t k = hist.size(); k-- > 0;) {
+            for (const FaultCopy& copy : copies) {
+                if (hist[k].first < copy.addr + copy.size && copy.addr < hist[k].second) {
+                    return k < tags.size() ? tags[k] : std::pair<u8, u64>{0, 0};
+                }
+            }
+        }
+    }
+    return {0, 0};
+}
+
+/// Census (a): control-block fault jobs (0x270000000-0x2701fffff) by why they did (not) take the
+/// ASC copy path: producer not on the ASC stream, ASC producer already done, ASC producer
+/// unfinished and blocked by an unfinished main writer (by kind and pipeline), or ASC path taken.
+void BufferCache::CensusCtrlJob(std::span<const FaultCopy> copies, u64 tick, u64 asc_producer,
+                                bool asc_done) {
+    if (copies.empty() || copies.front().addr < 0x270000000ULL ||
+        copies.front().addr >= 0x270200000ULL) {
+        return;
+    }
+    struct Census {
+        u64 jobs = 0, not_asc = 0, asc_done = 0, blocked = 0, asc_path = 0;
+        std::array<u64, 256> by_kind{};
+        std::unordered_map<u64, u64> by_id;
+    };
+    static Census c;
+    ++c.jobs;
+    if (asc_producer == 0) {
+        ++c.not_asc;
+    } else if (asc_done) {
+        ++c.asc_done;
+    } else {
+        auto* master = scheduler.GetMasterSemaphore();
+        const u64 completed = master->KnownGpuTick();
+        if (completed != 0 && completed < tick && BatchesWriteAny(copies, completed, tick)) {
+            ++c.blocked;
+            const auto [kind, id] = NewestMainWriterTag(copies, completed, tick);
+            ++c.by_kind[kind];
+            ++c.by_id[(u64(kind) << 56) ^ id];
+        } else {
+            ++c.asc_path;
+        }
+    }
+    if ((c.jobs & 0xff) != 0) {
+        return;
+    }
+    std::string kinds;
+    for (size_t k = 0; k < c.by_kind.size(); ++k) {
+        if (c.by_kind[k] != 0) {
+            kinds += fmt::format(" k{}={}", k, c.by_kind[k]);
+        }
+    }
+    std::vector<std::pair<u64, u64>> top(c.by_id.begin(), c.by_id.end());
+    std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::string ids;
+    for (size_t k = 0; k < std::min<size_t>(top.size(), 6); ++k) {
+        ids += fmt::format(" k{}:{:08x}={}", top[k].first >> 56, top[k].first & 0x00ffffffffffffffULL,
+                           top[k].second);
+    }
+    LOG_INFO(Render, "AscCensusCtrl: jobs={} producer_not_asc={} asc_done={} blocked_by_main={} "
+                     "asc_path={} blockers:{} top:{}",
+             c.jobs, c.not_asc, c.asc_done, c.blocked, c.asc_path, kinds, ids);
+}
+
+void BufferCache::CensusAscBinding(BufferId buffer_id, VAddr addr, u64 size, bool written) {
+    struct Entry {
+        VAddr base = 0;
+        u64 buffer_size = 0, n = 0, written = 0, max_size = 0;
+    };
+    static std::unordered_map<u32, Entry> by_buffer;
+    static u64 bindings = 0, in_texel_span = 0, written_in_texel_span = 0;
+    ++bindings;
+    constexpr VAddr TexelLo = 0x248002000ULL;
+    constexpr VAddr TexelHi = 0x248002000ULL + 0x21dfe000ULL;
+    if (addr < TexelHi && TexelLo < addr + size) {
+        ++in_texel_span;
+        written_in_texel_span += written;
+    }
+    if (buffer_id) {
+        const Buffer& buffer = slot_buffers[buffer_id];
+        auto& e = by_buffer[buffer_id.index];
+        e.base = buffer.CpuAddr();
+        e.buffer_size = buffer.SizeBytes();
+        ++e.n;
+        e.written += written;
+        e.max_size = std::max(e.max_size, size);
+    }
+    if ((bindings & 0xffff) != 0) {
+        return;
+    }
+    std::vector<Entry> top;
+    for (const auto& [id, e] : by_buffer) {
+        top.push_back(e);
+    }
+    std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.n > b.n; });
+    std::string line;
+    for (size_t k = 0; k < std::min<size_t>(top.size(), 8); ++k) {
+        line += fmt::format(" [{:#x}+{:#x} n={} w={} max={:#x}]", top[k].base, top[k].buffer_size,
+                            top[k].n, top[k].written, top[k].max_size);
+    }
+    LOG_INFO(Render, "AscCensusBind: bindings={} buffers={} in_texel_span={} written_in_span={} top:{}",
+             bindings, by_buffer.size(), in_texel_span, written_in_texel_span, line);
 }
 
 void BufferCache::NoteGpuWrite(VAddr addr, u64 size) {
@@ -2547,6 +2675,7 @@ void BufferCache::BindIndexBuffer(
 }
 
 void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
+    WriterTagScope census_tag{*this, 8};
     ASSERT_MSG(address % 4 == 0, "GDS offset must be dword aligned");
     if (!is_gds) {
         texture_cache.ClearMeta(address);
@@ -2569,6 +2698,7 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
 }
 
 void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+    WriterTagScope census_tag{*this, 4};
     if (!dst_gds && !IsRegionGpuModified(dst, num_bytes)) {
         if (!src_gds && !IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {
@@ -3297,6 +3427,7 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
 
 void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
                               bool accumulate_stream_score) {
+    WriterTagScope census_tag{*this, 6};
     Buffer& new_buffer = slot_buffers[new_buffer_id];
     Buffer& overlap = slot_buffers[overlap_id];
     NoteBatchWrite(overlap.CpuAddr(), overlap.SizeBytes());
@@ -3644,6 +3775,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 }
 
 bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, u32 size) {
+    WriterTagScope census_tag{*this, 7};
     buffer.NoteMainAccess(scheduler.CurrentTick(), true);
     // TIER-2 SPLIT PROBE: the ob_sync gap (ob_sync - scan/copy/mark = ~7.7 ms/frame) is untimed and
     // was GUESSED to be lock/framing. This path (read-only texel buffers) is the prime suspect.
@@ -3742,6 +3874,7 @@ void BufferCache::SynchronizeBuffersInRange(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* value, u32 num_bytes) {
+    WriterTagScope census_tag{*this, 5};
     NoteBatchWrite(address, num_bytes);
     buffer.NoteMainAccess(scheduler.CurrentTick(), true);
     vk::BufferCopy copy = {

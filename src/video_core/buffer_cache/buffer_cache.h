@@ -348,6 +348,19 @@ private:
     }
 public:
     /// SHADPS4_ASC_STREAM: an indirect dispatch's argument range, checked with its bindings.
+    /// SHADPS4_ASC_V2_CENSUS=1 (diagnostic, notes/asc-stream-v2-design-2026-09-28.md step 0): who
+    /// writes. The rasterizer sets the draw / dispatch tag, the DMA / fill / WRITE_DATA / join /
+    /// image paths set their own; NoteBatchWrite stores it next to each main write-history entry.
+    /// Kinds: 1 draw, 2 dispatch from the graphics queue, 3 dispatch from an async queue recorded on
+    /// main, 4 DMA_DATA copy, 5 WRITE_DATA, 6 JoinOverlap, 7 image->buffer, 8 fill, 0 other.
+    void SetWriterTag(u8 kind, u64 id) noexcept {
+        census_kind = kind;
+        census_id = id;
+    }
+    [[nodiscard]] static bool CensusEnabled();
+    /// Census (b): one ASC candidate binding (before the stream decision).
+    void CensusAscBinding(BufferId buffer_id, VAddr addr, u64 size, bool written);
+
     void SetAscIndirectArgs(VAddr addr, u64 size) noexcept {
         asc_indirect_addr = addr;
         asc_indirect_size = size;
@@ -560,6 +573,30 @@ private:
     /// SHADPS4_PRECISE_PRODUCER: the GPU write ranges of the last WriteHistory batches.
     static constexpr u64 WriteHistory = 64;
     std::array<std::vector<std::pair<VAddr, VAddr>>, WriteHistory> write_hist;
+    /// SHADPS4_ASC_V2_CENSUS: writer kind and pipeline hash per write_hist entry (same index).
+    std::array<std::vector<std::pair<u8, u64>>, WriteHistory> write_hist_tag;
+    u8 census_kind{};
+    u64 census_id{};
+    struct WriterTagScope {
+        BufferCache& cache;
+        u8 kind;
+        u64 id;
+        WriterTagScope(BufferCache& cache_, u8 new_kind)
+            : cache{cache_}, kind{cache_.census_kind}, id{cache_.census_id} {
+            cache.census_kind = new_kind;
+            cache.census_id = 0;
+        }
+        ~WriterTagScope() {
+            cache.census_kind = kind;
+            cache.census_id = id;
+        }
+    };
+    /// Newest main write-history entry in [first, last] overlapping the copies: its tag, or
+    /// kind 255 when the answer is "older than the history" (conservative writer).
+    std::pair<u8, u64> NewestMainWriterTag(std::span<const FaultCopy> copies, u64 first,
+                                           u64 last) const;
+    void CensusCtrlJob(std::span<const FaultCopy> copies, u64 tick, u64 asc_producer,
+                       bool asc_done);
     std::array<u64, WriteHistory> write_hist_tick{};
     /// Newest batch tick that wrote any of the copies; 0 when none of the last WriteHistory did.
     u64 PreciseProducer(std::span<const FaultCopy> copies) const;
