@@ -433,9 +433,11 @@ private:
         // This is the only path out of the tracker that reaches a VirtualProtect syscall. Count
         // and time it: it is the one candidate in the per-draw sync path that can plausibly cost
         // microseconds, and bitset arithmetic cannot.
-        // Read watchers stay synchronous: num_read_watchers is one bit, so a deferred -1 must
-        // not overtake its +1 (Opus review 2026-09-28). Row 3 (write faults) is the write side.
-        if (g_deferred_watch && !is_read) {
+        // Two users: SHADPS4_DEFER_READ_PROTECT (the CP's read tightens, handed to the Protector)
+        // and SHADPS4_FAULT_WATCH_OUTSIDE (a guest write fault's window only runs
+        // ChangeRegionState<CPU>, i.e. write-side updates). Do not filter by is_read here: on
+        // 2026-09-28 an `&& !is_read` guard silently turned DEFER_READ_PROTECT off (a34).
+        if (g_deferred_watch) {
             g_deferred_watch->push_back({tracker, cpu_addr, mask, track, is_read});
             return;
         }
