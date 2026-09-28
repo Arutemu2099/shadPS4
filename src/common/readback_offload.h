@@ -59,6 +59,8 @@ inline bool LatencyEnabled() {
 /// SHADPS4_READBACK_LATENCY: guest RIP of the read fault this thread is resolving (0 unknown);
 /// set by the page-fault handler, read by the batch-mix diagnostic.
 inline thread_local u64 t_read_fault_rip = 0;
+/// SHADPS4_READBACK_LATENCY: set while this thread runs the HLE memset (libc_internal).
+inline thread_local bool t_in_hle_memset = false;
 
 /// SHADPS4_READBACK_SPIN_WAIT=N: a guest readback polls the timeline semaphore for up to N us
 /// before falling back to vkWaitSemaphores.

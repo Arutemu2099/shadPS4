@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
+#include <atomic>
+#include <chrono>
 #include "common/logging/log.h"
+#include "common/readback_offload.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
 #include "libc_internal_memory.h"
@@ -10,6 +13,32 @@
 namespace Libraries::LibcInternal {
 
 void* PS4_SYSV_ABI internal_memset(void* s, int c, size_t n) {
+    if (Common::ReadbackOffload::LatencyEnabled() && n >= 4096) [[unlikely]] {
+        // Diagnostic: time of large guest memsets (their write faults included) and a thread
+        // flag that tags the readback jobs they raise (batch mix class "memset").
+        static std::atomic<u64> calls{0}, bytes{0}, ns{0}, max_ns{0};
+        const auto t0 = std::chrono::steady_clock::now();
+        Common::ReadbackOffload::t_in_hle_memset = true;
+        void* result = std::memset(s, c, n);
+        Common::ReadbackOffload::t_in_hle_memset = false;
+        const u64 d = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           std::chrono::steady_clock::now() - t0)
+                                           .count());
+        bytes.fetch_add(n, std::memory_order_relaxed);
+        ns.fetch_add(d, std::memory_order_relaxed);
+        u64 m = max_ns.load(std::memory_order_relaxed);
+        while (d > m && !max_ns.compare_exchange_weak(m, d, std::memory_order_relaxed)) {
+        }
+        const u64 k = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((k & 0x3fff) == 0) {
+            LOG_INFO(Lib_LibcInternal,
+                     "HleMemsetLarge: calls={} mean_bytes={} total_ms={:.1f} mean_us={:.2f} "
+                     "max_us={:.1f} (cumulative; n >= 4096)",
+                     k, bytes.load() / k, double(ns.load()) / 1e6, double(ns.load()) / 1e3 / k,
+                     double(max_ns.load()) / 1e3);
+        }
+        return result;
+    }
     return std::memset(s, c, n);
 }
 

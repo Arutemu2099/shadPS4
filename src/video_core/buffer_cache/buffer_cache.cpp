@@ -127,6 +127,9 @@ static u32 ClassifyReadbackAddr(VAddr addr) {
     // Exact when the faulting instruction is known: the game functions of REFERENCE 4.2
     // (control-block reader 0x3f3ed0, mesh snap 0x3fed00, exposure sum 0x171610; function
     // extents assumed, entry + a few KB).
+    if (Offload::t_in_hle_memset) {
+        return Timer::MixMemset;
+    }
     if (const u64 rip = Offload::t_read_fault_rip; rip != 0) {
         const u64 off = rip - 0x800000000ULL;
         u32 by_rip = Timer::MixOther;
