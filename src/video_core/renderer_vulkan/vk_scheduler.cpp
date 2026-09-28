@@ -353,11 +353,13 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
         ImGui::Core::TextureManager::Submit();
     }
     const u32 draws = batch_draws;
+    const u32 dispatches = batch_dispatches;
     batch_draws = 0;
+    batch_dispatches = 0;
     batch_ops = 0;
-    recording_worker->Record([this, info, signal_value, draws]() mutable {
+    recording_worker->Record([this, info, signal_value, draws, dispatches]() mutable {
         if (batch_timer) {
-            batch_timer->End(current_cmdbuf, signal_value, draws);
+            batch_timer->End(current_cmdbuf, signal_value, draws, dispatches);
         }
         Check(current_cmdbuf.end());
         static constexpr std::array<vk::PipelineStageFlags, 3> wait_stage_masks = {
@@ -447,6 +449,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     const u64 signal_value = master_semaphore.NextTick();
     last_batch_draws = batch_draws;
     batch_draws = 0;
+    batch_dispatches = 0;
     batch_ops = 0;
 
 #if TRACY_GPU_ENABLED

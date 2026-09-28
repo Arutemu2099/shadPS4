@@ -1700,7 +1700,7 @@ void Rasterizer::DispatchDirectTail(const ComputePipeline* pipeline) {
         cmdbuf.dispatch(x, y, z);
     });
     DebugState.IncDispatch();
-    scheduler.NoteOp();
+    scheduler.NoteDispatch();
 
     ResetBindings();
     if (buffer_cache.TakeReadbackFlushRequest()) {
@@ -1752,7 +1752,7 @@ void Rasterizer::DispatchIndirectTail(const ComputePipeline* pipeline, VAddr add
             cmdbuf.dispatchIndirect(buffer, base);
         });
     DebugState.IncDispatch();
-    scheduler.NoteOp();
+    scheduler.NoteDispatch();
 
     ResetBindings();
     MaybeFlushEveryOps(scheduler);

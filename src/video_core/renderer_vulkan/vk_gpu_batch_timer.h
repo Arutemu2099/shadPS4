@@ -186,7 +186,7 @@ public:
     }
 
     /// Recording worker, just before ending a batch submitted with `signal_value`.
-    void End(vk::CommandBuffer cmdbuf, u64 signal_value, u32 draws) {
+    void End(vk::CommandBuffer cmdbuf, u64 signal_value, u32 draws, u32 dispatches) {
         if (!began) {
             return;
         }
@@ -195,12 +195,171 @@ public:
                               u32(slot * 2 + 1));
         signal_values[slot] = signal_value;
         batch_draws[slot] = draws;
+        batch_dispatches[slot] = dispatches;
+        submit_ns[slot] = NowNs();
         written.store(++write_seq, std::memory_order_release);
         began = false;
     }
 
+    static u64 NowNs() {
+        return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count());
+    }
+
+    /// Readback batch mix (with SHADPS4_READBACK_LATENCY): one timed readback copy. The main-queue
+    /// batches `done_tick + 1 .. last_ahead` were not known complete when the copy was flushed;
+    /// `own_tick` is the batch holding the copy (0 when it was a separate queue-order submission);
+    /// `producer` is the newest batch that GPU-wrote the copied bytes (0 unknown).
+    enum MixClass : u32 { MixArena, MixPool, MixOther, NumMixClasses };
+    struct MixRequest {
+        u64 done_tick;
+        u64 last_ahead;
+        u64 own_tick;
+        u64 producer;
+        u64 flush_ns;
+        u32 cls;
+    };
+    void RequestMix(const MixRequest& request) {
+        std::scoped_lock lk{mix_mutex};
+        if (mix_pending.size() < 4096) {
+            mix_pending.push_back(request);
+        }
+    }
+
 private:
     static constexpr u64 Slots = 1024;
+    static constexpr u64 TickSlots = 8192;
+
+    /// Per completed batch, indexed by its signal value (reader thread only).
+    struct TickInfo {
+        u64 tick = 0;
+        u64 duration_ns = 0;
+        u64 submit_ns = 0;
+        u32 draws = 0;
+        u32 dispatches = 0;
+    };
+
+    /// Batch kinds: 0 graphics only, 1 dispatches only, 2 both, 3 neither (copies, uploads).
+    static u32 Kind(const TickInfo& t) {
+        if (t.draws != 0) {
+            return t.dispatches != 0 ? 2 : 0;
+        }
+        return t.dispatches != 0 ? 1 : 3;
+    }
+
+    struct MixAccum {
+        u64 jobs = 0, own_jobs = 0, ahead_batches = 0, untimed = 0;
+        std::array<u64, 4> ahead_ns{};    ///< GPU time of batches ahead, by kind.
+        std::array<u64, 4> ahead_count{}; ///< Batches ahead, by kind.
+        u64 before_producer_ns = 0;       ///< Ahead and older than the producer batch.
+        u64 producer_ahead = 0;           ///< Producer among the batches ahead.
+        u64 producer_own = 0;             ///< Producer is the copy's own batch.
+        u64 producer_done = 0;            ///< Producer known complete at flush.
+        u64 age_weighted = 0;             ///< Sum of (flush - submit) us x GPU ns, batches ahead.
+        u64 own_ns = 0, own_draws = 0, own_dispatches = 0, own_timed = 0;
+        std::array<u64, 8> ahead_hist{};  ///< Jobs by batches ahead: 0,1,2,3,4-7,8-15,16-31,32+.
+    };
+
+    void ResolveMix(u64 processed_tick) {
+        std::vector<MixRequest> ready;
+        {
+            std::scoped_lock lk{mix_mutex};
+            for (size_t i = 0; i < mix_pending.size();) {
+                const MixRequest& r = mix_pending[i];
+                if (std::max(r.own_tick, r.last_ahead) <= processed_tick) {
+                    ready.push_back(r);
+                    mix_pending[i] = mix_pending.back();
+                    mix_pending.pop_back();
+                } else {
+                    ++i;
+                }
+            }
+        }
+        for (const MixRequest& r : ready) {
+            MixAccum& a = mix[r.cls];
+            ++a.jobs;
+            u64 n = 0;
+            // At most 256 batches; an older known-done value only means the poll was stale.
+            const u64 first = std::max(r.done_tick + 1, r.last_ahead > 255 ? r.last_ahead - 255 : 1);
+            for (u64 t = first; t <= r.last_ahead; ++t) {
+                const TickInfo& info = ticks[t % TickSlots];
+                ++n;
+                if (info.tick != t) {
+                    ++a.untimed;
+                    continue;
+                }
+                const u32 k = Kind(info);
+                a.ahead_ns[k] += info.duration_ns;
+                ++a.ahead_count[k];
+                if (r.producer != 0 && t < r.producer) {
+                    a.before_producer_ns += info.duration_ns;
+                }
+                if (r.flush_ns > info.submit_ns) {
+                    a.age_weighted += (r.flush_ns - info.submit_ns) / 1000 * info.duration_ns;
+                }
+            }
+            a.ahead_batches += n;
+            ++a.ahead_hist[n < 4 ? n : n < 8 ? 4 : n < 16 ? 5 : n < 32 ? 6 : 7];
+            if (r.producer != 0) {
+                if (r.producer <= r.done_tick) {
+                    ++a.producer_done;
+                } else if (r.own_tick != 0 && r.producer >= r.own_tick) {
+                    ++a.producer_own;
+                } else {
+                    ++a.producer_ahead;
+                }
+            }
+            if (r.own_tick != 0) {
+                ++a.own_jobs;
+                const TickInfo& own = ticks[r.own_tick % TickSlots];
+                if (own.tick == r.own_tick) {
+                    ++a.own_timed;
+                    a.own_ns += own.duration_ns;
+                    a.own_draws += own.draws;
+                    a.own_dispatches += own.dispatches;
+                }
+            }
+        }
+    }
+
+    void LogMix() {
+        static constexpr std::array<const char*, NumMixClasses> names = {"arena", "pool",
+                                                                         "other"};
+        for (u32 c = 0; c < NumMixClasses; ++c) {
+            MixAccum& a = mix[c];
+            if (a.jobs == 0) {
+                continue;
+            }
+            const double j = double(a.jobs);
+            u64 ahead_total = 0;
+            for (const u64 v : a.ahead_ns) {
+                ahead_total += v;
+            }
+            const double ot = a.own_timed ? double(a.own_timed) : 1.0;
+            LOG_INFO(Render_Vulkan,
+                     "BatchMix[{}]: jobs={} own_batch_jobs={} ahead_batches={:.2f} untimed={:.2f} "
+                     "ahead_gpu_us={:.1f} gfx_only_us={:.1f} disp_only_us={:.1f} mixed_us={:.1f} "
+                     "neither_us={:.1f} n_gfx/disp/mixed/neither={:.2f}/{:.2f}/{:.2f}/{:.2f} "
+                     "before_producer_us={:.1f} producer_done/ahead/own={}/{}/{} "
+                     "ahead_age_ms_gpu_weighted={:.2f} own_us={:.1f} own_draws={:.1f} "
+                     "own_disp={:.1f} hist[0,1,2,3,4-7,8-15,16-31,32+]={}/{}/{}/{}/{}/{}/{}/{}",
+                     names[c], a.jobs, a.own_jobs, double(a.ahead_batches) / j,
+                     double(a.untimed) / j, double(ahead_total) / j / 1000.0,
+                     double(a.ahead_ns[0]) / j / 1000.0, double(a.ahead_ns[1]) / j / 1000.0,
+                     double(a.ahead_ns[2]) / j / 1000.0, double(a.ahead_ns[3]) / j / 1000.0,
+                     double(a.ahead_count[0]) / j, double(a.ahead_count[1]) / j,
+                     double(a.ahead_count[2]) / j, double(a.ahead_count[3]) / j,
+                     double(a.before_producer_ns) / j / 1000.0, a.producer_done,
+                     a.producer_ahead, a.producer_own,
+                     ahead_total ? double(a.age_weighted) / double(ahead_total) / 1000.0 : 0.0,
+                     double(a.own_ns) / ot / 1000.0, double(a.own_draws) / ot,
+                     double(a.own_dispatches) / ot, a.ahead_hist[0], a.ahead_hist[1],
+                     a.ahead_hist[2], a.ahead_hist[3], a.ahead_hist[4], a.ahead_hist[5],
+                     a.ahead_hist[6], a.ahead_hist[7]);
+            a = MixAccum{};
+        }
+    }
 
     void ReadLoop(std::stop_token stop) {
         Common::SetCurrentThreadName("shadPS4:GpuBatchTimer");
@@ -229,6 +388,9 @@ private:
             const u64 start = u64(double(ts[0]) * period_ns);
             const u64 end = u64(double(ts[1]) * period_ns);
             const u64 duration = end - start;
+            ticks[value % TickSlots] = TickInfo{value, duration, submit_ns[slot],
+                                                batch_draws[slot], batch_dispatches[slot]};
+            ResolveMix(value);
             busy += duration;
             max_batch = std::max(max_batch, duration);
             if (prev_end != 0 && start > prev_end && start - prev_end < 50'000'000) {
@@ -259,6 +421,7 @@ private:
                          GpuBreaks().image_barrier_calls.exchange(0),
                          GpuBreaks().image_barriers.exchange(0));
                 LOG_INFO(Render_Vulkan, "GpuBreakSites:{}", GpuBreakSites().Report());
+                LogMix();
                 busy = gaps = gap_count = batches = draws = max_batch = 0;
                 window_start = now;
             }
@@ -271,6 +434,12 @@ private:
     double period_ns = 1.0;
     std::array<u64, Slots> signal_values{};
     std::array<u32, Slots> batch_draws{};
+    std::array<u32, Slots> batch_dispatches{};
+    std::array<u64, Slots> submit_ns{};
+    std::array<TickInfo, TickSlots> ticks{};
+    std::array<MixAccum, NumMixClasses> mix{};
+    std::mutex mix_mutex;
+    std::vector<MixRequest> mix_pending;
     u64 write_seq = 0;
     bool began = false;
     std::atomic<u64> written{0};

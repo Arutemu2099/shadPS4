@@ -301,9 +301,17 @@ private:
         u64 flush_end_ns{};
         u32 batch_draws{};
         u32 inflight{};
+        /// SHADPS4_GPU_BATCH_TIMING batch mix: main tick known complete before the flush, the
+        /// last main batch ahead of the copy, the copy's own main batch (0: separate submission),
+        /// the newest batch that wrote the copied bytes, and the flush time (0: not recorded).
+        u64 done_tick{};
+        u64 last_ahead{};
+        u64 own_tick{};
+        u64 producer{};
+        u64 mix_flush_ns{};
     };
     void RecordFaultLatency(const FaultTicket& ticket, u32 passes, u64 t_fault, u64 t_cp,
-                            u64 t_wait, u64 t_woke, bool free_at_wait);
+                            u64 t_wait, u64 t_woke, bool free_at_wait, VAddr device_addr);
 
     /// Waits until a job's copy has completed on whichever queue it ran.
     void WaitFaultJob(const FaultJob& job);

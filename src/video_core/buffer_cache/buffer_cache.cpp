@@ -20,6 +20,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/readback_queue.h"
 #include "video_core/buffer_cache/memory_tracker.h"
+#include "video_core/renderer_vulkan/vk_gpu_batch_timer.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -110,6 +111,37 @@ static bool PreciseProducerEnabled() {
 
 static bool PrebatchEnabled() {
     return PrebatchMode() != '0';
+}
+
+/// SHADPS4_BATCH_MIX_SS=1 (diagnostic, inFAMOUS Second Son only, with SHADPS4_READBACK_LATENCY and
+/// SHADPS4_GPU_BATCH_TIMING): classifies a read fault by the game's own particle globals (REFERENCE
+/// 4.2): the per-frame linear arena that holds the effect control blocks (cursor 0x807d3eb20, limit
+/// 0x807d3eb28; the arena's size is not known, so "arena" = the 64 MiB below the limit, checked by
+/// the logged samples) and the particle pool ([0x807d3eb40], 0x20000 records of 96 bytes).
+static u32 ClassifyReadbackAddr(VAddr addr) {
+    using Timer = Vulkan::GpuBatchTimer;
+    static const bool enabled = EnvIs1("SHADPS4_BATCH_MIX_SS");
+    if (!enabled) {
+        return Timer::MixOther;
+    }
+    const auto read = [](u64 a) { return *reinterpret_cast<const volatile u64*>(a); };
+    const u64 cursor = read(0x807d3eb20);
+    const u64 limit = read(0x807d3eb28);
+    const u64 pool = read(0x807d3eb40);
+    u32 cls = Timer::MixOther;
+    if (pool != 0 && addr >= pool && addr < pool + 0x20000ULL * 96) {
+        cls = Timer::MixPool;
+    } else if (limit != 0 && addr < limit && addr + (64ULL << 20) >= limit) {
+        cls = Timer::MixArena;
+    }
+    static std::atomic<u32> samples{0};
+    if (samples.fetch_add(1, std::memory_order_relaxed) < 48) {
+        LOG_INFO(Render_Vulkan,
+                 "BatchMixSample: addr={:#x} cls={} cursor={:#x} limit={:#x} pool={:#x} "
+                 "limit-addr={:#x} cursor-addr={}",
+                 addr, cls, cursor, limit, pool, limit - addr, s64(cursor) - s64(addr));
+    }
+    return cls;
 }
 
 namespace {
@@ -639,14 +671,26 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool of
         [&] { FinishFaultDownload(ticket.id, device_addr, size, is_write); });
     fault_guest_waiters.fetch_sub(1);
     if (latency) {
-        RecordFaultLatency(ticket, passes, t_fault, t_cp, t_wait, t_woke, free_at_wait);
+        RecordFaultLatency(ticket, passes, t_fault, t_cp, t_wait, t_woke, free_at_wait,
+                           device_addr);
     }
     Offload::MaybeLog();
 }
 
 void BufferCache::RecordFaultLatency(const FaultTicket& ticket, u32 passes, u64 t_fault,
-                                     u64 t_cp, u64 t_wait, u64 t_woke, bool free_at_wait) {
+                                     u64 t_cp, u64 t_wait, u64 t_woke, bool free_at_wait,
+                                     VAddr device_addr) {
     auto& l = Offload::Latency();
+    if (passes == 1 && ticket.mix_flush_ns != 0) {
+        if (auto* timer = scheduler.BatchTimer()) {
+            timer->RequestMix({.done_tick = ticket.done_tick,
+                               .last_ahead = ticket.last_ahead,
+                               .own_tick = ticket.own_tick,
+                               .producer = ticket.producer,
+                               .flush_ns = ticket.mix_flush_ns,
+                               .cls = ClassifyReadbackAddr(device_addr)});
+        }
+    }
     const u64 t_done = Offload::NowNs();
     const auto add = [](std::atomic<u64>& counter, u64 value) {
         counter.fetch_add(value, std::memory_order_relaxed);
@@ -1196,6 +1240,15 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
             }
             job->tick = side_tick;
             job->on_readback_queue = true;
+            FaultTicket side_ticket{id, side_tick, false, true};
+            if (Offload::LatencyEnabled()) {
+                auto* semaphore = scheduler.GetMasterSemaphore();
+                semaphore->Refresh();
+                side_ticket.done_tick = semaphore->KnownGpuTick();
+                side_ticket.last_ahead = tick - 1;
+                side_ticket.producer = PreciseProducer(job->copies);
+                side_ticket.mix_flush_ns = Vulkan::GpuBatchTimer::NowNs();
+            }
             if (prebatch && PrebatchMode() == '2') {
                 // After the copy's submission, so the copy does not wait for this batch.
                 scheduler.EndRendering();
@@ -1207,7 +1260,7 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
                 LOG_INFO(Render_Vulkan, "ReadbackQueue: {} of {} jobs on the readback queue",
                          side.load(), n);
             }
-            return {id, side_tick, false, true};
+            return side_ticket;
         }
         static std::atomic<u64> main_jobs{0};
         const u64 m = main_jobs.fetch_add(1) + 1;
@@ -1231,7 +1284,13 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
     }
     if (Offload::LatencyEnabled()) {
         FaultTicket ticket{.id = id, .tick = tick};
+        ticket.producer = PreciseProducer(job->copies);
+        scheduler.GetMasterSemaphore()->Refresh();
+        ticket.done_tick = scheduler.GetMasterSemaphore()->KnownGpuTick();
+        ticket.last_ahead = tick - 1;
+        ticket.own_tick = tick;
         ticket.prep_end_ns = Offload::NowNs();
+        ticket.mix_flush_ns = Vulkan::GpuBatchTimer::NowNs();
         scheduler.Flush();
         ticket.flush_end_ns = Offload::NowNs();
         ticket.batch_draws = scheduler.LastBatchDraws();
@@ -1421,7 +1480,7 @@ void BufferCache::NoteBatchWrite(VAddr addr, u64 size) {
     if (size == 0) {
         return;
     }
-    if (PreciseProducerEnabled()) {
+    if (PreciseProducerEnabled() || Offload::LatencyEnabled()) {
         const u64 tick = scheduler.CurrentTick();
         const u64 i = tick % WriteHistory;
         if (write_hist_tick[i] != tick) {

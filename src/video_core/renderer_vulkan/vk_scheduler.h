@@ -564,6 +564,15 @@ public:
     void NoteOp() noexcept {
         ++batch_ops;
     }
+    /// A compute dispatch: NoteOp plus the per-batch dispatch count (SHADPS4_GPU_BATCH_TIMING).
+    void NoteDispatch() noexcept {
+        ++batch_ops;
+        ++batch_dispatches;
+    }
+    /// SHADPS4_GPU_BATCH_TIMING timer, or null (diagnostic).
+    [[nodiscard]] class GpuBatchTimer* BatchTimer() const noexcept {
+        return batch_timer.get();
+    }
     [[nodiscard]] u32 BatchOps() const noexcept {
         return batch_ops;
     }
@@ -631,6 +640,7 @@ private:
     std::unique_ptr<class GpuBatchTimer> batch_timer;
     void SubmitExecutionAsync(SubmitInfo& info);
     u32 batch_draws = 0;
+    u32 batch_dispatches = 0;
     u32 last_batch_draws = 0;
     u32 batch_ops = 0;
     MasterSemaphore master_semaphore;
