@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <shared_mutex>
+
 #include <map>
 #include <tuple>
 
@@ -614,6 +616,10 @@ private:
     Common::LeastRecentlyUsedCache<BufferId, u64> lru_cache;
     RangeSet gpu_modified_ranges;
     SplitRangeMap<BufferId> buffer_ranges;
+    /// Guards buffer_ranges between the command processor (Register/Unregister edit the tree) and
+    /// guest threads (write faults read it in IsRegionRegistered). Other readers run on the command
+    /// processor. SHADPS4_BUFFER_RANGES_LOCK=0 disables it (A/B only).
+    mutable std::shared_mutex buffer_ranges_mutex;
     PageTable page_table;
     std::array<FaultJob, MaxFaultJobs> fault_jobs;
     std::vector<std::unique_ptr<Buffer>> fault_staging_pool;

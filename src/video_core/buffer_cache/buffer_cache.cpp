@@ -89,6 +89,15 @@ const bool g_write_fault_offload =
 const bool g_range_add_skip = EnvIs1("SHADPS4_RANGE_ADD_SKIP");
 const bool g_vb_repeat_stats = EnvIs1("SHADPS4_VB_REPEAT_STATS");
 const bool g_written_memo = EnvIs1("SHADPS4_WRITTEN_MEMO");
+/// SHADPS4_BUFFER_RANGES_LOCK (default on; =0 disables): see BufferCache::buffer_ranges_mutex.
+/// Found 2026-09-28: a freeze's all-thread capture (logs/hang-night0928-1-*) had a guest job thread
+/// spinning forever inside buffer_ranges' tree lookup (IsRegionRegistered from a write fault) while
+/// the command processor edits that tree on buffer create/join/delete: an unsynchronized reader of a
+/// red-black tree being rebalanced can loop. The game then waited forever for that job's fence.
+const bool g_buffer_ranges_lock = [] {
+    const char* value = std::getenv("SHADPS4_BUFFER_RANGES_LOCK");
+    return !(value && value[0] == '0');
+}();
 /// SHADPS4_WRITTEN_RUN_MEMO: 0 off, 1 on, 2 verify. See ObtainBuffer.
 const int g_written_run_memo = [] {
     const char* value = std::getenv("SHADPS4_WRITTEN_RUN_MEMO");
@@ -3148,6 +3157,10 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 si
 
 bool BufferCache::IsRegionRegistered(VAddr addr, size_t size) {
     // Check if we are missing some edge case here
+    if (g_buffer_ranges_lock) {
+        std::shared_lock lk{buffer_ranges_mutex};
+        return buffer_ranges.Intersects(addr, size);
+    }
     return buffer_ranges.Intersects(addr, size);
 }
 
@@ -3369,13 +3382,23 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
         }
         WriteDataBuffer(bda_pagetable_buffer, page_begin * sizeof(vk::DeviceAddress),
                         bda_addrs.data(), bda_addrs.size() * sizeof(vk::DeviceAddress));
-        buffer_ranges.Add(buffer.CpuAddr(), buffer.SizeBytes(), buffer_id);
+        if (g_buffer_ranges_lock) {
+            std::unique_lock lk{buffer_ranges_mutex};
+            buffer_ranges.Add(buffer.CpuAddr(), buffer.SizeBytes(), buffer_id);
+        } else {
+            buffer_ranges.Add(buffer.CpuAddr(), buffer.SizeBytes(), buffer_id);
+        }
     } else {
         total_used_memory -= Common::AlignUp(size, CACHING_PAGESIZE);
         lru_cache.Free(buffer.LRUId());
         const u64 offset = bda_pagetable_buffer.Offset(page_begin * sizeof(vk::DeviceAddress));
         bda_pagetable_buffer.Fill(offset, size_pages * sizeof(vk::DeviceAddress), 0);
-        buffer_ranges.Subtract(buffer.CpuAddr(), buffer.SizeBytes());
+        if (g_buffer_ranges_lock) {
+            std::unique_lock lk{buffer_ranges_mutex};
+            buffer_ranges.Subtract(buffer.CpuAddr(), buffer.SizeBytes());
+        } else {
+            buffer_ranges.Subtract(buffer.CpuAddr(), buffer.SizeBytes());
+        }
     }
 }
 
