@@ -26,6 +26,13 @@ struct RangeLockGuard {
         begin = end;
     }
 
+    /// Unlocks the range now; the destructor then does nothing.
+    void unlock() {
+        for (; begin != end; ++begin) {
+            begin->unlock();
+        }
+    }
+
     ~RangeLockGuard() {
         for (; begin != end; ++begin) {
             begin->unlock();

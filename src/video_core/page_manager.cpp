@@ -426,6 +426,7 @@ struct PageManager::Impl {
 
         // Acquire locks for the range of pages
         auto lk = LockPages(page, page_end);
+        OsPending os_pending;
 
         auto perms = cached_pages[page].Perms();
         u64 range_begin = 0;
@@ -443,7 +444,11 @@ struct PageManager::Impl {
                         return;
                     }
                 }
-                Protect(range_begin << PM_PAGE_BITS, range_bytes, perms);
+                if (os_lock_mode) {
+                    os_pending.push_back({range_begin, range_begin + (range_bytes >> PM_PAGE_BITS)});
+                } else {
+                    Protect(range_begin << PM_PAGE_BITS, range_bytes, perms);
+                }
                 range_bytes = 0;
                 potential_range_bytes = 0;
             }
@@ -493,6 +498,7 @@ struct PageManager::Impl {
 
         // Add pending (un)protect action
         release_pending();
+        ApplyOsPending(lk, os_pending);
     }
 
     template <bool track, bool is_read>
@@ -513,6 +519,7 @@ struct PageManager::Impl {
         // The stripes the mask's page span touches; without SHADPS4_PAGE_LOCK_PAGES that is the
         // region's one lock, as before.
         auto lk = LockPages(base_page + start_range.first, base_page + end_range.second);
+        OsPending os_pending;
         auto perms = cached_pages[base_page + start_range.first].Perms();
         u64 range_begin = 0;
         u64 range_bytes = 0;
@@ -529,7 +536,11 @@ struct PageManager::Impl {
                         return;
                     }
                 }
-                Protect((range_begin << PM_PAGE_BITS), range_bytes, perms);
+                if (os_lock_mode) {
+                    os_pending.push_back({range_begin, range_begin + (range_bytes >> PM_PAGE_BITS)});
+                } else {
+                    Protect((range_begin << PM_PAGE_BITS), range_bytes, perms);
+                }
                 range_bytes = 0;
                 potential_range_bytes = 0;
             }
@@ -572,6 +583,7 @@ struct PageManager::Impl {
 
         // Add pending (un)protect action
         release_pending();
+        ApplyOsPending(lk, os_pending);
     }
 
     /// Applies the current watcher state of every page in the range to the OS protection.
@@ -580,6 +592,10 @@ struct PageManager::Impl {
         const size_t first = addr >> PM_PAGE_BITS;
         const size_t end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
         if (end <= first) {
+            return;
+        }
+        if (os_lock_mode) {
+            ReconcileOs(first, end);
             return;
         }
         auto lk = LockPages(first, end);
@@ -608,6 +624,134 @@ struct PageManager::Impl {
     using LockType = Common::SpinLock;
 #endif
     std::array<LockType, NUM_ADDRESS_LOCKS> locks{};
+
+    /**
+     * SHADPS4_PAGE_OS_LOCK=1 (design B of notes/page-lock-hold-design-2026-09-28.md): the page
+     * locks (`locks`, the "count locks") are never held across a protection syscall. Watcher
+     * counts still change only under them; every syscall is made by ReconcileOs under a second
+     * stripe array `os_locks` (one per 4 MB region), which snapshots Perms(counts) under the
+     * count locks after taking the OS stripe, releases the count locks, then calls the OS.
+     * Why the OS state stays right: syscalls on a stripe are serialized by its OS lock and each
+     * applies counts read after that lock was taken, so a stale snapshot can never land after a
+     * newer one; every count change is followed by its own ReconcileOs on the same thread before
+     * the caller returns (or, for deferred write protects, by the recorder's ReconcileProtection
+     * before its copy), so the last reconcile of a page always reads its latest counts.
+     * Lock order: region lock -> OS stripes -> count stripes; count holders never take an OS
+     * stripe. Measured 2026-09-28 (a33 fire, back stacks): the CP spun 4.3% of its wall time on
+     * count locks held across VirtualProtect by fault handlers, the recorder and the Protector
+     * (7.1% with SHADPS4_FAULT_WATCH_OUTSIDE=1, which moves the region-lock wait onto them).
+     * SHADPS4_PAGE_OS_VERIFY=1 (diagnostic): after each syscall, still under the OS stripe,
+     * VirtualQuery the run's first and last page and count mismatches with the snapshot. False
+     * positives: guest mprotect (MemoryManager::Protect), SHADPS4_TIMESTAMP_READER (do not combine),
+     * pages AddressSpace skips as unmapped that VirtualQuery reports committed. Costly: fire ran
+     * at ~18 FPS with it (VirtualQuery against concurrent VirtualProtect; measured 2026-09-28).
+     */
+    static bool EnvIs(const char* name, char value) {
+        const char* env = std::getenv(name);
+        return env && env[0] == value;
+    }
+    const bool os_lock_mode = EnvIs("SHADPS4_PAGE_OS_LOCK", '1');
+    const bool os_verify = os_lock_mode && EnvIs("SHADPS4_PAGE_OS_VERIFY", '1');
+    const std::unique_ptr<LockType[]> os_locks =
+        os_lock_mode ? std::make_unique<LockType[]>(NUM_ADDRESS_LOCKS) : nullptr;
+    std::atomic<u64> os_reconciles{0};
+    std::atomic<u64> os_syscalls{0};
+    std::atomic<u64> os_verified{0};
+    std::atomic<u64> os_mismatches{0};
+
+    /// Page ranges [first, end) whose protection a watcher update must reconcile.
+    using OsPending = boost::container::small_vector<std::pair<size_t, size_t>, 4>;
+
+    static Core::MemoryPermission ExpressiblePerms(Core::MemoryPermission perms) {
+        // Write-only is not expressible on the CPU; the stricter state is always safe.
+        return perms == Core::MemoryPermission::Write ? Core::MemoryPermission::None : perms;
+    }
+
+    /// Releases the count locks, then reconciles what the update left pending.
+    template <typename Guard>
+    void ApplyOsPending(Guard& lk, const OsPending& pending) {
+        if (pending.empty()) {
+            return;
+        }
+        lk.unlock();
+        // One reconcile over the whole span (ranges are pushed in ascending order): gap pages
+        // get Perms(counts) as well, which is their state already.
+        ReconcileOs(pending.front().first, pending.back().second);
+    }
+
+    void ReconcileOs(size_t first, size_t end) {
+        RENDERER_TRACE;
+        Common::RangeLockGuard<LockType*> os_lk(os_locks.get() + first / PAGES_PER_LOCK,
+                                                os_locks.get() +
+                                                    Common::DivCeil(end, PAGES_PER_LOCK));
+        // Run starts and their perms; a run ends where the next starts (or at `end`).
+        boost::container::small_vector<std::pair<size_t, Core::MemoryPermission>, 8> runs;
+        {
+            auto lk = LockPages(first, end);
+            auto perms = ExpressiblePerms(cached_pages[first].Perms());
+            runs.push_back({first, perms});
+            for (size_t page = first + 1; page < end; ++page) {
+                const auto next = ExpressiblePerms(cached_pages[page].Perms());
+                if (next != perms) {
+                    runs.push_back({page, next});
+                    perms = next;
+                }
+            }
+        }
+        for (size_t i = 0; i < runs.size(); ++i) {
+            const size_t run_end = i + 1 < runs.size() ? runs[i + 1].first : end;
+            Protect(runs[i].first << PM_PAGE_BITS, (run_end - runs[i].first) << PM_PAGE_BITS,
+                    runs[i].second);
+#ifdef _WIN32
+            if (os_verify) [[unlikely]] {
+                VerifyPage(runs[i].first, runs[i].second);
+                VerifyPage(run_end - 1, runs[i].second);
+            }
+#endif
+        }
+        os_lk.unlock();
+        os_syscalls.fetch_add(runs.size(), std::memory_order_relaxed);
+        const u64 n = os_reconciles.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((n & ((1ULL << 22) - 1)) == 0) {
+            LOG_INFO(Render,
+                     "PageOsLock: reconciles={} syscalls={} verified_pages={} mismatches={}", n,
+                     os_syscalls.load(std::memory_order_relaxed),
+                     os_verified.load(std::memory_order_relaxed),
+                     os_mismatches.load(std::memory_order_relaxed));
+        }
+    }
+
+#ifdef _WIN32
+    /// SHADPS4_PAGE_OS_VERIFY: the OS protection of `page` must equal `perms` on the read/write
+    /// axis (guard and execute bits ignored; pages the address space does not commit skipped).
+    void VerifyPage(size_t page, Core::MemoryPermission perms) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<LPCVOID>(page << PM_PAGE_BITS), &info, sizeof(info)) ==
+                0 ||
+            info.State != MEM_COMMIT) {
+            return;
+        }
+        const DWORD raw = info.Protect & 0xff;
+        const bool read = raw == PAGE_READONLY || raw == PAGE_READWRITE ||
+                          raw == PAGE_EXECUTE_READ || raw == PAGE_EXECUTE_READWRITE ||
+                          raw == PAGE_WRITECOPY || raw == PAGE_EXECUTE_WRITECOPY;
+        const bool write = raw == PAGE_READWRITE || raw == PAGE_EXECUTE_READWRITE ||
+                           raw == PAGE_WRITECOPY || raw == PAGE_EXECUTE_WRITECOPY;
+        const bool want_read = True(perms & Core::MemoryPermission::Read);
+        const bool want_write = True(perms & Core::MemoryPermission::Write);
+        os_verified.fetch_add(1, std::memory_order_relaxed);
+        if (read != want_read || write != want_write) {
+            const u64 bad = os_mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (bad <= 8) {
+                LOG_CRITICAL(Render,
+                             "PageOsVerify: page {:#x} OS protect {:#x} (read={} write={}) != "
+                             "snapshot read={} write={}",
+                             page << PM_PAGE_BITS, info.Protect, read, write, want_read,
+                             want_write);
+            }
+        }
+    }
+#endif
 
     /**
      * SHADPS4_PAGE_LOCK_PAGES=<n> (power of two, 16..NUM_PAGES_PER_REGION): lock stripes of n pages
