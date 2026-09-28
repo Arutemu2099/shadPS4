@@ -843,8 +843,9 @@ private:
         bool open = false;
         u32 num_reads = 0;
         u32 num_writes = 0;
-        std::array<TransferRange, 16> reads{};
-        std::array<TransferRange, 16> writes{};
+        // 64: with 16 entries, 175k of 187k transfer->transfer barriers in fire were list overflows.
+        std::array<TransferRange, 64> reads{};
+        std::array<TransferRange, 64> writes{};
     };
     /// Per worker stream (0 = main, 1 = ASC command buffer); recording-order state.
     std::array<TransferGroup, 2> transfer_group{};
