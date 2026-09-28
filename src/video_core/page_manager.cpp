@@ -11,6 +11,7 @@
 #include "common/fault_monitor.h"
 #include "common/lean.h"
 #include "common/range_lock.h"
+#include "common/readback_offload.h"
 #include "common/signal_context.h"
 #include "core/memory.h"
 #include "core/signals.h"
@@ -394,7 +395,12 @@ struct PageManager::Impl {
             if (ReadFaultRipEnabled()) [[unlikely]] {
                 SnapshotReadFaultPage(addr);
             }
+            if (Common::ReadbackOffload::LatencyEnabled()) [[unlikely]] {
+                Common::ReadbackOffload::t_read_fault_rip =
+                    static_cast<EXCEPTION_POINTERS*>(context)->ContextRecord->Rip;
+            }
             const bool handled = rasterizer->ReadMemory(addr, 8);
+            Common::ReadbackOffload::t_read_fault_rip = 0;
             Common::FaultMonitor::CountGuestReadFault(handled, Common::FaultMonitor::SinceNs(start),
                                                       addr);
             if (handled && ReadFaultRipEnabled()) [[unlikely]] {

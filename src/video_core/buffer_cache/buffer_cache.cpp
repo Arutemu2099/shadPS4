@@ -124,6 +124,27 @@ static u32 ClassifyReadbackAddr(VAddr addr) {
     if (!enabled) {
         return Timer::MixOther;
     }
+    // Exact when the faulting instruction is known: the game functions of REFERENCE 4.2
+    // (control-block reader 0x3f3ed0, mesh snap 0x3fed00, exposure sum 0x171610; function
+    // extents assumed, entry + a few KB).
+    if (const u64 rip = Offload::t_read_fault_rip; rip != 0) {
+        const u64 off = rip - 0x800000000ULL;
+        u32 by_rip = Timer::MixOther;
+        if (off >= 0x3f3ed0 && off < 0x3f4800) {
+            by_rip = Timer::MixArena;
+        } else if (off >= 0x3fed00 && off < 0x400000) {
+            by_rip = Timer::MixPool;
+        } else if (off >= 0x171610 && off < 0x171a00) {
+            by_rip = Timer::MixExposure;
+        }
+        static std::atomic<u32> other_samples{0};
+        if (by_rip == Timer::MixOther &&
+            other_samples.fetch_add(1, std::memory_order_relaxed) < 64) {
+            LOG_INFO(Render_Vulkan, "BatchMixOtherRip: rip={:#x} off={:#x} addr={:#x}", rip, off,
+                     addr);
+        }
+        return by_rip;
+    }
     const auto read = [](u64 a) { return *reinterpret_cast<const volatile u64*>(a); };
     const u64 cursor = read(0x807d3eb20);
     const u64 limit = read(0x807d3eb28);
