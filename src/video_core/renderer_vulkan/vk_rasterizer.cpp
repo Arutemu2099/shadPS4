@@ -1377,9 +1377,10 @@ void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
             if ((asc_dispatches & 0xffff) == 0) {
                 LOG_INFO(Render_Vulkan,
                          "AscStream: dispatches={} demoted_to_main={} reasons[struct/written/"
-                         "read/args/gds]={}/{}/{}/{}/{}",
+                         "read/args/gds]={}/{}/{}/{}/{} main_flushes={}",
                          asc_dispatches, asc_demoted, asc_demote_reason[1], asc_demote_reason[2],
-                         asc_demote_reason[3], asc_demote_reason[4], asc_demote_reason[5]);
+                         asc_demote_reason[3], asc_demote_reason[4], asc_demote_reason[5],
+                         asc_flushes);
             }
         }
         dispatch_target = 0;
@@ -3316,6 +3317,21 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
                         reason = 5;
                     }
                 }
+            }
+            // SHADPS4_ASC_STREAM=2: instead of keeping the dispatch on main (whose writes then
+            // demote every later dispatch of the span: 89% of demotions, run
+            // diag-fire-ascstream-20260928-r), flush the open main batch once. Its submission
+            // first submits the open ASC segment (I1); the new segment waits on the flushed batch.
+            static const bool flush_mode = [] {
+                const char* value = std::getenv("SHADPS4_ASC_STREAM");
+                return value && value[0] == '2';
+            }();
+            if (!ok && reason != 1 && flush_mode) {
+                const u64 flushed = scheduler.CurrentTick();
+                scheduler.Flush();
+                wait_main = std::max(wait_main, flushed);
+                ok = true;
+                ++asc_flushes;
             }
             if (!ok) {
                 target = 0;

@@ -427,7 +427,7 @@ bool Instance::CreateDevice() {
     // guest's async compute (see Scheduler::SwitchStream).
     has_asc_queue = [] {
         const char* value = std::getenv("SHADPS4_ASC_STREAM");
-        return value && value[0] == '1';
+        return value && (value[0] == '1' || value[0] == '2');
     }() && readback_family_concurrent && family_properties[readback_queue_family].queueCount >= 2;
     const std::array queue_infos = {
         vk::DeviceQueueCreateInfo{
