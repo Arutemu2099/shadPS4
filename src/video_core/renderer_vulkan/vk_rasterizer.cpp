@@ -1375,8 +1375,11 @@ void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
         if (s == 1) {
             ++asc_dispatches;
             if ((asc_dispatches & 0xffff) == 0) {
-                LOG_INFO(Render_Vulkan, "AscStream: dispatches={} demoted_to_main={}",
-                         asc_dispatches, asc_demoted);
+                LOG_INFO(Render_Vulkan,
+                         "AscStream: dispatches={} demoted_to_main={} reasons[struct/written/"
+                         "read/args/gds]={}/{}/{}/{}/{}",
+                         asc_dispatches, asc_demoted, asc_demote_reason[1], asc_demote_reason[2],
+                         asc_demote_reason[3], asc_demote_reason[4], asc_demote_reason[5]);
             }
         }
         dispatch_target = 0;
@@ -3276,6 +3279,7 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
         if (target == 1) {
             const u64 now = scheduler.CurrentTick();
             bool ok = buffer_cache.StructGeneration() == struct_gen_before;
+            u32 reason = ok ? 0 : 1;
             for (const auto& [buffer_id, vsharp, size] : buffer_bindings) {
                 if (!ok) {
                     break;
@@ -3285,6 +3289,9 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
                 }
                 const auto& buffer = buffer_cache.GetBuffer(buffer_id);
                 ok = buffer.main_access_tick < now;
+                if (!ok) {
+                    reason = buffer.main_write_tick >= now ? 2 : 3;
+                }
                 wait_main = std::max(wait_main, buffer.main_access_tick);
             }
             if (ok && buffer_cache.asc_indirect_size != 0) {
@@ -3296,12 +3303,18 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
                     ok = args.main_access_tick < now;
                     wait_main = std::max(wait_main, args.main_access_tick);
                 }
+                if (!ok && reason == 0) {
+                    reason = 4;
+                }
             }
             for (const auto& desc : stage.buffers) {
                 if (ok && desc.buffer_type == Shader::BufferType::GdsBuffer) {
                     const u64 gds_tick = buffer_cache.GetGdsBuffer()->main_access_tick;
                     ok = gds_tick < now;
                     wait_main = std::max(wait_main, gds_tick);
+                    if (!ok) {
+                        reason = 5;
+                    }
                 }
             }
             if (!ok) {
@@ -3309,6 +3322,9 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
                 dispatch_target = 0;
                 cur_dispatch_run = 0; // Its run state was the ASC stream's.
                 ++asc_demoted;
+                // Reasons: 1 pass 1 created/joined, 2 binding written by the open main batch,
+                // 3 binding only read by it, 4 indirect args, 5 GDS.
+                ++asc_demote_reason[std::min<u32>(reason, 5)];
             }
         }
         scheduler.SwitchStream(target);
