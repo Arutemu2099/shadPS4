@@ -285,6 +285,31 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
             Common::FaultMonitor::CountBarriers(false, 0, 0);
             return {};
         }
+        // SHADPS4_IMAGE_WAW_STATS=1 (diagnostic): same-state write-after-write barriers (same
+        // layout and access, previous access writes), which upstream #5112 stopped emitting.
+        static const bool waw_stats = [] {
+            const char* value = std::getenv("SHADPS4_IMAGE_WAW_STATS");
+            return value && value[0] == '1';
+        }();
+        if (waw_stats) [[unlikely]] {
+            static u64 total = 0, same_waw = 0, same_waw_color = 0, same_waw_general = 0,
+                       same_waw_depth = 0;
+            ++total;
+            if (last_state.layout == dst_layout && last_state.access_mask == dst_mask && is_write) {
+                ++same_waw;
+                same_waw_color += dst_layout == vk::ImageLayout::eColorAttachmentOptimal;
+                same_waw_general += dst_layout == vk::ImageLayout::eGeneral;
+                same_waw_depth += dst_layout == vk::ImageLayout::eDepthStencilAttachmentOptimal ||
+                                  dst_layout == vk::ImageLayout::eDepthAttachmentOptimal;
+            }
+            if ((total & 0x3ffff) == 0) {
+                LOG_INFO(Render_Vulkan,
+                         "ImageWawStats: whole-image barriers={} same_state_waw={} ({:.1f}%) "
+                         "color={} general={} depth={}",
+                         total, same_waw, 100.0 * double(same_waw) / double(total),
+                         same_waw_color, same_waw_general, same_waw_depth);
+            }
+        }
         barriers.emplace_back(vk::ImageMemoryBarrier2{
             .srcStageMask = last_state.pl_stage,
             .srcAccessMask = last_state.access_mask,
