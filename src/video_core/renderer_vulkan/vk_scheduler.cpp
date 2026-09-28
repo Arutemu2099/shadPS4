@@ -346,6 +346,7 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
     // worker for submits/borrows and ~1.6% inside vkQueueSubmit.
     Common::FaultMonitor::CountGpuSubmit();
     EndRendering();
+    TakeNextSubmitWait(info);
     const u64 signal_value = master_semaphore.NextTick();
     info.AddSignal(master_semaphore.Handle(), signal_value);
     {
@@ -409,6 +410,9 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
 }
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
+    if (!(async_submit && synchronous_scopes == 0)) {
+        TakeNextSubmitWait(info);
+    }
     if (async_submit && synchronous_scopes == 0) {
         SubmitExecutionAsync(info);
         return;

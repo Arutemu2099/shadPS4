@@ -275,6 +275,8 @@ private:
         u64 tick{};
         /// `tick` is a value of the readback queue's timeline, not the main one.
         bool on_readback_queue{};
+        /// With on_readback_queue: the timeline is the fast lane's (SHADPS4_READBACK_FAST_LANE).
+        bool on_fast_lane{};
         u64 total_bytes{};
         std::vector<FaultCopy> copies;
         /// Buffer spans the copies were collected in, in order: [addr, addr + size) for a read
@@ -296,6 +298,8 @@ private:
         bool retry{};
         /// `tick` belongs to the readback queue's timeline.
         bool on_readback_queue{};
+        /// With on_readback_queue: the fast lane's timeline.
+        bool on_fast_lane{};
         /// SHADPS4_READBACK_LATENCY diagnostics, set by PrepareFaultDownload.
         u64 prep_end_ns{};
         u64 flush_end_ns{};
@@ -322,6 +326,11 @@ private:
                                           std::span<const vk::BufferCopy> copies,
                                           bool in_queue_order);
     std::unique_ptr<ReadbackQueue> readback_queue;
+    /// SHADPS4_READBACK_FAST_LANE: second queue for copies whose producer already completed.
+    std::unique_ptr<ReadbackQueue> fast_lane;
+    ReadbackQueue& LaneOf(bool on_fast_lane) {
+        return on_fast_lane ? *fast_lane : *readback_queue;
+    }
     u64 producer_floor = 0; ///< Tick of the newest write too large to record per slot.
     /// SHADPS4_READBACK_EARLY_FLUSH: main tick of the last readback job per 1 MB slot, and a
     /// request raised when a GPU write lands in a recently read-back slot.

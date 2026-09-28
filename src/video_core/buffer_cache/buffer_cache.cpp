@@ -113,6 +113,18 @@ static bool PrebatchEnabled() {
     return PrebatchMode() != '0';
 }
 
+/// SHADPS4_READBACK_FAST_LANE=1 (with SHADPS4_READBACK_QUEUE=1 for the extra queue and
+/// SHADPS4_READBACK_PREBATCH=2): a guest readback whose newest GPU writer (64-batch write
+/// history) has already completed is copied at once on a second queue instead of behind the
+/// unfinished main-queue batches; every other readback keeps the prebatch path. On PS4 the CPU
+/// reads finished GPU results in place; measured 2026-09-27 (ASC_YIELD on) such copies waited
+/// ~1.4 ms of unrelated GPU work. The next main-queue submission waits for the copy, so later
+/// work cannot write the bytes while it reads them.
+static bool FastLaneEnabled() {
+    static const bool enabled = EnvIs1("SHADPS4_READBACK_FAST_LANE");
+    return enabled;
+}
+
 /// SHADPS4_BATCH_MIX_SS=1 (diagnostic, inFAMOUS Second Son only, with SHADPS4_READBACK_LATENCY and
 /// SHADPS4_GPU_BATCH_TIMING): classifies a read fault by the game's own particle globals (REFERENCE
 /// 4.2): the per-frame linear arena that holds the effect control blocks (cursor 0x807d3eb20, limit
@@ -427,7 +439,15 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                           "BDA Page Table Buffer");
 
     memory_tracker = std::make_unique<MemoryTracker>(tracker);
-    if (instance.HasReadbackQueue()) {
+    if (FastLaneEnabled() && instance.HasReadbackQueue() && PrebatchEnabled() &&
+        Offload::Enabled()) {
+        readback_queue = std::make_unique<ReadbackQueue>(
+            instance, instance.GetGraphicsQueue(), instance.GetGraphicsQueueFamilyIndex(),
+            &Vulkan::Scheduler::submit_mutex);
+        fast_lane = std::make_unique<ReadbackQueue>(instance);
+        LOG_INFO(Render, "ReadbackFastLane: completed-producer copies on a second queue, the "
+                         "rest prebatched");
+    } else if (instance.HasReadbackQueue()) {
         readback_queue = std::make_unique<ReadbackQueue>(instance);
     } else if (PrebatchEnabled() && Offload::Enabled()) {
         readback_queue = std::make_unique<ReadbackQueue>(
@@ -674,7 +694,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool of
             free_at_wait = !ticket.on_readback_queue && semaphore->IsFree(ticket.tick);
         }
         if (ticket.on_readback_queue) {
-            readback_queue->Semaphore().Wait(ticket.tick);
+            LaneOf(ticket.on_fast_lane).Semaphore().Wait(ticket.tick);
         } else if (spin_ns != 0) {
             semaphore->SpinWait(ticket.tick, spin_ns);
         } else {
@@ -1052,7 +1072,9 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
                 }
                 const auto [job_begin, job_end] = TrackerPageSpan(job.addr, job.size);
                 if (job_begin < end && begin < job_end) {
-                    return {job.id, job.tick, true, job.on_readback_queue};
+                    FaultTicket retry_ticket{job.id, job.tick, true, job.on_readback_queue};
+                    retry_ticket.on_fast_lane = job.on_fast_lane;
+                    return retry_ticket;
                 }
             }
         }
@@ -1209,6 +1231,56 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
     Common::FaultMonitor::CountReadbackDownload(total_size_bytes);
 
     job->on_readback_queue = false;
+    job->on_fast_lane = false;
+    if (fast_lane) {
+        // The newest batch that GPU-wrote any copied byte; batches before it completed first
+        // (one queue), batches after it wrote none of these bytes. If it has completed, nothing
+        // unfinished stands between the data and this copy.
+        const u64 producer = PreciseProducer(job->copies);
+        auto* master = scheduler.GetMasterSemaphore();
+        bool done = producer < tick && master->IsFree(producer);
+        if (!done && producer < tick) {
+            master->Refresh();
+            done = master->IsFree(producer);
+        }
+        if (done) {
+            const u64 lane_tick = fast_lane->Submit(
+                master->Handle(), producer, [&](vk::CommandBuffer cmd) {
+                    ForEachSourceRun(vk_sources.data(), vk_sources.size(),
+                                     [&](size_t first, size_t count) {
+                                         RecordFaultCopiesOnReadbackQueue(
+                                             cmd, vk_sources[first], staging_handle,
+                                             {vk_copies.data() + first, count}, false);
+                                     });
+                });
+            // Later main-queue work (including the batch still being recorded) must not write
+            // these bytes while the copy reads them.
+            scheduler.AddNextSubmitWait(fast_lane->Semaphore().Handle(), lane_tick);
+            job->tick = lane_tick;
+            job->on_readback_queue = true;
+            job->on_fast_lane = true;
+            FaultTicket lane_ticket{id, lane_tick, false, true};
+            lane_ticket.on_fast_lane = true;
+            if (Offload::LatencyEnabled()) {
+                master->Refresh();
+                lane_ticket.done_tick = master->KnownGpuTick();
+                lane_ticket.last_ahead = tick - 1;
+                lane_ticket.producer = producer;
+                lane_ticket.mix_flush_ns = Vulkan::GpuBatchTimer::NowNs();
+            }
+            if (PrebatchMode() == '2') {
+                // Same batch cutting as a prebatched copy.
+                scheduler.EndRendering();
+                scheduler.Flush();
+            }
+            static std::atomic<u64> lane_jobs{0};
+            if (((lane_jobs.fetch_add(1) + 1) & 0x3ff) == 0) {
+                LOG_INFO(Render_Vulkan, "ReadbackFastLane: {} jobs on the fast lane",
+                         lane_jobs.load());
+            }
+            return lane_ticket;
+        }
+    }
     if (readback_queue) {
         // Every GPU write into this window was recorded no later than `producer`. If that batch
         // is already submitted, copy on the readback queue after it alone.
@@ -1504,7 +1576,7 @@ void BufferCache::NoteBatchWrite(VAddr addr, u64 size) {
     if (size == 0) {
         return;
     }
-    if (PreciseProducerEnabled() || Offload::LatencyEnabled()) {
+    if (PreciseProducerEnabled() || Offload::LatencyEnabled() || FastLaneEnabled()) {
         const u64 tick = scheduler.CurrentTick();
         const u64 i = tick % WriteHistory;
         if (write_hist_tick[i] != tick) {
@@ -1681,7 +1753,7 @@ u64 BufferCache::ProducerTick(VAddr addr, u64 size) const {
 
 void BufferCache::WaitFaultJob(const FaultJob& job) {
     if (job.on_readback_queue) {
-        readback_queue->Semaphore().Wait(job.tick);
+        LaneOf(job.on_fast_lane).Semaphore().Wait(job.tick);
         return;
     }
     if (!scheduler.IsFree(job.tick)) {
@@ -3380,9 +3452,14 @@ void BufferCache::DeleteBuffer(BufferId buffer_id) {
     const u64 rq_tick = readback_queue && !readback_queue->InQueueOrder()
                             ? readback_queue->Semaphore().CurrentTick() - 1
                             : 0;
-    scheduler.DeferOperation([this, buffer_id, rq_tick] {
+    // The fast lane likewise waits only for completed producers.
+    const u64 lane_tick = fast_lane ? fast_lane->Semaphore().CurrentTick() - 1 : 0;
+    scheduler.DeferOperation([this, buffer_id, rq_tick, lane_tick] {
         if (rq_tick != 0) {
             readback_queue->Semaphore().Wait(rq_tick);
+        }
+        if (lane_tick != 0) {
+            fast_lane->Semaphore().Wait(lane_tick);
         }
         slot_buffers.erase(buffer_id);
     });

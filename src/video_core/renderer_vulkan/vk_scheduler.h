@@ -569,6 +569,14 @@ public:
         ++batch_ops;
         ++batch_dispatches;
     }
+    /// The next submission of this scheduler waits for `value` on `semaphore` (all commands).
+    /// SHADPS4_READBACK_FAST_LANE: later main-queue work must not overtake a fast-lane copy.
+    /// Command processor only; a second call before the submission keeps the larger value.
+    void AddNextSubmitWait(vk::Semaphore semaphore, u64 value) noexcept {
+        next_wait_semaphore = semaphore;
+        next_wait_value = std::max(next_wait_value, value);
+    }
+
     /// SHADPS4_GPU_BATCH_TIMING timer, or null (diagnostic).
     [[nodiscard]] class GpuBatchTimer* BatchTimer() const noexcept {
         return batch_timer.get();
@@ -641,6 +649,14 @@ private:
     void SubmitExecutionAsync(SubmitInfo& info);
     u32 batch_draws = 0;
     u32 batch_dispatches = 0;
+    vk::Semaphore next_wait_semaphore{};
+    u64 next_wait_value = 0;
+    void TakeNextSubmitWait(SubmitInfo& info) noexcept {
+        if (next_wait_value != 0) {
+            info.AddWait(next_wait_semaphore, next_wait_value);
+            next_wait_value = 0;
+        }
+    }
     u32 last_batch_draws = 0;
     u32 batch_ops = 0;
     MasterSemaphore master_semaphore;
