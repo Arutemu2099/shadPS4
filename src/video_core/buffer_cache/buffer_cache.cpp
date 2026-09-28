@@ -4071,8 +4071,10 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
         TouchBuffer(buffer);
         }
     }
+    // Main stream only: on the ASC stream the eligibility check (RangeConflict) saw the binding's
+    // range, not the pages ahead (Opus review 2026-09-28).
     if (g_upload_ahead_pages != 0 && src_buffer && total_size_bytes <= 16_KB &&
-        !t_upload_ahead_active) [[unlikely]] {
+        !t_upload_ahead_active && g_record_stream == 0) [[unlikely]] {
         UploadAhead(buffer, device_addr, size);
     }
     if (is_texel_buffer && !is_written) {
