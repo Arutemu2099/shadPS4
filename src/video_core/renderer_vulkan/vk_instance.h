@@ -85,6 +85,11 @@ public:
         return readback_queue;
     }
 
+    /// SHADPS4_READBACK_QUEUE=3: the readback queue is in another family, so buffers are
+    /// created VK_SHARING_MODE_CONCURRENT between the graphics and readback families.
+    bool BuffersShareReadbackFamily() const {
+        return readback_family_concurrent;
+    }
     u32 GetReadbackQueueFamilyIndex() const {
         return readback_queue_family;
     }
@@ -536,6 +541,7 @@ private:
     vk::Queue graphics_queue;
     vk::Queue readback_queue;
     bool has_readback_queue{};
+    bool readback_family_concurrent{};
     u32 readback_queue_family{};
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;

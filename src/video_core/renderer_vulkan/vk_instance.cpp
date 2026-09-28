@@ -407,6 +407,20 @@ bool Instance::CreateDevice() {
         }
     } else if (readback_mode == '1') {
         has_readback_queue = family_properties[queue_family_index].queueCount >= 2;
+    } else if (readback_mode == '3') {
+        // 3 = a compute-only family (the async compute engine on NVIDIA; a second queue of the
+        // graphics family time-slices the graphics engine: 2026-09-27 fast-lane copies still
+        // waited ~0.7 ms there). Buffers are made CONCURRENT between the two families, so no
+        // ownership transfer is needed (mode 2 relied on undefined EXCLUSIVE behaviour).
+        for (u32 i = 0; i < family_properties.size(); ++i) {
+            const auto flags = family_properties[i].queueFlags;
+            if ((flags & vk::QueueFlagBits::eCompute) && !(flags & vk::QueueFlagBits::eGraphics)) {
+                readback_queue_family = i;
+                has_readback_queue = true;
+                readback_family_concurrent = true;
+                break;
+            }
+        }
     }
     const bool separate_family = has_readback_queue && readback_queue_family != queue_family_index;
     const std::array queue_infos = {

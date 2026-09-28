@@ -136,9 +136,15 @@ Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
         flags |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
     }
     // Create buffer object.
+    const std::array<u32, 2> families = {instance->GetGraphicsQueueFamilyIndex(),
+                                         instance->GetReadbackQueueFamilyIndex()};
+    const bool concurrent = instance->BuffersShareReadbackFamily();
     const vk::BufferCreateInfo buffer_ci = {
         .size = size_bytes,
         .usage = flags,
+        .sharingMode = concurrent ? vk::SharingMode::eConcurrent : vk::SharingMode::eExclusive,
+        .queueFamilyIndexCount = concurrent ? 2u : 0u,
+        .pQueueFamilyIndices = concurrent ? families.data() : nullptr,
     };
     VmaAllocationInfo alloc_info{};
     buffer.Create(buffer_ci, usage, &alloc_info);
