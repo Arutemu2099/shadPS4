@@ -608,6 +608,25 @@ public:
         std::vector<Entry> entries;
     };
     mutable std::unique_ptr<MainRangeLog> range_log;
+    mutable std::unique_ptr<MainRangeLog> prev_range_log;
+    /// Census: does the logged batch `tick` (previous log) touch [lo, lo+size) in a conflicting
+    /// way? -1 = no log for that tick, 0 = no overlap, 1 = overlap (or whole).
+    int PrevLogConflict(u64 tick, VAddr lo, u64 size, bool written) const {
+        const MainRangeLog* log = prev_range_log.get();
+        if (!log || log->tick != tick) {
+            return -1;
+        }
+        if (log->whole) {
+            return 1;
+        }
+        const VAddr hi = lo + size;
+        for (const auto& e : log->entries) {
+            if (e.lo < hi && lo < e.hi && (e.write || written)) {
+                return 1;
+            }
+        }
+        return 0;
+    }
     mutable bool asc_bound = false;
     MainRangeLog* OpenRangeLog(u64 tick) const {
         if (g_record_stream != 0 || !asc_bound) {
@@ -617,6 +636,12 @@ public:
             range_log = std::make_unique<MainRangeLog>();
         }
         if (range_log->tick != tick) {
+            // Keep the previous batch's log (census: would a flushed-batch wait survive range
+            // precision?).
+            if (!prev_range_log) {
+                prev_range_log = std::make_unique<MainRangeLog>();
+            }
+            std::swap(prev_range_log, range_log);
             range_log->tick = tick;
             range_log->whole = false;
             range_log->entries.clear();

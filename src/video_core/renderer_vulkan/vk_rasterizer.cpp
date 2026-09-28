@@ -3449,6 +3449,23 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
                     const u64 prev = written ? buffer.prev_access_tick : buffer.prev_write_tick;
                     const u64 flushed = last < now ? last : prev;
                     wait_main = std::max(wait_main, flushed);
+                    if (VideoCore::BufferCache::CensusEnabled()) [[unlikely]] {
+                        // Would range precision drop this flushed-batch wait? (I2 census)
+                        static u64 waits = 0, logged = 0, avoidable = 0;
+                        if (flushed != 0) {
+                            ++waits;
+                            const int c = buffer.PrevLogConflict(flushed, vsharp.base_address,
+                                                                 size, written);
+                            logged += c >= 0;
+                            avoidable += c == 0;
+                            if ((waits & 0xfffff) == 0) {
+                                LOG_INFO(Render_Vulkan,
+                                         "AscI2Census: flushed_waits={} with_log={} "
+                                         "no_range_overlap={}",
+                                         waits, logged, avoidable);
+                            }
+                        }
+                    }
                     continue;
                 }
                 ok = buffer.main_access_tick < now;
