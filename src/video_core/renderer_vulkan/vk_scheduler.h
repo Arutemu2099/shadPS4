@@ -443,6 +443,9 @@ public:
             if (scheduler.synchronous_scopes == 0) {
                 scheduler.DrainRecording();
             }
+            // The worker is idle: a coalesced transfer group left open by it is closed before the
+            // borrower records directly (SHADPS4_TRANSFER_COALESCE).
+            scheduler.CloseTransferGroup(scheduler.current_cmdbuf);
             // A borrower may bind legacy descriptor state behind the scheduler's back.
             scheduler.native_heaps_bound = false;
             ++scheduler.synchronous_scopes;
@@ -504,43 +507,80 @@ public:
         native_heaps_bound = false;
     }
 
-    template <typename F>
+    /// IsTransfer: the command records only buffer copies that call BeginTransferOnWorker
+    /// (SHADPS4_TRANSFER_COALESCE); every other command first closes an open transfer group.
+    template <bool IsTransfer = false, typename F>
     void Record(F&& command) {
         ++stream_seq[active_stream];
         if (!IsAsyncRecording()) {
+            CloseTransferGroup(current_cmdbuf);
             command(current_cmdbuf);
+            CloseTransferGroup(current_cmdbuf); // no group survives a synchronous record
             return;
         }
         // The handle is read when the worker runs the command: with SHADPS4_ASYNC_SUBMIT the
         // worker itself ends, submits and replaces the command buffer, in recording order.
         recording_worker->Record([this, command = std::forward<F>(command)]() mutable {
+            if constexpr (!IsTransfer) {
+                CloseTransferGroup(current_cmdbuf);
+            }
             command(current_cmdbuf);
         });
     }
 
     // Clone transient arrays into the same unpublished chunk as their callback.
     // Factories never execute guest-memory reads or reenter the scheduler.
-    template <typename F, typename... T>
+    template <bool IsTransfer = false, typename F, typename... T>
     void RecordArrays(F&& command, std::span<const T>... arrays) {
         static_assert((std::is_trivially_copyable_v<T> && ...));
         ++stream_seq[active_stream];
         if (!IsAsyncRecording()) {
+            CloseTransferGroup(current_cmdbuf);
             command(current_cmdbuf, arrays...);
+            CloseTransferGroup(current_cmdbuf);
             return;
         }
         const size_t bytes = (size_t{} + ... + AlignedPayloadSize(arrays.size_bytes()));
         if (bytes > 32768) {
-            auto access = AcquireCommandBuffer();
+            auto access = AcquireCommandBuffer(); // closes an open group
             command(access.Handle(), arrays...);
+            CloseTransferGroup(access.Handle());
             return;
         }
         recording_worker->RecordWithPayload(bytes, [&](std::span<std::byte> storage) {
             auto* cursor = storage.data();
             auto copies = std::tuple{CopyPayload(cursor, arrays)...};
             return [this, command = std::forward<F>(command), copies]() mutable {
+                if constexpr (!IsTransfer) {
+                    CloseTransferGroup(current_cmdbuf);
+                }
                 std::apply([&](auto... spans) { command(current_cmdbuf, spans...); }, copies);
             };
         });
+    }
+
+    /// SHADPS4_TRANSFER_COALESCE=1 (notes/transfer-serialization-2026-09-28.md): consecutive
+    /// transfer ops (uploads, guest buffer copies) share one barrier pair instead of one pair
+    /// each; each pair drains the GPU (~4.5 us per tiny particle job in fire). Runs where the
+    /// command records (worker, or the CP thread when synchronous), in recording order.
+    struct TransferRange {
+        VkBuffer buffer;
+        u64 lo;
+        u64 hi;
+    };
+    static bool TransferCoalesceEnabled();
+    /// Called by a transfer command before its copies: opens the group with a global
+    /// AllCommands -> Transfer barrier, or adds a Transfer -> Transfer barrier when this op
+    /// overlaps an op already in the group (RAW / WAR / WAW between transfers).
+    void BeginTransferOnWorker(vk::CommandBuffer cmdbuf, const TransferRange& read,
+                               const TransferRange& write);
+    /// Emits the group's Transfer -> AllCommands barrier (before any other command, a borrow,
+    /// or the end of the command buffer).
+    void CloseTransferGroup(vk::CommandBuffer cmdbuf) {
+        TransferGroup& group = transfer_group[worker_stream];
+        if (group.open) [[unlikely]] {
+            CloseTransferGroupSlow(group, cmdbuf);
+        }
     }
 
     /// Returns the current command buffer tick.
@@ -799,6 +839,16 @@ private:
     void AscTimerCollect();
     u64 asc_waited_by_main = 0;
     std::array<u64, 2> stream_seq{};
+    struct TransferGroup {
+        bool open = false;
+        u32 num_reads = 0;
+        u32 num_writes = 0;
+        std::array<TransferRange, 16> reads{};
+        std::array<TransferRange, 16> writes{};
+    };
+    /// Per worker stream (0 = main, 1 = ASC command buffer); recording-order state.
+    std::array<TransferGroup, 2> transfer_group{};
+    void CloseTransferGroupSlow(TransferGroup& group, vk::CommandBuffer cmdbuf);
     void AscSubmitOnWorker(u64 value, u64 wait_main);
     void BeginAscCmdbufOnWorker();
 

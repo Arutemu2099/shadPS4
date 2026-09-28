@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <bit>
 #include <cstdlib>
 #include <cstring>
 #include <optional>
@@ -66,6 +67,34 @@ const bool g_precise_producer = EnvIs1("SHADPS4_PRECISE_PRODUCER");
 const bool g_buffer_traffic_enabled = EnvIs1("SHADPS4_BUFFER_TRAFFIC");
 const bool g_fault_write_skip_settle = EnvIs1("SHADPS4_FAULT_WRITE_SKIP_SETTLE");
 const bool g_async_submit = EnvIs1("SHADPS4_ASYNC_SUBMIT");
+/// SHADPS4_UPLOAD_AHEAD_STATS=1 (diagnostic, notes/transfer-serialization-2026-09-28.md): per
+/// upload, how many CPU-dirty tracker pages lie in the 64 pages after it (read-ahead potential),
+/// and how many transfer ops follow another transfer with nothing recorded in between (barrier
+/// coalescing potential). Each transfer op records its own barrier pair today.
+const bool g_upload_ahead_stats = EnvIs1("SHADPS4_UPLOAD_AHEAD_STATS");
+/// SHADPS4_UPLOAD_AHEAD=<pages> (notes/transfer-serialization-2026-09-28.md): after a small
+/// upload (<= 16 KiB), also upload the CPU-dirty pages among the next <pages> tracker pages of the
+/// same Buffer, as a later binding of them would. Fire's particle dispatches each bind a fresh
+/// page of an arena the CPU filled before submitting: one upload + barrier pair per dispatch
+/// serialized the chain (60% of uploads had the next page dirty, 67% >= 16 of the next 64).
+const u32 g_upload_ahead_pages = [] {
+    const char* value = std::getenv("SHADPS4_UPLOAD_AHEAD");
+    return value ? static_cast<u32>(std::clamp(std::atoi(value), 0, 256)) : 0u;
+}();
+thread_local bool t_upload_ahead_active = false;
+std::atomic<u64> g_upload_ahead_calls{}, g_upload_ahead_bytes{};
+/// SHADPS4_TRANSFER_COALESCE=1: uploads (deferred-protect path) and guest buffer copies use the
+/// scheduler's transfer group (one barrier pair per run of consecutive transfers).
+const bool g_transfer_coalesce = Vulkan::Scheduler::TransferCoalesceEnabled();
+struct UploadAheadStats {
+    std::atomic<u64> uploads{}, upload_bytes{}, copies{}, transfers{}, adjacent{};
+    std::atomic<u64> ahead[8]{}; ///< dirty pages ahead: 0, 1, 2-3, 4-7, 8-15, 16-31, 32-63, 64
+    std::atomic<u64> gap[4]{};   ///< first dirty page ahead at: +1, +2..4, +5..16, +17.. or none
+    std::atomic<u64> ahead_same_run[2]{}; ///< [0] next page dirty, [1] next page clean
+    u64 last_seq = ~0ULL;
+    u32 last_stream = ~0U;
+};
+UploadAheadStats g_uas;
 const bool g_readback_early_flush = EnvIs1("SHADPS4_READBACK_EARLY_FLUSH");
 const bool g_readback_producer_stats = EnvIs1("SHADPS4_READBACK_PRODUCER_STATS");
 /// SHADPS4_WRITE_FAULT_WIDEN=1: a write fault on GPU-modified memory first downloads the same
@@ -2927,6 +2956,30 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
             .size = num_bytes,
         },
     };
+    if (g_upload_ahead_stats) {
+        ++g_uas.copies;
+        NoteTransferBegin();
+    }
+    SCOPE_EXIT {
+        if (g_upload_ahead_stats) {
+            NoteTransferEnd();
+        }
+    };
+    if (g_transfer_coalesce) {
+        const Vulkan::Scheduler::TransferRange read{static_cast<VkBuffer>(src_buffer.Handle()),
+                                                    region.srcOffset,
+                                                    region.srcOffset + region.size};
+        const Vulkan::Scheduler::TransferRange write{static_cast<VkBuffer>(dst_buffer.Handle()),
+                                                     region.dstOffset,
+                                                     region.dstOffset + region.size};
+        scheduler.Record<true>([source = src_buffer.Handle(), destination = dst_buffer.Handle(),
+                                region, read, write,
+                                sched = &scheduler](vk::CommandBuffer cmdbuf) {
+            sched->BeginTransferOnWorker(cmdbuf, read, write);
+            cmdbuf.copyBuffer(source, destination, region);
+        });
+        return;
+    }
     scheduler.Record([source = src_buffer.Handle(), destination = dst_buffer.Handle(), region,
                       before = std::to_array(buf_barriers_before),
                       after = std::to_array(buf_barriers_after)](vk::CommandBuffer cmdbuf) {
@@ -3742,6 +3795,80 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
     }
 }
 
+void BufferCache::UploadAhead(Buffer& buffer, VAddr device_addr, u32 size) {
+    constexpr u64 page = TRACKER_BYTES_PER_PAGE;
+    const VAddr lo = Common::AlignUp(device_addr + size, page);
+    const VAddr hi = std::min<VAddr>(lo + u64{g_upload_ahead_pages} * page,
+                                     buffer.CpuAddr() + buffer.SizeBytes());
+    if (hi <= lo) {
+        return;
+    }
+    t_upload_ahead_active = true;
+    const u64 saved_last = last_sync_upload_bytes;
+    // A plain read sync of the range: uploads its CPU-dirty pages, re-protects them and records
+    // the copy right after the triggering one (same transfer group under TRANSFER_COALESCE).
+    SynchronizeBuffer(buffer, lo, static_cast<u32>(hi - lo), false, false, nullptr);
+    const u64 bytes = last_sync_upload_bytes;
+    last_sync_upload_bytes = saved_last;
+    t_upload_ahead_active = false;
+    g_upload_ahead_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    const u64 n = g_upload_ahead_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((n & 0xffff) == 0) {
+        LOG_INFO(Render_Vulkan, "UploadAheadRun: calls={} bytes={}", n,
+                 g_upload_ahead_bytes.load(std::memory_order_relaxed));
+    }
+}
+
+void BufferCache::NoteTransferBegin() {
+    const u32 stream = scheduler.ActiveStream();
+    ++g_uas.transfers;
+    if (stream == g_uas.last_stream && scheduler.RecordSeqOf(stream) == g_uas.last_seq) {
+        ++g_uas.adjacent;
+    }
+}
+
+void BufferCache::NoteTransferEnd() {
+    g_uas.last_stream = scheduler.ActiveStream();
+    g_uas.last_seq = scheduler.RecordSeqOf(g_uas.last_stream);
+}
+
+void BufferCache::NoteUploadAhead(const Buffer& buffer, VAddr device_addr, u32 size, u64 bytes) {
+    constexpr u64 page = TRACKER_BYTES_PER_PAGE;
+    const VAddr start = Common::AlignUp(device_addr + size, page);
+    const VAddr buffer_end = buffer.CpuAddr() + buffer.SizeBytes();
+    u32 dirty = 0;
+    u32 first = 0;
+    for (u32 i = 0; i < 64; ++i) {
+        const VAddr p = start + i * page;
+        if (p + page > buffer_end) {
+            break;
+        }
+        if (memory_tracker->IsRegionCpuModified(p, page)) {
+            ++dirty;
+            if (first == 0) {
+                first = i + 1;
+            }
+        }
+    }
+    const u32 bin = dirty == 0 ? 0 : dirty == 64 ? 7 : std::min<u32>(std::bit_width(dirty), 6);
+    ++g_uas.ahead[bin];
+    ++g_uas.gap[first == 1 ? 0 : first != 0 && first <= 4 ? 1 : first != 0 && first <= 16 ? 2 : 3];
+    ++g_uas.ahead_same_run[first == 1 ? 0 : 1];
+    g_uas.upload_bytes += bytes;
+    const u64 n = ++g_uas.uploads;
+    if ((n & 0x3fff) == 0) {
+        auto v = [](const std::atomic<u64>& a) { return a.load(std::memory_order_relaxed); };
+        LOG_INFO(Render_Vulkan,
+                 "UploadAhead: uploads={} bytes={} copies={} transfers={} adjacent={} "
+                 "ahead[0,1,2-3,4-7,8-15,16-31,32-63,64]={},{},{},{},{},{},{},{} "
+                 "first_gap[1,2-4,5-16,none/far]={},{},{},{}",
+                 n, v(g_uas.upload_bytes), v(g_uas.copies), v(g_uas.transfers), v(g_uas.adjacent),
+                 v(g_uas.ahead[0]), v(g_uas.ahead[1]), v(g_uas.ahead[2]), v(g_uas.ahead[3]),
+                 v(g_uas.ahead[4]), v(g_uas.ahead[5]), v(g_uas.ahead[6]), v(g_uas.ahead[7]),
+                 v(g_uas.gap[0]), v(g_uas.gap[1]), v(g_uas.gap[2]), v(g_uas.gap[3]));
+    }
+}
+
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
                                     bool is_texel_buffer,
                                     Common::BufferSampleProbe* sample_probe) {
@@ -3786,6 +3913,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     }
     last_sync_upload_bytes = total_size_bytes;
     sync_upload_bytes_total += total_size_bytes;
+    if (g_upload_ahead_stats && src_buffer) [[unlikely]] {
+        NoteUploadAhead(buffer, device_addr, size, total_size_bytes);
+    }
     if (total_size_bytes != 0) {
         // An upload is a main write of the Buffer (SynchronizeBuffersInRange reaches here without
         // any other note; Opus review 2026-09-28). Skipped on the ASC stream by NoteMainAccess.
@@ -3860,7 +3990,40 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             .offset = 0,
             .size = buffer.SizeBytes(),
         };
-        if (defer) {
+        if (g_upload_ahead_stats) {
+            NoteTransferBegin();
+        }
+        SCOPE_EXIT {
+            if (g_upload_ahead_stats) {
+                NoteTransferEnd();
+            }
+        };
+        if (defer && g_transfer_coalesce) {
+            // SHADPS4_TRANSFER_COALESCE: the barriers come from the scheduler's transfer group.
+            Vulkan::Scheduler::TransferRange write{static_cast<VkBuffer>(buffer.Handle()), ~0ULL, 0};
+            for (const auto& copy : copies) {
+                write.lo = std::min<u64>(write.lo, copy.dstOffset);
+                write.hi = std::max<u64>(write.hi, copy.dstOffset + copy.size);
+            }
+            scheduler.RecordArrays<true>(
+                [src_buffer, destination = buffer.Handle(), write, sched = &scheduler,
+                 memory = memory, pm = &page_manager](vk::CommandBuffer cmdbuf, auto owned_copies,
+                                                      auto cpu_copies, auto protects) {
+                    // Protect first, then copy: see SynchronizeBuffer.
+                    pm->ReconcileProtection(protects);
+                    for (const DeferredCopy& copy : cpu_copies) {
+                        if (!memory->TryReadBacking(copy.addr, copy.dest, copy.size)) {
+                            memory->CopySparseMemory(copy.addr, copy.dest, copy.size);
+                        }
+                    }
+                    sched->BeginTransferOnWorker(cmdbuf, {}, write);
+                    cmdbuf.copyBuffer(src_buffer, destination, owned_copies);
+                },
+                std::span<const vk::BufferCopy>{copies},
+                std::span<const DeferredCopy>{deferred_copies},
+                std::span<const PageManager::ProtectRange>{deferred_protects});
+            TouchBuffer(buffer);
+        } else if (defer) {
             scheduler.RecordArrays(
                 [src_buffer, destination = buffer.Handle(), pre_barrier, post_barrier,
                  memory = memory, pm = &page_manager](vk::CommandBuffer cmdbuf, auto owned_copies,
@@ -3907,6 +4070,10 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             std::span<const vk::BufferCopy>{copies});
         TouchBuffer(buffer);
         }
+    }
+    if (g_upload_ahead_pages != 0 && src_buffer && total_size_bytes <= 16_KB &&
+        !t_upload_ahead_active) [[unlikely]] {
+        UploadAhead(buffer, device_addr, size);
     }
     if (is_texel_buffer && !is_written) {
         const auto t_texel = sample_probe ? sample_probe->Now()

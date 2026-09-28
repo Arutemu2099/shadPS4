@@ -388,6 +388,12 @@ public:
         pending_asc.clear();
     }
     [[nodiscard]] static bool AscDepsEnabled();
+    /// SHADPS4_UPLOAD_AHEAD_STATS (diagnostic).
+    void NoteTransferBegin();
+    void NoteTransferEnd();
+    void NoteUploadAhead(const Buffer& buffer, VAddr device_addr, u32 size, u64 bytes);
+    /// SHADPS4_UPLOAD_AHEAD: upload the dirty pages after a small upload (see buffer_cache.cpp).
+    void UploadAhead(Buffer& buffer, VAddr device_addr, u32 size);
     /// Marks a Buffer as bound by an ASC candidate (its main accesses are noted by range).
     /// A Buffer bound for the first time in the middle of a batch has no range log for the
     /// accesses already made in it: those count as whole-Buffer (conservative).

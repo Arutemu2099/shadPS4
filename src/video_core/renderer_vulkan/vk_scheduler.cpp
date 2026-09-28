@@ -92,6 +92,103 @@ Scheduler::~Scheduler() {
 #endif
 }
 
+bool Scheduler::TransferCoalesceEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_TRANSFER_COALESCE");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
+namespace {
+struct TransferCoalesceStats {
+    u64 ops = 0, groups = 0, tt_barriers = 0, overflow = 0;
+};
+TransferCoalesceStats g_tcs; // recording order only (one recorder at a time)
+
+bool RangesOverlap(const Scheduler::TransferRange& a, const Scheduler::TransferRange& b) {
+    return a.buffer == b.buffer && a.lo < b.hi && b.lo < a.hi;
+}
+} // namespace
+
+void Scheduler::BeginTransferOnWorker(vk::CommandBuffer cmdbuf, const TransferRange& read,
+                                      const TransferRange& write) {
+    TransferGroup& group = transfer_group[worker_stream];
+    ++g_tcs.ops;
+    if (!group.open) {
+        // Everything recorded before the group -> the group's transfers (was: one such barrier
+        // per op, scoped to its buffer; global is a superset).
+        const vk::MemoryBarrier2 pre = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask =
+                vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &pre,
+        });
+        group.open = true;
+        group.num_reads = 0;
+        group.num_writes = 0;
+        ++g_tcs.groups;
+    } else {
+        bool hazard = group.num_reads == group.reads.size() ||
+                      group.num_writes == group.writes.size();
+        g_tcs.overflow += hazard;
+        for (u32 i = 0; i < group.num_writes && !hazard; ++i) {
+            hazard = (write.buffer && RangesOverlap(write, group.writes[i])) ||
+                     (read.buffer && RangesOverlap(read, group.writes[i]));
+        }
+        for (u32 i = 0; i < group.num_reads && !hazard; ++i) {
+            hazard = write.buffer && RangesOverlap(write, group.reads[i]);
+        }
+        if (hazard) {
+            // Transfers of one group run unordered: order this op after the earlier ones.
+            const vk::MemoryBarrier2 tt = {
+                .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .dstAccessMask =
+                    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite,
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .memoryBarrierCount = 1,
+                .pMemoryBarriers = &tt,
+            });
+            group.num_reads = 0;
+            group.num_writes = 0;
+            ++g_tcs.tt_barriers;
+        }
+    }
+    if (read.buffer) {
+        group.reads[group.num_reads++] = read;
+    }
+    if (write.buffer) {
+        group.writes[group.num_writes++] = write;
+    }
+    if ((g_tcs.ops & 0x3ffff) == 0) {
+        LOG_INFO(Render_Vulkan, "TransferCoalesce: ops={} groups={} tt_barriers={} overflow={}",
+                 g_tcs.ops, g_tcs.groups, g_tcs.tt_barriers, g_tcs.overflow);
+    }
+}
+
+void Scheduler::CloseTransferGroupSlow(TransferGroup& group, vk::CommandBuffer cmdbuf) {
+    group.open = false;
+    // The group's transfers -> everything recorded after it (was: one such barrier per op).
+    const vk::MemoryBarrier2 post = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &post,
+    });
+}
+
 void Scheduler::DrainRecording() {
     if (recording_worker) {
         recording_worker->Drain();
@@ -470,6 +567,9 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
     batch_dispatches = 0;
     batch_ops = 0;
     recording_worker->Record([this, info, signal_value, draws, dispatches]() mutable {
+        if (transfer_group[0].open) {
+            CloseTransferGroupSlow(transfer_group[0], main_cmdbuf);
+        }
         if (batch_timer) {
             bool asc_wait = false;
             for (u32 i = 0; i < info.num_wait_semas; ++i) {
@@ -625,6 +725,9 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 #endif
 
     EndRendering();
+    if (transfer_group[0].open) {
+        CloseTransferGroupSlow(transfer_group[0], main_cmdbuf);
+    }
     Check(main_cmdbuf.end());
 
     const vk::Semaphore timeline = master_semaphore.Handle();
@@ -806,6 +909,9 @@ u64 Scheduler::SubmitAscSegment() {
 void Scheduler::AscSubmitOnWorker(u64 value, u64 wait_main) {
     if (!asc_cmdbuf) {
         BeginAscCmdbufOnWorker(); // An empty segment still signals its value.
+    }
+    if (transfer_group[1].open) {
+        CloseTransferGroupSlow(transfer_group[1], asc_cmdbuf);
     }
     if (asc_timer) {
         AscTimerEnd(value);
