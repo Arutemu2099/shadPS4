@@ -39,6 +39,7 @@ struct BoundStage;
 
 namespace Vulkan {
 class GraphicsPipeline;
+class MasterSemaphore;
 }
 
 namespace Common {
