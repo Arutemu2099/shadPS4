@@ -1315,18 +1315,38 @@ void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
     // no sync packet or draw in between (same nonzero guest run) and nothing was recorded since
     // that dispatch ended (no copy, upload, readback, pending operation or borrowed buffer).
     if (dispatch_run != 0 && scheduler.IsAsyncRecording()) {
-        const bool cont = dispatch_run == prev_dispatch_run &&
-                          scheduler.RecordSeq() == prev_dispatch_end_seq;
+        const bool same_guest = dispatch_run == prev_dispatch_run;
+        const u64 seq = scheduler.RecordSeq();
+        const bool cont = same_guest && seq == prev_dispatch_end_seq;
         cur_dispatch_run = cont ? prev_effective_run : ++effective_run_counter;
+        // Counters (log only): continued runs vs breaks by cause, and recorded commands between.
+        static u64 n_cont = 0, n_guest = 0, n_seq = 0, seq_gap = 0, n_all = 0;
+        ++n_all;
+        n_cont += cont;
+        n_guest += !same_guest;
+        if (same_guest && !cont) {
+            ++n_seq;
+            seq_gap += seq - prev_dispatch_end_seq;
+        }
+        if ((n_all & 0xffff) == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "GuestDispatchOrder: dispatches={} continued={} new_guest_run={} "
+                     "recorded_between={} (avg {:.1f} records)",
+                     n_all, n_cont, n_guest, n_seq, n_seq ? double(seq_gap) / double(n_seq) : 0.0);
+        }
     } else {
         cur_dispatch_run = 0;
     }
+    const u64 tick_before_tail = scheduler.CurrentTick();
     if (is_indirect) {
         DispatchIndirectTail(pipeline, address, offset, size);
     } else {
         DispatchDirectTail(pipeline);
     }
-    prev_dispatch_run = cur_dispatch_run != 0 ? dispatch_run : 0;
+    // A flush inside the tail runs pending operations after the dispatch; the next dispatch's
+    // sequence check could not see what they recorded (Opus review 2026-09-27): end the run.
+    const bool flushed = scheduler.CurrentTick() != tick_before_tail;
+    prev_dispatch_run = (cur_dispatch_run != 0 && !flushed) ? dispatch_run : 0;
     prev_effective_run = cur_dispatch_run;
     prev_dispatch_end_seq = scheduler.RecordSeq();
     cur_dispatch_run = 0;
