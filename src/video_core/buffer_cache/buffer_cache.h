@@ -520,6 +520,22 @@ private:
         u32 buffer_index{};
     };
     std::array<ReadMemoEntry, 8192> read_memo_table{};
+    /// SHADPS4_WRITTEN_RUN_MEMO (default off): a written ObtainBuffer of exactly this range ran in
+    /// full in batch `tick` with these epochs and this many admitted fault jobs.
+    struct WrittenRunEntry {
+        VAddr addr{};
+        u64 size{};
+        u64 serial{};
+        u64 tick{};
+        u64 dirty_epoch{};
+        u64 clear_epoch{};
+        u64 jobs{};
+    };
+    std::array<WrittenRunEntry, 4096> written_run_table{};
+    /// calls, hits, miss key, miss tick, miss dirty epoch, miss clear epoch, miss jobs, verify bad.
+    std::array<u64, 8> written_run_stats{};
+    /// Fault jobs admitted so far (monotonic; PrepareFaultDownload, CP thread).
+    std::atomic<u64> fault_jobs_admitted{0};
     u64 read_memo_calls{};
     u64 read_memo_verify_bad{};
     u64 buffer_memo_serial{};

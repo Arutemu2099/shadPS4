@@ -89,6 +89,15 @@ const bool g_write_fault_offload =
 const bool g_range_add_skip = EnvIs1("SHADPS4_RANGE_ADD_SKIP");
 const bool g_vb_repeat_stats = EnvIs1("SHADPS4_VB_REPEAT_STATS");
 const bool g_written_memo = EnvIs1("SHADPS4_WRITTEN_MEMO");
+/// SHADPS4_WRITTEN_RUN_MEMO: 0 off, 1 on, 2 verify. See ObtainBuffer.
+const int g_written_run_memo = [] {
+    const char* value = std::getenv("SHADPS4_WRITTEN_RUN_MEMO");
+    const char* asc = std::getenv("SHADPS4_ASC_STREAM");
+    if (!value || (value[0] != '1' && value[0] != '2') || (asc && asc[0] != '0')) {
+        return 0;
+    }
+    return value[0] - '0';
+}();
 /// SHADPS4_READ_BIND_MEMO: 0 off, 1 on, 2 verify (a hit still runs the full path and checks that
 /// it uploaded nothing; the returned pair is identical by construction); 3 / 4 the same with the
 /// buffer's creation serial as the structure guard instead of the global StructGeneration. Off
@@ -1243,6 +1252,7 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
         const auto [window_begin, window_end] = TrackerPageSpan(addr, bytes);
         fault_windows[job - fault_jobs.data()] = {window_begin, window_end};
         pending_fault_jobs.fetch_add(1);
+        fault_jobs_admitted.fetch_add(1, std::memory_order_acq_rel);
     });
     if (!admitted) {
         job->seqs.clear();
@@ -2712,7 +2722,10 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     u64 read_memo_gen = 0;
     bool read_memo_verify = false;
     u64 read_memo_bytes_before = 0;
-    if (g_read_bind_memo != 0 && !is_written && !is_texel_buffer) {
+    // Shader bindings only: vertex/index/image callers (BufferSampleCaller::Other) hit 18% and the
+    // probe cost them ~30 ns/draw (same-EXE DRAW_COST pair, runs diag-fire-rbmemo2-dc-*-20260928).
+    if (g_read_bind_memo != 0 && !is_written && !is_texel_buffer &&
+        sample_caller != Common::BufferSampleCaller::Other) {
         read_memo_epoch = g_dirty_epoch.load(std::memory_order_acquire);
         const bool serial_guard = g_read_bind_memo >= 3;
         read_memo_gen = serial_guard ? buffer.memo_serial : StructGeneration();
@@ -2762,6 +2775,62 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             if (is_written) {
                 buffer.diag_main_write_tick = now;
             }
+        }
+    }
+    // SHADPS4_WRITTEN_RUN_MEMO: the particle ring binds the same written ranges dispatch after
+    // dispatch (fire: ~2.9 written bindings per dispatch at ~390 ns, ~1,000 dispatches/frame on
+    // the path Game:Main waits for). A full written run leaves its range CPU-clean (uploaded),
+    // GPU-marked in the tracker and gpu_modified_ranges, bumps gpu_write_seq in its regions and
+    // records the range in this batch's write history. Repeating it in the same batch (tick)
+    // while no page anywhere became CPU-dirty (g_dirty_epoch), no GPU bit or range was cleared
+    // (gpu_clear_epoch, bumped by every Subtract / UnmarkRegionAsGpuModified) and no fault job
+    // was admitted (a job admitted before the first run was already vetoed by its seq bump) only
+    // bumps gpu_write_seq again, which nothing can observe: skip it. Unlike WRITTEN_MEMO (0 hits:
+    // it demanded whole 4 MB regions CPU-clean) this needs only no dirtying since the first run.
+    const int written_run = g_written_run_memo;
+    WrittenRunEntry* run_entry = nullptr;
+    WrittenRunEntry run_now{};
+    bool run_verify = false;
+    u64 run_bytes_before = 0;
+    size_t run_ranges_before = 0;
+    if (written_run != 0 && is_written) {
+        run_now = {device_addr,
+                   size,
+                   buffer.memo_serial,
+                   scheduler.CurrentTick(),
+                   g_dirty_epoch.load(std::memory_order_acquire),
+                   MemoryTracker::gpu_clear_epoch.load(std::memory_order_acquire),
+                   fault_jobs_admitted.load(std::memory_order_acquire)};
+        const u64 h = (device_addr * 0x9E3779B97F4A7C15ULL) ^ (u64(size) * 0xC2B2AE3D27D4EB4FULL);
+        run_entry = &written_run_table[(h ^ (h >> 29)) & (written_run_table.size() - 1)];
+        auto& st = written_run_stats;
+        ++st[0];
+        if ((st[0] & 0x7ffff) == 0) {
+            LOG_INFO(Render,
+                     "WrittenRunMemo: calls={} hits={} miss key/tick/dirty/clear/jobs="
+                     "{}/{}/{}/{}/{} verify_bad={}",
+                     st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7]);
+        }
+        const auto& e = *run_entry;
+        if (e.addr != device_addr || e.size != size || e.serial != run_now.serial ||
+            run_now.serial == 0) {
+            ++st[2];
+        } else if (e.tick != run_now.tick) {
+            ++st[3];
+        } else if (e.dirty_epoch != run_now.dirty_epoch) {
+            ++st[4];
+        } else if (e.clear_epoch != run_now.clear_epoch) {
+            ++st[5];
+        } else if (e.jobs != run_now.jobs) {
+            ++st[6];
+        } else {
+            ++st[1];
+            if (written_run == 1) {
+                return {&buffer, buffer.Offset(device_addr)};
+            }
+            run_verify = true;
+            run_bytes_before = sync_upload_bytes_total;
+            run_ranges_before = gpu_modified_ranges.m_ranges_set.iterative_size();
         }
     }
     // SHADPS4_WRITTEN_MEMO=1: a GPU-written binding of exactly this range was fully synchronized
@@ -2843,6 +2912,22 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             sample->AddRangeAddNs(sample->SinceNs(t_range_add));
         }
         Common::FaultMonitor::CountRangeAdd(gpu_modified_ranges.m_ranges_set.iterative_size());
+    }
+    if (run_entry) {
+        // SHADPS4_WRITTEN_RUN_MEMO=2: a hit must have uploaded nothing and added no new interval.
+        if (run_verify &&
+            (sync_upload_bytes_total != run_bytes_before ||
+             gpu_modified_ranges.m_ranges_set.iterative_size() != run_ranges_before)) {
+            if (++written_run_stats[7] <= 20) {
+                LOG_ERROR(Render,
+                          "WrittenRunMemo verify: hit at {:#x}+{:#x} uploaded {} bytes, ranges "
+                          "{} -> {}",
+                          device_addr, size, sync_upload_bytes_total - run_bytes_before,
+                          run_ranges_before, gpu_modified_ranges.m_ranges_set.iterative_size());
+            }
+        }
+        // Values read before the full run: a change during it misses next time.
+        *run_entry = run_now;
     }
     return {&buffer, buffer.Offset(device_addr)};
 }
