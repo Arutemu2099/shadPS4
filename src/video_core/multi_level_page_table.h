@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -48,11 +49,21 @@ public:
         return &(*first_level_map[l1_page])[l2_page];
     }
 
+    /// For readers on another thread than the one that allocates (see operator[]): one acquire load
+    /// of the second-level pointer, which operator[] publishes with release.
+    [[nodiscard]] const Entry* find_acquire(size_t page) const {
+        const size_t l1_page = page >> SecondLevelBits;
+        const size_t l2_page = page & (NumEntriesPerL1Page - 1);
+        L1Page* const l2 = std::atomic_ref<L1Page*>(const_cast<L1Page*&>(first_level_map[l1_page]))
+                               .load(std::memory_order_acquire);
+        return l2 ? &(*l2)[l2_page] : nullptr;
+    }
     [[nodiscard]] const Entry& operator[](size_t page) const {
         const size_t l1_page = page >> SecondLevelBits;
         const size_t l2_page = page & (NumEntriesPerL1Page - 1);
         if (!first_level_map[l1_page]) {
-            first_level_map[l1_page] = page_alloc.Create();
+            std::atomic_ref<L1Page*>(first_level_map[l1_page])
+                .store(page_alloc.Create(), std::memory_order_release);
         }
         return (*first_level_map[l1_page])[l2_page];
     }
@@ -61,7 +72,8 @@ public:
         const size_t l1_page = page >> SecondLevelBits;
         const size_t l2_page = page & (NumEntriesPerL1Page - 1);
         if (!first_level_map[l1_page]) {
-            first_level_map[l1_page] = page_alloc.Create();
+            std::atomic_ref<L1Page*>(first_level_map[l1_page])
+                .store(page_alloc.Create(), std::memory_order_release);
         }
         return (*first_level_map[l1_page])[l2_page];
     }

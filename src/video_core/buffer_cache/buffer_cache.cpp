@@ -98,6 +98,16 @@ const bool g_buffer_ranges_lock = [] {
     const char* value = std::getenv("SHADPS4_BUFFER_RANGES_LOCK");
     return !(value && value[0] == '0');
 }();
+/// SHADPS4_BUFFER_RANGES_LOCK=2: IsRegionRegistered reads page_table (the buffer id per 16 KB caching
+/// page that ChangeRegister writes next to buffer_ranges; buffers are caching-page aligned, so "any
+/// page has a buffer" equals Intersects) with no lock and no tree walk. The table's second-level
+/// pages are never freed and find() never allocates. Ranges over 64 MB use the locked tree. Added
+/// because a short screen (s73) ran a32 (mode 1) ~2% below a30 in fire, possibly the shared lock's
+/// cache-line traffic across faulting guest threads (guess).
+const bool g_buffer_ranges_table = [] {
+    const char* value = std::getenv("SHADPS4_BUFFER_RANGES_LOCK");
+    return value && value[0] == '2';
+}();
 /// SHADPS4_WRITTEN_RUN_MEMO: 0 off, 1 on, 2 verify. See ObtainBuffer.
 const int g_written_run_memo = [] {
     const char* value = std::getenv("SHADPS4_WRITTEN_RUN_MEMO");
@@ -3157,6 +3167,23 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 si
 
 bool BufferCache::IsRegionRegistered(VAddr addr, size_t size) {
     // Check if we are missing some edge case here
+    // Bounded: find() does no range check (page_table covers 2^40 bytes); larger or wider
+    // queries take the locked tree (Opus review).
+    if (g_buffer_ranges_table && size != 0 && size <= (u64{64} << 20) && addr < (u64{1} << 40) &&
+        size <= (u64{1} << 40) - addr) {
+        const u64 first = addr >> CACHING_PAGEBITS;
+        const u64 last = (addr + size - 1) >> CACHING_PAGEBITS;
+        const auto& table = page_table;
+        for (u64 page = first; page <= last; ++page) {
+            const PageData* entry = table.find_acquire(page);
+            // Written by the command processor in ChangeRegister; an empty page is INVALID_INDEX.
+            if (entry && std::atomic_ref<u32>(const_cast<u32&>(entry->buffer_id.index))
+                                 .load(std::memory_order_acquire) != BufferId::INVALID_INDEX) {
+                return true;
+            }
+        }
+        return false;
+    }
     if (g_buffer_ranges_lock) {
         std::shared_lock lk{buffer_ranges_mutex};
         return buffer_ranges.Intersects(addr, size);
@@ -3365,11 +3392,9 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
     const u64 page_end = Common::DivCeil(device_addr_end, CACHING_PAGESIZE);
     const u64 size_pages = page_end - page_begin;
     for (u64 page = page_begin; page != page_end; ++page) {
-        if constexpr (insert) {
-            page_table[page].buffer_id = buffer_id;
-        } else {
-            page_table[page].buffer_id = BufferId{};
-        }
+        // Atomic: IsRegionRegistered (SHADPS4_BUFFER_RANGES_LOCK=2) reads it on guest threads.
+        std::atomic_ref<u32>(page_table[page].buffer_id.index)
+            .store(insert ? buffer_id.index : BufferId::INVALID_INDEX, std::memory_order_relaxed);
     }
     if constexpr (insert) {
         total_used_memory += Common::AlignUp(size, CACHING_PAGESIZE);
