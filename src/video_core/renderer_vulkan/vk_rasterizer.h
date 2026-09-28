@@ -233,6 +233,7 @@ private:
     u64 prev_dispatch_run{};
     u64 prev_effective_run{};
     u64 prev_dispatch_end_seq{~u64{0}};
+    u64 prev_dispatch_end_tick{};
     u64 effective_run_counter{};
     bool bind_memo_rebound{};  // BindTextures re-found a needs_rebind image
 

@@ -212,13 +212,27 @@ u64 AscNowNs() {
 struct AscStartCounters {
     u64 starts = 0, total_ns = 0, max_ns = 0, over_1ms = 0, yields = 0;
     std::array<u64, 6> hist{}; ///< <50 us, <200 us, <500 us, <1 ms, <3 ms, >=3 ms
+    /// Split by whether the queue was busy (an earlier submission unfinished) at submit.
+    std::array<u64, 2> split_n{}, split_ns{}, split_over_1ms{};
+    /// Per mapped queue: starts, total ns, submits that found the queue busy.
+    std::array<u64, 64> q_n{}, q_ns{}, q_busy{};
 };
 AscStartCounters g_asc_start; // front thread only
 
-void NoteAscStart(u64 submit_ns) {
+void NoteAscStart(u64 stamp, u32 queue) {
     auto& c = g_asc_start;
+    const bool busy = (stamp & 1) != 0;
+    const u64 submit_ns = stamp & ~u64{1};
     const u64 now = AscNowNs();
     const u64 ns = now > submit_ns ? now - submit_ns : 0;
+    ++c.split_n[busy];
+    c.split_ns[busy] += ns;
+    c.split_over_1ms[busy] += ns >= 1'000'000;
+    if (queue < c.q_n.size()) {
+        ++c.q_n[queue];
+        c.q_ns[queue] += ns;
+        c.q_busy[queue] += busy;
+    }
     ++c.starts;
     c.total_ns += ns;
     c.max_ns = std::max(c.max_ns, ns);
@@ -230,6 +244,21 @@ void NoteAscStart(u64 submit_ns) {
                  c.starts, double(c.total_ns) / double(c.starts) / 1000.0,
                  double(c.max_ns) / 1000.0, c.yields, c.hist[0], c.hist[1], c.hist[2],
                  c.hist[3], c.hist[4], c.hist[5]);
+        std::string per_queue;
+        for (u32 q = 0; q < c.q_n.size(); ++q) {
+            if (c.q_n[q] != 0) {
+                per_queue += fmt::format(" q{}={}/{:.0f}us/busy{}", q, c.q_n[q],
+                                         double(c.q_ns[q]) / double(c.q_n[q]) / 1000.0,
+                                         c.q_busy[q]);
+            }
+        }
+        LOG_INFO(Render,
+                 "AscStartSplit: idle_at_submit n={} mean_us={:.1f} over_1ms={} | busy_at_submit "
+                 "n={} mean_us={:.1f} over_1ms={} | per queue (starts/mean/busy):{}",
+                 c.split_n[0], c.split_n[0] ? double(c.split_ns[0]) / double(c.split_n[0]) / 1e3 : 0.0,
+                 c.split_over_1ms[0], c.split_n[1],
+                 c.split_n[1] ? double(c.split_ns[1]) / double(c.split_n[1]) / 1e3 : 0.0,
+                 c.split_over_1ms[1], per_queue);
         c = AscStartCounters{};
     }
 }
@@ -2958,7 +2987,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 }
             }
             if (submit_ns != 0) {
-                NoteAscStart(submit_ns);
+                NoteAscStart(submit_ns, vqid + 1);
             }
         }
     }
@@ -3432,7 +3461,9 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
         if (AscStartStats()) [[unlikely]] {
-            asc_submit_ns[gnm_vqid].push_back(AscNowNs());
+            // Low bit: an earlier submission of this queue is still queued or running.
+            asc_submit_ns[gnm_vqid].push_back((AscNowNs() & ~u64{1}) |
+                                              (queue.submits.size() > 1 ? 1 : 0));
         }
     }
 

@@ -408,6 +408,7 @@ private:
     u64 gfx_seen_asc_seq{};
     /// SHADPS4_ASC_START_STATS: submit times of queued top-level ASC buffers per mapped queue
     /// (under that queue's m_access), consumed when the buffer's task first runs.
+    /// Low bit set: the queue already held an unfinished submission when this one arrived.
     std::array<std::deque<u64>, NumTotalQueues> asc_submit_ns{};
     std::atomic<bool> submit_done{};
     std::mutex submit_mutex;

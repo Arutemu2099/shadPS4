@@ -1317,7 +1317,10 @@ void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
     if (dispatch_run != 0 && scheduler.IsAsyncRecording()) {
         const bool same_guest = dispatch_run == prev_dispatch_run;
         const u64 seq = scheduler.RecordSeq();
-        const bool cont = same_guest && seq == prev_dispatch_end_seq;
+        // A flush between the two dispatches may run pending operations without moving the
+        // record sequence (Opus review 2026-09-27, ASC_YIELD): require the same batch too.
+        const bool cont = same_guest && seq == prev_dispatch_end_seq &&
+                          scheduler.CurrentTick() == prev_dispatch_end_tick;
         cur_dispatch_run = cont ? prev_effective_run : ++effective_run_counter;
         // Counters (log only): continued runs vs breaks by cause, and recorded commands between.
         static u64 n_cont = 0, n_guest = 0, n_seq = 0, seq_gap = 0, n_all = 0;
@@ -1349,6 +1352,7 @@ void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
     prev_dispatch_run = (cur_dispatch_run != 0 && !flushed) ? dispatch_run : 0;
     prev_effective_run = cur_dispatch_run;
     prev_dispatch_end_seq = scheduler.RecordSeq();
+    prev_dispatch_end_tick = scheduler.CurrentTick();
     cur_dispatch_run = 0;
 }
 
