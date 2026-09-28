@@ -46,6 +46,11 @@ public:
         return *pipeline_layout;
     }
 
+    /// Descriptors pushed per dispatch (no descriptor set from the master-timeline heap).
+    [[nodiscard]] bool UsesPushDescriptors() const noexcept {
+        return uses_push_descriptors && !uses_native_bindings;
+    }
+
     auto GetStages() const {
         static_assert(static_cast<u32>(Shader::LogicalStage::Compute) == Shader::MaxStageTypes - 1);
         if (is_compute) {

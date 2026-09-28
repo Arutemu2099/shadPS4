@@ -2149,8 +2149,10 @@ void BufferCache::WaitFaultJob(const FaultJob& job) {
         JobSemaphore(job.on_fast_lane, job.on_asc).Wait(job.tick);
         return;
     }
-    if (!scheduler.IsFree(job.tick)) {
-        scheduler.Wait(job.tick);
+    // Main only: a fault copy recorded on main waits its producers explicitly; a dual wait would
+    // tie Game:Main to all ASC work before the batch (asc-i1-relax design, R0 table).
+    if (!scheduler.IsFreeMain(job.tick)) {
+        scheduler.WaitMain(job.tick);
     }
 }
 

@@ -1423,7 +1423,16 @@ u64 Rasterizer::StreamBatchId(u32 stream) const {
 bool Rasterizer::AscCandidate(const ComputePipeline* pipeline) const {
     // Buffers only: no images, samplers, texel buffers (may alias images), DMA / fault / BDA
     // buffers. HLE shaders and image copy / clear shaders never reach BindResources.
-    (void)pipeline;
+    // Descriptor sets from the heap are recycled by the main timeline (asc-i1-relax design R0
+    // table): ASC pipelines must push their descriptors.
+    if (!pipeline->UsesPushDescriptors()) {
+        static std::atomic<u64> no_push{0};
+        const u64 n = no_push.fetch_add(1) + 1;
+        if ((n & (n - 1)) == 0) {
+            LOG_INFO(Render_Vulkan, "AscCandidate: {} dispatches rejected (heap descriptors)", n);
+        }
+        return false;
+    }
     const auto* info = bound_stages[static_cast<u32>(Shader::LogicalStage::Compute)].info;
     if (info && VideoCore::BufferCache::CensusEnabled()) [[unlikely]] {
         // SHADPS4_ASC_V2_CENSUS: why an async-queue pipeline is not eligible, once per shader.

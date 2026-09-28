@@ -409,6 +409,8 @@ public:
 
     /// Waits for the given tick to trigger on the GPU.
     void Wait(u64 tick);
+    /// Main timeline only (see IsFreeMain).
+    void WaitMain(u64 tick);
 
     /// Attempts to execute operations whose tick the GPU has caught up with.
     void PopPendingOperations();
@@ -543,13 +545,62 @@ public:
         return master_semaphore.CurrentTick();
     }
 
-    /// Returns true when a tick has been triggered by the GPU.
+    /// Returns true when a tick has been triggered by the GPU. With the ASC stream this is the
+    /// dual-timeline retirement (R0, notes/asc-i1-relax-design-2026-09-28.md): main tick `tick`
+    /// complete AND every ASC segment submitted before that main flush complete. While I1 holds,
+    /// main already waited those segments, so the extra check only refreshes the ASC counter.
     [[nodiscard]] bool IsFree(u64 tick) noexcept {
+        if (!IsFreeMain(tick)) {
+            return false;
+        }
+        return AscRetired(tick);
+    }
+
+    /// Main timeline only (fault jobs whose copy ran on main: they must not inherit ASC waits).
+    [[nodiscard]] bool IsFreeMain(u64 tick) noexcept {
         if (master_semaphore.IsFree(tick)) {
             return true;
         }
         master_semaphore.Refresh();
         return master_semaphore.IsFree(tick);
+    }
+
+    /// The last ASC value submitted before main tick `tick` was flushed (0: none / ASC off).
+    /// Evicted entries answer the newest submitted value (conservative).
+    [[nodiscard]] u64 AscAt(u64 tick) const noexcept {
+        if (!asc_enabled || tick == 0) {
+            return 0;
+        }
+        const u64 i = tick % AscAtSlots;
+        const u64 tag = asc_at_tag[i].load(std::memory_order_acquire);
+        if (tag == tick) {
+            const u64 value = asc_at_val[i].load(std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (asc_at_tag[i].load(std::memory_order_relaxed) == tick) {
+                return value;
+            }
+        }
+        if (tag > tick) {
+            // Evicted (>= 4096 flushes ago): the newest evicted value is >= the true value and
+            // already old; the newest submitted value would stall on current ASC work (Opus review:
+            // StreamBuffer ring wraps waited on it, 17% of the CP back).
+            ++asc_at_evicted_hits;
+            return asc_at_evicted.load(std::memory_order_acquire);
+        }
+        ++asc_at_fallback_hits; // not flushed yet (callers check main first) or being written
+        return asc_last_submitted.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] bool AscRetired(u64 tick) noexcept {
+        const u64 value = AscAt(tick);
+        if (value == 0 || asc_semaphore->IsFree(value)) {
+            return true;
+        }
+        asc_semaphore->Refresh();
+        ++asc_retired_refreshes;
+        const bool free = asc_semaphore->IsFree(value);
+        asc_retired_blocked += !free; // R0 falsifier: ~0 while I1 holds
+        return free;
     }
 
     /// Returns the master timeline semaphore.
@@ -687,6 +738,37 @@ private:
     bool asc_enabled = false;
     std::unique_ptr<MasterSemaphore> asc_semaphore;
     std::unique_ptr<CommandPool> asc_pool;
+    static constexpr u64 AscAtSlots = 4096;
+    std::array<std::atomic<u64>, AscAtSlots> asc_at_tag{};
+    std::array<std::atomic<u64>, AscAtSlots> asc_at_val{};
+    std::atomic<u64> asc_at_evicted{0};
+    mutable std::atomic<u64> asc_at_evicted_hits{0};
+    mutable std::atomic<u64> asc_at_fallback_hits{0};
+    std::atomic<u64> asc_retired_refreshes{0};
+    std::atomic<u64> asc_retired_blocked{0};
+    void NoteAscAtFlush(u64 main_tick) noexcept {
+        if (!asc_enabled) {
+            return;
+        }
+        const u64 i = main_tick % AscAtSlots;
+        if (asc_at_tag[i].load(std::memory_order_relaxed) != 0) {
+            // Slots are overwritten in tick order, so the evicted values are monotonic.
+            asc_at_evicted.store(asc_at_val[i].load(std::memory_order_relaxed),
+                                 std::memory_order_release);
+        }
+        asc_at_tag[i].store(0, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        asc_at_val[i].store(asc_last_submitted.load(std::memory_order_relaxed),
+                            std::memory_order_relaxed);
+        asc_at_tag[i].store(main_tick, std::memory_order_release);
+        if ((main_tick & 0xffff) == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "AscR0: flushes={} evicted_hits={} fallback_hits={} retired_refreshes={} "
+                     "retired_blocked={}",
+                     main_tick, asc_at_evicted_hits.load(), asc_at_fallback_hits.load(),
+                     asc_retired_refreshes.load(), asc_retired_blocked.load());
+        }
+    }
     vk::CommandBuffer main_cmdbuf;
     vk::CommandBuffer asc_cmdbuf;
     u32 worker_stream = 0;
@@ -694,7 +776,7 @@ private:
     bool asc_dirty = false;
     u64 open_asc_value = 0;
     u64 asc_wait_main = 0;
-    u64 asc_last_submitted = 0;
+    std::atomic<u64> asc_last_submitted{0};
     u64 asc_waited_by_main = 0;
     std::array<u64, 2> stream_seq{};
     void AscSubmitOnWorker(u64 value, u64 wait_main);

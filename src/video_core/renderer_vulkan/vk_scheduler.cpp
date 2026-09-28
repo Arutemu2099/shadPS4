@@ -62,7 +62,10 @@ Scheduler::Scheduler(const Instance& instance, bool allow_recording_worker)
     if (async_submit && instance.HasAscQueue()) {
         asc_enabled = true;
         asc_semaphore = std::make_unique<MasterSemaphore>(instance);
-        asc_pool = std::make_unique<CommandPool>(instance, &master_semaphore,
+        // Recycled by the ASC timeline: an ASC command buffer must not be reset while the compute
+        // queue still runs it (keyed by the main semaphore, this only held through I1; the
+        // SHADPS4_ASC_NO_I1 probe froze, 2026-09-28).
+        asc_pool = std::make_unique<CommandPool>(instance, asc_semaphore.get(),
                                                  instance.GetReadbackQueueFamilyIndex());
         LOG_INFO(Render_Vulkan, "AscStream: enabled");
     }
@@ -290,6 +293,14 @@ void Scheduler::Finish() {
 }
 
 void Scheduler::Wait(u64 tick) {
+    WaitMain(tick);
+    // R0: the ASC segments submitted before that main flush (a no-op while I1 holds).
+    if (const u64 value = AscAt(tick); value != 0) {
+        asc_semaphore->Wait(value);
+    }
+}
+
+void Scheduler::WaitMain(u64 tick) {
     if (tick >= master_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         SubmitInfo info{};
@@ -317,7 +328,9 @@ void Scheduler::PopPendingOperations() {
     }
     std::unique_lock lk(priority_pending_ops_mutex);
     master_semaphore.Refresh();
-    while (!pending_ops.empty() && master_semaphore.IsFree(pending_ops.front().gpu_tick)) {
+    // R0: an operation retires when its main tick and the ASC segments before it are done.
+    while (!pending_ops.empty() && master_semaphore.IsFree(pending_ops.front().gpu_tick) &&
+           AscRetired(pending_ops.front().gpu_tick)) {
         pending_ops.front().callback();
         pending_ops.pop();
     }
@@ -372,6 +385,7 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
         }
     }
     const u64 signal_value = master_semaphore.NextTick();
+    NoteAscAtFlush(signal_value);
     info.AddSignal(master_semaphore.Handle(), signal_value);
     // SHADPS4_SUBMIT_LOCK_SKIP=1: take the global submit lock for the overlay's texture uploads
     // only when one is queued. The recorder holds this lock across vkQueueSubmit, the readback
@@ -531,6 +545,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         }
     }
     const u64 signal_value = master_semaphore.NextTick();
+    NoteAscAtFlush(signal_value);
     last_batch_draws = batch_draws;
     batch_draws = 0;
     batch_dispatches = 0;
@@ -704,6 +719,9 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
         }
 
         master_semaphore.Wait(op.gpu_tick);
+        if (const u64 value = AscAt(op.gpu_tick); value != 0) {
+            asc_semaphore->Wait(value); // R0
+        }
         if (stoken.stop_requested()) {
             break;
         }
