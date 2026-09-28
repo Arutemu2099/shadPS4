@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <source_location>
@@ -780,6 +781,22 @@ private:
     u64 asc_wait_main = 0;
     std::atomic<u64> asc_last_submitted{0};
     std::array<u64, 4> asc_wait_dist{};
+    /// SHADPS4_ASC_TIMING=1 (diagnostic): GPU time of each ASC segment on the compute queue.
+    struct AscTimer {
+        static constexpr u32 Slots = 4096;
+        vk::UniqueQueryPool pool;
+        std::array<u64, Slots> value{};
+        u64 write_seq = 0, read_seq = 0;
+        u32 open_slot = 0;
+        bool began = false;
+        double period_ns = 1.0;
+        u64 busy_ns = 0, segments = 0, max_ns = 0;
+        std::chrono::steady_clock::time_point window{};
+    };
+    std::unique_ptr<AscTimer> asc_timer;
+    void AscTimerBegin();
+    void AscTimerEnd(u64 value);
+    void AscTimerCollect();
     u64 asc_waited_by_main = 0;
     std::array<u64, 2> stream_seq{};
     void AscSubmitOnWorker(u64 value, u64 wait_main);

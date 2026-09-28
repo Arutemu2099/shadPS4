@@ -67,6 +67,17 @@ Scheduler::Scheduler(const Instance& instance, bool allow_recording_worker)
         // SHADPS4_ASC_NO_I1 probe froze, 2026-09-28).
         asc_pool = std::make_unique<CommandPool>(instance, asc_semaphore.get(),
                                                  instance.GetReadbackQueueFamilyIndex());
+        if (const char* t = std::getenv("SHADPS4_ASC_TIMING"); t && t[0] == '1') {
+            asc_timer = std::make_unique<AscTimer>();
+            asc_timer->pool = instance.GetDevice()
+                                  .createQueryPoolUnique(vk::QueryPoolCreateInfo{
+                                      .queryType = vk::QueryType::eTimestamp,
+                                      .queryCount = AscTimer::Slots * 2,
+                                  })
+                                  .value;
+            asc_timer->period_ns = instance.GetPhysicalDevice().getProperties().limits.timestampPeriod;
+            asc_timer->window = std::chrono::steady_clock::now();
+        }
         LOG_INFO(Render_Vulkan, "AscStream: enabled");
     }
     AllocateWorkerCommandBuffers();
@@ -663,6 +674,71 @@ void Scheduler::BeginAscCmdbufOnWorker() {
     Check(asc_cmdbuf.begin(vk::CommandBufferBeginInfo{
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
     }));
+    if (asc_timer) {
+        AscTimerBegin();
+    }
+}
+
+void Scheduler::AscTimerBegin() {
+    auto& t = *asc_timer;
+    AscTimerCollect();
+    if (t.write_seq - t.read_seq >= AscTimer::Slots) {
+        t.began = false; // ring full: skip this segment
+        return;
+    }
+    t.open_slot = static_cast<u32>(t.write_seq % AscTimer::Slots);
+    asc_cmdbuf.resetQueryPool(*t.pool, t.open_slot * 2, 2);
+    asc_cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *t.pool, t.open_slot * 2);
+    t.began = true;
+}
+
+void Scheduler::AscTimerEnd(u64 value) {
+    auto& t = *asc_timer;
+    if (!t.began) {
+        return;
+    }
+    asc_cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *t.pool,
+                              t.open_slot * 2 + 1);
+    t.value[t.open_slot] = value;
+    ++t.write_seq;
+    t.began = false;
+}
+
+void Scheduler::AscTimerCollect() {
+    auto& t = *asc_timer;
+    while (t.read_seq < t.write_seq) {
+        const u32 slot = static_cast<u32>(t.read_seq % AscTimer::Slots);
+        if (asc_semaphore->KnownGpuTick() < t.value[slot]) {
+            asc_semaphore->Refresh();
+            if (asc_semaphore->KnownGpuTick() < t.value[slot]) {
+                break;
+            }
+        }
+        std::array<u64, 2> ts{};
+        const auto result = instance.GetDevice().getQueryPoolResults(
+            *t.pool, slot * 2, 2, sizeof(ts), ts.data(), sizeof(u64),
+            vk::QueryResultFlagBits::e64);
+        ++t.read_seq;
+        if (result == vk::Result::eSuccess && ts[1] >= ts[0]) {
+            const u64 ns = u64(double(ts[1] - ts[0]) * t.period_ns);
+            t.busy_ns += ns;
+            t.max_ns = std::max(t.max_ns, ns);
+            ++t.segments;
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const double wall_ns =
+        double(std::chrono::duration_cast<std::chrono::nanoseconds>(now - t.window).count());
+    if (wall_ns >= 10e9) {
+        LOG_INFO(Render_Vulkan,
+                 "AscTiming: segments={} busy_ms={:.1f} busy_pct={:.1f} mean_us={:.1f} max_us={:.1f} "
+                 "(per {:.1f} s window; ASC queue, segment start to end)",
+                 t.segments, double(t.busy_ns) / 1e6, 100.0 * double(t.busy_ns) / wall_ns,
+                 t.segments ? double(t.busy_ns) / double(t.segments) / 1000.0 : 0.0,
+                 double(t.max_ns) / 1000.0, wall_ns / 1e9);
+        t.busy_ns = t.segments = t.max_ns = 0;
+        t.window = now;
+    }
 }
 
 void Scheduler::SwitchStream(u32 stream) {
@@ -730,6 +806,9 @@ u64 Scheduler::SubmitAscSegment() {
 void Scheduler::AscSubmitOnWorker(u64 value, u64 wait_main) {
     if (!asc_cmdbuf) {
         BeginAscCmdbufOnWorker(); // An empty segment still signals its value.
+    }
+    if (asc_timer) {
+        AscTimerEnd(value);
     }
     Check(asc_cmdbuf.end());
     const vk::Semaphore wait_sema = master_semaphore.Handle();
