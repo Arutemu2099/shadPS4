@@ -177,6 +177,63 @@ bool IbTaskFree() {
     return enabled;
 }
 
+/// SHADPS4_ASC_YIELD=1: the graphics task yields to the round-robin at the next packet boundary
+/// when the guest submitted async-compute work since it last looked. On GCN the ACEs parse and
+/// run compute queues beside the graphics CP; the emulator's front otherwise parses a whole
+/// graphics submission (thousands of draws, at back-thread speed) before an ASC submission gets a
+/// turn, unless the graphics stream blocks on a wait. Second Son submits its particle compute and
+/// reads the results in the same frame (REFERENCE 4.2 0x29c8d0), so that delay lands on Game:Main.
+/// Only the interleaving changes, and the graphics task already yields mid-stream at unsatisfied
+/// WAIT_REG_MEM / MEM_SEMAPHORE / REWIND; the round-robin resumes it with the task guards as there.
+bool AscYield() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_ASC_YIELD");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
+/// SHADPS4_ASC_START_STATS=1 (diagnostic): time from SubmitAsc to the first run of that buffer's
+/// task, and the number of ASC_YIELD yields; logged every 2,000 ASC submissions.
+bool AscStartStats() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_ASC_START_STATS");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
+u64 AscNowNs() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+
+struct AscStartCounters {
+    u64 starts = 0, total_ns = 0, max_ns = 0, over_1ms = 0, yields = 0;
+    std::array<u64, 6> hist{}; ///< <50 us, <200 us, <500 us, <1 ms, <3 ms, >=3 ms
+};
+AscStartCounters g_asc_start; // front thread only
+
+void NoteAscStart(u64 submit_ns) {
+    auto& c = g_asc_start;
+    const u64 now = AscNowNs();
+    const u64 ns = now > submit_ns ? now - submit_ns : 0;
+    ++c.starts;
+    c.total_ns += ns;
+    c.max_ns = std::max(c.max_ns, ns);
+    const u64 us = ns / 1000;
+    ++c.hist[us < 50 ? 0 : us < 200 ? 1 : us < 500 ? 2 : us < 1000 ? 3 : us < 3000 ? 4 : 5];
+    if (c.starts % 2000 == 0) {
+        LOG_INFO(Render, "AscStart: starts={} mean_us={:.1f} max_us={:.1f} gfx_yields={} "
+                         "hist[<50,<200,<500,<1000,<3000,>=3000 us]={}/{}/{}/{}/{}/{}",
+                 c.starts, double(c.total_ns) / double(c.starts) / 1000.0,
+                 double(c.max_ns) / 1000.0, c.yields, c.hist[0], c.hist[1], c.hist[2],
+                 c.hist[3], c.hist[4], c.hist[5]);
+        c = AscStartCounters{};
+    }
+}
+
 void PrefetchProgram(const ShaderProgram& program) {
     const auto* code = program.Address<const char*>();
     if (!code) {
@@ -2096,8 +2153,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     const bool guest_markers_enabled = rasterizer && EmulatorSettings.IsVkGuestMarkersEnabled();
 
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
+    const bool asc_yield = AscYield();
     while (!dcb.empty()) {
         ProcessCommands();
+
+        if (asc_yield) {
+            const u64 seq = asc_submit_seq.load(std::memory_order_acquire);
+            if (seq != gfx_seen_asc_seq) {
+                gfx_seen_asc_seq = seq;
+                ++g_asc_start.yields;
+                YIELD_GFX();
+            }
+        }
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;
@@ -2879,6 +2946,21 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     // RELEASE_MEM, MEM_SEMAPHORE and WAIT_REG_MEM stay synchronous.
     if constexpr (!is_indirect) {
         BumpEpoch(PM4ItOpcode::Nop);
+        if (AscStartStats()) [[unlikely]] {
+            u64 submit_ns = 0;
+            {
+                auto& mq = mapped_queues[vqid + 1];
+                std::scoped_lock lock{mq.m_access};
+                auto& times = asc_submit_ns[vqid + 1];
+                if (!times.empty()) {
+                    submit_ns = times.front();
+                    times.pop_front();
+                }
+            }
+            if (submit_ns != 0) {
+                NoteAscStart(submit_ns);
+            }
+        }
     }
     SplitSpanScope split_span{*this, &acb,
                               is_indirect ? CpSplit::DrainReason::TaskGuardIb
@@ -3349,11 +3431,15 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
+        if (AscStartStats()) [[unlikely]] {
+            asc_submit_ns[gnm_vqid].push_back(AscNowNs());
+        }
     }
 
     std::scoped_lock lk{submit_mutex};
     num_mapped_queues = std::max(num_mapped_queues, gnm_vqid + 1);
     ++num_submits;
+    asc_submit_seq.fetch_add(1, std::memory_order_release);
     submit_cv.notify_one();
 }
 

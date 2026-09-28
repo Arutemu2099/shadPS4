@@ -12,6 +12,8 @@
 #include <thread>
 #include <vector>
 #include <queue>
+#include <array>
+#include <deque>
 
 #include "common/assert.h"
 #include "common/slot_vector.h"
@@ -401,6 +403,12 @@ private:
     /// POST_TASK_DONE: submissions the front finished whose Retire record the back has not run.
     std::atomic<u32> pending_retire{};
     std::atomic<u32> num_commands{};
+    /// SHADPS4_ASC_YIELD: bumped by SubmitAsc; the graphics task yields when it changed.
+    std::atomic<u64> asc_submit_seq{};
+    u64 gfx_seen_asc_seq{};
+    /// SHADPS4_ASC_START_STATS: submit times of queued top-level ASC buffers per mapped queue
+    /// (under that queue's m_access), consumed when the buffer's task first runs.
+    std::array<std::deque<u64>, NumTotalQueues> asc_submit_ns{};
     std::atomic<bool> submit_done{};
     std::mutex submit_mutex;
     std::condition_variable_any submit_cv;
