@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdlib>
 #include <ctime>
+#include <mutex>
 #include <vector>
 #include <string>
 #include <thread>
@@ -292,7 +293,64 @@ const CpuClasses& GetCpuClasses() {
     }();
     return classes;
 }
+
+// Whole performance cores handed to single threads (SHADPS4_CP_QOS=3, SHADPS4_HOT_CORES): the
+// process default CPU set is everything except the reserved cores (both logical processors).
+std::mutex g_reserved_mutex;
+std::array<bool, 64> g_reserved_core{}; // by CoreIndex, performance cores only
+
+/// Gives the calling thread the `rank`-th performance core counted from the last one (0 = last)
+/// and keeps the rest of the process off it. `first` receives its first logical processor.
+bool ReservePerformanceCore(int rank, int& first, size_t& others_count) {
+    const auto& c = GetCpuClasses();
+    std::vector<int> firsts;
+    for (size_t i = 0; i < c.count; ++i) {
+        if (c.cls[i] == c.max_class &&
+            (i == 0 || c.core[i - 1] != c.core[i] || c.cls[i - 1] != c.max_class)) {
+            firsts.push_back(int(i));
+        }
+    }
+    first = -1;
+    if (rank < 0 || size_t(rank) >= firsts.size()) {
+        return false;
+    }
+    first = firsts[firsts.size() - 1 - size_t(rank)];
+    std::scoped_lock lock{g_reserved_mutex};
+    g_reserved_core[c.core[first]] = true;
+    std::vector<ULONG> others;
+    for (size_t i = 0; i < c.count; ++i) {
+        if (!(c.cls[i] == c.max_class && g_reserved_core[c.core[i]])) {
+            others.push_back(c.ids[i]);
+        }
+    }
+    others_count = others.size();
+    const ULONG mine = c.ids[first];
+    return SetProcessDefaultCpuSets(GetCurrentProcess(), others.data(), ULONG(others.size())) &&
+           SetThreadSelectedCpuSets(GetCurrentThread(), &mine, 1);
+}
 } // namespace
+
+void ApplyHotThreadPlacement(HotThread which) {
+    static const unsigned mask = [] {
+        const char* value = std::getenv("SHADPS4_HOT_CORES");
+        return value ? static_cast<unsigned>(std::strtoul(value, nullptr, 0)) : 0u;
+    }();
+    const unsigned bit = which == HotThread::Recorder ? 1u : 2u;
+    if ((mask & bit) == 0) {
+        return;
+    }
+    THREAD_POWER_THROTTLING_STATE throttling{};
+    throttling.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+    throttling.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+    throttling.StateMask = 0;
+    SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &throttling,
+                         sizeof(throttling));
+    int first = -1;
+    size_t others = 0;
+    const bool ok = ReservePerformanceCore(which == HotThread::Recorder ? 1 : 2, first, others);
+    LOG_INFO(Common, "SHADPS4_HOT_CORES={}: {} on logical {}, {} logical for the rest, ok {}", mask,
+             which == HotThread::Recorder ? "recorder" : "front", first, others, ok);
+}
 
 void ApplyCommandProcessorPlacement() {
     const char* value = std::getenv("SHADPS4_CP_QOS");
@@ -318,32 +376,11 @@ void ApplyCommandProcessorPlacement() {
     if (mode == 3) {
         // A whole P-core for this thread: the last performance core's first logical processor
         // for us, and every other thread (process default) kept off both of its siblings.
-        const auto& c = GetCpuClasses();
-        int chosen = -1;
-        for (size_t i = 0; i < c.count; ++i) {
-            if (c.cls[i] == c.max_class) {
-                chosen = int(i);
-            }
-        }
-        if (chosen >= 0) {
-            const u8 core = c.core[chosen];
-            int first = chosen;
-            while (first > 0 && c.core[first - 1] == core && c.cls[first - 1] == c.max_class) {
-                --first;
-            }
-            std::vector<ULONG> others;
-            for (size_t i = 0; i < c.count; ++i) {
-                if (c.core[i] != core || c.cls[i] != c.cls[first]) {
-                    others.push_back(c.ids[i]);
-                }
-            }
-            const ULONG mine = c.ids[first];
-            sets_ok = SetProcessDefaultCpuSets(GetCurrentProcess(), others.data(),
-                                               ULONG(others.size())) &&
-                      SetThreadSelectedCpuSets(GetCurrentThread(), &mine, 1);
-            p_cores = others.size();
+        int first = -1;
+        sets_ok = ReservePerformanceCore(0, first, p_cores);
+        if (first >= 0) {
             LOG_INFO(Common, "SHADPS4_CP_QOS=3: CP on logical {} (core {}), {} logical for the rest",
-                     first, core, others.size());
+                     first, GetCpuClasses().core[first], p_cores);
         }
     } else if (mode >= 2) {
         const auto& c = GetCpuClasses();
@@ -435,6 +472,36 @@ __declspec(noinline) u32 ClockProbeTicks() {
     }
     return static_cast<u32>(std::min<u64>(best, 0xffffffffULL));
 }
+
+/// Busy share of every logical processor since the previous call (whole machine, all
+/// processes), from the kernel's per-processor idle times. One caller only (the CP back).
+std::string LogicalProcessorLoad() {
+    struct ProcessorPerf {
+        LARGE_INTEGER idle, kernel, user, dpc, interrupt;
+        ULONG interrupts;
+    };
+    using QueryFn = LONG(__stdcall*)(ULONG, PVOID, ULONG, PULONG);
+    static const QueryFn query = reinterpret_cast<QueryFn>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation"));
+    static std::array<ProcessorPerf, 64> last{};
+    std::array<ProcessorPerf, 64> now{};
+    ULONG bytes = 0;
+    // 8 = SystemProcessorPerformanceInformation
+    if (!query || query(8, now.data(), ULONG(sizeof(now)), &bytes) < 0) {
+        return {};
+    }
+    const size_t count = bytes / sizeof(ProcessorPerf);
+    std::string out;
+    for (size_t i = 0; i < count; ++i) {
+        // kernel time includes idle time
+        const double total = double((now[i].kernel.QuadPart - last[i].kernel.QuadPart) +
+                                    (now[i].user.QuadPart - last[i].user.QuadPart));
+        const double idle = double(now[i].idle.QuadPart - last[i].idle.QuadPart);
+        out += fmt::format(" {}:{:.0f}", i, total > 0 ? 100.0 * (total - idle) / total : 0.0);
+    }
+    last = now;
+    return out;
+}
 } // namespace
 
 void SampleThreadPlacement(const char* role, unsigned stride_log2) {
@@ -500,6 +567,10 @@ void SampleThreadPlacement(const char* role, unsigned stride_log2) {
              role, wall_s, cpu_s, 100.0 * cpu_s / std::max(wall_s, 1e-9), st.samples,
              st.migrations, probe_med, probe_min, st.num_probes, ghz(probe_med), ghz(probe_min),
              double(st.tsc_per_s) * 1e-6, top);
+    if (role[0] == 'b') {
+        LOG_INFO(Common, "ThreadStats: logical processor busy % (all processes):{}",
+                 LogicalProcessorLoad());
+    }
     st.hits.fill(0);
     st.samples = 0;
     st.migrations = 0;
@@ -510,6 +581,7 @@ void SampleThreadPlacement(const char* role, unsigned stride_log2) {
 }
 #else
 void ApplyCommandProcessorPlacement() {}
+void ApplyHotThreadPlacement(HotThread) {}
 void SampleCommandProcessorCore() {}
 void SampleThreadPlacement(const char*, unsigned) {}
 #endif

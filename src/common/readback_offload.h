@@ -178,6 +178,14 @@ struct Counters {
     std::atomic<u64> next_log_ns{};
 };
 
+/// Always on (at most three relaxed increments per fault job): which fault-service regime a
+/// run is in (5 vs thousands of sequence vetoes per run were seen on 2026-09-30). Logged
+/// cumulatively next to the CpSplit window line.
+struct RegimeCounters {
+    std::atomic<u64> jobs{}, seq_vetoes{}, sync_fallbacks{};
+};
+inline RegimeCounters g_regime;
+
 inline Counters& State() {
     static Counters counters;
     return counters;

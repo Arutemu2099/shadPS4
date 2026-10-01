@@ -1267,6 +1267,7 @@ void Liverpool::Process(std::stop_token stoken) {
 void Liverpool::FrontProcess(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandFront");
     CpSplit::t_is_front = true;
+    Common::ApplyHotThreadPlacement(Common::HotThread::Front);
     // SPLIT-TODO: placement. ApplyCommandProcessorPlacement pins the back; the front wants its
     // own P-core (with the recording worker and Game:Main, 4 hot threads on 6 P-cores).
     ProcessLoop(stoken);

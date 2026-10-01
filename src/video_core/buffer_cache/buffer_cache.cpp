@@ -1432,11 +1432,13 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
         ReleaseFaultStaging(std::move(staging)); // Never submitted or host-consumed.
         Offload::Add(Offload::State().mapping_fallbacks);
         Offload::Add(Offload::State().sync_fallbacks);
+        Offload::g_regime.sync_fallbacks.fetch_add(1, std::memory_order_relaxed);
         ResolveFaultSync(device_addr, size, is_write, Offload::Origin::Guest);
         return {};
     }
     const vk::Buffer staging_handle = job->staging->Handle();
     Offload::Add(Offload::State().jobs);
+    Offload::g_regime.jobs.fetch_add(1, std::memory_order_relaxed);
     if (is_write) {
         Offload::Add(Offload::State().write_jobs);
     }
@@ -2410,6 +2412,7 @@ bool BufferCache::FinishFaultDownload(u64 id, VAddr device_addr, u64 size, bool 
         // Exactly one synchronous fallback per vetoed job (after SHADPS4_FAULT_VETO_RETRY's
         // asynchronous attempts, if any).
         Offload::Add(Offload::State().sync_fallbacks);
+        Offload::g_regime.sync_fallbacks.fetch_add(1, std::memory_order_relaxed);
         ResolveFaultSync(device_addr, size, is_write, Offload::Origin::Guest);
     }
     return false;
@@ -2487,6 +2490,7 @@ bool BufferCache::PublishFaultJob(FaultJob& job) {
     // fault or submit, so no GPU write marking lands between the vote and the clears.
     if (!memory_tracker->GpuWriteSeqMatches(job.addr, job.size, job.seqs)) {
         Offload::Add(Offload::State().seq_vetoes);
+        Offload::g_regime.seq_vetoes.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
     // Compare BEFORE subtracting: on a mismatch the sync fallback must find the ranges.
@@ -2541,6 +2545,7 @@ BufferCache::VerifyResult BufferCache::VerifyFaultJob(FaultJob& job) {
         // Differing bytes are expected, so nothing is compared. The veto PublishFaultJob
         // would have cast is counted here, since it is no longer reached.
         Offload::Add(Offload::State().seq_vetoes);
+        Offload::g_regime.seq_vetoes.fetch_add(1, std::memory_order_relaxed);
         return VerifyResult::Unverified;
     }
     // Look the buffers up without creating or merging anything. The source of each copy has to
@@ -2591,6 +2596,7 @@ BufferCache::VerifyResult BufferCache::VerifyFaultJob(FaultJob& job) {
     // then vetoed by the same vote in PublishFaultJob's place.
     if (!memory_tracker->GpuWriteSeqMatches(job.addr, job.size, job.seqs)) {
         Offload::Add(Offload::State().seq_vetoes);
+        Offload::g_regime.seq_vetoes.fetch_add(1, std::memory_order_relaxed);
     } else {
         for (const Buffer* staging : {second.get(), job.staging.get()}) {
             if (!staging->is_coherent) {

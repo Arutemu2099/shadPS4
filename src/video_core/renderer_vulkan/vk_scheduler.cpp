@@ -46,7 +46,10 @@ Scheduler::Scheduler(const Instance& instance, bool allow_recording_worker)
         recording_measure_timing = timing && std::string_view{timing} == "1";
         recording_worker =
             std::make_unique<Common::CommandRecordingWorker<>>(recording_measure_timing);
-        recording_worker->Record([] { Common::SetCurrentThreadName("shadPS4:VkRecorder"); });
+        recording_worker->Record([] {
+            Common::SetCurrentThreadName("shadPS4:VkRecorder");
+            Common::ApplyHotThreadPlacement(Common::HotThread::Recorder);
+        });
         Common::CommandRecordingWorker<>::SetChunkHook(
             [] { Common::SampleThreadPlacement("recorder", 2); });
         LOG_INFO(Render_Vulkan, "AsyncRecording: enabled, ordered primary command worker, {} chunks",

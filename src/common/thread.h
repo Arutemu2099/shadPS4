@@ -53,6 +53,13 @@ std::string GetCurrentThreadName();
 /// THREAD_PRIORITY_HIGHEST; =2 additionally restricts it to the performance cores (highest CPU
 /// set efficiency class). Default off. Windows only; call on the thread itself.
 void ApplyCommandProcessorPlacement();
+/// SHADPS4_HOT_CORES=<mask> (default 0): bit 0 gives the Vulkan recording worker, bit 1 the CP
+/// front thread a whole performance core each (the two before the one SHADPS4_CP_QOS=3 gives the
+/// CP back); the rest of the process is kept off those cores. Measured 2026-10-01 without it: the
+/// recorder (80-87% busy) changes logical processor at ~20% of its chunk boundaries and spends
+/// 2-15% of them on efficiency cores. Windows only; call on the thread itself.
+enum class HotThread { Recorder, Front };
+void ApplyHotThreadPlacement(HotThread which);
 /// SHADPS4_CP_CORE_STATS=1: sample the logical CPU this thread runs on (call often, it is cheap)
 /// and periodically log the share on performance vs efficiency cores. Diagnostic only.
 void SampleCommandProcessorCore();

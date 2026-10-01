@@ -11,6 +11,7 @@
 #include <fmt/format.h>
 
 #include "common/logging/log.h"
+#include "common/readback_offload.h"
 #include "video_core/amdgpu/cp_split.h"
 
 namespace AmdGpu::CpSplit {
@@ -583,6 +584,13 @@ void Channel::MaybeLog() {
              c.posted[static_cast<u32>(PostKind::AscDispatch)],
              c.posted[static_cast<u32>(PostKind::AscPacket)],
              c.posted[static_cast<u32>(PostKind::Fence)]);
+    {
+        const auto& r = Common::ReadbackOffload::g_regime;
+        LOG_INFO(Render, "FaultRegime: jobs={} seq_vetoes={} sync_fallbacks={} (cumulative)",
+                 r.jobs.load(std::memory_order_relaxed),
+                 r.seq_vetoes.load(std::memory_order_relaxed),
+                 r.sync_fallbacks.load(std::memory_order_relaxed));
+    }
     std::string guard_checks;
     for (u32 r = 0; r < NumDrainReasons; ++r) {
         if (c.guard_checks[r] != 0) {
