@@ -40,7 +40,41 @@ thread_local u64 g_refresh_lock_cyc = 0;
 } // namespace
 
 static constexpr u64 PageShift = 12;
+// Counted in AgeTick() units: submissions, not frames (the name is upstream's).
 static constexpr u64 NumFramesBeforeRemoval = 32;
+
+namespace {
+bool EnvIs(const char* name, char value, bool fallback) {
+    const char* env = std::getenv(name);
+    return env ? env[0] == value : fallback;
+}
+// A rare-event log: the first `first` occurrences, then every 256th.
+bool RareLog(u32& counter, u32 first = 96) {
+    const u32 n = counter++;
+    return n < first || (n & 255) == 0;
+}
+} // namespace
+
+u64 TextureCache::AgeTick() const {
+    static const bool raw = EnvIs("SHADPS4_TEX_AGE_RAW", '1', false);
+    return raw ? scheduler.CurrentTick() : scheduler.CurrentTick() - scheduler.CadenceFlushes();
+}
+
+bool TextureCache::MetaUsedByOtherImage(VAddr meta_addr, VAddr guest_address, u64 guest_size) {
+    bool used = false;
+    ForEachPage(guest_address, guest_size, [&](u64 page) {
+        const auto it = page_table.find(page);
+        if (it == nullptr) {
+            return;
+        }
+        for (const ImageId other_id : *it) {
+            const auto& meta = slot_images[other_id].info.meta_info;
+            used |= meta.cmask_addr == meta_addr || meta.fmask_addr == meta_addr ||
+                    meta.htile_addr == meta_addr;
+        }
+    });
+    return used;
+}
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            AmdGpu::Liverpool* liverpool_, BufferCache& buffer_cache_,
@@ -605,7 +639,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                                                            ImageId merged_image_id) {
     auto& cache_image = slot_images[cache_image_id];
     const bool safe_to_delete =
-        scheduler.CurrentTick() - cache_image.tick_accessed_last > NumFramesBeforeRemoval;
+        AgeTick() - cache_image.tick_accessed_last > NumFramesBeforeRemoval;
 
     // Equal address
     if (image_info.guest_address == cache_image.info.guest_address) {
@@ -762,8 +796,8 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                   static_cast<s64>(image_info.guest_size) - static_cast<s64>(expected_size),
                   (static_cast<double>(image_info.guest_size) / expected_size - 1.0) * 100.0,
 
-                  merged_image_id.index, static_cast<int>(binding), scheduler.CurrentTick(),
-                  scheduler.CurrentTick() - cache_image.tick_accessed_last);
+                  merged_image_id.index, static_cast<int>(binding), AgeTick(),
+                  AgeTick() - cache_image.tick_accessed_last);
 
         UNREACHABLE_MSG("Encountered unresolvable image overlap with equal memory address.");
     }
@@ -970,7 +1004,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
 
     Image& image = slot_images[image_id];
-    image.tick_accessed_last = scheduler.CurrentTick();
+    image.tick_accessed_last = AgeTick();
     TouchImage(image);
 
     // If the image requested is a subresource of the image from cache record its location.
@@ -1108,7 +1142,7 @@ ImageId TextureCache::FindImageLockFree(const ImageDesc& desc, bool exact_fmt) {
                 std::atomic_ref<ImageFlagBits>{image.flags}.load(std::memory_order_relaxed);
             if (memo->uid && image.image_uid == memo->uid &&
                 True(flags & ImageFlagBits::Registered) && False(flags & ImageFlagBits::Picked)) {
-                image.tick_accessed_last = scheduler.CurrentTick();
+                image.tick_accessed_last = AgeTick();
                 TouchImage(image);
                 ++prepared_images->calls;
                 ++prepared_images->hits;
@@ -1254,12 +1288,23 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 
     // Register meta data for this depth buffer
     if (desc.info.meta_info.htile_addr) {
-        meta_clear_epoch +=
+        const bool created =
             surface_metas
                 .emplace(desc.info.meta_info.htile_addr,
                          MetaDataInfo{.type = MetaDataInfo::Type::HTile,
                                       .clear_mask = image.info.meta_info.htile_clear_mask})
                 .second;
+        meta_clear_epoch += created;
+        static u32 logged = 0;
+        if (created && RareLog(logged)) {
+            // A new entry of an image that has been drawn to before is the Tower-save bug.
+            LOG_INFO(Render_Vulkan,
+                     "MetaNew: htile {:#x} for image {}x{} {} at {:#x} clear_mask={:#x} "
+                     "raw_tick={}",
+                     desc.info.meta_info.htile_addr, image.info.size.width, image.info.size.height,
+                     vk::to_string(image.info.pixel_format), image.info.guest_address,
+                     u32(image.info.meta_info.htile_clear_mask), scheduler.CurrentTick());
+        }
         image.info.meta_info.htile_addr = desc.info.meta_info.htile_addr;
     }
 
@@ -1527,7 +1572,7 @@ bool TextureCache::IsPerfectMatch(const ImageInfo& info, ImageId id) {
 }
 
 void TextureCache::TouchImageAccess(Image& image) {
-    image.tick_accessed_last = scheduler.CurrentTick();
+    image.tick_accessed_last = AgeTick();
     TouchImage(image);
 }
 
@@ -1889,17 +1934,40 @@ void TextureCache::DeleteImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered), "Image was not unregistered");
     InvalidatePreparedImages();
 
-    // Remove any registered meta areas.
+    // Remove any registered meta areas - unless another registered image still uses the same
+    // metadata address. Images that alias the same guest memory share it (Second Son renders a
+    // 768x768 depth target at the main depth buffer's address); erasing the entry under the
+    // surviving image made its next FindDepthTarget re-create the entry with every slice
+    // "cleared", i.e. a depth clear in the middle of a frame (seen 2026-10-01, Tower save, once
+    // SHADPS4_FLUSH_EVERY_OPS made ResolveOverlap evict images within a frame).
+    // SHADPS4_META_SHARED_KEEP=0 restores the unconditional erase. This image is already
+    // unregistered, so the page table holds only the others.
+    static const bool shared_keep = EnvIs("SHADPS4_META_SHARED_KEEP", '0', false) == false;
     const auto& meta_info = image.info.meta_info;
-    if (meta_info.cmask_addr) {
-        surface_metas.erase(meta_info.cmask_addr);
-    }
-    if (meta_info.fmask_addr) {
-        surface_metas.erase(meta_info.fmask_addr);
-    }
-    if (meta_info.htile_addr) {
-        surface_metas.erase(meta_info.htile_addr);
-    }
+    const auto erase_meta = [&](VAddr meta_addr, const char* kind) {
+        if (!meta_addr || !surface_metas.contains(meta_addr)) {
+            return;
+        }
+        const bool shared =
+            MetaUsedByOtherImage(meta_addr, image.info.guest_address, image.info.guest_size);
+        const bool keep = shared && shared_keep;
+        static u32 logged = 0;
+        if (shared || RareLog(logged)) {
+            LOG_INFO(Render_Vulkan,
+                     "MetaErase: {} {:#x} by image {}x{} {} at {:#x}:{:#x} age={} raw_tick={} "
+                     "shared={} kept={}",
+                     kind, meta_addr, image.info.size.width, image.info.size.height,
+                     vk::to_string(image.info.pixel_format), image.info.guest_address,
+                     image.info.guest_size, AgeTick() - image.tick_accessed_last,
+                     scheduler.CurrentTick(), shared, keep);
+        }
+        if (!keep) {
+            surface_metas.erase(meta_addr);
+        }
+    };
+    erase_meta(meta_info.cmask_addr, "cmask");
+    erase_meta(meta_info.fmask_addr, "fmask");
+    erase_meta(meta_info.htile_addr, "htile");
 
     {
         std::unique_lock lk{download_images_mutex};

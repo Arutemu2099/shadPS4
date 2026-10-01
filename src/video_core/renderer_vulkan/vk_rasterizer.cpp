@@ -597,6 +597,7 @@ static void MaybeFlushEveryOps(Scheduler& scheduler) {
         return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0u;
     }();
     if (flush_every_ops != 0 && scheduler.BatchOps() >= flush_every_ops) {
+        scheduler.NoteCadenceFlush();
         scheduler.Flush();
     }
 }
@@ -1773,6 +1774,7 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
         static thread_local u32 draws_since_flush = 0;
         if (++draws_since_flush >= flush_every_draws) {
             draws_since_flush = 0;
+            scheduler.NoteCadenceFlush();
             scheduler.Flush();
         }
     }
@@ -1781,6 +1783,7 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     if (buffer_cache.TakeReadbackFlushRequest()) {
         static thread_local u32 early_flushes = 0;
         ++early_flushes;
+        scheduler.NoteCadenceFlush();
         scheduler.Flush();
     }
     MaybeFlushEveryOps(scheduler);

@@ -442,6 +442,16 @@ private:
     /// Removes the image and any views/surface metas that reference it.
     void DeleteImage(ImageId image_id);
 
+    /// Clock of Image::tick_accessed_last and of ResolveOverlap's "safe to delete" age: the
+    /// scheduler tick minus the cadence-only submissions (Scheduler::NoteCadenceFlush), so the
+    /// eviction age does not shrink when batches are submitted more often.
+    /// SHADPS4_TEX_AGE_RAW=1 restores the plain scheduler tick.
+    u64 AgeTick() const;
+
+    /// True if another registered image over [guest_address, +guest_size) uses `meta_addr` as
+    /// one of its metadata surfaces (images that alias the same guest memory share them).
+    bool MetaUsedByOtherImage(VAddr meta_addr, VAddr guest_address, u64 guest_size);
+
     /// Touch the image in the LRU cache.
     void TouchImage(const Image& image);
 

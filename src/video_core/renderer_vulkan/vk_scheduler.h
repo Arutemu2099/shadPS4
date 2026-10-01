@@ -722,6 +722,16 @@ public:
     [[nodiscard]] u32 BatchOps() const noexcept {
         return batch_ops;
     }
+    /// Submissions made only to shorten GPU batches (SHADPS4_FLUSH_EVERY_OPS / _DRAWS, the
+    /// readback early flush), counted by their callers just before Flush(). The texture cache
+    /// subtracts them from its age clock (TextureCache::AgeTick): its overlap eviction counts
+    /// submissions since an image's last use, and these multiply the submissions per frame.
+    void NoteCadenceFlush() noexcept {
+        ++cadence_flushes;
+    }
+    [[nodiscard]] u64 CadenceFlushes() const noexcept {
+        return cadence_flushes;
+    }
     [[nodiscard]] u32 LastBatchDraws() const noexcept {
         return last_batch_draws;
     }
@@ -866,6 +876,7 @@ private:
 
     u32 last_batch_draws = 0;
     u32 batch_ops = 0;
+    u64 cadence_flushes = 0;
     MasterSemaphore master_semaphore;
     CommandPool command_pool;
     DynamicState dynamic_state;
