@@ -29,6 +29,8 @@
 #include "video_core/texture_cache/texture_cache.h"
 
 #include <vk_mem_alloc.h>
+#include <xxhash.h>
+#include "video_core/buffer_cache/protect_queue.h"
 
 namespace VideoCore {
 
@@ -72,6 +74,59 @@ const bool g_async_submit = EnvIs1("SHADPS4_ASYNC_SUBMIT");
 /// and how many transfer ops follow another transfer with nothing recorded in between (barrier
 /// coalescing potential). Each transfer op records its own barrier pair today.
 const bool g_upload_ahead_stats = EnvIs1("SHADPS4_UPLOAD_AHEAD_STATS");
+/// SHADPS4_DEFERRED_COPY_CENSUS=1 (diagnostic): with DEFERRED_PROTECT the guest -> staging copy
+/// of an upload runs on the recording thread, later than the command processor recorded it, and
+/// guest labels are written at CP time. Counts deferred copies whose guest bytes changed between
+/// record time and copy time, and how many of those had a guest label written in between (the
+/// guest was told the GPU was done and may have reused the memory). Opus review 2026-09-30.
+const bool g_deferred_copy_census = EnvIs1("SHADPS4_DEFERRED_COPY_CENSUS");
+
+struct DeferredCopyCensus {
+    std::atomic<u64> copies{0}, bytes{0}, unreadable{0}, changed{0}, after_label{0},
+        changed_after_label{0}, changed_bytes_after_label{0}, max_label_lag{0};
+};
+DeferredCopyCensus g_dcc;
+
+/// Recording thread, right after the guest -> staging copy of `dest`.
+void NoteDeferredCopyCensus(VAddr addr, const u8* dest, u64 size, u64 hash, u64 label_seq) {
+    auto& c = g_dcc;
+    const u64 n = c.copies.fetch_add(1, std::memory_order_relaxed) + 1;
+    c.bytes.fetch_add(size, std::memory_order_relaxed);
+    if (label_seq == ~0ULL) {
+        c.unreadable.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        const u64 now_seq = VideoCore::g_guest_label_seq.load(std::memory_order_relaxed);
+        const bool after = now_seq != label_seq;
+        const bool changed = XXH3_64bits(dest, size) != hash;
+        c.after_label.fetch_add(after, std::memory_order_relaxed);
+        c.changed.fetch_add(changed, std::memory_order_relaxed);
+        if (after) {
+            u64 lag = now_seq - label_seq;
+            u64 prev = c.max_label_lag.load(std::memory_order_relaxed);
+            while (lag > prev && !c.max_label_lag.compare_exchange_weak(prev, lag)) {
+            }
+        }
+        if (after && changed) {
+            const u64 k = c.changed_after_label.fetch_add(1, std::memory_order_relaxed) + 1;
+            c.changed_bytes_after_label.fetch_add(size, std::memory_order_relaxed);
+            if (k <= 24) {
+                LOG_WARNING(Render,
+                            "DeferredCopyCensus: guest bytes changed after a label: {:#x}+{:#x} "
+                            "(labels between record and copy: {})",
+                            addr, size, now_seq - label_seq);
+            }
+        }
+    }
+    if ((n & 0x3ffff) == 0) {
+        LOG_INFO(Render,
+                 "DeferredCopyCensus: copies={} bytes={} unreadable={} changed={} "
+                 "copied_after_label={} changed_after_label={} changed_bytes_after_label={} "
+                 "max_labels_between={}",
+                 n, c.bytes.load(), c.unreadable.load(), c.changed.load(), c.after_label.load(),
+                 c.changed_after_label.load(), c.changed_bytes_after_label.load(),
+                 c.max_label_lag.load());
+    }
+}
 /// SHADPS4_UPLOAD_AHEAD=<pages> (notes/transfer-serialization-2026-09-28.md): after a small
 /// upload (<= 16 KiB), also upload the CPU-dirty pages among the next <pages> tracker pages of the
 /// same Buffer, as a later binding of them would. Fire's particle dispatches each bind a fresh
@@ -955,7 +1010,7 @@ bool BufferCache::DownloadWindowMultiBuffer(VAddr window_addr, u64 window_size) 
                 gpu_modified_ranges.Subtract(range_addr, range_size);
                 MemoryTracker::gpu_clear_epoch.fetch_add(1, std::memory_order_acq_rel);
                 Common::FaultMonitor::CountRangeSubtract(
-                    gpu_modified_ranges.m_ranges_set.iterative_size());
+                    gpu_modified_ranges.Fragments());
             });
     });
     if (total_size_bytes == 0) {
@@ -2400,7 +2455,7 @@ bool BufferCache::PublishFaultJob(FaultJob& job) {
             lo, hi - lo, [&](u64 device_addr_out, u64 range_size) {
                 gpu_modified_ranges.Subtract(device_addr_out, range_size); MemoryTracker::gpu_clear_epoch.fetch_add(1, std::memory_order_acq_rel);
                 Common::FaultMonitor::CountRangeSubtract(
-                    gpu_modified_ranges.m_ranges_set.iterative_size());
+                    gpu_modified_ranges.Fragments());
             });
     }
     if (!job.staging->is_coherent) {
@@ -2576,7 +2631,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
             gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, add_download);
             gpu_modified_ranges.Subtract(device_addr_out, range_size); MemoryTracker::gpu_clear_epoch.fetch_add(1, std::memory_order_acq_rel);
             Common::FaultMonitor::CountRangeSubtract(
-                gpu_modified_ranges.m_ranges_set.iterative_size());
+                gpu_modified_ranges.Fragments());
         });
     if (total_size_bytes == 0) {
         return false;
@@ -2889,7 +2944,7 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         SynchronizeBuffer(buffer, dst, num_bytes, true, true, nullptr);
         NoteGpuWrite(dst, num_bytes);
         AddGpuModified(gpu_modified_ranges, dst, num_bytes);
-        Common::FaultMonitor::CountRangeAdd(gpu_modified_ranges.m_ranges_set.iterative_size());
+        Common::FaultMonitor::CountRangeAdd(gpu_modified_ranges.Fragments());
         return buffer;
     }();
     src_buffer.NoteMainAccess(scheduler.CurrentTick(), false);
@@ -3188,7 +3243,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             }
             run_verify = true;
             run_bytes_before = sync_upload_bytes_total;
-            run_ranges_before = gpu_modified_ranges.m_ranges_set.iterative_size();
+            run_ranges_before = gpu_modified_ranges.Fragments();
         }
     }
     // SHADPS4_WRITTEN_MEMO=1: a GPU-written binding of exactly this range was fully synchronized
@@ -3269,19 +3324,19 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         if (sample) {
             sample->AddRangeAddNs(sample->SinceNs(t_range_add));
         }
-        Common::FaultMonitor::CountRangeAdd(gpu_modified_ranges.m_ranges_set.iterative_size());
+        Common::FaultMonitor::CountRangeAdd(gpu_modified_ranges.Fragments());
     }
     if (run_entry) {
         // SHADPS4_WRITTEN_RUN_MEMO=2: a hit must have uploaded nothing and added no new interval.
         if (run_verify &&
             (sync_upload_bytes_total != run_bytes_before ||
-             gpu_modified_ranges.m_ranges_set.iterative_size() != run_ranges_before)) {
+             gpu_modified_ranges.Fragments() != run_ranges_before)) {
             if (++written_run_stats[7] <= 20) {
                 LOG_ERROR(Render,
                           "WrittenRunMemo verify: hit at {:#x}+{:#x} uploaded {} bytes, ranges "
                           "{} -> {}",
                           device_addr, size, sync_upload_bytes_total - run_bytes_before,
-                          run_ranges_before, gpu_modified_ranges.m_ranges_set.iterative_size());
+                          run_ranges_before, gpu_modified_ranges.Fragments());
             }
         }
         // Values read before the full run: a change during it misses next time.
@@ -4015,6 +4070,10 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                         if (!memory->TryReadBacking(copy.addr, copy.dest, copy.size)) {
                             memory->CopySparseMemory(copy.addr, copy.dest, copy.size);
                         }
+                        if (g_deferred_copy_census) [[unlikely]] {
+                            NoteDeferredCopyCensus(copy.addr, copy.dest, copy.size, copy.hash,
+                                                   copy.label_seq);
+                        }
                     }
                     sched->BeginTransferOnWorker(cmdbuf, {}, write);
                     cmdbuf.copyBuffer(src_buffer, destination, owned_copies);
@@ -4033,6 +4092,10 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                     for (const DeferredCopy& copy : cpu_copies) {
                         if (!memory->TryReadBacking(copy.addr, copy.dest, copy.size)) {
                             memory->CopySparseMemory(copy.addr, copy.dest, copy.size);
+                        }
+                        if (g_deferred_copy_census) [[unlikely]] {
+                            NoteDeferredCopyCensus(copy.addr, copy.dest, copy.size, copy.hash,
+                                                   copy.label_seq);
                         }
                     }
                     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
@@ -4107,6 +4170,19 @@ vk::Buffer BufferCache::ReserveDeferredCopies(Buffer& buffer, std::span<vk::Buff
     for (auto& copy : copies) {
         deferred_copies.push_back(
             {buffer.CpuAddr() + copy.dstOffset, staging + copy.srcOffset, copy.size});
+        if (g_deferred_copy_census) [[unlikely]] {
+            // The guest bytes as the command processor sees them now (through the backing, like
+            // the deferred copy itself), hashed in a scratch buffer.
+            static thread_local std::vector<u8> scratch;
+            auto& census = deferred_copies.back();
+            scratch.resize(census.size);
+            if (memory->TryReadBacking(census.addr, scratch.data(), census.size)) {
+                census.hash = XXH3_64bits(scratch.data(), census.size);
+                census.label_seq = VideoCore::g_guest_label_seq.load(std::memory_order_relaxed);
+            } else {
+                census.label_seq = ~0ULL;
+            }
+        }
         copy.srcOffset += offset;
     }
     staging_buffer.Commit();

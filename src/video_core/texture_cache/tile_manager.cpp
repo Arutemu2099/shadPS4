@@ -227,6 +227,9 @@ TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset
             cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, writes);
             cmdbuf.dispatch(dim_x, 1, 1);
         });
+        // As the borrow of the synchronous path does (CommandBufferAccess): the push descriptor
+        // set above replaces descriptor heap binds (SHADPS4_NATIVE_BINDINGS; Opus 2026-09-30).
+        scheduler.InvalidateNativeHeaps();
         return {out_buffer, 0};
     }
 

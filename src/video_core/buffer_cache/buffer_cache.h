@@ -23,6 +23,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/submit_epoch.h"
 #include "video_core/buffer_cache/fault_manager.h"
+#include "video_core/buffer_cache/gpu_range_set.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/multi_level_page_table.h"
 #include "video_core/page_manager.h"
@@ -553,6 +554,10 @@ private:
         VAddr addr;
         u8* dest;
         u64 size;
+        /// SHADPS4_DEFERRED_COPY_CENSUS only: hash of the guest range and the guest label count
+        /// when the copy was recorded (label_seq ~0: the range could not be read then).
+        u64 hash{};
+        u64 label_seq{};
     };
     std::vector<DeferredCopy> deferred_copies;
     /// SHADPS4_READBACK_PRODUCER_STATS=1: last command tick that GPU-wrote each 1 MB slot, to
@@ -700,7 +705,7 @@ private:
     u64 critical_gc_memory = 0;
     u64 gc_tick = 0;
     Common::LeastRecentlyUsedCache<BufferId, u64> lru_cache;
-    RangeSet gpu_modified_ranges;
+    GpuRangeSet gpu_modified_ranges;
     SplitRangeMap<BufferId> buffer_ranges;
     /// Guards buffer_ranges between the command processor (Register/Unregister edit the tree) and
     /// guest threads (write faults read it in IsRegionRegistered). Other readers run on the command

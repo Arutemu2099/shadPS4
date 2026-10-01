@@ -68,12 +68,35 @@ public:
         return env[0] - '0';
     }
 
+    /**
+     * SHADPS4_PROTECT_SPIN_US=N (default 0 = block at once, as before). After a batch the
+     * Protector polls `enqueued` for N microseconds before it blocks in the condition variable.
+     * Measured 2026-09-30 (a38, back-only CPU samples): with PROTECT_STEAL=2 the CP back applied
+     * ~5% (fire) / ~3% (forest) of its time in StealAndApply at label fences, because a blocked
+     * Protector wakes later than the next fence arrives (62 ASC labels per frame in fire). A
+     * polling Protector claims a push within one pause, so the fence finds the batch claimed and
+     * waits only for the calls in flight. Claim order, the chained publication and Fence's
+     * contract are unchanged: only when the Protector looks at `pending` changes.
+     */
+    static u64 SpinNs() {
+        const char* env = std::getenv("SHADPS4_PROTECT_SPIN_US");
+        if (env == nullptr) {
+            return 0;
+        }
+        const u64 us = std::strtoull(env, nullptr, 10);
+        return (us > 100'000 ? 100'000 : us) * 1000;
+    }
+
     static ProtectQueue& Instance() {
         static ProtectQueue queue;
         return queue;
     }
 
     ProtectQueue() {
+        if (spin_ns != 0) {
+            LOG_INFO(Render, "ProtectQueue: SHADPS4_PROTECT_SPIN_US={} (Protector polls before "
+                             "blocking)", spin_ns / 1000);
+        }
         if (steal_mode != 0) {
             LOG_INFO(Render, "ProtectQueue: SHADPS4_PROTECT_STEAL={} ({})", steal_mode,
                      steal_mode == 2 ? "notify only when idle, fence applies unclaimed batches"
@@ -211,12 +234,34 @@ private:
     void Loop(std::stop_token stop) {
         Common::SetCurrentThreadName("shadPS4:Protector");
         std::vector<DeferredWatch> work;
+        // SHADPS4_PROTECT_SPIN_US: `enqueued` as of this thread's last look at `pending`, and the
+        // start of the current polling window (the end of the last batch).
+        u64 seen = 0;
+        Clock::time_point spin_from = Clock::now();
         while (!stop.stop_requested()) {
+            if (spin_ns != 0) {
+                // A push is a release store of `enqueued` under `mutex`. `idle` stays false while
+                // polling, so Push does not notify; the predicate below still runs under `mutex`
+                // before any block, so no push can be missed when the window ends.
+                for (u32 spins = 1; enqueued.load(std::memory_order_acquire) == seen; ++spins) {
+                    if ((spins & 63) == 0 &&
+                        (stop.stop_requested() || Ns(spin_from, Clock::now()) >= spin_ns)) {
+                        break;
+                    }
+                    _mm_pause();
+                }
+            }
             u64 seq;
             u64 prev = 0;
             Clock::time_point first_push{};
             {
                 std::unique_lock lk{mutex};
+                if (spin_ns != 0 && pending.empty() && !stop.stop_requested() &&
+                    Ns(spin_from, Clock::now()) < spin_ns) {
+                    // A Fence stole the batch (PROTECT_STEAL=2): note it and keep polling.
+                    seen = enqueued.load(std::memory_order_relaxed);
+                    continue;
+                }
                 if (wake_stats) [[unlikely]] {
                     sleeping = pending.empty();
                 }
@@ -238,6 +283,7 @@ private:
                 seq = enqueued.load(std::memory_order_relaxed);
                 prev = claimed_seq;
                 claimed_seq = seq;
+                seen = seq;
                 if (wake_stats) [[unlikely]] {
                     sleeping = false;
                     first_push = batch_first_push;
@@ -259,6 +305,9 @@ private:
                 WaitApplied(prev); // chained publication, see StealAndApply
             }
             applied.store(seq, std::memory_order_release);
+            if (spin_ns != 0) {
+                spin_from = Clock::now();
+            }
         }
     }
 
@@ -380,6 +429,7 @@ private:
     std::atomic<u64> applied{0};
     const bool wake_stats = WakeStatsEnabled();
     const int steal_mode = StealMode();
+    const u64 spin_ns = SpinNs();
     u64 claimed_seq = 0;                  // under `mutex`: `enqueued` value of the latest claim
     bool idle = false;                    // under `mutex`, SHADPS4_PROTECT_STEAL only (see Push)
     std::vector<DeferredWatch> steal_work; // CP only (StealAndApply), empty between fences
@@ -389,8 +439,13 @@ private:
     std::jthread thread;
 };
 
+/// Guest-visible completion signals so far (every ProtectFence call: EOP / EOS / ASC RELEASE_MEM
+/// labels and the other fenced writes). Read by SHADPS4_DEFERRED_COPY_CENSUS.
+inline std::atomic<u64> g_guest_label_seq{0};
+
 /// Called by the command processor before it makes any guest-visible completion signal.
 inline void ProtectFence() {
+    g_guest_label_seq.fetch_add(1, std::memory_order_relaxed);
     if (ProtectQueue::Enabled()) {
         ProtectQueue::Instance().Fence();
     }
