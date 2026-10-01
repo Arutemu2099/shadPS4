@@ -18,6 +18,7 @@
 #include "common/debug.h"
 #include "common/fault_monitor.h"
 #include "common/types.h"
+#include "video_core/buffer_cache/back_clean.h"
 #include "video_core/buffer_cache/dirty_epoch.h"
 #include "video_core/buffer_cache/fast_settings.h"
 #include "video_core/buffer_cache/region_definitions.h"
@@ -219,6 +220,10 @@ public:
             if constexpr (type == Type::CPU) {
                 // Raise the summary BEFORE the bits, so a lock-free reader can never observe
                 // false while a set that precedes it in program order has already landed.
+                // SHADPS4_BACK_CLEAN: log the pages first (under the region lock, which every
+                // caller holds), so the back's private "verified clean" bits drop them.
+                DirtyLog::Append((cpu_addr >> TRACKER_PAGE_BITS) + start_page,
+                                 std::min<size_t>(end_page, NUM_PAGES_PER_REGION) - start_page);
                 PublishCpuDirty([&] {
                     MarkDirty();
                     bits.SetRange(start_page, end_page);

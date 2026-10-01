@@ -282,8 +282,111 @@ public:
         return true;
     }
 
+    /// SHADPS4_BACK_CLEAN (see back_clean.h): read-only syncs on the command processor answer
+    /// from the private "verified clean" bits; only unverified page runs take the locked walk.
+    UploadPath ForEachUploadRangeBackClean(VAddr query_cpu_range, u64 query_size, auto&& func,
+                                           auto&& on_upload) {
+        auto& bc = back_clean;
+        auto& runs = back_clean_runs;
+        ++bc.stats.queries;
+        if ((bc.stats.queries & (g_back_clean == 2 ? 0x3fffffULL : 0x3ffffffULL)) == 0) {
+            const auto& s = bc.stats;
+            LOG_INFO(Render,
+                     "BackClean: mode={} queries={} clean={} ({:.2f}%) runs={} run_pages={} "
+                     "drained={} resets={} raced={} mismatches={}",
+                     g_back_clean, s.queries, s.clean, 100.0 * s.clean / s.queries, s.runs,
+                     s.run_pages, s.drained, s.resets, s.raced, s.mismatches);
+        }
+        bc.Sync();
+        runs.clear();
+        bc.CollectUnverified(query_cpu_range, query_size, runs);
+        if (g_back_clean == 2) [[unlikely]] {
+            // Verify every verified sub-range of the query (the gaps between the unverified
+            // runs) against the tracker's own bits. A dirty bit there had its log entry
+            // appended before it was set, so one more drain must drop the page; if the
+            // sub-range is still verified after it, the private bits are wrong. Diagnostic
+            // read (relaxed), sound on x86.
+            const u64 first = query_cpu_range >> TRACKER_PAGE_BITS;
+            const u64 end = (query_cpu_range + query_size + TRACKER_BYTES_PER_PAGE - 1) >>
+                            TRACKER_PAGE_BITS;
+            auto& gaps = back_clean_gaps;
+            gaps.clear();
+            u64 at = first;
+            for (const auto& [first_page, count] : runs) {
+                if (first_page > at) {
+                    gaps.emplace_back(at, first_page - at);
+                }
+                at = first_page + count;
+            }
+            if (end > at) {
+                gaps.emplace_back(at, end - at);
+            }
+            bool resync = false;
+            auto& bad = back_clean_bad;
+            bad.clear();
+            for (const auto& [gap_page, gap_count] : gaps) {
+                const VAddr gap_addr = gap_page << TRACKER_PAGE_BITS;
+                const u64 gap_size = gap_count << TRACKER_PAGE_BITS;
+                if (!CpuDirtyRelaxed(gap_addr, gap_size)) {
+                    continue;
+                }
+                bc.Sync();
+                resync = true;
+                auto& again = back_clean_again;
+                again.clear();
+                bc.CollectUnverified(gap_addr, gap_size, again);
+                if (again.empty()) {
+                    if (++bc.stats.mismatches <= 16) {
+                        LOG_CRITICAL(Render,
+                                     "BackClean mismatch: {:#x}+{:#x} verified clean, tracker "
+                                     "dirty (query {:#x}+{:#x})",
+                                     gap_addr, gap_size, query_cpu_range, query_size);
+                    }
+                    bad.emplace_back(gap_page, gap_count);
+                } else {
+                    ++bc.stats.raced;
+                }
+            }
+            if (resync) {
+                runs.clear();
+                bc.CollectUnverified(query_cpu_range, query_size, runs);
+                runs.insert(runs.end(), bad.begin(), bad.end());
+            }
+        }
+        if (runs.empty()) [[likely]] {
+            ++bc.stats.clean;
+            on_upload();
+            return UploadPath::Memo;
+        }
+        for (const auto& [first_page, count] : runs) {
+            ++bc.stats.runs;
+            bc.stats.run_pages += count;
+            // Always under the region lock: a fault handler that has logged its pages but not
+            // yet set their bits holds it (no lock-free "region is clean" shortcut here).
+            IteratePages<true>(first_page << TRACKER_PAGE_BITS, count << TRACKER_PAGE_BITS,
+                               [&func](RegionManager* manager, u64 offset, size_t size) {
+                                   std::scoped_lock lk{manager->lock};
+                                   manager->template ForEachModifiedRange<Type::CPU, true>(
+                                       manager->GetCpuAddr() + offset, size, func);
+                               });
+        }
+        // Before on_upload(): nothing may drain the log between a walk and its MarkVerified (a
+        // drained entry for a page not yet marked would be lost). The bits are cleared and the
+        // ranges recorded at this point, as in the old path.
+        for (const auto& [first_page, count] : runs) {
+            bc.MarkVerified(first_page, count);
+        }
+        on_upload();
+        return UploadPath::Walk;
+    }
+
     UploadPath ForEachUploadRange(VAddr query_cpu_range, u64 query_size, bool is_written,
                                   auto&& func, auto&& on_upload) {
+        if (g_back_clean != 0 && !is_written && !g_epoch_defer_upload && query_size != 0 &&
+            Common::FaultMonitor::t_is_cp_thread &&
+            ((query_cpu_range + query_size) >> MAX_CPU_PAGE_BITS) == 0) {
+            return ForEachUploadRangeBackClean(query_cpu_range, query_size, func, on_upload);
+        }
         // Three phases with very different costs - scan is bitset work, mark can reach a
         // VirtualProtect syscall. Timed separately so a fix is aimed at the one that is expensive.
         const auto t_scan = Common::FaultMonitor::Now();
@@ -573,6 +676,9 @@ private:
     /// the whole 40-bit space. Maintained by RegionManager under its lock, read without it.
     std::array<std::atomic<u64>, NUM_HIGH_PAGES / 64> skippable{};
     std::array<CleanMemoEntry, CLEAN_MEMO_SIZE> clean_memo{};
+    BackCleanCache back_clean;
+    std::vector<BackCleanCache::Run> back_clean_runs;
+    std::vector<BackCleanCache::Run> back_clean_gaps, back_clean_bad, back_clean_again; // =2
 };
 
 } // namespace VideoCore
