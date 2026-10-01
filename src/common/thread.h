@@ -56,5 +56,12 @@ void ApplyCommandProcessorPlacement();
 /// SHADPS4_CP_CORE_STATS=1: sample the logical CPU this thread runs on (call often, it is cheap)
 /// and periodically log the share on performance vs efficiency cores. Diagnostic only.
 void SampleCommandProcessorCore();
+/// SHADPS4_THREAD_STATS=1 (diagnostic, default off): call at a natural point of a hot thread's
+/// loop. Every 2^stride_log2-th call notes the logical processor the thread is on; four times a
+/// second it times a fixed dependent-operation loop with rdtsc (loop iterations per TSC tick
+/// follow the core's real clock, which the invariant TSC does not); every ~10 s the thread logs
+/// its processor histogram, migrations, CPU time and the clock probe (median and minimum).
+/// Explains run-to-run speed modes: placement and frequency versus extra work.
+void SampleThreadPlacement(const char* role, unsigned stride_log2 = 6);
 
 } // namespace Common

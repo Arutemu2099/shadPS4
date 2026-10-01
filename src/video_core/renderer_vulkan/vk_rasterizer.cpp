@@ -92,6 +92,13 @@ const int g_viewport_memo = [] {
     const char* value = std::getenv("SHADPS4_VIEWPORT_MEMO");
     return value ? value[0] - '0' : 0;
 }();
+// SHADPS4_RENDER_STATE_MEMO=1 (=2 verify), default off; see RenderStateMemo in vk_rasterizer.h.
+// Forced off with SHADPS4_STENCIL_PLANE_MERGE (FindDepthTarget merges stencil planes per draw).
+const int g_render_state_memo = [] {
+    const char* value = std::getenv("SHADPS4_RENDER_STATE_MEMO");
+    const int mode = value ? value[0] - '0' : 0;
+    return (mode == 1 || mode == 2) && !VideoCore::TextureCache::StencilPlaneMerge() ? mode : 0;
+}();
 const bool g_hair_stencil_trace = EnvExactly1("SHADPS4_HAIR_STENCIL_TRACE");
 const bool g_replace_op_reference = EnvExactly1("SHADPS4_STENCIL_REPLACE_OP");
 
@@ -1495,7 +1502,48 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     };
     const auto t_prepare = Common::FaultMonitor::Now();
     sample.BeginPhase(Common::DrawSampleProbe::Phase::Prepare);
-    PrepareRenderState(pipeline);
+    const int rs_mode = g_render_state_memo;
+    const size_t rs_bound_begin = bound_images.size();
+    u64 rs_gen_at_entry = 0;
+    bool rs_hit = false;   // mode 1: the memo stood in for PrepareRenderState
+    bool rs_would = false; // mode 2: it would have
+    if (rs_mode != 0) {
+        if ((++rs_stats.draws & 0x3fffff) == 0) {
+            RenderStateMemoLog();
+        }
+        rs_gen_at_entry = texture_cache.StructGeneration();
+        if (rs_mode == 1) {
+            rs_hit = RenderStateMemoMatch(pipeline, true);
+            if (!rs_hit) {
+                // The full path rewrites cb_descs / db_desc.
+                rs_memo.valid = false;
+            }
+        } else {
+            rs_would = RenderStateMemoMatch(pipeline, false);
+            if (!rs_would) {
+                rs_memo.valid = false;
+            }
+        }
+    }
+    if (!rs_hit) {
+        PrepareRenderState(pipeline);
+    }
+    if (rs_would) {
+        // Verify: the full path must have resolved the remembered targets, in order.
+        ++rs_stats.verify_prepare;
+        bool same = bound_images.size() == rs_bound_begin + rs_memo.targets.size();
+        for (size_t i = 0; same && i < rs_memo.targets.size(); ++i) {
+            same = bound_images[rs_bound_begin + i] == rs_memo.targets[i].id;
+        }
+        if (!same) {
+            rs_would = false;
+            if (++rs_stats.mismatches <= 16) {
+                LOG_CRITICAL(Render_Vulkan,
+                             "RenderStateMemo mismatch: prepare resolved {} targets, memo {}",
+                             bound_images.size() - rs_bound_begin, rs_memo.targets.size());
+            }
+        }
+    }
     sample.EndPhase(Common::DrawSampleProbe::Phase::Prepare);
     dc_lap(DcPrepare);
     const auto t_bindres = Common::FaultMonitor::Now();
@@ -1568,7 +1616,49 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
             }
         }
     }
-    const auto state = BeginRendering(pipeline);
+    RenderState state;
+    if (rs_hit && RenderStateMemoBeginOk()) {
+        RenderStateMemoBegin(state);
+        ++rs_stats.begin_hits;
+    } else {
+        const bool rs_begin_would = rs_would && RenderStateMemoBeginOk();
+        rs_stats.begin_fallbacks += rs_hit;
+        state = BeginRendering(pipeline);
+        if (rs_mode != 0) {
+            if (rs_begin_would && !attachment_feedback_loop) {
+                // Verify: the remembered state is what the full path just built.
+                ++rs_stats.verify_begin;
+                const bool depth_same = !db_desc.first ||
+                                        rs_last_depth_layout == rs_memo.depth_layout;
+                if (!(state == rs_memo.state) || !depth_same) {
+                    if (++rs_stats.mismatches <= 16) {
+                        u32 first_diff = 99;
+                        for (u32 i = 0; i < state.color_attachments.size(); ++i) {
+                            if (std::memcmp(&state.color_attachments[i],
+                                            &rs_memo.state.color_attachments[i],
+                                            sizeof(state.color_attachments[i])) != 0) {
+                                first_diff = i;
+                                break;
+                            }
+                        }
+                        LOG_CRITICAL(Render_Vulkan,
+                                     "RenderStateMemo mismatch: state differs (first colour "
+                                     "attachment {}, depth attachment same {}, depth layout same "
+                                     "{}, extent {}x{}x{} vs {}x{}x{}, colours {} vs {})",
+                                     first_diff,
+                                     std::memcmp(&state.depth_stencil_attachment,
+                                                 &rs_memo.state.depth_stencil_attachment,
+                                                 sizeof(state.depth_stencil_attachment)) == 0,
+                                     depth_same, state.width, state.height, state.num_layers,
+                                     rs_memo.state.width, rs_memo.state.height,
+                                     rs_memo.state.num_layers, state.num_color_attachments,
+                                     rs_memo.state.num_color_attachments);
+                    }
+                }
+            }
+            RenderStateMemoStore(pipeline, state, rs_bound_begin, rs_gen_at_entry);
+        }
+    }
     sample.EndPhase(Common::DrawSampleProbe::Phase::BuildRenderingState);
     dc_lap(DcBeginRendering);
     if (g_merge_probe) {
@@ -1714,6 +1804,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 void Rasterizer::DrawIndirectTail(const GraphicsPipeline* pipeline, bool is_indexed,
                                   VAddr arg_address, u32 offset, u32 stride, u32 max_count,
                                   VAddr count_address) {
+    rs_memo.valid = false; // RENDER_STATE_MEMO: this path rewrites cb_descs / db_desc
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
         return;
@@ -4135,6 +4226,264 @@ void Rasterizer::BindTextures(const Shader::BoundStage& bound,
                                             Common::FaultMonitor::SinceNs(t_sampler_start));
 }
 
+namespace {
+template <typename T>
+bool SameReg(const T& a, const T& b) {
+    return std::memcmp(&a, &b, sizeof(T)) == 0;
+}
+} // namespace
+
+bool Rasterizer::RenderStateMemoRegsEqual(u32 num_cbs) const {
+    const auto& regs = liverpool->BackRegs();
+    const auto& m = rs_memo;
+    return std::memcmp(m.color_buffers.data(), &regs.color_buffers[0],
+                       num_cbs * sizeof(AmdGpu::ColorBuffer)) == 0 &&
+           SameReg(m.color_target_mask, regs.color_target_mask) &&
+           SameReg(m.color_control, regs.color_control) &&
+           SameReg(m.depth_control, regs.depth_control) &&
+           SameReg(m.depth_buffer, regs.depth_buffer) && SameReg(m.depth_view, regs.depth_view) &&
+           SameReg(m.depth_htile_data_base, regs.depth_htile_data_base) &&
+           SameReg(m.depth_render_control, regs.depth_render_control) &&
+           SameReg(m.depth_clear, regs.depth_clear) && SameReg(m.stencil_clear, regs.stencil_clear);
+}
+
+bool Rasterizer::RenderStateMemoMatch(const GraphicsPipeline* pipeline, bool apply) {
+    auto& m = rs_memo;
+    auto& st = rs_stats;
+    if (!m.valid) {
+        ++st.miss_invalid;
+        return false;
+    }
+    const auto& key = pipeline->GetGraphicsKey();
+    if (key.mrt_mask != m.mrt_mask || key.color_samples != m.color_samples) {
+        ++st.miss_key;
+        return false;
+    }
+    const u32 num_cbs = std::bit_width(key.mrt_mask);
+    // The extent hints come from NOP packets and can change without a register byte changing.
+    for (u32 cb = 0; cb < num_cbs; ++cb) {
+        if (liverpool->BackCbExtent(cb).raw != m.extents[cb]) {
+            ++st.miss_regs;
+            return false;
+        }
+    }
+    if (liverpool->BackDbExtent().raw != m.extents[AmdGpu::NUM_COLOR_BUFFERS]) {
+        ++st.miss_regs;
+        return false;
+    }
+    // The context epoch only moves with SHADPS4_VIEWPORT_MEMO; an unchanged epoch means no
+    // context register byte changed. Otherwise compare the registers the two functions read.
+    const u64 epoch = liverpool->BackContextEpoch();
+    if (g_viewport_memo != 0 && epoch == m.ctx_epoch) {
+        if (g_render_state_memo == 2 && !RenderStateMemoRegsEqual(num_cbs)) {
+            if (++st.mismatches <= 16) {
+                LOG_CRITICAL(Render_Vulkan,
+                             "RenderStateMemo mismatch: registers changed under context epoch {}",
+                             epoch);
+            }
+            return false;
+        }
+    } else {
+        if (!RenderStateMemoRegsEqual(num_cbs)) {
+            ++st.miss_regs;
+            return false;
+        }
+        m.ctx_epoch = epoch;
+        ++st.epoch_moved;
+    }
+    // Image checks and the touches a hit keeps run inside one memo section, like the texture
+    // binding memo: a foreign structural change cannot interleave with them.
+    const auto section = texture_cache.EnterMemoSection();
+    if (section == VideoCore::TextureCache::MemoSection::Refused) {
+        ++st.miss_refused;
+        return false;
+    }
+    bool ok = true;
+    if (texture_cache.StructGeneration() != m.struct_gen) {
+        ++st.miss_struct;
+        ok = false;
+    } else if (texture_cache.MetaClearEpoch() != m.meta_epoch) {
+        ++st.miss_meta;
+        ok = false;
+    } else {
+        // An unchanged structure generation means no image was deleted: the ids are live.
+        for (const auto& t : m.targets) {
+            const auto& image = texture_cache.PeekImage(t.id);
+            if (image.image_uid != t.uid || image.backing != t.backing) {
+                ++st.miss_image;
+                ok = false;
+                break;
+            }
+        }
+    }
+    if (ok && apply) {
+        // What PrepareRenderState leaves behind: FindImage's access tick and LRU touch, the
+        // target flag and the bound_images entry (same order: colours by index, then depth).
+        for (const auto& t : m.targets) {
+            auto& image = texture_cache.PeekImage(t.id);
+            texture_cache.TouchImageAccess(image);
+            image.binding.is_target = 1u;
+            bound_images.emplace_back(t.id);
+        }
+    }
+    texture_cache.LeaveMemoSection(section);
+    st.hits += ok;
+    return ok;
+}
+
+bool Rasterizer::RenderStateMemoBeginOk() {
+    const auto& m = rs_memo;
+    // BindResources ran since the match: it can create, replace or re-back images, bind a
+    // target as a texture (feedback loop) or ask for a rebind. Any of those takes the full path.
+    const auto section = texture_cache.EnterMemoSection();
+    if (section == VideoCore::TextureCache::MemoSection::Refused) {
+        return false;
+    }
+    bool ok = m.valid && texture_cache.StructGeneration() == m.struct_gen &&
+              texture_cache.MetaClearEpoch() == m.meta_epoch;
+    if (ok) {
+        for (const auto& t : m.targets) {
+            const auto& image = texture_cache.PeekImage(t.id);
+            if (image.image_uid != t.uid || image.backing != t.backing ||
+                image.binding.needs_rebind || image.binding.is_bound ||
+                image.binding.force_general) {
+                ok = false;
+                break;
+            }
+        }
+    }
+    texture_cache.LeaveMemoSection(section);
+    return ok;
+}
+
+void Rasterizer::RenderStateMemoBegin(RenderState& state) {
+    const auto& m = rs_memo;
+    attachment_feedback_loop = false;
+    state = m.state;
+    for (const auto& t : m.targets) {
+        const bool is_depth = t.cb == RenderStateMemo::DepthSlot;
+        texture_cache.NoteTargetUse(t.id, is_depth);
+        auto& image = texture_cache.PeekImage(t.id);
+        if (is_depth) {
+            image.Transit(m.depth_layout,
+                          vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+                              vk::AccessFlagBits2::eDepthStencilAttachmentRead,
+                          db_desc.second.view_info.range);
+            state.depth_stencil_attachment.image_layout = image.backing->state.layout;
+        } else {
+            image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
+                          vk::AccessFlagBits2::eColorAttachmentWrite |
+                              vk::AccessFlagBits2::eColorAttachmentRead,
+                          cb_descs[t.cb].second.view_info.range);
+            state.color_attachments[t.cb].image_layout = image.backing->state.layout;
+        }
+    }
+}
+
+void Rasterizer::RenderStateMemoStore(const GraphicsPipeline* pipeline, const RenderState& state,
+                                      size_t bound_begin, u64 struct_gen_at_entry) {
+    auto& m = rs_memo;
+    auto& st = rs_stats;
+    m.valid = false;
+    if (attachment_feedback_loop) {
+        ++st.refused_feedback;
+        return;
+    }
+    // A structural change during this draw (a texture binding created or replaced an image):
+    // the targets were resolved against the older structure.
+    const u64 struct_gen = texture_cache.StructGeneration();
+    if (struct_gen != struct_gen_at_entry) {
+        ++st.refused_gen;
+        return;
+    }
+    m.targets.clear();
+    for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
+        const auto& [image_id, desc] = cb_descs[cb];
+        if (!image_id) {
+            continue;
+        }
+        // A cleared state must not repeat from the memo (the clear is consumed by this draw).
+        if (state.color_attachments[cb].is_clear) {
+            ++st.refused_clear;
+            return;
+        }
+        const auto& image = texture_cache.PeekImage(image_id);
+        if (!image.image_uid || !texture_cache.IsPerfectMatch(desc.info, image_id)) {
+            ++st.refused_overlap;
+            return;
+        }
+        m.targets.push_back({image_id, image.image_uid, image.backing, static_cast<u8>(cb)});
+    }
+    if (const auto image_id = db_desc.first; image_id) {
+        const auto& attachment = state.depth_stencil_attachment;
+        if (attachment.depth_clear || attachment.stencil_clear) {
+            ++st.refused_clear;
+            return;
+        }
+        const auto& image = texture_cache.PeekImage(image_id);
+        if (image.info.num_samples == 2) {
+            // Pro scene depth: BeginRendering keeps per-draw bookkeeping for it.
+            ++st.refused_other;
+            return;
+        }
+        if (!image.image_uid || !texture_cache.IsPerfectMatch(db_desc.second.info, image_id)) {
+            ++st.refused_overlap;
+            return;
+        }
+        m.targets.push_back({image_id, image.image_uid, image.backing, RenderStateMemo::DepthSlot});
+    }
+    // The ids PrepareRenderState resolved must be the ones BeginRendering used (it re-finds an
+    // image whose binding asked for a rebind).
+    if (bound_images.size() < bound_begin + m.targets.size()) {
+        ++st.refused_rebind;
+        return;
+    }
+    for (size_t i = 0; i < m.targets.size(); ++i) {
+        if (bound_images[bound_begin + i] != m.targets[i].id) {
+            ++st.refused_rebind;
+            return;
+        }
+    }
+    const auto& key = pipeline->GetGraphicsKey();
+    const auto& regs = liverpool->BackRegs();
+    m.ctx_epoch = liverpool->BackContextEpoch();
+    m.mrt_mask = key.mrt_mask;
+    m.color_samples = key.color_samples;
+    m.struct_gen = struct_gen;
+    m.meta_epoch = texture_cache.MetaClearEpoch();
+    std::memcpy(m.color_buffers.data(), &regs.color_buffers[0], sizeof(m.color_buffers));
+    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        m.extents[cb] = liverpool->BackCbExtent(cb).raw;
+    }
+    m.extents[AmdGpu::NUM_COLOR_BUFFERS] = liverpool->BackDbExtent().raw;
+    m.color_target_mask = regs.color_target_mask;
+    m.color_control = regs.color_control;
+    m.depth_control = regs.depth_control;
+    m.depth_buffer = regs.depth_buffer;
+    m.depth_view = regs.depth_view;
+    m.depth_htile_data_base = regs.depth_htile_data_base;
+    m.depth_render_control = regs.depth_render_control;
+    m.depth_clear = regs.depth_clear;
+    m.stencil_clear = regs.stencil_clear;
+    m.state = state;
+    m.depth_layout = rs_last_depth_layout;
+    m.valid = true;
+}
+
+void Rasterizer::RenderStateMemoLog() {
+    const auto& s = rs_stats;
+    LOG_INFO(Render_Vulkan,
+             "RenderStateMemo: mode={} draws={} hits={} ({:.1f}%) begin_hits={} "
+             "begin_fallbacks={} | miss invalid={} key={} regs={} refused={} struct={} meta={} "
+             "image={} | store refused clear={} feedback={} overlap={} rebind={} gen={} other={} | "
+             "epoch_moved={} verify_prepare={} verify_begin={} mismatches={}",
+             g_render_state_memo, s.draws, s.hits, 100.0 * s.hits / std::max<u64>(s.draws, 1),
+             s.begin_hits, s.begin_fallbacks, s.miss_invalid, s.miss_key, s.miss_regs,
+             s.miss_refused, s.miss_struct, s.miss_meta, s.miss_image, s.refused_clear,
+             s.refused_feedback, s.refused_overlap, s.refused_rebind, s.refused_gen,
+             s.refused_other, s.epoch_moved, s.verify_prepare, s.verify_begin, s.mismatches);
+}
+
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     attachment_feedback_loop = false;
     const auto& regs = liverpool->BackRegs();
@@ -4233,6 +4582,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                                     ? vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal
                                 : has_stencil ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
                                               : vk::ImageLayout::eDepthReadOnlyOptimal;
+        rs_last_depth_layout = new_layout;
         image.Transit(new_layout,
                       vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
                           vk::AccessFlagBits2::eDepthStencilAttachmentRead,

@@ -315,10 +315,25 @@ public:
         auto it = surface_metas.find(address);
         if (it != surface_metas.end()) {
             it.value().clear_mask = u32(-1);
+            ++meta_clear_epoch;
             return true;
         }
         return false;
     }
+
+    /// SHADPS4_RENDER_STATE_MEMO: bumped whenever a clear bit of a metadata surface is set
+    /// (ClearMeta, TouchMeta with is_clear). While it stands still, a slice that read "not
+    /// cleared" still reads so. CP thread only, like surface_metas.
+    [[nodiscard]] u64 MetaClearEpoch() const noexcept {
+        return meta_clear_epoch;
+    }
+
+    /// SHADPS4_RENDER_STATE_MEMO: what FindRenderTarget / FindDepthTarget do to a target that
+    /// was already resolved by them with the same descriptor and whose image, backing and
+    /// registered metadata are unchanged since: the GPU-modified flag, the usage bit, the
+    /// linear-readback registration and UpdateImage. No meta registration, stencil link or view
+    /// lookup (their results are unchanged by construction; see the memo's validity checks).
+    void NoteTargetUse(ImageId image_id, bool is_depth);
 
     /// Updates the state of a slice of the specified metadata surface.
     bool TouchMeta(VAddr address, u32 slice, bool is_clear) {
@@ -326,6 +341,7 @@ public:
         if (it != surface_metas.end()) {
             if (is_clear) {
                 it.value().clear_mask |= 1u << slice;
+                ++meta_clear_epoch;
             } else {
                 it.value().clear_mask &= ~(1u << slice);
             }
@@ -557,6 +573,7 @@ private:
         s32 clear_mask = -1;
     };
     tsl::robin_map<VAddr, MetaDataInfo> surface_metas;
+    u64 meta_clear_epoch{}; // SHADPS4_RENDER_STATE_MEMO, see MetaClearEpoch
 };
 
 } // namespace VideoCore

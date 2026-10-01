@@ -1278,6 +1278,7 @@ void Liverpool::BackLoop(std::stop_token stoken) {
     bool stop_forwarded = false;
     for (;;) {
         if (const auto* record = split->Next()) {
+            Common::SampleThreadPlacement("back", 8);
             ExecuteRecord(*record);
             split->Done(record);
             // Guest commands run at record boundaries, as they ran at packet boundaries before.
@@ -2458,6 +2459,7 @@ void Liverpool::ExecuteGfxPacket(const PM4Header* header, bool guest_markers_ena
 
 void Liverpool::ProcessLoop(std::stop_token stoken) {
     while (!stoken.stop_requested()) {
+        Common::SampleThreadPlacement(CpSplit::t_is_front ? "front" : "cp", 2);
         {
             // Idle here is the CP thread waiting on the GUEST, not emulator cost. Splitting it out
             // is what says whether parallel command recording can pay off - see
@@ -3985,6 +3987,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     }
 
     Common::FaultMonitor::CountGuestSubmit(true);
+    Common::SampleThreadPlacement("guest-submit-gfx", 4);
     if (AscRingLatency()) [[unlikely]] {
         auto& g = g_asc_ring;
         const u64 eop = g.last_eop_tsc.load(std::memory_order_relaxed);

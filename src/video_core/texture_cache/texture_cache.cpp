@@ -1315,6 +1315,21 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     return slot_images[image_id].FindView(desc.view_info, false);
 }
 
+void TextureCache::NoteTargetUse(ImageId image_id, bool is_depth) {
+    Image& image = slot_images[image_id];
+    image.flags |= ImageFlagBits::GpuModified;
+    if (is_depth) {
+        image.usage.depth_target = 1u;
+    } else {
+        if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
+            std::unique_lock lk{download_images_mutex};
+            download_images.emplace(image_id);
+        }
+        image.usage.render_target = 1u;
+    }
+    UpdateImage(image_id);
+}
+
 void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;

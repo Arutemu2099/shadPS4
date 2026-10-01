@@ -137,6 +137,11 @@ public:
         std::uint64_t space_wait_ns{};
     };
 
+    /// Diagnostic: called on the worker thread once per chunk (SHADPS4_THREAD_STATS).
+    static void SetChunkHook(void (*hook)()) {
+        chunk_hook_.store(hook, std::memory_order_relaxed);
+    }
+
     explicit CommandRecordingWorker(const bool measure_timing = false)
         : measure_timing_{measure_timing}, worker_{&CommandRecordingWorker::WorkerLoop, this} {}
 
@@ -671,6 +676,9 @@ private:
                 }
                 chunk = PopPublishedLocked();
             }
+            if (auto* const hook = chunk_hook_.load(std::memory_order_relaxed)) {
+                hook();
+            }
 
             const auto worker_start = measure_timing_ ? Clock::now() : Clock::time_point{};
             std::exception_ptr callback_error;
@@ -757,6 +765,7 @@ private:
     std::atomic<bool> failure_flag_{};
     bool stop_requested_{};
     const bool measure_timing_;
+    static inline std::atomic<void (*)()> chunk_hook_{nullptr};
     std::uint64_t worker_ns_{};
     std::uint64_t drain_ns_{};
     std::uint64_t space_wait_ns_{};

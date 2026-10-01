@@ -23,6 +23,8 @@
 #include <pthread.h>
 #elif defined(_WIN32)
 #include <windows.h>
+#include <bit>
+#include <intrin.h>
 #include "common/string_util.h"
 #else
 #if defined(__Bitrig__) || defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)
@@ -391,9 +393,125 @@ void SampleCommandProcessorCore() {
     hits.fill(0);
     samples = 0;
 }
+namespace {
+struct ThreadPlacementState {
+    std::array<u32, 64> hits{};
+    std::array<u32, 48> probes{};
+    u32 calls{};
+    u32 samples{};
+    u32 migrations{};
+    u32 num_probes{};
+    u32 last_cpu{~0u};
+    u64 window_tsc{};
+    u64 probe_tsc{};
+    u64 tsc_per_s{3'500'000'000ULL};
+    LARGE_INTEGER window_qpc{};
+    u64 cpu_100ns{};
+};
+
+u64 ThreadCpuTime100ns() {
+    FILETIME creation, exit, kernel, user;
+    if (!GetThreadTimes(GetCurrentThread(), &creation, &exit, &kernel, &user)) {
+        return 0;
+    }
+    return ((u64(kernel.dwHighDateTime) << 32) | kernel.dwLowDateTime) +
+           ((u64(user.dwHighDateTime) << 32) | user.dwLowDateTime);
+}
+
+/// TSC ticks for 4096 iterations of a two-operation dependency chain (rotate, xor): the chain
+/// runs at the core's real clock, the TSC at a fixed rate. Best of four; ~1 us each.
+__declspec(noinline) u32 ClockProbeTicks() {
+    static volatile u64 seed = 0x9E3779B97F4A7C15ULL;
+    u64 best = ~0ULL;
+    for (int rep = 0; rep < 4; ++rep) {
+        u64 v = seed;
+        const u64 t0 = __rdtsc();
+        for (u32 i = 0; i < 4096; ++i) {
+            v = std::rotl(v, 7) ^ i;
+        }
+        const u64 dt = __rdtsc() - t0;
+        seed = v;
+        best = std::min(best, dt);
+    }
+    return static_cast<u32>(std::min<u64>(best, 0xffffffffULL));
+}
+} // namespace
+
+void SampleThreadPlacement(const char* role, unsigned stride_log2) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_THREAD_STATS");
+        return value && value[0] == '1';
+    }();
+    if (!enabled) [[likely]] {
+        return;
+    }
+    thread_local ThreadPlacementState st;
+    if ((++st.calls & ((1u << stride_log2) - 1)) != 0) {
+        return;
+    }
+    const u32 cpu = GetCurrentProcessorNumber() & 63;
+    ++st.hits[cpu];
+    ++st.samples;
+    st.migrations += st.last_cpu != ~0u && cpu != st.last_cpu;
+    st.last_cpu = cpu;
+    const u64 now = __rdtsc();
+    if (st.window_tsc == 0) {
+        st.window_tsc = now;
+        st.probe_tsc = now;
+        QueryPerformanceCounter(&st.window_qpc);
+        st.cpu_100ns = ThreadCpuTime100ns();
+        return;
+    }
+    if (now - st.probe_tsc > st.tsc_per_s / 4 && st.num_probes < st.probes.size()) {
+        st.probes[st.num_probes++] = ClockProbeTicks();
+        st.probe_tsc = __rdtsc();
+    }
+    if (now - st.window_tsc < st.tsc_per_s * 10) {
+        return;
+    }
+    LARGE_INTEGER qpc, freq;
+    QueryPerformanceCounter(&qpc);
+    QueryPerformanceFrequency(&freq);
+    const double wall_s = double(qpc.QuadPart - st.window_qpc.QuadPart) / double(freq.QuadPart);
+    const u64 cpu_100ns = ThreadCpuTime100ns();
+    const double cpu_s = double(cpu_100ns - st.cpu_100ns) * 1e-7;
+    if (wall_s > 1.0) {
+        st.tsc_per_s = static_cast<u64>(double(now - st.window_tsc) / wall_s);
+    }
+    const auto& c = GetCpuClasses();
+    std::string top;
+    for (size_t i = 0; i < 64; ++i) {
+        if (u64(st.hits[i]) * 50 >= st.samples) {
+            top += fmt::format(" cpu{}({}{}):{:.0f}%", i, c.cls[i] == c.max_class ? "P" : "E",
+                               c.core[i], 100.0 * st.hits[i] / st.samples);
+        }
+    }
+    std::sort(st.probes.begin(), st.probes.begin() + st.num_probes);
+    const u32 probe_min = st.num_probes ? st.probes[0] : 0;
+    const u32 probe_med = st.num_probes ? st.probes[st.num_probes / 2] : 0;
+    // 8192 chain operations per probe: operations per TSC tick x TSC rate = core clock estimate
+    // (exact only if each operation takes one cycle; compare between runs of the same EXE).
+    const auto ghz = [&](u32 ticks) {
+        return ticks ? 8192.0 / double(ticks) * double(st.tsc_per_s) * 1e-9 : 0.0;
+    };
+    LOG_INFO(Common,
+             "ThreadStats: role={} window_s={:.2f} cpu_s={:.2f} ({:.1f}%) samples={} migrations={} "
+             "clock_probe_ticks med={} min={} n={} (~{:.2f} / {:.2f} GHz) tsc_mhz={:.0f} on{}",
+             role, wall_s, cpu_s, 100.0 * cpu_s / std::max(wall_s, 1e-9), st.samples,
+             st.migrations, probe_med, probe_min, st.num_probes, ghz(probe_med), ghz(probe_min),
+             double(st.tsc_per_s) * 1e-6, top);
+    st.hits.fill(0);
+    st.samples = 0;
+    st.migrations = 0;
+    st.num_probes = 0;
+    st.window_tsc = now;
+    st.window_qpc = qpc;
+    st.cpu_100ns = cpu_100ns;
+}
 #else
 void ApplyCommandProcessorPlacement() {}
 void SampleCommandProcessorCore() {}
+void SampleThreadPlacement(const char*, unsigned) {}
 #endif
 
 std::string GetCurrentThreadName() {

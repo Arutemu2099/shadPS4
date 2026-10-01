@@ -16,6 +16,7 @@
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_native_bindings.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace AmdGpu {
@@ -381,6 +382,68 @@ private:
         decoded_image_descs{};
     bool fault_process_pending{};
     bool attachment_feedback_loop{};
+
+    // SHADPS4_RENDER_STATE_MEMO=1 (=2 verify), default off, direct draws (DrawTail) only:
+    // PrepareRenderState + BeginRendering recompute the same render targets and RenderState for
+    // almost every draw of a pass. One entry remembers the last state that the full path built
+    // without a clear, a feedback loop or an overlap-resolved target; a draw with the same
+    // registers, pipeline targets, texture-cache structure, metadata clear state, images and
+    // backings takes the short path (notes/back-split-phase1-2026-09-30.md section 6).
+    // cb_descs / db_desc stay as the remembered draw left them while the entry is valid: every
+    // other PrepareRenderState call invalidates it first.
+    struct RenderStateMemo {
+        struct Target {
+            VideoCore::ImageId id{};
+            u64 uid{};
+            const void* backing{};
+            u8 cb{}; ///< colour buffer index; DepthSlot for the depth target
+        };
+        static constexpr u8 DepthSlot = 0xff;
+        bool valid{};
+        u64 ctx_epoch{};
+        u32 mrt_mask{};
+        std::array<u8, AmdGpu::NUM_COLOR_BUFFERS> color_samples{};
+        u64 struct_gen{};
+        u64 meta_epoch{};
+        // Every register PrepareRenderState and BeginRendering read (colour buffers below
+        // bit_width(mrt_mask) only), plus the extent hints (slot 8 = depth).
+        std::array<AmdGpu::ColorBuffer, AmdGpu::NUM_COLOR_BUFFERS> color_buffers{};
+        std::array<u32, AmdGpu::NUM_COLOR_BUFFERS + 1> extents{};
+        decltype(AmdGpu::Regs::color_target_mask) color_target_mask{};
+        decltype(AmdGpu::Regs::color_control) color_control{};
+        decltype(AmdGpu::Regs::depth_control) depth_control{};
+        decltype(AmdGpu::Regs::depth_buffer) depth_buffer{};
+        decltype(AmdGpu::Regs::depth_view) depth_view{};
+        decltype(AmdGpu::Regs::depth_htile_data_base) depth_htile_data_base{};
+        decltype(AmdGpu::Regs::depth_render_control) depth_render_control{};
+        decltype(AmdGpu::Regs::depth_clear) depth_clear{};
+        decltype(AmdGpu::Regs::stencil_clear) stencil_clear{};
+        boost::container::static_vector<Target, AmdGpu::NUM_COLOR_BUFFERS + 1> targets;
+        RenderState state{};
+        vk::ImageLayout depth_layout{};
+    };
+    struct RenderStateMemoStats {
+        u64 draws{}, hits{}, begin_hits{}, begin_fallbacks{};
+        u64 miss_invalid{}, miss_key{}, miss_regs{}, miss_refused{}, miss_struct{}, miss_meta{},
+            miss_image{};
+        u64 refused_clear{}, refused_feedback{}, refused_overlap{}, refused_rebind{},
+            refused_gen{}, refused_other{};
+        u64 epoch_moved{}, verify_prepare{}, verify_begin{}, mismatches{};
+    };
+    RenderStateMemo rs_memo;
+    RenderStateMemoStats rs_stats;
+    /// Depth layout BeginRendering transitioned the depth target to (valid when one is bound).
+    vk::ImageLayout rs_last_depth_layout{};
+    [[nodiscard]] bool RenderStateMemoRegsEqual(u32 num_cbs) const;
+    /// True when the entry serves this draw. With `apply` it also does what PrepareRenderState
+    /// leaves behind (target flags, bound_images, access touches).
+    [[nodiscard]] bool RenderStateMemoMatch(const GraphicsPipeline* pipeline, bool apply);
+    /// After BindResources: the entry can still stand in for BeginRendering.
+    [[nodiscard]] bool RenderStateMemoBeginOk();
+    void RenderStateMemoBegin(RenderState& state);
+    void RenderStateMemoStore(const GraphicsPipeline* pipeline, const RenderState& state,
+                              size_t bound_begin, u64 struct_gen_at_entry);
+    void RenderStateMemoLog();
 
 };
 
