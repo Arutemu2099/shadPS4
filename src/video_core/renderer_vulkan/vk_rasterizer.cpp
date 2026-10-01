@@ -1246,7 +1246,8 @@ const GraphicsPipeline* Rasterizer::RelookupDrawFront() {
 }
 
 void Rasterizer::ExecuteDraw(const SplitDraw& draw,
-                             const std::array<Shader::BoundStage, Shader::MaxStageTypes>& stages) {
+                             const std::array<Shader::BoundStage, Shader::MaxStageTypes>& stages,
+                             const AmdGpu::CpSplit::VertexInputsPayload* front_vi) {
     // CP split, back thread: Draw/DrawIndirect with the front's classification, lookup and
     // per-stage data. Registers come from the back's mirror through BackRegs().
     // With run-ahead the front runs concurrently: nothing here may read front state (regs,
@@ -1296,7 +1297,7 @@ void Rasterizer::ExecuteDraw(const SplitDraw& draw,
     if (begin()) {
         // The lookup ran on the front: the Pipeline phase and pipeline_ns are 0 here.
         DrawTail(draw.pipeline, draw.args.is_indexed, draw.args.index_offset, sample, t_entry,
-                 t_entry, 0);
+                 t_entry, 0, front_vi);
     }
 }
 
@@ -1493,7 +1494,8 @@ bool Rasterizer::AscCandidate(const ComputePipeline* pipeline) const {
 void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset,
                           Common::DrawSampleProbe& sample,
                           std::chrono::steady_clock::time_point t_entry,
-                          std::chrono::steady_clock::time_point t_pipeline, u64 pipeline_ns) {
+                          std::chrono::steady_clock::time_point t_pipeline, u64 pipeline_ns,
+                          const AmdGpu::CpSplit::VertexInputsPayload* front_vi) {
     const auto& regs = liverpool->BackRegs();
     std::array<u64, DcCount> dc{};
     u64 dc_t = g_draw_cost ? __rdtsc() : 0;
@@ -1687,7 +1689,7 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
 
     sample.BeginPhase(Common::DrawSampleProbe::Phase::VertexIndexBuffers);
     buffer_cache.BindVertexBuffers(*pipeline, GetBoundStage(Shader::LogicalStage::Vertex),
-                                   buffer_barriers);
+                                   buffer_barriers, front_vi);
     if (is_indexed) {
         buffer_cache.BindIndexBuffer(index_offset, buffer_barriers);
     }

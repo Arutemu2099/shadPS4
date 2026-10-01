@@ -177,6 +177,23 @@ bool RegBatch() {
     return batch;
 }
 
+int FrontDerive() {
+    static const int mode = [] {
+        const char* value = std::getenv("SHADPS4_CP_SPLIT_FRONT_DERIVE");
+        const int v = value ? value[0] - '0' : 0;
+        return v == 1 || v == 2 ? v : 0;
+    }();
+    return mode;
+}
+
+bool FrontDeriveVertexInputSkip() {
+    static const bool skip = [] {
+        const char* value = std::getenv("SHADPS4_CP_SPLIT_FRONT_DERIVE_VI_SKIP");
+        return !(value && value[0] == '0');
+    }();
+    return skip;
+}
+
 Channel::Channel(u32 ring_bytes) {
     ASSERT_MSG(ring_bytes >= (64u << 10) && (ring_bytes & (ring_bytes - 1)) == 0,
                "CP split ring size must be a power of two >= 64 KB");

@@ -30,7 +30,10 @@
 
 namespace AmdGpu {
 struct Liverpool;
+namespace CpSplit {
+struct VertexInputsPayload;
 }
+} // namespace AmdGpu
 
 namespace Core {
 class MemoryManager;
@@ -156,9 +159,11 @@ public:
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false,
                     bool offload_write = false);
 
-    /// Binds host vertex buffers for the current draw.
+    /// Binds host vertex buffers for the current draw. `front_vi`: with CP split FRONT_DERIVE,
+    /// the vertex inputs the front derived for this draw (cp_split.h), else null.
     void BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline, const Shader::BoundStage& vs,
-                           boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers);
+                           boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers,
+                           const AmdGpu::CpSplit::VertexInputsPayload* front_vi = nullptr);
 
     /// Bind host index buffer for the current draw.
     void BindIndexBuffer(u32 index_offset,
@@ -581,6 +586,11 @@ private:
     void TouchBuffer(const Buffer& buffer);
 
     void DeleteBuffer(BufferId buffer_id);
+
+    /// FRONT_DERIVE=1: BindVertexBuffers from the front's block (no V# reads, no sort here).
+    void BindVertexBuffersDerived(
+        const AmdGpu::CpSplit::VertexInputsPayload& vi,
+        boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers);
 
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;

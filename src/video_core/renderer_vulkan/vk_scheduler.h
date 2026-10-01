@@ -134,6 +134,13 @@ struct DynamicState {
         bool feedback_loop_enabled : 1;
     } dirty_state{};
 
+    /// CP split FRONT_DERIVE: the command buffer's setVertexInputEXT state is unknown. Set by
+    /// Invalidate, cleared by BufferCache::BindVertexBuffers when it records one; deliberately
+    /// not a dirty_state bit (Scheduler::CommitDynamicState rebuilds those from scratch, and
+    /// Commit does not record this state). While clear, a draw whose description id equals the
+    /// one recorded last skips its setVertexInputEXT.
+    bool vertex_input_unknown{true};
+
     Viewports viewports{};
     Scissors scissors{};
 
@@ -176,6 +183,7 @@ struct DynamicState {
     /// Invalidates all dynamic state to be flushed into the next command buffer.
     void Invalidate() {
         std::memset(&dirty_state, 0xFF, sizeof(dirty_state));
+        vertex_input_unknown = true;
     }
 
     void SetViewports(const Viewports& viewports_) {

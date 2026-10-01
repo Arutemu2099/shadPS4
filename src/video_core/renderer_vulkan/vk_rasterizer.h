@@ -92,9 +92,11 @@ public:
     /// empty-draw counters), against the front's registers and pipeline cache.
     const GraphicsPipeline* RelookupDrawFront();
     /// Back thread: runs a draw the front prepared, with the per-stage user data it copied
-    /// (indexed by LogicalStage). Registers come from Liverpool::BackRegs().
+    /// (indexed by LogicalStage) and, with FRONT_DERIVE, the vertex inputs it derived (null
+    /// otherwise). Registers come from Liverpool::BackRegs().
     void ExecuteDraw(const SplitDraw& draw,
-                     const std::array<Shader::BoundStage, Shader::MaxStageTypes>& stages);
+                     const std::array<Shader::BoundStage, Shader::MaxStageTypes>& stages,
+                     const AmdGpu::CpSplit::VertexInputsPayload* front_vi);
     /// Back thread: runs a dispatch the front looked up. The caller points
     /// Liverpool::BackCsRegs() at the record's ComputeProgram snapshot.
     void ExecuteDispatch(const ComputePipeline* pipeline,
@@ -191,10 +193,12 @@ private:
     static bool SkipEmptyDraw(const AmdGpu::Regs& regs);
 
     // Everything after the pipeline lookup, shared by the inline path and the CP split's back.
-    // bound_stages must already hold the draw's stage data.
+    // bound_stages must already hold the draw's stage data. `front_vi`: the split record's
+    // FRONT_DERIVE block (null on the inline path and without the flag).
     void DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset,
                   Common::DrawSampleProbe& sample, std::chrono::steady_clock::time_point t_entry,
-                  std::chrono::steady_clock::time_point t_pipeline, u64 pipeline_ns);
+                  std::chrono::steady_clock::time_point t_pipeline, u64 pipeline_ns,
+                  const AmdGpu::CpSplit::VertexInputsPayload* front_vi = nullptr);
     void DrawIndirectTail(const GraphicsPipeline* pipeline, bool is_indexed, VAddr arg_address,
                           u32 offset, u32 stride, u32 max_count, VAddr count_address);
     void DispatchDirectTail(const ComputePipeline* pipeline);

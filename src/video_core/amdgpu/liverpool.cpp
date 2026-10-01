@@ -770,6 +770,9 @@ struct SplitDrawRecord {
     const void* cmd_address; ///< For the host marker text only (formatted, never read).
     u32 stage_count;
     u32 verify;              ///< DrawVerifyFull / DrawVerifySnapshot (VERIFY only), else 0.
+    u32 vi_bytes;            ///< FRONT_DERIVE: bytes of the VertexInputsPayload block after the
+                             ///< stage blocks (0: none).
+    u32 pad;
 };
 static_assert(sizeof(SplitDrawRecord) % 8 == 0);
 
@@ -1184,6 +1187,10 @@ Liverpool::Liverpool() {
             split_post_fence = false;
         }
         split_disp_guard = CpSplit::DispGuard();
+        split_front_derive = CpSplit::FrontDerive();
+        if (split_front_derive != 0) {
+            front_vi = std::make_unique<CpSplit::VertexInputsDerived>();
+        }
         split_verify_every = split_run_ahead ? CpSplit::VerifyEvery() : 1u;
         split = std::make_unique<CpSplit::Channel>();
         mirror = std::make_unique<CpSplit::BackMirror>();
@@ -1214,6 +1221,14 @@ Liverpool::Liverpool() {
             }
         } else {
             LOG_INFO(Render, "CpSplit: on (depth 0){}", split_verify ? ", VERIFY" : "");
+        }
+        if (split_front_derive != 0) {
+            const char* detail = split_front_derive == 2 ? ", verify"
+                                 : CpSplit::FrontDeriveVertexInputSkip()
+                                     ? ", setVertexInputEXT skip"
+                                     : "";
+            LOG_INFO(Render, "CpSplit: FRONT_DERIVE {} (vertex inputs{})", split_front_derive,
+                     detail);
         }
     }
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
@@ -1421,6 +1436,12 @@ void Liverpool::ExecuteDrawRecord(const CpSplit::RecordHeader& record) {
     std::array<Shader::BoundStage, Shader::MaxStageTypes> stages{};
     const u8* stages_end =
         ReadStages(reinterpret_cast<const u8*>(&rec + 1), rec.stage_count, stages);
+    // FRONT_DERIVE block (read by BufferCache::BindVertexBuffers), between stages and snapshot.
+    const CpSplit::VertexInputsPayload* vi_block = nullptr;
+    if (rec.vi_bytes != 0) {
+        vi_block = reinterpret_cast<const CpSplit::VertexInputsPayload*>(stages_end);
+        stages_end += rec.vi_bytes;
+    }
     if (rec.verify & DrawVerifyFull) {
         VerifyMirror("draw", record.seq, nullptr);
         VerifyStages(stages, record.seq);
@@ -1448,10 +1469,10 @@ void Liverpool::ExecuteDrawRecord(const CpSplit::RecordHeader& record) {
     }
     if (rec.marker) {
         rasterizer->ScopeMarkerBegin(fmt::format("gfx:{}:{}", rec.cmd_address, rec.marker));
-        rasterizer->ExecuteDraw(rec.draw, stages);
+        rasterizer->ExecuteDraw(rec.draw, stages, vi_block);
         rasterizer->ScopeMarkerEnd();
     } else {
-        rasterizer->ExecuteDraw(rec.draw, stages);
+        rasterizer->ExecuteDraw(rec.draw, stages, vi_block);
     }
 }
 
@@ -1986,6 +2007,33 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
             }
         }
     }
+    // FRONT_DERIVE: derived here, before the Sync below and from the same Info the stage copy
+    // reads, so the V# table reads happen at parse time (whether that differs from the back's
+    // read at execute time is what mode 2 measures). Not for indirect draws: DrawIndirectTail
+    // keeps the back-side derivation.
+    u32 vi_bytes = 0;
+    if (split_front_derive != 0 && has_stages && !args.is_indirect) {
+        const auto stages = draw.pipeline->GetStages();
+        const Shader::BoundStage vs{stages[static_cast<u32>(Shader::LogicalStage::Vertex)]};
+        vi_bytes = draw.pipeline->DeriveVertexInputs(*front_vi, regs.vgt_instance_step_rate_0,
+                                                     regs.vgt_instance_step_rate_1, vs);
+        bytes += vi_bytes;
+        // Number the description part: the back skips the setVertexInputEXT of a repeated id.
+        auto& vi = *front_vi;
+        bool same = vi.header.count == front_vi_prev_count;
+        for (u32 i = 0; same && i < vi.header.count; ++i) {
+            same = std::memcmp(&vi.attribs[i].desc, &front_vi_prev[i],
+                               sizeof(CpSplit::VertexInputDesc)) == 0;
+        }
+        if (!same) {
+            ++front_vi_desc_id;
+            front_vi_prev_count = vi.header.count;
+            for (u32 i = 0; i < vi.header.count; ++i) {
+                front_vi_prev[i] = vi.attribs[i].desc;
+            }
+        }
+        vi.header.desc_id = front_vi_desc_id;
+    }
     if (verify == DrawVerifySnapshot) {
         bytes += VerifySnapshotBytes;
     }
@@ -1996,6 +2044,8 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
     rec->cmd_address = header;
     rec->stage_count = 0;
     rec->verify = verify;
+    rec->vi_bytes = vi_bytes;
+    rec->pad = 0;
     // Copied now: the front's next lookup rewrites these Info fields (inventory 4.4). With
     // run-ahead this is what makes the record self-contained: the back reads user data, flat
     // buffer and pgm_base only from here, and the Info only for its immutable part.
@@ -2008,6 +2058,9 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
                 ++rec->stage_count;
             }
         }
+    }
+    if (vi_bytes != 0) {
+        out = front_vi->Write(out);
     }
     if (verify == DrawVerifySnapshot) {
         WriteVerifySnapshot(out, regs, last_cb_extent, last_db_extent);

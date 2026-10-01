@@ -19,6 +19,10 @@ class BufferCache;
 class TextureCache;
 } // namespace VideoCore
 
+namespace AmdGpu::CpSplit {
+struct VertexInputsDerived;
+}
+
 namespace Vulkan {
 
 static constexpr u32 MaxShaderStages = static_cast<u32>(Shader::LogicalStage::NumLogicalStages);
@@ -113,6 +117,13 @@ public:
                          VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
                          VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0,
                          u32 step_rate_1, const Shader::BoundStage& vs) const;
+
+    /// CP split FRONT_DERIVE: GetVertexInputs plus BufferCache::BindVertexBuffers' range merge
+    /// as one record block (cp_split.h), the same function on either thread. Reads the fetch
+    /// shader, `vs` (one V# per attribute through its user data) and the two step rates. Returns
+    /// the block's bytes.
+    u32 DeriveVertexInputs(AmdGpu::CpSplit::VertexInputsDerived& out, u32 step_rate_0,
+                           u32 step_rate_1, const Shader::BoundStage& vs) const;
 
 private:
     void BuildDescSetLayout(SerializationSupport& sdata, bool preloading);

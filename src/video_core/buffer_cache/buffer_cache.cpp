@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <optional>
@@ -230,6 +231,10 @@ const bool g_write_fault_offload =
     g_write_fault_widen == '2' && EnvIs1("SHADPS4_WRITE_FAULT_OFFLOAD");
 const bool g_range_add_skip = EnvIs1("SHADPS4_RANGE_ADD_SKIP");
 const bool g_vb_repeat_stats = EnvIs1("SHADPS4_VB_REPEAT_STATS");
+/// SHADPS4_CP_SPLIT_FRONT_DERIVE (cp_split.h): 0 off, 1 use, 2 verify; and mode 1's
+/// setVertexInputEXT skip switch. See BindVertexBuffers.
+const int g_front_derive = AmdGpu::CpSplit::FrontDerive();
+const bool g_front_derive_vi_skip = AmdGpu::CpSplit::FrontDeriveVertexInputSkip();
 const bool g_written_memo = EnvIs1("SHADPS4_WRITTEN_MEMO");
 /// SHADPS4_BUFFER_RANGES_LOCK (default on; =0 disables): see BufferCache::buffer_ranges_mutex.
 /// Found 2026-09-28: a freeze's all-thread capture (logs/hang-night0928-1-*) had a guest job thread
@@ -3048,9 +3053,171 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     return true;
 }
 
+namespace {
+/// SHADPS4_CP_SPLIT_FRONT_DERIVE, the thread that executes draws (the CP back with the split):
+/// the description id of the setVertexInputEXT recorded last (0: unknown, a legacy record or
+/// none yet), counters, and a log line every ~10 s (the clock is checked every 4096 blocks).
+struct FrontDeriveState {
+    u64 recorded_desc_id{};
+    u64 last_desc_id{};
+    u64 draws{};         ///< Draw records carrying a block.
+    u64 shipped{};       ///< ... whose description id differs from the previous block's.
+    u64 reused{};        ///< setVertexInputEXT skipped (mode 1), or skippable (mode 2).
+    u64 verify_checks{};
+    u64 mismatches{};
+    u64 mismatches_total{};
+    u64 block_bytes{};
+    u64 window_start_ns{};
+    u32 calls{};
+    AmdGpu::CpSplit::VertexInputsDerived scratch{}; ///< Mode 2: this thread's own derivation.
+
+    void Note(const AmdGpu::CpSplit::VertexInputsPayload& vi) {
+        ++draws;
+        block_bytes += AmdGpu::CpSplit::VertexInputsBytes(vi.count, vi.range_count);
+        shipped += vi.desc_id != last_desc_id;
+        last_desc_id = vi.desc_id;
+        if ((++calls & 4095) == 0) {
+            MaybeLog();
+        }
+    }
+    void Mismatch(const char* what, u32 index, const AmdGpu::CpSplit::VertexInputsPayload& vi) {
+        ++mismatches;
+        if (++mismatches_total <= 16) {
+            LOG_WARNING(Render_Vulkan,
+                        "FrontDerive mismatch: {} {} (front block: {} attributes, {} ranges, "
+                        "desc_id {}; back derivation: {} attributes, {} ranges)",
+                        what, index, vi.count, vi.range_count, vi.desc_id, scratch.header.count,
+                        scratch.header.range_count);
+        }
+    }
+    void MaybeLog() {
+        const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                             std::chrono::steady_clock::now().time_since_epoch())
+                                             .count());
+        if (window_start_ns == 0) {
+            window_start_ns = now;
+            return;
+        }
+        if (now - window_start_ns < 10'000'000'000ull) {
+            return;
+        }
+        LOG_INFO(Render_Vulkan,
+                 "FrontDerive: mode={} draws={} shipped={} reused={} verify_checks={} "
+                 "mismatches={} mismatches_total={} block_bytes_per_draw={:.0f} window_s={:.1f}",
+                 g_front_derive, draws, shipped, reused, verify_checks, mismatches,
+                 mismatches_total, double(block_bytes) / double(std::max<u64>(draws, 1)),
+                 double(now - window_start_ns) / 1e9);
+        draws = shipped = reused = verify_checks = mismatches = block_bytes = 0;
+        window_start_ns = now;
+    }
+};
+FrontDeriveState g_fd;
+
+/// The 2EXT arrays of a block: what GetVertexInputs builds for setVertexInputEXT.
+void BuildVertexInputArrays(
+    const AmdGpu::CpSplit::VertexInputsPayload& vi,
+    Vulkan::VertexInputs<vk::VertexInputAttributeDescription2EXT>& attributes,
+    Vulkan::VertexInputs<vk::VertexInputBindingDescription2EXT>& bindings) {
+    const auto* attribs = AmdGpu::CpSplit::VertexInputAttribs(vi);
+    for (u32 i = 0; i < vi.count; ++i) {
+        const auto& desc = attribs[i].desc;
+        attributes.push_back(vk::VertexInputAttributeDescription2EXT{
+            .location = desc.location,
+            .binding = desc.location,
+            .format = static_cast<vk::Format>(desc.vk_format),
+            .offset = 0,
+        });
+        bindings.push_back(vk::VertexInputBindingDescription2EXT{
+            .binding = desc.location,
+            .stride = desc.stride,
+            .inputRate = desc.instanced ? vk::VertexInputRate::eInstance
+                                        : vk::VertexInputRate::eVertex,
+            .divisor = desc.divisor,
+        });
+    }
+}
+
+/// FRONT_DERIVE=2: derives the block again here (the same function; this thread's registers
+/// and the V# table as it reads now) and compares it with the front's; then compares the arrays
+/// mode 1 would record with the legacy GetVertexInputs output. False on a mismatch.
+bool FrontDeriveVerify(
+    const Vulkan::Instance& instance, const AmdGpu::Regs& regs,
+    const Vulkan::GraphicsPipeline& pipeline, const Shader::BoundStage& vs,
+    const AmdGpu::CpSplit::VertexInputsPayload& vi,
+    const Vulkan::VertexInputs<vk::VertexInputAttributeDescription2EXT>& attributes,
+    const Vulkan::VertexInputs<vk::VertexInputBindingDescription2EXT>& bindings) {
+    using namespace AmdGpu::CpSplit;
+    auto& fd = g_fd;
+    ++fd.verify_checks;
+    pipeline.DeriveVertexInputs(fd.scratch, regs.vgt_instance_step_rate_0,
+                                regs.vgt_instance_step_rate_1, vs);
+    const auto* attribs = VertexInputAttribs(vi);
+    const auto* ranges = VertexInputRanges(vi);
+    const char* what = nullptr;
+    u32 index = 0;
+    if (fd.scratch.header.count != vi.count) {
+        what = "attribute count";
+    } else if (fd.scratch.header.range_count != vi.range_count) {
+        what = "range count";
+    }
+    for (u32 i = 0; !what && i < vi.count; ++i) {
+        if (std::memcmp(&fd.scratch.attribs[i], &attribs[i], sizeof(VertexInputAttrib)) != 0) {
+            what = std::memcmp(&fd.scratch.attribs[i].desc, &attribs[i].desc,
+                               sizeof(VertexInputDesc)) != 0
+                       ? "attribute description"
+                       : "attribute buffer";
+            index = i;
+        }
+    }
+    for (u32 i = 0; !what && i < vi.range_count; ++i) {
+        if (std::memcmp(&fd.scratch.ranges[i], &ranges[i], sizeof(VertexInputRange)) != 0) {
+            what = "range";
+            index = i;
+        }
+    }
+    if (!what && instance.IsVertexInputDynamicState()) {
+        Vulkan::VertexInputs<vk::VertexInputAttributeDescription2EXT> block_attributes;
+        Vulkan::VertexInputs<vk::VertexInputBindingDescription2EXT> block_bindings;
+        BuildVertexInputArrays(vi, block_attributes, block_bindings);
+        bool same = block_attributes.size() == attributes.size() &&
+                    block_bindings.size() == bindings.size();
+        for (size_t i = 0; same && i < attributes.size(); ++i) {
+            const auto& a = block_attributes[i];
+            const auto& b = block_bindings[i];
+            same = a.location == attributes[i].location && a.binding == attributes[i].binding &&
+                   a.format == attributes[i].format && a.offset == attributes[i].offset &&
+                   b.binding == bindings[i].binding && b.stride == bindings[i].stride &&
+                   b.inputRate == bindings[i].inputRate && b.divisor == bindings[i].divisor;
+            index = static_cast<u32>(i);
+        }
+        if (!same) {
+            what = "vulkan arrays";
+        }
+    }
+    if (what) {
+        fd.Mismatch(what, index, vi);
+    }
+    return what == nullptr;
+}
+} // namespace
+
 void BufferCache::BindVertexBuffers(
     const Vulkan::GraphicsPipeline& pipeline, const Shader::BoundStage& vs,
-    boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers) {
+    boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers,
+    const AmdGpu::CpSplit::VertexInputsPayload* front_vi) {
+    // SHADPS4_CP_SPLIT_FRONT_DERIVE: a split draw record may carry everything below up to the
+    // ObtainBuffer loop, derived on the front (cp_split.h VertexInputsPayload). Mode 1 consumes
+    // it (BindVertexBuffersDerived); mode 2 verifies it against this thread's own derivation and
+    // the arrays built here, then uses its own result. Every other caller (no split, indirect
+    // draws) runs the path below unchanged.
+    const int fd_mode = front_vi ? g_front_derive : 0;
+    if (fd_mode != 0) {
+        g_fd.Note(*front_vi);
+    }
+    if (fd_mode == 1) {
+        BindVertexBuffersDerived(*front_vi, barriers);
+        return;
+    }
     const auto& regs = liverpool->BackRegs();
     Vulkan::VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
     Vulkan::VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
@@ -3058,8 +3225,17 @@ void BufferCache::BindVertexBuffers(
     Vulkan::VertexInputs<AmdGpu::Buffer> guest_buffers;
     pipeline.GetVertexInputs(attributes, bindings, divisors, guest_buffers,
                              regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1, vs);
+    const bool fd_verified =
+        fd_mode == 2 &&
+        FrontDeriveVerify(instance, regs, pipeline, vs, *front_vi, attributes, bindings);
 
     if (instance.IsVertexInputDynamicState()) {
+        auto& dynamic_state = scheduler.GetDynamicState();
+        if (fd_mode == 2) {
+            // Mode 1 would skip this record (the command buffer holds this description).
+            g_fd.reused += !dynamic_state.vertex_input_unknown &&
+                           front_vi->desc_id == g_fd.recorded_desc_id;
+        }
         // Update current vertex inputs.
         scheduler.RecordArrays(
             [](vk::CommandBuffer cmdbuf, auto bindings, auto attributes) {
@@ -3067,6 +3243,12 @@ void BufferCache::BindVertexBuffers(
             },
             std::span<const vk::VertexInputBindingDescription2EXT>{bindings},
             std::span<const vk::VertexInputAttributeDescription2EXT>{attributes});
+        if (g_front_derive != 0) {
+            // Also for a draw without a block (indirect): a later derived draw must not skip
+            // against an id this record did not establish.
+            dynamic_state.vertex_input_unknown = false;
+            g_fd.recorded_desc_id = fd_verified ? front_vi->desc_id : 0;
+        }
     }
 
     if (bindings.empty()) {
@@ -3107,6 +3289,20 @@ void BufferCache::BindVertexBuffers(
             } else {
                 prev_range.end_address = std::max(prev_range.end_address, range.end_address);
             }
+        }
+    }
+    if (fd_mode == 2) {
+        // The block's ranges against this merge (the derivation's merge vs the original one).
+        const auto* vi_ranges = AmdGpu::CpSplit::VertexInputRanges(*front_vi);
+        bool same = ranges_merged.size() == front_vi->range_count;
+        u32 index = 0;
+        for (size_t i = 0; same && i < ranges_merged.size(); ++i) {
+            same = ranges_merged[i].base_address == vi_ranges[i].base_address &&
+                   ranges_merged[i].end_address == vi_ranges[i].end_address;
+            index = static_cast<u32>(i);
+        }
+        if (!same) {
+            g_fd.Mismatch("merged ranges", index, *front_vi);
         }
     }
 
@@ -3180,6 +3376,100 @@ void BufferCache::BindVertexBuffers(
     scheduler.RecordArrays(
         [dynamic = instance.IsVertexInputDynamicState()](vk::CommandBuffer cmdbuf, auto buffers,
                                                          auto offsets, auto sizes, auto strides) {
+            if (dynamic) {
+                cmdbuf.bindVertexBuffers(0, u32(buffers.size()), buffers.data(), offsets.data());
+            } else {
+                cmdbuf.bindVertexBuffers2(0, u32(buffers.size()), buffers.data(), offsets.data(),
+                                          sizes.data(), strides.data());
+            }
+        },
+        std::span<const vk::Buffer>{host_buffers}, std::span<const vk::DeviceSize>{host_offsets},
+        std::span<const vk::DeviceSize>{host_sizes}, std::span<const vk::DeviceSize>{host_strides});
+}
+
+void BufferCache::BindVertexBuffersDerived(
+    const AmdGpu::CpSplit::VertexInputsPayload& vi,
+    boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers) {
+    // BindVertexBuffers with the front's block: the attributes, bindings and merged ranges are
+    // read from the record (no V# reads, no sort); the address-space and cache queries and the
+    // recording stay here.
+    using namespace AmdGpu::CpSplit;
+    const auto* attribs = VertexInputAttribs(vi);
+    const auto* vi_ranges = VertexInputRanges(vi);
+    const bool dynamic = instance.IsVertexInputDynamicState();
+    if (dynamic) {
+        auto& dynamic_state = scheduler.GetDynamicState();
+        if (g_front_derive_vi_skip && !dynamic_state.vertex_input_unknown &&
+            vi.desc_id == g_fd.recorded_desc_id) {
+            // The command buffer holds this description already: recorded for an earlier draw
+            // and nothing invalidated it since (DynamicState::Invalidate).
+            ++g_fd.reused;
+        } else {
+            Vulkan::VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+            Vulkan::VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+            BuildVertexInputArrays(vi, attributes, bindings);
+            scheduler.RecordArrays(
+                [](vk::CommandBuffer cmdbuf, auto bindings, auto attributes) {
+                    cmdbuf.setVertexInputEXT(bindings, attributes);
+                },
+                std::span<const vk::VertexInputBindingDescription2EXT>{bindings},
+                std::span<const vk::VertexInputAttributeDescription2EXT>{attributes});
+            dynamic_state.vertex_input_unknown = false;
+            g_fd.recorded_desc_id = vi.desc_id;
+        }
+    }
+
+    if (vi.count == 0) {
+        // No bindings: nothing further to do.
+        return;
+    }
+
+    // Map buffers for the merged ranges.
+    struct Mapped {
+        vk::Buffer vk_buffer;
+        u64 offset;
+    };
+    std::array<Mapped, MaxVertexInputs> mapped;
+    for (u32 i = 0; i < vi.range_count; ++i) {
+        const auto& range = vi_ranges[i];
+        const u64 size =
+            memory->ClampRangeSize(range.base_address, range.end_address - range.base_address);
+        const auto [buffer, offset] = ObtainBuffer(range.base_address, size, false);
+        mapped[i] = {buffer->buffer, offset};
+        if (IsRegionGpuModified(range.base_address, size)) {
+            if (auto barrier =
+                    buffer->GetBarrier(vk::AccessFlagBits2::eVertexAttributeRead,
+                                       vk::PipelineStageFlagBits2::eVertexAttributeInput)) {
+                barriers.emplace_back(*barrier);
+            }
+        }
+    }
+
+    // Bind vertex buffers. With dynamic vertex input the sizes and strides are not used
+    // (bindVertexBuffers), so they are not cloned into the recorder.
+    Vulkan::VertexInputs<vk::Buffer> host_buffers;
+    Vulkan::VertexInputs<vk::DeviceSize> host_offsets;
+    Vulkan::VertexInputs<vk::DeviceSize> host_sizes;
+    Vulkan::VertexInputs<vk::DeviceSize> host_strides;
+    for (u32 i = 0; i < vi.count; ++i) {
+        const auto& attrib = attribs[i];
+        if (attrib.range != VertexInputNoRange) {
+            ASSERT(attrib.range < vi.range_count);
+            host_buffers.emplace_back(mapped[attrib.range].vk_buffer);
+            host_offsets.push_back(mapped[attrib.range].offset + attrib.base_address -
+                                   vi_ranges[attrib.range].base_address);
+        } else {
+            host_buffers.emplace_back(VK_NULL_HANDLE);
+            host_offsets.push_back(0);
+        }
+        if (!dynamic) {
+            host_sizes.push_back(attrib.size);
+            host_strides.push_back(attrib.desc.stride);
+        }
+    }
+
+    scheduler.RecordArrays(
+        [dynamic](vk::CommandBuffer cmdbuf, auto buffers, auto offsets, auto sizes, auto strides) {
             if (dynamic) {
                 cmdbuf.bindVertexBuffers(0, u32(buffers.size()), buffers.data(), offsets.data());
             } else {

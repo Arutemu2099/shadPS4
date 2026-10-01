@@ -8,6 +8,7 @@
 #include "common/assert.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
+#include "video_core/amdgpu/cp_split.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -467,6 +468,81 @@ template void GraphicsPipeline::GetVertexInputs(
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
     VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1,
     const Shader::BoundStage& vs) const;
+
+u32 GraphicsPipeline::DeriveVertexInputs(AmdGpu::CpSplit::VertexInputsDerived& out,
+                                         u32 step_rate_0, u32 step_rate_1,
+                                         const Shader::BoundStage& vs) const {
+    using namespace AmdGpu::CpSplit;
+    using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
+    static_assert(MaxVertexInputs == MaxVertexBufferCount);
+    out.header = {};
+    if (fetch_shader && !fetch_shader->attributes.empty()) {
+        // The GetVertexInputs loop (the 2EXT instantiation: the divisor rides in the binding).
+        for (const auto& attrib : fetch_shader->attributes) {
+            ASSERT_MSG(out.header.count < MaxVertexInputs,
+                       "Vertex attribute binding count exceeded limit: {} >= {}",
+                       out.header.count, MaxVertexInputs);
+            const auto step_rate = attrib.GetStepRate();
+            const auto buffer = attrib.GetSharp(vs);
+            auto& a = out.attribs[out.header.count++];
+            a.desc.vk_format = static_cast<u32>(
+                LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt()));
+            a.desc.stride = buffer.GetStride();
+            a.desc.divisor = step_rate == InstanceIdType::OverStepRate0
+                                 ? step_rate_0
+                                 : (step_rate == InstanceIdType::OverStepRate1 ? step_rate_1 : 1);
+            a.desc.location = attrib.semantic;
+            a.desc.instanced = step_rate != InstanceIdType::None;
+            a.desc.pad = 0;
+            a.base_address = buffer.base_address;
+            a.size = buffer.GetSize();
+            a.range = VertexInputNoRange;
+            a.pad = 0;
+        }
+    }
+    // BindVertexBuffers' range list: the buffers with a base and a size, sorted by base
+    // (insertion sort: at most 32, usually a handful), connecting ranges merged.
+    std::array<VertexInputRange, MaxVertexInputs> sorted;
+    u32 num_sorted = 0;
+    for (u32 i = 0; i < out.header.count; ++i) {
+        const auto& a = out.attribs[i];
+        if (a.base_address == 0 || a.size == 0) {
+            continue;
+        }
+        const VertexInputRange range{a.base_address, a.base_address + a.size};
+        u32 pos = num_sorted++;
+        while (pos > 0 && sorted[pos - 1].base_address > range.base_address) {
+            sorted[pos] = sorted[pos - 1];
+            --pos;
+        }
+        sorted[pos] = range;
+    }
+    for (u32 i = 0; i < num_sorted; ++i) {
+        const auto& range = sorted[i];
+        if (i == 0 || out.ranges[out.header.range_count - 1].end_address < range.base_address) {
+            out.ranges[out.header.range_count++] = range;
+        } else {
+            auto& prev = out.ranges[out.header.range_count - 1];
+            prev.end_address = std::max(prev.end_address, range.end_address);
+        }
+    }
+    // The merged range each bound buffer falls in (BindVertexBuffers' find_if per buffer).
+    for (u32 i = 0; i < out.header.count; ++i) {
+        auto& a = out.attribs[i];
+        if (a.base_address == 0 || a.size == 0) {
+            continue;
+        }
+        u32 r = 0;
+        while (r < out.header.range_count &&
+               !(a.base_address >= out.ranges[r].base_address &&
+                 a.base_address < out.ranges[r].end_address)) {
+            ++r;
+        }
+        ASSERT(r < out.header.range_count);
+        a.range = static_cast<u16>(r);
+    }
+    return out.Bytes();
+}
 
 void GraphicsPipeline::BuildDescSetLayout(SerializationSupport& sdata, bool preloading) {
     boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32> bindings;

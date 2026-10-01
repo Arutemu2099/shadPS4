@@ -126,6 +126,14 @@ u32 DoneBatch();
 /// SHADPS4_CP_SPLIT_REG_BATCH=1: consecutive register writes are appended to the newest RegWrite
 /// record while it is unpublished (one record, several segments). Default off.
 bool RegBatch();
+/// SHADPS4_CP_SPLIT_FRONT_DERIVE: 0 = off (default); 1 = the front derives the vertex inputs of
+/// each draw (VertexInputsPayload) and the back uses them; 2 = verify: the back derives as
+/// today, compares with the record, counts and logs mismatches, and uses its own result.
+/// Read once.
+int FrontDerive();
+/// SHADPS4_CP_SPLIT_FRONT_DERIVE_VI_SKIP=0 (bisect switch, default on): mode 1 no longer skips
+/// the setVertexInputEXT of a draw whose description the command buffer already holds.
+bool FrontDeriveVertexInputSkip();
 
 /// True on the front thread (set by Liverpool::FrontProcess). The fault handlers use it to drain
 /// before a read fault downloads GPU data (inventory 4.6).
@@ -275,6 +283,76 @@ struct DrawArgs {
     u32 stride{};
     u32 max_count{};
     VAddr count_address{};
+};
+
+/// FRONT_DERIVE: the vertex-input derivation of BufferCache::BindVertexBuffers (the
+/// GraphicsPipeline::GetVertexInputs loop and the merged, sorted guest ranges), computed on the
+/// front in EmitDraw from the fetch shader, the vertex stage's user data (the V# table reads the
+/// stage copy's user data points at) and the front's VGT step-rate registers. Follows the stage
+/// blocks of a draw record (SplitDrawRecord::vi_bytes), before the VERIFY snapshot. Layout:
+/// VertexInputsPayload, VertexInputAttrib[count], VertexInputRange[range_count]; every part is a
+/// multiple of 8 bytes. Stays on the back: ClampRangeSize, ObtainBuffer, IsRegionGpuModified and
+/// the barriers, the recording.
+struct VertexInputsPayload {
+    u32 count;       ///< Fetch-shader attributes (= bindings). 0: an empty setVertexInputEXT.
+    u32 range_count; ///< Merged guest ranges (buffers with a base and a size), sorted by base.
+    u64 desc_id;     ///< 1-based; the front bumps it when the description part changes.
+};
+/// The description part: what setVertexInputEXT takes (a pure function of the fetch shader, the
+/// V# format / stride and the step rates).
+struct VertexInputDesc {
+    u32 vk_format; ///< vk::Format of the V#'s data / number format.
+    u32 stride;    ///< V# stride.
+    u32 divisor;   ///< Instance divisor (1 unless over a step rate).
+    u8 location;   ///< attrib.semantic (= binding).
+    u8 instanced;  ///< 1: vk::VertexInputRate::eInstance.
+    u16 pad;
+};
+constexpr u16 VertexInputNoRange = 0xffff;
+struct VertexInputAttrib {
+    VertexInputDesc desc;
+    VAddr base_address; ///< V# base plus the fetch instruction offset.
+    u32 size;           ///< V# size. Base 0 or size 0: no buffer, a null handle is bound.
+    u16 range;          ///< Index of the merged range holding base_address, else NoRange.
+    u16 pad;
+};
+struct VertexInputRange {
+    VAddr base_address;
+    VAddr end_address;
+};
+static_assert(sizeof(VertexInputsPayload) == 16 && sizeof(VertexInputAttrib) == 32 &&
+              sizeof(VertexInputRange) == 16);
+inline const VertexInputAttrib* VertexInputAttribs(const VertexInputsPayload& vi) {
+    return reinterpret_cast<const VertexInputAttrib*>(&vi + 1);
+}
+inline const VertexInputRange* VertexInputRanges(const VertexInputsPayload& vi) {
+    return reinterpret_cast<const VertexInputRange*>(VertexInputAttribs(vi) + vi.count);
+}
+/// Vulkan::MaxVertexBufferCount (checked where the derivation is defined).
+constexpr u32 MaxVertexInputs = 32;
+constexpr u32 VertexInputsBytes(u32 count, u32 range_count) {
+    return static_cast<u32>(sizeof(VertexInputsPayload) + count * sizeof(VertexInputAttrib) +
+                            range_count * sizeof(VertexInputRange));
+}
+/// A block at fixed capacity: the derivation's output (front), or the back's own derivation in
+/// verify mode.
+struct VertexInputsDerived {
+    VertexInputsPayload header{};
+    std::array<VertexInputAttrib, MaxVertexInputs> attribs{};
+    std::array<VertexInputRange, MaxVertexInputs> ranges{};
+
+    u32 Bytes() const {
+        return VertexInputsBytes(header.count, header.range_count);
+    }
+    /// Copies the block to `out` (8-aligned). Returns the end.
+    u8* Write(u8* out) const {
+        std::memcpy(out, &header, sizeof(header));
+        out += sizeof(header);
+        std::memcpy(out, attribs.data(), header.count * sizeof(VertexInputAttrib));
+        out += header.count * sizeof(VertexInputAttrib);
+        std::memcpy(out, ranges.data(), header.range_count * sizeof(VertexInputRange));
+        return out + header.range_count * sizeof(VertexInputRange);
+    }
 };
 
 /**

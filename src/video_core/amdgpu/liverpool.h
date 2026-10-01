@@ -451,6 +451,13 @@ private:
     u64 split_relookup_diffs{0};    ///< Back, VERIFY: ... whose re-lookup disagreed.
     u64 split_draw_relookup_checks{0}; ///< Back, run-ahead VERIFY: synced draws re-looked-up.
     u64 split_draw_relookup_diffs{0};  ///< Back, run-ahead VERIFY: ... whose re-lookup disagreed.
+    /// SHADPS4_CP_SPLIT_FRONT_DERIVE (0 / 1 / 2). Front: the derivation's output and the previous
+    /// draw's description part, which numbers descriptions (VertexInputsPayload::desc_id).
+    int split_front_derive{0};
+    std::unique_ptr<CpSplit::VertexInputsDerived> front_vi;
+    std::array<CpSplit::VertexInputDesc, CpSplit::MaxVertexInputs> front_vi_prev{};
+    u32 front_vi_prev_count{~0u}; ///< No previous description yet: the first draw bumps the id.
+    u64 front_vi_desc_id{0};
     bool back_in_call{false};    ///< Back: inside a Call record (the front is parked).
     std::unique_ptr<CpSplit::Channel> split;
     std::unique_ptr<CpSplit::BackMirror> mirror;
