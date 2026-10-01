@@ -586,10 +586,15 @@ void Channel::MaybeLog() {
              c.posted[static_cast<u32>(PostKind::Fence)]);
     {
         const auto& r = Common::ReadbackOffload::g_regime;
-        LOG_INFO(Render, "FaultRegime: jobs={} seq_vetoes={} sync_fallbacks={} (cumulative)",
+        LOG_INFO(Render,
+                 "FaultRegime: jobs={} seq_vetoes={} sync_fallbacks={} exact_clean={} "
+                 "exact_touched={} exact_overrun={} (cumulative)",
                  r.jobs.load(std::memory_order_relaxed),
                  r.seq_vetoes.load(std::memory_order_relaxed),
-                 r.sync_fallbacks.load(std::memory_order_relaxed));
+                 r.sync_fallbacks.load(std::memory_order_relaxed),
+                 r.exact_clean.load(std::memory_order_relaxed),
+                 r.exact_touched.load(std::memory_order_relaxed),
+                 r.exact_overrun.load(std::memory_order_relaxed));
     }
     std::string guard_checks;
     for (u32 r = 0; r < NumDrainReasons; ++r) {

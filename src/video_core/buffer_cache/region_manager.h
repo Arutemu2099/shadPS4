@@ -20,6 +20,7 @@
 #include "common/types.h"
 #include "video_core/buffer_cache/back_clean.h"
 #include "video_core/buffer_cache/dirty_epoch.h"
+#include "video_core/buffer_cache/gpu_write_log.h"
 #include "video_core/buffer_cache/fast_settings.h"
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/page_manager.h"
@@ -247,6 +248,12 @@ public:
                 // Counts every GPU write marking, including one that finds all bits already
                 // set, so an in-flight fault download can tell its snapshot went stale.
                 ++gpu_write_seq;
+                if (GpuWriteLog::Mode() != 0) {
+                    GpuWriteLog::Append(
+                        cpu_addr + start_page * TRACKER_BYTES_PER_PAGE,
+                        cpu_addr + std::min<size_t>(end_page, NUM_PAGES_PER_REGION) *
+                                       TRACKER_BYTES_PER_PAGE);
+                }
                 bits.SetRange(start_page, end_page);
             }
         } else {

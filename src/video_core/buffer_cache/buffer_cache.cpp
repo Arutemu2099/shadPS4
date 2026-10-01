@@ -1435,6 +1435,7 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
     const u64 tick = scheduler.CurrentTick();
     job->seqs.clear();
     memory_tracker->SnapshotGpuWriteSeq(addr, bytes, job->seqs);
+    job->write_log_pos = GpuWriteLog::Position();
     const bool admitted = fault_mapping_gate.TryAdmit(addr, bytes, [&] {
         // No GPU, memory-manager call or wait inside this callback. Unmap either blocks this
         // admission or observes the published window and settles it before removing pages.
@@ -2587,10 +2588,46 @@ bool BufferCache::CloseGuestCopy(FaultJob& job) {
     }
 }
 
+bool BufferCache::FaultJobUnwritten(const FaultJob& job) {
+    if (memory_tracker->GpuWriteSeqMatches(job.addr, job.size, job.seqs)) {
+        return true;
+    }
+    const int mode = GpuWriteLog::Mode();
+    if (mode == 0) {
+        return false;
+    }
+    // A region sequence moved: some GPU write marking landed in one of the job's 4 MiB
+    // regions since the snapshot. Every such marking logged its page range; the job is
+    // stale only if one of them intersects its window. The copy-list comparison in
+    // PublishFaultJob still follows and catches a window whose GPU-modified set changed.
+    const auto [window_begin, window_end] = TrackerPageSpan(job.addr, job.size);
+    u64 hit_begin = 0;
+    u64 hit_end = 0;
+    auto& regime = Offload::g_regime;
+    switch (GpuWriteLog::Check(job.write_log_pos, window_begin, window_end, hit_begin, hit_end)) {
+    case GpuWriteLog::Result::Clean:
+        regime.exact_clean.fetch_add(1, std::memory_order_relaxed);
+        return mode == 1;
+    case GpuWriteLog::Result::Overrun:
+        regime.exact_overrun.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    case GpuWriteLog::Result::Touched:
+        break;
+    }
+    const u64 touched = regime.exact_touched.fetch_add(1, std::memory_order_relaxed);
+    if (touched < 48 || (touched & 1023) == 0) {
+        LOG_INFO(Render,
+                 "FaultVetoTouched: #{} job {:#x}:{:#x} write={} log_age={} by {:#x}:{:#x}",
+                 touched, job.addr, job.size, job.is_write,
+                 GpuWriteLog::Position() - job.write_log_pos, hit_begin, hit_end - hit_begin);
+    }
+    return false;
+}
+
 bool BufferCache::PublishFaultJob(FaultJob& job, bool guest_copied) {
     // One uninterrupted command processor step: vote, compare, then mutate. Nothing here can
     // fault or submit, so no GPU write marking lands between the vote and the clears.
-    if (!memory_tracker->GpuWriteSeqMatches(job.addr, job.size, job.seqs)) {
+    if (!FaultJobUnwritten(job)) {
         Offload::Add(Offload::State().seq_vetoes);
         Offload::g_regime.seq_vetoes.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -2645,7 +2682,7 @@ bool BufferCache::PublishFaultJob(FaultJob& job, bool guest_copied) {
 BufferCache::VerifyResult BufferCache::VerifyFaultJob(FaultJob& job) {
     // Oracle for GPU writes that bypass the region sequence. It does not prove the absence
     // of races; it only compares two readbacks the sequence claims are identical.
-    if (!memory_tracker->GpuWriteSeqMatches(job.addr, job.size, job.seqs)) {
+    if (!FaultJobUnwritten(job)) {
         // Differing bytes are expected, so nothing is compared. The veto PublishFaultJob
         // would have cast is counted here, since it is no longer reached.
         Offload::Add(Offload::State().seq_vetoes);
@@ -2698,7 +2735,7 @@ BufferCache::VerifyResult BufferCache::VerifyFaultJob(FaultJob& job) {
     VerifyResult result = VerifyResult::Unverified;
     // Finish can reenter. A marking since then makes differing bytes legitimate; the job is
     // then vetoed by the same vote in PublishFaultJob's place.
-    if (!memory_tracker->GpuWriteSeqMatches(job.addr, job.size, job.seqs)) {
+    if (!FaultJobUnwritten(job)) {
         Offload::Add(Offload::State().seq_vetoes);
         Offload::g_regime.seq_vetoes.fetch_add(1, std::memory_order_relaxed);
     } else {

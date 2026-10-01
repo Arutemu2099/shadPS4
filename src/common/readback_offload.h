@@ -183,6 +183,8 @@ struct Counters {
 /// cumulatively next to the CpSplit window line.
 struct RegimeCounters {
     std::atomic<u64> jobs{}, seq_vetoes{}, sync_fallbacks{};
+    /// SHADPS4_FAULT_VETO_EXACT: jobs whose region sequence moved, by what the range log said.
+    std::atomic<u64> exact_clean{}, exact_touched{}, exact_overrun{};
 };
 inline RegimeCounters g_regime;
 

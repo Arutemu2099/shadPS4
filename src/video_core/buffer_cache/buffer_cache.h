@@ -299,12 +299,18 @@ private:
         VAddr mark_addr{};
         u64 mark_size{};
         std::vector<u64> seqs;
+        /// SHADPS4_FAULT_VETO_EXACT: GpuWriteLog position at the snapshot of `seqs`.
+        u64 write_log_pos{};
         std::unique_ptr<Buffer> staging;
         /// SHADPS4_FAULT_GUEST_COPY: who copies the staging bytes into guest memory.
         /// 0 open, 1 the owning guest thread is copying, 2 it has copied, 3 closed by the
         /// command processor (it copies itself, or the job is vetoed). See GuestCopyFaultJob.
         std::atomic<u32> guest_copy{0};
     };
+    /// The vote of a fault job: true if no GPU write marking touched it since its snapshot
+    /// (region sequences; with SHADPS4_FAULT_VETO_EXACT=1 a moved sequence is refined by the
+    /// logged ranges of those markings against the job's window). Command processor only.
+    bool FaultJobUnwritten(const FaultJob& job);
     /// Guest thread that owns `job`, after its GPU wait and before FinishFaultDownload.
     void GuestCopyFaultJob(FaultJob& job);
     /// Command processor, before a job is finalized: true if the guest thread has copied.

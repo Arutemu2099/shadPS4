@@ -311,6 +311,7 @@ public:
         for (size_t index = first; index <= last; ++index) {
             top_tier[index]->BumpGpuWriteSeq();
         }
+        LogGpuWrite(cpu_addr, size);
         return true;
     }
 
@@ -591,6 +592,17 @@ public:
             std::scoped_lock lk{manager->lock};
             manager->BumpGpuWriteSeq();
         });
+        LogGpuWrite(cpu_addr, size);
+    }
+
+    /// SHADPS4_FAULT_VETO_EXACT: every BumpGpuWriteSeq caller logs its range (whole tracker
+    /// pages), as ChangeRegionState<GPU, true> does for its own bump. Command processor only.
+    static void LogGpuWrite(VAddr cpu_addr, u64 size) noexcept {
+        if (GpuWriteLog::Mode() != 0 && size != 0) {
+            GpuWriteLog::Append(cpu_addr & ~(TRACKER_BYTES_PER_PAGE - 1),
+                                (cpu_addr + size + TRACKER_BYTES_PER_PAGE - 1) &
+                                    ~(TRACKER_BYTES_PER_PAGE - 1));
+        }
     }
 
 private:
