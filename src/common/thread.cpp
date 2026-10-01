@@ -504,14 +504,12 @@ std::string LogicalProcessorLoad() {
 }
 } // namespace
 
-void SampleThreadPlacement(const char* role, unsigned stride_log2) {
-    static const bool enabled = [] {
-        const char* value = std::getenv("SHADPS4_THREAD_STATS");
-        return value && value[0] == '1';
-    }();
-    if (!enabled) [[likely]] {
-        return;
-    }
+const bool g_thread_stats = [] {
+    const char* value = std::getenv("SHADPS4_THREAD_STATS");
+    return value && value[0] == '1';
+}();
+
+void SampleThreadPlacementSlow(const char* role, unsigned stride_log2) {
     thread_local ThreadPlacementState st;
     if ((++st.calls & ((1u << stride_log2) - 1)) != 0) {
         return;
@@ -583,7 +581,8 @@ void SampleThreadPlacement(const char* role, unsigned stride_log2) {
 void ApplyCommandProcessorPlacement() {}
 void ApplyHotThreadPlacement(HotThread) {}
 void SampleCommandProcessorCore() {}
-void SampleThreadPlacement(const char*, unsigned) {}
+const bool g_thread_stats = false;
+void SampleThreadPlacementSlow(const char*, unsigned) {}
 #endif
 
 std::string GetCurrentThreadName() {

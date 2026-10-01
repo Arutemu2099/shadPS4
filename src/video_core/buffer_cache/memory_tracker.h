@@ -31,6 +31,10 @@ inline const bool g_upload_precheck = [] {
     const char* env = std::getenv("SHADPS4_UPLOAD_PRECHECK");
     return env != nullptr && env[0] == '1';
 }();
+inline const bool g_gpu_mod_relaxed = [] {
+    const char* env = std::getenv("SHADPS4_GPU_MOD_RELAXED");
+    return env != nullptr && env[0] == '1';
+}();
 inline const bool g_fault_watch_outside = [] {
     const char* env = std::getenv("SHADPS4_FAULT_WATCH_OUTSIDE");
     return env != nullptr && env[0] == '1';
@@ -58,6 +62,14 @@ public:
 
     /// Returns true if a region has been modified from the GPU
     bool IsRegionGpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
+        if (g_gpu_mod_relaxed && Common::FaultMonitor::t_is_cp_thread) {
+            // No lock on the CP: see RegionManager::GpuModifiedInRangeRelaxed. The locked read
+            // was 1.0% of the CP back in fire (a41 profile), all of it in the spin lock.
+            return IteratePages<false>(
+                query_cpu_addr, query_size, [](RegionManager* manager, u64 offset, size_t size) {
+                    return manager->GpuModifiedInRangeRelaxed(offset, size);
+                });
+        }
         return IteratePages<false>(
             query_cpu_addr, query_size, [](RegionManager* manager, u64 offset, size_t size) {
                 std::scoped_lock lk{manager->lock};

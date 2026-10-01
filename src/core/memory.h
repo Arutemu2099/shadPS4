@@ -315,7 +315,10 @@ private:
         return std::prev(fmem_map.upper_bound(target));
     }
 
-    bool HasPhysicalBacking(VirtualMemoryArea vma) {
+    // By reference: the by-value parameter copied the area and its phys_areas std::map on every
+    // call (1.4% + allocator time of the CP back in fire, a41 profile 2026-10-01: every read-fault
+    // publication calls it per area through TryWriteBacking).
+    bool HasPhysicalBacking(const VirtualMemoryArea& vma) {
         return vma.type == VMAType::Direct || vma.type == VMAType::Flexible ||
                vma.type == VMAType::Pooled;
     }

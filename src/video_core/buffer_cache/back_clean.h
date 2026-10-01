@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -140,6 +141,7 @@ public:
     BackCleanCache() {
         if (g_back_clean != 0) {
             top = std::make_unique<Region*[]>(NumRegions);
+            full = std::make_unique<u64[]>(NumRegions / 64);
             head = DirtyLog::Start();
         }
     }
@@ -153,6 +155,7 @@ public:
         if (!ok) [[unlikely]] {
             ++generation;
             ++stats.resets;
+            std::fill_n(full.get(), NumRegions / 64, u64{0});
         }
     }
 
@@ -162,6 +165,14 @@ public:
         const u64 end = (addr + size + TRACKER_BYTES_PER_PAGE - 1) >> TRACKER_PAGE_BITS;
         while (page < end) {
             const u64 region = page / NUM_PAGES_PER_REGION;
+            // Fully verified regions are skipped through the summary, 64 regions per word:
+            // the average query spans ~11 regions (4 MiB each) and a per-region block lookup
+            // cost as much as the tracker walk it replaced (profile 2026-10-01).
+            const u32 skip = static_cast<u32>(std::countr_one(full[region / 64] >> (region % 64)));
+            if (skip != 0) {
+                page = (region + skip) * NUM_PAGES_PER_REGION;
+                continue;
+            }
             const u64 base = region * NUM_PAGES_PER_REGION;
             const u64 lo = page - base;
             const u64 hi = std::min<u64>(end - base, NUM_PAGES_PER_REGION);
@@ -206,6 +217,9 @@ public:
                 r->count += static_cast<u32>(std::popcount(mask & ~r->bits[word]));
                 r->bits[word] |= mask;
             }
+            if (r->count == NUM_PAGES_PER_REGION) {
+                full[region / 64] |= 1ULL << (region % 64);
+            }
             page = base + hi;
         }
     }
@@ -244,6 +258,7 @@ private:
         if (!r || r->generation != generation) {
             return;
         }
+        full[region / 64] &= ~(1ULL << (region % 64));
         const u64 lo = first_page - region * NUM_PAGES_PER_REGION;
         const u64 hi = std::min<u64>(lo + count, NUM_PAGES_PER_REGION);
         for (u64 word = lo / 64; word <= (hi - 1) / 64; ++word) {
@@ -254,6 +269,8 @@ private:
     }
 
     std::unique_ptr<Region*[]> top;
+    /// One bit per region: every page of it is verified (current generation). Private.
+    std::unique_ptr<u64[]> full;
     std::deque<Region> pool;
     u64 generation{1};
     u64 head{};

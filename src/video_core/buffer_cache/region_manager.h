@@ -170,6 +170,20 @@ public:
         return !cpu.AnyInRangeRelaxed(start_page, end_page) && gpu.AllInRange(start_page, end_page);
     }
 
+    /// SHADPS4_GPU_MOD_RELAXED, CP thread only: is any page of the range GPU-modified, read
+    /// without the region lock. GPU bits are set only on the CP; the one off-CP mutator clears
+    /// them (a deferred download's unmark), so a relaxed read returns what a locked read just
+    /// before or just after that clear would have returned.
+    bool GpuModifiedInRangeRelaxed(u64 offset, u64 size) const noexcept {
+        const size_t start_page = SanitizeAddress(offset) / TRACKER_BYTES_PER_PAGE;
+        const size_t end_page =
+            Common::DivCeil(SanitizeAddress(offset + size), TRACKER_BYTES_PER_PAGE);
+        if (start_page >= NUM_PAGES_PER_REGION || end_page <= start_page) {
+            return false;
+        }
+        return gpu.AnyInRangeRelaxed(start_page, end_page);
+    }
+
     /// Records a GPU write that sets no tracker bit, so in-flight fault downloads of this
     /// region drop their snapshot. Call under the region lock.
     void BumpGpuWriteSeq() noexcept {

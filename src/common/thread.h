@@ -69,6 +69,15 @@ void SampleCommandProcessorCore();
 /// follow the core's real clock, which the invariant TSC does not); every ~10 s the thread logs
 /// its processor histogram, migrations, CPU time and the clock probe (median and minimum).
 /// Explains run-to-run speed modes: placement and frequency versus extra work.
-void SampleThreadPlacement(const char* role, unsigned stride_log2 = 6);
+/// Cost, measured 2026-10-01 on a41 in fire: -3.3% FPS with the flag on (117.75 vs 121.3 / 122.0;
+/// the per-record call on the CP back, not the sampled work). Attribution runs only, never in
+/// an FPS comparison. Off: one inline test of a global per call site.
+extern const bool g_thread_stats;
+void SampleThreadPlacementSlow(const char* role, unsigned stride_log2);
+inline void SampleThreadPlacement(const char* role, unsigned stride_log2 = 6) {
+    if (g_thread_stats) [[unlikely]] {
+        SampleThreadPlacementSlow(role, stride_log2);
+    }
+}
 
 } // namespace Common
