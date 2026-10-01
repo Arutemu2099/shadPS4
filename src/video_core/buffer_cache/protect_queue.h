@@ -265,7 +265,26 @@ private:
                 if (wake_stats) [[unlikely]] {
                     sleeping = pending.empty();
                 }
-                if (steal_mode != 0) [[unlikely]] {
+                if (steal_mode != 0 && spin_ns != 0) [[unlikely]] {
+                    // As below, but a wake-up that finds the batch already stolen by a Fence
+                    // returns (enqueued moved past `seen`) so that polling starts again: a
+                    // Protector that only ever woke after the fence would otherwise re-block
+                    // here forever and never poll (Opus review 2026-09-30). It still blocks
+                    // only after setting `idle` under `mutex`.
+                    cv.wait(lk, stop, [&] {
+                        idle = pending.empty() &&
+                               enqueued.load(std::memory_order_relaxed) == seen;
+                        return !idle;
+                    });
+                    if (stop.stop_requested()) {
+                        return;
+                    }
+                    if (pending.empty()) {
+                        seen = enqueued.load(std::memory_order_relaxed);
+                        spin_from = Clock::now();
+                        continue;
+                    }
+                } else if (steal_mode != 0) [[unlikely]] {
                     // The predicate runs under `mutex` before every block, including after a
                     // wake-up that found the queue already stolen, so `idle` is true whenever
                     // this thread is blocked (see Push).

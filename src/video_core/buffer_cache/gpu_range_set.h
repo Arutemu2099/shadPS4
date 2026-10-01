@@ -84,6 +84,9 @@ public:
         if (mode == 0) {
             return icl.Contains(base, size);
         }
+        if (size == 0) {
+            return true; // as icl: the empty interval is contained in every set
+        }
         // Contained iff one joined interval covers the whole query.
         bool contained = false;
         if (size != 0) {
@@ -92,8 +95,13 @@ public:
                 contained = ++visits == 1 && lo == base && hi == base + size;
             });
         }
-        if (mode == 2 && size != 0 && contained != icl.Contains(base, size)) [[unlikely]] {
-            Mismatch("Contains", base, size);
+        if (mode == 2) [[unlikely]] {
+            // Verify behaves as mode 0: the icl answer is returned (Opus review 2026-09-30).
+            const bool reference = icl.Contains(base, size);
+            if (contained != reference) {
+                Mismatch("Contains", base, size);
+            }
+            return reference;
         }
         return contained;
     }
@@ -110,7 +118,7 @@ public:
             icl.ForEachInRange(base, size,
                                [&](VAddr lo, VAddr hi) { reference.emplace_back(lo, hi); });
             ++checks;
-            if (flat != reference) {
+            if (size != 0 && flat != reference) {
                 Mismatch("ForEachInRange", base, size);
             }
             if ((checks & 0xfffff) == 0) {
@@ -127,7 +135,7 @@ public:
 
     /// Number of stored intervals (flat modes: pieces, so one more per region boundary crossed).
     size_t Fragments() const {
-        return mode == 0 ? icl.m_ranges_set.iterative_size() : fragments;
+        return mode == 1 ? fragments : icl.m_ranges_set.iterative_size();
     }
 
 private:

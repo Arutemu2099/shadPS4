@@ -82,22 +82,36 @@ const bool g_upload_ahead_stats = EnvIs1("SHADPS4_UPLOAD_AHEAD_STATS");
 const bool g_deferred_copy_census = EnvIs1("SHADPS4_DEFERRED_COPY_CENSUS");
 
 struct DeferredCopyCensus {
-    std::atomic<u64> copies{0}, bytes{0}, unreadable{0}, changed{0}, after_label{0},
-        changed_after_label{0}, changed_bytes_after_label{0}, max_label_lag{0};
+    std::atomic<u64> copies{0}, bytes{0}, ahead{0}, unreadable{0}, bound{0}, changed{0},
+        after_label{0}, changed_after_label{0}, max_label_lag{0};
 };
 DeferredCopyCensus g_dcc;
 
+/// At most the first and the last 512 bytes of [data, data + len): cheap enough to leave the
+/// timing alone (hashing whole copies ran the fire scene at 39 FPS and saturated the recorder).
+u64 CensusSampleHash(const u8* data, u64 len) {
+    constexpr u64 Edge = 512;
+    if (len <= 2 * Edge) {
+        return XXH3_64bits(data, len);
+    }
+    return XXH3_64bits(data, Edge) ^ (XXH3_64bits(data + len - Edge, Edge) * 0x9E3779B97F4A7C15ULL);
+}
+
 /// Recording thread, right after the guest -> staging copy of `dest`.
-void NoteDeferredCopyCensus(VAddr addr, const u8* dest, u64 size, u64 hash, u64 label_seq) {
+void NoteDeferredCopyCensus(VAddr addr, const u8* dest, u64 size, u64 hash, u64 label_seq,
+                            u32 hash_off, u32 hash_len, u32 kind) {
     auto& c = g_dcc;
     const u64 n = c.copies.fetch_add(1, std::memory_order_relaxed) + 1;
     c.bytes.fetch_add(size, std::memory_order_relaxed);
-    if (label_seq == ~0ULL) {
+    if (kind == 2) {
+        c.ahead.fetch_add(1, std::memory_order_relaxed);
+    } else if (kind == 3) {
         c.unreadable.fetch_add(1, std::memory_order_relaxed);
-    } else {
+    } else if (kind == 1) {
+        c.bound.fetch_add(1, std::memory_order_relaxed);
         const u64 now_seq = VideoCore::g_guest_label_seq.load(std::memory_order_relaxed);
         const bool after = now_seq != label_seq;
-        const bool changed = XXH3_64bits(dest, size) != hash;
+        const bool changed = CensusSampleHash(dest + hash_off, hash_len) != hash;
         c.after_label.fetch_add(after, std::memory_order_relaxed);
         c.changed.fetch_add(changed, std::memory_order_relaxed);
         if (after) {
@@ -108,22 +122,20 @@ void NoteDeferredCopyCensus(VAddr addr, const u8* dest, u64 size, u64 hash, u64 
         }
         if (after && changed) {
             const u64 k = c.changed_after_label.fetch_add(1, std::memory_order_relaxed) + 1;
-            c.changed_bytes_after_label.fetch_add(size, std::memory_order_relaxed);
             if (k <= 24) {
                 LOG_WARNING(Render,
-                            "DeferredCopyCensus: guest bytes changed after a label: {:#x}+{:#x} "
-                            "(labels between record and copy: {})",
-                            addr, size, now_seq - label_seq);
+                            "DeferredCopyCensus: bound guest bytes changed after a label: "
+                            "{:#x}+{:#x} (labels between record and copy: {})",
+                            addr + hash_off, hash_len, now_seq - label_seq);
             }
         }
     }
     if ((n & 0x3ffff) == 0) {
         LOG_INFO(Render,
-                 "DeferredCopyCensus: copies={} bytes={} unreadable={} changed={} "
-                 "copied_after_label={} changed_after_label={} changed_bytes_after_label={} "
-                 "max_labels_between={}",
-                 n, c.bytes.load(), c.unreadable.load(), c.changed.load(), c.after_label.load(),
-                 c.changed_after_label.load(), c.changed_bytes_after_label.load(),
+                 "DeferredCopyCensus: copies={} bytes={} upload_ahead={} unreadable={} | bound={} "
+                 "changed={} copied_after_label={} changed_after_label={} max_labels_between={}",
+                 n, c.bytes.load(), c.ahead.load(), c.unreadable.load(), c.bound.load(),
+                 c.changed.load(), c.after_label.load(), c.changed_after_label.load(),
                  c.max_label_lag.load());
     }
 }
@@ -3942,6 +3954,10 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     // Measured 2026-09-23: VirtualProtect was 10.2% and this copy ~2% of CP wall time.
     const bool deferred_protect = g_deferred_protect;
     const bool defer = deferred_protect && scheduler.IsAsyncRecording();
+    if (g_deferred_copy_census) [[unlikely]] {
+        census_lo = device_addr;
+        census_hi = device_addr + size;
+    }
     if (defer) {
         deferred_protects.clear();
         deferred_copies.clear();
@@ -4072,7 +4088,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                         }
                         if (g_deferred_copy_census) [[unlikely]] {
                             NoteDeferredCopyCensus(copy.addr, copy.dest, copy.size, copy.hash,
-                                                   copy.label_seq);
+                                                   copy.label_seq, copy.hash_off, copy.hash_len,
+                                                   copy.census_kind);
                         }
                     }
                     sched->BeginTransferOnWorker(cmdbuf, {}, write);
@@ -4095,7 +4112,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                         }
                         if (g_deferred_copy_census) [[unlikely]] {
                             NoteDeferredCopyCensus(copy.addr, copy.dest, copy.size, copy.hash,
-                                                   copy.label_seq);
+                                                   copy.label_seq, copy.hash_off, copy.hash_len,
+                                                   copy.census_kind);
                         }
                     }
                     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
@@ -4171,16 +4189,36 @@ vk::Buffer BufferCache::ReserveDeferredCopies(Buffer& buffer, std::span<vk::Buff
         deferred_copies.push_back(
             {buffer.CpuAddr() + copy.dstOffset, staging + copy.srcOffset, copy.size});
         if (g_deferred_copy_census) [[unlikely]] {
-            // The guest bytes as the command processor sees them now (through the backing, like
-            // the deferred copy itself), hashed in a scratch buffer.
-            static thread_local std::vector<u8> scratch;
+            // The part of this copy inside the binding being served, as the command processor
+            // sees it now (through the backing, like the deferred copy itself). The rest of the
+            // copied pages belongs to other allocations the guest may still be filling.
             auto& census = deferred_copies.back();
-            scratch.resize(census.size);
-            if (memory->TryReadBacking(census.addr, scratch.data(), census.size)) {
-                census.hash = XXH3_64bits(scratch.data(), census.size);
+            const VAddr lo = std::max(census.addr, census_lo);
+            const VAddr hi = std::min<VAddr>(census.addr + census.size, census_hi);
+            if (t_upload_ahead_active) {
+                census.census_kind = 2;
+            } else if (lo < hi) {
+                constexpr u64 Edge = 512;
+                const u64 len = hi - lo;
+                std::array<u8, 2 * Edge> sample;
+                bool ok;
+                u64 hash;
+                if (len <= 2 * Edge) {
+                    ok = memory->TryReadBacking(lo, sample.data(), len);
+                    hash = ok ? XXH3_64bits(sample.data(), len) : 0;
+                } else {
+                    ok = memory->TryReadBacking(lo, sample.data(), Edge) &&
+                         memory->TryReadBacking(hi - Edge, sample.data() + Edge, Edge);
+                    hash = ok ? XXH3_64bits(sample.data(), Edge) ^
+                                    (XXH3_64bits(sample.data() + Edge, Edge) *
+                                     0x9E3779B97F4A7C15ULL)
+                              : 0;
+                }
+                census.census_kind = ok ? 1 : 3;
+                census.hash = hash;
+                census.hash_off = static_cast<u32>(lo - census.addr);
+                census.hash_len = static_cast<u32>(len);
                 census.label_seq = VideoCore::g_guest_label_seq.load(std::memory_order_relaxed);
-            } else {
-                census.label_seq = ~0ULL;
             }
         }
         copy.srcOffset += offset;

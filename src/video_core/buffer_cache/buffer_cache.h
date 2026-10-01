@@ -554,11 +554,19 @@ private:
         VAddr addr;
         u8* dest;
         u64 size;
-        /// SHADPS4_DEFERRED_COPY_CENSUS only: hash of the guest range and the guest label count
-        /// when the copy was recorded (label_seq ~0: the range could not be read then).
+        /// SHADPS4_DEFERRED_COPY_CENSUS only: a sampled hash of the part of this copy that lies in
+        /// the bound range (hash_off / hash_len inside the copy), and the guest label count when
+        /// the copy was recorded. census_kind: 0 = not counted, 1 = bound range, 2 = upload-ahead
+        /// page (speculative, nothing consumes it yet), 3 = unreadable at record time.
         u64 hash{};
         u64 label_seq{};
+        u32 hash_off{};
+        u32 hash_len{};
+        u32 census_kind{};
     };
+    /// SHADPS4_DEFERRED_COPY_CENSUS: the binding SynchronizeBuffer is serving (CP thread only).
+    VAddr census_lo{};
+    VAddr census_hi{};
     std::vector<DeferredCopy> deferred_copies;
     /// SHADPS4_READBACK_PRODUCER_STATS=1: last command tick that GPU-wrote each 1 MB slot, to
     /// measure whether readback data is already complete when a fault asks for it.
