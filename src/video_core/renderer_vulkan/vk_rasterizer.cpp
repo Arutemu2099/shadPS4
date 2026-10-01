@@ -767,6 +767,10 @@ Rasterizer::DrawClass Rasterizer::ClassifyDraw(const AmdGpu::Regs& regs) {
 }
 
 void Rasterizer::ExecuteFilteredDraw(DrawClass draw_class) {
+    if (draw_class != DrawClass::Draw) {
+        // RENDER_STATE_MEMO: these touch render-target metadata outside DrawTail.
+        rs_memo.valid = false;
+    }
     switch (draw_class) {
     case DrawClass::Draw:
         break;
@@ -1537,6 +1541,7 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
         }
         if (!same) {
             rs_would = false;
+            rs_memo.valid = false;
             if (++rs_stats.mismatches <= 16) {
                 LOG_CRITICAL(Render_Vulkan,
                              "RenderStateMemo mismatch: prepare resolved {} targets, memo {}",
@@ -1623,6 +1628,12 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     } else {
         const bool rs_begin_would = rs_would && RenderStateMemoBeginOk();
         rs_stats.begin_fallbacks += rs_hit;
+        RenderState rs_probe;
+        if (rs_begin_would) {
+            // Verify: run the hit-side begin as well (its effects are repeated by the full
+            // path right after) and compare what it would have returned.
+            RenderStateMemoBegin(rs_probe);
+        }
         state = BeginRendering(pipeline);
         if (rs_mode != 0) {
             if (rs_begin_would && !attachment_feedback_loop) {
@@ -1630,7 +1641,7 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
                 ++rs_stats.verify_begin;
                 const bool depth_same = !db_desc.first ||
                                         rs_last_depth_layout == rs_memo.depth_layout;
-                if (!(state == rs_memo.state) || !depth_same) {
+                if (!(state == rs_memo.state) || !depth_same || !(state == rs_probe)) {
                     if (++rs_stats.mismatches <= 16) {
                         u32 first_diff = 99;
                         for (u32 i = 0; i < state.color_attachments.size(); ++i) {
@@ -1642,10 +1653,11 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
                             }
                         }
                         LOG_CRITICAL(Render_Vulkan,
-                                     "RenderStateMemo mismatch: state differs (first colour "
+                                     "RenderStateMemo mismatch: state differs (probe same {}, "
+                                     "first colour "
                                      "attachment {}, depth attachment same {}, depth layout same "
                                      "{}, extent {}x{}x{} vs {}x{}x{}, colours {} vs {})",
-                                     first_diff,
+                                     state == rs_probe, first_diff,
                                      std::memcmp(&state.depth_stencil_attachment,
                                                  &rs_memo.state.depth_stencil_attachment,
                                                  sizeof(state.depth_stencil_attachment)) == 0,
@@ -4274,7 +4286,7 @@ bool Rasterizer::RenderStateMemoMatch(const GraphicsPipeline* pipeline, bool app
     // The context epoch only moves with SHADPS4_VIEWPORT_MEMO; an unchanged epoch means no
     // context register byte changed. Otherwise compare the registers the two functions read.
     const u64 epoch = liverpool->BackContextEpoch();
-    if (g_viewport_memo != 0 && epoch == m.ctx_epoch) {
+    if (g_viewport_memo >= 1 && epoch == m.ctx_epoch) {
         if (g_render_state_memo == 2 && !RenderStateMemoRegsEqual(num_cbs)) {
             if (++st.mismatches <= 16) {
                 LOG_CRITICAL(Render_Vulkan,
@@ -4364,6 +4376,12 @@ void Rasterizer::RenderStateMemoBegin(RenderState& state) {
         const bool is_depth = t.cb == RenderStateMemo::DepthSlot;
         texture_cache.NoteTargetUse(t.id, is_depth);
         auto& image = texture_cache.PeekImage(t.id);
+        if (!is_depth) {
+            // An upload inside UpdateImage switches a re-sampled colour target to its guest
+            // sample count; the full path switches back before it looks up the view, and
+            // the remembered view belongs to the backing of the pipeline's sample count.
+            image.SetBackingSamples(m.color_samples[t.cb]);
+        }
         if (is_depth) {
             image.Transit(m.depth_layout,
                           vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
@@ -4456,15 +4474,19 @@ void Rasterizer::RenderStateMemoStore(const GraphicsPipeline* pipeline, const Re
         m.extents[cb] = liverpool->BackCbExtent(cb).raw;
     }
     m.extents[AmdGpu::NUM_COLOR_BUFFERS] = liverpool->BackDbExtent().raw;
-    m.color_target_mask = regs.color_target_mask;
-    m.color_control = regs.color_control;
-    m.depth_control = regs.depth_control;
-    m.depth_buffer = regs.depth_buffer;
-    m.depth_view = regs.depth_view;
-    m.depth_htile_data_base = regs.depth_htile_data_base;
-    m.depth_render_control = regs.depth_render_control;
-    m.depth_clear = regs.depth_clear;
-    m.stencil_clear = regs.stencil_clear;
+    const auto copy_reg = [](auto& dst, const auto& src) {
+        static_assert(sizeof(dst) == sizeof(src));
+        std::memcpy(&dst, &src, sizeof(dst));
+    };
+    copy_reg(m.color_target_mask, regs.color_target_mask);
+    copy_reg(m.color_control, regs.color_control);
+    copy_reg(m.depth_control, regs.depth_control);
+    copy_reg(m.depth_buffer, regs.depth_buffer);
+    copy_reg(m.depth_view, regs.depth_view);
+    copy_reg(m.depth_htile_data_base, regs.depth_htile_data_base);
+    copy_reg(m.depth_render_control, regs.depth_render_control);
+    copy_reg(m.depth_clear, regs.depth_clear);
+    copy_reg(m.stencil_clear, regs.stencil_clear);
     m.state = state;
     m.depth_layout = rs_last_depth_layout;
     m.valid = true;
