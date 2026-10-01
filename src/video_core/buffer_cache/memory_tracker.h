@@ -31,9 +31,11 @@ inline const bool g_upload_precheck = [] {
     const char* env = std::getenv("SHADPS4_UPLOAD_PRECHECK");
     return env != nullptr && env[0] == '1';
 }();
-inline const bool g_gpu_mod_relaxed = [] {
+/// SHADPS4_GPU_MOD_RELAXED=1 (=2 verify: also takes the locked read and compares), default off.
+inline const int g_gpu_mod_relaxed = [] {
     const char* env = std::getenv("SHADPS4_GPU_MOD_RELAXED");
-    return env != nullptr && env[0] == '1';
+    const int mode = env ? env[0] - '0' : 0;
+    return mode == 1 || mode == 2 ? mode : 0;
 }();
 inline const bool g_fault_watch_outside = [] {
     const char* env = std::getenv("SHADPS4_FAULT_WATCH_OUTSIDE");
@@ -65,10 +67,28 @@ public:
         if (g_gpu_mod_relaxed && Common::FaultMonitor::t_is_cp_thread) {
             // No lock on the CP: see RegionManager::GpuModifiedInRangeRelaxed. The locked read
             // was 1.0% of the CP back in fire (a41 profile), all of it in the spin lock.
-            return IteratePages<false>(
+            const bool relaxed = IteratePages<false>(
                 query_cpu_addr, query_size, [](RegionManager* manager, u64 offset, size_t size) {
                     return manager->GpuModifiedInRangeRelaxed(offset, size);
                 });
+            if (g_gpu_mod_relaxed == 2) [[unlikely]] {
+                const bool locked = IteratePages<false>(
+                    query_cpu_addr, query_size,
+                    [](RegionManager* manager, u64 offset, size_t size) {
+                        std::scoped_lock lk{manager->lock};
+                        return manager->template IsRegionModified<Type::GPU>(offset, size);
+                    });
+                static u64 checks = 0, mismatches = 0;
+                ++checks;
+                if (locked != relaxed && ++mismatches <= 16) {
+                    LOG_CRITICAL(Render, "GpuModRelaxed mismatch: {:#x}+{:#x} relaxed {} locked {}",
+                                 query_cpu_addr, query_size, relaxed, locked);
+                }
+                if ((checks & 0x3ffffff) == 0) {
+                    LOG_INFO(Render, "GpuModRelaxed: checks={} mismatches={}", checks, mismatches);
+                }
+            }
+            return relaxed;
         }
         return IteratePages<false>(
             query_cpu_addr, query_size, [](RegionManager* manager, u64 offset, size_t size) {

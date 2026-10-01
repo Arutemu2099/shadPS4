@@ -171,9 +171,10 @@ public:
     }
 
     /// SHADPS4_GPU_MOD_RELAXED, CP thread only: is any page of the range GPU-modified, read
-    /// without the region lock. GPU bits are set only on the CP; the one off-CP mutator clears
-    /// them (a deferred download's unmark), so a relaxed read returns what a locked read just
-    /// before or just after that clear would have returned.
+    /// without the region lock. GPU bits are set and cleared only on the CP (every unmark site
+    /// runs in a SendCommand callback, CP-inline or in PopPendingOperations; Opus review
+    /// 2026-10-01), so this read is exact. A clear moved off the CP would still be safe; a SET
+    /// off the CP would not (=2 cross-checks against the locked read).
     bool GpuModifiedInRangeRelaxed(u64 offset, u64 size) const noexcept {
         const size_t start_page = SanitizeAddress(offset) / TRACKER_BYTES_PER_PAGE;
         const size_t end_page =

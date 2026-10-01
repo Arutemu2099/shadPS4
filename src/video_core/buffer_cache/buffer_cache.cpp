@@ -90,6 +90,21 @@ const u32 g_fault_veto_retry = [] {
     return static_cast<u32>(n > 4 ? 4 : n);
 }();
 std::atomic<u64> g_fault_veto_retries{0};
+/// SHADPS4_FAULT_GUEST_COPY=1 (default off): the guest thread that owns a fault job copies the
+/// downloaded bytes from the job's staging buffer into guest memory itself, after its GPU wait
+/// and before FinishFaultDownload, instead of the command processor doing it inside the
+/// publication. Measured 2026-10-01 (a41, fire): TryWriteBacking under PublishFaultJob is 5.9%
+/// of the CP back's wall time (1 MiB windows, ~650 jobs a second), and the back is the frame
+/// rate limiter while the faulting thread is waiting anyway.
+/// Why the early copy is safe: the pages stay GPU-modified and protected until the CP's
+/// publication, so no guest code can see them; fault windows never overlap (a second fault on
+/// a pending window gets a retry ticket) and every CP path that touches a pending window
+/// settles the job first, which waits for or forestalls this copy (FaultJob::guest_copy). A
+/// job vetoed after the copy leaves its bytes behind the protection: GPU bits are cleared only
+/// by paths that download every GPU-modified byte of the pages they unmark, so something newer
+/// overwrites them before any unprotect (Opus review 2026-10-01). Not used in verify mode.
+const bool g_fault_guest_copy = EnvIs1("SHADPS4_FAULT_GUEST_COPY");
+std::atomic<u64> g_guest_copies{0}, g_guest_copy_closed{0}, g_guest_copy_cp_waits{0};
 /// SHADPS4_DEFERRED_COPY_CENSUS=1 (diagnostic): with DEFERRED_PROTECT the guest -> staging copy
 /// of an upload runs on the recording thread, later than the command processor recorded it, and
 /// guest labels are written at CP time. Counts deferred copies whose guest bytes changed between
@@ -861,6 +876,18 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool of
                 t_cp = Offload::NowNs();
             }
             ticket = PrepareFaultDownload(device_addr, size, is_write);
+            if (g_fault_guest_copy && ticket.id != 0 && !ticket.retry &&
+                !Offload::VerifyEnabled()) {
+                // The job created for this fault, if the command processor has not settled it
+                // already inside the prepare step. The slot is not reused before this fault's
+                // FinishFaultDownload.
+                for (FaultJob& candidate : fault_jobs) {
+                    if (candidate.state == FaultJobState::Pending && candidate.id == ticket.id) {
+                        ticket.job = &candidate;
+                        break;
+                    }
+                }
+            }
         });
         ++passes;
         if (ticket.id == 0) {
@@ -889,6 +916,9 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool of
         }
         // Another fault's job covered this window; publish it, then look again.
         cp->SendCommand<true>([&] { SettlePendingJob(ticket.id); });
+    }
+    if (g_fault_guest_copy && ticket.job != nullptr) {
+        GuestCopyFaultJob(*ticket.job);
     }
     // No teardown check: the cache outlives every guest thread (see ~BufferCache).
     bool retry = false;
@@ -1409,6 +1439,7 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
         // No GPU, memory-manager call or wait inside this callback. Unmap either blocks this
         // admission or observes the published window and settles it before removing pages.
         job->id = id;
+        job->guest_copy.store(0, std::memory_order_seq_cst);
         job->state = FaultJobState::Pending;
         job->abandoned = false;
         job->is_write = is_write;
@@ -2344,6 +2375,11 @@ void BufferCache::SettlePendingJob(u64 id) {
             continue;
         }
         job.state = FaultJobState::Settling;
+        if (g_fault_guest_copy) {
+            // A Settling job is skipped by nested settles: close the owner's copy now, so
+            // nothing the wait below could reenter can be followed by a late guest copy.
+            CloseGuestCopy(job);
+        }
         Offload::Add(Offload::State().cp_settles);
         const u64 wait_start = Offload::ProfileNowNs();
         WaitFaultJob(job);
@@ -2444,6 +2480,9 @@ void BufferCache::SettleOverlappingJobs(VAddr device_addr, u64 size) {
         // This runs on the command processor and needs no callback from it, which is what a
         // command processor fault during a guest job requires.
         found->state = FaultJobState::Settling;
+        if (g_fault_guest_copy) {
+            CloseGuestCopy(*found); // as in SettlePendingJob
+        }
         Offload::Add(Offload::State().cp_settles);
         const u64 wait_start = Offload::ProfileNowNs();
         WaitFaultJob(*found);
@@ -2454,6 +2493,8 @@ void BufferCache::SettleOverlappingJobs(VAddr device_addr, u64 size) {
 
 void BufferCache::FinalizeFaultJob(FaultJob& job) {
     // Precondition: state is Settling and the GPU has reached job.tick.
+    // Before anything reads or releases the staging: wait for or forestall the owner's copy.
+    const bool guest_copied = g_fault_guest_copy && CloseGuestCopy(job);
     bool ok = true;
     if (Offload::VerifyEnabled()) {
         // Only a completed comparison lets a job through. Anything else is a veto, which
@@ -2462,7 +2503,7 @@ void BufferCache::FinalizeFaultJob(FaultJob& job) {
         ok = VerifyFaultJob(job) == VerifyResult::Matched;
     }
     if (ok) {
-        ok = PublishFaultJob(job);
+        ok = PublishFaultJob(job, guest_copied);
     }
     ReleaseFaultStaging(std::move(job.staging));
     job.copies.clear();
@@ -2485,7 +2526,68 @@ void BufferCache::FinalizeFaultJob(FaultJob& job) {
     }
 }
 
-bool BufferCache::PublishFaultJob(FaultJob& job) {
+void BufferCache::GuestCopyFaultJob(FaultJob& job) {
+    u32 expected = 0;
+    if (!job.guest_copy.compare_exchange_strong(expected, 1, std::memory_order_seq_cst)) {
+        // The command processor settled this job first (it needed the window): it copied
+        // itself or vetoed, and the staging may already be released.
+        g_guest_copy_closed.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    // While the state is 1 the command processor cannot finalize the job: the copy list and
+    // the staging buffer stay as PrepareFaultDownload left them.
+    if (!job.staging->is_coherent) {
+        vmaInvalidateAllocation(instance.GetAllocator(), job.staging->buffer.allocation, 0,
+                                job.total_bytes);
+    }
+    const u8* const download = job.staging->mapped_data.data();
+    auto* memory = Core::Memory::Instance();
+    for (const FaultCopy& copy : job.copies) {
+        memory->TryWriteBacking(std::bit_cast<u8*>(copy.addr), download + copy.staging_offset,
+                                copy.size);
+    }
+    job.guest_copy.store(2, std::memory_order_seq_cst);
+    const u64 n = g_guest_copies.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((n & 0x3fff) == 0) {
+        LOG_INFO(Render, "FaultGuestCopy: guest copies {} closed first {} cp waits {}", n,
+                 g_guest_copy_closed.load(std::memory_order_relaxed),
+                 g_guest_copy_cp_waits.load(std::memory_order_relaxed));
+    }
+}
+
+bool BufferCache::CloseGuestCopy(FaultJob& job) {
+    bool waited = false;
+    u32 spins = 0;
+    for (;;) {
+        u32 state = job.guest_copy.load(std::memory_order_seq_cst);
+        if (state == 2) {
+            return true;
+        }
+        if (state == 3) {
+            return false;
+        }
+        if (state == 0) {
+            if (job.guest_copy.compare_exchange_strong(state, 3, std::memory_order_seq_cst)) {
+                return false;
+            }
+            continue;
+        }
+        // 1: the owner is copying (at most one window, well under a millisecond).
+        if (!waited) {
+            waited = true;
+            g_guest_copy_cp_waits.fetch_add(1, std::memory_order_relaxed);
+        }
+        // The owner may be descheduled or suspended (debugger pause, stack sampler): do not
+        // burn the core on it for long.
+        if (++spins < 4096) {
+            _mm_pause();
+        } else {
+            std::this_thread::yield();
+        }
+    }
+}
+
+bool BufferCache::PublishFaultJob(FaultJob& job, bool guest_copied) {
     // One uninterrupted command processor step: vote, compare, then mutate. Nothing here can
     // fault or submit, so no GPU write marking lands between the vote and the clears.
     if (!memory_tracker->GpuWriteSeqMatches(job.addr, job.size, job.seqs)) {
@@ -2520,9 +2622,11 @@ bool BufferCache::PublishFaultJob(FaultJob& job) {
     }
     const u8* const download = job.staging->mapped_data.data();
     auto* memory = Core::Memory::Instance();
-    for (const FaultCopy& copy : job.copies) {
-        memory->TryWriteBacking(std::bit_cast<u8*>(copy.addr), download + copy.staging_offset,
-                                copy.size);
+    if (!guest_copied) {
+        for (const FaultCopy& copy : job.copies) {
+            memory->TryWriteBacking(std::bit_cast<u8*>(copy.addr),
+                                    download + copy.staging_offset, copy.size);
+        }
     }
     // Only the buffer spans: for a write job the rest of the window may be GPU-modified image
     // memory that was not downloaded (as in DownloadWindowMultiBuffer).

@@ -300,7 +300,15 @@ private:
         u64 mark_size{};
         std::vector<u64> seqs;
         std::unique_ptr<Buffer> staging;
+        /// SHADPS4_FAULT_GUEST_COPY: who copies the staging bytes into guest memory.
+        /// 0 open, 1 the owning guest thread is copying, 2 it has copied, 3 closed by the
+        /// command processor (it copies itself, or the job is vetoed). See GuestCopyFaultJob.
+        std::atomic<u32> guest_copy{0};
     };
+    /// Guest thread that owns `job`, after its GPU wait and before FinishFaultDownload.
+    void GuestCopyFaultJob(FaultJob& job);
+    /// Command processor, before a job is finalized: true if the guest thread has copied.
+    bool CloseGuestCopy(FaultJob& job);
 
     /// Returned to the faulting thread by value. id 0 means the fault was resolved already.
     struct FaultTicket {
@@ -329,6 +337,8 @@ private:
         u64 producer{};
         u64 mix_flush_ns{};
         u64 label_tick{};
+        /// SHADPS4_FAULT_GUEST_COPY: the job created for this fault (null for a retry ticket).
+        FaultJob* job{};
     };
     void RecordFaultLatency(const FaultTicket& ticket, u32 passes, u64 t_fault, u64 t_cp,
                             u64 t_wait, u64 t_woke, bool free_at_wait, VAddr device_addr);
@@ -505,7 +515,7 @@ private:
 
     VerifyResult VerifyFaultJob(FaultJob& job);
 
-    bool PublishFaultJob(FaultJob& job);
+    bool PublishFaultJob(FaultJob& job, bool guest_copied = false);
 
     /// Same walk and staging layout as DownloadBufferMemory, without subtracting anything.
     /// Staging offsets continue from `total_size_bytes`; returns the new total.
