@@ -402,6 +402,10 @@ struct AscRingState {
     /// Back idle (WaitForWork) by the front's state when the back ran out of work.
     std::array<u64, 4> idle_n{}, idle_ticks{};
     std::array<u64, 5> idle_hist{}; ///< <5 us, <20, <100, <500, >= 500 (approx, 3.5 GHz)
+    /// Back time in guest commands (SendCommand: read-fault downloads and the like); it is
+    /// part of whatever stream class is current.
+    u64 cmd_n = 0, cmd_ticks = 0;
+    u64 prev_gfx = 0, prev_asc = 0, prev_idle = 0; ///< Class clock at the window start.
     u32 front_queue = 0; ///< Front only: the stream of the last Switch marker.
     std::mutex submit_mutex; ///< Guards `submits` (SubmitAsc on guest threads, the front pops).
     std::array<std::deque<AscRingSnap>, AscRingQueues> submits{};
@@ -445,17 +449,18 @@ void AscRingCloseGroup(AscRingQueueState& s) {
     s.group_subs = s.group_labels = 0;
 }
 
-void AscRingLog() {
+/// Returns true when it logged a window (every ~10 s).
+bool AscRingLog() {
     auto& g = g_asc_ring;
     const u64 now_tsc = __rdtsc();
     const u64 now_ns = AscNowNs();
     if (g.window_tsc == 0) {
         g.window_tsc = now_tsc;
         g.window_ns = now_ns;
-        return;
+        return false;
     }
     if (now_ns - g.window_ns < 10'000'000'000ull) {
-        return;
+        return false;
     }
     const double ticks_per_us =
         double(now_tsc - g.window_tsc) / (double(now_ns - g.window_ns) / 1000.0);
@@ -512,11 +517,26 @@ void AscRingLog() {
              g.idle_n[FrontGuestIdle], us(g.idle_ticks[FrontUnknown], 1) / 1e3,
              g.idle_n[FrontUnknown], g.idle_hist[0], g.idle_hist[1], g.idle_hist[2],
              g.idle_hist[3], g.idle_hist[4]);
+    {
+        // The class clock over the window (whole back wall time: every tick is in one class).
+        const AscRingSnap snap = g_asc_ring_clock.Snap(0);
+        LOG_INFO(Render,
+                 "AscRingBackSplit: window_s={:.1f} back ms: gfx_stream={:.1f} asc_streams={:.1f} "
+                 "idle={:.1f} | of which guest commands (SendCommand) ms={:.1f} n={}",
+                 double(now_ns - g.window_ns) / 1e9, us(snap.gfx - g.prev_gfx, 1) / 1e3,
+                 us(snap.asc - g.prev_asc, 1) / 1e3, us(snap.idle - g.prev_idle, 1) / 1e3,
+                 us(g.cmd_ticks, 1) / 1e3, g.cmd_n);
+        g.prev_gfx = snap.gfx;
+        g.prev_asc = snap.asc;
+        g.prev_idle = snap.idle;
+        g.cmd_n = g.cmd_ticks = 0;
+    }
     g.idle_n = {};
     g.idle_ticks = {};
     g.idle_hist = {};
     g.window_tsc = now_tsc;
     g.window_ns = now_ns;
+    return true;
 }
 
 /// Back: around WaitForWork.
@@ -535,8 +555,8 @@ void AscRingIdleExit(u32 front_state) {
     ++g.idle_hist[us < 5 ? 0 : us < 20 ? 1 : us < 100 ? 2 : us < 500 ? 3 : 4];
 }
 
-/// Back: a Diag record of the ring-latency instrument, in stream order.
-void AscRingBack(const CpSplit::DiagPayload& diag) {
+/// Back: a Diag record of the ring-latency instrument, in stream order. True: a window was logged.
+bool AscRingBack(const CpSplit::DiagPayload& diag) {
     const u32 q = diag.queue % AscRingQueues;
     auto& s = g_asc_ring.q[q];
     switch (diag.kind) {
@@ -569,11 +589,11 @@ void AscRingBack(const CpSplit::DiagPayload& diag) {
             s.subs_nolabel += s.labels == 0;
             s.open = false;
         }
-        AscRingLog();
-        break;
+        return AscRingLog();
     default:
         break;
     }
+    return false;
 }
 
 /// Back: an ASC RELEASE_MEM (the queue's completion label) is being executed.
@@ -1242,8 +1262,22 @@ void Liverpool::BackLoop(std::stop_token stoken) {
             ExecuteRecord(*record);
             split->Done(record);
             // Guest commands run at record boundaries, as they ran at packet boundaries before.
+            if (num_commands.load(std::memory_order_relaxed) != 0 && AscRingLatency())
+                [[unlikely]] {
+                const u64 t0 = __rdtsc();
+                ProcessCommands();
+                g_asc_ring.cmd_ticks += __rdtsc() - t0;
+                ++g_asc_ring.cmd_n;
+                continue;
+            }
             ProcessCommands();
             continue;
+        }
+        if (num_commands.load(std::memory_order_relaxed) != 0 && AscRingLatency()) [[unlikely]] {
+            const u64 t0 = __rdtsc();
+            ProcessCommands();
+            g_asc_ring.cmd_ticks += __rdtsc() - t0;
+            ++g_asc_ring.cmd_n;
         }
         ProcessCommands();
         if (split->FrontHasExited()) {
@@ -1350,7 +1384,9 @@ void Liverpool::ExecuteRecord(const CpSplit::RecordHeader& record) {
         break;
     }
     case CpSplit::RecordType::Diag:
-        AscRingBack(*reinterpret_cast<const CpSplit::DiagPayload*>(payload));
+        if (AscRingBack(*reinterpret_cast<const CpSplit::DiagPayload*>(payload)) && rasterizer) {
+            rasterizer->GetScheduler().LogRecordingWindow();
+        }
         break;
     case CpSplit::RecordType::Wrap:
     default:

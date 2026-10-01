@@ -195,6 +195,22 @@ void Scheduler::DrainRecording() {
     }
 }
 
+void Scheduler::LogRecordingWindow() {
+    if (!recording_worker) {
+        return;
+    }
+    static Common::CommandRecordingWorker<>::Counters prev{};
+    const auto now = recording_worker->GetCounters();
+    LOG_INFO(Render_Vulkan,
+             "AsyncRecordingWindow: timing={} commands={} chunks={} bytes={} worker_ms={:.1f} "
+             "producer_drain_wait_ms={:.1f} producer_space_wait_ms={:.1f} active_chunks={}",
+             recording_measure_timing, now.commands - prev.commands, now.chunks - prev.chunks,
+             now.bytes - prev.bytes, double(now.worker_ns - prev.worker_ns) / 1e6,
+             double(now.drain_ns - prev.drain_ns) / 1e6,
+             double(now.space_wait_ns - prev.space_wait_ns) / 1e6, recording_worker->ActiveChunks());
+    prev = now;
+}
+
 void Scheduler::CommitDynamicState() {
     if (!IsAsyncRecording()) {
         dynamic_state.Commit(instance, current_cmdbuf);

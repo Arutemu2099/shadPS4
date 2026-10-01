@@ -482,6 +482,9 @@ public:
         }
     }
     void CommitDynamicState();
+    /// Diagnostic (SHADPS4_ASC_RING_LATENCY + SHADPS4_ASYNC_RECORDING_TIMING=1): logs the recording
+    /// worker's counters since the previous call. Command-processor thread (the producer) only.
+    void LogRecordingWindow();
     void PushDescriptors(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
                          std::span<const vk::WriteDescriptorSet> writes);
 
