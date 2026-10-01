@@ -68,7 +68,9 @@ private:
         u64 begin;
         u64 end;
     };
-    static constexpr u64 Capacity = 1ULL << 14;
+    // Fire logs a few thousand markings per frame and a job can age a frame or two; an overrun
+    // only costs the refinement (FaultRegime exact_overrun counts them).
+    static constexpr u64 Capacity = 1ULL << 16;
     static constexpr u64 Mask = Capacity - 1;
     static inline std::array<Entry, Capacity> entries{};
     static inline std::atomic<u64> head{0};

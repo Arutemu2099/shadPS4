@@ -105,6 +105,20 @@ std::atomic<u64> g_fault_veto_retries{0};
 /// overwrites them before any unprotect (Opus review 2026-10-01). Not used in verify mode.
 const bool g_fault_guest_copy = EnvIs1("SHADPS4_FAULT_GUEST_COPY");
 std::atomic<u64> g_guest_copies{0}, g_guest_copy_closed{0}, g_guest_copy_cp_waits{0};
+/// SHADPS4_FAULT_GUEST_SUBMIT=1 (default off): for a job copied on a lane with its own queue
+/// (the fast lane; the prebatch readback queue is the main queue in submission order and its
+/// copies are submitted by the recording worker), the command processor records the copy into a
+/// ReadbackQueue slot and the owning guest thread calls vkQueueSubmit before it waits, instead of
+/// the command processor doing it inside PrepareFaultDownload. Measured 2026-10-01 (a41, fire):
+/// ReadbackQueue::Submit is 2.6% of the CP back's samples, vk::Queue::submit 2.0% of them (~23 us
+/// per job in the driver). The lane's timeline value is taken under the lane's queue mutex at
+/// submit time, so values are submitted in order whichever thread submits; the job's tick is
+/// unknown until then, and every command processor reader of it closes the submit first
+/// (FaultJob::guest_submit: wait for an in-flight guest submit, or submit the slot itself).
+/// Buffer deletion closes the submits of the jobs over the buffer before it reads the lane tick
+/// it waits for (DeleteBuffer). Not used in verify mode.
+const bool g_fault_guest_submit = EnvIs1("SHADPS4_FAULT_GUEST_SUBMIT");
+std::atomic<u64> g_guest_submits{0}, g_guest_submit_takeovers{0}, g_guest_submit_cp_waits{0};
 /// SHADPS4_DEFERRED_COPY_CENSUS=1 (diagnostic): with DEFERRED_PROTECT the guest -> staging copy
 /// of an upload runs on the recording thread, later than the command processor recorded it, and
 /// guest labels are written at CP time. Counts deferred copies whose guest bytes changed between
@@ -876,7 +890,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool of
                 t_cp = Offload::NowNs();
             }
             ticket = PrepareFaultDownload(device_addr, size, is_write);
-            if (g_fault_guest_copy && ticket.id != 0 && !ticket.retry &&
+            if (g_fault_guest_copy && ticket.id != 0 && !ticket.retry && ticket.job == nullptr &&
                 !Offload::VerifyEnabled()) {
                 // The job created for this fault, if the command processor has not settled it
                 // already inside the prepare step. The slot is not reused before this fault's
@@ -896,6 +910,11 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool of
             return;
         }
         const u64 wait_start = Offload::ProfileNowNs();
+        if (ticket.deferred_submit) {
+            // SHADPS4_FAULT_GUEST_SUBMIT: the copy is recorded, not submitted. Submit it here
+            // (or take the tick the command processor submitted meanwhile), then wait.
+            ticket.tick = GuestSubmitFaultJob(*ticket.job);
+        }
         if (latency) {
             t_wait = Offload::NowNs();
             free_at_wait = !ticket.on_readback_queue && semaphore->IsFree(ticket.tick);
@@ -1306,12 +1325,14 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
     if (overlap_retry) {
         if (pending_fault_jobs.load(std::memory_order_relaxed) != 0) {
             const auto [begin, end] = TrackerPageSpan(settle_addr, settle_size);
-            for (const FaultJob& job : fault_jobs) {
+            for (FaultJob& job : fault_jobs) {
                 if (job.state != FaultJobState::Pending) {
                     continue;
                 }
                 const auto [job_begin, job_end] = TrackerPageSpan(job.addr, job.size);
                 if (job_begin < end && begin < job_end) {
+                    // The ticket carries the job's tick: a deferred submit has to exist first.
+                    CloseGuestSubmit(job);
                     FaultTicket retry_ticket{job.id, job.tick, true, job.on_readback_queue};
                     retry_ticket.on_fast_lane = job.on_fast_lane;
                     retry_ticket.on_asc = job.on_asc;
@@ -1441,6 +1462,7 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
         // admission or observes the published window and settles it before removing pages.
         job->id = id;
         job->guest_copy.store(0, std::memory_order_seq_cst);
+        job->guest_submit.store(4, std::memory_order_seq_cst); // nothing deferred until recorded
         job->state = FaultJobState::Pending;
         job->abandoned = false;
         job->is_write = is_write;
@@ -1553,23 +1575,39 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
                           !BatchesWriteAny(job->copies, completed, tick);
         const u64 producer = completed;
         if (done) {
-            const u64 lane_tick = fast_lane->Submit(
-                master->Handle(), producer, [&](vk::CommandBuffer cmd) {
-                    ForEachSourceRun(vk_sources.data(), vk_sources.size(),
-                                     [&](size_t first, size_t count) {
-                                         RecordFaultCopiesOnReadbackQueue(
-                                             cmd, vk_sources[first], staging_handle,
-                                             {vk_copies.data() + first, count}, false);
-                                     });
-                });
+            const auto record = [&](vk::CommandBuffer cmd) {
+                ForEachSourceRun(vk_sources.data(), vk_sources.size(),
+                                 [&](size_t first, size_t count) {
+                                     RecordFaultCopiesOnReadbackQueue(
+                                         cmd, vk_sources[first], staging_handle,
+                                         {vk_copies.data() + first, count}, false);
+                                 });
+            };
+            // SHADPS4_FAULT_GUEST_SUBMIT: record only; the owner submits before its wait and
+            // the tick is unknown until then (0 here). Lane fields first: the release below
+            // publishes them to the owner and to CloseGuestSubmit.
+            const bool deferred =
+                g_fault_guest_submit && !Offload::VerifyEnabled() && !fast_lane->InQueueOrder();
+            u64 lane_tick = 0;
+            if (deferred) {
+                job->submit_slot = static_cast<u32>(fast_lane->RecordSlot(master->Handle(),
+                                                                          producer, record));
+            } else {
+                lane_tick = fast_lane->Submit(master->Handle(), producer, record);
+            }
             // No main-queue wait on the copy: a GPU write to the window marked before
             // publication changes its write sequence and vetoes the job (PublishFaultJob), and
             // one marked after it comes after the guest waited for this copy (Opus review).
             job->tick = lane_tick;
             job->on_readback_queue = true;
             job->on_fast_lane = true;
+            if (deferred) {
+                job->guest_submit.store(0, std::memory_order_seq_cst);
+            }
             FaultTicket lane_ticket{id, lane_tick, false, true};
             lane_ticket.on_fast_lane = true;
+            lane_ticket.deferred_submit = deferred;
+            lane_ticket.job = deferred ? job : nullptr;
             if (Offload::LatencyEnabled()) {
                 master->Refresh();
                 lane_ticket.done_tick = master->KnownGpuTick();
@@ -1613,6 +1651,7 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
         if (side_ok) {
             static std::atomic<u64> side{0}, total{0};
             u64 side_tick = 0;
+            bool deferred = false;
             if (prebatch && AsyncFaultCopies()) {
                 // Asynchronous submission: batches recorded before this point may not be
                 // submitted yet, so the recording worker submits the copy when it gets here.
@@ -1633,20 +1672,34 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
                 });
                 scheduler.PublishRecording();
             } else {
-                side_tick = readback_queue->Submit(
-                    scheduler.GetMasterSemaphore()->Handle(), producer,
-                    [&](vk::CommandBuffer cmd) {
-                        ForEachSourceRun(vk_sources.data(), vk_sources.size(),
-                                         [&](size_t first, size_t count) {
-                                             RecordFaultCopiesOnReadbackQueue(
-                                                 cmd, vk_sources[first], staging_handle,
-                                                 {vk_copies.data() + first, count}, prebatch);
-                                         });
-                    });
+                const auto record = [&](vk::CommandBuffer cmd) {
+                    ForEachSourceRun(vk_sources.data(), vk_sources.size(),
+                                     [&](size_t first, size_t count) {
+                                         RecordFaultCopiesOnReadbackQueue(
+                                             cmd, vk_sources[first], staging_handle,
+                                             {vk_copies.data() + first, count}, prebatch);
+                                     });
+                };
+                // SHADPS4_FAULT_GUEST_SUBMIT, own-queue lane only (as on the fast lane). In
+                // queue order the copy must precede the batch being recorded, and DeleteBuffer
+                // relies on that order.
+                deferred = g_fault_guest_submit && !Offload::VerifyEnabled() && !prebatch;
+                if (deferred) {
+                    job->submit_slot = static_cast<u32>(readback_queue->RecordSlot(
+                        scheduler.GetMasterSemaphore()->Handle(), producer, record));
+                } else {
+                    side_tick = readback_queue->Submit(scheduler.GetMasterSemaphore()->Handle(),
+                                                       producer, record);
+                }
             }
             job->tick = side_tick;
             job->on_readback_queue = true;
+            if (deferred) {
+                job->guest_submit.store(0, std::memory_order_seq_cst);
+            }
             FaultTicket side_ticket{id, side_tick, false, true};
+            side_ticket.deferred_submit = deferred;
+            side_ticket.job = deferred ? job : nullptr;
             if (Offload::LatencyEnabled()) {
                 auto* semaphore = scheduler.GetMasterSemaphore();
                 semaphore->Refresh();
@@ -2332,8 +2385,9 @@ u64 BufferCache::ProducerTick(VAddr addr, u64 size) const {
     return producer;
 }
 
-void BufferCache::WaitFaultJob(const FaultJob& job) {
+void BufferCache::WaitFaultJob(FaultJob& job) {
     if (job.on_readback_queue) {
+        CloseGuestSubmit(job); // SHADPS4_FAULT_GUEST_SUBMIT: the tick exists only after this
         JobSemaphore(job.on_fast_lane, job.on_asc).Wait(job.tick);
         return;
     }
@@ -2622,6 +2676,86 @@ bool BufferCache::FaultJobUnwritten(const FaultJob& job) {
                  GpuWriteLog::Position() - job.write_log_pos, hit_begin, hit_end - hit_begin);
     }
     return false;
+}
+
+u64 BufferCache::GuestSubmitFaultJob(FaultJob& job) {
+    u32 expected = 0;
+    if (job.guest_submit.compare_exchange_strong(expected, 1, std::memory_order_seq_cst)) {
+        // While the state is 1 the command processor waits in CloseGuestSubmit; nothing in
+        // SubmitSlot needs the command processor, so that wait is bounded by the submit.
+        const u64 tick = LaneOf(job.on_fast_lane).SubmitSlot(job.submit_slot);
+        job.tick = tick;
+        job.guest_submit.store(2, std::memory_order_seq_cst);
+        const u64 n = g_guest_submits.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((n & 0x3fff) == 0) {
+            LOG_INFO(Render,
+                     "FaultGuestSubmit: guest submits={} cp takeovers={} cp waits={} jobs={}", n,
+                     g_guest_submit_takeovers.load(std::memory_order_relaxed),
+                     g_guest_submit_cp_waits.load(std::memory_order_relaxed),
+                     Offload::g_regime.jobs.load(std::memory_order_relaxed));
+        }
+        return tick;
+    }
+    // The command processor needed this job first (a settle, a retry ticket or a buffer
+    // deletion): it is submitting (3) or has submitted (4). Its tick is valid at 4 only.
+    u32 spins = 0;
+    while (job.guest_submit.load(std::memory_order_seq_cst) != 4) {
+        if (++spins < 4096) {
+            _mm_pause();
+        } else {
+            std::this_thread::yield();
+        }
+    }
+    return job.tick;
+}
+
+void BufferCache::CloseGuestSubmit(FaultJob& job) {
+    bool waited = false;
+    u32 spins = 0;
+    for (;;) {
+        u32 state = job.guest_submit.load(std::memory_order_seq_cst);
+        if (state == 2 || state == 4) {
+            return;
+        }
+        if (state == 0) {
+            if (job.guest_submit.compare_exchange_strong(state, 3, std::memory_order_seq_cst)) {
+                // Forestalled: the owner finds 3 and waits for 4 (GuestSubmitFaultJob).
+                job.tick = LaneOf(job.on_fast_lane).SubmitSlot(job.submit_slot);
+                job.guest_submit.store(4, std::memory_order_seq_cst);
+                g_guest_submit_takeovers.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            continue;
+        }
+        // 1: the owner is inside vkQueueSubmit (tens of microseconds, unless descheduled). 3 is
+        // not reached here: one command processor thread closes, and SubmitSlot never reenters.
+        if (!waited) {
+            waited = true;
+            g_guest_submit_cp_waits.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (++spins < 4096) {
+            _mm_pause();
+        } else {
+            std::this_thread::yield();
+        }
+    }
+}
+
+void BufferCache::CloseGuestSubmitsOver(VAddr device_addr, u64 size) {
+    if (!g_fault_guest_submit || pending_fault_jobs.load(std::memory_order_relaxed) == 0) {
+        return;
+    }
+    for (FaultJob& job : fault_jobs) {
+        // Only an unfinalized job can hold a recorded, unsubmitted slot. Its copies lie inside
+        // its window, and a buffer that does not overlap the window is not one of its sources.
+        if (job.state == FaultJobState::Free || job.state == FaultJobState::Success ||
+            job.state == FaultJobState::Vetoed) {
+            continue;
+        }
+        if (job.addr < device_addr + size && device_addr < job.addr + job.size) {
+            CloseGuestSubmit(job);
+        }
+    }
 }
 
 bool BufferCache::PublishFaultJob(FaultJob& job, bool guest_copied) {
@@ -3396,7 +3530,9 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     // records the range in this batch's write history. Repeating it in the same batch (tick)
     // while no page anywhere became CPU-dirty (g_dirty_epoch), no GPU bit or range was cleared
     // (gpu_clear_epoch, bumped by every Subtract / UnmarkRegionAsGpuModified) and no fault job
-    // was admitted (a job admitted before the first run was already vetoed by its seq bump) only
+    // was admitted (a job admitted before the first run was already vetoed by that run: its seq
+    // bump, and under SHADPS4_FAULT_VETO_EXACT its logged range, which is this same range - a job
+    // the first run's range does not touch is not touched by the repeat either) only
     // bumps gpu_write_seq again, which nothing can observe: skip it. Unlike WRITTEN_MEMO (0 hits:
     // it demanded whole 4 MB regions CPU-clean) this needs only no dirtying since the first run.
     const int written_run = g_written_run_memo;
@@ -4665,6 +4801,9 @@ void BufferCache::DeleteBuffer(BufferId buffer_id) {
     // passes the deletion and the buffer is freed (review 2026-09-27, use-after-free). Before
     // freeing, wait for every readback-queue copy submitted up to now; each waits on a producer
     // below the deletion tick, which has completed when this deferred operation runs.
+    // SHADPS4_FAULT_GUEST_SUBMIT: a copy of this buffer recorded for a guest to submit has no
+    // value yet; submit those here first, so the ticks read below cover them.
+    CloseGuestSubmitsOver(buffer.CpuAddr(), buffer.SizeBytes());
     const u64 rq_tick = readback_queue && !readback_queue->InQueueOrder()
                             ? readback_queue->Semaphore().CurrentTick() - 1
                             : 0;

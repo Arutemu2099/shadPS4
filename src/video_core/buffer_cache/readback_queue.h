@@ -4,7 +4,9 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <mutex>
+#include <utility>
 #include "common/assert.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -22,7 +24,10 @@ namespace VideoCore {
  * Mode 1 (same family) needs no ownership transfer. Mode 2 (transfer-only family) reads
  * EXCLUSIVE buffers without a queue-family ownership transfer: undefined by the spec for
  * contents, relied on here only as an experiment on NVIDIA, where buffers carry no
- * family-specific layout or compression. Command processor only.
+ * family-specific layout or compression. Recording is command processor only; a recorded
+ * slot may be submitted from any thread (SHADPS4_FAULT_GUEST_SUBMIT, see RecordSlot /
+ * SubmitSlot): every submit on the queue, and the timeline value it signals, is taken under
+ * queue_mutex, so values reach the queue in increasing order.
  */
 class ReadbackQueue {
 public:
@@ -64,8 +69,15 @@ public:
     /// 0) and returns the value this queue's timeline reaches when the copy is done.
     template <typename Record>
     u64 Submit(vk::Semaphore wait_semaphore, u64 wait_value, Record&& record) {
-        const size_t slot = next_slot++ % NumSlots;
-        semaphore.Wait(slot_values[slot]);
+        return SubmitSlot(RecordSlot(wait_semaphore, wait_value, std::forward<Record>(record)));
+    }
+
+    /// Records with `record(cmdbuf)` into a slot and returns it without submitting. The slot
+    /// is held (never reset or handed out again) until SubmitSlot runs on it, from any thread.
+    /// Recording thread only, like Submit.
+    template <typename Record>
+    size_t RecordSlot(vk::Semaphore wait_semaphore, u64 wait_value, Record&& record) {
+        const size_t slot = AcquireSlot();
         const vk::CommandBuffer cmdbuf = cmdbufs[slot];
         ASSERT(cmdbuf.reset() == vk::Result::eSuccess);
         ASSERT(cmdbuf.begin(vk::CommandBufferBeginInfo{
@@ -73,7 +85,20 @@ public:
                vk::Result::eSuccess);
         record(cmdbuf);
         ASSERT(cmdbuf.end() == vk::Result::eSuccess);
+        slot_wait_semaphores[slot] = wait_semaphore;
+        slot_wait_values[slot] = wait_value;
+        return slot;
+    }
 
+    /// Submits a slot RecordSlot returned and returns the value this queue's timeline reaches
+    /// when the copy is done. Any thread; the caller publishes the slot index to the submitting
+    /// thread with its own release/acquire pair. The timeline value is taken and submitted
+    /// under one lock, so a slot submitted later signals a larger value.
+    u64 SubmitSlot(size_t slot) {
+        std::scoped_lock lk{queue_mutex};
+        const vk::CommandBuffer cmdbuf = cmdbufs[slot];
+        const vk::Semaphore wait_semaphore = slot_wait_semaphores[slot];
+        const u64 wait_value = slot_wait_values[slot];
         const u64 signal_value = semaphore.NextTick();
         const vk::Semaphore signal_semaphore = semaphore.Handle();
         const vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eTransfer;
@@ -96,14 +121,16 @@ public:
         };
         vk::Result result;
         if (submit_lock) {
-            std::scoped_lock lk{*submit_lock};
+            std::scoped_lock submit_lk{*submit_lock};
             result = queue.submit(submit_info);
         } else {
             result = queue.submit(submit_info);
         }
         ASSERT_MSG(result == vk::Result::eSuccess, "ReadbackQueue: submit failed: {}",
                    vk::to_string(result));
-        slot_values[slot] = signal_value;
+        slot_values[slot].store(signal_value, std::memory_order_relaxed);
+        // After the value: AcquireSlot reads it behind this acquire.
+        slot_held[slot].store(false, std::memory_order_release);
         return signal_value;
     }
 
@@ -121,8 +148,7 @@ public:
 
     template <typename Record>
     void SubmitReserved(u64 signal_value, Record&& record) {
-        const size_t slot = next_slot++ % NumSlots;
-        semaphore.Wait(slot_values[slot]);
+        const size_t slot = AcquireSlot();
         const vk::CommandBuffer cmdbuf = cmdbufs[slot];
         ASSERT(cmdbuf.reset() == vk::Result::eSuccess);
         ASSERT(cmdbuf.begin(vk::CommandBufferBeginInfo{
@@ -151,7 +177,8 @@ public:
         }
         ASSERT_MSG(result == vk::Result::eSuccess, "ReadbackQueue: submit failed: {}",
                    vk::to_string(result));
-        slot_values[slot] = signal_value;
+        slot_values[slot].store(signal_value, std::memory_order_relaxed);
+        slot_held[slot].store(false, std::memory_order_release);
     }
 
     /// True when this is the main graphics queue (copies are ordered by submission).
@@ -160,14 +187,35 @@ public:
     }
 
 private:
+    /// Next free slot in round-robin order, its last copy complete. A slot recorded and not yet
+    /// submitted is skipped: its command buffer must not be reset, and its value does not exist
+    /// yet. At most one slot per fault job is held, far fewer than NumSlots.
+    size_t AcquireSlot() {
+        for (size_t tries = 0;; ++tries) {
+            const size_t slot = next_slot++ % NumSlots;
+            if (!slot_held[slot].load(std::memory_order_acquire)) {
+                semaphore.Wait(slot_values[slot].load(std::memory_order_relaxed));
+                slot_held[slot].store(true, std::memory_order_relaxed);
+                return slot;
+            }
+            ASSERT_MSG(tries < NumSlots, "ReadbackQueue: every slot holds an unsubmitted copy");
+        }
+    }
+
     static constexpr size_t NumSlots = 32;
     const Vulkan::Instance& instance;
     vk::Queue queue;
     std::mutex* submit_lock{};
+    /// Serializes SubmitSlot across threads (queue access and timeline value order).
+    std::mutex queue_mutex;
     Vulkan::MasterSemaphore semaphore;
     vk::UniqueCommandPool pool;
     std::array<vk::CommandBuffer, NumSlots> cmdbufs{};
-    std::array<u64, NumSlots> slot_values{};
+    std::array<std::atomic<u64>, NumSlots> slot_values{};
+    /// Recorded, not yet submitted (see AcquireSlot).
+    std::array<std::atomic<bool>, NumSlots> slot_held{};
+    std::array<vk::Semaphore, NumSlots> slot_wait_semaphores{};
+    std::array<u64, NumSlots> slot_wait_values{};
     size_t next_slot = 0;
 };
 

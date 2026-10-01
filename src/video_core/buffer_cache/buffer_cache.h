@@ -306,6 +306,13 @@ private:
         /// 0 open, 1 the owning guest thread is copying, 2 it has copied, 3 closed by the
         /// command processor (it copies itself, or the job is vetoed). See GuestCopyFaultJob.
         std::atomic<u32> guest_copy{0};
+        /// SHADPS4_FAULT_GUEST_SUBMIT: who submits the recorded lane copy (ReadbackQueue slot
+        /// `submit_slot`). 0 recorded and open to the owning guest thread, 1 the owner is
+        /// submitting, 2 it has submitted, 3 the command processor is submitting, 4 submitted
+        /// by the command processor or nothing deferred. `tick` is valid in 2 and 4 only; the
+        /// command processor reads it through CloseGuestSubmit. See GuestSubmitFaultJob.
+        std::atomic<u32> guest_submit{4};
+        u32 submit_slot{};
     };
     /// The vote of a fault job: true if no GPU write marking touched it since its snapshot
     /// (region sequences; with SHADPS4_FAULT_VETO_EXACT=1 a moved sequence is refined by the
@@ -315,6 +322,15 @@ private:
     void GuestCopyFaultJob(FaultJob& job);
     /// Command processor, before a job is finalized: true if the guest thread has copied.
     bool CloseGuestCopy(FaultJob& job);
+    /// Guest thread that owns `job`, before its GPU wait: submits the lane copy, or takes the
+    /// value the command processor submitted. Returns the lane tick to wait for.
+    u64 GuestSubmitFaultJob(FaultJob& job);
+    /// Command processor, before it reads a job's tick: waits for an in-flight guest submit
+    /// or submits the recorded slot itself. No-op for a job that is not deferred.
+    void CloseGuestSubmit(FaultJob& job);
+    /// Closes the submit of every unfinalized job whose window overlaps the range (a buffer
+    /// about to be deleted may be a source of its recorded copy).
+    void CloseGuestSubmitsOver(VAddr device_addr, u64 size);
 
     /// Returned to the faulting thread by value. id 0 means the fault was resolved already.
     struct FaultTicket {
@@ -345,12 +361,16 @@ private:
         u64 label_tick{};
         /// SHADPS4_FAULT_GUEST_COPY: the job created for this fault (null for a retry ticket).
         FaultJob* job{};
+        /// SHADPS4_FAULT_GUEST_SUBMIT: `job` has a recorded lane copy the owner submits
+        /// (GuestSubmitFaultJob) before it waits; `tick` is then unknown.
+        bool deferred_submit{};
     };
     void RecordFaultLatency(const FaultTicket& ticket, u32 passes, u64 t_fault, u64 t_cp,
                             u64 t_wait, u64 t_woke, bool free_at_wait, VAddr device_addr);
 
-    /// Waits until a job's copy has completed on whichever queue it ran.
-    void WaitFaultJob(const FaultJob& job);
+    /// Waits until a job's copy has completed on whichever queue it ran. Closes a deferred
+    /// guest submit first, so the tick exists.
+    void WaitFaultJob(FaultJob& job);
     /// Newest main-timeline tick that GPU-wrote any byte of the range (0 if never).
     u64 ProducerTick(VAddr addr, u64 size) const;
     void RecordFaultCopiesOnReadbackQueue(vk::CommandBuffer cmdbuf, vk::Buffer source,
