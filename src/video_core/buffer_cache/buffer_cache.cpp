@@ -81,6 +81,9 @@ const bool g_upload_ahead_stats = EnvIs1("SHADPS4_UPLOAD_AHEAD_STATS");
 /// and ResolveFaultSync is ~4% of the CP back's samples. A retry costs the faulting guest thread
 /// one more job round trip instead. A vetoed job has published nothing and released its staging
 /// and window (FinalizeFaultJob), so preparing again is the same as a new fault on that address.
+/// Read faults only: a vetoed write job must keep its single fallback behind the unmap gate (Opus
+/// review 2026-09-30). Measured the same night: falsified - retried jobs are vetoed again about two
+/// times in three and the synchronous fallbacks do not fall (fire, N=2). Leave at 0.
 const u32 g_fault_veto_retry = [] {
     const char* value = std::getenv("SHADPS4_FAULT_VETO_RETRY");
     const unsigned long n = value ? std::strtoul(value, nullptr, 10) : 0ul;
@@ -891,7 +894,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool of
     bool retry = false;
     cp->SendCommand<true>([&] {
         retry = FinishFaultDownload(ticket.id, device_addr, size, is_write,
-                                    veto_retries < g_fault_veto_retry);
+                                    !is_write && veto_retries < g_fault_veto_retry);
     });
     if (!retry) {
         break;
