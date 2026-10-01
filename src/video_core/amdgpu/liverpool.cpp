@@ -265,6 +265,341 @@ void NoteAscStart(u64 stamp, u32 queue) {
     }
 }
 
+/// SHADPS4_ASC_RING_LATENCY=1 (diagnostic, CP split run-ahead only): where the time between a
+/// guest ASC submission (sceGnmDingDong -> SubmitAsc) and the back reaching that submission's
+/// RELEASE_MEM label goes. Second Son's Game:Main polls the particle ring's label right after
+/// submitting the particle compute (0x1695e0), so this window is on the frame's critical path.
+/// The back keeps a class clock (graphics stream / each ASC queue / idle) that changes only at
+/// stream switches (Diag records the front emits when its round-robin changes queue) and around
+/// WaitForWork; SubmitAsc snapshots it on the guest thread, the back snapshots it at the label.
+/// Logged every ~10 s per ASC queue: per submission, and per group of submissions whose submit
+/// times lie within AscRingGroupGapUs of each other (one particle update, inferred).
+bool AscRingLatency() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_ASC_RING_LATENCY");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
+constexpr u32 AscRingQueues = 64;
+constexpr u64 AscRingGroupGapUs = 3000;
+enum AscRingDiagKind : u32 { AscRingSwitch = 1, AscRingBegin = 2, AscRingEnd = 3 };
+
+/// The class clock at one instant (TSC ticks spent per class since start).
+struct AscRingSnap {
+    u64 tsc = 0, gfx = 0, asc = 0, own = 0, idle = 0;
+};
+
+/// Written by the back only. A seqlock lets SubmitAsc (guest threads) read a consistent snapshot.
+struct AscRingClock {
+    std::atomic<u32> seq{0};
+    std::atomic<u64> since{0};
+    std::atomic<u32> queue{0}; ///< Stream the back is executing: 0 = graphics, else ASC queue.
+    std::atomic<bool> idle{false};
+    std::atomic<u64> gfx{0}, asc{0}, idle_ticks{0};
+    std::array<std::atomic<u64>, AscRingQueues> asc_q{};
+
+    void Set(u32 new_queue, bool new_idle) { // back only
+        const u64 now = __rdtsc();
+        seq.fetch_add(1);
+        const u64 start = since.load();
+        if (start != 0) {
+            const u64 d = now - start;
+            if (idle.load()) {
+                idle_ticks.fetch_add(d);
+            } else if (const u32 q = queue.load(); q == 0) {
+                gfx.fetch_add(d);
+            } else {
+                asc.fetch_add(d);
+                asc_q[q % AscRingQueues].fetch_add(d);
+            }
+        }
+        since.store(now);
+        queue.store(new_queue);
+        idle.store(new_idle);
+        seq.fetch_add(1);
+    }
+
+    AscRingSnap Snap(u32 q) const {
+        for (;;) {
+            const u32 s = seq.load();
+            if (s & 1) {
+                _mm_pause();
+                continue;
+            }
+            AscRingSnap snap;
+            snap.gfx = gfx.load();
+            snap.asc = asc.load();
+            snap.own = asc_q[q % AscRingQueues].load();
+            snap.idle = idle_ticks.load();
+            const u64 start = since.load();
+            const u32 cur = queue.load();
+            const bool is_idle = idle.load();
+            snap.tsc = __rdtsc();
+            if (seq.load() != s) {
+                continue;
+            }
+            if (start != 0 && snap.tsc > start) {
+                const u64 d = snap.tsc - start;
+                if (is_idle) {
+                    snap.idle += d;
+                } else if (cur == 0) {
+                    snap.gfx += d;
+                } else {
+                    snap.asc += d;
+                    if (cur == q) {
+                        snap.own += d;
+                    }
+                }
+            }
+            return snap;
+        }
+    }
+};
+AscRingClock g_asc_ring_clock;
+
+/// Sums of a class-clock difference (TSC ticks).
+struct AscRingSpan {
+    u64 wall = 0, gfx = 0, own = 0, other = 0, idle = 0;
+    void Add(const AscRingSnap& from, const AscRingSnap& to) {
+        wall += to.tsc - from.tsc;
+        gfx += to.gfx - from.gfx;
+        own += to.own - from.own;
+        other += (to.asc - from.asc) - (to.own - from.own);
+        idle += to.idle - from.idle;
+    }
+};
+
+struct AscRingQueueState { // back only
+    // The submission being executed (a queue's submissions are parsed one at a time, in order).
+    bool open = false;
+    AscRingSnap submit{};
+    u64 front_tsc = 0, back_tsc = 0;
+    u32 labels = 0;
+    // The group (submissions close in submit time).
+    bool group_open = false;
+    AscRingSnap group_first{}, group_last_submit{}, group_label{}, group_label_submit{};
+    u32 group_subs = 0, group_labels = 0;
+    // The ~10 s window.
+    u64 subs = 0, subs_nolabel = 0, label_count = 0, deferred_labels = 0, dispatches = 0;
+    u64 to_front = 0, to_back = 0, to_label = 0;
+    AscRingSpan sub_span{};
+    u64 groups = 0, group_sub_sum = 0, group_submit_span = 0;
+    AscRingSpan window{}, tail{};
+    std::array<u64, 6> tail_hist{}; ///< <250 us, <500, <1000, <2000, <4000, >= 4000
+    VAddr last_label_addr = 0;
+};
+
+/// What the front is doing (written by the front, sampled by the back when it runs out of work).
+enum AscRingFrontState : u32 { FrontUnknown, FrontGfxTask, FrontAscTask, FrontGuestIdle };
+std::atomic<u32> g_asc_ring_front_state{FrontUnknown};
+
+struct AscRingState {
+    std::array<AscRingQueueState, AscRingQueues> q{};
+    u64 window_tsc = 0;
+    u64 window_ns = 0;
+    /// Back idle (WaitForWork) by the front's state when the back ran out of work.
+    std::array<u64, 4> idle_n{}, idle_ticks{};
+    std::array<u64, 5> idle_hist{}; ///< <5 us, <20, <100, <500, >= 500 (approx, 3.5 GHz)
+    u32 front_queue = 0; ///< Front only: the stream of the last Switch marker.
+    std::mutex submit_mutex; ///< Guards `submits` (SubmitAsc on guest threads, the front pops).
+    std::array<std::deque<AscRingSnap>, AscRingQueues> submits{};
+};
+AscRingState g_asc_ring;
+
+void EmitAscRingDiag(CpSplit::Channel& channel, u32 kind, u32 queue,
+                     const AscRingSnap* snap = nullptr, u64 front_tsc = 0) {
+    auto* diag = channel.Reserve<CpSplit::DiagPayload>(CpSplit::RecordType::Diag);
+    diag->kind = kind;
+    diag->queue = queue;
+    if (snap) {
+        diag->values[0] = snap->tsc;
+        diag->values[1] = snap->gfx;
+        diag->values[2] = snap->asc;
+        diag->values[3] = snap->own;
+        diag->values[4] = snap->idle;
+    } else {
+        diag->values[0] = diag->values[1] = diag->values[2] = diag->values[3] = 0;
+        diag->values[4] = 0;
+    }
+    diag->values[5] = front_tsc;
+    channel.Commit();
+}
+
+void AscRingCloseGroup(AscRingQueueState& s) {
+    if (s.group_open && s.group_labels != 0) {
+        ++s.groups;
+        s.group_sub_sum += s.group_subs;
+        s.group_submit_span += s.group_last_submit.tsc - s.group_first.tsc;
+        s.window.Add(s.group_first, s.group_label);
+        const u64 before = s.tail.wall;
+        s.tail.Add(s.group_label_submit, s.group_label);
+        // Bucketed in ticks here, converted by the logger's ratio only for the means; the
+        // histogram uses a fixed 3 ticks/ns guess corrected below when logged (labelled approx).
+        const u64 ticks = s.tail.wall - before;
+        const u64 us = ticks / 3500; // ~3.5 GHz TSC (i5-13600K); the means use the measured ratio
+        ++s.tail_hist[us < 250 ? 0 : us < 500 ? 1 : us < 1000 ? 2 : us < 2000 ? 3 : us < 4000 ? 4 : 5];
+    }
+    s.group_open = false;
+    s.group_subs = s.group_labels = 0;
+}
+
+void AscRingLog() {
+    auto& g = g_asc_ring;
+    const u64 now_tsc = __rdtsc();
+    const u64 now_ns = AscNowNs();
+    if (g.window_tsc == 0) {
+        g.window_tsc = now_tsc;
+        g.window_ns = now_ns;
+        return;
+    }
+    if (now_ns - g.window_ns < 10'000'000'000ull) {
+        return;
+    }
+    const double ticks_per_us =
+        double(now_tsc - g.window_tsc) / (double(now_ns - g.window_ns) / 1000.0);
+    const auto us = [&](u64 ticks, u64 n) {
+        return n ? double(ticks) / ticks_per_us / double(n) : 0.0;
+    };
+    for (u32 q = 1; q < AscRingQueues; ++q) {
+        auto& s = g.q[q];
+        if (s.subs == 0 && s.groups == 0) {
+            continue;
+        }
+        const u64 labelled = s.subs - s.subs_nolabel;
+        LOG_INFO(Render,
+                 "AscRing q{}: window_s={:.1f} tsc_mhz={:.0f} subs={} no_label={} labels={} "
+                 "deferred_labels={} dispatches={} label_addr={:#x} | per labelled sub (us): "
+                 "submit->front={:.0f} submit->back={:.0f} submit->label={:.0f} [gfx={:.0f} "
+                 "own={:.0f} other_asc={:.0f} idle={:.0f}]",
+                 q, double(now_ns - g.window_ns) / 1e9, ticks_per_us, s.subs, s.subs_nolabel,
+                 s.label_count, s.deferred_labels, s.dispatches, s.last_label_addr,
+                 us(s.to_front, labelled), us(s.to_back, labelled), us(s.to_label, labelled),
+                 us(s.sub_span.gfx, labelled), us(s.sub_span.own, labelled),
+                 us(s.sub_span.other, labelled), us(s.sub_span.idle, labelled));
+        LOG_INFO(Render,
+                 "AscRingGroup q{}: groups={} subs_per_group={:.1f} dispatches_per_group={:.0f} | "
+                 "mean us: submit_span={:.0f} | first_submit->last_label={:.0f} [gfx={:.0f} "
+                 "own={:.0f} other_asc={:.0f} idle={:.0f}] | last_submit->last_label={:.0f} "
+                 "[gfx={:.0f} own={:.0f} other_asc={:.0f} idle={:.0f}] "
+                 "tail_hist_approx[<250,<500,<1000,<2000,<4000,>=4000 us]={}/{}/{}/{}/{}/{}",
+                 q, s.groups, s.groups ? double(s.group_sub_sum) / double(s.groups) : 0.0,
+                 s.groups ? double(s.dispatches) / double(s.groups) : 0.0,
+                 us(s.group_submit_span, s.groups), us(s.window.wall, s.groups),
+                 us(s.window.gfx, s.groups), us(s.window.own, s.groups),
+                 us(s.window.other, s.groups), us(s.window.idle, s.groups),
+                 us(s.tail.wall, s.groups), us(s.tail.gfx, s.groups), us(s.tail.own, s.groups),
+                 us(s.tail.other, s.groups), us(s.tail.idle, s.groups), s.tail_hist[0],
+                 s.tail_hist[1], s.tail_hist[2], s.tail_hist[3], s.tail_hist[4], s.tail_hist[5]);
+        // Reset the window sums; keep the open submission and group.
+        s.subs = s.subs_nolabel = s.label_count = s.deferred_labels = s.dispatches = 0;
+        s.to_front = s.to_back = s.to_label = 0;
+        s.sub_span = {};
+        s.groups = s.group_sub_sum = s.group_submit_span = 0;
+        s.window = {};
+        s.tail = {};
+        s.tail_hist = {};
+    }
+    LOG_INFO(Render,
+             "AscRingBackIdle: window_s={:.1f} back idle ms (waits) by front state at idle start: "
+             "front_in_gfx_task={:.1f} ({}) front_in_asc_task={:.1f} ({}) front_waits_for_guest="
+             "{:.1f} ({}) unknown={:.1f} ({}) | idle_hist_approx[<5,<20,<100,<500,>=500 us]="
+             "{}/{}/{}/{}/{}",
+             double(now_ns - g.window_ns) / 1e9, us(g.idle_ticks[FrontGfxTask], 1) / 1e3,
+             g.idle_n[FrontGfxTask], us(g.idle_ticks[FrontAscTask], 1) / 1e3,
+             g.idle_n[FrontAscTask], us(g.idle_ticks[FrontGuestIdle], 1) / 1e3,
+             g.idle_n[FrontGuestIdle], us(g.idle_ticks[FrontUnknown], 1) / 1e3,
+             g.idle_n[FrontUnknown], g.idle_hist[0], g.idle_hist[1], g.idle_hist[2],
+             g.idle_hist[3], g.idle_hist[4]);
+    g.idle_n = {};
+    g.idle_ticks = {};
+    g.idle_hist = {};
+    g.window_tsc = now_tsc;
+    g.window_ns = now_ns;
+}
+
+/// Back: around WaitForWork.
+u32 AscRingIdleEnter() {
+    g_asc_ring_clock.Set(g_asc_ring_clock.queue.load(), true);
+    return g_asc_ring_front_state.load(std::memory_order_relaxed);
+}
+void AscRingIdleExit(u32 front_state) {
+    const u64 start = g_asc_ring_clock.since.load();
+    g_asc_ring_clock.Set(g_asc_ring_clock.queue.load(), false);
+    const u64 ticks = g_asc_ring_clock.since.load() - start;
+    auto& g = g_asc_ring;
+    ++g.idle_n[front_state & 3];
+    g.idle_ticks[front_state & 3] += ticks;
+    const u64 us = ticks / 3500;
+    ++g.idle_hist[us < 5 ? 0 : us < 20 ? 1 : us < 100 ? 2 : us < 500 ? 3 : 4];
+}
+
+/// Back: a Diag record of the ring-latency instrument, in stream order.
+void AscRingBack(const CpSplit::DiagPayload& diag) {
+    const u32 q = diag.queue % AscRingQueues;
+    auto& s = g_asc_ring.q[q];
+    switch (diag.kind) {
+    case AscRingSwitch:
+        g_asc_ring_clock.Set(diag.queue, false);
+        break;
+    case AscRingBegin: {
+        const AscRingSnap submit{diag.values[0], diag.values[1], diag.values[2], diag.values[3],
+                                 diag.values[4]};
+        const u64 gap_ticks = AscRingGroupGapUs * 3500; // ~3.5 GHz TSC, see AscRingCloseGroup
+        if (s.group_open && submit.tsc - s.group_last_submit.tsc > gap_ticks) {
+            AscRingCloseGroup(s);
+        }
+        if (!s.group_open) {
+            s.group_open = true;
+            s.group_first = submit;
+        }
+        s.group_last_submit = submit;
+        ++s.group_subs;
+        s.open = true;
+        s.submit = submit;
+        s.front_tsc = diag.values[5];
+        s.back_tsc = __rdtsc();
+        s.labels = 0;
+        break;
+    }
+    case AscRingEnd:
+        if (s.open) {
+            ++s.subs;
+            s.subs_nolabel += s.labels == 0;
+            s.open = false;
+        }
+        AscRingLog();
+        break;
+    default:
+        break;
+    }
+}
+
+/// Back: an ASC RELEASE_MEM (the queue's completion label) is being executed.
+void AscRingLabel(VAddr address, bool deferred_to_gpu) {
+    const u32 q = g_asc_ring_clock.queue.load() % AscRingQueues;
+    auto& s = g_asc_ring.q[q];
+    ++s.label_count;
+    s.deferred_labels += deferred_to_gpu;
+    s.last_label_addr = address;
+    if (!s.open) {
+        return;
+    }
+    const AscRingSnap label = g_asc_ring_clock.Snap(q);
+    if (s.labels++ == 0) {
+        s.to_front += s.front_tsc - s.submit.tsc;
+        s.to_back += s.back_tsc - s.submit.tsc;
+        s.to_label += label.tsc - s.submit.tsc;
+        s.sub_span.Add(s.submit, label);
+    }
+    if (s.group_open) {
+        s.group_label = label;
+        s.group_label_submit = s.submit;
+        ++s.group_labels;
+    }
+}
+
 void PrefetchProgram(const ShaderProgram& program) {
     const auto* code = program.Address<const char*>();
     if (!code) {
@@ -928,7 +1263,12 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                 return value != nullptr && value[0] == '1';
             }();
             const u64 idle_t0 = draw_cost ? __rdtsc() : 0;
+            const bool ring_latency = AscRingLatency();
+            const u32 ring_front_state = ring_latency ? AscRingIdleEnter() : 0;
             split->WaitForWork(num_commands, stoken);
+            if (ring_latency) [[unlikely]] {
+                AscRingIdleExit(ring_front_state);
+            }
             if (draw_cost) {
                 g_back_idle_cyc += __rdtsc() - idle_t0;
             }
@@ -1009,6 +1349,9 @@ void Liverpool::ExecuteRecord(const CpSplit::RecordHeader& record) {
         submit_cv.notify_all();
         break;
     }
+    case CpSplit::RecordType::Diag:
+        AscRingBack(*reinterpret_cast<const CpSplit::DiagPayload*>(payload));
+        break;
     case CpSplit::RecordType::Wrap:
     default:
         UNREACHABLE_MSG("CpSplit: bad record type {}", static_cast<u32>(record.type));
@@ -1085,6 +1428,9 @@ void Liverpool::ExecuteDispatchRecord(const CpSplit::RecordHeader& record) {
         }
     } else if (rec.verify & DrawVerifySnapshot) {
         VerifySnapshot(stages_end, record.seq);
+    }
+    if (rec.queue != GfxQueueId && AscRingLatency()) [[unlikely]] {
+        ++g_asc_ring.q[rec.queue % AscRingQueues].dispatches;
     }
     // BackCsRegs() returns the snapshot while this dispatch runs (HLE, IsCompute*, BindBuffers).
     back_cs = &rec.cs;
@@ -1446,6 +1792,12 @@ void Liverpool::ExecuteAscReleaseMem(const PM4CmdReleaseMem* release_mem, u32 pi
     }
     g_cp_wait.NoteWrite(release_mem->Address<void*>());
     VideoCore::ProtectFence();
+    if (AscRingLatency()) [[unlikely]] {
+        // Just before the label write (or its deferral to the GPU, counted separately).
+        AscRingLabel(release_mem->Address<VAddr>(),
+                     (FenceAtGpu() == 1 || FenceAtGpu() == 2) && rasterizer &&
+                         release_mem->data_sel != DataSelect::GdsMemStore);
+    }
     if ((FenceAtGpu() == 1 || FenceAtGpu() == 2) && rasterizer &&
         release_mem->data_sel != DataSelect::GdsMemStore) {
         rasterizer->DeferToGpu(
@@ -2054,6 +2406,7 @@ void Liverpool::ProcessLoop(std::stop_token stoken) {
             // notes\parallel-command-recording-plan.md.
             const auto t_wait = Common::FaultMonitor::Now();
             const u64 idle_start = g_cp_wait.enabled ? CpWaitStats::Now() : 0;
+            g_asc_ring_front_state.store(FrontGuestIdle, std::memory_order_relaxed);
             std::unique_lock lk{submit_mutex};
             Common::CondvarWait(submit_cv, lk, stoken,
                                 [this] { return num_commands || num_submits || submit_done; });
@@ -2095,9 +2448,23 @@ void Liverpool::ProcessLoop(std::stop_token stoken) {
                 // its buffers. A task not started yet checks its own buffer at entry instead.
                 SplitGuardActive();
             }
+            const bool ring_latency = split_run_ahead && AscRingLatency();
+            if (ring_latency) [[unlikely]] {
+                g_asc_ring_front_state.store(curr_qid == s32(GfxQueueId) ? FrontGfxTask
+                                                                         : FrontAscTask,
+                                             std::memory_order_relaxed);
+                if (g_asc_ring.front_queue != u32(curr_qid)) {
+                    // Stream switch, in stream order: rides along with the task's next record.
+                    g_asc_ring.front_queue = u32(curr_qid);
+                    EmitAscRingDiag(*split, AscRingSwitch, u32(curr_qid));
+                }
+            }
             task.resume();
 
             if (task.done()) {
+                if (ring_latency && curr_qid != s32(GfxQueueId)) [[unlikely]] {
+                    EmitAscRingDiag(*split, AscRingEnd, u32(curr_qid));
+                }
                 // CP split: the guest reads num_submits == 0 as "GPU idle", so the back must
                 // have finished the submission first. POST_TASK_DONE: instead of draining, count
                 // it pending and post a Retire record; WaitGpuIdle/IsGpuIdle also wait for
@@ -3095,6 +3462,22 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 NoteAscStart(submit_ns, vqid + 1);
             }
         }
+        if (split_run_ahead && AscRingLatency()) [[unlikely]] {
+            AscRingSnap submit{};
+            bool have = false;
+            {
+                std::scoped_lock lock{g_asc_ring.submit_mutex};
+                auto& stamps = g_asc_ring.submits[(vqid + 1) % AscRingQueues];
+                if (!stamps.empty()) {
+                    submit = stamps.front();
+                    stamps.pop_front();
+                    have = true;
+                }
+            }
+            if (have) {
+                EmitAscRingDiag(*split, AscRingBegin, vqid + 1, &submit, __rdtsc());
+            }
+        }
     }
     SplitSpanScope split_span{*this, &acb,
                               is_indirect ? CpSplit::DrainReason::TaskGuardIb
@@ -3564,6 +3947,12 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     const auto& task = ProcessCompute(acb, vqid);
     {
         std::scoped_lock lock{queue.m_access};
+        if (split_run_ahead && AscRingLatency()) [[unlikely]] {
+            // Under m_access and before the push below, so stamps keep the queue's task order.
+            std::scoped_lock ring_lock{g_asc_ring.submit_mutex};
+            g_asc_ring.submits[gnm_vqid % AscRingQueues].push_back(
+                g_asc_ring_clock.Snap(gnm_vqid));
+        }
         // Before the push: the front may run and pop this task before this function returns.
         asc_outstanding.fetch_add(1, std::memory_order_relaxed);
         queue.submits.emplace(task.handle);

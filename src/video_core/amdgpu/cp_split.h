@@ -152,6 +152,7 @@ enum class RecordType : u16 {
     Call,       ///< CallPayload: a function on the front's stack. Always synchronous.
     Retire,     ///< No payload: a guest submission is complete (POST_TASK_DONE); the back
                 ///< retires it for WaitGpuIdle.
+    Diag,       ///< DiagPayload: a diagnostic marker in stream order (SHADPS4_ASC_RING_LATENCY).
 };
 
 /// Flags for Packet records.
@@ -242,6 +243,12 @@ struct EpochPayload {
 struct CallPayload {
     void (*invoke)(void*);
     void* context;
+};
+/// Diagnostic marker (never emitted unless a diagnostic flag is on).
+struct DiagPayload {
+    u32 kind;
+    u32 queue;
+    u64 values[6];
 };
 
 /// Per-stage user data of one draw/dispatch, copied on the front right after the lookup
