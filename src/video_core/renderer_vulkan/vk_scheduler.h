@@ -727,10 +727,12 @@ public:
     /// subtracts them from its age clock (TextureCache::AgeTick): its overlap eviction counts
     /// submissions since an image's last use, and these multiply the submissions per frame.
     void NoteCadenceFlush() noexcept {
-        ++cadence_flushes;
+        cadence_flushes.fetch_add(1, std::memory_order_relaxed);
     }
+    /// Read off the command processor thread too (TextureCache::FindImage from the video-out
+    /// surface registration), hence atomic.
     [[nodiscard]] u64 CadenceFlushes() const noexcept {
-        return cadence_flushes;
+        return cadence_flushes.load(std::memory_order_relaxed);
     }
     [[nodiscard]] u32 LastBatchDraws() const noexcept {
         return last_batch_draws;
@@ -876,7 +878,7 @@ private:
 
     u32 last_batch_draws = 0;
     u32 batch_ops = 0;
-    u64 cadence_flushes = 0;
+    std::atomic<u64> cadence_flushes{0};
     MasterSemaphore master_semaphore;
     CommandPool command_pool;
     DynamicState dynamic_state;

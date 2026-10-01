@@ -638,8 +638,10 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                                                            ImageId cache_image_id,
                                                            ImageId merged_image_id) {
     auto& cache_image = slot_images[cache_image_id];
+    // Saturating: between NoteCadenceFlush and the tick it precedes, and for a lookup from
+    // another thread, the age clock can read one below a stamp taken just before.
     const bool safe_to_delete =
-        AgeTick() - cache_image.tick_accessed_last > NumFramesBeforeRemoval;
+        AgeTick() > cache_image.tick_accessed_last + NumFramesBeforeRemoval;
 
     // Equal address
     if (image_info.guest_address == cache_image.info.guest_address) {
@@ -1283,6 +1285,7 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
 ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
+    const bool first_depth_use = !image.usage.depth_target;
     image.usage.depth_target = 1u;
     UpdateImage(image_id);
 
@@ -1304,6 +1307,18 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
                      desc.info.meta_info.htile_addr, image.info.size.width, image.info.size.height,
                      vk::to_string(image.info.pixel_format), image.info.guest_address,
                      u32(image.info.meta_info.htile_clear_mask), scheduler.CurrentTick());
+        }
+        // The reverse of the kept-entry case (Opus review 2026-10-01): an image on its first
+        // depth use meets an entry kept alive by an aliasing image, so it does not get the
+        // first-use clear a new entry would have given it. Not seen; logged if it happens.
+        static u32 logged_first = 0;
+        if (!created && first_depth_use && image.info.meta_info.htile_clear_mask != 0 &&
+            RareLog(logged_first, 32)) {
+            LOG_INFO(Render_Vulkan,
+                     "MetaKeptFirstUse: htile {:#x} first depth use of image {}x{} {} at {:#x} "
+                     "finds an existing entry (no first-use clear)",
+                     desc.info.meta_info.htile_addr, image.info.size.width, image.info.size.height,
+                     vk::to_string(image.info.pixel_format), image.info.guest_address);
         }
         image.info.meta_info.htile_addr = desc.info.meta_info.htile_addr;
     }
@@ -1951,8 +1966,8 @@ void TextureCache::DeleteImage(ImageId image_id) {
         const bool shared =
             MetaUsedByOtherImage(meta_addr, image.info.guest_address, image.info.guest_size);
         const bool keep = shared && shared_keep;
-        static u32 logged = 0;
-        if (shared || RareLog(logged)) {
+        static u32 logged = 0, logged_shared = 0;
+        if (RareLog(shared ? logged_shared : logged)) {
             LOG_INFO(Render_Vulkan,
                      "MetaErase: {} {:#x} by image {}x{} {} at {:#x}:{:#x} age={} raw_tick={} "
                      "shared={} kept={}",

@@ -1939,6 +1939,7 @@ void Rasterizer::DispatchDirectTail(const ComputePipeline* pipeline) {
 
     ResetBindings();
     if (buffer_cache.TakeReadbackFlushRequest()) {
+        scheduler.NoteCadenceFlush();
         scheduler.Flush();
     }
     MaybeFlushEveryOps(scheduler);
