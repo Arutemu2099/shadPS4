@@ -74,6 +74,19 @@ const bool g_async_submit = EnvIs1("SHADPS4_ASYNC_SUBMIT");
 /// and how many transfer ops follow another transfer with nothing recorded in between (barrier
 /// coalescing potential). Each transfer op records its own barrier pair today.
 const bool g_upload_ahead_stats = EnvIs1("SHADPS4_UPLOAD_AHEAD_STATS");
+/// SHADPS4_FAULT_VETO_RETRY=N (0-4, default 0): a guest fault job that was vetoed (a GPU write was
+/// marked in its regions while it settled) is prepared again as a new asynchronous job up to N
+/// times before the synchronous fallback. The fallback downloads on the command processor with a
+/// flush and a GPU wait; measured 2026-09-30 in fire: 4.3% of jobs are vetoed (0.36 per frame)
+/// and ResolveFaultSync is ~4% of the CP back's samples. A retry costs the faulting guest thread
+/// one more job round trip instead. A vetoed job has published nothing and released its staging
+/// and window (FinalizeFaultJob), so preparing again is the same as a new fault on that address.
+const u32 g_fault_veto_retry = [] {
+    const char* value = std::getenv("SHADPS4_FAULT_VETO_RETRY");
+    const unsigned long n = value ? std::strtoul(value, nullptr, 10) : 0ul;
+    return static_cast<u32>(n > 4 ? 4 : n);
+}();
+std::atomic<u64> g_fault_veto_retries{0};
 /// SHADPS4_DEFERRED_COPY_CENSUS=1 (diagnostic): with DEFERRED_PROTECT the guest -> staging copy
 /// of an upload runs on the recording thread, later than the command processor recorded it, and
 /// guest labels are written at CP time. Counts deferred copies whose guest bytes changed between
@@ -838,6 +851,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool of
     bool free_at_wait = false;
     u32 passes = 0;
     const u64 spin_ns = Offload::SpinWaitNs();
+    for (u32 veto_retries = 0;; ++veto_retries) {
     for (;;) {
         cp->SendCommand<true>([&] {
             if (latency && passes == 0) {
@@ -874,8 +888,17 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool of
         cp->SendCommand<true>([&] { SettlePendingJob(ticket.id); });
     }
     // No teardown check: the cache outlives every guest thread (see ~BufferCache).
-    cp->SendCommand<true>(
-        [&] { FinishFaultDownload(ticket.id, device_addr, size, is_write); });
+    bool retry = false;
+    cp->SendCommand<true>([&] {
+        retry = FinishFaultDownload(ticket.id, device_addr, size, is_write,
+                                    veto_retries < g_fault_veto_retry);
+    });
+    if (!retry) {
+        break;
+    }
+    // SHADPS4_FAULT_VETO_RETRY: vetoed, nothing published; prepare a new job.
+    ticket = FaultTicket{};
+    }
     fault_guest_waiters.fetch_sub(1);
     if (latency) {
         RecordFaultLatency(ticket, passes, t_fault, t_cp, t_wait, t_woke, free_at_wait,
@@ -2325,7 +2348,8 @@ void BufferCache::SettlePendingJob(u64 id) {
     }
 }
 
-void BufferCache::FinishFaultDownload(u64 id, VAddr device_addr, u64 size, bool is_write) {
+bool BufferCache::FinishFaultDownload(u64 id, VAddr device_addr, u64 size, bool is_write,
+                                      bool allow_retry) {
     FaultJob* job = nullptr;
     for (FaultJob& candidate : fault_jobs) {
         if (candidate.state != FaultJobState::Free && candidate.id == id) {
@@ -2334,6 +2358,7 @@ void BufferCache::FinishFaultDownload(u64 id, VAddr device_addr, u64 size, bool 
         }
     }
     bool vetoed = true;
+    bool clean_veto = false; // the job itself ended Vetoed (not missing, not abandoned)
     if (!job) {
         // Only teardown frees a job its owner has not consumed. Tracking is intact by
         // construction, so the synchronous path below is still correct.
@@ -2356,8 +2381,18 @@ void BufferCache::FinishFaultDownload(u64 id, VAddr device_addr, u64 size, bool 
             // A job the command processor settled earlier stays in Success or Vetoed until
             // this point, so removal after a veto is never mistaken for success.
             vetoed = job->state == FaultJobState::Vetoed;
+            clean_veto = vetoed;
             job->state = FaultJobState::Free;
         }
+    }
+    if (clean_veto && allow_retry) {
+        // The job is Free again, its staging and window were released when it was finalized and
+        // the tracker is untouched: the caller's next PrepareFaultDownload starts from scratch.
+        const u64 n = g_fault_veto_retries.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((n & 0x3ff) == 0) {
+            LOG_INFO(Render, "FaultVetoRetry: {} vetoed jobs retried asynchronously", n);
+        }
+        return true;
     }
     if (vetoed) {
         if (is_write && !fault_mapping_gate.TryAdmit(device_addr, size, [] {})) {
@@ -2367,12 +2402,14 @@ void BufferCache::FinishFaultDownload(u64 id, VAddr device_addr, u64 size, bool 
             // guest's write finds the page still protected it faults again, and that fault is
             // not admitted as a job and resolves synchronously.
             Offload::Add(Offload::State().write_map_skips);
-            return;
+            return false;
         }
-        // Exactly one synchronous fallback per vetoed job, and no retry.
+        // Exactly one synchronous fallback per vetoed job (after SHADPS4_FAULT_VETO_RETRY's
+        // asynchronous attempts, if any).
         Offload::Add(Offload::State().sync_fallbacks);
         ResolveFaultSync(device_addr, size, is_write, Offload::Origin::Guest);
     }
+    return false;
 }
 
 void BufferCache::SettleOverlappingJobs(VAddr device_addr, u64 size) {

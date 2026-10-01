@@ -479,7 +479,11 @@ private:
 
     FaultTicket PrepareFaultDownload(VAddr device_addr, u64 size, bool is_write);
 
-    void FinishFaultDownload(u64 id, VAddr device_addr, u64 size, bool is_write);
+    /// Returns true when the job was vetoed and `allow_retry` asked for another asynchronous
+    /// attempt instead of the synchronous fallback (SHADPS4_FAULT_VETO_RETRY): nothing was
+    /// published or downloaded, the caller prepares a new job.
+    bool FinishFaultDownload(u64 id, VAddr device_addr, u64 size, bool is_write,
+                             bool allow_retry = false);
 
     /// Finalizes every pending job sharing a tracker page with the range, waiting on its tick
     /// here. Must precede any download, publication or tracker clear over that range.

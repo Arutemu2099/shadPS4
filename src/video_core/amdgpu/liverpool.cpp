@@ -406,6 +406,13 @@ struct AscRingState {
     /// part of whatever stream class is current.
     u64 cmd_n = 0, cmd_ticks = 0;
     u64 prev_gfx = 0, prev_asc = 0, prev_idle = 0; ///< Class clock at the window start.
+    /// Frame-fence discriminator: TSC of the newest gfx EOP label write (back), and at each
+    /// SubmitGfx (guest thread) the time since it. Second Son waits for the previous frame's EOP
+    /// label before it submits the next frame (0x1f1e30) with a 50 us poll: if Game:Main is
+    /// waiting there, each submit follows a label write within about one poll.
+    std::atomic<u64> last_eop_tsc{0};
+    std::atomic<u64> sg_n{0}, sg_ticks{0};
+    std::array<std::atomic<u64>, 5> sg_hist{}; ///< <100 us, <300, <1000, <3000, >= 3000 (approx)
     u32 front_queue = 0; ///< Front only: the stream of the last Switch marker.
     std::mutex submit_mutex; ///< Guards `submits` (SubmitAsc on guest threads, the front pops).
     std::array<std::deque<AscRingSnap>, AscRingQueues> submits{};
@@ -530,6 +537,18 @@ bool AscRingLog() {
         g.prev_asc = snap.asc;
         g.prev_idle = snap.idle;
         g.cmd_n = g.cmd_ticks = 0;
+    }
+    {
+        const u64 n = g.sg_n.exchange(0, std::memory_order_relaxed);
+        const u64 ticks = g.sg_ticks.exchange(0, std::memory_order_relaxed);
+        std::array<u64, 5> h{};
+        for (u32 i = 0; i < h.size(); ++i) {
+            h[i] = g.sg_hist[i].exchange(0, std::memory_order_relaxed);
+        }
+        LOG_INFO(Render,
+                 "AscRingFrameFence: gfx_submits={} mean_us_since_last_eop_label={:.0f} "
+                 "hist_approx[<100,<300,<1000,<3000,>=3000 us]={}/{}/{}/{}/{}",
+                 n, us(ticks, n), h[0], h[1], h[2], h[3], h[4]);
     }
     g.idle_n = {};
     g.idle_ticks = {};
@@ -2357,6 +2376,9 @@ void Liverpool::ExecuteGfxPacket(const PM4Header* header, bool guest_markers_ena
                 }
             },
             [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
+        if (AscRingLatency()) [[unlikely]] {
+            g_asc_ring.last_eop_tsc.store(__rdtsc(), std::memory_order_relaxed);
+        }
         break;
     }
     case PM4ItOpcode::DmaData: {
@@ -3963,6 +3985,19 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     }
 
     Common::FaultMonitor::CountGuestSubmit(true);
+    if (AscRingLatency()) [[unlikely]] {
+        auto& g = g_asc_ring;
+        const u64 eop = g.last_eop_tsc.load(std::memory_order_relaxed);
+        const u64 now = __rdtsc();
+        if (eop != 0 && now > eop) {
+            const u64 ticks = now - eop;
+            const u64 us = ticks / 3500; // ~3.5 GHz TSC; the mean uses the measured ratio
+            g.sg_n.fetch_add(1, std::memory_order_relaxed);
+            g.sg_ticks.fetch_add(ticks, std::memory_order_relaxed);
+            g.sg_hist[us < 100 ? 0 : us < 300 ? 1 : us < 1000 ? 2 : us < 3000 ? 3 : 4].fetch_add(
+                1, std::memory_order_relaxed);
+        }
+    }
     auto task = ProcessGraphics(dcb, ccb);
     {
         std::scoped_lock lock{queue.m_access};

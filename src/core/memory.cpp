@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <boost/container/small_vector.hpp>
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -180,6 +181,12 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
         return false;
     }
 
+    // The source advances with every piece: a write that spans several physical areas used to
+    // copy the first bytes of `data` into each of them (found 2026-09-30; the first such write is
+    // logged, to learn whether it ever happens in this title).
+    const u8* src = static_cast<const u8*>(data);
+    u32 pieces = 0;
+    const u64 total_size = size;
     for (const VirtualMemoryArea* vma_ptr : vmas_to_write) {
         const VirtualMemoryArea& vma = *vma_ptr;
         auto start_in_vma = std::max<VAddr>(virtual_addr, vma.base) - vma.base;
@@ -192,8 +199,18 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
                 std::max<u64>(start_in_vma, phys_handle->first) - phys_handle->first;
             u8* backing = impl.BackingBase() + phys_handle->second.base + start_in_dma;
             u64 copy_size = std::min<u64>(size, phys_handle->second.size - start_in_dma);
-            memcpy(backing, data, copy_size);
+            memcpy(backing, src, copy_size);
+            src += copy_size;
             size -= copy_size;
+            ++pieces;
+        }
+    }
+    if (pieces > 1) [[unlikely]] {
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+            LOG_WARNING(Kernel_Vmm,
+                        "TryWriteBacking: write {:#x}+{:#x} spans {} physical areas", virtual_addr,
+                        total_size, pieces);
         }
     }
 
