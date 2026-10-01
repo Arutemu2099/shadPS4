@@ -34,12 +34,23 @@ GraphicsPipeline::GraphicsPipeline(
     vk::PipelineCache pipeline_cache, std::span<const Shader::Info*, MaxShaderStages> infos,
     std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
     std::shared_ptr<const Shader::Gcn::FetchShaderData> fetch_shader_,
-    std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading)
+    std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading,
+    const DescSetBindings* derived /*= nullptr*/)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_},
       fetch_shader{std::move(fetch_shader_)} {
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
-    BuildDescSetLayout(sdata, preloading);
+    // With `derived`, the lookup thread already read everything below that needs an Info's
+    // user data (DeriveStageInputs); this constructor may be running on the compiler thread
+    // while that thread rewrites the Infos for its next draw.
+    ASSERT_MSG(!(derived && preloading), "Derived stage inputs are never preloaded");
+    if (derived) {
+        BuildDescSetLayout(std::span{derived->data(), derived->size()});
+    } else {
+        DescSetBindings bindings;
+        CollectDescSetBindings(stages, sdata, preloading, bindings);
+        BuildDescSetLayout(std::span{bindings.data(), bindings.size()});
+    }
     const auto debug_str = GetDebugString();
 
     const vk::PushConstantRange push_constants = {
@@ -64,7 +75,7 @@ GraphicsPipeline::GraphicsPipeline(
         SetObjectName(device, *pipeline_layout, "Graphics PipelineLayout {}", debug_str);
     }
 
-    if (!preloading) {
+    if (!preloading && !derived) {
         VertexInputs<AmdGpu::Buffer> guest_buffers;
         if (!instance.IsVertexInputDynamicState()) {
             const auto& vs_info = runtime_infos[u32(Shader::LogicalStage::Vertex)].vs_info;
@@ -415,12 +426,14 @@ GraphicsPipeline::GraphicsPipeline(
 
 GraphicsPipeline::~GraphicsPipeline() = default;
 
+// GetVertexInputs on a fetch shader that is not yet owned by a pipeline (DeriveStageInputs).
 template <typename Attribute, typename Binding>
-void GraphicsPipeline::GetVertexInputs(
-    VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
-    VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
-    VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1,
-    const Shader::BoundStage& vs) const {
+static void FetchVertexInputs(const Shader::Gcn::FetchShaderData* fetch_shader,
+                              VertexInputs<Attribute>& attributes,
+                              VertexInputs<Binding>& bindings,
+                              VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
+                              VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0,
+                              u32 step_rate_1, const Shader::BoundStage& vs) {
     using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
     if (!fetch_shader || fetch_shader->attributes.empty()) {
         return;
@@ -453,6 +466,16 @@ void GraphicsPipeline::GetVertexInputs(
         }
         guest_buffers.emplace_back(buffer);
     }
+}
+
+template <typename Attribute, typename Binding>
+void GraphicsPipeline::GetVertexInputs(
+    VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
+    VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
+    VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1,
+    const Shader::BoundStage& vs) const {
+    FetchVertexInputs<Attribute, Binding>(fetch_shader.get(), attributes, bindings, divisors,
+                                          guest_buffers, step_rate_0, step_rate_1, vs);
 }
 
 // Declare templated GetVertexInputs for necessary types.
@@ -544,8 +567,26 @@ u32 GraphicsPipeline::DeriveVertexInputs(AmdGpu::CpSplit::VertexInputsDerived& o
     return out.Bytes();
 }
 
-void GraphicsPipeline::BuildDescSetLayout(SerializationSupport& sdata, bool preloading) {
-    boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32> bindings;
+GraphicsPipeline::DescSetBindings GraphicsPipeline::DeriveStageInputs(
+    const Instance& instance, std::span<const Shader::Info*, MaxShaderStages> stages,
+    std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
+    const Shader::Gcn::FetchShaderData* fetch_shader, SerializationSupport& sdata) {
+    // The same two reads of the Infos the constructor makes without `derived`, in its order.
+    DescSetBindings bindings;
+    CollectDescSetBindings(stages, sdata, false, bindings);
+    if (!instance.IsVertexInputDynamicState()) {
+        VertexInputs<AmdGpu::Buffer> guest_buffers;
+        const auto& vs_info = runtime_infos[u32(Shader::LogicalStage::Vertex)].vs_info;
+        FetchVertexInputs(fetch_shader, sdata.vertex_attributes, sdata.vertex_bindings,
+                          sdata.divisors, guest_buffers, vs_info.step_rate_0, vs_info.step_rate_1,
+                          Shader::BoundStage{stages[u32(Shader::LogicalStage::Vertex)]});
+    }
+    return bindings;
+}
+
+void GraphicsPipeline::CollectDescSetBindings(std::span<const Shader::Info* const> stages,
+                                              SerializationSupport& sdata, bool preloading,
+                                              DescSetBindings& bindings) {
     u32 binding{};
     // Image descriptor counts cannot be recomputed while preloading, so they are carried in
     // sdata. Populated on first creation, replayed on preload.
@@ -605,6 +646,13 @@ void GraphicsPipeline::BuildDescSetLayout(SerializationSupport& sdata, bool prel
             });
         }
     }
+}
+
+void GraphicsPipeline::BuildDescSetLayout(
+    std::span<const vk::DescriptorSetLayoutBinding> bindings) {
+    // The unified binding count is the next free index after the last binding.
+    const u32 binding =
+        bindings.empty() ? 0u : bindings.back().binding + bindings.back().descriptorCount;
     if (instance.IsNativeBindingsActive()) {
         // Same unified binding numbering, expressed as descriptor heap mappings instead.
         BuildNativeMappings(bindings);

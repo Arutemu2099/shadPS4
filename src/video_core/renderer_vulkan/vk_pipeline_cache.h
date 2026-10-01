@@ -180,6 +180,17 @@ private:
         return num_new_pipelines > 0;
     }
 
+    // SHADPS4_ASYNC_PIPELINES (default off): a new graphics key is handed to one compiler thread
+    // and the lookup returns null (the draw is skipped) until a later lookup publishes the
+    // finished pipeline. graphics_pipelines keeps its single mutator: only the lookup thread
+    // inserts (a null entry marks a pending key) and assigns. Compute pipelines stay synchronous.
+    struct AsyncJob;
+    struct AsyncCompiler;
+    void QueueAsyncPipeline(u64 pipeline_hash);
+    void PublishAsyncPipelines();
+    void NoteCompiledPipeline(u64 hash, double translate_ms, double create_ms, u32 queued_ahead,
+                              bool async);
+
 private:
     const Instance& instance;
     Scheduler& scheduler;
@@ -199,6 +210,19 @@ private:
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+
+    std::unique_ptr<AsyncCompiler> async_compiler; // started by the first async job
+    u32 async_pending{};         // queued, not yet published; lookup thread only
+    double lookup_translate_ms{}; // GetProgram's module creation time within this lookup
+    // PipelineCompile / PipelineCompileSummary log lines (both modes). skipped_draws counts
+    // lookups that returned null because the key's compile was pending.
+    struct CompileStats {
+        u64 n{};
+        u64 skipped_draws{};
+        double translate_ms_total{};
+        double create_ms_total{};
+        double max_create_ms{};
+    } compile_stats{};
 
     // Allocated on first use when SHADPS4_PREPARED_PIPELINES=1. The epoch invalidates every
     // entry at once whenever a pipeline is erased or a module handle is replaced.

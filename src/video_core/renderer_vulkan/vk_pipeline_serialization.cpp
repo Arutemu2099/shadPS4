@@ -329,6 +329,19 @@ void PipelineCache::WarmUp() {
         LOG_WARNING(Render, "A SPIR-V variant flag is set: the pipeline cache is not used this run");
         return;
     }
+    // SHADPS4_PIPELINE_CACHE_SKIP=1: neither preload nor save the on-disk cache this run, so
+    // every pipeline compiles at first use (a test bed for SHADPS4_ASYNC_PIPELINES that needs no
+    // new area). Unlike the SPIR-V variant flags it changes nothing in the shaders; the store
+    // stays unopened, so Register* and Sync are no-ops.
+    static const bool skip_cache = [] {
+        const char* value = std::getenv("SHADPS4_PIPELINE_CACHE_SKIP");
+        return value && value[0] == '1';
+    }();
+    if (skip_cache) {
+        LOG_WARNING(Render, "SHADPS4_PIPELINE_CACHE_SKIP: the pipeline cache is neither read nor "
+                            "written this run");
+        return;
+    }
 
     Storage::DataBase::Instance().Open(instance.IsNativeBindingsActive());
 

@@ -1,6 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include <unordered_set>
 #include <cstdlib>
 #include <ranges>
@@ -11,6 +18,8 @@
 #include "common/lean.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
+#include "common/polyfill_thread.h"
+#include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -258,6 +267,123 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
     return info;
 }
 
+namespace {
+// Wall time of one shader translation or pipeline construction; read only around those, never
+// per draw (Common::FaultMonitor::Now is a no-op unless SHADPS4_FAULT_TIMERS).
+using CompileClock = std::chrono::steady_clock;
+double MsSince(CompileClock::time_point start) {
+    return std::chrono::duration<double, std::milli>(CompileClock::now() - start).count();
+}
+} // namespace
+
+// SHADPS4_ASYNC_PIPELINES: one graphics pipeline construction, owned end to end. The compiler
+// thread reads only copies, plus two kinds of handle to objects the cache never destroys while a
+// job can exist: `infos` point into program_cache's Programs (unique_ptr, never erased; the
+// constructor dereferences them only for the immutable stage/pgm_hash of its debug name, every
+// per-draw field was read by DeriveStageInputs on the lookup thread) and `modules`, which only
+// ReplaceShader destroys, after WaitIdle.
+struct PipelineCache::AsyncJob {
+    GraphicsPipelineKey key{};
+    u64 hash{};
+    std::array<const Shader::Info*, MaxShaderStages> infos{};
+    std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
+    std::array<vk::ShaderModule, MaxShaderStages> modules{};
+    std::shared_ptr<const Shader::Gcn::FetchShaderData> fetch_shader;
+    GraphicsPipeline::SerializationSupport sdata{};
+    GraphicsPipeline::DescSetBindings desc_bindings;
+    double translate_ms{};
+    u32 queued_ahead{};
+    // Compiler thread output, handed back under the queue mutex.
+    double create_ms{};
+    std::unique_ptr<GraphicsPipeline> pipeline;
+};
+
+// FIFO worker. vk::PipelineCache was created without the externally-synchronized flag, so the
+// driver serializes its use between this thread and the synchronous compute path.
+struct PipelineCache::AsyncCompiler {
+    AsyncCompiler(const Instance& instance_, Scheduler& scheduler_, DescriptorHeap& desc_heap_,
+                  const Shader::Profile& profile_, vk::PipelineCache pipeline_cache_)
+        : instance{instance_}, scheduler{scheduler_}, desc_heap{desc_heap_}, profile{profile_},
+          pipeline_cache{pipeline_cache_}, thread{std::bind_front(&AsyncCompiler::Run, this)} {}
+
+    // Queued jobs are dropped; a construction in progress completes first (one driver compile).
+    // Finished, unpublished pipelines are destroyed with `finished`, after the thread.
+    ~AsyncCompiler() {
+        thread.request_stop();
+        thread.join();
+    }
+
+    void Push(std::unique_ptr<AsyncJob> job) {
+        {
+            std::scoped_lock lk{mutex};
+            job->queued_ahead = static_cast<u32>(queue.size()) + (busy ? 1u : 0u);
+            queue.push_back(std::move(job));
+        }
+        cv.notify_one();
+    }
+
+    bool HasFinished() const {
+        return num_finished.load(std::memory_order_acquire) != 0;
+    }
+
+    std::vector<std::unique_ptr<AsyncJob>> TakeFinished() {
+        std::scoped_lock lk{mutex};
+        num_finished.store(0, std::memory_order_relaxed);
+        return std::exchange(finished, {});
+    }
+
+    /// Returns once nothing is queued or in construction.
+    void WaitIdle() {
+        std::unique_lock lk{mutex};
+        idle_cv.wait(lk, [&] { return queue.empty() && !busy; });
+    }
+
+private:
+    void Run(std::stop_token stoken) {
+        Common::SetCurrentThreadName("shadPS4:PipelineCompiler");
+        while (true) {
+            std::unique_ptr<AsyncJob> job;
+            {
+                std::unique_lock lk{mutex};
+                Common::CondvarWait(cv, lk, stoken, [&] { return !queue.empty(); });
+                if (stoken.stop_requested()) {
+                    return;
+                }
+                job = std::move(queue.front());
+                queue.pop_front();
+                busy = true;
+            }
+            const auto t_create = CompileClock::now();
+            job->pipeline = std::make_unique<GraphicsPipeline>(
+                instance, scheduler, desc_heap, profile, job->key, pipeline_cache, job->infos,
+                job->runtime_infos, job->fetch_shader, job->modules, job->sdata, false,
+                &job->desc_bindings);
+            job->create_ms = MsSince(t_create);
+            {
+                std::scoped_lock lk{mutex};
+                finished.push_back(std::move(job));
+                busy = false;
+                num_finished.fetch_add(1, std::memory_order_release);
+            }
+            idle_cv.notify_all();
+        }
+    }
+
+    const Instance& instance;
+    Scheduler& scheduler;
+    DescriptorHeap& desc_heap;
+    const Shader::Profile& profile;
+    vk::PipelineCache pipeline_cache;
+    std::mutex mutex;
+    std::condition_variable_any cv;
+    std::condition_variable_any idle_cv;
+    std::deque<std::unique_ptr<AsyncJob>> queue;
+    std::vector<std::unique_ptr<AsyncJob>> finished;
+    bool busy{};
+    std::atomic<u32> num_finished{};
+    std::jthread thread; // last: joined before anything above is destroyed
+};
+
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
@@ -328,6 +454,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 }
 
 PipelineCache::~PipelineCache() {
+    // SHADPS4_ASYNC_PIPELINES: the compiler references members of this object; stop it first.
+    // Queued jobs are dropped, finished unpublished pipelines are destroyed with it.
+    async_compiler.reset();
     scheduler.DrainRecording();
 }
 
@@ -358,6 +487,7 @@ const bool g_shared_fetch_verify = [] {
 const bool g_prepared_programs = EnvExactly1("SHADPS4_PREPARED_PROGRAMS");
 const bool g_prepared_programs_verify = EnvExactly1("SHADPS4_PREPARED_PROGRAMS_VERIFY");
 const bool g_prepared_programs_two_entry = EnvExactly1("SHADPS4_PREPARED_PROGRAMS_TWO_ENTRY");
+const bool g_async_pipelines = EnvExactly1("SHADPS4_ASYNC_PIPELINES");
 } // namespace
 
 static bool PreparedPipelinesEnabled() {
@@ -424,6 +554,12 @@ void PipelineCache::NoteStageSelection(LogicalStage l_stage, Program* program, s
 static bool ShaderCollectCached() {
     static const bool collect = EmulatorSettings.IsShaderCollect();
     return collect;
+}
+
+// SHADPS4_ASYNC_PIPELINES, off under shader collection: that path records module/pipeline
+// relations at creation and erases map entries on hot reload, both from the creating thread.
+static bool AsyncPipelinesEnabled() {
+    return g_async_pipelines && !ShaderCollectCached();
 }
 
 size_t PipelineCache::PreparedPipelineWays() {
@@ -719,6 +855,10 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
             stage_selections.fill({});
         }
     }
+    if (async_pending != 0 && async_compiler->HasFinished()) {
+        PublishAsyncPipelines();
+    }
+    lookup_translate_ms = 0;
     const auto t_probe0 = Common::FaultMonitor::Now();
     if (!RefreshGraphicsKey()) {
         ASSERT_MSG(!prepared_hit, "PreparedPipelines hit a draw the original path rejects");
@@ -770,10 +910,26 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
+        // A draw that carries a register-driven depth or stencil clear is not skipped: the clear
+        // is that draw's own load op (Rasterizer depth attachment), so skipping it would leave
+        // the frame's depth/stencil uncleared (Opus review 2026-10-01). It compiles in line.
+        const auto& drc = liverpool->regs.depth_render_control;
+        if (AsyncPipelinesEnabled() && !drc.depth_clear_enable && !drc.stencil_clear_enable) {
+            // The entry stays null until a later lookup publishes the compiler's result; this
+            // draw and every draw of the key until then are skipped. Nothing below (memo seed,
+            // collection) sees a null pipeline.
+            QueueAsyncPipeline(pipeline_hash);
+            fetch_shader.reset();
+            ++compile_stats.skipped_draws;
+            return nullptr;
+        }
+
         GraphicsPipeline::SerializationSupport sdata{};
+        const auto t_create = CompileClock::now();
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
             runtime_infos, fetch_shader, modules, sdata, false);
+        const double create_ms = MsSince(t_create);
 
         RegisterPipelineData(graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
@@ -787,6 +943,12 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
             }
         }
         fetch_shader.reset();
+        NoteCompiledPipeline(pipeline_hash, lookup_translate_ms, create_ms, 0, false);
+    } else if (!it->second) {
+        // Pending in the compiler: entries are null only while SHADPS4_ASYNC_PIPELINES is on.
+        // Not memoised: a prepared entry is seeded from a non-null pipeline only.
+        ++compile_stats.skipped_draws;
+        return nullptr;
     }
     if (prepared_hit) {
         VerifyPreparedPipeline(*prepared_hit, it->second.get(), is_new);
@@ -795,6 +957,66 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
         SeedPreparedPipeline(prepared_state, it->second.get());
     }
     return it->second.get();
+}
+
+void PipelineCache::QueueAsyncPipeline(u64 pipeline_hash) {
+    if (!async_compiler) {
+        async_compiler = std::make_unique<AsyncCompiler>(instance, scheduler, desc_heap, profile,
+                                                         *pipeline_cache);
+        LOG_INFO(Render_Vulkan, "AsyncPipelines: compiler thread started; draws of a graphics "
+                                "pipeline are skipped while it compiles");
+    }
+    auto job = std::make_unique<AsyncJob>();
+    job->key = graphics_key;
+    job->hash = pipeline_hash;
+    job->infos = infos;
+    job->runtime_infos = runtime_infos;
+    job->modules = modules;
+    job->fetch_shader = fetch_shader;
+    job->translate_ms = lookup_translate_ms;
+    // The only reads of the Infos' per-draw state, here on the lookup thread.
+    job->desc_bindings = GraphicsPipeline::DeriveStageInputs(instance, infos, runtime_infos,
+                                                             fetch_shader.get(), job->sdata);
+    async_compiler->Push(std::move(job));
+    ++async_pending;
+}
+
+void PipelineCache::PublishAsyncPipelines() {
+    for (auto& job : async_compiler->TakeFinished()) {
+        // Inserted null by the lookup that queued the job; nothing erases entries while async
+        // is on (hot reload needs shader collection).
+        const auto it = graphics_pipelines.find(job->key);
+        ASSERT_MSG(it != graphics_pipelines.end() && !it->second,
+                   "Async pipeline {:#x} has no pending entry", job->hash);
+        it.value() = std::move(job->pipeline);
+        RegisterPipelineData(job->key, job->hash, job->sdata);
+        ++num_new_pipelines;
+        --async_pending;
+        NoteCompiledPipeline(job->hash, job->translate_ms, job->create_ms, job->queued_ahead,
+                             true);
+    }
+}
+
+void PipelineCache::NoteCompiledPipeline(u64 hash, double translate_ms, double create_ms,
+                                         u32 queued_ahead, bool async) {
+    auto& stats = compile_stats;
+    ++stats.n;
+    stats.translate_ms_total += translate_ms;
+    stats.create_ms_total += create_ms;
+    stats.max_create_ms = std::max(stats.max_create_ms, create_ms);
+    // translate: new programs/modules this lookup created (0 when all were cached); create: the
+    // GraphicsPipeline constructor, which holds the driver compile; queued: jobs ahead of this
+    // one in the compiler when it was queued.
+    LOG_INFO(Render_Vulkan,
+             "PipelineCompile: hash={:#x} translate_ms={:.2f} create_ms={:.2f} queued={} async={}",
+             hash, translate_ms, create_ms, queued_ahead, async);
+    if (stats.n % 64 == 0) {
+        LOG_INFO(Render_Vulkan,
+                 "PipelineCompileSummary: n={} translate_ms_total={:.1f} create_ms_total={:.1f} "
+                 "max_create_ms={:.2f} skipped_draws={}",
+                 stats.n, stats.translate_ms_total, stats.create_ms_total, stats.max_create_ms,
+                 stats.skipped_draws);
+    }
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
@@ -1172,6 +1394,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
     auto runtime_info = BuildRuntimeInfo(stage, l_stage);
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
     if (new_program) {
+        const auto t_translate = CompileClock::now();
         it_pgm.value() = std::make_unique<Program>(stage, l_stage, params);
         auto& program = it_pgm.value();
         auto start = binding;
@@ -1182,6 +1405,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
         program->AddPermut(module, std::move(spec));
         NoteStageSelection(l_stage, program.get(), 0, true);
+        lookup_translate_ms += MsSince(t_translate);
         return std::make_tuple(&program->info, module, SharedFetchMetadata(program->modules[0]),
                                perm_hash);
     }
@@ -1253,11 +1477,13 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
     const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
     const bool compiled = it == program->modules.end();
     if (compiled) {
+        const auto t_translate = CompileClock::now();
         auto new_info = Shader::Info(stage, l_stage, params);
         module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
 
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
         program->AddPermut(module, std::move(spec));
+        lookup_translate_ms += MsSince(t_translate);
     } else {
         info.AddBindings(binding);
         module = it->module;
@@ -1288,6 +1514,12 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
     // draws, then finish all uses of the old pipelines before destroying them.
     liverpool->SendCommand<true>([&] {
         scheduler.Finish();
+        // SHADPS4_ASYNC_PIPELINES: a queued job copied module handles; let the compiler drain
+        // before any handle below is destroyed. Its finished jobs are published by the next
+        // lookup, not here (this may be the back thread while the front is mid-lookup).
+        if (async_compiler) {
+            async_compiler->WaitIdle();
+        }
         // Entries hold pipeline pointers and module handles; drop them all before either
         // can be destroyed below. Runs on the command-processor thread like the draws.
         ++prepared_pipeline_epoch;

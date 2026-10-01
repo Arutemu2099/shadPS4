@@ -93,6 +93,12 @@ public:
         bool Deserialize(Serialization::Archive& ar);
     };
 
+    /// Descriptor set layout bindings of every stage, in unified binding order.
+    using DescSetBindings = boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32>;
+
+    /// `derived` (SHADPS4_ASYNC_PIPELINES): the result of DeriveStageInputs, computed on the
+    /// lookup thread. With it the constructor reads no Info field except the immutable
+    /// stage/pgm_hash (debug name), so it can run on the pipeline compiler thread.
     GraphicsPipeline(const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
                      const Shader::Profile& profile, const GraphicsPipelineKey& key,
                      vk::PipelineCache pipeline_cache,
@@ -100,8 +106,16 @@ public:
                      std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
                      std::shared_ptr<const Shader::Gcn::FetchShaderData> fetch_shader,
                      std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
-                     bool preloading);
+                     bool preloading, const DescSetBindings* derived = nullptr);
     ~GraphicsPipeline();
+
+    /// SHADPS4_ASYNC_PIPELINES: the parts of construction that read the stage Infos' per-draw
+    /// state (user data behind image sharps and fetch V#s), run on the lookup thread. Fills
+    /// sdata's vertex inputs and image binding counts and returns the descriptor bindings.
+    static DescSetBindings DeriveStageInputs(
+        const Instance& instance, std::span<const Shader::Info*, MaxShaderStages> stages,
+        std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
+        const Shader::Gcn::FetchShaderData* fetch_shader, SerializationSupport& sdata);
 
     const Shader::Gcn::FetchShaderData* GetFetchShader() const noexcept {
         return fetch_shader.get();
@@ -126,7 +140,12 @@ public:
                            u32 step_rate_1, const Shader::BoundStage& vs) const;
 
 private:
-    void BuildDescSetLayout(SerializationSupport& sdata, bool preloading);
+    /// One binding per buffer and sampler, one per image with its descriptor count (recorded
+    /// in sdata.image_binding_counts on first creation, replayed from it while preloading).
+    static void CollectDescSetBindings(std::span<const Shader::Info* const> stages,
+                                       SerializationSupport& sdata, bool preloading,
+                                       DescSetBindings& bindings);
+    void BuildDescSetLayout(std::span<const vk::DescriptorSetLayoutBinding> bindings);
 
 private:
     GraphicsPipelineKey key;
