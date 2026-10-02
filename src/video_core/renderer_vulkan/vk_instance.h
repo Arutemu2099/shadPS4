@@ -110,6 +110,10 @@ public:
         return features.samplerAnisotropy;
     }
 
+    /// SHADPS4_DEVICE_FAULT=1: logs the driver's VK_EXT_device_fault report (call on a device
+    /// loss, before asserting). Says so when the extension is not enabled.
+    void LogDeviceFault() const;
+
     /// Returns true if depth bounds testing is supported
     bool IsDepthBoundsSupported() const {
         return features.depthBounds;
@@ -591,6 +595,7 @@ private:
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};
     bool supports_memory_budget{};
+    bool device_fault{}; ///< SHADPS4_DEVICE_FAULT=1 and VK_EXT_device_fault enabled
     bool supports_block_texel_view{};
     mutable bool native_bindings_active{};
     NativeBindingLayout native_binding_layout{};

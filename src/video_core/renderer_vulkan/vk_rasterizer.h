@@ -363,8 +363,12 @@ private:
         const GraphicsPipeline* pipeline{};
         std::vector<u32> key;  ///< binding inputs of the previous draw
         std::vector<u32> cand; ///< binding inputs of the draw being processed
-        u64 dirty_epoch{}, image_epoch{}, buf_gen{}, tex_gen{}, border{}; ///< previous draw
-        u64 c_dirty_epoch{}, c_image_epoch{}, c_buf_gen{}, c_tex_gen{}, c_border{}; ///< this draw
+        u64 dirty_epoch{}, image_epoch{}, buf_gen{}, tex_gen{}, smp_gen{}, border{}; ///< previous
+        u64 c_dirty_epoch{}, c_image_epoch{}, c_buf_gen{}, c_tex_gen{}, c_smp_gen{},
+            c_border{}; ///< this draw
+        /// Textured stages of the draw being processed that did not hit the texture bind memo
+        /// (reset by BindResources): such a draw is never the base of a repeat.
+        u32 tex_nonhit_stages{};
         u64 end_seq{}; ///< Scheduler::RecordSeq after the previous draw's records
         Shader::PushData push_data{};
         // Verify scratch.

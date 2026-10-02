@@ -70,6 +70,9 @@ void MasterSemaphore::Wait(u64 tick) {
             break;
         }
         // A lost device used to spin here forever with nothing in the log (review 2026-09-27).
+        if (result == vk::Result::eErrorDeviceLost) {
+            instance.LogDeviceFault();
+        }
         ASSERT_MSG(result != vk::Result::eErrorDeviceLost, "Device lost in semaphore wait (tick {})",
                    tick);
     }

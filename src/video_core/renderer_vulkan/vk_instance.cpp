@@ -348,6 +348,11 @@ bool Instance::CreateDevice() {
     }
     image_view_min_lod = add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    if (const char* fault = std::getenv("SHADPS4_DEVICE_FAULT"); fault && fault[0] == '1') {
+        device_fault = add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+        LOG_INFO(Render_Vulkan, "DeviceFault: VK_EXT_device_fault {}",
+                 device_fault ? "enabled" : "not offered by the driver");
+    }
     if (const char* mirror = std::getenv("SHADPS4_HOST_MIRROR"); mirror && mirror[0] == '1') {
         external_memory_host = add_extension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     }
@@ -642,6 +647,16 @@ bool Instance::CreateDevice() {
         device_ci.pNext = &heap_features;
     }
 
+    // SHADPS4_DEVICE_FAULT: spliced by hand like the heap features above.
+    vk::PhysicalDeviceFaultFeaturesEXT fault_features = {
+        .deviceFault = true,
+    };
+    if (device_fault) {
+        auto& device_ci = device_chain.get<vk::DeviceCreateInfo>();
+        fault_features.pNext = const_cast<void*>(device_ci.pNext);
+        device_ci.pNext = &fault_features;
+    }
+
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
     if (device_result != vk::Result::eSuccess) {
         LOG_CRITICAL(Render_Vulkan, "Failed to create device: {}", vk::to_string(device_result));
@@ -888,6 +903,39 @@ bool Instance::QueryNativeBindings() {
              layout.sampler_heap_size, layout.sampler_slots, layout.sampler_stride,
              layout.sampler_base);
     return true;
+}
+
+void Instance::LogDeviceFault() const {
+    if (!device_fault) {
+        LOG_CRITICAL(Render_Vulkan, "DeviceFault: no report (set SHADPS4_DEVICE_FAULT=1)");
+        return;
+    }
+    vk::DeviceFaultCountsEXT counts{};
+    const auto counted = device->getFaultInfoEXT(&counts, nullptr);
+    std::vector<vk::DeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+    std::vector<vk::DeviceFaultVendorInfoEXT> vendors(counts.vendorInfoCount);
+    counts.vendorBinarySize = 0;
+    vk::DeviceFaultInfoEXT info{};
+    info.pAddressInfos = addresses.empty() ? nullptr : addresses.data();
+    info.pVendorInfos = vendors.empty() ? nullptr : vendors.data();
+    info.pVendorBinaryData = nullptr;
+    const auto result = device->getFaultInfoEXT(&counts, &info);
+    LOG_CRITICAL(Render_Vulkan,
+                 "DeviceFault: count result {} info result {} description '{}' addresses {} "
+                 "vendor infos {}",
+                 vk::to_string(counted), vk::to_string(result),
+                 std::string_view{info.description.data()}, counts.addressInfoCount,
+                 counts.vendorInfoCount);
+    for (u32 i = 0; i < counts.addressInfoCount && i < addresses.size(); ++i) {
+        LOG_CRITICAL(Render_Vulkan, "DeviceFault: address {} type {} reported {:#x} precision {:#x}",
+                     i, vk::to_string(addresses[i].addressType), addresses[i].reportedAddress,
+                     addresses[i].addressPrecision);
+    }
+    for (u32 i = 0; i < counts.vendorInfoCount && i < vendors.size(); ++i) {
+        LOG_CRITICAL(Render_Vulkan, "DeviceFault: vendor {} '{}' code {:#x} data {:#x}", i,
+                     std::string_view{vendors[i].description.data()}, vendors[i].vendorFaultCode,
+                     vendors[i].vendorFaultData);
+    }
 }
 
 void Instance::CreateAllocator() {

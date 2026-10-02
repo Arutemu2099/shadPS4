@@ -1774,8 +1774,8 @@ void TextureCache::UntrackImage(ImageId image_id) {
     const auto addr = image.track_addr;
     const auto size = image.track_addr_end - image.track_addr;
     image.track_addr = 0;
-    g_image_epoch.fetch_add(1, std::memory_order_release);
     image.track_addr_end = 0;
+    g_image_epoch.fetch_add(1, std::memory_order_release);
     if (size != 0) {
         if (g_deferred_untracks) {
             g_deferred_untracks->emplace_back(addr, size);

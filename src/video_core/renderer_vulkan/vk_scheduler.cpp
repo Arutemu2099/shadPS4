@@ -900,8 +900,35 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
             }
         }
         {
+            // SHADPS4_DEBUG_SUBMIT_STALL_MS (diagnostic): one artificial recorder stall, see
+            // scripts/patch/debug-submit-stall-2026-10-02.py.
+            static const u32 stall_ms = [] {
+                const char* value = std::getenv("SHADPS4_DEBUG_SUBMIT_STALL_MS");
+                return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0u;
+            }();
+            if (stall_ms != 0) [[unlikely]] {
+                static const u32 at_s = [] {
+                    const char* value = std::getenv("SHADPS4_DEBUG_SUBMIT_STALL_AT_S");
+                    return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 10u;
+                }();
+                static const auto first_submit = std::chrono::steady_clock::now();
+                static bool stalled = false;
+                if (!stalled && std::chrono::steady_clock::now() - first_submit >=
+                                    std::chrono::seconds(at_s)) {
+                    stalled = true;
+                    LOG_WARNING(Render_Vulkan,
+                                "DebugSubmitStall: the recorder sleeps {} ms before submitting "
+                                "tick {}",
+                                stall_ms, signal_value);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(stall_ms));
+                    LOG_WARNING(Render_Vulkan, "DebugSubmitStall: awake, submitting");
+                }
+            }
             std::scoped_lock lk{submit_mutex};
             const auto result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+            if (result == vk::Result::eErrorDeviceLost) {
+                instance.LogDeviceFault();
+            }
             ASSERT_MSG(result != vk::Result::eErrorDeviceLost, "Device lost during submit");
             async_submitted_tick.store(signal_value, std::memory_order_release);
         }
@@ -1023,6 +1050,9 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     ImGui::Core::TextureManager::Submit();
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    if (submit_result == vk::Result::eErrorDeviceLost) {
+        instance.LogDeviceFault();
+    }
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
     if (async_submit) {
         // A synchronous submission of the async timeline (inside a borrow scope) counts too.

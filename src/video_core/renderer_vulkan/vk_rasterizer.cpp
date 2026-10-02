@@ -2350,11 +2350,21 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
     st.c_image_epoch = VideoCore::g_image_epoch.load(std::memory_order_acquire);
     st.c_buf_gen = buffer_cache.StructGeneration();
     st.c_tex_gen = texture_cache.StructGeneration();
+    st.c_smp_gen = texture_cache.SamplerGeneration();
     st.c_border = liverpool->BackRegs().ta_bc_base.base_addr;
     // Key: everything the binding resolution reads from the stages.
     st.cand.clear();
+    // Configurations in which the claim does not hold (review 2026-10-02): no recording worker
+    // (RecordSeq does not see synchronous records), deferred uploads keyed on the submit epoch,
+    // the untracked stream-copy path.
+    static const bool config_ok = [] {
+        const char* stream = std::getenv("SHADPS4_STREAM_MAX_SIZE");
+        const bool stream_off = !stream || std::strtoull(stream, nullptr, 0) == 0;
+        return stream_off && !VideoCore::g_epoch_defer_upload;
+    }();
     bool eligible = tex_bind_memo == 1 && build_set_writes && !native_bindings &&
-                    !bind_memo_stats && pending_stencil_writebacks.empty();
+                    !bind_memo_stats && pending_stencil_writebacks.empty() && config_ok &&
+                    scheduler.IsAsyncRecording();
     // Why a draw is ineligible (diagnostic split of f_ineligible; first reason per draw).
     static std::array<u64, 6> why{}; // global, dma, written, formatted, special, image written
     u32 reason = eligible ? ~0u : 0u;
@@ -2446,7 +2456,8 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
         ++st.f_image;
         return false;
     }
-    if (st.c_buf_gen != st.buf_gen || st.c_tex_gen != st.tex_gen || st.c_border != st.border) {
+    if (st.c_buf_gen != st.buf_gen || st.c_tex_gen != st.tex_gen ||
+        st.c_smp_gen != st.smp_gen || st.c_border != st.border) {
         ++st.f_gen;
         return false;
     }
@@ -2460,6 +2471,8 @@ void Rasterizer::DrawRepeatApply(const GraphicsPipeline* pipeline) {
     // buffer offsets from the bindings, which are the previous draw's.
     buffer_barriers.clear();
     binding_compute = false;
+    g_dc_bind_buf = 0;
+    g_dc_bind_tex = 0;
     Shader::Backend::Bindings binding{};
     push_data = MakeUserData(liverpool->BackRegs());
     for (const auto& bound : BoundStages(pipeline)) {
@@ -2518,7 +2531,9 @@ void Rasterizer::DrawRepeatVerify(const GraphicsPipeline* pipeline) {
 
 void Rasterizer::DrawRepeatStore(const GraphicsPipeline* pipeline, bool completed) {
     auto& st = draw_repeat;
-    st.valid = completed && st.eligible;
+    // A base must have resolved every textured stage through a memo hit (a repeat inherits the
+    // base's count: BindResources did not run).
+    st.valid = completed && st.eligible && st.tex_nonhit_stages == 0;
     if (!st.valid) {
         return;
     }
@@ -2528,6 +2543,7 @@ void Rasterizer::DrawRepeatStore(const GraphicsPipeline* pipeline, bool complete
     st.image_epoch = st.c_image_epoch;
     st.buf_gen = st.c_buf_gen;
     st.tex_gen = st.c_tex_gen;
+    st.smp_gen = st.c_smp_gen;
     st.border = st.c_border;
     st.push_data = push_data;
     st.end_seq = scheduler.RecordSeq();
@@ -2551,6 +2567,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     buffer_barriers.clear();
     buffer_infos.clear();
     image_infos.clear();
+    draw_repeat.tex_nonhit_stages = 0;
     g_dc_bind_buf = 0;
     g_dc_bind_tex = 0;
     g_dc_tex_sub = {};
@@ -3530,6 +3547,8 @@ void Rasterizer::BindTexturesMemo(const Pipeline* pipeline, const Shader::BoundS
         st.hit_samplers += rec.samplers.size();
         return;
     }
+    // SHADPS4_DRAW_REPEAT: this stage takes the full texture path (or the verify path).
+    ++draw_repeat.tex_nonhit_stages;
 
     const size_t img_begin = image_infos.size();
     const u32 sw_begin = set_write_index;

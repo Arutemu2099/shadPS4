@@ -6,6 +6,7 @@
 #include "common/enum.h"
 #include "common/incremental_id.h"
 #include "common/types.h"
+#include "video_core/buffer_cache/dirty_epoch.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view.h"
@@ -112,13 +113,22 @@ struct Image {
     }
 
     void AssociateDepth(ImageId depth_image_id, u64 depth_image_uid) {
+        const bool changed = depth_id != depth_image_id || depth_uid != depth_image_uid;
         depth_id = depth_image_id;
         depth_uid = depth_image_uid;
+        if (changed) {
+            // SHADPS4_DRAW_REPEAT: a full bind would now redirect this image (review 2026-10-02).
+            g_image_epoch.fetch_add(1, std::memory_order_release);
+        }
     }
 
     void DisassociateDepth() {
+        const bool changed = static_cast<bool>(depth_id) || depth_uid != 0;
         depth_id = {};
         depth_uid = {};
+        if (changed) {
+            g_image_epoch.fetch_add(1, std::memory_order_release);
+        }
     }
 
     ImageView& FindView(const ImageViewInfo& view_info, bool ensure_guest_samples = true);
