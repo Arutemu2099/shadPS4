@@ -56,6 +56,11 @@ extern std::atomic<u64> frame_over_10ms;
 extern std::atomic<u64> frame_over_17ms;
 extern std::atomic<u64> frame_over_33ms;
 extern std::atomic<u64> frame_slow_ns;
+/// Per-second thread-wait columns (2026-10-02). Ticks = rdtsc, converted by the reporter.
+extern std::atomic<u64> front_idle_ns;    ///< front waiting for the guest to submit
+extern std::atomic<u64> front_wait_ticks; ///< front waiting for the back (depth, drains)
+extern std::atomic<u64> back_idle_ticks;  ///< back waiting for work
+extern std::atomic<u64> rf_guest_ns;      ///< guest threads inside a read-fault download
 
 /**
  * Which thread pays for fault handling.

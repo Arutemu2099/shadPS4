@@ -10,6 +10,7 @@
 #include <immintrin.h>
 #include <fmt/format.h>
 
+#include "common/fault_monitor.h"
 #include "common/logging/log.h"
 #include "common/readback_offload.h"
 #include "video_core/amdgpu/cp_split.h"
@@ -453,7 +454,9 @@ u64 Channel::WaitDone(u64 seq) {
     const u64 deadline = NowNs() + SpinNs();
     for (u32 spins = 1;; ++spins) {
         if (done_seq.load(std::memory_order_acquire) >= seq) {
-            return Ticks() - t0;
+            const u64 waited = Ticks() - t0;
+            Common::FaultMonitor::front_wait_ticks.fetch_add(waited, std::memory_order_relaxed);
+            return waited;
         }
         if ((spins & 63) == 0 && NowNs() > deadline) {
             break;
@@ -470,7 +473,9 @@ u64 Channel::WaitDone(u64 seq) {
         done_seq.wait(current, std::memory_order_acquire);
     }
     front_parked.store(false, std::memory_order_relaxed);
-    return Ticks() - t0;
+    const u64 waited = Ticks() - t0;
+    Common::FaultMonitor::front_wait_ticks.fetch_add(waited, std::memory_order_relaxed);
+    return waited;
 }
 
 const RecordHeader* Channel::Next() {
@@ -533,7 +538,9 @@ void Channel::WaitForWork(const std::atomic<u32>& num_commands, const std::stop_
     const u64 deadline = NowNs() + SpinNs();
     for (u32 spins = 1;; ++spins) {
         if (done()) {
-            back_idle_ticks.fetch_add(Ticks() - t0, std::memory_order_relaxed);
+            const u64 waited = Ticks() - t0;
+            back_idle_ticks.fetch_add(waited, std::memory_order_relaxed);
+            Common::FaultMonitor::back_idle_ticks.fetch_add(waited, std::memory_order_relaxed);
             return;
         }
         if ((spins & 63) == 0 && NowNs() > deadline) {
@@ -547,7 +554,9 @@ void Channel::WaitForWork(const std::atomic<u32>& num_commands, const std::stop_
         doorbell.wait(ticket, std::memory_order_acquire);
     }
     back_parked.store(false, std::memory_order_relaxed);
-    back_idle_ticks.fetch_add(Ticks() - t0, std::memory_order_relaxed);
+    const u64 waited = Ticks() - t0;
+    back_idle_ticks.fetch_add(waited, std::memory_order_relaxed);
+    Common::FaultMonitor::back_idle_ticks.fetch_add(waited, std::memory_order_relaxed);
 }
 
 void Channel::WakeBackIfParked() {

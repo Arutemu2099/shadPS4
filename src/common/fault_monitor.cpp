@@ -19,6 +19,7 @@
 #include <profile/instr_prof_interface.h>
 #endif
 
+#include <immintrin.h>
 #include "common/fault_monitor.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
@@ -42,6 +43,10 @@ std::atomic<u64> frame_over_10ms{0};
 std::atomic<u64> frame_over_17ms{0};
 std::atomic<u64> frame_over_33ms{0};
 std::atomic<u64> frame_slow_ns{0};
+std::atomic<u64> front_idle_ns{0};
+std::atomic<u64> front_wait_ticks{0};
+std::atomic<u64> back_idle_ticks{0};
+std::atomic<u64> rf_guest_ns{0};
 std::atomic<u64> range_fragments{0};
 std::atomic<u64> range_adds{0};
 std::atomic<u64> range_subtracts{0};
@@ -533,7 +538,8 @@ std::ofstream OpenCsv() {
                "up_skipped_pct,up_kb_per_call,"
                "up_fastpath_pct,"
                "up_memohit_pct,"
-               "frame_max_ms,frames_over_10ms,frames_over_17ms,frames_over_33ms,frame_slow_ms\n";
+               "frame_max_ms,frames_over_10ms,frames_over_17ms,frames_over_33ms,frame_slow_ms,"
+               "front_idle_ms,front_wait_ms,back_idle_ms,rf_guest_ms\n";
         csv.flush();
         LOG_INFO(Render, "FaultMonitor: rate CSV at {}", FS::PathToUTF8String(path));
     } else {
@@ -572,6 +578,24 @@ void ReportLoop() {
         const Sample cur = Read();
 
         const double dt = std::chrono::duration<double>(now - prev_time).count();
+        // Thread-wait columns: rdtsc ticks to ms with this interval's own tick rate.
+        static u64 prev_tsc = __rdtsc();
+        const u64 tsc_now = __rdtsc();
+        const double ms_per_tick =
+            tsc_now > prev_tsc + 1000000 ? dt * 1e3 / static_cast<double>(tsc_now - prev_tsc)
+                                         : 0.0; // 0 on the first row (no interval yet)
+        prev_tsc = tsc_now;
+        const double per_s = dt > 0.0 ? 1.0 / dt : 0.0;
+        const double front_idle_ms =
+            static_cast<double>(front_idle_ns.exchange(0, std::memory_order_relaxed)) / 1e6 * per_s;
+        const double front_wait_ms =
+            static_cast<double>(front_wait_ticks.exchange(0, std::memory_order_relaxed)) *
+            ms_per_tick * per_s;
+        const double back_idle_ms =
+            static_cast<double>(back_idle_ticks.exchange(0, std::memory_order_relaxed)) *
+            ms_per_tick * per_s;
+        const double rf_guest_ms =
+            static_cast<double>(rf_guest_ns.exchange(0, std::memory_order_relaxed)) / 1e6 * per_s;
         const double elapsed = std::chrono::duration<double>(now - started).count();
         if (dt <= 0.0) {
             continue;
@@ -912,7 +936,7 @@ void ReportLoop() {
                 "{:.3f},{:.3f},{:.3f},{:.3f},{:.4f},{:.3f},{:.4f},{:.3f},"
                 "{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},"
                 "{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},"
-                "{:.2f},{:.2f},{:.1f},{:.3f},{:.3f},{:.3f},{:.3f},{:.1f},{:.2f},{:.3f},{:.3f},{:.1f},{:.2f},{:.3f},{:.3f},{:.2f},{:.1f},{:.2f},{:.2f},{:.2f},{},{},{},{:.1f}\n",
+                "{:.2f},{:.2f},{:.1f},{:.3f},{:.3f},{:.3f},{:.3f},{:.1f},{:.2f},{:.3f},{:.3f},{:.1f},{:.2f},{:.3f},{:.3f},{:.2f},{:.1f},{:.2f},{:.2f},{:.2f},{},{},{},{:.1f},{:.1f},{:.1f},{:.1f},{:.1f}\n",
                 elapsed, fps, read_rate, write_rate, jit_rate, per_frame, read_us, write_us,
                 handler_pct, cur.read, cur.read_unhandled, cur.write, cur.write_unhandled, cur.jit,
                 cur.frames, cur.fragments, static_cast<double>(d_adds) / dt,
@@ -934,7 +958,8 @@ void ReportLoop() {
                 frame_over_10ms.exchange(0, std::memory_order_relaxed),
                 frame_over_17ms.exchange(0, std::memory_order_relaxed),
                 frame_over_33ms.exchange(0, std::memory_order_relaxed),
-                static_cast<double>(frame_slow_ns.exchange(0, std::memory_order_relaxed)) / 1e6);
+                static_cast<double>(frame_slow_ns.exchange(0, std::memory_order_relaxed)) / 1e6,
+                front_idle_ms, front_wait_ms, back_idle_ms, rf_guest_ms);
             csv.flush(); // a killed process must not lose the curve
         }
 

@@ -361,8 +361,12 @@ private:
         bool valid{};    ///< the previous direct draw completed and is a base for a repeat
         bool eligible{}; ///< the draw being processed: key gathered, pipeline eligible
         const GraphicsPipeline* pipeline{};
-        std::vector<u32> key;  ///< binding inputs of the previous draw
-        std::vector<u32> cand; ///< binding inputs of the draw being processed
+        /// Binding inputs: words[kidx] = the previous draw's (the key), words[kidx ^ 1] = the
+        /// draw being processed (the candidate). DrawRepeatStore flips kidx.
+        static constexpr u32 MaxKeyWords = 1024;
+        std::array<std::array<u32, MaxKeyWords>, 2> words{};
+        std::array<u32, 2> sizes{};
+        u32 kidx{};
         u64 dirty_epoch{}, image_epoch{}, buf_gen{}, tex_gen{}, smp_gen{}, border{}; ///< previous
         u64 c_dirty_epoch{}, c_image_epoch{}, c_buf_gen{}, c_tex_gen{}, c_smp_gen{},
             c_border{}; ///< this draw
@@ -377,7 +381,7 @@ private:
         u64 v_seq{};
         // Statistics (window).
         u64 draws{}, repeats{}, f_ineligible{}, f_pipeline{}, f_key{}, f_rs{}, f_seq{},
-            f_epoch{}, f_image{}, f_gen{}, f_other{}, verified{}, mismatches{};
+            f_epoch{}, f_image{}, f_gen{}, f_other{}, verified{}, mismatches{}, f_gated{};
     };
     DrawRepeatState draw_repeat;
     bool DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit);

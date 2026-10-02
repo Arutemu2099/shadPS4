@@ -857,6 +857,18 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool of
     const bool cp_self = liverpool->IsGpuThread();
     const auto origin = cp_self ? Offload::Origin::CpSelf : Offload::Origin::Guest;
     Offload::CountFault(origin);
+    // Thread-wait column rf_guest_ms (always on): a guest thread's time in a read fault,
+    // synchronous or offloaded (review 2026-10-02); command processor faults are not counted.
+    struct GuestReadTime {
+        bool on;
+        u64 from;
+        ~GuestReadTime() {
+            if (on) {
+                Common::FaultMonitor::rf_guest_ns.fetch_add(Offload::NowNs() - from,
+                                                            std::memory_order_relaxed);
+            }
+        }
+    } guest_read_time{!is_write && !cp_self, !is_write && !cp_self ? Offload::NowNs() : 0};
     if (!Offload::Enabled() || cp_self || (is_write && !offload_write)) {
         // A command processor fault cannot leave its own thread: the wait would land there
         // anyway, and a second step queued to it could never run while it is blocked here.
@@ -1304,6 +1316,85 @@ void BufferCache::ReleaseFaultStaging(std::unique_ptr<Buffer> staging) {
     }
 }
 
+/// SHADPS4_READ_BURST_STATS=1 (census; command processor only): see
+/// scripts/patch/read-burst-census-2026-10-02.py.
+static void NoteReadBurst(VAddr addr, u64 bytes) {
+    struct State {
+        u64 frame{~0ULL};
+        u64 first_pos{};
+        u64 first_ns{};
+        boost::container::small_vector<VAddr, 32> cur;
+        boost::container::small_vector<VAddr, 32> prev;
+        u64 frames{}, jobs{}, later{}, ready{}, touched{}, overrun{}, seen_prev{}, batchable{};
+        u64 first_seen_prev{}, kb{}, batchable_kb{};
+        std::array<u64, 6> after{}; // later jobs by time since the first: <0.25 <0.5 <1 <2 <4 >=4 ms
+    };
+    static State st;
+    const u64 frame = Common::FaultMonitor::presented_frames.load(std::memory_order_relaxed);
+    const u64 now = Offload::NowNs();
+    const bool first = frame != st.frame;
+    if (first) {
+        if ((st.frames & 2047) == 0 && st.frames != 0) {
+            const double later = static_cast<double>(std::max<u64>(st.later, 1));
+            LOG_INFO(Render,
+                     "ReadBurst: frames={} jobs/frame={:.2f} kB/frame={:.0f} | later jobs: "
+                     "ready={:.1f}% touched={:.1f}% overrun={:.1f}% seen_prev={:.1f}% "
+                     "batchable={:.1f}% ({:.2f} per frame, {:.0f} kB per frame) | first job "
+                     "seen_prev={:.1f}% | later jobs after the first: <0.25ms {:.1f}% <0.5 "
+                     "{:.1f}% <1 {:.1f}% <2 {:.1f}% <4 {:.1f}% >=4 {:.1f}%",
+                     st.frames, static_cast<double>(st.jobs) / st.frames,
+                     static_cast<double>(st.kb) / st.frames, 100.0 * st.ready / later,
+                     100.0 * st.touched / later, 100.0 * st.overrun / later,
+                     100.0 * st.seen_prev / later, 100.0 * st.batchable / later,
+                     static_cast<double>(st.batchable) / st.frames,
+                     static_cast<double>(st.batchable_kb) / st.frames,
+                     100.0 * st.first_seen_prev / st.frames, 100.0 * st.after[0] / later,
+                     100.0 * st.after[1] / later, 100.0 * st.after[2] / later,
+                     100.0 * st.after[3] / later, 100.0 * st.after[4] / later,
+                     100.0 * st.after[5] / later);
+            st.frames = st.jobs = st.later = st.ready = st.touched = st.overrun = 0;
+            st.seen_prev = st.batchable = st.first_seen_prev = st.kb = st.batchable_kb = 0;
+            st.after = {};
+        }
+        st.frame = frame;
+        st.first_pos = GpuWriteLog::Position();
+        st.first_ns = now;
+        st.prev = st.cur;
+        st.cur.clear();
+        ++st.frames;
+    }
+    ++st.jobs;
+    st.kb += bytes >> 10;
+    const bool seen = std::ranges::find(st.prev, addr) != st.prev.end();
+    st.cur.push_back(addr);
+    if (first) {
+        st.first_seen_prev += seen;
+        return;
+    }
+    ++st.later;
+    st.seen_prev += seen;
+    const auto [begin, end] = TrackerPageSpan(addr, bytes);
+    u64 hit_begin = 0;
+    u64 hit_end = 0;
+    switch (GpuWriteLog::Check(st.first_pos, begin, end, hit_begin, hit_end)) {
+    case GpuWriteLog::Result::Clean:
+        ++st.ready;
+        if (seen) {
+            ++st.batchable;
+            st.batchable_kb += bytes >> 10;
+        }
+        break;
+    case GpuWriteLog::Result::Touched:
+        ++st.touched;
+        break;
+    case GpuWriteLog::Result::Overrun:
+        ++st.overrun;
+        break;
+    }
+    const u64 us = (now - st.first_ns) / 1000;
+    ++st.after[us < 250 ? 0 : us < 500 ? 1 : us < 1000 ? 2 : us < 2000 ? 3 : us < 4000 ? 4 : 5];
+}
+
 BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u64 size,
                                                            bool is_write) {
     if (!is_write) {
@@ -1502,6 +1593,13 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
         Offload::Add(Offload::State().write_jobs);
     }
     Common::FaultMonitor::CountReadbackDownload(total_size_bytes);
+    static const bool read_burst_stats = [] {
+        const char* value = std::getenv("SHADPS4_READ_BURST_STATS");
+        return value && value[0] == '1';
+    }();
+    if (read_burst_stats && !is_write) [[unlikely]] {
+        NoteReadBurst(job->addr, job->size);
+    }
 
     job->on_readback_queue = false;
     job->on_fast_lane = false;

@@ -139,6 +139,14 @@ public:
     u32 DeriveVertexInputs(AmdGpu::CpSplit::VertexInputsDerived& out, u32 step_rate_0,
                            u32 step_rate_1, const Shader::BoundStage& vs) const;
 
+    /// SHADPS4_DRAW_REPEAT (Rasterizer::DrawRepeatMatch, back thread only): the static part of
+    /// the repeat test's eligibility (0xff unknown, 0 never, 1 eligible, 2 eligible while user
+    /// clip planes are off), its first ineligibility reason, and the adaptive gate.
+    mutable u8 repeat_static = 0xff;
+    mutable u8 repeat_why = 0;
+    mutable u8 repeat_miss_run = 0;
+    mutable u8 repeat_skip = 0;
+
 private:
     /// One binding per buffer and sampler, one per image with its descriptor count (recorded
     /// in sdata.image_binding_counts on first creation, replayed from it while preloading).

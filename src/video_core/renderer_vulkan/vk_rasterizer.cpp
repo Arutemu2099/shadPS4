@@ -2335,14 +2335,14 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
                  "DrawRepeatSkip: mode={} draws={} repeats={} ({:.1f}%) | not a repeat: "
                  "ineligible={:.1f}% pipeline={:.1f}% key={:.1f}% render_state={:.1f}% "
                  "recorded_between={:.1f}% dirty_epoch={:.1f}% image_epoch={:.1f}% "
-                 "cache_gen={:.1f}% other={:.1f}% | verified={} mismatches={}",
+                 "cache_gen={:.1f}% other={:.1f}% gated={:.1f}% | verified={} mismatches={}",
                  g_draw_repeat, st.draws, st.repeats, 100.0 * st.repeats / d,
                  100.0 * st.f_ineligible / d, 100.0 * st.f_pipeline / d, 100.0 * st.f_key / d,
                  100.0 * st.f_rs / d, 100.0 * st.f_seq / d, 100.0 * st.f_epoch / d,
                  100.0 * st.f_image / d, 100.0 * st.f_gen / d, 100.0 * st.f_other / d,
-                 st.verified, st.mismatches);
+                 100.0 * st.f_gated / d, st.verified, st.mismatches);
         st.draws = st.repeats = st.f_ineligible = st.f_pipeline = st.f_key = st.f_rs = st.f_seq =
-            st.f_epoch = st.f_image = st.f_gen = st.f_other = st.verified = 0;
+            st.f_epoch = st.f_image = st.f_gen = st.f_other = st.verified = st.f_gated = 0;
     }
     // The state of this draw, sampled BEFORE its bindings are resolved (a change during the
     // resolution must break the next draw's repeat).
@@ -2353,7 +2353,6 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
     st.c_smp_gen = texture_cache.SamplerGeneration();
     st.c_border = liverpool->BackRegs().ta_bc_base.base_addr;
     // Key: everything the binding resolution reads from the stages.
-    st.cand.clear();
     // Configurations in which the claim does not hold (review 2026-10-02): no recording worker
     // (RecordSeq does not see synchronous records), deferred uploads keyed on the submit epoch,
     // the untracked stream-copy path.
@@ -2365,57 +2364,107 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
     bool eligible = tex_bind_memo == 1 && build_set_writes && !native_bindings &&
                     !bind_memo_stats && pending_stencil_writebacks.empty() && config_ok &&
                     scheduler.IsAsyncRecording();
-    // Why a draw is ineligible (diagnostic split of f_ineligible; first reason per draw).
+    // Why a draw is ineligible (diagnostic split of f_ineligible; first reason per pipeline).
     static std::array<u64, 6> why{}; // global, dma, written, formatted, special, image written
     u32 reason = eligible ? ~0u : 0u;
-    const auto fail = [&](u32 r, bool bad) {
-        if (bad && reason == ~0u) {
-            reason = r;
+    if (pipeline->repeat_static == 0xff) {
+        // Static per pipeline: the stage infos are the pipeline's own (BoundStages). Special
+        // buffers: only the clip-plane slot with clip planes off (BindBuffers binds a null
+        // descriptor for it; the enable bits are tested on both draws). Flatbuf / LDS copies get
+        // a new stream offset per draw; the others are left to the full path.
+        u8 cls = 1;
+        u8 first = 0;
+        const auto bad = [&](u8 r) {
+            cls = 0;
+            first = first != 0 ? first : r;
+        };
+        for (const auto& bound : BoundStages(pipeline)) {
+            const auto* stage = bound.info;
+            if (!stage) {
+                continue;
+            }
+            if (stage->uses_dma) {
+                bad(1);
+            }
+            for (const auto& desc : stage->buffers) {
+                if (desc.is_written) {
+                    bad(2);
+                } else if (desc.is_formatted) {
+                    bad(3);
+                } else if (desc.IsSpecial()) {
+                    if (desc.buffer_type != Shader::BufferType::ClipPlanes) {
+                        bad(4);
+                    } else if (cls == 1) {
+                        cls = 2;
+                    }
+                }
+            }
+            for (const auto& desc : stage->images) {
+                if (desc.is_written) {
+                    bad(5);
+                }
+            }
         }
-    };
-    const auto add = [&](const auto& sharp) {
-        const size_t words = sizeof(sharp) / sizeof(u32);
-        const size_t at = st.cand.size();
-        st.cand.resize(at + words);
-        std::memcpy(&st.cand[at], &sharp, words * sizeof(u32));
-    };
-    for (const auto& bound : BoundStages(pipeline)) {
-        const auto* stage = bound.info;
-        if (!stage) {
-            continue;
-        }
-        eligible &= !stage->uses_dma;
-        fail(1, stage->uses_dma);
-        for (const auto& desc : stage->buffers) {
-            // Special buffers: only the clip-plane slot with clip planes off (BindBuffers binds a
-            // null descriptor for it; the enable bits are part of the key through this test on
-            // both draws). Flatbuf / LDS copies get a new stream offset per draw; the others
-            // are left to the full path.
-            const bool special_ok =
-                !desc.IsSpecial() ||
-                (desc.buffer_type == Shader::BufferType::ClipPlanes &&
-                 liverpool->BackRegs().clipper_control.user_clip_plane_enable == 0);
-            eligible &= !desc.is_written && !desc.is_formatted && special_ok;
-            fail(2, desc.is_written);
-            fail(3, desc.is_formatted);
-            fail(4, !special_ok);
-            add(desc.GetSharp(bound));
-        }
-        for (const auto& desc : stage->images) {
-            eligible &= !desc.is_written;
-            fail(5, desc.is_written);
-            add(desc.GetSharp(bound));
-        }
-        for (const auto& desc : stage->samplers) {
-            add(desc.GetSharp(bound));
-        }
-        u32 mask = stage->ud_mask.mask;
-        while (mask) {
-            const u32 index = std::countr_zero(mask);
-            mask &= ~(1U << index);
-            st.cand.push_back(bound.user_data[index]);
+        pipeline->repeat_static = cls;
+        pipeline->repeat_why = first;
+    }
+    if (eligible) {
+        if (pipeline->repeat_static == 0) {
+            eligible = false;
+            reason = pipeline->repeat_why;
+        } else if (pipeline->repeat_static == 2 &&
+                   liverpool->BackRegs().clipper_control.user_clip_plane_enable != 0) {
+            eligible = false;
+            reason = 4;
         }
     }
+    if (eligible && pipeline->repeat_skip != 0) {
+        // Adaptive gate: this pipeline's keys kept changing. No test, no base.
+        --pipeline->repeat_skip;
+        st.eligible = false;
+        ++st.f_gated;
+        return false;
+    }
+    auto& cand = st.words[st.kidx ^ 1];
+    u32 n = 0;
+    bool overflow = false;
+    const auto add = [&](const auto& sharp) {
+        constexpr u32 words = static_cast<u32>(sizeof(sharp) / sizeof(u32));
+        if (n + words > cand.size()) {
+            overflow = true;
+            return;
+        }
+        std::memcpy(&cand[n], &sharp, sizeof(sharp));
+        n += words;
+    };
+    if (eligible) {
+        for (const auto& bound : BoundStages(pipeline)) {
+            const auto* stage = bound.info;
+            if (!stage) {
+                continue;
+            }
+            for (const auto& desc : stage->buffers) {
+                add(desc.GetSharp(bound));
+            }
+            for (const auto& desc : stage->images) {
+                add(desc.GetSharp(bound));
+            }
+            for (const auto& desc : stage->samplers) {
+                add(desc.GetSharp(bound));
+            }
+            u32 mask = stage->ud_mask.mask;
+            while (mask) {
+                const u32 index = std::countr_zero(mask);
+                mask &= ~(1U << index);
+                add(bound.user_data[index]);
+            }
+        }
+        if (overflow) {
+            eligible = false;
+            reason = 0;
+        }
+    }
+    st.sizes[st.kidx ^ 1] = n;
     st.eligible = eligible;
     if (!eligible) {
         ++st.f_ineligible;
@@ -2436,10 +2485,16 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
         ++st.f_pipeline;
         return false;
     }
-    if (st.cand != st.key) {
+    if (st.sizes[st.kidx] != n ||
+        std::memcmp(st.words[st.kidx].data(), cand.data(), n * sizeof(u32)) != 0) {
         ++st.f_key;
+        if (++pipeline->repeat_miss_run >= 4) {
+            pipeline->repeat_miss_run = 0;
+            pipeline->repeat_skip = 28;
+        }
         return false;
     }
+    pipeline->repeat_miss_run = 0;
     if (!rs_hit) {
         ++st.f_rs;
         return false;
@@ -2538,7 +2593,7 @@ void Rasterizer::DrawRepeatStore(const GraphicsPipeline* pipeline, bool complete
         return;
     }
     st.pipeline = pipeline;
-    st.key.swap(st.cand);
+    st.kidx ^= 1; // the candidate becomes the key
     st.dirty_epoch = st.c_dirty_epoch;
     st.image_epoch = st.c_image_epoch;
     st.buf_gen = st.c_buf_gen;

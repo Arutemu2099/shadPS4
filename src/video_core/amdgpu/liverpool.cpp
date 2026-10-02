@@ -2590,8 +2590,18 @@ void Liverpool::ProcessLoop(std::stop_token stoken) {
             const u64 idle_start = g_cp_wait.enabled ? CpWaitStats::Now() : 0;
             g_asc_ring_front_state.store(FrontGuestIdle, std::memory_order_relaxed);
             std::unique_lock lk{submit_mutex};
-            Common::CondvarWait(submit_cv, lk, stoken,
-                                [this] { return num_commands || num_submits || submit_done; });
+            if (!(num_commands || num_submits || submit_done)) {
+                // Thread-wait column front_idle_ms (always on): only a wait that really blocks.
+                const auto idle_from = std::chrono::steady_clock::now();
+                Common::CondvarWait(submit_cv, lk, stoken, [this] {
+                    return num_commands || num_submits || submit_done;
+                });
+                Common::FaultMonitor::front_idle_ns.fetch_add(
+                    static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - idle_from)
+                                         .count()),
+                    std::memory_order_relaxed);
+            }
             Common::FaultMonitor::CountCpWait(Common::FaultMonitor::SinceNs(t_wait));
             if (g_cp_wait.enabled) {
                 g_cp_wait.idle_ns += CpWaitStats::Now() - idle_start;
