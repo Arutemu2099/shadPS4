@@ -695,6 +695,13 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
         liverpool->BindRasterizer(this);
     }
     memory->SetRasterizer(this);
+    if (OcclusionQueries::Requested() && !EmulatorSettings.IsNullGPU()) {
+        if (instance.IsHostQueryResetSupported()) {
+            occlusion = std::make_unique<OcclusionQueries>(instance, scheduler);
+        } else {
+            LOG_WARNING(Render_Vulkan, "OcclusionQ: off, hostQueryReset is not supported");
+        }
+    }
     build_set_writes = !native_bindings || native_bindings->IsVerifying();
     const char* memo_stats = std::getenv("SHADPS4_BIND_MEMO_STATS");
     bind_memo_stats = memo_stats && memo_stats[0] == '1';
@@ -1717,6 +1724,18 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     const auto& fetch_shader = pipeline->GetFetchShader();
     const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
 
+    // SHADPS4_OCCLUSION_QUERIES: a draw between the guest's two counter dumps is wrapped in its
+    // own occlusion query, recorded right around the draw (same render pass, same command buffer).
+    u32 occlusion_slot = OcclusionQueries::NoSlot;
+    if (occlusion && occlusion->Open()) [[unlikely]] {
+        occlusion_slot = occlusion->DrawSlot();
+        if (occlusion_slot != OcclusionQueries::NoSlot) {
+            scheduler.Record([query_pool = occlusion->Pool(), occlusion_slot,
+                              query_flags = occlusion->Flags()](vk::CommandBuffer cmdbuf) {
+                cmdbuf.beginQuery(query_pool, occlusion_slot, query_flags);
+            });
+        }
+    }
     scheduler.Record([handle = pipeline->Handle(), is_indexed, count = regs.num_indices,
                       instances = regs.num_instances.NumInstances(), vertex_offset,
                       instance_offset](vk::CommandBuffer cmdbuf) {
@@ -1729,6 +1748,12 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
             cmdbuf.draw(count, instances, vertex_offset, instance_offset);
         }
     });
+    if (occlusion_slot != OcclusionQueries::NoSlot) [[unlikely]] {
+        scheduler.Record(
+            [query_pool = occlusion->Pool(), occlusion_slot](vk::CommandBuffer cmdbuf) {
+                cmdbuf.endQuery(query_pool, occlusion_slot);
+            });
+    }
     DebugState.IncDrawCall();
     scheduler.NoteDraw();
 
@@ -1863,6 +1888,16 @@ void Rasterizer::DrawIndirectTail(const GraphicsPipeline* pipeline, bool is_inde
 
     ASSERT((is_indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand)) ==
            stride);
+    u32 occlusion_slot = OcclusionQueries::NoSlot;
+    if (occlusion && occlusion->Open()) [[unlikely]] {
+        occlusion_slot = occlusion->DrawSlot();
+        if (occlusion_slot != OcclusionQueries::NoSlot) {
+            scheduler.Record([query_pool = occlusion->Pool(), occlusion_slot,
+                              query_flags = occlusion->Flags()](vk::CommandBuffer cmdbuf) {
+                cmdbuf.beginQuery(query_pool, occlusion_slot, query_flags);
+            });
+        }
+    }
     scheduler.Record([handle = pipeline->Handle(), buffer = buffer->Handle(), base,
                       count_handle = count_buffer ? count_buffer->Handle() : vk::Buffer{},
                       has_count = count_address != 0, count_base, max_count, stride,
@@ -1885,6 +1920,12 @@ void Rasterizer::DrawIndirectTail(const GraphicsPipeline* pipeline, bool is_inde
             }
         }
     });
+    if (occlusion_slot != OcclusionQueries::NoSlot) [[unlikely]] {
+        scheduler.Record(
+            [query_pool = occlusion->Pool(), occlusion_slot](vk::CommandBuffer cmdbuf) {
+                cmdbuf.endQuery(query_pool, occlusion_slot);
+            });
+    }
     DebugState.IncDrawCall();
     scheduler.NoteOp();
 

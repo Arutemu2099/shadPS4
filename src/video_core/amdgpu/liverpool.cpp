@@ -2383,6 +2383,11 @@ void Liverpool::ExecuteGfxPacket(const PM4Header* header, bool guest_markers_ena
                 static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                 static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
                 u64* results = event->Address<u64*>();
+                // SHADPS4_OCCLUSION_QUERIES=1: real queries (vk_occlusion.h) publish their counts
+                // here; the probe and the fake below are then unused.
+                if (rasterizer && rasterizer->OcclusionDump(results, num_counter_pairs)) {
+                    break;
+                }
                 if (occlusion_log) [[unlikely]] {
                     static u64 dumps = 0, window_dumps = 0, window_slot8 = 0, window_frame0 = 0;
                     static std::unordered_set<u64> window_addrs;

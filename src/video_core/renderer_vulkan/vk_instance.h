@@ -115,6 +115,16 @@ public:
         return features.depthBounds;
     }
 
+    /// Occlusion queries that return the exact sample count (SHADPS4_OCCLUSION_QUERIES).
+    bool IsOcclusionQueryPreciseSupported() const {
+        return features.occlusionQueryPrecise;
+    }
+
+    /// vkResetQueryPool from the host (SHADPS4_OCCLUSION_QUERIES).
+    bool IsHostQueryResetSupported() const {
+        return vk12_features.hostQueryReset;
+    }
+
     /// Returns true if 16-bit floats are supported in shaders
     bool IsShaderFloat16Supported() const {
         return vk12_features.shaderFloat16;

@@ -15,6 +15,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_native_bindings.h"
+#include "video_core/renderer_vulkan/vk_occlusion.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -128,6 +129,16 @@ public:
 
     void ScopeMarkerBegin(const std::string_view& str, bool from_guest = false);
     void ScopeMarkerEnd(bool from_guest = false);
+
+    /// SHADPS4_OCCLUSION_QUERIES: a ZPASS counter dump of the guest (command processor thread, in
+    /// order with the draws). Returns false when the feature is off: the caller writes the fake.
+    bool OcclusionDump(u64* results, s32 pairs) {
+        if (!occlusion) {
+            return false;
+        }
+        occlusion->Dump(results, pairs);
+        return true;
+    }
     void ScopedMarkerInsert(const std::string_view& str, bool from_guest = false);
     void ScopedMarkerInsertColor(const std::string_view& str, const u32 color,
                                  bool from_guest = false);
@@ -330,6 +341,8 @@ private:
     boost::icl::interval_set<VAddr> mapped_ranges;
     Common::SharedFirstMutex mapped_ranges_mutex;
     PipelineCache pipeline_cache;
+    /// Null unless SHADPS4_OCCLUSION_QUERIES=1 (vk_occlusion.h).
+    std::unique_ptr<OcclusionQueries> occlusion;
 
     using RenderTargetInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     std::array<RenderTargetInfo, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
