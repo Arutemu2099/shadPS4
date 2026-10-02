@@ -356,6 +356,30 @@ private:
     boost::icl::interval_set<VAddr> mapped_ranges;
     Common::SharedFirstMutex mapped_ranges_mutex;
     PipelineCache pipeline_cache;
+    /// SHADPS4_DRAW_REPEAT (back thread only): the previous direct draw, see DrawRepeatMatch.
+    struct DrawRepeatState {
+        bool valid{};    ///< the previous direct draw completed and is a base for a repeat
+        bool eligible{}; ///< the draw being processed: key gathered, pipeline eligible
+        const GraphicsPipeline* pipeline{};
+        std::vector<u32> key;  ///< binding inputs of the previous draw
+        std::vector<u32> cand; ///< binding inputs of the draw being processed
+        u64 dirty_epoch{}, image_epoch{}, buf_gen{}, tex_gen{}, border{}; ///< previous draw
+        u64 c_dirty_epoch{}, c_image_epoch{}, c_buf_gen{}, c_tex_gen{}, c_border{}; ///< this draw
+        u64 end_seq{}; ///< Scheduler::RecordSeq after the previous draw's records
+        Shader::PushData push_data{};
+        // Verify scratch.
+        std::vector<vk::DescriptorBufferInfo> v_buffers;
+        std::vector<vk::DescriptorImageInfo> v_images;
+        u64 v_seq{};
+        // Statistics (window).
+        u64 draws{}, repeats{}, f_ineligible{}, f_pipeline{}, f_key{}, f_rs{}, f_seq{},
+            f_epoch{}, f_image{}, f_gen{}, f_other{}, verified{}, mismatches{};
+    };
+    DrawRepeatState draw_repeat;
+    bool DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit);
+    void DrawRepeatApply(const GraphicsPipeline* pipeline);
+    void DrawRepeatVerify(const GraphicsPipeline* pipeline);
+    void DrawRepeatStore(const GraphicsPipeline* pipeline, bool completed);
     /// Null unless SHADPS4_OCCLUSION_QUERIES=1 (vk_occlusion.h).
     std::unique_ptr<OcclusionQueries> occlusion;
 

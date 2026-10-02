@@ -289,22 +289,168 @@ void Scheduler::RecordDrawPacket(const DrawPacketDesc& desc) {
     if (desc.header.num_writes != 0) {
         native_heaps_bound = false; // as PushDescriptors
     }
-    const size_t bytes =
-        DrawPacketPayloadBytes(desc.barriers.size(), desc.table.size(),
-                               desc.buffer_infos.size(), desc.image_infos.size());
+    std::span<const PacketBinding> table = desc.table;
+    std::span<const vk::DescriptorBufferInfo> buffer_infos = desc.buffer_infos;
+    std::span<const vk::DescriptorImageInfo> image_infos = desc.image_infos;
+    bool keep_descriptors = false;
+    // SHADPS4_DRAW_PACKET_DELTA: see scripts/patch/draw-packet-delta-2026-10-02.py. Graphics
+    // packets only; this thread recorded everything since the previous packet, and every other
+    // graphics descriptor push sets packet_state_unknown.
+    static const bool packet_delta = [] {
+        const char* value = std::getenv("SHADPS4_DRAW_PACKET_DELTA");
+        return value && value[0] == '1';
+    }();
+    if (packet_delta && desc.header.bind_point == vk::PipelineBindPoint::eGraphics &&
+        !table.empty()) {
+        auto& ps = packet_push;
+        ++ps.packets;
+        const VkPipelineLayout layout = desc.header.layout;
+        if (dynamic_state.packet_state_unknown) {
+            ++ps.unknown;
+        } else if (ps.layout != layout) {
+            ++ps.layout_changed;
+        } else {
+            static_assert(sizeof(PacketBinding) == sizeof(u64));
+            bool same = ps.table.size() == table.size() &&
+                        ps.buffer_infos.size() == buffer_infos.size() &&
+                        ps.image_infos.size() == image_infos.size() &&
+                        std::memcmp(ps.table.data(), table.data(), table.size_bytes()) == 0;
+            for (size_t i = 0; same && i < buffer_infos.size(); ++i) {
+                const auto& a = ps.buffer_infos[i];
+                const auto& b = buffer_infos[i];
+                same = a.buffer == b.buffer && a.offset == b.offset && a.range == b.range;
+            }
+            for (size_t i = 0; same && i < image_infos.size(); ++i) {
+                const auto& a = ps.image_infos[i];
+                const auto& b = image_infos[i];
+                same = a.sampler == b.sampler && a.imageView == b.imageView &&
+                       a.imageLayout == b.imageLayout;
+            }
+            keep_descriptors = same;
+            ps.differs += !same;
+        }
+        if (keep_descriptors) {
+            ++ps.kept;
+            table = {};
+            buffer_infos = {};
+            image_infos = {};
+        } else {
+            ps.layout = layout;
+            ps.table.resize(table.size());
+            std::memcpy(ps.table.data(), table.data(), table.size_bytes());
+            ps.buffer_infos.assign(buffer_infos.begin(), buffer_infos.end());
+            ps.image_infos.assign(image_infos.begin(), image_infos.end());
+            dynamic_state.packet_state_unknown = false;
+        }
+        if ((ps.packets & 0x1fffff) == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "DrawPacketDelta: packets={} kept={} ({:.1f}%) unknown={} "
+                     "layout_changed={} differs={}",
+                     ps.packets, ps.kept, 100.0 * ps.kept / ps.packets, ps.unknown,
+                     ps.layout_changed, ps.differs);
+            ps.packets = ps.kept = ps.unknown = ps.layout_changed = ps.differs = 0;
+        }
+    }
+    const size_t bytes = DrawPacketPayloadBytes(desc.barriers.size(), table.size(),
+                                                buffer_infos.size(), image_infos.size());
     ASSERT_MSG(bytes <= DrawPacketMaxBytes, "Draw packet of {} bytes", bytes);
     recording_worker->RecordWithPayload(bytes, [&](std::span<std::byte> storage) {
         std::byte* cursor = storage.data();
         auto* header = reinterpret_cast<DrawPacketHeader*>(cursor);
         std::memcpy(header, &desc.header, sizeof(DrawPacketHeader));
+        if (keep_descriptors) {
+            header->flags |= DrawPacketKeepDescriptors;
+            header->num_writes = 0;
+            header->num_buffer_infos = 0;
+            header->num_image_infos = 0;
+        }
         cursor += DrawPacketAlign(sizeof(DrawPacketHeader));
         // The same layout ViewDrawPacket reads back (an empty span advances nothing).
         CopyPayload(cursor, desc.barriers);
-        CopyPayload(cursor, desc.table);
-        CopyPayload(cursor, desc.buffer_infos);
-        CopyPayload(cursor, desc.image_infos);
+        CopyPayload(cursor, table);
+        CopyPayload(cursor, buffer_infos);
+        CopyPayload(cursor, image_infos);
         return [this, header] { ExecuteDrawPacket(*header); };
     });
+}
+
+/// SHADPS4_DRAW_PACKET_STATS=1 (recorder thread only): how much of a packet repeats the packet
+/// before it in the same command buffer. A census: it copies the packet's tables.
+static void DrawPacketRecorderStats(vk::CommandBuffer cmdbuf, const DrawPacketHeader& header,
+                                    const DrawPacketView& view) {
+    struct State {
+        VkCommandBuffer cmdbuf{};
+        VkPipelineLayout layout{};
+        VkPipeline pipeline{};
+        std::vector<PacketBinding> table;
+        std::vector<vk::DescriptorBufferInfo> buffers;
+        std::vector<vk::DescriptorImageInfo> images;
+        u64 packets{}, same_layout{}, same_pipeline{}, writes{}, writes_in_same{}, writes_equal{};
+        u64 all_equal{}, push_data_equal{};
+        std::array<u8, sizeof(header.push_data)> push{};
+    };
+    static State st;
+    ++st.packets;
+    st.writes += header.num_writes;
+    const bool table_same =
+        st.cmdbuf == static_cast<VkCommandBuffer>(cmdbuf) &&
+        st.layout == static_cast<VkPipelineLayout>(header.layout) &&
+        st.table.size() == view.table.size() &&
+        (view.table.empty() || std::memcmp(st.table.data(), view.table.data(),
+                                           view.table.size_bytes()) == 0) &&
+        st.buffers.size() == view.buffer_infos.size() &&
+        st.images.size() == view.image_infos.size();
+    st.same_pipeline += st.cmdbuf == static_cast<VkCommandBuffer>(cmdbuf) &&
+                        st.pipeline == static_cast<VkPipeline>(header.pipeline);
+    if (table_same) {
+        ++st.same_layout;
+        st.writes_in_same += header.num_writes;
+        size_t bi = 0, ii = 0;
+        u32 equal = 0;
+        for (const PacketBinding& binding : view.table) {
+            const auto type = static_cast<vk::DescriptorType>(binding.type);
+            bool same = true;
+            if (IsPacketBufferType(type)) {
+                for (u32 k = 0; k < binding.count; ++k, ++bi) {
+                    const auto& a = st.buffers[bi];
+                    const auto& b = view.buffer_infos[bi];
+                    same &= a.buffer == b.buffer && a.offset == b.offset && a.range == b.range;
+                }
+            } else {
+                for (u32 k = 0; k < binding.count; ++k, ++ii) {
+                    const auto& a = st.images[ii];
+                    const auto& b = view.image_infos[ii];
+                    same &= a.sampler == b.sampler && a.imageView == b.imageView &&
+                            a.imageLayout == b.imageLayout;
+                }
+            }
+            equal += same;
+        }
+        st.writes_equal += equal;
+        st.all_equal += equal == header.num_writes;
+        st.push_data_equal +=
+            std::memcmp(st.push.data(), &header.push_data, sizeof(header.push_data)) == 0;
+    }
+    st.cmdbuf = static_cast<VkCommandBuffer>(cmdbuf);
+    st.layout = static_cast<VkPipelineLayout>(header.layout);
+    st.pipeline = static_cast<VkPipeline>(header.pipeline);
+    st.table.assign(view.table.begin(), view.table.end());
+    st.buffers.assign(view.buffer_infos.begin(), view.buffer_infos.end());
+    st.images.assign(view.image_infos.begin(), view.image_infos.end());
+    std::memcpy(st.push.data(), &header.push_data, sizeof(header.push_data));
+    if ((st.packets & 0x1fffff) == 0) {
+        LOG_INFO(Render_Vulkan,
+                 "DrawPacketRec: packets={} writes/packet={:.2f} same_layout={:.1f}% "
+                 "same_pipeline={:.1f}% | in same-layout packets: writes equal={:.1f}% "
+                 "all writes equal={:.1f}% push constants equal={:.1f}%",
+                 st.packets, static_cast<double>(st.writes) / st.packets,
+                 100.0 * st.same_layout / st.packets, 100.0 * st.same_pipeline / st.packets,
+                 st.writes_in_same ? 100.0 * st.writes_equal / st.writes_in_same : 0.0,
+                 st.same_layout ? 100.0 * st.all_equal / st.same_layout : 0.0,
+                 st.same_layout ? 100.0 * st.push_data_equal / st.same_layout : 0.0);
+        st.packets = st.same_layout = st.same_pipeline = st.writes = st.writes_in_same =
+            st.writes_equal = st.all_equal = st.push_data_equal = 0;
+    }
 }
 
 void Scheduler::ExecuteDrawPacket(const DrawPacketHeader& header) {
@@ -322,8 +468,21 @@ void Scheduler::ExecuteDrawPacket(const DrawPacketHeader& header) {
     }
     cmdbuf.pushConstants(header.layout, header.stage_flags, 0u, sizeof(header.push_data),
                          &header.push_data);
+    static const bool packet_stats = [] {
+        const char* value = std::getenv("SHADPS4_DRAW_PACKET_STATS");
+        return value && value[0] == '1';
+    }();
+    if (packet_stats) [[unlikely]] {
+        DrawPacketRecorderStats(cmdbuf, header, view);
+    }
     if (header.num_writes != 0) {
-        std::array<vk::WriteDescriptorSet, DrawPacketMaxWrites> writes;
+        // Not value-initialized: BuildDrawPacketWrites assigns every write it returns (the
+        // constructors of 64 writes per packet were 5.6% of the recorder, 2026-10-02).
+        std::aligned_storage_t<sizeof(vk::WriteDescriptorSet) * DrawPacketMaxWrites,
+                               alignof(vk::WriteDescriptorSet)>
+            write_storage;
+        const std::span<vk::WriteDescriptorSet> writes{
+            reinterpret_cast<vk::WriteDescriptorSet*>(&write_storage), DrawPacketMaxWrites};
         const u32 count =
             BuildDrawPacketWrites(view.table, view.buffer_infos, view.image_infos, writes);
         ASSERT_MSG(count == header.num_writes, "Draw packet rebuilt {} of {} writes", count,
@@ -352,6 +511,7 @@ void Scheduler::ExecuteDrawPacket(const DrawPacketHeader& header) {
 void Scheduler::PushDescriptors(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
                                 std::span<const vk::WriteDescriptorSet> writes) {
     native_heaps_bound = false;
+    dynamic_state.packet_state_unknown = true; // a push outside the draw packets
     if (!IsAsyncRecording()) {
         current_cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, writes);
         return;

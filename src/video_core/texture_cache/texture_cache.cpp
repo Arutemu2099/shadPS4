@@ -10,6 +10,7 @@
 #include <xxhash.h>
 
 #include "common/assert.h"
+#include "video_core/buffer_cache/dirty_epoch.h"
 #include "common/path_util.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
@@ -302,6 +303,7 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
         image.hash = XXH3_64bits(addr, image.info.guest_size);
     }
     image.flags |= ImageFlagBits::MaybeCpuDirty;
+    g_image_epoch.fetch_add(1, std::memory_order_release);
     UntrackImage(image_id);
 }
 
@@ -387,6 +389,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             // Modified region overlaps image, so the image was definitely accessed by this fault.
             // Untrack the image, so that the range is unprotected and the guest can write freely.
             image.flags |= ImageFlagBits::CpuDirty;
+            g_image_epoch.fetch_add(1, std::memory_order_release);
             UntrackImage(image_id);
         } else if (pages_end < image_end) {
             // This page access may or may not modify the image.
@@ -422,6 +425,7 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
         }
         // Ensure image is reuploaded when accessed again.
         image.flags |= ImageFlagBits::GpuDirty;
+        g_image_epoch.fetch_add(1, std::memory_order_release);
     });
 }
 
@@ -1718,8 +1722,8 @@ void TextureCache::TrackImage(ImageId image_id) {
 
     if (!image.IsTracked()) {
         // Re-track the whole image
-        image.track_addr = image_begin;
-        image.track_addr_end = image_end;
+        image.track_addr = image_begin; g_image_epoch.fetch_add(1, std::memory_order_release);
+        image.track_addr_end = image_end; g_image_epoch.fetch_add(1, std::memory_order_release);
         tracker.UpdatePageWatchers<1>(image_begin, image.info.guest_size);
     } else {
         if (image_begin < image.track_addr) {
@@ -1742,7 +1746,7 @@ void TextureCache::TrackImageHead(ImageId image_id) {
     }
     ASSERT(image.track_addr != 0 && image_begin < image.track_addr);
     const auto size = image.track_addr - image_begin;
-    image.track_addr = image_begin;
+    image.track_addr = image_begin; g_image_epoch.fetch_add(1, std::memory_order_release);
     tracker.UpdatePageWatchers<1>(image_begin, size);
 }
 
@@ -1758,7 +1762,7 @@ void TextureCache::TrackImageTail(ImageId image_id) {
     ASSERT(image.track_addr_end != 0 && image.track_addr_end < image_end);
     const auto addr = image.track_addr_end;
     const auto size = image_end - image.track_addr_end;
-    image.track_addr_end = image_end;
+    image.track_addr_end = image_end; g_image_epoch.fetch_add(1, std::memory_order_release);
     tracker.UpdatePageWatchers<1>(addr, size);
 }
 
@@ -1770,6 +1774,7 @@ void TextureCache::UntrackImage(ImageId image_id) {
     const auto addr = image.track_addr;
     const auto size = image.track_addr_end - image.track_addr;
     image.track_addr = 0;
+    g_image_epoch.fetch_add(1, std::memory_order_release);
     image.track_addr_end = 0;
     if (size != 0) {
         if (g_deferred_untracks) {
@@ -1789,6 +1794,7 @@ void TextureCache::UntrackImageHead(ImageId image_id) {
     const auto addr = tracker.GetNextPageAddr(image_begin);
     const auto size = addr - image_begin;
     image.track_addr = addr;
+    g_image_epoch.fetch_add(1, std::memory_order_release);
     if (image.track_addr == image.track_addr_end) {
         // This image spans only 2 pages and both are modified,
         // but the image itself was not directly affected.
@@ -1812,6 +1818,7 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
     const auto addr = tracker.GetPageAddr(image_end);
     const auto size = image_end - addr;
     image.track_addr_end = addr;
+    g_image_epoch.fetch_add(1, std::memory_order_release);
     if (image.track_addr == image.track_addr_end) {
         // This image spans only 2 pages and both are modified,
         // but the image itself was not directly affected.

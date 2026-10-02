@@ -12,6 +12,10 @@ namespace VideoCore {
 // epoch AFTER the dirty summaries and bits have been updated under their lock.
 inline std::atomic<std::uint64_t> g_dirty_epoch{1};
 
+// SHADPS4_DRAW_REPEAT: moves after every change of an image's dirty flags or tracked range (texture
+// cache; guest fault handlers included). Unchanged = no cached image went stale or was re-tracked.
+inline std::atomic<std::uint64_t> g_image_epoch{1};
+
 template <typename Mutation>
 void PublishCpuDirty(Mutation&& mutation) noexcept {
     mutation();

@@ -142,6 +142,10 @@ struct DynamicState {
     /// Commit does not record this state). While clear, a draw whose description id equals the
     /// one recorded last skips its setVertexInputEXT.
     bool vertex_input_unknown{true};
+    /// SHADPS4_DRAW_PACKET_DELTA: the descriptors pushed by the last graphics draw packet may
+    /// no longer be bound (new command buffer, a blit or post-process pass, a legacy descriptor
+    /// push). Set by Invalidate and by the legacy push paths, cleared by RecordDrawPacket.
+    bool packet_state_unknown{true};
 
     Viewports viewports{};
     Scissors scissors{};
@@ -186,6 +190,7 @@ struct DynamicState {
     void Invalidate() {
         std::memset(&dirty_state, 0xFF, sizeof(dirty_state));
         vertex_input_unknown = true;
+        packet_state_unknown = true;
     }
 
     void SetViewports(const Viewports& viewports_) {
@@ -905,6 +910,16 @@ private:
     MasterSemaphore master_semaphore;
     CommandPool command_pool;
     DynamicState dynamic_state;
+    /// SHADPS4_DRAW_PACKET_DELTA (producer thread only): what the last graphics draw packet that
+    /// pushed descriptors pushed, and with which layout.
+    struct PacketPushState {
+        VkPipelineLayout layout{};
+        std::vector<u64> table; ///< the PacketBinding entries (8 bytes each), as words
+        std::vector<vk::DescriptorBufferInfo> buffer_infos;
+        std::vector<vk::DescriptorImageInfo> image_infos;
+        u64 packets{}, kept{}, unknown{}, layout_changed{}, differs{};
+    };
+    PacketPushState packet_push;
     vk::CommandBuffer current_cmdbuf;
     std::condition_variable_any event_cv;
     struct PendingOp {

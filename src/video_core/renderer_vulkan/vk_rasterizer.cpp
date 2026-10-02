@@ -110,6 +110,12 @@ const bool g_replace_op_reference = EnvExactly1("SHADPS4_STENCIL_REPLACE_OP");
 // worker rebuilds the WriteDescriptorSets from the pipeline's binding table. =2: the writes are
 // rebuilt on the back too, compared field by field with the legacy set_writes (DrawPacket:
 // MISMATCH, first 16), and the legacy path records.
+/// SHADPS4_DRAW_REPEAT (0 off / 1 skip / 2 verify): see Rasterizer::DrawRepeatMatch.
+const int g_draw_repeat = [] {
+    const char* value = std::getenv("SHADPS4_DRAW_REPEAT");
+    return value ? std::atoi(value) : 0;
+}();
+
 const int g_draw_packet = [] {
     const char* value = std::getenv("SHADPS4_DRAW_PACKET");
     const int mode = value ? value[0] - '0' : 0;
@@ -1331,6 +1337,93 @@ void Rasterizer::ExecuteDraw(const SplitDraw& draw,
             return false;
         }
         bound_stages = stages;
+        // SHADPS4_DRAW_REPEAT_STATS=1: census of draws whose binding inputs repeat the previous
+        // draw's (scripts/patch/draw-repeat-census-2026-10-02.py).
+        static const bool repeat_stats = [] {
+            const char* value = std::getenv("SHADPS4_DRAW_REPEAT_STATS");
+            return value && value[0] == '1';
+        }();
+        if (repeat_stats && !draw.args.is_indirect) [[unlikely]] {
+            struct State {
+                const GraphicsPipeline* pipeline{};
+                std::vector<u32> inputs;
+                u64 epoch{}, buf_gen{}, tex_gen{}, tick{};
+                u64 draws{}, same_pipeline{}, same_inputs{}, all_same{};
+                u64 broke_epoch{}, broke_buf_gen{}, broke_tex_gen{}, broke_tick{};
+                std::vector<u32> scratch;
+            };
+            static State st;
+            st.scratch.clear();
+            for (const auto& stage : stages) {
+                if (!stage.info) {
+                    continue;
+                }
+                // Only what the binding resolution reads: every V# / T# / S# of the stage and the
+                // user-data registers it pushes (the raw registers also hold per-draw values the
+                // bindings never read, e.g. the vertex-buffer table pointer: 0.0% repeats).
+                const auto add = [&](const auto& sharp) {
+                    const size_t words = sizeof(sharp) / sizeof(u32);
+                    const size_t at = st.scratch.size();
+                    st.scratch.resize(at + words);
+                    std::memcpy(&st.scratch[at], &sharp, words * sizeof(u32));
+                };
+                for (const auto& desc : stage.info->buffers) {
+                    add(desc.GetSharp(stage));
+                }
+                for (const auto& desc : stage.info->images) {
+                    add(desc.GetSharp(stage));
+                }
+                for (const auto& desc : stage.info->samplers) {
+                    add(desc.GetSharp(stage));
+                }
+                u32 mask = stage.info->ud_mask.mask;
+                while (mask) {
+                    const u32 index = std::countr_zero(mask);
+                    mask &= ~(1U << index);
+                    st.scratch.push_back(stage.user_data[index]);
+                }
+            }
+            const u64 epoch = VideoCore::g_dirty_epoch.load(std::memory_order_acquire);
+            const u64 buf_gen = buffer_cache.StructGeneration();
+            const u64 tex_gen = texture_cache.StructGeneration();
+            const u64 tick = scheduler.CurrentTick();
+            ++st.draws;
+            const bool same_pipeline = st.pipeline == draw.pipeline;
+            st.same_pipeline += same_pipeline;
+            if (same_pipeline && st.scratch == st.inputs) {
+                ++st.same_inputs;
+                const bool e = epoch == st.epoch, b = buf_gen == st.buf_gen,
+                           t = tex_gen == st.tex_gen, k = tick == st.tick;
+                st.all_same += e && b && t && k;
+                st.broke_epoch += !e;
+                st.broke_buf_gen += !b;
+                st.broke_tex_gen += !t;
+                st.broke_tick += !k;
+            }
+            st.pipeline = draw.pipeline;
+            st.inputs.swap(st.scratch);
+            st.epoch = epoch;
+            st.buf_gen = buf_gen;
+            st.tex_gen = tex_gen;
+            st.tick = tick;
+            if ((st.draws & 0x1fffff) == 0) {
+                const double d = static_cast<double>(st.draws);
+                LOG_INFO(Render_Vulkan,
+                         "DrawRepeat: draws={} same_pipeline={:.1f}% same_inputs={:.1f}% "
+                         "same_inputs_and_unchanged={:.1f}% | of same-input draws broken by: "
+                         "dirty_epoch={:.1f}% buffer_gen={:.1f}% texture_gen={:.1f}% tick={:.1f}% "
+                         "| input words per draw={}",
+                         st.draws, 100.0 * st.same_pipeline / d, 100.0 * st.same_inputs / d,
+                         100.0 * st.all_same / d,
+                         st.same_inputs ? 100.0 * st.broke_epoch / st.same_inputs : 0.0,
+                         st.same_inputs ? 100.0 * st.broke_buf_gen / st.same_inputs : 0.0,
+                         st.same_inputs ? 100.0 * st.broke_tex_gen / st.same_inputs : 0.0,
+                         st.same_inputs ? 100.0 * st.broke_tick / st.same_inputs : 0.0,
+                         st.inputs.size());
+                st.draws = st.same_pipeline = st.same_inputs = st.all_same = 0;
+                st.broke_epoch = st.broke_buf_gen = st.broke_tex_gen = st.broke_tick = 0;
+            }
+        }
         if (VideoCore::BufferCache::CensusEnabled()) [[unlikely]] {
             u64 id = 0;
             for (const auto* stage : draw.pipeline->GetStages()) {
@@ -1615,10 +1708,27 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     dc_lap(DcPrepare);
     const auto t_bindres = Common::FaultMonitor::Now();
     sample.BeginPhase(Common::DrawSampleProbe::Phase::BindResources);
-    const bool bound = BindResources(pipeline);
+    // SHADPS4_DRAW_REPEAT: the previous draw's resolved bindings stand when this draw repeats
+    // its binding inputs and nothing changed in between (DrawRepeatMatch).
+    const int repeat_mode = g_draw_repeat;
+    const bool repeat = repeat_mode != 0 && DrawRepeatMatch(pipeline, rs_hit);
+    bool bound;
+    if (repeat && repeat_mode == 1) {
+        DrawRepeatApply(pipeline);
+        bound = true;
+    } else if (repeat) {
+        draw_repeat.v_buffers.assign(buffer_infos.begin(), buffer_infos.end());
+        draw_repeat.v_images.assign(image_infos.begin(), image_infos.end());
+        draw_repeat.v_seq = scheduler.RecordSeq();
+        bound = BindResources(pipeline);
+        DrawRepeatVerify(pipeline);
+    } else {
+        bound = BindResources(pipeline);
+    }
     sample.EndPhase(Common::DrawSampleProbe::Phase::BindResources);
     const auto bindres_ns = Common::FaultMonitor::SinceNs(t_bindres);
     if (!bound) {
+        draw_repeat.valid = false;
         return;
     }
     if (g_draw_cost) {
@@ -1860,6 +1970,11 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     sample.EndPhase(Common::DrawSampleProbe::Phase::ActualDraw);
     sample.BeginPhase(Common::DrawSampleProbe::Phase::ResetImageBindings);
     ResetBindings();
+    if (repeat_mode != 0) {
+        // An occlusion-query draw goes through the legacy records: not a base for a repeat.
+        DrawRepeatStore(pipeline, occlusion_slot == OcclusionQueries::NoSlot &&
+                                      !(occlusion && occlusion->Open()));
+    }
     sample.EndPhase(Common::DrawSampleProbe::Phase::ResetImageBindings);
     sample.Finish();
     if (g_draw_cost) {
@@ -2210,6 +2325,212 @@ void Rasterizer::OnSubmit() {
     texture_cache.ProcessDownloadImages();
     texture_cache.RunGarbageCollector();
     buffer_cache.RunGarbageCollector();
+}
+
+bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) {
+    auto& st = draw_repeat;
+    if ((++st.draws & 0x1fffff) == 0) {
+        const double d = static_cast<double>(st.draws);
+        LOG_INFO(Render_Vulkan,
+                 "DrawRepeatSkip: mode={} draws={} repeats={} ({:.1f}%) | not a repeat: "
+                 "ineligible={:.1f}% pipeline={:.1f}% key={:.1f}% render_state={:.1f}% "
+                 "recorded_between={:.1f}% dirty_epoch={:.1f}% image_epoch={:.1f}% "
+                 "cache_gen={:.1f}% other={:.1f}% | verified={} mismatches={}",
+                 g_draw_repeat, st.draws, st.repeats, 100.0 * st.repeats / d,
+                 100.0 * st.f_ineligible / d, 100.0 * st.f_pipeline / d, 100.0 * st.f_key / d,
+                 100.0 * st.f_rs / d, 100.0 * st.f_seq / d, 100.0 * st.f_epoch / d,
+                 100.0 * st.f_image / d, 100.0 * st.f_gen / d, 100.0 * st.f_other / d,
+                 st.verified, st.mismatches);
+        st.draws = st.repeats = st.f_ineligible = st.f_pipeline = st.f_key = st.f_rs = st.f_seq =
+            st.f_epoch = st.f_image = st.f_gen = st.f_other = st.verified = 0;
+    }
+    // The state of this draw, sampled BEFORE its bindings are resolved (a change during the
+    // resolution must break the next draw's repeat).
+    st.c_dirty_epoch = VideoCore::g_dirty_epoch.load(std::memory_order_acquire);
+    st.c_image_epoch = VideoCore::g_image_epoch.load(std::memory_order_acquire);
+    st.c_buf_gen = buffer_cache.StructGeneration();
+    st.c_tex_gen = texture_cache.StructGeneration();
+    st.c_border = liverpool->BackRegs().ta_bc_base.base_addr;
+    // Key: everything the binding resolution reads from the stages.
+    st.cand.clear();
+    bool eligible = tex_bind_memo == 1 && build_set_writes && !native_bindings &&
+                    !bind_memo_stats && pending_stencil_writebacks.empty();
+    // Why a draw is ineligible (diagnostic split of f_ineligible; first reason per draw).
+    static std::array<u64, 6> why{}; // global, dma, written, formatted, special, image written
+    u32 reason = eligible ? ~0u : 0u;
+    const auto fail = [&](u32 r, bool bad) {
+        if (bad && reason == ~0u) {
+            reason = r;
+        }
+    };
+    const auto add = [&](const auto& sharp) {
+        const size_t words = sizeof(sharp) / sizeof(u32);
+        const size_t at = st.cand.size();
+        st.cand.resize(at + words);
+        std::memcpy(&st.cand[at], &sharp, words * sizeof(u32));
+    };
+    for (const auto& bound : BoundStages(pipeline)) {
+        const auto* stage = bound.info;
+        if (!stage) {
+            continue;
+        }
+        eligible &= !stage->uses_dma;
+        fail(1, stage->uses_dma);
+        for (const auto& desc : stage->buffers) {
+            // Special buffers: only the clip-plane slot with clip planes off (BindBuffers binds a
+            // null descriptor for it; the enable bits are part of the key through this test on
+            // both draws). Flatbuf / LDS copies get a new stream offset per draw; the others
+            // are left to the full path.
+            const bool special_ok =
+                !desc.IsSpecial() ||
+                (desc.buffer_type == Shader::BufferType::ClipPlanes &&
+                 liverpool->BackRegs().clipper_control.user_clip_plane_enable == 0);
+            eligible &= !desc.is_written && !desc.is_formatted && special_ok;
+            fail(2, desc.is_written);
+            fail(3, desc.is_formatted);
+            fail(4, !special_ok);
+            add(desc.GetSharp(bound));
+        }
+        for (const auto& desc : stage->images) {
+            eligible &= !desc.is_written;
+            fail(5, desc.is_written);
+            add(desc.GetSharp(bound));
+        }
+        for (const auto& desc : stage->samplers) {
+            add(desc.GetSharp(bound));
+        }
+        u32 mask = stage->ud_mask.mask;
+        while (mask) {
+            const u32 index = std::countr_zero(mask);
+            mask &= ~(1U << index);
+            st.cand.push_back(bound.user_data[index]);
+        }
+    }
+    st.eligible = eligible;
+    if (!eligible) {
+        ++st.f_ineligible;
+        ++why[reason < why.size() ? reason : 0];
+        if ((st.f_ineligible & 0xfffff) == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "DrawRepeatWhy: ineligible by global={} dma={} written={} formatted={} "
+                     "special={} image_written={}",
+                     why[0], why[1], why[2], why[3], why[4], why[5]);
+        }
+        return false;
+    }
+    if (!st.valid) {
+        ++st.f_other;
+        return false;
+    }
+    if (st.pipeline != pipeline) {
+        ++st.f_pipeline;
+        return false;
+    }
+    if (st.cand != st.key) {
+        ++st.f_key;
+        return false;
+    }
+    if (!rs_hit) {
+        ++st.f_rs;
+        return false;
+    }
+    if (scheduler.RecordSeq() != st.end_seq) {
+        ++st.f_seq;
+        return false;
+    }
+    if (st.c_dirty_epoch != st.dirty_epoch) {
+        ++st.f_epoch;
+        return false;
+    }
+    if (st.c_image_epoch != st.image_epoch) {
+        ++st.f_image;
+        return false;
+    }
+    if (st.c_buf_gen != st.buf_gen || st.c_tex_gen != st.tex_gen || st.c_border != st.border) {
+        ++st.f_gen;
+        return false;
+    }
+    ++st.repeats;
+    return true;
+}
+
+void Rasterizer::DrawRepeatApply(const GraphicsPipeline* pipeline) {
+    // What BindResources leaves besides the resolved infos (still those of the previous draw):
+    // push_data. The viewport transform and the pushed registers come from this draw, the
+    // buffer offsets from the bindings, which are the previous draw's.
+    buffer_barriers.clear();
+    binding_compute = false;
+    Shader::Backend::Bindings binding{};
+    push_data = MakeUserData(liverpool->BackRegs());
+    for (const auto& bound : BoundStages(pipeline)) {
+        if (bound.info) {
+            bound.PushUd(binding, push_data);
+        }
+    }
+    push_data.buf_offsets = draw_repeat.push_data.buf_offsets;
+}
+
+void Rasterizer::DrawRepeatVerify(const GraphicsPipeline* pipeline) {
+    auto& st = draw_repeat;
+    ++st.verified;
+    const char* what = nullptr;
+    if (scheduler.RecordSeq() != st.v_seq) {
+        what = "the full path recorded commands";
+    } else if (!buffer_barriers.empty()) {
+        what = "buffer barriers";
+    } else if (st.v_buffers.size() != buffer_infos.size() ||
+               st.v_images.size() != image_infos.size()) {
+        what = "info counts";
+    }
+    for (size_t i = 0; !what && i < buffer_infos.size(); ++i) {
+        const auto& a = st.v_buffers[i];
+        const auto& b = buffer_infos[i];
+        if (a.buffer != b.buffer || a.offset != b.offset || a.range != b.range) {
+            what = "buffer info";
+        }
+    }
+    for (size_t i = 0; !what && i < image_infos.size(); ++i) {
+        const auto& a = st.v_images[i];
+        const auto& b = image_infos[i];
+        if (a.sampler != b.sampler || a.imageView != b.imageView ||
+            a.imageLayout != b.imageLayout) {
+            what = "image info";
+        }
+    }
+    if (!what) {
+        // push_data as the skip would have built it against the full path's.
+        const Shader::PushData full = push_data;
+        DrawRepeatApply(pipeline);
+        if (push_data.xoffset != full.xoffset || push_data.yoffset != full.yoffset ||
+            push_data.xscale != full.xscale || push_data.yscale != full.yscale ||
+            push_data.ud_regs != full.ud_regs || push_data.buf_offsets != full.buf_offsets) {
+            what = "push data";
+        }
+        push_data = full;
+    }
+    if (what && ++st.mismatches <= 16) {
+        LOG_ERROR(Render_Vulkan,
+                  "DrawRepeat: MISMATCH {} (pipeline {:#x}, {} buffer infos, {} image infos)",
+                  what, reinterpret_cast<u64>(pipeline), buffer_infos.size(),
+                  image_infos.size());
+    }
+}
+
+void Rasterizer::DrawRepeatStore(const GraphicsPipeline* pipeline, bool completed) {
+    auto& st = draw_repeat;
+    st.valid = completed && st.eligible;
+    if (!st.valid) {
+        return;
+    }
+    st.pipeline = pipeline;
+    st.key.swap(st.cand);
+    st.dirty_epoch = st.c_dirty_epoch;
+    st.image_epoch = st.c_image_epoch;
+    st.buf_gen = st.c_buf_gen;
+    st.tex_gen = st.c_tex_gen;
+    st.border = st.c_border;
+    st.push_data = push_data;
+    st.end_seq = scheduler.RecordSeq();
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
@@ -3498,6 +3819,8 @@ void Rasterizer::RecordTexMemo(TexMemoRecord& rec, const Shader::Info& stage, u6
 }
 
 void Rasterizer::EmitPipelineResources(const Pipeline* pipeline) {
+    // SHADPS4_DRAW_PACKET_DELTA: the legacy records push descriptors outside the draw packets.
+    scheduler.GetDynamicState().packet_state_unknown = true;
     if (!native_bindings) {
         pipeline->BindResources(set_writes, buffer_barriers, push_data);
         return;

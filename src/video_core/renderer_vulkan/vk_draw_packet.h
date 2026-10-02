@@ -46,6 +46,9 @@ enum DrawPacketFlags : u32 {
     DrawPacketDraw = 1u << 0,     ///< bindPipeline(graphics) + draw / drawIndexed
     DrawPacketIndexed = 1u << 1,  ///< with DrawPacketDraw: drawIndexed
     DrawPacketDispatch = 1u << 2, ///< bindPipeline(compute) + dispatch
+    /// SHADPS4_DRAW_PACKET_DELTA: the set pushed by the previous graphics packet is still bound
+    /// and equal; this packet carries no table and no infos (statistics only on the worker).
+    DrawPacketKeepDescriptors = 1u << 3,
 };
 
 struct DrawPacketHeader {
