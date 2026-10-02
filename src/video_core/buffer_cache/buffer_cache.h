@@ -9,6 +9,7 @@
 #include <tuple>
 
 #include <array>
+#include <immintrin.h>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -647,6 +648,20 @@ private:
         u32 buffer_index{};
     };
     std::array<ReadMemoEntry, 8192> read_memo_table{};
+
+public:
+    /// SHADPS4_READ_MEMO_PREFETCH: pulls the READ_BIND_MEMO entry that ObtainBuffer will probe for
+    /// this read binding into the cache. The hash must stay the one in ObtainBuffer (a mismatch
+    /// only wastes the prefetch).
+    void PrefetchReadMemo(VAddr device_addr, u32 size, BufferId buffer_id) const noexcept {
+        const u64 h = (device_addr * 0x9E3779B97F4A7C15ULL) ^ (u64(size) * 0xC2B2AE3D27D4EB4FULL) ^
+                      u64(buffer_id.index);
+        _mm_prefetch(reinterpret_cast<const char*>(
+                         &read_memo_table[(h ^ (h >> 31)) & (read_memo_table.size() - 1)]),
+                     _MM_HINT_T0);
+    }
+
+private:
     /// SHADPS4_WRITTEN_RUN_MEMO (default off): a written ObtainBuffer of exactly this range ran in
     /// full in batch `tick` with these epochs and this many admitted fault jobs.
     struct WrittenRunEntry {

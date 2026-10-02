@@ -185,6 +185,9 @@ public:
         boost::container::small_vector<ImageViewInfo, 4> image_view_infos;
         boost::container::small_vector<ImageViewId, 4> image_view_ids;
         u32 num_samples;
+        /// Bumped by GetBarriers whenever it emits a barrier or changes `state` or the runs
+        /// (SHADPS4_TEX_TRANSIT_SKIP: an unchanged serial proves a repeated Transit is a no-op).
+        u64 state_serial{1};
     };
     std::deque<BackingImage> backing_images;
     BackingImage* backing{};

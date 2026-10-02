@@ -2783,6 +2783,9 @@ struct TexMemoRecord {
         VideoCore::Image::State state{};
         VideoCore::SubresourceRange range{}; // the range the full path passed to Transit
         bool full_range{};
+        /// SHADPS4_TEX_TRANSIT_SKIP: BackingImage::state_serial at which this image's Transit call
+        /// on a hit was a pure no-op (0 = not known). Written on hits, hence mutable.
+        mutable u64 ok_serial{};
     };
     bool valid{};
     bool excluded{};
@@ -3165,12 +3168,51 @@ u32 Rasterizer::EmitTexMemoHit(const TexMemoRecord& rec, Shader::Backend::Bindin
         auto& image = texture_cache.PeekImage(img.id);
         const auto& backing = *image.backing;
         if (!img.full_range || !backing.subresource_runs.empty() || !(backing.state == img.state)) {
-            // Exactly the full path's call for a sampled image with no feedback/general flags.
-            const auto new_layout = image.info.props.is_depth
-                                        ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-                                        : vk::ImageLayout::eShaderReadOnlyOptimal;
-            image.Transit(new_layout, vk::AccessFlagBits2::eShaderRead, img.range);
-            ++transits;
+            // SHADPS4_TEX_TRANSIT_SKIP (0 off / 1 skip / 2 verify): the same call on the same state
+            // was a pure no-op before (the serial did not move), so it is one again.
+            static const int transit_skip = [] {
+                const char* value = std::getenv("SHADPS4_TEX_TRANSIT_SKIP");
+                return value ? std::atoi(value) : 0;
+            }();
+            static u64 skip_calls = 0, skip_skipped = 0, skip_mismatches = 0;
+            const bool stamped = transit_skip != 0 && img.ok_serial == backing.state_serial &&
+                                 img.backing == image.backing;
+            if (stamped && transit_skip == 1) {
+                ++skip_skipped;
+            } else {
+                const u64 serial_before = backing.state_serial;
+                // Exactly the full path's call for a sampled image with no feedback/general flags.
+                const auto new_layout = image.info.props.is_depth
+                                            ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+                                            : vk::ImageLayout::eShaderReadOnlyOptimal;
+                image.Transit(new_layout, vk::AccessFlagBits2::eShaderRead, img.range);
+                ++transits;
+                if (transit_skip != 0) {
+                    if (image.backing->state_serial == serial_before) {
+                        img.ok_serial = serial_before;
+                        skip_skipped += stamped; // verify mode: would have been skipped
+                    } else if (stamped) {
+                        if (skip_mismatches++ < 16) {
+                            LOG_ERROR(Render_Vulkan,
+                                      "TexTransitSkip: MISMATCH image {:#x} serial {} -> {} "
+                                      "full_range={} runs={}",
+                                      image.info.guest_address, serial_before,
+                                      image.backing->state_serial, img.full_range,
+                                      image.backing->subresource_runs.size());
+                        }
+                    }
+                }
+            }
+            if (transit_skip != 0 && (++skip_calls & 0x3fffff) == 0) {
+                LOG_INFO(Render_Vulkan,
+                         "TexTransitSkip: mode={} hit_transit_sites={} skipped={} ({:.1f}%) "
+                         "mismatches={}",
+                         transit_skip, skip_calls, skip_skipped,
+                         100.0 * static_cast<double>(skip_skipped) / static_cast<double>(skip_calls),
+                         skip_mismatches);
+                skip_calls = 0;
+                skip_skipped = 0;
+            }
         }
         image.usage.texture |= 1u;
         image_infos.emplace_back(VK_NULL_HANDLE, img.view, image.backing->state.layout);
@@ -3471,6 +3513,15 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
         if (!desc.IsSpecial() && vsharp.base_address != 0 && vsharp.GetSize() > 0) {
             const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
             const auto buffer_id = buffer_cache.FindBuffer(vsharp.base_address, size);
+            // SHADPS4_READ_MEMO_PREFETCH: pass 2 probes the read memo for this binding.
+            static const bool memo_prefetch = [] {
+                const char* value = std::getenv("SHADPS4_READ_MEMO_PREFETCH");
+                return value && value[0] == '1';
+            }();
+            if (memo_prefetch && buffer_id && !desc.is_written && !desc.is_formatted) {
+                buffer_cache.PrefetchReadMemo(vsharp.base_address, static_cast<u32>(size),
+                                              buffer_id);
+            }
             buffer_bindings.emplace_back(buffer_id, vsharp, size);
         } else {
             buffer_bindings.emplace_back(VideoCore::BufferId{}, vsharp, 0);

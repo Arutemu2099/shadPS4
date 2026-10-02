@@ -329,6 +329,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
             },
         });
         last_state = next_state(last_state);
+        ++backing->state_serial;
         Common::FaultMonitor::CountBarriers(false, 0, barriers.size());
         return barriers;
     }
@@ -340,6 +341,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
     // textures, which was the 11.5 ms/frame leaf).
     if (!promoted) {
         runs.push_back(StateRun{0u, res_levels * res_layers, last_state});
+        ++backing->state_serial;
     }
 
     const u32 base_level = needs_partial_transition ? subres_range->base.level : 0u;
@@ -438,6 +440,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
             }
         }
         runs.assign(rebuilt.begin(), rebuilt.end());
+        ++backing->state_serial;
     }
 
     // A full-resource transition leaves every subresource in one state, so drop back to the cheap
@@ -445,19 +448,26 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
     // With smart image barriers a full transition can leave differing (merged or skipped) states;
     // keep per-subresource tracking unless every run agrees.
     if (!needs_partial_transition && !smart_images) {
-        runs.clear();
+        if (!runs.empty()) {
+            runs.clear();
+            ++backing->state_serial;
+        }
     } else if (!needs_partial_transition) {
         const bool uniform = std::ranges::all_of(
             runs, [&](const StateRun& r) { return r.state == runs.front().state; });
         if (uniform) {
             last_state = runs.empty() ? dst_state : runs.front().state;
             runs.clear();
+            ++backing->state_serial;
             Common::FaultMonitor::CountBarriers(true, seg_iters, barriers.size());
             return barriers;
         }
     }
 
-    last_state = dst_state;
+    if (!(last_state == dst_state)) {
+        last_state = dst_state;
+        ++backing->state_serial;
+    }
     Common::FaultMonitor::CountBarriers(true, seg_iters, barriers.size());
     return barriers;
 }
