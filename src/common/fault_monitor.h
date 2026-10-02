@@ -48,6 +48,14 @@ extern std::atomic<u64> guest_write_ns;
 extern std::atomic<u64> jit_patch_faults;
 extern std::atomic<u64> jit_patch_ns;
 extern std::atomic<u64> presented_frames;
+// Frame-interval statistics of the current report window (2026-10-02): written by the presenter
+// thread in CountPresentedFrame, read and reset by the report thread.
+extern std::atomic<u64> frame_last_ns;
+extern std::atomic<u64> frame_max_ns;
+extern std::atomic<u64> frame_over_10ms;
+extern std::atomic<u64> frame_over_17ms;
+extern std::atomic<u64> frame_over_33ms;
+extern std::atomic<u64> frame_slow_ns;
 
 /**
  * Which thread pays for fault handling.
@@ -530,6 +538,28 @@ inline void CountJitPatchFault(u64 ns) {
 
 inline void CountPresentedFrame() {
     presented_frames.fetch_add(1, std::memory_order_relaxed);
+    // Once per presented frame: the interval since the previous present.
+    const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count());
+    const u64 last = frame_last_ns.exchange(now, std::memory_order_relaxed);
+    if (last == 0 || now <= last) {
+        return;
+    }
+    const u64 d = now - last;
+    if (d > frame_max_ns.load(std::memory_order_relaxed)) {
+        frame_max_ns.store(d, std::memory_order_relaxed);
+    }
+    if (d > 10'000'000ULL) {
+        frame_over_10ms.fetch_add(1, std::memory_order_relaxed);
+        frame_slow_ns.fetch_add(d, std::memory_order_relaxed);
+        if (d > 16'700'000ULL) {
+            frame_over_17ms.fetch_add(1, std::memory_order_relaxed);
+            if (d > 33'300'000ULL) {
+                frame_over_33ms.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
 }
 
 /// `fragments` is the interval count after the operation. Cheap: interval_set::iterative_size()
