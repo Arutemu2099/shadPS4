@@ -1069,6 +1069,7 @@ void Image::SetBackingSamples(u32 num_samples, bool copy_backing) {
         new_backing->state.layout = dst_layout;
         new_backing->state.access_mask = dst_access;
         new_backing->state.pl_stage = dst_stage;
+        ++new_backing->state_serial; // SHADPS4_TEX_TRANSIT_SKIP: a state write outside GetBarriers
     }
 
     backing = new_backing;

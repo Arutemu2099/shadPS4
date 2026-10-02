@@ -656,9 +656,11 @@ public:
     void PrefetchReadMemo(VAddr device_addr, u32 size, BufferId buffer_id) const noexcept {
         const u64 h = (device_addr * 0x9E3779B97F4A7C15ULL) ^ (u64(size) * 0xC2B2AE3D27D4EB4FULL) ^
                       u64(buffer_id.index);
-        _mm_prefetch(reinterpret_cast<const char*>(
-                         &read_memo_table[(h ^ (h >> 31)) & (read_memo_table.size() - 1)]),
-                     _MM_HINT_T0);
+        const char* entry = reinterpret_cast<const char*>(
+            &read_memo_table[(h ^ (h >> 31)) & (read_memo_table.size() - 1)]);
+        _mm_prefetch(entry, _MM_HINT_T0);
+        // The 40-byte entry is unaligned: its tail can sit on the next cache line.
+        _mm_prefetch(entry + sizeof(ReadMemoEntry) - 1, _MM_HINT_T0);
     }
 
 private:
