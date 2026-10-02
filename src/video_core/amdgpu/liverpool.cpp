@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -2353,15 +2354,77 @@ void Liverpool::ExecuteGfxPacket(const PM4Header* header, bool guest_markers_ena
     case PM4ItOpcode::EventWrite: {
         // The streamout-flush part is a register write and stays in ProcessGraphics.
         const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
+        // SHADPS4_OCCLUSION_FAKE / SHADPS4_OCCLUSION_LOG (2026-10-02, probe; see
+        // scripts/patch/occlusion-probe-2026-10-02.py): what the game's occlusion queries are answered
+        // with, and a log of their pattern. Defaults keep the upstream fake (always "visible").
+        static const int occlusion_fake = [] {
+            const char* value = std::getenv("SHADPS4_OCCLUSION_FAKE");
+            return value ? std::atoi(value) : 1;
+        }();
+        static const bool occlusion_log = [] {
+            const char* value = std::getenv("SHADPS4_OCCLUSION_LOG");
+            return value && value[0] == '1';
+        }();
+        if (occlusion_log && event->event_type.Value() != EventType::PixelPipeStatDump &&
+            (event->event_index.Value() == EventIndex::ZpassDone ||
+             event->event_type.Value() == EventType::PixelPipeStatControl ||
+             event->event_type.Value() == EventType::PixelPipeStatReset)) {
+            static u32 other_logged = 0;
+            if (other_logged < 16) {
+                ++other_logged;
+                LOG_INFO(Render, "OcclusionQ: other event type={} index={} frame={}",
+                         static_cast<u32>(event->event_type.Value()),
+                         static_cast<u32>(event->event_index.Value()),
+                         Common::FaultMonitor::presented_frames.load(std::memory_order_relaxed));
+            }
+        }
         if (event->event_index.Value() == EventIndex::ZpassDone) {
             if (event->event_type.Value() == EventType::PixelPipeStatDump) {
                 static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                 static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
                 u64* results = event->Address<u64*>();
-                for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
-                    *results = pixel_counter | OcclusionCounterValidMask;
+                if (occlusion_log) [[unlikely]] {
+                    static u64 dumps = 0, window_dumps = 0, window_slot8 = 0, window_frame0 = 0;
+                    static std::unordered_set<u64> window_addrs;
+                    const u64 frame =
+                        Common::FaultMonitor::presented_frames.load(std::memory_order_relaxed);
+                    const u64 addr = reinterpret_cast<u64>(results);
+                    if (dumps < 48) {
+                        LOG_INFO(Render,
+                                 "OcclusionQ: dump #{} addr={:#x} slot={} had={:#x} next={:#x} "
+                                 "counter={:#x} frame={}",
+                                 dumps, addr, (addr & 8) ? 1 : 0, results[0], results[1],
+                                 pixel_counter, frame);
+                    }
+                    if (window_dumps == 0) {
+                        window_frame0 = frame;
+                    }
+                    ++dumps;
+                    ++window_dumps;
+                    window_slot8 += (addr & 8) ? 1 : 0;
+                    window_addrs.insert(addr);
+                    if (window_dumps == 2048) {
+                        const u64 frames = frame - window_frame0;
+                        LOG_INFO(Render,
+                                 "OcclusionQ: dumps={} frames={} dumps/frame={:.1f} distinct_addrs={} "
+                                 "slot1_share={:.1f}% fake_mode={} total={}",
+                                 window_dumps, frames,
+                                 frames ? static_cast<double>(window_dumps) / frames : 0.0,
+                                 window_addrs.size(), 100.0 * window_slot8 / window_dumps,
+                                 occlusion_fake, dumps);
+                        window_dumps = 0;
+                        window_slot8 = 0;
+                        window_addrs.clear();
+                    }
                 }
-                pixel_counter += OcclusionCounterStep;
+                if (occlusion_fake != 2) {
+                    for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
+                        *results = pixel_counter | OcclusionCounterValidMask;
+                    }
+                    if (occlusion_fake != 0) {
+                        pixel_counter += OcclusionCounterStep;
+                    }
+                }
             }
         }
         break;
