@@ -2911,9 +2911,42 @@ struct TexMemoRecord {
 /// SHADPS4_TEX_MEMO_WAYS=N (1-8, default 1): each (pipeline, stage) keeps N records, so a shader
 /// that alternates between materials hits on each of them instead of missing on the key.
 struct TexMemoSet {
-    static constexpr u32 MaxWays = 8;
+    static constexpr u32 MaxWays = 32;
+    /// SHADPS4_TEX_MEMO_HASH: key hash (0 = never recorded) and LRU stamp of every way, kept flat
+    /// so the search does not touch the records.
+    std::array<u64, MaxWays> key_hash{};
+    std::array<u64, MaxWays> hash_last_use{};
     std::array<TexMemoRecord, MaxWays> ways{};
 };
+
+/// SHADPS4_TEX_MEMO_HASH=1 (default off): hash-first search of the ways (see TexMemoSet).
+static bool TexMemoHash() {
+    static const bool on = [] {
+        const char* value = std::getenv("SHADPS4_TEX_MEMO_HASH");
+        return value && value[0] == '1';
+    }();
+    return on;
+}
+
+/// 64-bit mix of a byte string (never returns 0). Only narrows the search; SameBytes decides.
+static u64 TexMemoHashBytes(u64 h, const void* data, size_t size) {
+    const u8* p = static_cast<const u8*>(data);
+    while (size >= 8) {
+        u64 v;
+        std::memcpy(&v, p, 8);
+        h = (h ^ v) * 0x9E3779B97F4A7C15ULL;
+        h ^= h >> 29;
+        p += 8;
+        size -= 8;
+    }
+    if (size != 0) {
+        u64 v = 0;
+        std::memcpy(&v, p, size);
+        h = (h ^ v) * 0xC2B2AE3D27D4EB4FULL;
+        h ^= h >> 31;
+    }
+    return h;
+}
 
 static u32 TexMemoWays() {
     static const u32 ways = [] {
@@ -3056,15 +3089,50 @@ void Rasterizer::BindTexturesMemo(const Pipeline* pipeline, const Shader::BoundS
     // misses on the key below and is re-recorded by the full path.
     TexMemoRecord* found = nullptr;
     TexMemoRecord* victim = &set.ways[0];
-    for (u32 w = 0; w < ways; ++w) {
-        auto& cand = set.ways[w];
-        if (cand.valid && border == cand.border && SameBytes(st.tsharps, cand.tsharps) &&
-            SameBytes(st.ssharps, cand.ssharps)) {
-            found = &cand;
-            break;
+    const bool hash_search = TexMemoHash();
+    if (hash_search) {
+        u64 h = TexMemoHashBytes(border | 1, st.tsharps.data(),
+                                 st.tsharps.size() * sizeof(AmdGpu::Image));
+        h = TexMemoHashBytes(h, st.ssharps.data(), st.ssharps.size() * sizeof(AmdGpu::Sampler));
+        h |= 1; // 0 marks a way that was never recorded
+        u32 victim_way = 0;
+        u64 oldest = ~0ULL;
+        u32 found_way = ways;
+        for (u32 w = 0; w < ways; ++w) {
+            if (set.key_hash[w] == h) {
+                auto& cand = set.ways[w];
+                if (cand.valid && border == cand.border && SameBytes(st.tsharps, cand.tsharps) &&
+                    SameBytes(st.ssharps, cand.ssharps)) {
+                    found = &cand;
+                    found_way = w;
+                    break;
+                }
+            }
+            // Never-used ways have stamp 0 and are taken first, then the least recently used.
+            if (set.hash_last_use[w] < oldest) {
+                oldest = set.hash_last_use[w];
+                victim_way = w;
+            }
         }
-        if (!cand.valid ? victim->valid : (victim->valid && cand.last_use < victim->last_use)) {
-            victim = &cand;
+        if (!found) {
+            // The miss path below re-records this way with the key under test.
+            victim = &set.ways[victim_way];
+            set.key_hash[victim_way] = h;
+            found_way = victim_way;
+        }
+        set.hash_last_use[found_way] = st.total_stages;
+    } else {
+        for (u32 w = 0; w < ways; ++w) {
+            auto& cand = set.ways[w];
+            if (cand.valid && border == cand.border && SameBytes(st.tsharps, cand.tsharps) &&
+                SameBytes(st.ssharps, cand.ssharps)) {
+                found = &cand;
+                break;
+            }
+            if (!cand.valid ? victim->valid
+                            : (victim->valid && cand.last_use < victim->last_use)) {
+                victim = &cand;
+            }
         }
     }
     auto& rec = found ? *found : *victim;
@@ -3074,8 +3142,11 @@ void Rasterizer::BindTexturesMemo(const Pipeline* pipeline, const Shader::BoundS
     // one memo section, so a foreign structural change cannot interleave with them; the
     // structure generation is re-read inside it for the same reason.
     s32 miss = -1;
-    if (!rec.valid || border != rec.border || !SameBytes(st.tsharps, rec.tsharps) ||
-        !SameBytes(st.ssharps, rec.ssharps)) {
+    // Hash search: a found way already passed the full key compare; a victim never matches.
+    if (hash_search ? !found
+                    : (!rec.valid || border != rec.border ||
+                       !SameBytes(st.tsharps, rec.tsharps) ||
+                       !SameBytes(st.ssharps, rec.ssharps))) {
         miss = TmKey;
     } else if (rec.excluded) {
         miss = TmExcluded;

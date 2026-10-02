@@ -3059,6 +3059,9 @@ namespace {
 /// none yet), counters, and a log line every ~10 s (the clock is checked every 4096 blocks).
 struct FrontDeriveState {
     u64 recorded_desc_id{};
+    /// Mode 2: the arrays of the last setVertexInputEXT record (the skip oracle).
+    std::vector<vk::VertexInputBindingDescription2EXT> last_bindings;
+    std::vector<vk::VertexInputAttributeDescription2EXT> last_attributes;
     u64 last_desc_id{};
     u64 draws{};         ///< Draw records carrying a block.
     u64 shipped{};       ///< ... whose description id differs from the previous block's.
@@ -3233,8 +3236,31 @@ void BufferCache::BindVertexBuffers(
         auto& dynamic_state = scheduler.GetDynamicState();
         if (fd_mode == 2) {
             // Mode 1 would skip this record (the command buffer holds this description).
-            g_fd.reused += !dynamic_state.vertex_input_unknown &&
-                           front_vi->desc_id == g_fd.recorded_desc_id;
+            const bool would_skip = !dynamic_state.vertex_input_unknown &&
+                                    front_vi->desc_id == g_fd.recorded_desc_id;
+            g_fd.reused += would_skip;
+            // Skip oracle: the arrays recorded last must be the arrays recorded now.
+            // Field by field: the Vulkan structs have padding after sType (a byte compare of
+            // them reported ~100 false mismatches per second, 2026-10-02).
+            bool same_arrays = g_fd.last_bindings.size() == bindings.size() &&
+                               g_fd.last_attributes.size() == attributes.size();
+            for (size_t i = 0; same_arrays && i < bindings.size(); ++i) {
+                const auto& a = g_fd.last_bindings[i];
+                const auto& b = bindings[i];
+                same_arrays = a.binding == b.binding && a.stride == b.stride &&
+                              a.inputRate == b.inputRate && a.divisor == b.divisor;
+            }
+            for (size_t i = 0; same_arrays && i < attributes.size(); ++i) {
+                const auto& a = g_fd.last_attributes[i];
+                const auto& b = attributes[i];
+                same_arrays = a.location == b.location && a.binding == b.binding &&
+                              a.format == b.format && a.offset == b.offset;
+            }
+            if (would_skip && !same_arrays) {
+                g_fd.Mismatch("skip arrays", 0, *front_vi);
+            }
+            g_fd.last_bindings.assign(bindings.begin(), bindings.end());
+            g_fd.last_attributes.assign(attributes.begin(), attributes.end());
         }
         // Update current vertex inputs.
         scheduler.RecordArrays(
