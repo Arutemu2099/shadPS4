@@ -29,6 +29,8 @@ class VkCtxScope;
 namespace Vulkan {
 
 class Instance;
+struct DrawPacketDesc;
+struct DrawPacketHeader;
 
 struct RenderAttachment {
     vk::ImageView image_view;
@@ -490,6 +492,19 @@ public:
         }
     }
     void CommitDynamicState();
+    /// SHADPS4_DRAW_PACKET: true when CommitDynamicState would record a command right now (the
+    /// resource packet of a draw must be recorded before it to keep the legacy command order).
+    [[nodiscard]] bool CommitDynamicStateWouldRecord() const;
+    /// SHADPS4_DRAW_PACKET: true when BeginRendering(state) would record nothing.
+    [[nodiscard]] bool RenderingMatches(const RenderState& state) const noexcept {
+        return is_rendering && render_state == state;
+    }
+    /// SHADPS4_DRAW_PACKET (vk_draw_packet.h): records one worker command carrying the draw's
+    /// buffer barriers, push constants, push descriptors and optionally the draw / dispatch, as
+    /// flat bytes; the worker rebuilds the WriteDescriptorSets. The caller has already done the
+    /// command-processor side of the barriers (Pipeline::BeginBufferBarriers) and guarantees
+    /// IsAsyncRecording() and DrawPacketPayloadBytes(..) <= DrawPacketMaxBytes.
+    void RecordDrawPacket(const DrawPacketDesc& desc);
     /// Diagnostic (SHADPS4_ASC_RING_LATENCY + SHADPS4_ASYNC_RECORDING_TIMING=1): logs the recording
     /// worker's counters since the previous call. Command-processor thread (the producer) only.
     void LogRecordingWindow();
@@ -780,6 +795,14 @@ private:
     }
 
     void AllocateWorkerCommandBuffers();
+
+    /// The dirty bits CommitDynamicState leaves set because their test is disabled (the half of
+    /// its decision that CommitDynamicStateWouldRecord shares).
+    using DynamicDirtyBits = decltype(DynamicState::dirty_state);
+    [[nodiscard]] DynamicDirtyBits PostponedDynamicDirty() const;
+
+    /// Recording-worker side of RecordDrawPacket.
+    void ExecuteDrawPacket(const DrawPacketHeader& header);
 
     void SubmitExecution(SubmitInfo& info);
 

@@ -27,6 +27,19 @@ Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorH
 
 Pipeline::~Pipeline() = default;
 
+void Pipeline::BeginBufferBarriers(const BufferBarriers& buffer_barriers) const {
+    // RecordBufferBarriers without its record (kept separate so the legacy path, including the
+    // batch timer's end-of-rendering site, stays byte-identical).
+    if (buffer_barriers.empty()) {
+        return;
+    }
+    if (GpuBatchTimer::Enabled()) {
+        GpuBreaks().buffer_barrier_calls.fetch_add(1, std::memory_order_relaxed);
+        GpuBreaks().buffer_barriers.fetch_add(buffer_barriers.size(), std::memory_order_relaxed);
+    }
+    scheduler.EndRendering();
+}
+
 void Pipeline::RecordBufferBarriers(const BufferBarriers& buffer_barriers) const {
     if (buffer_barriers.empty()) {
         return;
@@ -129,6 +142,25 @@ void Pipeline::BindResourcesNative(NativeBindings& native, std::span<const u32> 
             };
             push(cmdbuf, &info);
         });
+}
+
+void Pipeline::BuildPacketBindings(std::span<const vk::DescriptorSetLayoutBinding> bindings) {
+    packet_bindings.clear();
+    packet_bindings.reserve(bindings.size());
+    packet_buffer_infos = 0;
+    packet_image_infos = 0;
+    for (const auto& binding : bindings) {
+        if (IsPacketBufferType(binding.descriptorType)) {
+            packet_buffer_infos += binding.descriptorCount;
+        } else {
+            packet_image_infos += binding.descriptorCount;
+        }
+        packet_bindings.push_back(PacketBinding{
+            .binding = static_cast<u16>(binding.binding),
+            .count = static_cast<u16>(binding.descriptorCount),
+            .type = static_cast<u32>(binding.descriptorType),
+        });
+    }
 }
 
 void Pipeline::BuildNativeMappings(std::span<const vk::DescriptorSetLayoutBinding> bindings) {

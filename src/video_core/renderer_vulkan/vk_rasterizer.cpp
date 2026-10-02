@@ -30,6 +30,7 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_draw_packet.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -101,6 +102,57 @@ const int g_render_state_memo = [] {
 }();
 const bool g_hair_stencil_trace = EnvExactly1("SHADPS4_HAIR_STENCIL_TRACE");
 const bool g_replace_op_reference = EnvExactly1("SHADPS4_STENCIL_REPLACE_OP");
+
+// SHADPS4_DRAW_PACKET=1 (=2 verify), default off (vk_draw_packet.h; notes/back-split-design-
+// 2026-09-28.md phase 1): the direct draw and dispatch paths record buffer barriers, push
+// constants and push descriptors as ONE worker record of flat bytes, folding the draw / dispatch
+// in when the legacy path would record nothing between the descriptors and it; the recording
+// worker rebuilds the WriteDescriptorSets from the pipeline's binding table. =2: the writes are
+// rebuilt on the back too, compared field by field with the legacy set_writes (DrawPacket:
+// MISMATCH, first 16), and the legacy path records.
+const int g_draw_packet = [] {
+    const char* value = std::getenv("SHADPS4_DRAW_PACKET");
+    const int mode = value ? value[0] - '0' : 0;
+    return (mode == 1 || mode == 2) ? mode : 0;
+}();
+// Counters of the thread that executes draws (one thread). Cumulative; logged every ~10 s.
+struct DrawPacketStats {
+    u64 draws{};        // EmitPipelineResourcesOrPacket calls (draws + direct dispatches)
+    u64 packets{};      // sent as a packet
+    u64 folded{};       // packets that also carried the draw / dispatch
+    u64 fb_oversize{};  // legacy: payload over DrawPacketMaxBytes
+    u64 fb_occlusion{}; // legacy: draw inside an occlusion query
+    u64 fb_other{};     // legacy: no push descriptors / native bindings / sync recording / shape
+    u64 verify_checked{};
+    u64 mismatches{};
+    u64 fold_misses{};  // a "would record nothing" prediction that recorded (see DrawTail)
+    u64 packet_bytes{}; // chunk bytes of the packets plus, when not folded, the draw record
+    u64 legacy_bytes{}; // chunk bytes the legacy records of every draw would take (estimate)
+    std::chrono::steady_clock::time_point last_log{};
+};
+DrawPacketStats g_dp_stats;
+
+void DrawPacketLog() {
+    const auto& s = g_dp_stats;
+    LOG_INFO(Render_Vulkan,
+             "DrawPacket: mode={} draws={} packets={} folded_draws={} "
+             "fallbacks(oversize/occlusion/other)={}/{}/{} bytes_per_packet={} "
+             "legacy_bytes_per_draw={} (both estimated from the chunk layout) verify_checked={} "
+             "mismatches={} fold_misses={}",
+             g_draw_packet, s.draws, s.packets, s.folded, s.fb_oversize, s.fb_occlusion,
+             s.fb_other, s.packet_bytes / std::max<u64>(s.packets, 1),
+             s.legacy_bytes / std::max<u64>(s.draws, 1), s.verify_checked, s.mismatches,
+             s.fold_misses);
+}
+
+void NoteDrawPacketFoldMiss(const char* what) {
+    if (++g_dp_stats.fold_misses <= 16) {
+        LOG_CRITICAL(Render_Vulkan,
+                     "DrawPacket: fold prediction missed, {} recorded while the packet was "
+                     "pending (packet recorded after it)",
+                     what);
+    }
+}
 
 // SHADPS4_DRAW_COST=1 (diagnostic, default off): rdtsc cycles of each DrawTail phase per graphics
 // pipeline on the thread that executes draws (the CP back with the split), logged every 2^20
@@ -1706,16 +1758,52 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     const auto t_descwrite = Common::FaultMonitor::Now();
 
     sample.BeginPhase(Common::DrawSampleProbe::Phase::PipelineResources);
-    EmitPipelineResources(pipeline);
+    // SHADPS4_DRAW_PACKET: `packet` = the resources are pending as one record that must go out
+    // before anything else of this draw is recorded (the legacy order is barrier, push
+    // constants, descriptors, dynamic state, beginRendering, draw). A draw wrapped in an
+    // occlusion query takes the legacy path; Open() only changes between draws.
+    const bool occlusion_draw = occlusion && occlusion->Open();
+    bool packet = EmitPipelineResourcesOrPacket(pipeline, occlusion_draw);
     sample.EndPhase(Common::DrawSampleProbe::Phase::PipelineResources);
     dc_lap(DcEmitResources);
     const auto t_dynstate = Common::FaultMonitor::Now();
     sample.BeginPhase(Common::DrawSampleProbe::Phase::DynamicState);
-    UpdateDynamicState(pipeline, is_indexed);
+    UpdateDynamicState(pipeline, is_indexed, !packet);
+    if (packet) {
+        if (scheduler.CommitDynamicStateWouldRecord()) {
+            RecordPacket(pipeline, DrawPacketHeader{});
+            packet = false;
+            scheduler.CommitDynamicState();
+        } else {
+            // Predicted no record: check it (the one thing verify mode cannot see). A miss
+            // only reorders the dynamic state before the descriptors (valid); count and log.
+            const u64 seq = scheduler.RecordSeq();
+            scheduler.CommitDynamicState();
+            if (scheduler.RecordSeq() != seq) [[unlikely]] {
+                NoteDrawPacketFoldMiss("dynamic state");
+                RecordPacket(pipeline, DrawPacketHeader{});
+                packet = false;
+            }
+        }
+    }
     sample.EndPhase(Common::DrawSampleProbe::Phase::DynamicState);
     const auto t_schedbegin = Common::FaultMonitor::Now();
     sample.BeginPhase(Common::DrawSampleProbe::Phase::SchedulerBeginRendering);
-    scheduler.BeginRendering(state);
+    if (packet && !scheduler.RenderingMatches(state)) {
+        RecordPacket(pipeline, DrawPacketHeader{});
+        packet = false;
+    }
+    if (packet) {
+        const u64 seq = scheduler.RecordSeq();
+        scheduler.BeginRendering(state);
+        if (scheduler.RecordSeq() != seq) [[unlikely]] {
+            NoteDrawPacketFoldMiss("beginRendering");
+            RecordPacket(pipeline, DrawPacketHeader{});
+            packet = false;
+        }
+    } else {
+        scheduler.BeginRendering(state);
+    }
     sample.EndPhase(Common::DrawSampleProbe::Phase::SchedulerBeginRendering);
     const auto t_emit = Common::FaultMonitor::Now();
 
@@ -1736,18 +1824,30 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
             });
         }
     }
-    scheduler.Record([handle = pipeline->Handle(), is_indexed, count = regs.num_indices,
-                      instances = regs.num_instances.NumInstances(), vertex_offset,
-                      instance_offset](vk::CommandBuffer cmdbuf) {
-        if (!GraphicsBindTracker::Enabled() || GraphicsBindTracker::NeedBind(cmdbuf, handle)) {
-            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
-        }
-        if (is_indexed) {
-            cmdbuf.drawIndexed(count, instances, 0, s32(vertex_offset), instance_offset);
-        } else {
-            cmdbuf.draw(count, instances, vertex_offset, instance_offset);
-        }
-    });
+    if (packet) {
+        // Nothing was recorded since the descriptors: the draw rides in the packet.
+        DrawPacketHeader tail{};
+        tail.flags = DrawPacketDraw | (is_indexed ? DrawPacketIndexed : 0u);
+        tail.count = regs.num_indices;
+        tail.instances = regs.num_instances.NumInstances();
+        tail.vertex_offset = vertex_offset;
+        tail.instance_offset = instance_offset;
+        RecordPacket(pipeline, tail);
+    } else {
+        scheduler.Record([handle = pipeline->Handle(), is_indexed, count = regs.num_indices,
+                          instances = regs.num_instances.NumInstances(), vertex_offset,
+                          instance_offset](vk::CommandBuffer cmdbuf) {
+            if (!GraphicsBindTracker::Enabled() ||
+                GraphicsBindTracker::NeedBind(cmdbuf, handle)) {
+                cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+            }
+            if (is_indexed) {
+                cmdbuf.drawIndexed(count, instances, 0, s32(vertex_offset), instance_offset);
+            } else {
+                cmdbuf.draw(count, instances, vertex_offset, instance_offset);
+            }
+        });
+    }
     if (occlusion_slot != OcclusionQueries::NoSlot) [[unlikely]] {
         scheduler.Record(
             [query_pool = occlusion->Pool(), occlusion_slot](vk::CommandBuffer cmdbuf) {
@@ -1968,13 +2068,21 @@ void Rasterizer::DispatchDirectTail(const ComputePipeline* pipeline) {
     }
 
     scheduler.EndRendering();
-    EmitPipelineResources(pipeline);
-
-    scheduler.Record([handle = pipeline->Handle(), x = cs_program.dim_x, y = cs_program.dim_y,
-                      z = cs_program.dim_z](vk::CommandBuffer cmdbuf) {
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
-        cmdbuf.dispatch(x, y, z);
-    });
+    if (EmitPipelineResourcesOrPacket(pipeline, false)) {
+        // SHADPS4_DRAW_PACKET: nothing is recorded between the descriptors and the dispatch.
+        DrawPacketHeader tail{};
+        tail.flags = DrawPacketDispatch;
+        tail.dim_x = cs_program.dim_x;
+        tail.dim_y = cs_program.dim_y;
+        tail.dim_z = cs_program.dim_z;
+        RecordPacket(pipeline, tail);
+    } else {
+        scheduler.Record([handle = pipeline->Handle(), x = cs_program.dim_x, y = cs_program.dim_y,
+                          z = cs_program.dim_z](vk::CommandBuffer cmdbuf) {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+            cmdbuf.dispatch(x, y, z);
+        });
+    }
     DebugState.IncDispatch();
     scheduler.NoteDispatch();
 
@@ -3334,6 +3442,150 @@ void Rasterizer::EmitPipelineResources(const Pipeline* pipeline) {
         native_bindings->Verify(set_writes, indices);
     }
     pipeline->BindResourcesNative(*native_bindings, indices, buffer_barriers, push_data);
+}
+
+bool Rasterizer::EmitPipelineResourcesOrPacket(const Pipeline* pipeline, bool occlusion_draw) {
+    const int mode = g_draw_packet;
+    if (mode == 0) {
+        EmitPipelineResources(pipeline);
+        return false;
+    }
+    auto& st = g_dp_stats;
+    ++st.draws;
+    if ((st.draws & 0x3fff) == 0) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - st.last_log >= std::chrono::seconds(10)) {
+            st.last_log = now;
+            DrawPacketLog();
+        }
+    }
+    const std::span<const PacketBinding> table = pipeline->PacketBindings();
+    const size_t num_barriers = buffer_barriers.size();
+    const size_t num_writes = table.size();
+    const size_t num_buffer_infos = buffer_infos.size();
+    const size_t num_image_infos = image_infos.size();
+    // Sampled (1 draw in 64, scaled): the estimate walks the binding table (review 2026-10-02).
+    if ((st.draws & 63) == 0) {
+        st.legacy_bytes += 64 * DrawPacketLegacyBytes(num_barriers, table, true);
+    }
+
+    // Legacy for everything the packet does not model: the descriptor-heap and native paths,
+    // synchronous recording, a draw inside an occlusion query (three records around the draw),
+    // a layout whose table does not match what BindResources resolved, oversize payloads.
+    u64* fallback = nullptr;
+    if (native_bindings || !build_set_writes || !pipeline->UsesPushDescriptors() ||
+        !scheduler.IsAsyncRecording()) {
+        fallback = &st.fb_other;
+    } else if (occlusion_draw) {
+        fallback = &st.fb_occlusion;
+    } else if (num_writes > DrawPacketMaxWrites || num_writes != set_writes.size() ||
+               pipeline->PacketBufferInfos() != num_buffer_infos ||
+               pipeline->PacketImageInfos() != num_image_infos) {
+        fallback = &st.fb_other;
+    } else if (DrawPacketPayloadBytes(num_barriers, num_writes, num_buffer_infos,
+                                      num_image_infos) > DrawPacketMaxBytes) {
+        fallback = &st.fb_oversize;
+    }
+
+    if (!fallback && mode == 2) {
+        // Verify: rebuild the writes the worker would build and compare with the legacy ones.
+        ++st.verify_checked;
+        std::array<vk::WriteDescriptorSet, DrawPacketMaxWrites> derived;
+        const u32 count = BuildDrawPacketWrites(
+            table, std::span<const vk::DescriptorBufferInfo>{buffer_infos.data(), num_buffer_infos},
+            std::span<const vk::DescriptorImageInfo>{image_infos.data(), num_image_infos}, derived);
+        std::string why;
+        if (count != set_writes.size()) {
+            why = fmt::format("count {} vs {}", count, set_writes.size());
+        }
+        for (size_t i = 0; why.empty() && i < set_writes.size(); ++i) {
+            const auto& a = set_writes[i];
+            const auto& b = derived[i];
+            if (a.pNext != nullptr || a.dstSet != b.dstSet || a.dstBinding != b.dstBinding ||
+                a.dstArrayElement != b.dstArrayElement || a.descriptorCount != b.descriptorCount ||
+                a.descriptorType != b.descriptorType || a.pTexelBufferView != nullptr ||
+                (a.pBufferInfo == nullptr) != (b.pBufferInfo == nullptr) ||
+                (a.pImageInfo == nullptr) != (b.pImageInfo == nullptr)) {
+                why = fmt::format("write {}: binding {} vs {}, count {} vs {}, type {} vs {}", i,
+                                  a.dstBinding, b.dstBinding, a.descriptorCount,
+                                  b.descriptorCount, vk::to_string(a.descriptorType),
+                                  vk::to_string(b.descriptorType));
+                break;
+            }
+            for (u32 e = 0; why.empty() && e < a.descriptorCount; ++e) {
+                if (a.pBufferInfo) {
+                    const auto& x = a.pBufferInfo[e];
+                    const auto& y = b.pBufferInfo[e];
+                    if (x.buffer != y.buffer || x.offset != y.offset || x.range != y.range) {
+                        why = fmt::format("write {} buffer info {} differs", i, e);
+                    }
+                } else if (a.pImageInfo) {
+                    const auto& x = a.pImageInfo[e];
+                    const auto& y = b.pImageInfo[e];
+                    if (x.sampler != y.sampler || x.imageView != y.imageView ||
+                        x.imageLayout != y.imageLayout) {
+                        why = fmt::format("write {} image info {} differs", i, e);
+                    }
+                }
+            }
+        }
+        if (!why.empty()) {
+            if (++st.mismatches <= 16) {
+                LOG_CRITICAL(Render_Vulkan,
+                             "DrawPacket: MISMATCH {} (writes {}, buffer infos {}, image infos "
+                             "{}, compute {})",
+                             why, set_writes.size(), num_buffer_infos, num_image_infos,
+                             pipeline->IsCompute());
+            }
+        }
+        EmitPipelineResources(pipeline);
+        return false;
+    }
+    if (fallback) {
+        ++*fallback;
+        EmitPipelineResources(pipeline);
+        return false;
+    }
+
+    // Packet. The command-processor side of RecordBufferBarriers happens now (it ends the
+    // rendering scope before the barrier, as today); the barrier itself rides in the packet.
+    pipeline->BeginBufferBarriers(buffer_barriers);
+    ++st.packets;
+    st.packet_bytes +=
+        DrawPacketRecordBytes(num_barriers, num_writes, num_buffer_infos, num_image_infos);
+    return true;
+}
+
+void Rasterizer::RecordPacket(const Pipeline* pipeline, const DrawPacketHeader& tail) {
+    DrawPacketDesc desc{};
+    desc.header = tail;
+    const bool compute = pipeline->IsCompute();
+    desc.header.layout = pipeline->GetLayout();
+    desc.header.pipeline = pipeline->Handle();
+    desc.header.stage_flags =
+        compute ? vk::ShaderStageFlags{vk::ShaderStageFlagBits::eCompute} : AllGraphicsStageBits;
+    desc.header.bind_point =
+        compute ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;
+    desc.table = pipeline->PacketBindings();
+    desc.barriers = std::span<const vk::BufferMemoryBarrier2>{buffer_barriers.data(),
+                                                             buffer_barriers.size()};
+    desc.buffer_infos =
+        std::span<const vk::DescriptorBufferInfo>{buffer_infos.data(), buffer_infos.size()};
+    desc.image_infos =
+        std::span<const vk::DescriptorImageInfo>{image_infos.data(), image_infos.size()};
+    desc.header.num_barriers = static_cast<u32>(desc.barriers.size());
+    desc.header.num_writes = static_cast<u32>(desc.table.size());
+    desc.header.num_buffer_infos = static_cast<u32>(desc.buffer_infos.size());
+    desc.header.num_image_infos = static_cast<u32>(desc.image_infos.size());
+    desc.header.push_data = push_data;
+    if (desc.header.flags & (DrawPacketDraw | DrawPacketDispatch)) {
+        ++g_dp_stats.folded;
+    } else {
+        // The draw / dispatch record that follows separately, so the bytes compare with
+        // legacy_bytes (which always includes it).
+        g_dp_stats.packet_bytes += 32 + 40;
+    }
+    scheduler.RecordDrawPacket(desc);
 }
 
 bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
@@ -4966,7 +5218,8 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     buffer_cache.BumpStructGeneration();
 }
 
-void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
+void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed,
+                                    const bool commit) const {
     // SHADPS4_VIEWPORT_MEMO=1: viewports and scissors are a pure function of context registers
     // (and device limits), so skip recomputing them while no SET_CONTEXT_REG changed a byte.
     // =2 recomputes anyway and checks the tracked values did not change.
@@ -5027,7 +5280,9 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
     UpdateRasterizationState();
     UpdateColorBlendingState(pipeline);
 
-    scheduler.CommitDynamicState();
+    if (commit) {
+        scheduler.CommitDynamicState();
+    }
 }
 
 void Rasterizer::UpdateViewportScissorState() const {

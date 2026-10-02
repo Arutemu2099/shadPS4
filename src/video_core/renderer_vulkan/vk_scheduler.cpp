@@ -9,6 +9,7 @@
 #include "common/fault_monitor.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
+#include "video_core/renderer_vulkan/vk_draw_packet.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -230,22 +231,7 @@ void Scheduler::CommitDynamicState() {
     const auto old_dirty = state.dirty_state;
     // Keep the conditional dirtiness which Commit deliberately postpones until
     // its corresponding test is enabled. All values in the packet are owned.
-    decltype(state.dirty_state) kept{};
-    kept.depth_compare_op = old_dirty.depth_compare_op && !state.depth_test_enabled;
-    kept.depth_bounds = old_dirty.depth_bounds && !state.depth_bounds_test_enabled;
-    kept.depth_bias = old_dirty.depth_bias && !state.depth_bias_enabled;
-    if (!state.stencil_test_enabled) {
-        kept.stencil_front_ops = old_dirty.stencil_front_ops;
-        kept.stencil_back_ops = old_dirty.stencil_back_ops;
-        kept.stencil_front_reference = old_dirty.stencil_front_reference;
-        kept.stencil_back_reference = old_dirty.stencil_back_reference;
-        kept.stencil_front_write_mask = old_dirty.stencil_front_write_mask;
-        kept.stencil_back_write_mask = old_dirty.stencil_back_write_mask;
-        kept.stencil_front_compare_mask = old_dirty.stencil_front_compare_mask;
-        kept.stencil_back_compare_mask = old_dirty.stencil_back_compare_mask;
-    }
-    kept.feedback_loop_enabled =
-        old_dirty.feedback_loop_enabled && !instance.IsAttachmentFeedbackLoopLayoutSupported();
+    const DynamicDirtyBits kept = PostponedDynamicDirty();
     if (skip_empty > 0) {
         const bool empty = std::memcmp(&kept, &old_dirty, sizeof(kept)) == 0;
         if (skip_empty == 2) {
@@ -264,6 +250,103 @@ void Scheduler::CommitDynamicState() {
         snapshot.Commit(*instance, cmdbuf);
     });
     state.dirty_state = kept;
+}
+
+Scheduler::DynamicDirtyBits Scheduler::PostponedDynamicDirty() const {
+    const auto& state = dynamic_state;
+    const auto old_dirty = state.dirty_state;
+    DynamicDirtyBits kept{};
+    kept.depth_compare_op = old_dirty.depth_compare_op && !state.depth_test_enabled;
+    kept.depth_bounds = old_dirty.depth_bounds && !state.depth_bounds_test_enabled;
+    kept.depth_bias = old_dirty.depth_bias && !state.depth_bias_enabled;
+    if (!state.stencil_test_enabled) {
+        kept.stencil_front_ops = old_dirty.stencil_front_ops;
+        kept.stencil_back_ops = old_dirty.stencil_back_ops;
+        kept.stencil_front_reference = old_dirty.stencil_front_reference;
+        kept.stencil_back_reference = old_dirty.stencil_back_reference;
+        kept.stencil_front_write_mask = old_dirty.stencil_front_write_mask;
+        kept.stencil_back_write_mask = old_dirty.stencil_back_write_mask;
+        kept.stencil_front_compare_mask = old_dirty.stencil_front_compare_mask;
+        kept.stencil_back_compare_mask = old_dirty.stencil_back_compare_mask;
+    }
+    kept.feedback_loop_enabled =
+        old_dirty.feedback_loop_enabled && !instance.IsAttachmentFeedbackLoopLayoutSupported();
+    return kept;
+}
+
+bool Scheduler::CommitDynamicStateWouldRecord() const {
+    if (!IsAsyncRecording() || g_skip_empty_dynstate <= 0) {
+        return true;
+    }
+    // CommitDynamicState's own skip test, on the same inputs.
+    const DynamicDirtyBits kept = PostponedDynamicDirty();
+    return std::memcmp(&kept, &dynamic_state.dirty_state, sizeof(kept)) != 0;
+}
+
+void Scheduler::RecordDrawPacket(const DrawPacketDesc& desc) {
+    ASSERT_MSG(IsAsyncRecording(), "Draw packets need the recording worker");
+    ++stream_seq[active_stream];
+    if (desc.header.num_writes != 0) {
+        native_heaps_bound = false; // as PushDescriptors
+    }
+    const size_t bytes =
+        DrawPacketPayloadBytes(desc.barriers.size(), desc.table.size(),
+                               desc.buffer_infos.size(), desc.image_infos.size());
+    ASSERT_MSG(bytes <= DrawPacketMaxBytes, "Draw packet of {} bytes", bytes);
+    recording_worker->RecordWithPayload(bytes, [&](std::span<std::byte> storage) {
+        std::byte* cursor = storage.data();
+        auto* header = reinterpret_cast<DrawPacketHeader*>(cursor);
+        std::memcpy(header, &desc.header, sizeof(DrawPacketHeader));
+        cursor += DrawPacketAlign(sizeof(DrawPacketHeader));
+        // The same layout ViewDrawPacket reads back (an empty span advances nothing).
+        CopyPayload(cursor, desc.barriers);
+        CopyPayload(cursor, desc.table);
+        CopyPayload(cursor, desc.buffer_infos);
+        CopyPayload(cursor, desc.image_infos);
+        return [this, header] { ExecuteDrawPacket(*header); };
+    });
+}
+
+void Scheduler::ExecuteDrawPacket(const DrawPacketHeader& header) {
+    // Recording-worker thread. Order = the legacy records: barrier, push constants, push
+    // descriptors, then (when folded) bind + draw / dispatch.
+    CloseTransferGroup(current_cmdbuf);
+    const vk::CommandBuffer cmdbuf = current_cmdbuf;
+    const DrawPacketView view = ViewDrawPacket(header);
+    if (header.num_barriers != 0) {
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+            .bufferMemoryBarrierCount = header.num_barriers,
+            .pBufferMemoryBarriers = view.barriers.data(),
+        });
+    }
+    cmdbuf.pushConstants(header.layout, header.stage_flags, 0u, sizeof(header.push_data),
+                         &header.push_data);
+    if (header.num_writes != 0) {
+        std::array<vk::WriteDescriptorSet, DrawPacketMaxWrites> writes;
+        const u32 count =
+            BuildDrawPacketWrites(view.table, view.buffer_infos, view.image_infos, writes);
+        ASSERT_MSG(count == header.num_writes, "Draw packet rebuilt {} of {} writes", count,
+                   header.num_writes);
+        cmdbuf.pushDescriptorSetKHR(header.bind_point, header.layout, 0,
+                                    std::span<const vk::WriteDescriptorSet>{writes.data(), count});
+    }
+    if (header.flags & DrawPacketDraw) {
+        if (!GraphicsBindTracker::Enabled() ||
+            GraphicsBindTracker::NeedBind(cmdbuf, header.pipeline)) {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, header.pipeline);
+        }
+        if (header.flags & DrawPacketIndexed) {
+            cmdbuf.drawIndexed(header.count, header.instances, 0, s32(header.vertex_offset),
+                               header.instance_offset);
+        } else {
+            cmdbuf.draw(header.count, header.instances, header.vertex_offset,
+                        header.instance_offset);
+        }
+    } else if (header.flags & DrawPacketDispatch) {
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, header.pipeline);
+        cmdbuf.dispatch(header.dim_x, header.dim_y, header.dim_z);
+    }
 }
 
 void Scheduler::PushDescriptors(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,

@@ -6,6 +6,7 @@
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#include "video_core/renderer_vulkan/vk_draw_packet.h"
 #include "video_core/renderer_vulkan/vk_native_bindings_api.h"
 
 #include <array>
@@ -74,6 +75,26 @@ public:
     void BindResources(DescriptorWrites& set_writes, const BufferBarriers& buffer_barriers,
                        const Shader::PushData& push_data) const;
 
+    /// SHADPS4_DRAW_PACKET (vk_draw_packet.h): one entry per descriptor write of the legacy
+    /// layout, in unified binding order - the order BindResources fills set_writes. Built once
+    /// with the descriptor set layout; empty for native bindings. Immutable afterwards.
+    [[nodiscard]] std::span<const PacketBinding> PacketBindings() const noexcept {
+        return packet_bindings;
+    }
+    /// Buffer infos / image infos (images plus samplers) one draw of this layout resolves.
+    [[nodiscard]] u32 PacketBufferInfos() const noexcept {
+        return packet_buffer_infos;
+    }
+    [[nodiscard]] u32 PacketImageInfos() const noexcept {
+        return packet_image_infos;
+    }
+
+    /// The command-processor side of RecordBufferBarriers (batch-timer counters and the end of
+    /// the rendering scope) when the barriers themselves travel in a draw packet (the packet is
+    /// recorded before anything else, so the barrier still follows this endRendering directly).
+    /// No-op when empty.
+    void BeginBufferBarriers(const BufferBarriers& buffer_barriers) const;
+
     /// True when the pipeline was created with descriptor heap mappings and no legacy layout.
     bool UsesNativeBindings() const noexcept {
         return uses_native_bindings;
@@ -104,6 +125,9 @@ protected:
     /// Builds one heap mapping per legacy binding, grouped by the owning shader stage.
     void BuildNativeMappings(std::span<const vk::DescriptorSetLayoutBinding> bindings);
 
+    /// SHADPS4_DRAW_PACKET: the binding table of a legacy (push descriptor) layout.
+    void BuildPacketBindings(std::span<const vk::DescriptorSetLayoutBinding> bindings);
+
     /// Mapping info to chain into the given stage's create info, or null if it binds nothing.
     /// Pointers stay valid for the lifetime of the pipeline object.
     const NativeApi::ShaderDescriptorSetAndBindingMappingInfo* NativeMappingInfo(
@@ -128,6 +152,9 @@ protected:
         mutable NativeApi::ShaderDescriptorSetAndBindingMappingInfo info{};
     };
     std::vector<NativeStageMappings> native_stage_mappings;
+    std::vector<PacketBinding> packet_bindings;
+    u32 packet_buffer_infos{};
+    u32 packet_image_infos{};
 };
 
 } // namespace Vulkan

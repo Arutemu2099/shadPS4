@@ -38,6 +38,7 @@ class Scheduler;
 class RenderState;
 class GraphicsPipeline;
 struct TexMemoRecord;
+struct DrawPacketHeader;
 
 class Rasterizer {
 public:
@@ -189,7 +190,10 @@ private:
     void DepthStencilCopy(bool is_depth, bool is_stencil);
     void EliminateFastClear();
 
-    void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed) const;
+    /// `commit`: end with Scheduler::CommitDynamicState (false only while a draw packet is
+    /// pending; the caller commits after recording the packet if a commit would record).
+    void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed,
+                            bool commit = true) const;
     void UpdateViewportScissorState() const;
     mutable u64 viewport_epoch{0};
     mutable u64 viewport_memo_skips{0};
@@ -313,6 +317,17 @@ private:
 
     /// Emits the bindings assembled by BindResources through the pipeline's binding model.
     void EmitPipelineResources(const Pipeline* pipeline);
+
+    /// SHADPS4_DRAW_PACKET: EmitPipelineResources, or (true) the decision to send this draw's
+    /// resources as one packet instead. When true nothing was recorded here: the caller must
+    /// call RecordPacket before the next command it records for the draw, or fold the draw
+    /// into it. `occlusion_draw`: the draw will be wrapped in an occlusion query (legacy path).
+    /// Mode 0: exactly EmitPipelineResources. Mode 2: verify, then EmitPipelineResources.
+    bool EmitPipelineResourcesOrPacket(const Pipeline* pipeline, bool occlusion_draw);
+    /// Records the pending packet from the bindings BindResources left behind (buffer_barriers,
+    /// buffer_infos, image_infos, push_data). `tail` carries only the flags and draw / dispatch
+    /// arguments (none: the draw is recorded separately, as today).
+    void RecordPacket(const Pipeline* pipeline, const DrawPacketHeader& tail);
 
     void ResetBindings() {
         for (auto& image_id : bound_images) {
