@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <optional>
 #include <span>
 #include <vector>
 #include <boost/container/static_vector.hpp>
@@ -147,6 +148,9 @@ struct Info : InfoPersistent {
     bool stores_tess_level_outer{};
     bool stores_tess_level_inner{};
     bool translation_failed{};
+    // Set before translating a later permutation: forces uses_dma to the program's value so the
+    // permutation's bindings match the shared Info the pipeline layout is built from.
+    std::optional<bool> pinned_uses_dma{};
 
     std::array<Interpolation, IR::NumParams> fs_interpolation{};
 

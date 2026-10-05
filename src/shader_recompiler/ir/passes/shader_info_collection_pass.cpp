@@ -162,7 +162,10 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
         }
     }
 
-    if (!EmulatorSettings.IsDirectMemoryAccessEnabled()) {
+    // A later permutation is pinned to its program's DMA state: every permutation shares the
+    // first one's Info for the pipeline layout, and the DMA buffers shift every image binding.
+    if (!EmulatorSettings.IsDirectMemoryAccessEnabled() ||
+        (info.pinned_uses_dma && !*info.pinned_uses_dma)) {
         info.uses_dma = false;
         info.readconst_types = Info::ReadConstType::None;
     }

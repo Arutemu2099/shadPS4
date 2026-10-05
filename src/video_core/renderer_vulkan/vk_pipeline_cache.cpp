@@ -1479,7 +1479,28 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
     if (compiled) {
         const auto t_translate = CompileClock::now();
         auto new_info = Shader::Info(stage, l_stage, params);
+        // The pipeline layout and descriptor binding of every permutation come from the
+        // program's shared Info (returned below), so the new module must have the same
+        // bindings. The DMA buffers (bda_pagetable, fault_buffer) sit between the guest buffers
+        // and the images: a program preloaded from an older cache generation without DMA plus
+        // a fresh DMA permutation shifted every image binding by 2 (city lighting void,
+        // 2026-10-04).
+        new_info.pinned_uses_dma = info.uses_dma;
+        const auto bind_start = binding;
         module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
+        if (!SameBindingLayout(new_info, info)) {
+            LOG_ERROR(Render_Vulkan,
+                      "Permutation {} of {}_{:#x} has a different binding layout than its "
+                      "program (buffers {} vs {}, images {} vs {}, samplers {} vs {}, dma {} vs "
+                      "{}); its bindings will not match the pipeline layout",
+                      perm_idx, stage, params.hash, new_info.buffers.size(), info.buffers.size(),
+                      new_info.images.size(), info.images.size(), new_info.samplers.size(),
+                      info.samplers.size(), new_info.uses_dma, info.uses_dma);
+        }
+        // Advance the caller's binding counters by the shared Info, which is what the
+        // pipeline layout and the descriptor writes use.
+        binding = bind_start;
+        info.AddBindings(binding);
 
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
         program->AddPermut(module, std::move(spec));

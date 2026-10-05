@@ -92,6 +92,25 @@ void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx)
                                        std::move(spv));
 }
 
+bool SameBindingLayout(const Shader::Info& a, const Shader::Info& b) {
+    if (a.uses_dma != b.uses_dma || a.buffers.size() != b.buffers.size() ||
+        a.images.size() != b.images.size() || a.samplers.size() != b.samplers.size() ||
+        a.fmasks.size() != b.fmasks.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.buffers.size(); ++i) {
+        if (a.buffers[i].buffer_type != b.buffers[i].buffer_type) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < a.images.size(); ++i) {
+        if (a.images[i].is_written != b.images[i].is_written) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
                     std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
                     Shader::StageSpecialization& spec, size_t& perm_idx) {
@@ -309,6 +328,16 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
             }
             module = it->module;
         } else {
+            // Every permutation is bound through the program's first Info. A cached permutation
+            // from another cache generation can have other bindings (DMA buffers shift every
+            // image), so it is left to compile at runtime, where it is pinned to that Info.
+            if (!SameBindingLayout(program->info, it_pgm.value()->info)) {
+                LOG_WARNING(Render_Vulkan,
+                            "Cached permutation {} of {}_{:x} has a different binding layout "
+                            "than its program, skipping preload",
+                            perm_idx, program->info.stage, program->info.pgm_hash);
+                return false;
+            }
             module = CompileSPV(spv, instance.GetDevice());
         }
     }

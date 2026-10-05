@@ -17,5 +17,8 @@ void RegisterShaderMeta(const Shader::Info& info,
                         const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
                         const Shader::StageSpecialization& spec, size_t perm_hash, size_t perm_idx);
 void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx);
+// True when two translations of one program give the same descriptor bindings (buffer kinds and
+// order, images, samplers, fmasks). Permutations share one Info, so they must agree on these.
+bool SameBindingLayout(const Shader::Info& a, const Shader::Info& b);
 
 } // namespace Vulkan

@@ -58,7 +58,9 @@ Id EmitGetUserData(EmitContext& ctx, IR::ScalarReg reg) {
 
 Id EmitReadConst(EmitContext& ctx, IR::Inst* inst, Id addr, Id offset) {
     const u32 flatbuf_off_dw = inst->Flags<u32>();
-    if (!EmulatorSettings.IsDirectMemoryAccessEnabled()) {
+    // info.uses_dma is false whenever the setting is off, and also for a permutation pinned to
+    // a program without DMA (read_const is only defined when uses_dma is set).
+    if (!ctx.info.uses_dma) {
         return ctx.EmitFlatbufferLoad(ctx.ConstU32(flatbuf_off_dw));
     }
     // We can only provide a fallback for immediate offsets.
