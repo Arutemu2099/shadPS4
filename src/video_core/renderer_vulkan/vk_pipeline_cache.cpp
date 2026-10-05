@@ -259,6 +259,26 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
         info.cs_info.tgid_enable = {cs_pgm.IsTgidEnabled(0), cs_pgm.IsTgidEnabled(1),
                                     cs_pgm.IsTgidEnabled(2)};
         info.cs_info.shared_memory_size = cs_pgm.SharedMemSize();
+        // SHADPS4_CS_FLOAT_MODE_LOG=1 (diagnostic, default off): the FLOAT_MODE bits (12-19) of
+        // COMPUTE_PGM_RSRC1, once per program address and mode. Compute shaders are translated
+        // with mode 0 whatever the guest sets (upstream #5126 changes that).
+        static const bool log_cs_float_mode = std::getenv("SHADPS4_CS_FLOAT_MODE_LOG") != nullptr;
+        if (log_cs_float_mode) {
+            u64 raw{};
+            std::memcpy(&raw, &cs_pgm.settings, sizeof(raw));
+            const u32 mode = u32(raw >> 12) & 0xff;
+            static std::mutex seen_mutex;
+            static std::unordered_set<u64> seen;
+            std::scoped_lock lk{seen_mutex};
+            const u64 pgm = u64(cs_pgm.address) << 8;
+            if (seen.insert((pgm << 8) | mode).second) {
+                LOG_INFO(Render_Vulkan,
+                         "CsFloatMode: pgm={:#x} mode={:#04x} round32={} round64={} denorm32={} "
+                         "denorm64={} uniques={}",
+                         pgm, mode, mode & 3, (mode >> 2) & 3, (mode >> 4) & 3, (mode >> 6) & 3,
+                         seen.size());
+            }
+        }
         break;
     }
     default:
