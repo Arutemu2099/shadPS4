@@ -3555,13 +3555,20 @@ void BufferCache::BindVertexBuffersDerived(
         u64 offset;
     };
     std::array<Mapped, MaxVertexInputs> mapped;
+    const u64 pb_t0 = g_pb_census != 0 && t_pb_sampled ? __rdtsc() : 0;
     for (u32 i = 0; i < vi.range_count; ++i) {
         const auto& range = vi_ranges[i];
         const u64 size =
             memory->ClampRangeSize(range.base_address, range.end_address - range.base_address);
         const auto [buffer, offset] = ObtainBuffer(range.base_address, size, false);
         mapped[i] = {buffer->buffer, offset};
+        if (g_pb_census != 0) [[unlikely]] {
+            t_pb_vi.bufs[i] = std::bit_cast<u64>(static_cast<VkBuffer>(mapped[i].vk_buffer));
+        }
         if (IsRegionGpuModified(range.base_address, size)) {
+            if (g_pb_census != 0) [[unlikely]] {
+                ++t_pb_vi.gpu_mod;
+            }
             if (auto barrier =
                     buffer->GetBarrier(vk::AccessFlagBits2::eVertexAttributeRead,
                                        vk::PipelineStageFlagBits2::eVertexAttributeInput)) {
@@ -3570,6 +3577,12 @@ void BufferCache::BindVertexBuffersDerived(
         }
     }
 
+    if (g_pb_census != 0) [[unlikely]] {
+        t_pb_vi.nranges = vi.range_count;
+        if (pb_t0 != 0) {
+            t_pb_vi.obtain_cyc += __rdtsc() - pb_t0;
+        }
+    }
     // Bind vertex buffers. With dynamic vertex input the sizes and strides are not used
     // (bindVertexBuffers), so they are not cloned into the recorder.
     Vulkan::VertexInputs<vk::Buffer> host_buffers;
@@ -3619,7 +3632,15 @@ void BufferCache::BindIndexBuffer(
 
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
+    const u64 pb_t0 = g_pb_census != 0 && t_pb_sampled ? __rdtsc() : 0;
     const auto [vk_buffer, offset] = ObtainBuffer(index_address, index_buffer_size, false);
+    if (g_pb_census != 0) [[unlikely]] {
+        t_pb_vi.ib_buf = std::bit_cast<u64>(static_cast<VkBuffer>(vk_buffer->Handle()));
+        t_pb_vi.ib_type = is_index16 ? 1u : 2u;
+        if (pb_t0 != 0) {
+            t_pb_vi.obtain_cyc += __rdtsc() - pb_t0;
+        }
+    }
     if (IsRegionGpuModified(index_address, index_buffer_size)) {
         if (auto barrier = vk_buffer->GetBarrier(vk::AccessFlagBits2::eIndexRead,
                                                  vk::PipelineStageFlagBits2::eIndexInput)) {

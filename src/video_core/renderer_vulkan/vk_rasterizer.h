@@ -391,6 +391,7 @@ private:
     /// SHADPS4_PB_CENSUS (diagnostic): the parallel-back census, see PbCensusEnd.
     void PbCensusBegin();
     void PbCensusPoint(u32 point);
+    void PbCensusDispatch(const ComputePipeline* pipeline, u32 point);
     void PbCensusEnd(const GraphicsPipeline* pipeline, bool rs_hit, bool repeat_skip,
                      const AmdGpu::CpSplit::VertexInputsPayload* front_vi, bool is_indexed,
                      u32 index_offset);

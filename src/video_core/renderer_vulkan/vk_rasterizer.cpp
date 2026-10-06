@@ -2199,9 +2199,16 @@ void Rasterizer::DispatchDirectTail(const ComputePipeline* pipeline) {
     if (ExecuteShaderHLE(cs, liverpool->BackRegs(), cs_program, *this)) {
         return;
     }
+    const bool pb_census = VideoCore::g_pb_census != 0;
+    if (pb_census) [[unlikely]] {
+        PbCensusDispatch(pipeline, 0);
+    }
 
     if (!BindResources(pipeline)) {
         return;
+    }
+    if (pb_census) [[unlikely]] {
+        PbCensusDispatch(pipeline, 1);
     }
 
     scheduler.EndRendering();
@@ -2229,6 +2236,9 @@ void Rasterizer::DispatchDirectTail(const ComputePipeline* pipeline) {
         scheduler.Flush();
     }
     MaybeFlushEveryOps(scheduler);
+    if (pb_census) [[unlikely]] {
+        PbCensusDispatch(pipeline, 2);
+    }
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
@@ -2625,13 +2635,15 @@ enum PbClass : u32 {
     PbTexMiss,
     PbGen,
     PbUpload,
+    PbWritten,
     PbReadMiss,
     PbPureRec,
     PbPure,
     PbClasses
 };
 constexpr std::array<const char*, PbClasses> kPbClassNames{
-    "repeat", "static", "rs_miss", "tex_miss", "gen", "upload", "rmemo_miss", "pure_rec", "pure"};
+    "repeat", "static",     "rs_miss",  "tex_miss", "gen",
+    "upload", "written",    "rmemo_miss", "pure_rec", "pure"};
 constexpr u32 kPbPhases = 5; // rs, bind, begin, vi, rest
 
 struct PbCensus {
@@ -2661,6 +2673,18 @@ struct PbCensus {
     std::array<std::array<u64, kPbLeadCount>, kPbComps> only{}; // resolvable, the only bad one
     // Commit side, [repeat, other]: draws, vi_same, begin_rec0, vi_rec0, rest_rec1, draw_only.
     std::array<std::array<u64, 6>, 2> vi{};
+    // v3, [repeat, other]: draws, indexed, ib_same, vb_same, all_same, gpu-modified vertex range.
+    std::array<std::array<u64, 6>, 2> vk{};
+    std::array<u64, PbClasses> obt{}; // sampled vertex / index lookup cycles per class
+    std::array<u64, 32> vk_prev{};
+    u32 vk_prev_n{};
+    u64 ib_prev_buf{};
+    u32 ib_prev_type{};
+    // Dispatches: count, sampled, bind cyc, total cyc, sampled written, bind cyc without written.
+    std::array<u64, 6> disp{};
+    u64 nd{};
+    bool d_sampled{};
+    u64 d_t0{}, d_t1{};
     std::array<std::array<u64, kPbPhases>, PbClasses> cyc{};
     std::array<u64, PbClasses> smp{};
     u64 self_cyc{}, self_n{};
@@ -2705,6 +2729,11 @@ void PbCensusMaybeLog(PbCensus& pb) {
         pb.n, wall_ns / 1e6, idle_ms, ns_per_tick,
         Common::FaultMonitor::presented_frames.load(std::memory_order_relaxed), PbJoin(pb.cls),
         pb.self_cyc, pb.self_n, PbJoin(pb.pure_attr), PbJoin(pb.vi[0]), PbJoin(pb.vi[1]));
+    line += fmt::format(" v3=1 vk_repeat={} vk_other={} disp={}", PbJoin(pb.vk[0]),
+                        PbJoin(pb.vk[1]), PbJoin(pb.disp));
+    for (u32 k = 0; k < PbClasses; ++k) {
+        line += fmt::format(" obt_{}={}", kPbClassNames[k], pb.obt[k]);
+    }
     for (u32 k = 0; k < PbClasses; ++k) {
         line += fmt::format(" acc_{}={} accnm_{}={}", kPbClassNames[k], PbJoin(pb.acc[k]),
                             kPbClassNames[k], PbJoin(pb.acc_nm[k]));
@@ -2732,6 +2761,11 @@ void PbCensusMaybeLog(PbCensus& pb) {
     const auto vi_prev = pb.vi_prev;
     const u32 vi_prev_bytes = pb.vi_prev_bytes;
     const auto ib_prev = pb.ib_prev;
+    const auto vk_prev = pb.vk_prev;
+    const u32 vk_prev_n = pb.vk_prev_n;
+    const u64 ib_prev_buf = pb.ib_prev_buf;
+    const u32 ib_prev_type = pb.ib_prev_type;
+    const u64 nd = pb.nd;
     pb = PbCensus{};
     pb.n = n;
     pb.prev = prev;
@@ -2740,6 +2774,11 @@ void PbCensusMaybeLog(PbCensus& pb) {
     pb.vi_prev = vi_prev;
     pb.vi_prev_bytes = vi_prev_bytes;
     pb.ib_prev = ib_prev;
+    pb.vk_prev = vk_prev;
+    pb.vk_prev_n = vk_prev_n;
+    pb.ib_prev_buf = ib_prev_buf;
+    pb.ib_prev_type = ib_prev_type;
+    pb.nd = nd;
     pb.w_start_ns = now_ns;
     pb.w_start_tsc = now_tsc;
     pb.w_start_idle = idle;
@@ -2779,11 +2818,54 @@ void Rasterizer::PbCensusBegin() {
     pb.bg0 = s[2];
     pb.tg0 = s[3];
     pb.rm0 = buffer_cache.ReadMemoMissesTotal();
+    VideoCore::t_pb_vi = {};
+    VideoCore::t_pb_sampled = pb.sampled;
     if (pb.sampled) {
         const u64 c1 = __rdtsc();
         pb.self = c1 - c0;
         pb.tsc[0] = c1;
     }
+}
+
+void Rasterizer::PbCensusDispatch(const ComputePipeline* pipeline, u32 point) {
+    auto& pb = g_pb;
+    if (point == 0) {
+        ++pb.disp[0];
+        pb.d_sampled = (++pb.nd & 63) == 0;
+        if (pb.d_sampled) {
+            pb.d_t0 = __rdtsc();
+        }
+        return;
+    }
+    if (!pb.d_sampled) {
+        return;
+    }
+    if (point == 1) {
+        pb.d_t1 = __rdtsc();
+        return;
+    }
+    const u64 t2 = __rdtsc();
+    bool written = false;
+    for (const auto& bound : BoundStages(pipeline)) {
+        const auto* stage = bound.info;
+        if (!stage) {
+            continue;
+        }
+        for (const auto& desc : stage->buffers) {
+            written |= desc.is_written;
+        }
+        for (const auto& desc : stage->images) {
+            written |= desc.is_written;
+        }
+    }
+    ++pb.disp[1];
+    pb.disp[2] += pb.d_t1 - pb.d_t0;
+    pb.disp[3] += t2 - pb.d_t0;
+    pb.disp[4] += written;
+    if (!written) {
+        pb.disp[5] += pb.d_t1 - pb.d_t0;
+    }
+    pb.d_sampled = false;
 }
 
 void Rasterizer::PbCensusPoint(u32 point) {
@@ -2862,6 +2944,8 @@ void Rasterizer::PbCensusEnd(const GraphicsPipeline* pipeline, bool rs_hit, bool
         cls = PbGen;
     } else if (pb.up2 != pb.up0 || pb.up4 != pb.up3) {
         cls = PbUpload;
+    } else if ((sbits & (2 | 32)) != 0) {
+        cls = PbWritten;
     } else if (pb.rm2 != pb.rm0) {
         cls = PbReadMiss;
     } else if (pb.seq2 != pb.seq0) {
@@ -2872,6 +2956,29 @@ void Rasterizer::PbCensusEnd(const GraphicsPipeline* pipeline, bool rs_hit, bool
     const bool pure = cls == PbPure || cls == PbPureRec;
     const bool resolvable = pure || cls == PbReadMiss;
     ++pb.cls[cls];
+    {
+        // v3: the Vulkan buffers the vertex / index binding resolved, against the previous draw.
+        const auto& v = VideoCore::t_pb_vi;
+        const bool vb_same = v.nranges == pb.vk_prev_n &&
+                             std::equal(v.bufs.begin(), v.bufs.begin() + v.nranges,
+                                        pb.vk_prev.begin());
+        const bool ib_same = is_indexed && v.ib_buf == pb.ib_prev_buf &&
+                             v.ib_type == pb.ib_prev_type;
+        auto& k = pb.vk[repeat_skip ? 0 : 1];
+        ++k[0];
+        k[1] += is_indexed;
+        k[2] += ib_same;
+        k[3] += vb_same;
+        k[4] += vb_same && (ib_same || !is_indexed);
+        k[5] += v.gpu_mod != 0;
+        pb.vk_prev = v.bufs;
+        pb.vk_prev_n = v.nranges;
+        pb.ib_prev_buf = is_indexed ? v.ib_buf : 0;
+        pb.ib_prev_type = is_indexed ? v.ib_type : 0;
+        if (pb.sampled) {
+            pb.obt[cls] += v.obtain_cyc;
+        }
+    }
     {
         // Commit side: vertex inputs equal to the previous draw's, records per window.
         bool vi_same = false;
@@ -2932,15 +3039,17 @@ void Rasterizer::PbCensusEnd(const GraphicsPipeline* pipeline, bool rs_hit, bool
             bad[c] = pb.last_change[c] > base;
         }
         bad[kPbMemo] = memo_w >= base;
-        u32 nbad = 0;
+        // v3: `only` over the design stamps; the memo stamp is a retry counter, not validity.
+        u32 nbad_d = 0;
         u32 which = 0;
-        for (u32 c = 0; c < kPbComps; ++c) {
-            if ((c < kPbDesign || c == kPbMemo) && bad[c]) {
-                ++nbad;
+        for (u32 c = 0; c < kPbDesign; ++c) {
+            if (bad[c]) {
+                ++nbad_d;
                 which = c;
             }
         }
-        const bool design_ok = nbad == 0 || (nbad == 1 && which == kPbMemo);
+        const bool design_ok = nbad_d == 0;
+        const u32 nbad = nbad_d + (bad[kPbMemo] ? 1u : 0u);
         for (u32 k = 0; k < (resolvable ? 2u : 1u); ++k) {
             for (u32 c = 0; c < kPbComps; ++c) {
                 pb.inv[k][c][li] += bad[c];
@@ -2948,7 +3057,7 @@ void Rasterizer::PbCensusEnd(const GraphicsPipeline* pipeline, bool rs_hit, bool
         }
         pb.acc[cls][li] += nbad == 0;
         pb.acc_nm[cls][li] += design_ok;
-        if (resolvable && nbad == 1) {
+        if (resolvable && nbad_d == 1) {
             ++pb.only[which][li];
         }
     }
