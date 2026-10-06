@@ -221,6 +221,10 @@ public:
     /// SHADPS4_TEX_LOCKFREE_HIT is on (Refused while a foreign CacheLock holder is active; the
     /// caller then runs the full path), otherwise the cache mutex. Nothing inside the section may
     /// take the cache lock.
+    /// SHADPS4_TEX_MEMO_LOCAL_GEN: the slot still holds an image (not erased). Inside a memo section.
+    [[nodiscard]] bool ImageAllocated(ImageId id) const {
+        return slot_images.is_allocated(id);
+    }
     enum class MemoSection : u8 { Refused, LockFree, Locked };
     [[nodiscard]] MemoSection EnterMemoSection();
     void LeaveMemoSection(MemoSection section);

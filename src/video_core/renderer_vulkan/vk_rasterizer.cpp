@@ -4163,6 +4163,11 @@ void Rasterizer::BindTexturesMemo(const Pipeline* pipeline, const Shader::BoundS
                     if (!img.id) {
                         continue;
                     }
+                    if (local && !texture_cache.ImageAllocated(img.id)) {
+                        // Without the generation test an erased slot is reachable here.
+                        miss = TmUid;
+                        break;
+                    }
                     const auto& image = texture_cache.PeekImage(img.id);
                     if (image.image_uid != img.uid) {
                         miss = TmUid;
@@ -4452,7 +4457,7 @@ void Rasterizer::RecordTexMemo(TexMemoRecord& rec, const Shader::Info& stage, u6
     rec.border = border;
     rec.tex_gen = tex_gen;
     rec.smp_gen = smp_gen;
-    rec.local_ok = texture_cache.StructGeneration() == tex_gen;
+    rec.local_ok = true; // decided inside a memo section after the image loop
     const size_t num_images = image_bindings.size();
     const size_t num_samplers = stage.samplers.size();
     // Stage-wide exclusions: native bindings, stencil redirects and scratch (Pro paths), images
@@ -4488,8 +4493,6 @@ void Rasterizer::RecordTexMemo(TexMemoRecord& rec, const Shader::Info& stage, u6
         }
         auto& image = texture_cache.PeekImage(image_id);
         img.uid = image.image_uid;
-        img.overlap_epoch = std::atomic_ref<u64>{const_cast<u64&>(image.overlap_epoch)}.load(
-            std::memory_order_relaxed);
         img.backing = image.backing;
         img.state = image.backing->state;
         img.full_range = img.range.base == VideoCore::SubresourceBase{} &&
@@ -4504,6 +4507,28 @@ void Rasterizer::RecordTexMemo(TexMemoRecord& rec, const Shader::Info& stage, u6
                         (image.info.num_samples == 2 &&
                          image.info.pixel_format == vk::Format::eR32Uint) ||
                         !texture_cache.IsPerfectMatch(desc.info, image_id);
+    }
+    if (g_tex_memo_local && !rec.excluded && rec.local_ok) {
+        // The generation test and the epoch reads together, inside one memo section: a foreign
+        // RegisterImage bumps the epochs before the generation, so separate reads outside a
+        // section could pair an old generation with a new epoch (Opus review 2026-10-05).
+        const auto section = texture_cache.EnterMemoSection();
+        if (section == VideoCore::TextureCache::MemoSection::Refused) {
+            rec.local_ok = false;
+        } else {
+            rec.local_ok = texture_cache.StructGeneration() == tex_gen;
+            for (auto& img : rec.imgs) {
+                if (img.id) {
+                    img.overlap_epoch =
+                        std::atomic_ref<u64>{
+                            const_cast<u64&>(texture_cache.PeekImage(img.id).overlap_epoch)}
+                            .load(std::memory_order_relaxed);
+                }
+            }
+            texture_cache.LeaveMemoSection(section);
+        }
+    } else {
+        rec.local_ok = false;
     }
     rec.samplers.resize(num_samplers);
     rec.sampler_lru.resize(num_samplers);
