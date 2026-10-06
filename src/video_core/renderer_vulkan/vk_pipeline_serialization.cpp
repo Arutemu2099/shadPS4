@@ -13,7 +13,7 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 3u;
+static constexpr u32 ShaderBinaryVersion = 4u; // GDS append index computed at run time (d6857fbc)
 static constexpr u32 ShaderMetaVersion = 4u; // ImageSpecialization gained is_block_1d
 static constexpr u32 PipelineKeyVersion = 4u; // SerializationSupport gained image_binding_counts
 } // namespace Serialization
