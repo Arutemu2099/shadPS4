@@ -2046,7 +2046,8 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     }
     MaybeFlushEveryOps(scheduler);
     if (pb_census) [[unlikely]] {
-        PbCensusEnd(pipeline, rs_hit, repeat && repeat_mode == 1);
+        PbCensusEnd(pipeline, rs_hit, repeat && repeat_mode == 1, front_vi, is_indexed,
+                    index_offset);
     }
 
     Common::FaultMonitor::CountDrawTail(Common::FaultMonitor::DiffNs(t_entry, t_pipeline) +
@@ -2641,7 +2642,10 @@ struct PbCensus {
     u64 rs_w{};
     std::array<u64, 5> tsc{};
     u64 self{};
-    u64 seq0{}, seq2{};
+    u64 seq0{}, seq2{}, seq3{}, seq4{};
+    std::array<u8, 16 + 32 * 32 + 32 * 16> vi_prev{};
+    u32 vi_prev_bytes{};
+    std::array<u64, 4> ib_prev{};
     u64 up0{}, up2{}, up3{}, up4{};
     u64 bg0{}, bg2{}, bg3{}, bg4{};
     u64 tg0{}, tg2{}, tg3{}, tg4{};
@@ -2650,10 +2654,13 @@ struct PbCensus {
     // Window.
     u64 w_start_ns{}, w_start_tsc{}, w_start_idle{};
     std::array<u64, PbClasses> cls{};
-    std::array<std::array<u64, kPbLeadCount>, 2> acc{};    // [all draws, pure draws]
-    std::array<std::array<u64, kPbLeadCount>, 2> acc_nm{}; // design set without the memo stamp
+    std::array<std::array<u64, kPbLeadCount>, PbClasses> acc{};    // per class, with the memo stamp
+    std::array<std::array<u64, kPbLeadCount>, PbClasses> acc_nm{}; // per class, design set only
+    // [all draws, resolvable draws (pure, pure_rec, rmemo_miss)]
     std::array<std::array<std::array<u64, kPbLeadCount>, kPbComps>, 2> inv{};
-    std::array<std::array<u64, kPbLeadCount>, kPbComps> only{}; // pure draws, the only bad one
+    std::array<std::array<u64, kPbLeadCount>, kPbComps> only{}; // resolvable, the only bad one
+    // Commit side, [repeat, other]: draws, vi_same, begin_rec0, vi_rec0, rest_rec1, draw_only.
+    std::array<std::array<u64, 6>, 2> vi{};
     std::array<std::array<u64, kPbPhases>, PbClasses> cyc{};
     std::array<u64, PbClasses> smp{};
     u64 self_cyc{}, self_n{};
@@ -2693,14 +2700,17 @@ void PbCensusMaybeLog(PbCensus& pb) {
     const double ns_per_tick = wall_ns / static_cast<double>(std::max<u64>(1, now_tsc - pb.w_start_tsc));
     const double idle_ms = static_cast<double>(idle - pb.w_start_idle) * ns_per_tick / 1e6;
     std::string line = fmt::format(
-        "PbCensus: n={} wall_ms={:.1f} idle_ms={:.1f} ns_per_tick={:.5f} frames={} cls={} "
-        "acc_all={} acc_pure={} accnm_all={} accnm_pure={} self_cyc={} self_n={} pure_attr={}",
+        "PbCensus: v=2 n={} wall_ms={:.1f} idle_ms={:.1f} ns_per_tick={:.5f} frames={} cls={} "
+        "self_cyc={} self_n={} pure_attr={} vi_repeat={} vi_other={}",
         pb.n, wall_ns / 1e6, idle_ms, ns_per_tick,
         Common::FaultMonitor::presented_frames.load(std::memory_order_relaxed), PbJoin(pb.cls),
-        PbJoin(pb.acc[0]), PbJoin(pb.acc[1]), PbJoin(pb.acc_nm[0]), PbJoin(pb.acc_nm[1]),
-        pb.self_cyc, pb.self_n, PbJoin(pb.pure_attr));
+        pb.self_cyc, pb.self_n, PbJoin(pb.pure_attr), PbJoin(pb.vi[0]), PbJoin(pb.vi[1]));
+    for (u32 k = 0; k < PbClasses; ++k) {
+        line += fmt::format(" acc_{}={} accnm_{}={}", kPbClassNames[k], PbJoin(pb.acc[k]),
+                            kPbClassNames[k], PbJoin(pb.acc_nm[k]));
+    }
     for (u32 c = 0; c < kPbComps; ++c) {
-        line += fmt::format(" inv_all_{}={} inv_pure_{}={} only_pure_{}={}", kPbCompNames[c],
+        line += fmt::format(" inv_all_{}={} inv_res_{}={} only_res_{}={}", kPbCompNames[c],
                             PbJoin(pb.inv[0][c]), kPbCompNames[c], PbJoin(pb.inv[1][c]),
                             kPbCompNames[c], PbJoin(pb.only[c]));
     }
@@ -2719,11 +2729,17 @@ void PbCensusMaybeLog(PbCensus& pb) {
     const auto prev = pb.prev;
     const auto last_change = pb.last_change;
     const auto* prev_pipeline = pb.prev_pipeline;
+    const auto vi_prev = pb.vi_prev;
+    const u32 vi_prev_bytes = pb.vi_prev_bytes;
+    const auto ib_prev = pb.ib_prev;
     pb = PbCensus{};
     pb.n = n;
     pb.prev = prev;
     pb.last_change = last_change;
     pb.prev_pipeline = prev_pipeline;
+    pb.vi_prev = vi_prev;
+    pb.vi_prev_bytes = vi_prev_bytes;
+    pb.ib_prev = ib_prev;
     pb.w_start_ns = now_ns;
     pb.w_start_tsc = now_tsc;
     pb.w_start_idle = idle;
@@ -2781,11 +2797,13 @@ void Rasterizer::PbCensusPoint(u32 point) {
         pb.rm2 = buffer_cache.ReadMemoMissesTotal();
         break;
     case 3:
+        pb.seq3 = scheduler.RecordSeq();
         pb.up3 = buffer_cache.SyncUploadBytesTotal();
         pb.bg3 = buffer_cache.StructGeneration();
         pb.tg3 = texture_cache.StructGeneration();
         break;
     case 4:
+        pb.seq4 = scheduler.RecordSeq();
         pb.up4 = buffer_cache.SyncUploadBytesTotal();
         pb.bg4 = buffer_cache.StructGeneration();
         pb.tg4 = texture_cache.StructGeneration();
@@ -2798,9 +2816,12 @@ void Rasterizer::PbCensusPoint(u32 point) {
     }
 }
 
-void Rasterizer::PbCensusEnd(const GraphicsPipeline* pipeline, bool rs_hit, bool repeat_skip) {
+void Rasterizer::PbCensusEnd(const GraphicsPipeline* pipeline, bool rs_hit, bool repeat_skip,
+                             const AmdGpu::CpSplit::VertexInputsPayload* front_vi,
+                             bool is_indexed, u32 index_offset) {
     auto& pb = g_pb;
     const u64 t_end = pb.sampled ? __rdtsc() : 0;
+    const u64 seq_end = scheduler.RecordSeq();
     const u64 n = pb.n;
     if (pipeline->pb_static == 0xff) {
         u8 bits = 0;
@@ -2849,7 +2870,43 @@ void Rasterizer::PbCensusEnd(const GraphicsPipeline* pipeline, bool rs_hit, bool
         cls = PbPure;
     }
     const bool pure = cls == PbPure || cls == PbPureRec;
+    const bool resolvable = pure || cls == PbReadMiss;
     ++pb.cls[cls];
+    {
+        // Commit side: vertex inputs equal to the previous draw's, records per window.
+        bool vi_same = false;
+        if (front_vi) {
+            const u32 bytes = AmdGpu::CpSplit::VertexInputsBytes(front_vi->count,
+                                                                 front_vi->range_count);
+            if (bytes <= pb.vi_prev.size()) {
+                vi_same = bytes == pb.vi_prev_bytes &&
+                          std::memcmp(pb.vi_prev.data(), front_vi, bytes) == 0;
+                std::memcpy(pb.vi_prev.data(), front_vi, bytes);
+                pb.vi_prev_bytes = bytes;
+            } else {
+                pb.vi_prev_bytes = 0;
+            }
+        } else {
+            pb.vi_prev_bytes = 0;
+        }
+        const auto& r = liverpool->BackRegs();
+        const std::array<u64, 4> ib{
+            is_indexed ? r.index_base_address.Address<u64>() : ~0ull,
+            is_indexed ? u64{index_offset} : 0ull, is_indexed ? u64{r.num_indices} : 0ull,
+            is_indexed && r.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 1ull : 0ull};
+        vi_same = vi_same && ib == pb.ib_prev;
+        pb.ib_prev = ib;
+        const bool begin0 = pb.seq3 == pb.seq2;
+        const bool vi0 = pb.seq4 == pb.seq3;
+        const bool rest1 = seq_end - pb.seq4 == 1;
+        auto& v = pb.vi[repeat_skip ? 0 : 1];
+        ++v[0];
+        v[1] += vi_same;
+        v[2] += begin0;
+        v[3] += vi0;
+        v[4] += rest1;
+        v[5] += vi_same && begin0 && rest1;
+    }
     if (pure) {
         pb.pure_attr[0] += (sbits & (2 | 32)) != 0;
         pb.pure_attr[1] += (sbits & 4) != 0;
@@ -2884,14 +2941,14 @@ void Rasterizer::PbCensusEnd(const GraphicsPipeline* pipeline, bool rs_hit, bool
             }
         }
         const bool design_ok = nbad == 0 || (nbad == 1 && which == kPbMemo);
-        for (u32 k = 0; k < (pure ? 2u : 1u); ++k) {
+        for (u32 k = 0; k < (resolvable ? 2u : 1u); ++k) {
             for (u32 c = 0; c < kPbComps; ++c) {
                 pb.inv[k][c][li] += bad[c];
             }
-            pb.acc[k][li] += nbad == 0;
-            pb.acc_nm[k][li] += design_ok;
         }
-        if (pure && nbad == 1) {
+        pb.acc[cls][li] += nbad == 0;
+        pb.acc_nm[cls][li] += design_ok;
+        if (resolvable && nbad == 1) {
             ++pb.only[which][li];
         }
     }

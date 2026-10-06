@@ -391,7 +391,9 @@ private:
     /// SHADPS4_PB_CENSUS (diagnostic): the parallel-back census, see PbCensusEnd.
     void PbCensusBegin();
     void PbCensusPoint(u32 point);
-    void PbCensusEnd(const GraphicsPipeline* pipeline, bool rs_hit, bool repeat_skip);
+    void PbCensusEnd(const GraphicsPipeline* pipeline, bool rs_hit, bool repeat_skip,
+                     const AmdGpu::CpSplit::VertexInputsPayload* front_vi, bool is_indexed,
+                     u32 index_offset);
     /// Null unless SHADPS4_OCCLUSION_QUERIES=1 (vk_occlusion.h).
     std::unique_ptr<OcclusionQueries> occlusion;
 
