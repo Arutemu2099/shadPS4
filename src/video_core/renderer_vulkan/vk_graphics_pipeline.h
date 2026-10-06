@@ -146,6 +146,14 @@ public:
     mutable u8 repeat_why = 0;
     mutable u8 repeat_miss_run = 0;
     mutable u8 repeat_skip = 0;
+    /// SHADPS4_PB_CENSUS (Rasterizer::PbCensusEnd, back thread only): static class bits
+    /// (0xff unknown; 1 DMA, 2 written buffer, 4 formatted buffer, 8 special buffer other than
+    /// the clip-plane slot, 16 clip-plane slot, 32 written image), the previous draw of this
+    /// pipeline (census index, pure) and its binding inputs.
+    mutable u8 pb_static = 0xff;
+    mutable u8 pb_last_pure = 0;
+    mutable u64 pb_last_draw = 0;
+    mutable std::vector<u32> pb_key;
 
 private:
     /// One binding per buffer and sampler, one per image with its descriptor count (recorded

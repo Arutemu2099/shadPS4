@@ -26,6 +26,8 @@
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/split_hazard.h"
 #include "video_core/buffer_cache/dirty_epoch.h"
+#include "video_core/buffer_cache/memory_tracker.h"
+#include "video_core/pb_census.h"
 #include "video_core/host_shaders/neo_id_derive_comp.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -1650,6 +1652,10 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
                           std::chrono::steady_clock::time_point t_pipeline, u64 pipeline_ns,
                           const AmdGpu::CpSplit::VertexInputsPayload* front_vi) {
     const auto& regs = liverpool->BackRegs();
+    const bool pb_census = VideoCore::g_pb_census != 0;
+    if (pb_census) [[unlikely]] {
+        PbCensusBegin();
+    }
     std::array<u64, DcCount> dc{};
     u64 dc_t = g_draw_cost ? __rdtsc() : 0;
     const auto dc_lap = [&](DrawCostPhase phase) {
@@ -1706,6 +1712,9 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     }
     sample.EndPhase(Common::DrawSampleProbe::Phase::Prepare);
     dc_lap(DcPrepare);
+    if (pb_census) [[unlikely]] {
+        PbCensusPoint(1);
+    }
     const auto t_bindres = Common::FaultMonitor::Now();
     sample.BeginPhase(Common::DrawSampleProbe::Phase::BindResources);
     // SHADPS4_DRAW_REPEAT: the previous draw's resolved bindings stand when this draw repeats
@@ -1730,6 +1739,9 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     if (!bound) {
         draw_repeat.valid = false;
         return;
+    }
+    if (pb_census) [[unlikely]] {
+        PbCensusPoint(2);
     }
     if (g_draw_cost) {
         dc_lap(DcBindOther);
@@ -1845,6 +1857,9 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     }
     sample.EndPhase(Common::DrawSampleProbe::Phase::BuildRenderingState);
     dc_lap(DcBeginRendering);
+    if (pb_census) [[unlikely]] {
+        PbCensusPoint(3);
+    }
     if (g_merge_probe) {
         thread_local RenderState last_state{};
         if (!(state == last_state)) {
@@ -1865,6 +1880,9 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     }
     sample.EndPhase(Common::DrawSampleProbe::Phase::VertexIndexBuffers);
     dc_lap(DcVertexIndex);
+    if (pb_census) [[unlikely]] {
+        PbCensusPoint(4);
+    }
     const auto t_descwrite = Common::FaultMonitor::Now();
 
     sample.BeginPhase(Common::DrawSampleProbe::Phase::PipelineResources);
@@ -2027,6 +2045,9 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
         scheduler.Flush();
     }
     MaybeFlushEveryOps(scheduler);
+    if (pb_census) [[unlikely]] {
+        PbCensusEnd(pipeline, rs_hit, repeat && repeat_mode == 1);
+    }
 
     Common::FaultMonitor::CountDrawTail(Common::FaultMonitor::DiffNs(t_entry, t_pipeline) +
                                             Common::FaultMonitor::DiffNs(t_prepare, t_bindres),
@@ -2581,6 +2602,409 @@ void Rasterizer::DrawRepeatVerify(const GraphicsPipeline* pipeline) {
                   "DrawRepeat: MISMATCH {} (pipeline {:#x}, {} buffer infos, {} image infos)",
                   what, reinterpret_cast<u64>(pipeline), buffer_infos.size(),
                   image_infos.size());
+    }
+}
+
+namespace {
+
+// SHADPS4_PB_CENSUS state (back thread only). See scripts/patch/pb-census-2026-10-05.py.
+constexpr std::array<u64, 6> kPbLeads{1, 2, 4, 8, 16, 64};
+constexpr u32 kPbLeadCount = static_cast<u32>(kPbLeads.size());
+constexpr u32 kPbStamps = 11;            // 0-8 the design set, 9 BackContextEpoch, 10 CurrentTick
+constexpr u32 kPbDesign = 9;
+constexpr u32 kPbMemo = kPbStamps;       // component index of the memo stamp
+constexpr u32 kPbComps = kPbStamps + 1;
+constexpr std::array<const char*, kPbComps> kPbCompNames{
+    "dirty", "image", "bufgen", "texgen", "smpgen", "border",
+    "gpuclear", "faultjobs", "metaclear", "ctx", "tick", "memo"};
+enum PbClass : u32 {
+    PbRepeat,
+    PbStatic,
+    PbRsMiss,
+    PbTexMiss,
+    PbGen,
+    PbUpload,
+    PbReadMiss,
+    PbPureRec,
+    PbPure,
+    PbClasses
+};
+constexpr std::array<const char*, PbClasses> kPbClassNames{
+    "repeat", "static", "rs_miss", "tex_miss", "gen", "upload", "rmemo_miss", "pure_rec", "pure"};
+constexpr u32 kPbPhases = 5; // rs, bind, begin, vi, rest
+
+struct PbCensus {
+    u64 n{};
+    std::array<u64, kPbStamps> prev{};
+    std::array<u64, kPbStamps> last_change{};
+    bool sampled{};
+    u64 rs_w{};
+    std::array<u64, 5> tsc{};
+    u64 self{};
+    u64 seq0{}, seq2{};
+    u64 up0{}, up2{}, up3{}, up4{};
+    u64 bg0{}, bg2{}, bg3{}, bg4{};
+    u64 tg0{}, tg2{}, tg3{}, tg4{};
+    u64 rm0{}, rm2{};
+    const GraphicsPipeline* prev_pipeline{};
+    // Window.
+    u64 w_start_ns{}, w_start_tsc{}, w_start_idle{};
+    std::array<u64, PbClasses> cls{};
+    std::array<std::array<u64, kPbLeadCount>, 2> acc{};    // [all draws, pure draws]
+    std::array<std::array<u64, kPbLeadCount>, 2> acc_nm{}; // design set without the memo stamp
+    std::array<std::array<std::array<u64, kPbLeadCount>, kPbComps>, 2> inv{};
+    std::array<std::array<u64, kPbLeadCount>, kPbComps> only{}; // pure draws, the only bad one
+    std::array<std::array<u64, kPbPhases>, PbClasses> cyc{};
+    std::array<u64, PbClasses> smp{};
+    u64 self_cyc{}, self_n{};
+    std::array<u64, 2> pure_attr{}; // pure draws with a written buffer / image, with a formatted one
+    // Keys (SHADPS4_PB_CENSUS & 2).
+    u64 k_draws{}, k_prev_same{}, k_prev_valid{}, k_pipe_any{}, k_pipe_valid{}, k_pipe_valid_pure{};
+    std::array<u64, 5> k_prev_by{}; // not taken by the skip: formatted, written, dma/special, rs miss, other
+    u64 k_diff{}, k_bind_total{}, k_bind_eq{}, k_stage_total{}, k_stage_eq{};
+};
+PbCensus g_pb;
+
+template <size_t N>
+std::string PbJoin(const std::array<u64, N>& values) {
+    std::string out;
+    for (size_t i = 0; i < N; ++i) {
+        out += fmt::format("{}{}", i ? "/" : "", values[i]);
+    }
+    return out;
+}
+
+void PbCensusMaybeLog(PbCensus& pb) {
+    const u64 now_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now().time_since_epoch())
+                                            .count());
+    const u64 now_tsc = __rdtsc();
+    const u64 idle = Common::FaultMonitor::back_idle_total_ticks.load(std::memory_order_relaxed);
+    if (pb.w_start_ns == 0) {
+        pb.w_start_ns = now_ns;
+        pb.w_start_tsc = now_tsc;
+        pb.w_start_idle = idle;
+        return;
+    }
+    if (now_ns - pb.w_start_ns < 5'000'000'000ull) {
+        return;
+    }
+    const double wall_ns = static_cast<double>(now_ns - pb.w_start_ns);
+    const double ns_per_tick = wall_ns / static_cast<double>(std::max<u64>(1, now_tsc - pb.w_start_tsc));
+    const double idle_ms = static_cast<double>(idle - pb.w_start_idle) * ns_per_tick / 1e6;
+    std::string line = fmt::format(
+        "PbCensus: n={} wall_ms={:.1f} idle_ms={:.1f} ns_per_tick={:.5f} frames={} cls={} "
+        "acc_all={} acc_pure={} accnm_all={} accnm_pure={} self_cyc={} self_n={} pure_attr={}",
+        pb.n, wall_ns / 1e6, idle_ms, ns_per_tick,
+        Common::FaultMonitor::presented_frames.load(std::memory_order_relaxed), PbJoin(pb.cls),
+        PbJoin(pb.acc[0]), PbJoin(pb.acc[1]), PbJoin(pb.acc_nm[0]), PbJoin(pb.acc_nm[1]),
+        pb.self_cyc, pb.self_n, PbJoin(pb.pure_attr));
+    for (u32 c = 0; c < kPbComps; ++c) {
+        line += fmt::format(" inv_all_{}={} inv_pure_{}={} only_pure_{}={}", kPbCompNames[c],
+                            PbJoin(pb.inv[0][c]), kPbCompNames[c], PbJoin(pb.inv[1][c]),
+                            kPbCompNames[c], PbJoin(pb.only[c]));
+    }
+    for (u32 k = 0; k < PbClasses; ++k) {
+        line += fmt::format(" cyc_{}={}", kPbClassNames[k], PbJoin(pb.cyc[k]));
+    }
+    line += fmt::format(" smp={}", PbJoin(pb.smp));
+    if (VideoCore::g_pb_census & 2) {
+        line += fmt::format(" keys={}/{}/{}/{}/{}/{} prev_by={} diff={}/{}/{}/{}/{}", pb.k_draws,
+                            pb.k_prev_same, pb.k_prev_valid, pb.k_pipe_any, pb.k_pipe_valid,
+                            pb.k_pipe_valid_pure, PbJoin(pb.k_prev_by), pb.k_diff,
+                            pb.k_bind_total, pb.k_bind_eq, pb.k_stage_total, pb.k_stage_eq);
+    }
+    LOG_INFO(Render_Vulkan, "{}", line);
+    const u64 n = pb.n;
+    const auto prev = pb.prev;
+    const auto last_change = pb.last_change;
+    const auto* prev_pipeline = pb.prev_pipeline;
+    pb = PbCensus{};
+    pb.n = n;
+    pb.prev = prev;
+    pb.last_change = last_change;
+    pb.prev_pipeline = prev_pipeline;
+    pb.w_start_ns = now_ns;
+    pb.w_start_tsc = now_tsc;
+    pb.w_start_idle = idle;
+}
+
+} // Anonymous namespace
+
+void Rasterizer::PbCensusBegin() {
+    auto& pb = g_pb;
+    const u64 n = ++pb.n;
+    VideoCore::g_pb_draw.store(n, std::memory_order_relaxed);
+    VideoCore::t_pb_memo_max = 0;
+    pb.sampled = (n & 63) == 0;
+    const u64 c0 = pb.sampled ? __rdtsc() : 0;
+    const auto& regs = liverpool->BackRegs();
+    const std::array<u64, kPbStamps> s{
+        VideoCore::g_dirty_epoch.load(std::memory_order_acquire),
+        VideoCore::g_image_epoch.load(std::memory_order_acquire),
+        buffer_cache.StructGeneration(),
+        texture_cache.StructGeneration(),
+        texture_cache.SamplerGeneration(),
+        static_cast<u64>(regs.ta_bc_base.base_addr),
+        VideoCore::MemoryTracker::gpu_clear_epoch.load(std::memory_order_acquire),
+        buffer_cache.FaultJobsAdmitted(),
+        texture_cache.MetaClearEpoch(),
+        liverpool->BackContextEpoch(),
+        scheduler.CurrentTick()};
+    for (u32 c = 0; c < kPbStamps; ++c) {
+        if (s[c] != pb.prev[c]) {
+            pb.last_change[c] = n;
+            pb.prev[c] = s[c];
+        }
+    }
+    pb.rs_w = rs_memo_pb_written;
+    pb.seq0 = scheduler.RecordSeq();
+    pb.up0 = buffer_cache.SyncUploadBytesTotal();
+    pb.bg0 = s[2];
+    pb.tg0 = s[3];
+    pb.rm0 = buffer_cache.ReadMemoMissesTotal();
+    if (pb.sampled) {
+        const u64 c1 = __rdtsc();
+        pb.self = c1 - c0;
+        pb.tsc[0] = c1;
+    }
+}
+
+void Rasterizer::PbCensusPoint(u32 point) {
+    auto& pb = g_pb;
+    switch (point) {
+    case 2:
+        pb.seq2 = scheduler.RecordSeq();
+        pb.up2 = buffer_cache.SyncUploadBytesTotal();
+        pb.bg2 = buffer_cache.StructGeneration();
+        pb.tg2 = texture_cache.StructGeneration();
+        pb.rm2 = buffer_cache.ReadMemoMissesTotal();
+        break;
+    case 3:
+        pb.up3 = buffer_cache.SyncUploadBytesTotal();
+        pb.bg3 = buffer_cache.StructGeneration();
+        pb.tg3 = texture_cache.StructGeneration();
+        break;
+    case 4:
+        pb.up4 = buffer_cache.SyncUploadBytesTotal();
+        pb.bg4 = buffer_cache.StructGeneration();
+        pb.tg4 = texture_cache.StructGeneration();
+        break;
+    default:
+        break;
+    }
+    if (pb.sampled && point < pb.tsc.size()) {
+        pb.tsc[point] = __rdtsc();
+    }
+}
+
+void Rasterizer::PbCensusEnd(const GraphicsPipeline* pipeline, bool rs_hit, bool repeat_skip) {
+    auto& pb = g_pb;
+    const u64 t_end = pb.sampled ? __rdtsc() : 0;
+    const u64 n = pb.n;
+    if (pipeline->pb_static == 0xff) {
+        u8 bits = 0;
+        for (const auto& bound : BoundStages(pipeline)) {
+            const auto* stage = bound.info;
+            if (!stage) {
+                continue;
+            }
+            if (stage->uses_dma) {
+                bits |= 1;
+            }
+            for (const auto& desc : stage->buffers) {
+                if (desc.IsSpecial()) {
+                    bits |= desc.buffer_type == Shader::BufferType::ClipPlanes ? 16 : 8;
+                } else {
+                    bits |= desc.is_written ? 2 : 0;
+                    bits |= desc.is_formatted ? 4 : 0;
+                }
+            }
+            for (const auto& desc : stage->images) {
+                bits |= desc.is_written ? 32 : 0;
+            }
+        }
+        pipeline->pb_static = bits;
+    }
+    const u8 sbits = pipeline->pb_static;
+    const bool clip_on = liverpool->BackRegs().clipper_control.user_clip_plane_enable != 0;
+    PbClass cls;
+    if (repeat_skip) {
+        cls = PbRepeat;
+    } else if ((sbits & (1 | 8)) != 0 || ((sbits & 16) != 0 && clip_on)) {
+        cls = PbStatic;
+    } else if (!rs_hit) {
+        cls = PbRsMiss;
+    } else if (draw_repeat.tex_nonhit_stages != 0) {
+        cls = PbTexMiss;
+    } else if (pb.bg2 != pb.bg0 || pb.tg2 != pb.tg0 || pb.bg4 != pb.bg3 || pb.tg4 != pb.tg3) {
+        cls = PbGen;
+    } else if (pb.up2 != pb.up0 || pb.up4 != pb.up3) {
+        cls = PbUpload;
+    } else if (pb.rm2 != pb.rm0) {
+        cls = PbReadMiss;
+    } else if (pb.seq2 != pb.seq0) {
+        cls = PbPureRec;
+    } else {
+        cls = PbPure;
+    }
+    const bool pure = cls == PbPure || cls == PbPureRec;
+    ++pb.cls[cls];
+    if (pure) {
+        pb.pure_attr[0] += (sbits & (2 | 32)) != 0;
+        pb.pure_attr[1] += (sbits & 4) != 0;
+    }
+
+    // (a) acceptance at each lead.
+    u64 memo_w = VideoCore::t_pb_memo_max;
+    if (rs_hit) {
+        memo_w = std::max(memo_w, pb.rs_w);
+    }
+    u64 design_max = 0;
+    for (u32 c = 0; c < kPbDesign; ++c) {
+        design_max = std::max(design_max, pb.last_change[c]);
+    }
+    for (u32 li = 0; li < kPbLeadCount; ++li) {
+        const u64 lead = kPbLeads[li];
+        if (n <= lead) {
+            continue;
+        }
+        const u64 base = n - lead;
+        std::array<bool, kPbComps> bad{};
+        for (u32 c = 0; c < kPbStamps; ++c) {
+            bad[c] = pb.last_change[c] > base;
+        }
+        bad[kPbMemo] = memo_w >= base;
+        u32 nbad = 0;
+        u32 which = 0;
+        for (u32 c = 0; c < kPbComps; ++c) {
+            if ((c < kPbDesign || c == kPbMemo) && bad[c]) {
+                ++nbad;
+                which = c;
+            }
+        }
+        const bool design_ok = nbad == 0 || (nbad == 1 && which == kPbMemo);
+        for (u32 k = 0; k < (pure ? 2u : 1u); ++k) {
+            for (u32 c = 0; c < kPbComps; ++c) {
+                pb.inv[k][c][li] += bad[c];
+            }
+            pb.acc[k][li] += nbad == 0;
+            pb.acc_nm[k][li] += design_ok;
+        }
+        if (pure && nbad == 1) {
+            ++pb.only[which][li];
+        }
+    }
+
+    // (d) timing of the sampled draw.
+    if (pb.sampled) {
+        auto& cyc = pb.cyc[cls];
+        cyc[0] += pb.tsc[1] - pb.tsc[0];
+        cyc[1] += pb.tsc[2] - pb.tsc[1];
+        cyc[2] += pb.tsc[3] - pb.tsc[2];
+        cyc[3] += pb.tsc[4] - pb.tsc[3];
+        cyc[4] += t_end - pb.tsc[4];
+        ++pb.smp[cls];
+    }
+
+    // (c) binding inputs against the previous draw of the same pipeline.
+    if (VideoCore::g_pb_census & 2) {
+        auto& key = pipeline->pb_key;
+        const bool have = pipeline->pb_last_draw != 0;
+        u32 pos = 0;
+        u32 nb = 0;
+        u32 neq = 0;
+        u32 ns = 0;
+        u32 nseq = 0;
+        const auto cmp = [&](const void* data, u32 words) {
+            bool eq = false;
+            if (pos + words <= key.size()) {
+                eq = have && std::memcmp(&key[pos], data, words * sizeof(u32)) == 0;
+            } else {
+                key.resize(pos + words);
+            }
+            std::memcpy(&key[pos], data, words * sizeof(u32));
+            pos += words;
+            ++nb;
+            neq += eq;
+            return eq;
+        };
+        for (const auto& bound : BoundStages(pipeline)) {
+            const auto* stage = bound.info;
+            if (!stage) {
+                continue;
+            }
+            bool stage_eq = true;
+            bool any = false;
+            for (const auto& desc : stage->buffers) {
+                const auto sharp = desc.GetSharp(bound);
+                stage_eq &= cmp(&sharp, static_cast<u32>(sizeof(sharp) / sizeof(u32)));
+                any = true;
+            }
+            for (const auto& desc : stage->images) {
+                const auto sharp = desc.GetSharp(bound);
+                stage_eq &= cmp(&sharp, static_cast<u32>(sizeof(sharp) / sizeof(u32)));
+                any = true;
+            }
+            for (const auto& desc : stage->samplers) {
+                const auto sharp = desc.GetSharp(bound);
+                stage_eq &= cmp(&sharp, static_cast<u32>(sizeof(sharp) / sizeof(u32)));
+                any = true;
+            }
+            u32 mask = stage->ud_mask.mask;
+            while (mask) {
+                const u32 index = std::countr_zero(mask);
+                mask &= ~(1U << index);
+                const u32 value = bound.user_data[index];
+                stage_eq &= cmp(&value, 1);
+                any = true;
+            }
+            if (any) {
+                ++ns;
+                nseq += stage_eq;
+            }
+        }
+        const bool key_eq = have && pos == key.size() && neq == nb;
+        ++pb.k_draws;
+        if (pb.prev_pipeline == pipeline) {
+            if (key_eq) {
+                ++pb.k_prev_same;
+                if (n > 1 && design_max <= n - 1) {
+                    ++pb.k_prev_valid;
+                    if (!repeat_skip) {
+                        const u32 why = (sbits & 4) != 0            ? 0
+                                        : (sbits & (2 | 32)) != 0   ? 1
+                                        : (sbits & (1 | 8 | 16)) != 0 ? 2
+                                        : !rs_hit                    ? 3
+                                                                     : 4;
+                        ++pb.k_prev_by[why];
+                    }
+                }
+            }
+        } else if (have && key_eq) {
+            ++pb.k_pipe_any;
+            if (design_max <= pipeline->pb_last_draw) {
+                ++pb.k_pipe_valid;
+                pb.k_pipe_valid_pure += pipeline->pb_last_pure != 0;
+            }
+        }
+        if (have && !key_eq) {
+            ++pb.k_diff;
+            pb.k_bind_total += nb;
+            pb.k_bind_eq += neq;
+            pb.k_stage_total += ns;
+            pb.k_stage_eq += nseq;
+        }
+        pipeline->pb_last_draw = n;
+        pipeline->pb_last_pure = pure ? 1 : 0;
+    }
+    pb.prev_pipeline = pipeline;
+    if (pb.sampled) {
+        pb.self_cyc += pb.self + (__rdtsc() - t_end);
+        ++pb.self_n;
+    }
+    if ((n & 4095) == 0) {
+        PbCensusMaybeLog(pb);
     }
 }
 
@@ -3293,6 +3717,7 @@ struct TexMemoRecord {
     u64 border{};
     u64 tex_gen{};
     u64 smp_gen{};
+    u64 pb_written{}; ///< SHADPS4_PB_CENSUS: census draw index of the last record
     std::vector<AmdGpu::Image> tsharps;
     std::vector<AmdGpu::Sampler> ssharps;
     std::vector<Img> imgs;
@@ -3595,6 +4020,9 @@ void Rasterizer::BindTexturesMemo(const Pipeline* pipeline, const Shader::BoundS
     }
 
     if (miss < 0 && tex_bind_memo == 1) {
+        if (VideoCore::g_pb_census != 0) [[unlikely]] {
+            VideoCore::PbFoldMemo(rec.pb_written);
+        }
         st.hit_transits += EmitTexMemoHit(rec, binding);
         ++st.hits;
         ++st.total_hits;
@@ -3827,6 +4255,7 @@ void Rasterizer::RecordTexMemo(TexMemoRecord& rec, const Shader::Info& stage, u6
                                u64 smp_gen, u64 border, size_t img_begin, u32 sw_begin) {
     const auto& st = GetTexMemoState();
     rec.valid = true;
+    rec.pb_written = VideoCore::PbDraw();
     rec.tsharps = st.tsharps;
     rec.ssharps = st.ssharps;
     rec.border = border;
@@ -5308,6 +5737,7 @@ void Rasterizer::RenderStateMemoStore(const GraphicsPipeline* pipeline, const Re
     m.state = state;
     m.depth_layout = rs_last_depth_layout;
     m.valid = true;
+    rs_memo_pb_written = VideoCore::PbDraw();
 }
 
 void Rasterizer::RenderStateMemoLog() {

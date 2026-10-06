@@ -23,6 +23,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/readback_queue.h"
 #include "video_core/buffer_cache/memory_tracker.h"
+#include "video_core/pb_census.h"
 #include "video_core/renderer_vulkan/vk_gpu_batch_timer.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -3906,6 +3907,9 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             ++st[4];
         } else {
             ++st[1];
+            if (g_pb_census != 0) [[unlikely]] {
+                PbFoldMemo(read_memo->pb_written);
+            }
             if (g_read_bind_memo == 1 || g_read_bind_memo == 3) {
                 return {&buffer, buffer.Offset(device_addr)};
             }
@@ -4061,6 +4065,9 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         }
         // Epoch and generation read before the walk: a change during it misses next time.
         *read_memo = {device_addr, size, read_memo_epoch, read_memo_gen, buffer_id.index};
+        if (g_pb_census != 0) [[unlikely]] {
+            read_memo->pb_written = PbDraw();
+        }
     }
     if (sample) {
         sample->AddSyncNs(sample->SinceNs(t_sample_sync));

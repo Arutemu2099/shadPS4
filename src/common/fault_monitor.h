@@ -60,6 +60,8 @@ extern std::atomic<u64> frame_slow_ns;
 extern std::atomic<u64> front_idle_ns;    ///< front waiting for the guest to submit
 extern std::atomic<u64> front_wait_ticks; ///< front waiting for the back (depth, drains)
 extern std::atomic<u64> back_idle_ticks;  ///< back waiting for work
+/// SHADPS4_PB_CENSUS: the same, never reset (the census takes window differences).
+extern std::atomic<u64> back_idle_total_ticks;
 extern std::atomic<u64> rf_guest_ns;      ///< guest threads inside a read-fault download
 
 /**

@@ -388,6 +388,10 @@ private:
     void DrawRepeatApply(const GraphicsPipeline* pipeline);
     void DrawRepeatVerify(const GraphicsPipeline* pipeline);
     void DrawRepeatStore(const GraphicsPipeline* pipeline, bool completed);
+    /// SHADPS4_PB_CENSUS (diagnostic): the parallel-back census, see PbCensusEnd.
+    void PbCensusBegin();
+    void PbCensusPoint(u32 point);
+    void PbCensusEnd(const GraphicsPipeline* pipeline, bool rs_hit, bool repeat_skip);
     /// Null unless SHADPS4_OCCLUSION_QUERIES=1 (vk_occlusion.h).
     std::unique_ptr<OcclusionQueries> occlusion;
 
@@ -495,6 +499,7 @@ private:
         u64 epoch_moved{}, verify_prepare{}, verify_begin{}, mismatches{};
     };
     RenderStateMemo rs_memo;
+    u64 rs_memo_pb_written{}; ///< SHADPS4_PB_CENSUS: census draw index of the last rs_memo store
     RenderStateMemoStats rs_stats;
     /// Depth layout BeginRendering transitioned the depth target to (valid when one is bound).
     vk::ImageLayout rs_last_depth_layout{};

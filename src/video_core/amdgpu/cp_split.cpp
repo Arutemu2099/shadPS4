@@ -541,6 +541,8 @@ void Channel::WaitForWork(const std::atomic<u32>& num_commands, const std::stop_
             const u64 waited = Ticks() - t0;
             back_idle_ticks.fetch_add(waited, std::memory_order_relaxed);
             Common::FaultMonitor::back_idle_ticks.fetch_add(waited, std::memory_order_relaxed);
+            Common::FaultMonitor::back_idle_total_ticks.fetch_add(waited,
+                                                                 std::memory_order_relaxed);
             return;
         }
         if ((spins & 63) == 0 && NowNs() > deadline) {
@@ -557,6 +559,7 @@ void Channel::WaitForWork(const std::atomic<u32>& num_commands, const std::stop_
     const u64 waited = Ticks() - t0;
     back_idle_ticks.fetch_add(waited, std::memory_order_relaxed);
     Common::FaultMonitor::back_idle_ticks.fetch_add(waited, std::memory_order_relaxed);
+    Common::FaultMonitor::back_idle_total_ticks.fetch_add(waited, std::memory_order_relaxed);
 }
 
 void Channel::WakeBackIfParked() {

@@ -213,6 +213,15 @@ public:
         return sync_upload_bytes_total;
     }
 
+    /// SHADPS4_PB_CENSUS: read-bind-memo misses so far (both caller classes). CP thread.
+    [[nodiscard]] u64 ReadMemoMissesTotal() const noexcept {
+        return (read_memo_stats[0][0] - read_memo_stats[0][1]) +
+               (read_memo_stats[1][0] - read_memo_stats[1][1]);
+    }
+    [[nodiscard]] u64 FaultJobsAdmitted() const noexcept {
+        return fault_jobs_admitted.load(std::memory_order_acquire);
+    }
+
     /// Return buffer id for the specified region
     BufferId FindBuffer(VAddr device_addr, u32 size);
 
@@ -646,6 +655,7 @@ private:
         u64 epoch{};
         u64 gen{};
         u32 buffer_index{};
+        u64 pb_written{}; ///< SHADPS4_PB_CENSUS: census draw index of the last write
     };
     std::array<ReadMemoEntry, 8192> read_memo_table{};
 

@@ -46,6 +46,7 @@ std::atomic<u64> frame_slow_ns{0};
 std::atomic<u64> front_idle_ns{0};
 std::atomic<u64> front_wait_ticks{0};
 std::atomic<u64> back_idle_ticks{0};
+std::atomic<u64> back_idle_total_ticks{0};
 std::atomic<u64> rf_guest_ns{0};
 std::atomic<u64> range_fragments{0};
 std::atomic<u64> range_adds{0};
