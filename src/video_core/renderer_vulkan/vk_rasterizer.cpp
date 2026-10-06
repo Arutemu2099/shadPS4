@@ -64,6 +64,9 @@ bool EnvExactly1(const char* name) {
     return value && std::string_view{value} == "1";
 }
 const bool g_prepared_targets = EnvIs1("SHADPS4_PREPARED_TARGETS");
+// SHADPS4_TEX_MEMO_LOCAL_GEN=1: texture bind memo validity per image (overlap_epoch) instead of the
+// texture cache's global structure generation (scripts/patch/tex-memo-local-gen-2026-10-05.py).
+const bool g_tex_memo_local = EnvIs1("SHADPS4_TEX_MEMO_LOCAL_GEN");
 const bool g_verify_targets = EnvIs1("SHADPS4_PREPARED_TARGETS_VERIFY");
 const bool g_raw_write_invalidate = EnvIs1("SHADPS4_RAW_WRITE_INVALIDATE");
 const bool g_cache_decoded_images = [] {
@@ -3877,9 +3880,13 @@ struct TexMemoRecord {
         /// SHADPS4_TEX_TRANSIT_SKIP: BackingImage::state_serial at which this image's Transit call
         /// on a hit was a pure no-op (0 = not known). Written on hits, hence mutable.
         mutable u64 ok_serial{};
+        u64 overlap_epoch{}; ///< SHADPS4_TEX_MEMO_LOCAL_GEN: Image::overlap_epoch when recorded
     };
     bool valid{};
     bool excluded{};
+    /// SHADPS4_TEX_MEMO_LOCAL_GEN: every T# resolved to an image and the structure generation did
+    /// not move during the recording full path, so per-image overlap epochs stand in for tex_gen.
+    bool local_ok{};
     u64 border{};
     u64 tex_gen{};
     u64 smp_gen{};
@@ -3978,6 +3985,7 @@ struct TexMemoState {
     u64 stages{}, empty_stages{}, key_hits{}, hits{}, hit_transits{}, hit_images{}, hit_samplers{};
     std::array<u64, NumTexMemoMiss> miss{};
     u64 verified{}, mismatched{};
+    u64 local_saved{}, local_overlap_miss{}; ///< SHADPS4_TEX_MEMO_LOCAL_GEN (window)
     u64 mis_shape{}, mis_id{}, mis_view{}, mis_layout{}, mis_sampler{}, mis_write{}, mis_bound{},
         mis_state{};
     u64 total_stages{}, total_hits{}, total_verified{}, total_mismatched{};
@@ -4014,6 +4022,13 @@ void LogTexMemo(TexMemoState& st, u8 mode) {
              st.verified, st.mismatched, st.mis_shape, st.mis_id, st.mis_view, st.mis_layout,
              st.mis_sampler, st.mis_write, st.mis_bound, st.mis_state, st.total_stages,
              st.total_hits, st.total_verified, st.total_mismatched);
+    if (g_tex_memo_local) {
+        LOG_INFO(Render_Vulkan,
+                 "TexMemoLocal: hits the global generation test would have missed={} "
+                 "overlap-epoch misses={}",
+                 st.local_saved, st.local_overlap_miss);
+        st.local_saved = st.local_overlap_miss = 0;
+    }
     st.frames0 = frames_now;
     st.stages = st.empty_stages = st.key_hits = st.hits = st.hit_transits = st.hit_images =
         st.hit_samplers = 0;
@@ -4139,7 +4154,9 @@ void Rasterizer::BindTexturesMemo(const Pipeline* pipeline, const Shader::BoundS
         if (section == VideoCore::TextureCache::MemoSection::Refused) {
             miss = TmRefused;
         } else {
-            if (texture_cache.StructGeneration() != rec.tex_gen) {
+            const bool local = g_tex_memo_local && rec.local_ok;
+            const bool gen_moved = texture_cache.StructGeneration() != rec.tex_gen;
+            if (!local && gen_moved) {
                 miss = TmTexGen;
             } else {
                 for (const auto& img : rec.imgs) {
@@ -4151,6 +4168,11 @@ void Rasterizer::BindTexturesMemo(const Pipeline* pipeline, const Shader::BoundS
                         miss = TmUid;
                     } else if (image.backing != img.backing) {
                         miss = TmBacking;
+                    } else if (local &&
+                               std::atomic_ref<u64>{const_cast<u64&>(image.overlap_epoch)}.load(
+                                   std::memory_order_relaxed) != img.overlap_epoch) {
+                        miss = TmTexGen;
+                        ++st.local_overlap_miss;
                     } else if (!texture_cache.ImageUpToDateRelaxed(img.id)) {
                         miss = TmDirtyImage;
                     } else if (image.binding.is_target || image.binding.force_general ||
@@ -4172,6 +4194,9 @@ void Rasterizer::BindTexturesMemo(const Pipeline* pipeline, const Shader::BoundS
                         texture_cache.TouchImageAccess(texture_cache.PeekImage(img.id));
                     }
                 }
+            }
+            if (miss < 0 && local && gen_moved) {
+                ++st.local_saved;
             }
             texture_cache.LeaveMemoSection(section);
         }
@@ -4427,6 +4452,7 @@ void Rasterizer::RecordTexMemo(TexMemoRecord& rec, const Shader::Info& stage, u6
     rec.border = border;
     rec.tex_gen = tex_gen;
     rec.smp_gen = smp_gen;
+    rec.local_ok = texture_cache.StructGeneration() == tex_gen;
     const size_t num_images = image_bindings.size();
     const size_t num_samplers = stage.samplers.size();
     // Stage-wide exclusions: native bindings, stencil redirects and scratch (Pro paths), images
@@ -4457,10 +4483,13 @@ void Rasterizer::RecordTexMemo(TexMemoRecord& rec, const Shader::Info& stage, u6
         img.type = set_writes[sw_begin + i].descriptorType;
         img.range = desc.view_info.range;
         if (!image_id) {
+            rec.local_ok = false;
             continue;
         }
         auto& image = texture_cache.PeekImage(image_id);
         img.uid = image.image_uid;
+        img.overlap_epoch = std::atomic_ref<u64>{const_cast<u64&>(image.overlap_epoch)}.load(
+            std::memory_order_relaxed);
         img.backing = image.backing;
         img.state = image.backing->state;
         img.full_range = img.range.base == VideoCore::SubresourceBase{} &&

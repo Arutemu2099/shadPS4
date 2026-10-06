@@ -203,6 +203,9 @@ public:
     BackingImage* backing{};
     boost::container::static_vector<u64, 16> mip_hashes{};
     u64 image_uid{};
+    /// SHADPS4_TEX_MEMO_LOCAL_GEN: bumped whenever an image sharing a page with this one is
+    /// registered or unregistered (RegisterImage / UnregisterImage). Relaxed atomic_ref access.
+    u64 overlap_epoch{};
     u64 lru_id{};
     u64 tick_accessed_last{};
     u64 hash{};

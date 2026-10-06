@@ -1677,7 +1677,12 @@ void TextureCache::RegisterImage(ImageId image_id) {
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
-        page_table[page].push_back(image_id);
+        auto& page_ids = page_table[page];
+        for (const ImageId other : page_ids) {
+            std::atomic_ref<u64>{slot_images[other].overlap_epoch}.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        page_ids.push_back(image_id);
         page_image_counts[page].fetch_add(1, std::memory_order_release);
     });
     InvalidatePreparedImages();
@@ -1704,6 +1709,10 @@ void TextureCache::UnregisterImage(ImageId image_id) {
             return;
         }
         image_ids.erase(vector_it);
+        for (const ImageId other : image_ids) {
+            std::atomic_ref<u64>{slot_images[other].overlap_epoch}.fetch_add(
+                1, std::memory_order_relaxed);
+        }
         page_image_counts[page].fetch_sub(1, std::memory_order_release);
     });
     InvalidatePreparedImages();
