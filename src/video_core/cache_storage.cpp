@@ -10,6 +10,7 @@
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 
 #include <miniz.h>
 
@@ -95,8 +96,11 @@ void DataBase::Open(bool native_bindings) {
     const auto& game_info = Common::ElfInfo::Instance();
     // Keep experimental binding-model caches separate from the playable legacy cache.
     // Shader metadata and permutation-indexed binaries must come from the same namespace.
+    // One cache per shader binary version: builds on either side of a version bump otherwise
+    // reject and overwrite each other's entries (A B B A gates would measure recompiles).
     const auto cache_name = std::string{game_info.GameSerial()} +
-                            (native_bindings ? "_native_bindings_v1" : "");
+                            (native_bindings ? "_native_bindings_v1" : "") +
+                            fmt::format("_sbv{}", Vulkan::GetShaderBinaryVersion());
 
     using namespace Common::FS;
     if (EmulatorSettings.IsPipelineCacheArchived()) {

@@ -9,6 +9,9 @@
 
 namespace Vulkan {
 
+// The on-disk cache is named per shader binary version (cache_storage.cpp Open).
+u32 GetShaderBinaryVersion();
+
 void RegisterPipelineData(const ComputePipelineKey& key,
                           ComputePipeline::SerializationSupport& sdata);
 void RegisterPipelineData(const GraphicsPipelineKey& key, u64 hash,

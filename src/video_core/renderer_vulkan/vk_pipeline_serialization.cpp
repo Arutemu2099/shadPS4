@@ -20,6 +20,10 @@ static constexpr u32 PipelineKeyVersion = 4u; // SerializationSupport gained ima
 
 namespace Vulkan {
 
+u32 GetShaderBinaryVersion() {
+    return Serialization::ShaderBinaryVersion;
+}
+
 void RegisterPipelineData(const ComputePipelineKey& key,
                           ComputePipeline::SerializationSupport& sdata) {
     if (!Storage::DataBase::Instance().IsOpened()) {
