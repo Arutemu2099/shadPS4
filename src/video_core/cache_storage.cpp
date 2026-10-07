@@ -99,11 +99,12 @@ void DataBase::Open(bool native_bindings) {
     const auto& game_info = Common::ElfInfo::Instance();
     // Keep experimental binding-model caches separate from the playable legacy cache.
     // Shader metadata and permutation-indexed binaries must come from the same namespace.
-    // One cache per shader binary version: builds on either side of a version bump otherwise
-    // reject and overwrite each other's entries (A B B A gates would measure recompiles).
+    // Builds on either side of the ShaderBinaryVersion 3 -> 4 bump share this folder: version 4
+    // accepts every version-3 entry except GDS shaders (LoadShaderMeta), so only those few
+    // recompile when the user alternates builds. (A per-version folder seeded by a copy was
+    // tried on 2026-10-07: the copy of ~38,000 files took 120 s at first launch.)
     const auto cache_name = std::string{game_info.GameSerial()} +
-                            (native_bindings ? "_native_bindings_v1" : "") +
-                            fmt::format("_sbv{}", Vulkan::GetShaderBinaryVersion());
+                            (native_bindings ? "_native_bindings_v1" : "");
 
     using namespace Common::FS;
     if (EmulatorSettings.IsPipelineCacheArchived()) {
@@ -123,30 +124,7 @@ void DataBase::Open(bool native_bindings) {
     } else {
         cache_path = GetUserPath(PathType::CacheDir) / cache_name;
         if (!std::filesystem::exists(cache_path)) {
-            // First launch of a new shader binary version: start from a copy of the previous
-            // version's folder (the unsuffixed name is version 3). The loader accepts the old
-            // entries it can still use (LoadShaderMeta) and recompiles the rest, so a version
-            // bump does not cost a cold cache.
-            const u32 version = Vulkan::GetShaderBinaryVersion();
-            const std::string base = std::string{game_info.GameSerial()} +
-                                     (native_bindings ? "_native_bindings_v1" : "");
-            const auto previous = GetUserPath(PathType::CacheDir) /
-                                  (version == 4 ? base : fmt::format("{}_sbv{}", base, version - 1));
-            std::error_code ec;
-            if (std::filesystem::is_directory(previous, ec)) {
-                const auto t0 = std::chrono::steady_clock::now();
-                std::filesystem::copy(previous, cache_path, std::filesystem::copy_options::recursive,
-                                      ec);
-                LOG_INFO(Render, "Shader cache {} seeded from {} in {} ms{}{}", cache_name,
-                         previous.filename().string(),
-                         std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::steady_clock::now() - t0)
-                             .count(),
-                         ec ? ": " : "", ec ? ec.message() : "");
-            }
-            if (!std::filesystem::exists(cache_path)) {
-                std::filesystem::create_directories(cache_path);
-            }
+            std::filesystem::create_directories(cache_path);
         }
     }
 

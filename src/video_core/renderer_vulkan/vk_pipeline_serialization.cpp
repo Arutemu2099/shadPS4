@@ -1,6 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <thread>
+#include <vector>
+
 #include "shader_recompiler/spirv_variants.h"
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
@@ -130,7 +137,7 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     meta.Read(binary_version);
     // Version 3 -> 4 changed only shaders that append / consume through GDS (the counter index
     // was baked at compile time, d6857fbc). A version-3 entry of any other shader is still exact,
-    // so the cache copied from the version-3 folder (cache_storage.cpp Open) stays warm.
+    // so the shared cache folder (cache_storage.cpp Open) stays warm across the bump.
     const bool upgradable = binary_version == 3u && Serialization::ShaderBinaryVersion == 4u;
     if (binary_version != Serialization::ShaderBinaryVersion && !upgradable) {
         return false;
@@ -252,6 +259,31 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
     return true;
 }
 
+namespace {
+/// SHADPS4_PARALLEL_WARMUP=1 (default off, 2026-10-07): the boot preload constructs the cached
+/// graphics pipelines on several threads after loading them in order. The constructor holds the
+/// driver compile, ~30 ms per pipeline the driver's own cache does not hold (measured s176): with
+/// ~5,700 cached graphics pipelines that was the minutes-long black screen of a build's first
+/// launch. Everything the constructor reads (Infos, modules, fetch data) is complete before the
+/// threads start and nothing else runs (the game has not started).
+struct PreloadGraphicsJob {
+    GraphicsPipelineKey key{};
+    std::array<const Shader::Info*, MaxShaderStages> infos{};
+    std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
+    std::array<vk::ShaderModule, MaxShaderStages> modules{};
+    std::shared_ptr<const Shader::Gcn::FetchShaderData> fetch_shader;
+    GraphicsPipeline::SerializationSupport sdata{};
+    std::unique_ptr<GraphicsPipeline> pipeline;
+};
+/// Set only while WarmUp runs with SHADPS4_PARALLEL_WARMUP (single-threaded loading phase).
+std::vector<PreloadGraphicsJob>* g_preload_jobs = nullptr;
+
+bool ParallelWarmUpEnabled() {
+    const char* value = std::getenv("SHADPS4_PARALLEL_WARMUP");
+    return value && value[0] == '1';
+}
+} // Anonymous namespace
+
 bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     infos.fill(nullptr);
     modules.fill(nullptr);
@@ -279,6 +311,21 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
         if (!LoadPipelineStage(meta_ar, stage_idx)) {
             return false;
         }
+    }
+
+    if (g_preload_jobs) {
+        // SHADPS4_PARALLEL_WARMUP: constructed by WarmUp's threads, inserted after them.
+        auto& job = g_preload_jobs->emplace_back();
+        job.key = graphics_key;
+        job.infos = infos;
+        job.runtime_infos = runtime_infos;
+        job.modules = modules;
+        job.fetch_shader = fetch_shader;
+        job.sdata = std::move(sdata);
+        infos.fill(nullptr);
+        modules.fill(nullptr);
+        fetch_shader.reset();
+        return true;
     }
 
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
@@ -421,6 +468,11 @@ void PipelineCache::WarmUp() {
     u32 num_pipelines{};
     u32 num_total_pipelines{};
 
+    const auto t_warmup = std::chrono::steady_clock::now();
+    std::vector<PreloadGraphicsJob> preload_jobs;
+    if (ParallelWarmUpEnabled()) {
+        g_preload_jobs = &preload_jobs;
+    }
     Storage::DataBase::Instance().ForEachBlob(
         Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
             ++num_total_pipelines;
@@ -448,6 +500,45 @@ void PipelineCache::WarmUp() {
                 ++num_pipelines;
             }
         });
+    g_preload_jobs = nullptr;
+
+    if (!preload_jobs.empty()) {
+        const auto t_build = std::chrono::steady_clock::now();
+        const char* env = std::getenv("SHADPS4_WARMUP_THREADS");
+        const u32 hw = std::max(2u, std::thread::hardware_concurrency());
+        const u32 num_threads = std::clamp<u32>(
+            env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : hw / 2, 1u, 16u);
+        std::atomic<size_t> next{0};
+        {
+            std::vector<std::jthread> threads;
+            for (u32 t = 0; t < num_threads; ++t) {
+                threads.emplace_back([&] {
+                    for (size_t i = next.fetch_add(1); i < preload_jobs.size();
+                         i = next.fetch_add(1)) {
+                        auto& job = preload_jobs[i];
+                        job.pipeline = std::make_unique<GraphicsPipeline>(
+                            instance, scheduler, desc_heap, profile, job.key, *pipeline_cache,
+                            job.infos, job.runtime_infos, job.fetch_shader, job.modules, job.sdata,
+                            true);
+                    }
+                });
+            }
+        } // joins
+        for (auto& job : preload_jobs) {
+            const auto [it, is_new] = graphics_pipelines.try_emplace(job.key);
+            ASSERT(is_new);
+            it.value() = std::move(job.pipeline);
+        }
+        LOG_INFO(Render, "WarmUp: {} graphics pipelines built on {} threads in {} ms",
+                 preload_jobs.size(), num_threads,
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - t_build)
+                     .count());
+    }
+    LOG_INFO(Render, "WarmUp: total {} ms",
+             std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - t_warmup)
+                 .count());
 
     LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
     if (num_total_pipelines > num_pipelines) {
