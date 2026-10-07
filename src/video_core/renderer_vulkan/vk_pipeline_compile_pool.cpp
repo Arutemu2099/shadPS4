@@ -201,6 +201,19 @@ bool AsyncComputePipelinesEnabled() {
     return enabled;
 }
 
+vk::PipelineCreateFlags DiagPipelineCreateFlags() {
+    static const bool no_opt = [] {
+        const char* value = std::getenv("SHADPS4_PIPELINE_NO_OPT");
+        const bool on = value && value[0] == '1';
+        if (on) {
+            LOG_WARNING(Render_Vulkan, "SHADPS4_PIPELINE_NO_OPT: pipelines are created without "
+                                       "driver optimization (diagnostic)");
+        }
+        return on;
+    }();
+    return no_opt ? vk::PipelineCreateFlagBits::eDisableOptimization : vk::PipelineCreateFlags{};
+}
+
 bool DeferredPipeline::TryRun(bool by_waiter) {
     u32 expected = Queued;
     if (!state.compare_exchange_strong(expected, Running, std::memory_order_acq_rel)) {
@@ -217,6 +230,7 @@ bool DeferredPipeline::TryRun(bool by_waiter) {
         .pName = "main",
     };
     const vk::ComputePipelineCreateInfo compute_pipeline_ci = {
+        .flags = DiagPipelineCreateFlags(),
         .stage = shader_ci,
         .layout = layout,
     };

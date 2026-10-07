@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <memory>
+#include <vector>
 #include <glslang/Include/ResourceLimits.h>
 #include <glslang/Public/ShaderLang.h>
 #include <glslang/SPIRV/GlslangToSpv.h>
@@ -255,6 +257,19 @@ vk::ShaderModule Compile(std::string_view code, vk::ShaderStageFlagBits stage, v
 }
 
 vk::ShaderModule CompileSPV(std::span<const u32> code, vk::Device device) {
+    // SHADPS4_SPIRV_SALT=<n> (diagnostic, 2026-10-07): writes n into the SPIR-V header's generator
+    // word (informational only), so the driver's own shader cache misses and a run measures
+    // first-time driver compiles without touching that cache.
+    static const u32 salt = [] {
+        const char* value = std::getenv("SHADPS4_SPIRV_SALT");
+        return value ? static_cast<u32>(std::strtoul(value, nullptr, 0)) : 0u;
+    }();
+    std::vector<u32> salted;
+    if (salt != 0 && code.size() > 2) [[unlikely]] {
+        salted.assign(code.begin(), code.end());
+        salted[2] = salt;
+        code = salted;
+    }
     const vk::ShaderModuleCreateInfo shader_info = {
         .codeSize = code.size() * sizeof(u32),
         .pCode = code.data(),

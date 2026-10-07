@@ -23,6 +23,12 @@ namespace Vulkan {
 /// The boot preload (WarmUp) defers the same way, so the game starts while they compile.
 bool AsyncComputePipelinesEnabled();
 
+/// SHADPS4_PIPELINE_NO_OPT=1 (diagnostic, 2026-10-07): every game pipeline (graphics and compute)
+/// is created with VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT, to measure how much faster the
+/// driver compiles a pipeline it has not seen (the first-use stutter) and what the unoptimized
+/// shaders cost the GPU. Empty flags otherwise.
+vk::PipelineCreateFlags DiagPipelineCreateFlags();
+
 /// One pending vkCreateComputePipelines, owned by its Pipeline (never destroyed while a worker
 /// can run it: pipelines live until the cache is destroyed, after PipelineCompilePool::Shutdown).
 struct DeferredPipeline {

@@ -12,6 +12,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_pipeline_compile_pool.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
@@ -401,6 +402,7 @@ GraphicsPipeline::GraphicsPipeline(
     const vk::GraphicsPipelineCreateInfo pipeline_info = {
         .pNext = uses_native_bindings ? static_cast<const void*>(&flags2_ci)
                                       : static_cast<const void*>(&pipeline_rendering_ci),
+        .flags = DiagPipelineCreateFlags(),
         .stageCount = static_cast<u32>(shader_stages.size()),
         .pStages = shader_stages.data(),
         .pVertexInputState = !instance.IsVertexInputDynamicState() ? &vertex_input_info : nullptr,

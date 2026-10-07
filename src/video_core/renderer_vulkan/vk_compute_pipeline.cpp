@@ -193,6 +193,7 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         return;
     }
     const vk::ComputePipelineCreateInfo compute_pipeline_ci = {
+        .flags = DiagPipelineCreateFlags(),
         .stage = shader_ci,
         .layout = *pipeline_layout,
     };
