@@ -59,6 +59,9 @@ struct Program {
     // Bumped by every module-list or module-handle mutation. Prepared graphics pipeline
     // entries record it, since a new/inserted permutation can change first-match selection.
     u64 generation{};
+    // SHADPS4_PRECOMPILE: built before the game dispatched it; first live use counted once.
+    bool precompiled{};
+    bool precompiled_seen{};
 
     Program() = default;
     Program(Shader::Stage stage, Shader::LogicalStage l_stage, Shader::ShaderParams params)
@@ -100,6 +103,8 @@ public:
     ~PipelineCache();
 
     void WarmUp();
+    // SHADPS4_PRECOMPILE (vk_pipeline_precompile.cpp): run by WarmUp on the main thread.
+    void PrecompileFromExtract();
     void Sync();
 
     bool LoadComputePipeline(Serialization::Archive& ar);

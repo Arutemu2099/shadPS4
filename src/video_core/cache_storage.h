@@ -32,6 +32,8 @@ public:
         return opened;
     }
     void FinishPreload();
+    // SHADPS4_CACHE_PREFETCH=1: read every cache file once on several threads (folder mode).
+    void Prefetch();
 
     bool Save(BlobType type, const std::string& name, std::vector<u8>&& data);
     bool Save(BlobType type, const std::string& name, std::vector<u32>&& data);

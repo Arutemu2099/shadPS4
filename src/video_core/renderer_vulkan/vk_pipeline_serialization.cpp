@@ -23,6 +23,9 @@ namespace Serialization {
 static constexpr u32 ShaderBinaryVersion = 4u; // GDS append index computed at run time (d6857fbc)
 static constexpr u32 ShaderMetaVersion = 4u; // ImageSpecialization gained is_block_1d
 static constexpr u32 PipelineKeyVersion = 4u; // SerializationSupport gained image_binding_counts
+// SHADPS4_PRECOMPILE: metas of permutations built from guessed contexts carry this bit, so builds
+// whose compute key lacks num_user_data / LDS size (before 2026-10-07) reject them as stale.
+static constexpr u32 PrecompiledMetaBit = 0x80000000u;
 } // namespace Serialization
 
 namespace Vulkan {
@@ -72,7 +75,7 @@ void RegisterPipelineData(const GraphicsPipelineKey& key, u64 hash,
 void RegisterShaderMeta(const Shader::Info& info,
                         const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
                         const Shader::StageSpecialization& spec, size_t perm_hash,
-                        size_t perm_idx) {
+                        size_t perm_idx, bool precompiled) {
     if (!Storage::DataBase::Instance().IsOpened()) {
         return;
     }
@@ -80,7 +83,8 @@ void RegisterShaderMeta(const Shader::Info& info,
     Serialization::Archive ar;
     Serialization::Writer meta{ar};
 
-    meta.Write(Serialization::ShaderMetaVersion);
+    meta.Write(Serialization::ShaderMetaVersion |
+               (precompiled ? Serialization::PrecompiledMetaBit : 0u));
     meta.Write(Serialization::ShaderBinaryVersion);
 
     meta.Write(perm_hash);
@@ -129,7 +133,7 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u32 meta_version{};
     meta.Read(meta_version);
-    if (meta_version != Serialization::ShaderMetaVersion) {
+    if ((meta_version & ~Serialization::PrecompiledMetaBit) != Serialization::ShaderMetaVersion) {
         return false;
     }
 
@@ -435,6 +439,7 @@ void PipelineCache::WarmUp() {
     }
 
     Storage::DataBase::Instance().Open(instance.IsNativeBindingsActive());
+    Storage::DataBase::Instance().Prefetch();
 
     // Check if cache is compatible
     std::vector<u8> profile_data{};
@@ -545,6 +550,8 @@ void PipelineCache::WarmUp() {
         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
                     num_total_pipelines - num_pipelines);
     }
+
+    PrecompileFromExtract();
 
     Storage::DataBase::Instance().FinishPreload();
 }

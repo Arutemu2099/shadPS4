@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/polyfill_thread.h"
@@ -14,9 +15,13 @@
 
 #include <miniz.h>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
+#include <fstream>
+#include <thread>
+#include <vector>
 #include <system_error>
 #include <functional>
 #include <future>
@@ -103,8 +108,14 @@ void DataBase::Open(bool native_bindings) {
     // accepts every version-3 entry except GDS shaders (LoadShaderMeta), so only those few
     // recompile when the user alternates builds. (A per-version folder seeded by a copy was
     // tried on 2026-10-07: the copy of ~38,000 files took 120 s at first launch.)
-    const auto cache_name = std::string{game_info.GameSerial()} +
-                            (native_bindings ? "_native_bindings_v1" : "");
+    auto cache_name = std::string{game_info.GameSerial()} +
+                      (native_bindings ? "_native_bindings_v1" : "");
+    // SHADPS4_CACHE_NAME (2026-10-07): another folder / archive name, e.g. a copy for test runs
+    // that write entries the user's own cache should not get.
+    if (const char* name = std::getenv("SHADPS4_CACHE_NAME"); name && *name) {
+        cache_name = name;
+        LOG_INFO(Render, "Pipeline cache name from SHADPS4_CACHE_NAME: {}", cache_name);
+    }
 
     using namespace Common::FS;
     if (EmulatorSettings.IsPipelineCacheArchived()) {
@@ -269,6 +280,48 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
             }
         }
     }
+}
+
+void DataBase::Prefetch() {
+    // The first open of a cache file is slow (~3.7 ms each on the user's PC, 2026-10-07: 38,368
+    // files took 141 s on one thread and 13.2 s on 16; a second pass 3.0 s). WarmUp opens every blob
+    // one by one, so a build's first launch, or any launch after the files' scan results expired,
+    // showed a black screen for minutes. Reading them once on many threads first makes that serial
+    // loop hit warm files.
+    const char* env = std::getenv("SHADPS4_CACHE_PREFETCH");
+    if (!opened || !env || env[0] != '1' || EmulatorSettings.IsPipelineCacheArchived()) {
+        return;
+    }
+    const auto t_start = std::chrono::steady_clock::now();
+    std::vector<std::filesystem::path> files;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(cache_path, ec)) {
+        if (entry.is_regular_file(ec)) {
+            files.push_back(entry.path());
+        }
+    }
+    constexpr u32 NumThreads = 16;
+    std::atomic<size_t> next{0};
+    std::atomic<u64> bytes{0};
+    {
+        std::vector<std::jthread> threads;
+        for (u32 t = 0; t < NumThreads; ++t) {
+            threads.emplace_back([&] {
+                std::vector<char> buffer(64 * 1024);
+                for (size_t i = next.fetch_add(1); i < files.size(); i = next.fetch_add(1)) {
+                    std::ifstream file(files[i], std::ios::binary);
+                    while (file.read(buffer.data(), buffer.size()) || file.gcount() > 0) {
+                        bytes.fetch_add(static_cast<u64>(file.gcount()), std::memory_order_relaxed);
+                    }
+                }
+            });
+        }
+    } // joins
+    LOG_INFO(Render, "Pipeline cache prefetch: {} files, {} MB read on {} threads in {} ms",
+             files.size(), bytes.load() >> 20, NumThreads,
+             std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - t_start)
+                 .count());
 }
 
 void DataBase::FinishPreload() {

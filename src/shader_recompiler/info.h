@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cstring>
 #include <optional>
 #include <span>
 #include <vector>
@@ -80,6 +82,11 @@ struct InfoPersistent {
     InfoPersistent(Stage stage_, LogicalStage l_stage_, u64 pgm_hash_)
         : stage{stage_}, l_stage{l_stage_}, pgm_hash{pgm_hash_} {}
 };
+
+/// SHADPS4_PRECOMPILE (video_core/renderer_vulkan/vk_pipeline_precompile.cpp): while set,
+/// RefreshFlatBuf takes the flattened user data from this image instead of walking the guest
+/// pointers in user data. Set only by WarmUp on the main thread, before the game runs.
+inline const std::vector<u32>* g_synthetic_flat = nullptr;
 
 struct Info : InfoPersistent {
     struct AttributeFlags {
@@ -194,6 +201,13 @@ struct Info : InfoPersistent {
 
     void RefreshFlatBuf() {
         flattened_ud_buf.resize(srt_info.flattened_bufsize_dw);
+        if (g_synthetic_flat) [[unlikely]] {
+            // Pre-compile: a recorded or synthesized image, no guest pointers to walk.
+            std::fill(flattened_ud_buf.begin(), flattened_ud_buf.end(), 0u);
+            std::memcpy(flattened_ud_buf.data(), g_synthetic_flat->data(),
+                        std::min(flattened_ud_buf.size(), g_synthetic_flat->size()) * sizeof(u32));
+            return;
+        }
         ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
         std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
         if (srt_info.walker_func) {

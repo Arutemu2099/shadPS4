@@ -1502,6 +1502,10 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
 
     const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
     const bool compiled = it == program->modules.end();
+    if (program->precompiled && !program->precompiled_seen) [[unlikely]] {
+        program->precompiled_seen = true;
+        NotePrecompiledUse(*program, spec, !compiled);
+    }
     if (compiled) {
         const auto t_translate = CompileClock::now();
         auto new_info = Shader::Info(stage, l_stage, params);

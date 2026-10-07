@@ -217,7 +217,10 @@ struct ComputeRuntimeInfo {
     std::array<bool, 3> tgid_enable;
 
     bool operator==(const ComputeRuntimeInfo& other) const noexcept {
-        return workgroup_size == other.workgroup_size && tgid_enable == other.tgid_enable;
+        // shared_memory_size is keyed since 2026-10-07: SHADPS4_PRECOMPILE guesses it for shaders
+        // the game has not dispatched yet, and a wrong guess must miss, not be reused.
+        return workgroup_size == other.workgroup_size && tgid_enable == other.tgid_enable &&
+               shared_memory_size == other.shared_memory_size;
     }
 };
 
@@ -261,7 +264,8 @@ struct RuntimeInfo {
         case Stage::Vertex:
             return vs_info == other.vs_info;
         case Stage::Compute:
-            return cs_info == other.cs_info;
+            // num_user_data places tgid after the user SGPRs; keyed for SHADPS4_PRECOMPILE's guesses.
+            return cs_info == other.cs_info && num_user_data == other.num_user_data;
         case Stage::Export:
             return es_info == other.es_info;
         case Stage::Geometry:

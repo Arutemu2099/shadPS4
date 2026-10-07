@@ -18,8 +18,14 @@ void RegisterPipelineData(const GraphicsPipelineKey& key, u64 hash,
                           GraphicsPipeline::SerializationSupport& sdata);
 void RegisterShaderMeta(const Shader::Info& info,
                         const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
-                        const Shader::StageSpecialization& spec, size_t perm_hash, size_t perm_idx);
+                        const Shader::StageSpecialization& spec, size_t perm_hash, size_t perm_idx,
+                        bool precompiled = false);
 void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx);
+// SHADPS4_PRECOMPILE: the game's first dispatch of a pre-compiled program, matched or not.
+void NotePrecompiledUse(const Program& program, const Shader::StageSpecialization& live, bool hit);
+bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
+                    std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
+                    Shader::StageSpecialization& spec, size_t& perm_idx);
 // True when two translations of one program give the same descriptor bindings (buffer kinds and
 // order, images, samplers, fmasks). Permutations share one Info, so they must agree on these.
 bool SameBindingLayout(const Shader::Info& a, const Shader::Info& b);
