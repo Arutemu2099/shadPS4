@@ -435,6 +435,7 @@ void PipelineCache::WarmUp() {
     }
 
     Storage::DataBase::Instance().Open(instance.IsNativeBindingsActive());
+    Storage::DataBase::Instance().Prefetch();
 
     // Check if cache is compatible
     std::vector<u8> profile_data{};
