@@ -939,7 +939,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     ImageId image_id = reuse ? memo_id : ImageId{};
 
     // Check for a perfect match first. Last qualifying candidate wins; registration/removal
-    // invalidates ALL memos so reuse preserves this ordering, including overlapping aliases.
+    // invalidates ALL memos, or (SHADPS4_PREPARED_LOCAL) bumps overlap_epoch of every image on the
+    // touched pages, so reuse preserves this ordering, including overlapping aliases.
     for (const auto& cache_id : image_ids) {
         auto& cache_image = slot_images[cache_id];
         if (cache_image.info.guest_address != info.guest_address) {
@@ -1070,6 +1071,11 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
 bool TextureCache::PreparedEntryValid(const PreparedImage& memo, u64 generation, bool& local_hit) {
     local_hit = false;
+    // Flag off (or a non-local entry): the old gate, before touching the slot at all (a deferred
+    // slot erase may run off the CP thread; Opus review 2026-10-07).
+    if (memo.generation != generation && !memo.local) {
+        return false;
+    }
     if (!memo.id || !memo.uid || !slot_images.is_allocated(memo.id)) {
         return false;
     }
