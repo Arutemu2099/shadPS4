@@ -31,6 +31,7 @@ class Instance;
 class Scheduler;
 class DescriptorHeap;
 class NativeBindings;
+struct DeferredPipeline;
 
 class Pipeline {
 public:
@@ -40,6 +41,10 @@ public:
     virtual ~Pipeline();
 
     vk::Pipeline Handle() const noexcept {
+        // SHADPS4_ASYNC_COMPUTE_PIPELINES: the driver compile may still be pending.
+        if (deferred) [[unlikely]] {
+            WaitDeferred();
+        }
         return *pipeline;
     }
 
@@ -122,6 +127,9 @@ protected:
 
     void RecordBufferBarriers(const BufferBarriers& buffer_barriers) const;
 
+    /// Returns once `deferred` has written `pipeline` (vk_pipeline_compile_pool.h).
+    void WaitDeferred() const noexcept;
+
     /// Builds one heap mapping per legacy binding, grouped by the owning shader stage.
     void BuildNativeMappings(std::span<const vk::DescriptorSetLayoutBinding> bindings);
 
@@ -138,6 +146,9 @@ protected:
     DescriptorHeap& desc_heap;
     const Shader::Profile& profile;
     vk::UniquePipeline pipeline;
+    /// SHADPS4_ASYNC_COMPUTE_PIPELINES: set by the constructor when `pipeline` is compiled on the
+    /// pool; written before the object is published to another thread, never reset.
+    std::unique_ptr<DeferredPipeline> deferred;
     vk::UniquePipelineLayout pipeline_layout;
     vk::UniqueDescriptorSetLayout desc_layout;
     std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};

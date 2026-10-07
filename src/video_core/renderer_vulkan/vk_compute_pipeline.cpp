@@ -10,6 +10,7 @@
 #include "video_core/host_shaders/infamous_particle_sort_comp.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_pipeline_compile_pool.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
@@ -175,6 +176,22 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     pipeline_layout = std::move(layout);
     SetObjectName(device, *pipeline_layout, "Compute PipelineLayout {}", debug_str);
 
+    // SHADPS4_ASYNC_COMPUTE_PIPELINES: only the driver compile is deferred; layouts and bindings
+    // above exist now. The smoke-sort replacement module dies with this constructor (SCOPE_EXIT),
+    // so that one pipeline stays synchronous.
+    if (AsyncComputePipelinesEnabled() && !synchronized_module) {
+        deferred = std::make_unique<DeferredPipeline>();
+        deferred->device = device;
+        deferred->cache = pipeline_cache;
+        deferred->module = module;
+        deferred->layout = *pipeline_layout;
+        deferred->subgroup_size_64 = instance.IsSubgroupSize64Supported();
+        deferred->preload = preloading;
+        deferred->debug_name = fmt::format("Compute Pipeline {}", debug_str);
+        deferred->out = &pipeline;
+        PipelineCompilePool::Push(deferred.get());
+        return;
+    }
     const vk::ComputePipelineCreateInfo compute_pipeline_ci = {
         .stage = shader_ci,
         .layout = *pipeline_layout,

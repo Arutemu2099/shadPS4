@@ -13,6 +13,7 @@
 #include "video_core/renderer_vulkan/vk_native_bindings.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
+#include "video_core/renderer_vulkan/vk_pipeline_compile_pool.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Vulkan {
@@ -25,7 +26,21 @@ Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorH
     : instance{instance_}, scheduler{scheduler_}, desc_heap{desc_heap_}, profile{profile_},
       is_compute{is_compute_} {}
 
-Pipeline::~Pipeline() = default;
+Pipeline::~Pipeline() {
+    // SHADPS4_ASYNC_COMPUTE_PIPELINES: a worker may not write into a destroyed pipeline. The
+    // cache stops the pool (or waits for it to go idle) before destroying pipelines, so a job is
+    // at most still running here, never queued.
+    if (deferred) {
+        for (u32 s = deferred->state.load(std::memory_order_acquire);
+             s == DeferredPipeline::Running; s = deferred->state.load(std::memory_order_acquire)) {
+            deferred->state.wait(s, std::memory_order_acquire);
+        }
+    }
+}
+
+void Pipeline::WaitDeferred() const noexcept {
+    deferred->Wait();
+}
 
 void Pipeline::BeginBufferBarriers(const BufferBarriers& buffer_barriers) const {
     // RecordBufferBarriers without its record (kept separate so the legacy path, including the

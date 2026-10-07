@@ -1110,6 +1110,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_draw_packet.h
                src/video_core/renderer_vulkan/vk_pipeline_common.cpp
                src/video_core/renderer_vulkan/vk_pipeline_common.h
+               src/video_core/renderer_vulkan/vk_pipeline_compile_pool.cpp
+               src/video_core/renderer_vulkan/vk_pipeline_compile_pool.h
                src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
                src/video_core/renderer_vulkan/vk_pipeline_serialization.h
                src/video_core/renderer_vulkan/vk_platform.cpp

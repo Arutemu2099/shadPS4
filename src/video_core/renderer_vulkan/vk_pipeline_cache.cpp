@@ -30,6 +30,7 @@
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_pipeline_compile_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -477,6 +478,8 @@ PipelineCache::~PipelineCache() {
     // SHADPS4_ASYNC_PIPELINES: the compiler references members of this object; stop it first.
     // Queued jobs are dropped, finished unpublished pipelines are destroyed with it.
     async_compiler.reset();
+    // SHADPS4_ASYNC_COMPUTE_PIPELINES: no worker may write into a pipeline destroyed below.
+    PipelineCompilePool::Shutdown();
     scheduler.DrainRecording();
 }
 
@@ -1561,6 +1564,8 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
         if (async_compiler) {
             async_compiler->WaitIdle();
         }
+        // SHADPS4_ASYNC_COMPUTE_PIPELINES: queued compute compiles hold module handles too.
+        PipelineCompilePool::WaitIdle();
         // Entries hold pipeline pointers and module handles; drop them all before either
         // can be destroyed below. Runs on the command-processor thread like the draws.
         ++prepared_pipeline_epoch;
