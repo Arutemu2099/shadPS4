@@ -28,6 +28,7 @@ bool AsyncComputePipelinesEnabled();
 struct DeferredPipeline {
     enum : u32 { Queued = 0, Running = 1, Done = 2 };
     std::atomic<u32> state{Queued};
+    std::atomic<bool> promoted{}; ///< A preload job re-queued ahead of the backlog (Promote).
 
     vk::Device device;
     vk::PipelineCache cache;
@@ -52,10 +53,17 @@ struct DeferredPipeline {
 /// Jobs the game is about to use (pushed while playing) run before boot-preload jobs.
 namespace PipelineCompilePool {
 void Push(DeferredPipeline* job);
+/// The game looked up a pipeline whose boot-preload compile is still queued: queue it again
+/// ahead of the preload backlog (once), so it is compiled by a worker, not by the back's
+/// first Handle() (Opus review 2026-10-07).
+void Promote(DeferredPipeline* job);
 /// Returns once nothing is queued or running (shader hot reload).
 void WaitIdle();
 /// Stops and joins the workers; queued jobs are dropped (their pipelines are about to be
 /// destroyed). Call before destroying any pipeline that may still be queued.
+/// RULE: a Pipeline with a deferred job may be destroyed only after Shutdown or a WaitIdle
+/// with no new pushes since: the queues hold raw pointers (also duplicates from Promote, and
+/// jobs a waiter already ran). Pipeline eviction would need a cancel path first.
 void Shutdown();
 } // namespace PipelineCompilePool
 

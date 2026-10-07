@@ -29,7 +29,8 @@ Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorH
 Pipeline::~Pipeline() {
     // SHADPS4_ASYNC_COMPUTE_PIPELINES: a worker may not write into a destroyed pipeline. The
     // cache stops the pool (or waits for it to go idle) before destroying pipelines, so a job is
-    // at most still running here, never queued.
+    // at most still running here; a queued one is no longer referenced by the pool (the RULE in
+    // vk_pipeline_compile_pool.h).
     if (deferred) {
         for (u32 s = deferred->state.load(std::memory_order_acquire);
              s == DeferredPipeline::Running; s = deferred->state.load(std::memory_order_acquire)) {
@@ -40,6 +41,12 @@ Pipeline::~Pipeline() {
 
 void Pipeline::WaitDeferred() const noexcept {
     deferred->Wait();
+}
+
+void Pipeline::PromoteDeferredSlow() const noexcept {
+    if (deferred->preload && !deferred->IsDone()) {
+        PipelineCompilePool::Promote(deferred.get());
+    }
 }
 
 void Pipeline::BeginBufferBarriers(const BufferBarriers& buffer_barriers) const {

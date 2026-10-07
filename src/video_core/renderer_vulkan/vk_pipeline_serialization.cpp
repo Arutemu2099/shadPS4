@@ -128,7 +128,11 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u32 binary_version{};
     meta.Read(binary_version);
-    if (binary_version != Serialization::ShaderBinaryVersion) {
+    // Version 3 -> 4 changed only shaders that append / consume through GDS (the counter index
+    // was baked at compile time, d6857fbc). A version-3 entry of any other shader is still exact,
+    // so the cache copied from the version-3 folder (cache_storage.cpp Open) stays warm.
+    const bool upgradable = binary_version == 3u && Serialization::ShaderBinaryVersion == 4u;
+    if (binary_version != Serialization::ShaderBinaryVersion && !upgradable) {
         return false;
     }
 
@@ -138,6 +142,13 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     spec.Deserialize(ar);
     info.Deserialize(ar);
+    if (binary_version != Serialization::ShaderBinaryVersion) {
+        for (const auto& buffer : info.buffers) {
+            if (buffer.buffer_type == Shader::BufferType::GdsBuffer) {
+                return false; // recompiled with the fix, stored as version 4
+            }
+        }
+    }
 
     fetch_shader_data = spec.fetch_shader_data;
     return true;

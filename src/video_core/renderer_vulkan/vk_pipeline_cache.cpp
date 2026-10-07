@@ -1062,6 +1062,9 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
             auto& m = modules[0];
             module_related_pipelines[m].emplace_back(compute_key);
         }
+    } else {
+        // SHADPS4_ASYNC_COMPUTE_PIPELINES: a preloaded pipeline still waiting for its compile.
+        it->second->PromoteDeferred();
     }
     return it->second.get();
 }

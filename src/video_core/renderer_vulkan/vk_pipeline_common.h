@@ -48,6 +48,14 @@ public:
         return *pipeline;
     }
 
+    /// SHADPS4_ASYNC_COMPUTE_PIPELINES: the lookup thread found this pipeline; if its boot-preload
+    /// compile is still queued, move it ahead of the backlog.
+    void PromoteDeferred() const noexcept {
+        if (deferred) [[unlikely]] {
+            PromoteDeferredSlow();
+        }
+    }
+
     vk::PipelineLayout GetLayout() const noexcept {
         return *pipeline_layout;
     }
@@ -129,6 +137,7 @@ protected:
 
     /// Returns once `deferred` has written `pipeline` (vk_pipeline_compile_pool.h).
     void WaitDeferred() const noexcept;
+    void PromoteDeferredSlow() const noexcept;
 
     /// Builds one heap mapping per legacy binding, grouped by the owning shader stage.
     void BuildNativeMappings(std::span<const vk::DescriptorSetLayoutBinding> bindings);

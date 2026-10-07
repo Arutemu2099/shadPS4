@@ -32,7 +32,7 @@ struct Stats {
     std::atomic<u64> done{}, done_preload{}, by_waiter{};
     std::atomic<u64> create_ns{}, max_create_ns{}, queue_ns{};
     std::atomic<u64> waits{}, wait_ns{}, max_wait_ns{}, preload_waits{};
-    std::atomic<u64> queue_max{};
+    std::atomic<u64> queue_max{}, promoted{};
 };
 Stats g_stats;
 
@@ -53,12 +53,13 @@ void MaybeLog(u64 done) {
     LOG_INFO(Render_Vulkan,
              "AsyncCompute: done={} preload={} run_by_waiter={} create_ms total={:.1f} max={:.2f} "
              "queue_ms total={:.1f} | waits={} (preload {}) wait_ms total={:.1f} max={:.2f} | "
-             "queue_max={}",
+             "queue_max={} promoted={}",
              done, g_stats.done_preload.load(std::memory_order_relaxed),
              g_stats.by_waiter.load(std::memory_order_relaxed), ms(g_stats.create_ns),
              ms(g_stats.max_create_ns), ms(g_stats.queue_ns), waits,
              g_stats.preload_waits.load(std::memory_order_relaxed), ms(g_stats.wait_ns),
-             ms(g_stats.max_wait_ns), g_stats.queue_max.load(std::memory_order_relaxed));
+             ms(g_stats.max_wait_ns), g_stats.queue_max.load(std::memory_order_relaxed),
+             g_stats.promoted.load(std::memory_order_relaxed));
 }
 
 class Pool {
@@ -72,6 +73,23 @@ public:
             (job->preload ? preload : demand).push_back(job);
             AtomicMax(g_stats.queue_max, demand.size() + preload.size());
         }
+        cv.notify_one();
+    }
+
+    /// A boot-preload job the game is about to use: queue it again ahead of the backlog. The old
+    /// entry stays in `preload`; whichever entry a worker pops second finds the job taken.
+    void Promote(DeferredPipeline* job) {
+        if (job->promoted.exchange(true, std::memory_order_relaxed)) {
+            return;
+        }
+        {
+            std::scoped_lock lk{mutex};
+            if (threads.empty()) {
+                return; // shut down: the waiter runs it
+            }
+            demand.push_back(job);
+        }
+        g_stats.promoted.fetch_add(1, std::memory_order_relaxed);
         cv.notify_one();
     }
 
@@ -100,6 +118,7 @@ public:
         std::scoped_lock lk{mutex};
         demand.clear();
         preload.clear();
+        idle_cv.notify_all();
     }
 
 private:
@@ -124,13 +143,24 @@ private:
             DeferredPipeline* job{};
             {
                 std::unique_lock lk{mutex};
-                if (!cv.wait(lk, stoken, [&] { return !demand.empty() || !preload.empty(); })) {
-                    return; // stop requested
+                // wait() returns the predicate after a stop request: check the token too, so a
+                // shutdown drops the backlog instead of compiling it (Opus review 2026-10-07).
+                if (!cv.wait(lk, stoken, [&] { return !demand.empty() || !preload.empty(); }) ||
+                    stoken.stop_requested()) {
+                    return;
                 }
-                auto& queue = !demand.empty() ? demand : preload;
+                const bool from_preload = demand.empty();
+                auto& queue = from_preload ? preload : demand;
                 job = queue.front();
                 queue.pop_front();
                 ++running;
+                if (from_preload && preload.empty() && !preload_drained_logged) {
+                    preload_drained_logged = true;
+                    LOG_INFO(Render_Vulkan,
+                             "AsyncCompute: boot preload queue drained (last job taken) {:.0f} ms "
+                             "after it was queued",
+                             static_cast<double>(NsSince(job->queued_at)) / 1e6);
+                }
             }
             job->TryRun(false);
             {
@@ -150,12 +180,15 @@ private:
     std::deque<DeferredPipeline*> preload;
     u32 running{};
     bool stopped{};
+    bool preload_drained_logged{};
     std::vector<std::jthread> threads;
 };
 
 Pool& GetPool() {
-    static Pool pool;
-    return pool;
+    // Never destroyed: a static Pool would die before the global presenter that owns the
+    // pipeline cache, whose destructor still calls Shutdown (Opus review 2026-10-07).
+    static Pool* pool = new Pool;
+    return *pool;
 }
 
 } // Anonymous namespace
@@ -232,6 +265,10 @@ namespace PipelineCompilePool {
 void Push(DeferredPipeline* job) {
     job->queued_at = Clock::now();
     GetPool().Push(job);
+}
+
+void Promote(DeferredPipeline* job) {
+    GetPool().Promote(job);
 }
 
 void WaitIdle() {
