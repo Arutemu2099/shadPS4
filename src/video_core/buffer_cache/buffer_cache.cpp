@@ -3821,6 +3821,108 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
     });
 }
 
+u64 BufferCache::RmemoCensusStamp(const Buffer& buffer) {
+    auto& c = rmemo_census;
+    if (!c.started) [[unlikely]] {
+        c.started = true;
+        c.gen = 1; // a stamp is never 0, the value of a never-stamped entry
+        c.dirty_head = DirtyLog::Start();
+        c.tsc0 = __rdtsc();
+        c.t0 = std::chrono::steady_clock::now();
+        LOG_INFO(Render, "RmemoCensus: on (back_clean={}, pb_census={}; needs 1 / 0)", g_back_clean,
+                 g_pb_census);
+    }
+    // A second consumer of the dirty-page log: every page range marked CPU-dirty since the last
+    // drain bumps the counter of each cache Buffer its 16 KiB pages map to now.
+    const bool ok = DirtyLog::Drain(c.dirty_head, [&](u64 first_page, u64 count) {
+        ++c.drained;
+        const u64 lo = (first_page << TRACKER_PAGE_BITS) >> CACHING_PAGEBITS;
+        const u64 hi = (((first_page + count) << TRACKER_PAGE_BITS) - 1) >> CACHING_PAGEBITS;
+        BufferId last{};
+        for (u64 page = lo; page <= hi; ++page) {
+            const PageData* entry = page_table.find(page);
+            if (!entry || IsBufferInvalid(entry->buffer_id) || entry->buffer_id == last ||
+                !slot_buffers.is_allocated(entry->buffer_id)) {
+                continue;
+            }
+            last = entry->buffer_id;
+            ++slot_buffers[last].census_dirty_seq;
+            ++c.bumps;
+        }
+    });
+    if (!ok) [[unlikely]] {
+        ++c.gen;
+        ++c.resets;
+    }
+    return (c.gen << 48) | (buffer.census_dirty_seq & ((1ULL << 48) - 1));
+}
+
+void BufferCache::RmemoCensusCount(int cls, const Buffer& buffer, bool epoch_same, u64 cyc,
+                                   bool timed) {
+    auto& c = rmemo_census;
+    ++c.calls[cls];
+    const u64 mib = buffer.SizeBytes() >> 20;
+    const int size_class = mib < 1      ? 0
+                           : mib < 4    ? 1
+                           : mib < 16   ? 2
+                           : mib < 64   ? 3
+                           : mib < 256  ? 4
+                           : mib < 1024 ? 5
+                                        : 6;
+    ++c.size_class[cls][size_class];
+    int path = 0;
+    if (cls != 0) {
+        const u8 bc = memory_tracker->census_bc;
+        path = last_sync_upload_bytes != 0 ? 2 : bc == 1 ? 0 : bc == 2 ? 1 : 3;
+        ++c.path[cls][path];
+        if (cls == 2 && epoch_same) {
+            ++c.epoch_same_path[path];
+        }
+    }
+    if (timed) {
+        ++c.timed[cls];
+        c.timed_cyc[cls] += cyc;
+        if (cls != 0 && path == 0) {
+            ++c.clean_timed[cls];
+            c.clean_cyc[cls] += cyc;
+            c.clean_check_cyc[cls] += memory_tracker->census_check_cyc;
+        }
+    }
+    const u64 total = c.calls[0] + c.calls[1] + c.calls[2] + c.calls[3];
+    if (total < c.next_log) [[likely]] {
+        return;
+    }
+    c.next_log = total + (1ULL << 22);
+    const double us = std::chrono::duration<double, std::micro>(
+                          std::chrono::steady_clock::now() - c.t0)
+                          .count();
+    const double tsc_per_ns = us > 0 ? double(__rdtsc() - c.tsc0) / (us * 1000.0) : 1.0;
+    const auto ns = [&](u64 cycles, u64 n) { return n ? double(cycles) / n / tsc_per_ns : 0.0; };
+    const auto& p = c.path;
+    const auto& s = c.size_class;
+    LOG_INFO(Render,
+             "RmemoCensus: calls hit/key/epoch/other={}/{}/{}/{} | path clean/walk0/upload/nonbc "
+             "key={}/{}/{}/{} epoch={}/{}/{}/{} other={}/{}/{}/{} | epoch own-buffer-clean by path "
+             "{}/{}/{}/{} | size <1/4/16/64/256/1024/more MiB hit={}/{}/{}/{}/{}/{}/{} key={}/{}/{}/{}/"
+             "{}/{}/{} epoch={}/{}/{}/{}/{}/{}/{} other={}/{}/{}/{}/{}/{}/{} | ns hit={:.1f} (n={}) "
+             "miss key={:.1f} epoch={:.1f} other={:.1f} | clean miss ns key={:.1f} check={:.1f} "
+             "epoch={:.1f} check={:.1f} other={:.1f} check={:.1f} (n={}/{}/{}) | drained={} bumps={} "
+             "resets={} tsc/ns={:.3f}",
+             c.calls[0], c.calls[1], c.calls[2], c.calls[3], p[1][0], p[1][1], p[1][2], p[1][3],
+             p[2][0], p[2][1], p[2][2], p[2][3], p[3][0], p[3][1], p[3][2], p[3][3],
+             c.epoch_same_path[0], c.epoch_same_path[1], c.epoch_same_path[2],
+             c.epoch_same_path[3], s[0][0], s[0][1], s[0][2], s[0][3], s[0][4], s[0][5], s[0][6],
+             s[1][0], s[1][1], s[1][2], s[1][3], s[1][4], s[1][5], s[1][6], s[2][0], s[2][1],
+             s[2][2], s[2][3], s[2][4], s[2][5], s[2][6], s[3][0], s[3][1], s[3][2], s[3][3],
+             s[3][4], s[3][5], s[3][6], ns(c.timed_cyc[0], c.timed[0]), c.timed[0],
+             ns(c.timed_cyc[1], c.timed[1]), ns(c.timed_cyc[2], c.timed[2]),
+             ns(c.timed_cyc[3], c.timed[3]), ns(c.clean_cyc[1], c.clean_timed[1]),
+             ns(c.clean_check_cyc[1], c.clean_timed[1]), ns(c.clean_cyc[2], c.clean_timed[2]),
+             ns(c.clean_check_cyc[2], c.clean_timed[2]), ns(c.clean_cyc[3], c.clean_timed[3]),
+             ns(c.clean_check_cyc[3], c.clean_timed[3]), c.clean_timed[1], c.clean_timed[2],
+             c.clean_timed[3], c.drained, c.bumps, c.resets, tsc_per_ns);
+}
+
 std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
                                                   bool is_texel_buffer, BufferId buffer_id,
                                                   Common::BufferSampleCaller sample_caller) {
@@ -3840,6 +3942,13 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     Common::BufferSampleProbe* const sample = sample_storage ? &*sample_storage : nullptr;
     const auto t_entry = Common::FaultMonitor::Now();
     u64 query_ns = 0;
+    // SHADPS4_RMEMO_CENSUS: read syncs only, 1 in 64 timed with rdtsc.
+    int census_cls = -1;
+    bool census_same = false;
+    u64 census_stamp = 0;
+    const bool census_timed =
+        g_rmemo_census && !is_written && !is_texel_buffer && ((++rmemo_census.seq & 63) == 0);
+    const u64 census_c0 = census_timed ? __rdtsc() : 0;
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     //
     // That trade is unmeasured. The fast path costs a guest->staging memcpy per binding per draw
@@ -3911,6 +4020,9 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         read_memo_epoch = g_dirty_epoch.load(std::memory_order_acquire);
         const bool serial_guard = g_read_bind_memo >= 3;
         read_memo_gen = serial_guard ? buffer.memo_serial : StructGeneration();
+        if (g_rmemo_census) [[unlikely]] {
+            census_stamp = RmemoCensusStamp(buffer);
+        }
         const u64 h = (device_addr * 0x9E3779B97F4A7C15ULL) ^ (u64(size) * 0xC2B2AE3D27D4EB4FULL) ^
                       u64(buffer_id.index);
         read_memo = &read_memo_table[(h ^ (h >> 31)) & (read_memo_table.size() - 1)];
@@ -3922,8 +4034,15 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         const bool guard_ok = read_memo->gen == read_memo_gen && (!serial_guard || read_memo_gen);
         if (!key) {
             ++st[2];
+            if (g_rmemo_census) [[unlikely]] {
+                census_cls = 1;
+            }
         } else if (!epoch_ok) {
             ++st[3];
+            if (g_rmemo_census) [[unlikely]] {
+                census_cls = 2;
+                census_same = read_memo->pb_written == census_stamp;
+            }
         } else if (!guard_ok) {
             ++st[4];
         } else {
@@ -3932,6 +4051,10 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                 PbFoldMemo(read_memo->pb_written);
             }
             if (g_read_bind_memo == 1 || g_read_bind_memo == 3) {
+                if (g_rmemo_census) [[unlikely]] {
+                    RmemoCensusCount(0, buffer, false, census_timed ? __rdtsc() - census_c0 : 0,
+                                     census_timed);
+                }
                 return {&buffer, buffer.Offset(device_addr)};
             }
             read_memo_verify = true;
@@ -3946,6 +4069,14 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                      b[0], b[1], b[2], b[3], b[4], o[0], o[1], o[2], o[3], o[4],
                      read_memo_verify_bad);
         }
+    }
+    if (g_rmemo_census && !is_written && !is_texel_buffer &&
+        sample_caller == Common::BufferSampleCaller::Other) [[unlikely]] {
+        census_cls = 3;
+    }
+    const u64 census_c1 = census_timed && census_cls >= 1 ? __rdtsc() : 0;
+    if (census_cls >= 1) [[unlikely]] {
+        memory_tracker->census_bc = 0;
     }
     if (Offload::AscSpanStatsEnabled()) [[unlikely]] {
         auto& span = Offload::AscSpan();
@@ -4060,6 +4191,49 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             return {&buffer, buffer.Offset(device_addr)};
         }
     }
+    // SHADPS4_READ_SYNC_FAST (notes/buffer-sync-validity-2026-10-07.md): 99.9% of the read syncs
+    // that get here (read-memo misses, vertex / index bindings) find no CPU-dirty page, and the
+    // back's private BackClean bits answer that in about a third of the full path's time
+    // (census run city-s188). With no unverified page SynchronizeBuffer records nothing (no copy,
+    // no protect change, no upload-ahead; texel syncs are excluded): return now. The memo entry
+    // is written as the full path writes it (epoch and guard read before the check). =2 runs the
+    // full path after every clean answer and counts uploads.
+    const auto write_read_memo = [&] {
+        // Epoch and generation read before the walk / check: a change during it misses next time.
+        *read_memo = {device_addr, size, read_memo_epoch, read_memo_gen, buffer_id.index};
+        if (g_pb_census != 0) [[unlikely]] {
+            read_memo->pb_written = PbDraw();
+        } else if (g_rmemo_census) [[unlikely]] {
+            // Stamp read before the walk, like the epoch.
+            read_memo->pb_written = census_stamp;
+        }
+    };
+    bool fast_verify = false;
+    u64 fast_tail = 0;
+    if (g_read_sync_fast != 0 && !is_written && !is_texel_buffer && !read_memo_verify) {
+        auto& fs = read_sync_fast_stats;
+        if ((++fs[0] & 0xffffff) == 0) {
+            LOG_INFO(Render,
+                     "ReadSyncFast: mode={} checks={} clean={} ({:.2f}%) verify uploads raced={} "
+                     "bad={}",
+                     g_read_sync_fast, fs[0], fs[1], 100.0 * double(fs[1]) / double(fs[0]), fs[2],
+                     fs[3]);
+        }
+        if (memory_tracker->ReadSyncClean(device_addr, size)) {
+            ++fs[1];
+            if (g_read_sync_fast == 1) {
+                last_sync_upload_bytes = 0;
+                if (read_memo) {
+                    write_read_memo();
+                }
+                return {&buffer, buffer.Offset(device_addr)};
+            }
+            fast_verify = true;
+            // The drain point, not the tail now: an entry appended after the drain is a race.
+            fast_tail = memory_tracker->BackCleanDrainedTo();
+            memory_tracker->census_bc = 0;
+        }
+    }
     const auto t_sync = Common::FaultMonitor::Now();
     const auto t_sample_sync = sample ? sample->Now() : ProbeClock::time_point{};
     const bool traffic = BufferTraffic::Enabled();
@@ -4071,6 +4245,28 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         g_buffer_traffic.Record(device_addr, size, is_written, is_texel_buffer,
                                 sample_caller == Common::BufferSampleCaller::Other, traffic_dirty,
                                 last_sync_upload_bytes);
+    }
+    if (fast_verify && (last_sync_upload_bytes != 0 || memory_tracker->census_bc == 2))
+        [[unlikely]] {
+        // The full path walked (found an unverified page) or uploaded after a clean answer. A
+        // dirty-log entry appended after the check's drain point that overlaps the range is a guest
+        // write that landed in between (the full path is right); none means the answer was wrong.
+        // With SHADPS4_BACK_CLEAN=2 the full path also checks the private bits against the
+        // tracker's own (its gap check), so a stale verified bit shows up here too.
+        const u64 lo = device_addr >> TRACKER_PAGE_BITS;
+        const u64 hi = (device_addr + size + TRACKER_BYTES_PER_PAGE - 1) >> TRACKER_PAGE_BITS;
+        bool raced = false;
+        u64 head = fast_tail;
+        raced |= !DirtyLog::Drain(head, [&](u64 first_page, u64 count) {
+            raced |= first_page < hi && lo < first_page + count;
+        });
+        auto& fs = read_sync_fast_stats;
+        if (++fs[raced ? 2 : 3] <= 20 && !raced) {
+            LOG_ERROR(Render,
+                      "ReadSyncFast verify: clean answer, full path walked (bc={}) and uploaded {} "
+                      "bytes at {:#x}+{:#x}",
+                      memory_tracker->census_bc, last_sync_upload_bytes, device_addr, size);
+        }
     }
     if (memo_entry) {
         // Epoch read before the walk: a clear during it makes the record miss next time.
@@ -4084,11 +4280,11 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                           sync_upload_bytes_total - read_memo_bytes_before, device_addr, size);
             }
         }
-        // Epoch and generation read before the walk: a change during it misses next time.
-        *read_memo = {device_addr, size, read_memo_epoch, read_memo_gen, buffer_id.index};
-        if (g_pb_census != 0) [[unlikely]] {
-            read_memo->pb_written = PbDraw();
-        }
+        write_read_memo();
+    }
+    if (census_cls >= 1) [[unlikely]] {
+        RmemoCensusCount(census_cls, buffer, census_same,
+                         census_timed ? __rdtsc() - census_c1 : 0, census_timed);
     }
     if (sample) {
         sample->AddSyncNs(sample->SinceNs(t_sample_sync));
