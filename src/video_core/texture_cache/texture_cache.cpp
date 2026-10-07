@@ -95,6 +95,7 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     if (enabled("SHADPS4_PREPARED_IMAGES")) {
         prepared_images = std::make_unique<PreparedImages>();
         prepared_images->verify = enabled("SHADPS4_PREPARED_IMAGES_VERIFY");
+        prepared_images->local = enabled("SHADPS4_PREPARED_LOCAL");
     }
     // The off-CP side of the handshake needs FlushProcessWriteBuffers (Windows only).
     lockfree_hit = enabled("SHADPS4_TEX_LOCKFREE_HIT") && Common::FlushProcessWriteBuffersAll();
@@ -901,22 +902,14 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         ++prepared_images->calls;
         lookup_generation = prepared_images->generation.load(std::memory_order_acquire);
         memo = PreparedSlot(info, desc.type, exact_fmt, key);
-        if (memo) {
-            if (memo->generation == lookup_generation && memo->key == key && memo->id &&
-                slot_images.is_allocated(memo->id)) {
-                const auto& cached = slot_images[memo->id];
-                // SlotId has no generation. Undefined-format stencil placeholders have no UID
-                // and are never eligible. No Image pointer or Vulkan backing/view is retained.
-                if (memo->uid && cached.image_uid == memo->uid &&
-                    True(cached.flags & ImageFlagBits::Registered) &&
-                    False(cached.flags & ImageFlagBits::Picked)) {
-                    memo_id = memo->id;
-                    memo_uid = memo->uid;
-                }
-            }
+        bool local_hit = false;
+        if (memo && memo->key == key && PreparedEntryValid(*memo, lookup_generation, local_hit)) {
+            memo_id = memo->id;
+            memo_uid = memo->uid;
         }
         if (memo_id) {
             ++prepared_images->hits;
+            prepared_images->local_hits += local_hit;
         } else {
             ++prepared_images->fallbacks;
         }
@@ -1036,14 +1029,21 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         if (memo && !memo_id && perfect_image_id && image_id == perfect_image_id &&
             image.image_uid && True(image.flags & ImageFlagBits::Registered) &&
             !(image.info.resources < info.resources) && final_generation == lookup_generation) {
-            *memo = {key, image_id, image.image_uid, final_generation};
+            // Read under the cache lock, after the walk, with the generation unchanged since the
+            // walk: no register / unregister interleaved, so this epoch belongs to this result.
+            *memo = {key,
+                     image_id,
+                     image.image_uid,
+                     final_generation,
+                     std::atomic_ref<u64>{image.overlap_epoch}.load(std::memory_order_relaxed),
+                     prepared_images->local};
         }
         if (fi_stats && (prepared_images->calls & 0x3ffff) == 0) {
             LOG_INFO(Render_Vulkan,
-                     "PreparedImages: calls={} hit={} invalidation={} fallback={} verified={} "
-                     "(cumulative; invalidation=structural changes)",
-                     prepared_images->calls, prepared_images->hits, final_generation - 1,
-                     prepared_images->fallbacks, prepared_images->verified);
+                     "PreparedImages: calls={} hit={} local_hit={} invalidation={} fallback={} "
+                     "verified={} (cumulative; invalidation=structural changes)",
+                     prepared_images->calls, prepared_images->hits, prepared_images->local_hits,
+                     final_generation - 1, prepared_images->fallbacks, prepared_images->verified);
         }
     }
 
@@ -1066,6 +1066,38 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
 
     return image_id;
+}
+
+bool TextureCache::PreparedEntryValid(const PreparedImage& memo, u64 generation, bool& local_hit) {
+    local_hit = false;
+    if (!memo.id || !memo.uid || !slot_images.is_allocated(memo.id)) {
+        return false;
+    }
+    const Image& image = slot_images[memo.id];
+    // SlotId has no generation. Undefined-format stencil placeholders have no UID and are never
+    // eligible. No Image pointer or Vulkan backing/view is retained. Fault handlers may set
+    // CpuDirty / Picked concurrently: Picked falls back to the locked path; dirtiness does not
+    // enter the match (UpdateImage handles it).
+    const auto flags =
+        std::atomic_ref<ImageFlagBits>{const_cast<ImageFlagBits&>(image.flags)}.load(
+            std::memory_order_relaxed);
+    if (image.image_uid != memo.uid || False(flags & ImageFlagBits::Registered) ||
+        True(flags & ImageFlagBits::Picked)) {
+        return false;
+    }
+    if (memo.generation == generation) {
+        return true;
+    }
+    // SHADPS4_PREPARED_LOCAL: every image registered or unregistered on one of this image's pages
+    // since the record bumped its overlap epoch (RegisterImage / UnregisterImage, before the
+    // generation moves), and a perfect match spans exactly the lookup's pages.
+    if (memo.local &&
+        std::atomic_ref<u64>{const_cast<u64&>(image.overlap_epoch)}.load(
+            std::memory_order_relaxed) == memo.overlap_epoch) {
+        local_hit = true;
+        return true;
+    }
+    return false;
 }
 
 TextureCache::PreparedImage* TextureCache::PreparedSlot(const ImageInfo& info, BindingType type,
@@ -1139,21 +1171,15 @@ ImageId TextureCache::FindImageLockFree(const ImageDesc& desc, bool exact_fmt) {
         PreparedImageKey key{};
         const u64 generation = prepared_images->generation.load(std::memory_order_acquire);
         PreparedImage* memo = PreparedSlot(desc.info, desc.type, exact_fmt, key);
-        if (memo && memo->generation == generation && memo->key == key && memo->id &&
-            slot_images.is_allocated(memo->id)) {
+        bool local_hit = false;
+        if (memo && memo->key == key && PreparedEntryValid(*memo, generation, local_hit)) {
             Image& image = slot_images[memo->id];
-            // Fault handlers may set CpuDirty/Picked concurrently. Picked falls back to the
-            // locked path; dirtiness does not enter the match (UpdateImage handles it).
-            const auto flags =
-                std::atomic_ref<ImageFlagBits>{image.flags}.load(std::memory_order_relaxed);
-            if (memo->uid && image.image_uid == memo->uid &&
-                True(flags & ImageFlagBits::Registered) && False(flags & ImageFlagBits::Picked)) {
-                image.tick_accessed_last = AgeTick();
-                TouchImage(image);
-                ++prepared_images->calls;
-                ++prepared_images->hits;
-                result = memo->id;
-            }
+            image.tick_accessed_last = AgeTick();
+            TouchImage(image);
+            ++prepared_images->calls;
+            ++prepared_images->hits;
+            prepared_images->local_hits += local_hit;
+            result = memo->id;
         }
     }
     std::atomic_signal_fence(std::memory_order_seq_cst);

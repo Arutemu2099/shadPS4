@@ -487,16 +487,30 @@ private:
         ImageId id{};
         u64 uid{};
         u64 generation{};
+        /// SHADPS4_PREPARED_LOCAL: the image's overlap_epoch when recorded. A perfect match covers
+        /// exactly the lookup range, and every register / unregister of another image on one of
+        /// its pages bumps that image's epoch, so an unchanged epoch keeps the entry exact even
+        /// after the global generation moved (texture streaming moves it constantly).
+        u64 overlap_epoch{};
+        bool local{};
     };
     struct PreparedImages {
-        static constexpr size_t Capacity = 1024;
+        static constexpr size_t Capacity = 4096;
         std::array<PreparedImage, Capacity> entries{};
         // Atomic because deferred slot reclamation does not take the lookup mutex. This does
         // not replace the existing page-table/slot synchronization or authorize concurrent use.
         std::atomic<u64> generation{1};
         bool verify{};
+        bool local{}; ///< SHADPS4_PREPARED_LOCAL=1
         u64 calls{}, hits{}, fallbacks{}, verified{}; // FindImage mutex protects entries/counters.
+        u64 local_hits{}; ///< hits the global generation test would have missed
     };
+
+    /// True when `memo` (key already equal) still names a registered, unpicked image with the
+    /// recorded uid, and either the global generation or (SHADPS4_PREPARED_LOCAL) the image's
+    /// overlap epoch is unchanged. `local_hit` reports a hit only the epoch test allowed.
+    [[nodiscard]] bool PreparedEntryValid(const PreparedImage& memo, u64 generation,
+                                          bool& local_hit);
 
     /// Memo slot for a lookup, or nullptr when the lookup is not eligible for memoization.
     PreparedImage* PreparedSlot(const ImageInfo& info, BindingType type, bool exact_fmt,
