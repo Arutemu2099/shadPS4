@@ -783,21 +783,22 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, InvalidateOrigin
         }
         return c;
     }();
+    // v2 (2026-10-08, Opus review of 469e9c20): the "no GPU-modified page in the block" check
+    // is made by MemoryTracker::InvalidateRegion under the region lock that also marks the
+    // block, so the back cannot mark a page GPU-modified between check and marking. Jobs are
+    // settled over the whole block (as in v1): the block's other pages become writable without
+    // a fault, so no job may still publish there afterwards.
+    u64 block_bytes = 0;
+    VAddr settle_addr = device_addr;
+    u64 settle_size = size;
     if (heap_block.bytes != 0 && origin == InvalidateOrigin::GuestWriteFault &&
         device_addr >= heap_block.lo && device_addr + size <= heap_block.hi) {
         const VAddr block = Common::AlignDown(device_addr, heap_block.bytes);
-        static std::atomic<u64> widened{0}, kept{0};
         if (block >= heap_block.lo && block + heap_block.bytes <= heap_block.hi &&
-            !memory_tracker->IsRegionGpuModified(block, heap_block.bytes)) {
-            device_addr = block;
-            size = heap_block.bytes;
-            const u64 n = widened.fetch_add(1, std::memory_order_relaxed) + 1;
-            if ((n & 0x3ffff) == 0) {
-                LOG_INFO(Render, "HeapWriteBlock: {} KB blocks widened={} kept_single={}",
-                         heap_block.bytes >> 10, n, kept.load(std::memory_order_relaxed));
-            }
-        } else {
-            kept.fetch_add(1, std::memory_order_relaxed);
+            device_addr + size <= block + heap_block.bytes) {
+            block_bytes = heap_block.bytes;
+            settle_addr = block;
+            settle_size = heap_block.bytes;
         }
     }
     // SHADPS4_FAULT_WRITE_SKIP_SETTLE=1: a write fault (guest or CP thread) needs no
@@ -808,21 +809,35 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, InvalidateOrigin
     // the CP on the GPU for 3.9% of its wall time.
     const bool skip_fault_settle = g_fault_write_skip_settle;
     if (Offload::Enabled() && !(skip_fault_settle && origin != InvalidateOrigin::Explicit) &&
-        HasOverlappingFaultJob(device_addr, size)) {
+        HasOverlappingFaultJob(settle_addr, settle_size)) {
         // InvalidateRegion marks CPU state on this thread wherever it finds no GPU bit, and an
         // unmap then removes the pages. A job over this range still has a publication to
         // make, so it is finalized first, while the range is mapped and untouched. The flush
         // callback below cannot do this: it never runs for the GPU-clean part of the range.
         Offload::Add(Offload::State().invalidate_settle_hops);
+        const auto settle_start = std::chrono::steady_clock::now();
         liverpool->SendCommand<true>(
-            [this, device_addr, size] { SettleOverlappingJobs(device_addr, size); });
+            [this, settle_addr, settle_size] { SettleOverlappingJobs(settle_addr, settle_size); });
+        Common::FaultMonitor::invalidate_settles.fetch_add(1, std::memory_order_relaxed);
+        Common::FaultMonitor::invalidate_settle_ns.fetch_add(
+            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - settle_start)
+                                 .count()),
+            std::memory_order_relaxed);
     }
     const bool from_guest_fault = origin == InvalidateOrigin::GuestWriteFault;
     const bool offload_write = from_guest_fault && g_write_fault_offload;
-    memory_tracker->InvalidateRegion(device_addr, size, from_guest_fault,
-                                     [this, device_addr, size, offload_write] {
-                                         ReadMemory(device_addr, size, true, offload_write);
-                                     });
+    const bool widened = memory_tracker->InvalidateRegion(
+        device_addr, size, from_guest_fault,
+        [this, device_addr, size, offload_write] {
+            ReadMemory(device_addr, size, true, offload_write);
+        },
+        block_bytes);
+    if (block_bytes != 0) {
+        (widened ? Common::FaultMonitor::heap_block_widened
+                 : Common::FaultMonitor::heap_block_kept)
+            .fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 /// Span of the tracker pages a range touches. Publication and tracker clears act on whole

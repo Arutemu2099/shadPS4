@@ -10,6 +10,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "common/alignment.h"
 #include "common/buffer_sample_probe.h"
 #include "common/debug.h"
 #include "common/fault_monitor.h"
@@ -179,11 +180,51 @@ public:
     /// Removes all protection from a page and ensures GPU data has been flushed if requested
     /// `from_guest_fault`: the call comes from a guest thread's write fault (not the CP, not an
     /// HLE write), so a newly dirtied page may be deferred. See submit_epoch.h.
-    void InvalidateRegion(VAddr cpu_addr, u64 size, bool from_guest_fault,
-                          auto&& on_flush) noexcept {
+    /// `block_bytes` (SHADPS4_HEAP_WRITE_BLOCK, 0 = off): when the whole aligned block holding
+    /// the range has no GPU-modified page, mark and unprotect the block instead of the range,
+    /// deciding under the region lock that also marks it (no race with the back marking a page
+    /// GPU-modified between the check and the marking). Returns true when the block was taken.
+    bool InvalidateRegion(VAddr cpu_addr, u64 size, bool from_guest_fault, auto&& on_flush,
+                          u64 block_bytes = 0) noexcept {
         const bool defer = g_epoch_defer_upload;
         const u64 submit_epoch = defer ? g_submit_epoch.load(std::memory_order_acquire) : 0;
         thread_local std::vector<DeferredWatch> deferred_watches;
+        if (block_bytes != 0) {
+            // An aligned power-of-two block <= 4 MB lies inside one region manager.
+            const VAddr block = Common::AlignDown(cpu_addr, block_bytes);
+            RegionManager* manager = top_tier[block >> TRACKER_HIGHER_PAGE_BITS];
+            if (manager && block_bytes <= TRACKER_HIGHER_PAGE_SIZE &&
+                cpu_addr + size <= block + block_bytes) {
+                if (g_fault_watch_outside && from_guest_fault) {
+                    g_deferred_watch = &deferred_watches;
+                }
+                const u64 offset = block & TRACKER_HIGHER_PAGE_MASK;
+                bool widened = false;
+                {
+                    std::scoped_lock lk{manager->lock};
+                    if (!(ReadbacksMode() != GpuReadbacksMode::Disabled &&
+                          manager->template IsRegionModified<Type::GPU>(offset, block_bytes))) {
+                        if (defer) {
+                            if (from_guest_fault) {
+                                manager->MarkRecentFromFault(block, block_bytes, submit_epoch);
+                            } else {
+                                manager->ClearRecent(block, block_bytes);
+                            }
+                        }
+                        manager->template ChangeRegionState<Type::CPU, true>(block, block_bytes);
+                        widened = true;
+                    }
+                }
+                if (g_deferred_watch) {
+                    g_deferred_watch = nullptr;
+                    ApplyDeferredWatches(deferred_watches);
+                }
+                if (widened) {
+                    return true;
+                }
+                // A GPU-modified page in the block: the range alone, on the path below.
+            }
+        }
         IteratePages<false>(
             cpu_addr, size,
             [&on_flush, defer, from_guest_fault, submit_epoch](RegionManager* manager, u64 offset,
@@ -221,6 +262,7 @@ public:
                     on_flush();
                 }
             });
+        return false;
     }
 
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified

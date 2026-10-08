@@ -57,6 +57,10 @@ std::atomic<u64> gpu_waits{0};
 std::atomic<u64> gpu_wait_ns{0};
 std::atomic<u64> download_calls{0};
 std::atomic<u64> download_bytes{0};
+std::atomic<u64> heap_block_widened{0};
+std::atomic<u64> heap_block_kept{0};
+std::atomic<u64> invalidate_settles{0};
+std::atomic<u64> invalidate_settle_ns{0};
 std::atomic<u64> draw_count{0};
 std::atomic<u64> draw_pipeline_ns{0};
 std::atomic<u64> draw_bindres_ns{0};
@@ -957,6 +961,28 @@ void ReportLoop() {
             prev_epoch = epoch;
             prev_syncs = syncs;
             prev_pages = pages;
+        }
+        {
+            static u64 prev_w = 0, prev_k = 0, prev_s = 0, prev_sns = 0;
+            const u64 w = heap_block_widened.load(std::memory_order_relaxed);
+            const u64 k = heap_block_kept.load(std::memory_order_relaxed);
+            const u64 sn = invalidate_settles.load(std::memory_order_relaxed);
+            const u64 sns = invalidate_settle_ns.load(std::memory_order_relaxed);
+            if (d_frames > 0 && (w != prev_w || k != prev_k || sn != prev_s)) {
+                const double f = static_cast<double>(d_frames);
+                LOG_INFO(Render,
+                         "HeapWriteBlock: t={:.0f}s widened/frame={:.1f} kept_single/frame={:.1f} "
+                         "settles/frame={:.2f} settle_ms/frame={:.3f} settle_pct_of_wall={:.2f}% "
+                         "write_faults/frame={:.1f} (totals widened={} kept={} settles={})",
+                         elapsed, (w - prev_w) / f, (k - prev_k) / f, (sn - prev_s) / f,
+                         (sns - prev_sns) / f / 1e6,
+                         dt > 0 ? (sns - prev_sns) / (dt * 1e9) * 100.0 : 0.0, d_write / f, w, k,
+                         sn);
+            }
+            prev_w = w;
+            prev_k = k;
+            prev_s = sn;
+            prev_sns = sns;
         }
         if (WriteFaultPagesEnabled()) {
             static u64 prev_gfx = 0, prev_asc = 0;

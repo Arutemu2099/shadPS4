@@ -130,6 +130,15 @@ extern std::atomic<u64> gpu_wait_ns;
 extern std::atomic<u64> download_calls;
 extern std::atomic<u64> download_bytes;
 
+/// SHADPS4_HEAP_WRITE_BLOCK (2026-10-08): guest write faults in the heap span that took their
+/// whole block / kept the single page (GPU-modified block), and the guest-thread settles of
+/// fault jobs before an invalidation (count and wall ns, every origin). Logged per frame in
+/// the `HeapWriteBlock:` window line.
+extern std::atomic<u64> heap_block_widened;
+extern std::atomic<u64> heap_block_kept;
+extern std::atomic<u64> invalidate_settles;
+extern std::atomic<u64> invalidate_settle_ns;
+
 /**
  * Per-draw CPU cost, measured directly instead of inferred from a stack scan.
  *
