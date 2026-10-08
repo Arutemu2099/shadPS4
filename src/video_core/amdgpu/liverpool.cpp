@@ -1360,6 +1360,12 @@ struct MtbWindow {
     u64 draws = 0, par_draws = 0;
     u64 par_cyc = 0, ser_draw_cyc = 0, seq_cyc = 0, other_cyc = 0;
     std::array<u64, AmdGpu::MtbCensus::Count> bails{};
+    // v4 (P1d, notes/parrec-build-2026-10-08.md sec. 10): sequence points by kind (0 WRITE_DATA,
+    // 1 EVENT_WRITE_EOP, 2 EVENT_WRITE_EOS, 3 DMA_DATA, 4 other packet, 5 Call): total, inside a
+    // batch (no submission during it), render pass left open, render pass ended; submissions;
+    // CurrentTick() reads during draw / dispatch translation.
+    std::array<u64, 6> sp_total{}, sp_in_batch{}, sp_pass_kept{}, sp_pass_ended{};
+    u64 submits = 0, tick_reads = 0;
 };
 MtbWindow g_mtb;
 const u64 g_mtb_segment = [] {
@@ -1410,6 +1416,14 @@ void MtbLog() {
              100.0 * double(w.segments_dependent) / double(std::max<u64>(w.segments, 1)), w.tail_draws,
              100.0 * double(w.tail_draws) / double(std::max<u64>(w.draws, 1)),
              AmdGpu::MtbCensus::g_invalidate_hits);
+    const auto kinds = [&w](const std::array<u64, 6>& a) {
+        return fmt::format("{}/{}/{}/{}/{}/{}", a[0], a[1], a[2], a[3], a[4], a[5]);
+    };
+    LOG_INFO(Render,
+             "MtbP1d: draws={} submits={} tick_reads_per_draw={:.2f} | seqpoints by kind "
+             "[write_data/eop/eos/dma/other_pkt/call] total={} in_batch={} pass_kept={} pass_ended={}",
+             w.draws, w.submits, double(w.tick_reads) / double(std::max<u64>(w.draws, 1)),
+             kinds(w.sp_total), kinds(w.sp_in_batch), kinds(w.sp_pass_kept), kinds(w.sp_pass_ended));
     AmdGpu::MtbCensus::g_invalidate_hits = 0;
     const u64 open = w.seg_draws;
     const bool open_bailed = w.seg_bailed;
@@ -1435,14 +1449,30 @@ void Liverpool::ExecuteRecord(const CpSplit::RecordHeader& record) {
     MC::g_draw_event = MC::None;
     MC::g_draw_dependent = false;
     MC::g_draw_events.clear();
+    Vulkan::Scheduler* const sched = rasterizer ? &rasterizer->GetScheduler() : nullptr;
+    const bool rend_in = sched && sched->IsRenderingNow();
+    const u64 tick_in = sched ? sched->GetMasterSemaphore()->CurrentTickRaw() : 0;
+    const u64 reads_in = Vulkan::MasterSemaphore::t_tick_reads;
     const u64 t0 = __rdtsc();
     ExecuteRecordImpl(record);
     const u64 cyc = __rdtsc() - t0;
+    const bool rend_out = sched && sched->IsRenderingNow();
+    const u64 tick_out = sched ? sched->GetMasterSemaphore()->CurrentTickRaw() : 0;
+    g_mtb.submits += tick_out - tick_in;
+    const auto note_seqpoint = [&](u32 kind) {
+        ++g_mtb.sp_total[kind];
+        if (tick_out == tick_in) {
+            ++g_mtb.sp_in_batch[kind];
+            g_mtb.sp_pass_kept[kind] += rend_in && rend_out ? 1 : 0;
+        }
+        g_mtb.sp_pass_ended[kind] += rend_in && !rend_out ? 1 : 0;
+    };
     switch (record.type) {
     case CpSplit::RecordType::Draw:
     case CpSplit::RecordType::Dispatch: {
         ++g_mtb.draws;
         ++g_mtb.seg_draws;
+        g_mtb.tick_reads += Vulkan::MasterSemaphore::t_tick_reads - reads_in;
         if (MC::g_draw_dependent) {
             ++g_mtb.dependents;
             if (!g_mtb.seg_dependent) {
@@ -1481,12 +1511,34 @@ void Liverpool::ExecuteRecord(const CpSplit::RecordHeader& record) {
         g_mtb.seq_cyc += cyc;
         ++g_mtb.seqpoints;
         MtbEndSegment();
+        if (record.flags & CpSplit::AscReleaseMem) {
+            note_seqpoint(4);
+        } else {
+            switch (header->type3.opcode) {
+            case PM4ItOpcode::WriteData:
+                note_seqpoint(0);
+                break;
+            case PM4ItOpcode::EventWriteEop:
+                note_seqpoint(1);
+                break;
+            case PM4ItOpcode::EventWriteEos:
+                note_seqpoint(2);
+                break;
+            case PM4ItOpcode::DmaData:
+                note_seqpoint(3);
+                break;
+            default:
+                note_seqpoint(4);
+                break;
+            }
+        }
         break;
     }
     case CpSplit::RecordType::Call:
         g_mtb.seq_cyc += cyc;
         ++g_mtb.seqpoints;
         MtbEndSegment();
+        note_seqpoint(5);
         break;
     case CpSplit::RecordType::Retire:
     case CpSplit::RecordType::ClearState:

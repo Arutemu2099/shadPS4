@@ -456,6 +456,11 @@ public:
     /// Ends current rendering scope. `loc` attributes the break under SHADPS4_GPU_BATCH_TIMING.
     void EndRendering(std::source_location loc = std::source_location::current());
 
+    /// The translating context has a render pass open (diagnostic: MTB census).
+    [[nodiscard]] bool IsRenderingNow() const noexcept {
+        return Rc().is_rendering;
+    }
+
     /// Returns the current render state.
     const RenderState& GetRenderState() const {
         return Rc().render_state;

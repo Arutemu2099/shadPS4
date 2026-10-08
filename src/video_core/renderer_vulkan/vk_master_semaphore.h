@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdlib>
 #include <condition_variable>
 #include <thread>
 #include <queue>
@@ -20,7 +21,22 @@ public:
     explicit MasterSemaphore(const Instance& instance_);
     ~MasterSemaphore();
 
+    /// SHADPS4_MTB_CENSUS=1 (diagnostic): CurrentTick() reads per thread (multi-threaded back
+    /// P1d: tick stamps taken while a draw is translated, notes/parrec-build-2026-10-08.md 6a).
+    static inline const bool count_tick_reads = [] {
+        const char* env = std::getenv("SHADPS4_MTB_CENSUS");
+        return env && env[0] == '1';
+    }();
+    static inline thread_local u64 t_tick_reads = 0;
+
     [[nodiscard]] u64 CurrentTick() const noexcept {
+        if (count_tick_reads) [[unlikely]] {
+            ++t_tick_reads;
+        }
+        return current_tick.load(std::memory_order_acquire);
+    }
+    /// CurrentTick without the census count.
+    [[nodiscard]] u64 CurrentTickRaw() const noexcept {
         return current_tick.load(std::memory_order_acquire);
     }
 
