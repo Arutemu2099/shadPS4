@@ -53,6 +53,12 @@ public:
     explicit MemoryTracker(PageManager& tracker_) : tracker{&tracker_} {}
     ~MemoryTracker() = default;
 
+    /// SHADPS4_RMEMO_CENSUS: the last BackClean read sync on the back. census_bc: 0 = the call did
+    /// not take the BackClean path (the caller resets it), 1 = no unverified page, 2 = walked.
+    /// census_check_cyc: rdtsc cycles from entry to the clean / walk decision.
+    u8 census_bc{};
+    u64 census_check_cyc{};
+
     /// Returns true if a region has been modified from the CPU
     bool IsRegionCpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
         return IteratePages<true>(
@@ -319,6 +325,7 @@ public:
     /// from the private "verified clean" bits; only unverified page runs take the locked walk.
     UploadPath ForEachUploadRangeBackClean(VAddr query_cpu_range, u64 query_size, auto&& func,
                                            auto&& on_upload) {
+        const u64 census_c0 = g_rmemo_census ? __rdtsc() : 0;
         auto& bc = back_clean;
         auto& runs = back_clean_runs;
         ++bc.stats.queries;
@@ -386,6 +393,10 @@ public:
                 runs.insert(runs.end(), bad.begin(), bad.end());
             }
         }
+        if (g_rmemo_census || g_read_sync_fast == 2) [[unlikely]] {
+            census_check_cyc = __rdtsc() - census_c0;
+            census_bc = runs.empty() ? 1 : 2;
+        }
         if (runs.empty()) [[likely]] {
             ++bc.stats.clean;
             on_upload();
@@ -411,6 +422,26 @@ public:
         }
         on_upload();
         return UploadPath::Walk;
+    }
+
+    /// SHADPS4_READ_SYNC_FAST: true when ForEachUploadRange(addr, size, is_written = false) would
+    /// take the BackClean path and find no unverified page - the case in which it calls no `func`
+    /// and changes no tracker or protection state. Same eligibility as that path, BACK_CLEAN=1 only;
+    /// BACK_CLEAN=2 is accepted under READ_SYNC_FAST=2, whose full path then checks the private bits
+    /// against the tracker (the gap check). Drains the dirty log, as that path does.
+    bool ReadSyncClean(VAddr addr, u64 size) {
+        const bool bc_ok = g_back_clean == 1 || (g_back_clean == 2 && g_read_sync_fast == 2);
+        if (!bc_ok || g_epoch_defer_upload || size == 0 ||
+            !Common::FaultMonitor::t_is_cp_thread || ((addr + size) >> MAX_CPU_PAGE_BITS) != 0) {
+            return false;
+        }
+        back_clean.Sync();
+        return back_clean.AllVerified(addr, size);
+    }
+
+    /// SHADPS4_READ_SYNC_FAST=2: where ReadSyncClean's drain stopped.
+    u64 BackCleanDrainedTo() const noexcept {
+        return back_clean.DrainedTo();
     }
 
     UploadPath ForEachUploadRange(VAddr query_cpu_range, u64 query_size, bool is_written,

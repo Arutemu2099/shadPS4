@@ -810,6 +810,8 @@ set(COMMON src/common/logging/classes.h
            src/common/signal_context.cpp
            src/common/singleton.h
            src/common/slab_heap.h
+           src/common/reserved_memory.cpp
+           src/common/reserved_memory.h
            src/common/slot_vector.h
            src/common/spin_lock.cpp
            src/common/spin_lock.h

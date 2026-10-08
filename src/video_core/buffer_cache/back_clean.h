@@ -57,6 +57,25 @@ inline const int g_back_clean = [] {
     return mode == 1 || mode == 2 ? mode : 0;
 }();
 
+/// SHADPS4_RMEMO_CENSUS=1 (diagnostic, default off; notes/buffer-sync-validity-2026-10-07.md):
+/// classifies read-binding memo misses by page-granular validity (the BackClean answer) and by a
+/// per-Buffer dirty counter (a second DirtyLog consumer on the back), and times the miss path.
+/// Needs SHADPS4_BACK_CLEAN=1 (DirtyLog appends nothing without it). Excludes SHADPS4_PB_CENSUS
+/// (both use ReadMemoEntry::pb_written).
+inline const bool g_rmemo_census = [] {
+    const char* env = std::getenv("SHADPS4_RMEMO_CENSUS");
+    return env && env[0] == '1';
+}();
+
+/// SHADPS4_READ_SYNC_FAST=1 (=2 verify), default off (notes/buffer-sync-validity-2026-10-07.md
+/// sec. 6): a read sync that BackClean answers "no unverified page" returns from ObtainBuffer
+/// before SynchronizeBuffer. Needs SHADPS4_BACK_CLEAN=1.
+inline const int g_read_sync_fast = [] {
+    const char* env = std::getenv("SHADPS4_READ_SYNC_FAST");
+    const int mode = env ? env[0] - '0' : 0;
+    return mode == 1 || mode == 2 ? mode : 0;
+}();
+
 class DirtyLog {
 public:
     static constexpr u64 Capacity = 1ULL << 16;
@@ -159,6 +178,11 @@ public:
         }
     }
 
+    /// The dirty-log index the last Sync() drained up to (entries before it are applied).
+    u64 DrainedTo() const noexcept {
+        return head;
+    }
+
     /// Appends the page runs of [addr, addr + size) that are not verified clean, merged.
     void CollectUnverified(VAddr addr, u64 size, std::vector<Run>& runs) const {
         u64 page = addr >> TRACKER_PAGE_BITS;
@@ -192,6 +216,37 @@ public:
             }
             page = base + hi;
         }
+    }
+
+    /// True when CollectUnverified(addr, size) would append nothing: every page of the range is
+    /// verified clean. Same walk, stops at the first unverified page and builds no run list.
+    bool AllVerified(VAddr addr, u64 size) const {
+        u64 page = addr >> TRACKER_PAGE_BITS;
+        const u64 end = (addr + size + TRACKER_BYTES_PER_PAGE - 1) >> TRACKER_PAGE_BITS;
+        while (page < end) {
+            const u64 region = page / NUM_PAGES_PER_REGION;
+            const u32 skip = static_cast<u32>(std::countr_one(full[region / 64] >> (region % 64)));
+            if (skip != 0) {
+                page = (region + skip) * NUM_PAGES_PER_REGION;
+                continue;
+            }
+            const u64 base = region * NUM_PAGES_PER_REGION;
+            const u64 lo = page - base;
+            const u64 hi = std::min<u64>(end - base, NUM_PAGES_PER_REGION);
+            const Region* r = top[region];
+            if (!r || r->generation != generation) {
+                return false;
+            }
+            if (r->count != NUM_PAGES_PER_REGION) {
+                for (u64 word = lo / 64; word <= (hi - 1) / 64; ++word) {
+                    if ((~r->bits[word] & WordMask(word, lo, hi)) != 0) {
+                        return false;
+                    }
+                }
+            }
+            page = base + hi;
+        }
+        return true;
     }
 
     /// The locked walk took these pages: each is clean in the tracker, or will be logged again.

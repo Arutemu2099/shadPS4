@@ -9,6 +9,7 @@
 #include <tuple>
 
 #include <array>
+#include <chrono>
 #include <immintrin.h>
 #include <atomic>
 #include <memory>
@@ -696,6 +697,32 @@ private:
     /// [0] BindBuffers (uniform/storage) [1] other callers: calls, hits, key miss, epoch miss,
     /// guard (generation or serial) miss.
     std::array<std::array<u64, 5>, 2> read_memo_stats{};
+    /// SHADPS4_READ_SYNC_FAST: checks, clean answers, verify (=2): the full path uploaded after a
+    /// clean answer with new dirty-log entries since the check (a guest write raced it) / without
+    /// any (a real mismatch).
+    std::array<u64, 4> read_sync_fast_stats{};
+    /// SHADPS4_RMEMO_CENSUS (notes/buffer-sync-validity-2026-10-07.md). Classes: 0 memo hit,
+    /// 1 key miss, 2 epoch miss (shader read bindings), 3 Other callers (vertex / index, no memo).
+    /// Paths of a miss: 0 BackClean found no unverified page, 1 walked and uploaded nothing,
+    /// 2 uploaded, 3 not the BackClean path and uploaded nothing.
+    struct RmemoCensus {
+        bool started{};
+        u64 seq{};
+        u64 dirty_head{};
+        u64 gen{};
+        u64 drained{}, resets{}, bumps{};
+        std::array<u64, 4> calls{};
+        std::array<std::array<u64, 4>, 4> path{};
+        std::array<std::array<u64, 7>, 4> size_class{};
+        std::array<u64, 4> epoch_same_path{}; ///< epoch misses, own Buffer not dirtied, by path
+        std::array<u64, 4> timed{}, timed_cyc{};             ///< all of a class (hit: whole call)
+        std::array<u64, 4> clean_timed{}, clean_cyc{}, clean_check_cyc{}; ///< path 0 only
+        u64 tsc0{};
+        std::chrono::steady_clock::time_point t0{};
+        u64 next_log{1ULL << 22};
+    } rmemo_census;
+    u64 RmemoCensusStamp(const Buffer& buffer);
+    void RmemoCensusCount(int cls, const Buffer& buffer, bool epoch_same, u64 cyc, bool timed);
     bool AsyncFaultCopies();
     void RecordFaultCopiesAsync(Buffer& source, vk::Buffer staging,
                                 std::span<const vk::BufferCopy> copies);
@@ -784,7 +811,7 @@ private:
     StreamBuffer device_buffer;
     Buffer gds_buffer;
     Buffer bda_pagetable_buffer;
-    Common::SlotVector<Buffer> slot_buffers;
+    Common::SlotVector<Buffer, Common::StableSlotCapacity> slot_buffers;
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;
     u64 critical_gc_memory = 0;
