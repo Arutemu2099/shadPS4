@@ -763,7 +763,7 @@ Rasterizer::Rasterizer(Rasterizer& primary, WorkerTag)
       buffer_cache{shared.buffer_cache}, texture_cache{shared.texture_cache},
       liverpool{primary.liverpool}, memory{primary.memory}, mapped_ranges{shared.mapped_ranges},
       mapped_ranges_mutex{shared.mapped_ranges_mutex}, pipeline_cache{shared.pipeline_cache},
-      occlusion{shared.occlusion} {
+      occlusion{shared.occlusion}, fault_process_pending{shared.fault_process_pending} {
     // The settings the primary's constructor derived; everything else starts empty.
     build_set_writes = primary.build_set_writes;
     bind_memo_stats = primary.bind_memo_stats;
@@ -779,7 +779,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
       texture_cache{shared.texture_cache}, liverpool{liverpool_},
       memory{Core::Memory::Instance()}, mapped_ranges{shared.mapped_ranges},
       mapped_ranges_mutex{shared.mapped_ranges_mutex}, pipeline_cache{shared.pipeline_cache},
-      occlusion{shared.occlusion} {
+      occlusion{shared.occlusion}, fault_process_pending{shared.fault_process_pending} {
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -807,6 +807,24 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
             tex_bind_memo = static_cast<u8>(value[0] - '0');
             LOG_INFO(Render_Vulkan, "TexBindMemo: enabled, mode={}",
                      tex_bind_memo == 2 ? "verify (full path + compare)" : "memo");
+        }
+    }
+    if (g_mtb_p1) {
+        // P1d (notes/parrec-build-2026-10-08.md sec. 14a): the Pro-only stencil scratch and Neo
+        // ID derive keep per-instance state that both instances' draws would need.
+        const auto on = [](const char* name) {
+            const char* value = std::getenv(name);
+            return value && value[0] == '1';
+        };
+        if (on("SHADPS4_STENCIL_STORAGE") || on("SHADPS4_NEO_IDBUF_DERIVE")) {
+            LOG_WARNING(Render_Vulkan, "MtbP1: no worker rasterizer (Pro stencil storage / Neo "
+                                       "ID derive are per instance)");
+        } else if (native_bindings) {
+            LOG_WARNING(Render_Vulkan, "MtbP1: no worker rasterizer with native bindings (ring "
+                                       "space per segment is P3 work)");
+        } else {
+            mtb_worker = std::make_unique<Rasterizer>(*this, WorkerTag{});
+            LOG_INFO(Render_Vulkan, "MtbP1: worker rasterizer instance created");
         }
     }
 }

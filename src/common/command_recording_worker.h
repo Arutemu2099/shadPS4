@@ -216,6 +216,18 @@ public:
         void MarkBoundary() noexcept {
             ++seq_;
         }
+        /// Continues a sequence another counter started (the RecordSeq before the sink).
+        void StartSeq(const std::uint64_t seq) noexcept {
+            seq_ = seq;
+        }
+        /// Serial use only (P1d: the producer fills the sink itself): when a new chunk is
+        /// needed, the full ones are published first, like the producer's own chunks.
+        void SetEagerPublish(const bool eager) noexcept {
+            eager_publish_ = eager;
+        }
+        [[nodiscard]] std::uint64_t EagerPublishes() const noexcept {
+            return eager_publishes_;
+        }
         [[nodiscard]] bool Empty() const noexcept {
             return chunks_.empty();
         }
@@ -242,6 +254,10 @@ public:
                 layout = TryLayout(chunk->used, object_bytes, object_alignment, payload_bytes);
             }
             if (!layout) {
+                if (eager_publish_ && !chunks_.empty()) {
+                    owner_.PublishSink(*this);
+                    ++eager_publishes_;
+                }
                 chunk = owner_.AcquireSinkChunk();
                 chunks_.push_back(chunk);
                 layout = TryLayout(0, object_bytes, object_alignment, payload_bytes);
@@ -271,6 +287,8 @@ public:
         CommandRecordingWorker& owner_;
         std::vector<Chunk*> chunks_;
         std::uint64_t seq_{};
+        bool eager_publish_{};
+        std::uint64_t eager_publishes_{};
     };
 
     /// Producer: queues everything it recorded so far, then the sink's commands, in that order,

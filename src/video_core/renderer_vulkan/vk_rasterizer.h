@@ -50,6 +50,16 @@ public:
     Rasterizer(Rasterizer& primary, WorkerTag);
     ~Rasterizer();
 
+    /// The instance that translates split draw / dispatch records: SHADPS4_MTB_P1's worker
+    /// instance (P1d, notes/parrec-build-2026-10-08.md sec. 14), else this one. Packets, Calls,
+    /// faults and OnSubmit stay on the primary.
+    [[nodiscard]] Rasterizer& Translating() noexcept {
+        return mtb_worker ? *mtb_worker : *this;
+    }
+    [[nodiscard]] bool HasMtbWorker() const noexcept {
+        return mtb_worker != nullptr;
+    }
+
     [[nodiscard]] Scheduler& GetScheduler() noexcept {
         return scheduler;
     }
@@ -367,6 +377,8 @@ private:
         Common::SharedFirstMutex mapped_ranges_mutex;
         PipelineCache pipeline_cache;
         std::unique_ptr<OcclusionQueries> occlusion;
+        /// Set by any instance's draw path, consumed by the primary's OnSubmit (P1d audit).
+        bool fault_process_pending{};
     };
     std::unique_ptr<Shared> owned_shared; ///< Primary instance only.
     Shared& shared;
@@ -474,7 +486,7 @@ private:
     };
     std::array<std::array<DecodedImageDesc, Shader::NUM_IMAGES>, Shader::MaxStageTypes>
         decoded_image_descs{};
-    bool fault_process_pending{};
+    bool& fault_process_pending; ///< In Shared.
     bool attachment_feedback_loop{};
 
     // SHADPS4_RENDER_STATE_MEMO=1 (=2 verify), default off, direct draws (DrawTail) only:
@@ -527,6 +539,9 @@ private:
     RenderStateMemo rs_memo;
     u64 rs_memo_pb_written{}; ///< SHADPS4_PB_CENSUS: census draw index of the last rs_memo store
     RenderStateMemoStats rs_stats;
+    /// SHADPS4_MTB_P1: the worker instance (primary only). Declared after owned_shared, so it
+    /// is destroyed first.
+    std::unique_ptr<Rasterizer> mtb_worker;
     /// Depth layout BeginRendering transitioned the depth target to (valid when one is bound).
     vk::ImageLayout rs_last_depth_layout{};
     [[nodiscard]] bool RenderStateMemoRegsEqual(u32 num_cbs) const;

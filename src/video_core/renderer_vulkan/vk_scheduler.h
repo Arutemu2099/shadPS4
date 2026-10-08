@@ -384,6 +384,20 @@ inline u32 ParRecRequested() {
 /// constructor (after the fallbacks) before any draw.
 inline u32 g_par_rec_lanes = 0;
 
+/// SHADPS4_MTB_P1=1 (multi-threaded back P1d, notes/parrec-build-2026-10-08.md sec. 14): the
+/// back translates split draws / dispatches through a worker rasterizer instance, into a
+/// translating RecordContext with a record sink and a reserved tick - the P3 code path, run on
+/// the back thread. Needs the recording worker with SHADPS4_ASYNC_SUBMIT (refused otherwise).
+inline bool MtbP1Requested() {
+    static const bool on = [] {
+        const char* value = std::getenv("SHADPS4_MTB_P1");
+        return value != nullptr && value[0] == '1';
+    }();
+    return on;
+}
+/// The draw scheduler accepted SHADPS4_MTB_P1 (written once by its constructor).
+inline bool g_mtb_p1 = false;
+
 /// SHADPS4_SKIP_REBIND=1: the draw paths skip vkCmdBindPipeline(graphics) when the same pipeline
 /// is already bound in the same command buffer. Updated in recording order (the recording worker,
 /// or the back after a drain). Every command-buffer begin and every other graphics bind into a
@@ -488,10 +502,14 @@ public:
             // borrower records directly (SHADPS4_TRANSFER_COALESCE).
             scheduler.CloseTransferGroup(scheduler.current_cmdbuf);
             // A borrower may bind legacy descriptor state behind the scheduler's back.
-            scheduler.Rc().native_heaps_bound = false;
+            RecordContext& rc = scheduler.Rc();
+            rc.native_heaps_bound = false;
             ++scheduler.synchronous_scopes;
             ++scheduler.synchronous_borrows;
-            ++scheduler.Rc().stream_seq[scheduler.active_stream];
+            ++rc.stream_seq[scheduler.active_stream];
+            if (rc.sink) [[unlikely]] {
+                rc.sink->MarkBoundary(); // recorded outside the sink (DrainRecording published it)
+            }
             if (scheduler.recording_measure_timing) {
                 ++scheduler.recording_borrow_counts[location.function_name()];
             }
@@ -519,8 +537,17 @@ public:
     /// Hands the recording worker everything recorded so far without waiting.
     void PublishRecording() {
         if (recording_worker) {
+            PublishActiveSink();
             recording_worker->Publish();
         }
+    }
+    /// SHADPS4_MTB_P1: installs the translating context on the calling thread (the back), once:
+    /// submits what was recorded so far, then every later command of this thread goes through
+    /// the context's sink (P1d, serial). False when the mode is off.
+    bool InstallMtbContext();
+    /// SHADPS4_MTB_P1_BREAK (pricing option b): a render pass ended before a packet.
+    void NoteMtbBreak() noexcept {
+        ++mtb_breaks;
     }
     void CommitDynamicState();
     /// SHADPS4_DRAW_PACKET: true when CommitDynamicState would record a command right now (the
@@ -1068,8 +1095,42 @@ private:
         std::array<u64, 2> stream_seq{};
         /// P1c: where this context's recorded commands go (null = the recording worker).
         RecordSink* sink = nullptr;
+        /// The scheduler the context belongs to: another scheduler used on the same thread (the
+        /// presenter's flip / present schedulers on the back) keeps its own rc_main.
+        const Scheduler* owner = nullptr;
     };
     RecordContext rc_main;
+    /// SHADPS4_MTB_P1 (P1d): the back's translating context, installed once by
+    /// InstallMtbContext. Destroyed before the recording worker (its sink owns worker chunks).
+    struct MtbContext {
+        RecordContext rc;
+        std::unique_ptr<RecordSink> sink;
+    };
+    std::unique_ptr<MtbContext> mtb;
+    u64 mtb_res_mismatch = 0;
+    u64 mtb_breaks = 0;
+    u64 mtb_batches = 0;
+    u64 mtb_log_batches = 0;
+    void LogMtbP1();
+    /// Committer: hands the translating context's unpublished commands to the recorder, before
+    /// anything this thread records outside the sink (submission lambda, borrow, drain).
+    void PublishActiveSink() {
+        if (record_ctx_installed) [[unlikely]] {
+            if (RecordSink* const sink = Rc().sink; sink && !sink->Empty()) {
+                recording_worker->PublishSink(*sink);
+            }
+        }
+    }
+    /// master_semaphore.NextTick(); with a translating context on this thread also checks that
+    /// its reservation was the batch's tick, reserves the next one and marks the sink boundary.
+    u64 AdvanceTick() {
+        const u64 signal_value = master_semaphore.NextTick();
+        if (record_ctx_installed) [[unlikely]] {
+            MtbTickAdvanced(signal_value);
+        }
+        return signal_value;
+    }
+    void MtbTickAdvanced(u64 signal_value);
     /// The recording worker, or the translating context's sink.
     template <typename F>
     void WorkerRecord(F&& command) {
@@ -1088,22 +1149,23 @@ private:
         recording_worker->RecordWithPayload(bytes, std::forward<Factory>(factory));
     }
     static inline thread_local RecordContext* t_record_ctx = nullptr;
-    /// Set once a translating thread installs a context: until then Rc() costs one predictable
-    /// branch on the back (the thread_local read was ~15-30 per draw; s259, sec. 12).
+    /// Set at startup by the draw scheduler when SHADPS4_MTB_P1 is accepted (before any other
+    /// thread reads it): without it Rc() costs one predictable branch on the back (the
+    /// thread_local read was ~15-30 per draw; s259, sec. 12).
     static inline bool record_ctx_installed = false;
     RecordContext& Rc() noexcept {
         if (!record_ctx_installed) [[likely]] {
             return rc_main;
         }
         RecordContext* const ctx = t_record_ctx;
-        return ctx ? *ctx : rc_main;
+        return ctx && ctx->owner == this ? *ctx : rc_main;
     }
     const RecordContext& Rc() const noexcept {
         if (!record_ctx_installed) [[likely]] {
             return rc_main;
         }
         const RecordContext* const ctx = t_record_ctx;
-        return ctx ? *ctx : rc_main;
+        return ctx && ctx->owner == this ? *ctx : rc_main;
     }
     vk::CommandBuffer current_cmdbuf;
     std::condition_variable_any event_cv;

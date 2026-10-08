@@ -160,6 +160,27 @@ namespace AmdGpu {
 /// SHADPS4_DRAW_COST=1: cycles the CP back spent in WaitForWork (read and reset by NoteDrawCost).
 thread_local u64 g_back_idle_cyc = 0;
 
+/// SHADPS4_MTB_P1_BREAK=1 (multi-threaded back P1d, notes/parrec-build-2026-10-08.md sec. 14):
+/// prices option (b) - every in-batch sequence point (packet record) ends an open render pass, as
+/// a worker segment starting after it would; the next draw re-begins the pass (LOAD).
+static const bool g_mtb_break = [] {
+    const char* value = std::getenv("SHADPS4_MTB_P1_BREAK");
+    return value != nullptr && value[0] == '1';
+}();
+
+void Liverpool::MtbBreakAtPacket(const PM4Header* header) {
+    // The DMA_DATA to 0x3022C is skipped by ExecuteGfxPacket: not a sequence point.
+    const auto* dma = reinterpret_cast<const PM4DmaData*>(header);
+    if (header->type3.opcode == PM4ItOpcode::DmaData && dma->dst_addr_lo == 0x3022C) {
+        return;
+    }
+    auto& scheduler = rasterizer->GetScheduler();
+    if (scheduler.IsRenderingNow()) {
+        scheduler.EndRendering();
+        scheduler.NoteMtbBreak();
+    }
+}
+
 
 namespace {
 bool ViewportMemoEnabled() {
@@ -1294,8 +1315,15 @@ void Liverpool::FrontProcess(std::stop_token stoken) {
 void Liverpool::BackLoop(std::stop_token stoken) {
     std::stop_callback wake_on_stop{stoken, [this] { split->WakeBack(); }};
     bool stop_forwarded = false;
+    // SHADPS4_MTB_P1 (P1d, notes/parrec-build-2026-10-08.md sec. 14): the translating context is
+    // installed before the first record that can record a command (a rasterizer is bound).
+    bool mtb_install = Vulkan::MtbP1Requested();
     for (;;) {
         if (const auto* record = split->Next()) {
+            if (mtb_install && rasterizer) [[unlikely]] {
+                mtb_install = false;
+                rasterizer->GetScheduler().InstallMtbContext();
+            }
             Common::SampleThreadPlacement("back", 8);
             ExecuteRecord(*record);
             split->Done(record);
@@ -1601,6 +1629,9 @@ void Liverpool::ExecuteRecordImpl(const CpSplit::RecordHeader& record) {
         if (rasterizer) {
             rasterizer->GetScheduler().SwitchStream(0);
         }
+        if (g_mtb_break && rasterizer) [[unlikely]] {
+            MtbBreakAtPacket(reinterpret_cast<const PM4Header*>(payload));
+        }
         if (record.flags & CpSplit::AscReleaseMem) [[unlikely]] {
             ExecuteAscReleaseMem(reinterpret_cast<const PM4CmdReleaseMem*>(payload),
                                  record.flags >> 8);
@@ -1675,12 +1706,14 @@ void Liverpool::ExecuteDrawRecord(const CpSplit::RecordHeader& record) {
     } else if (rec.verify & DrawVerifySnapshot) {
         VerifySnapshot(stages_end, record.seq);
     }
+    // SHADPS4_MTB_P1: split draws translate on the worker instance (P1d).
+    Vulkan::Rasterizer& translating = rasterizer->Translating();
     if (rec.marker) {
-        rasterizer->ScopeMarkerBegin(fmt::format("gfx:{}:{}", rec.cmd_address, rec.marker));
-        rasterizer->ExecuteDraw(rec.draw, stages, vi_block);
-        rasterizer->ScopeMarkerEnd();
+        translating.ScopeMarkerBegin(fmt::format("gfx:{}:{}", rec.cmd_address, rec.marker));
+        translating.ExecuteDraw(rec.draw, stages, vi_block);
+        translating.ScopeMarkerEnd();
     } else {
-        rasterizer->ExecuteDraw(rec.draw, stages, vi_block);
+        translating.ExecuteDraw(rec.draw, stages, vi_block);
     }
 }
 
@@ -1720,26 +1753,28 @@ void Liverpool::ExecuteDispatchRecord(const CpSplit::RecordHeader& record) {
     }
     // BackCsRegs() returns the snapshot while this dispatch runs (HLE, IsCompute*, BindBuffers).
     back_cs = &rec.cs;
-    rasterizer->SetDispatchRun(rec.run);
-    rasterizer->SetDispatchQueue(rec.queue);
+    // SHADPS4_MTB_P1: split dispatches (and their run / queue) go to the worker instance (P1d).
+    Vulkan::Rasterizer& translating = rasterizer->Translating();
+    translating.SetDispatchRun(rec.run);
+    translating.SetDispatchQueue(rec.queue);
     Common::ReadbackOffload::AscSpan().in_asc_dispatch = rec.queue != GfxQueueId;
     if (rec.marker && rec.queue != GfxQueueId) {
-        rasterizer->ScopeMarkerBegin(
+        translating.ScopeMarkerBegin(
             fmt::format("asc[{}]:{}:{}", rec.queue - 1, rec.cmd_address, rec.marker));
-        rasterizer->ExecuteDispatch(rec.pipeline, stages, rec.is_indirect != 0, rec.address,
+        translating.ExecuteDispatch(rec.pipeline, stages, rec.is_indirect != 0, rec.address,
                                     rec.offset, rec.size);
-        rasterizer->ScopeMarkerEnd();
+        translating.ScopeMarkerEnd();
     } else if (rec.marker) {
-        rasterizer->ScopeMarkerBegin(fmt::format("gfx:{}:{}", rec.cmd_address, rec.marker));
-        rasterizer->ExecuteDispatch(rec.pipeline, stages, rec.is_indirect != 0, rec.address,
+        translating.ScopeMarkerBegin(fmt::format("gfx:{}:{}", rec.cmd_address, rec.marker));
+        translating.ExecuteDispatch(rec.pipeline, stages, rec.is_indirect != 0, rec.address,
                                     rec.offset, rec.size);
-        rasterizer->ScopeMarkerEnd();
+        translating.ScopeMarkerEnd();
     } else {
-        rasterizer->ExecuteDispatch(rec.pipeline, stages, rec.is_indirect != 0, rec.address,
+        translating.ExecuteDispatch(rec.pipeline, stages, rec.is_indirect != 0, rec.address,
                                     rec.offset, rec.size);
     }
-    rasterizer->SetDispatchRun(0);
-    rasterizer->SetDispatchQueue(0);
+    translating.SetDispatchRun(0);
+    translating.SetDispatchQueue(0);
     Common::ReadbackOffload::AscSpan().in_asc_dispatch = false;
     back_cs = nullptr;
 }

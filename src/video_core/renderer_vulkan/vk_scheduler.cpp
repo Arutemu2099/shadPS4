@@ -101,6 +101,20 @@ Scheduler::Scheduler(const Instance& instance, bool allow_recording_worker)
                      "ParRec: {} recording lanes (batch k on lane k % {}, submitted in batch order)",
                      par_rec, par_rec);
         }
+        if (MtbP1Requested()) {
+            // P1d (notes/parrec-build-2026-10-08.md sec. 14): the back installs its translating
+            // context later (InstallMtbContext); these gates are fixed before any other thread
+            // reads them.
+            if (async_submit) {
+                g_mtb_p1 = true;
+                record_ctx_installed = true;
+                MasterSemaphore::reservations_enabled = true;
+                LOG_INFO(Render_Vulkan, "MtbP1: on (worker rasterizer, record sink, reserved tick "
+                                        "on the back; serial)");
+            } else {
+                LOG_WARNING(Render_Vulkan, "MtbP1: off because SHADPS4_ASYNC_SUBMIT is off");
+            }
+        }
         if (async_submit) {
             async_timeline.store(static_cast<VkSemaphore>(master_semaphore.Handle()));
             LOG_INFO(Render_Vulkan, "AsyncSubmit: the recording worker ends and submits batches");
@@ -136,6 +150,7 @@ Scheduler::Scheduler(const Instance& instance, bool allow_recording_worker)
 }
 
 Scheduler::~Scheduler() {
+    mtb.reset(); // its sink returns worker chunks
     recording_worker.reset();
 #if TRACY_GPU_ENABLED
     std::free(profiler_scope);
@@ -242,8 +257,61 @@ void Scheduler::CloseTransferGroupSlow(TransferGroup& group, vk::CommandBuffer c
 
 void Scheduler::DrainRecording() {
     if (recording_worker) {
+        PublishActiveSink();
         recording_worker->Drain();
     }
+}
+
+bool Scheduler::InstallMtbContext() {
+    if (!g_mtb_p1 || !recording_worker) {
+        return false;
+    }
+    if (mtb) {
+        return t_record_ctx == &mtb->rc;
+    }
+    // Everything recorded so far went through rc_main: submit it, so the context starts a batch
+    // (state invalidated, no pass open) - every later batch starts the same way.
+    Flush();
+    mtb = std::make_unique<MtbContext>();
+    mtb->sink = NewRecordSink();
+    mtb->sink->SetEagerPublish(true);
+    // RecordSeq continues (a memo's end_seq from before must not match a later sink value).
+    mtb->sink->StartSeq(RecordSeq() + 1);
+    mtb->rc.owner = this;
+    mtb->rc.sink = mtb->sink.get();
+    mtb->rc.stream_seq = rc_main.stream_seq;
+    mtb->rc.dynamic_state.Invalidate();
+    mtb->rc.native_heaps_bound = false;
+    t_record_ctx = &mtb->rc;
+    master_semaphore.Reserve(master_semaphore.CurrentTickRaw());
+    LOG_INFO(Render_Vulkan, "MtbP1: translating context installed at tick {}",
+             master_semaphore.CurrentTickRaw());
+    return true;
+}
+
+void Scheduler::MtbTickAdvanced(const u64 signal_value) {
+    RecordContext* const ctx = t_record_ctx;
+    if (!ctx || ctx->owner != this) {
+        return;
+    }
+    // The batch just submitted was translated with the tick its NextTick returned.
+    if (master_semaphore.ReservedTick() != signal_value) {
+        ++mtb_res_mismatch;
+    }
+    master_semaphore.Reserve(master_semaphore.CurrentTickRaw());
+    ctx->sink->MarkBoundary(); // the submission was recorded outside the sink
+    ++mtb_batches;
+    if (++mtb_log_batches >= 16384) {
+        LogMtbP1();
+    }
+}
+
+void Scheduler::LogMtbP1() {
+    mtb_log_batches = 0;
+    LOG_INFO(Render_Vulkan,
+             "MtbP1: batches={} res_mismatch={} breaks={} eager_publishes={} sink_space_waits={}",
+             mtb_batches, mtb_res_mismatch, mtb_breaks, mtb ? mtb->sink->EagerPublishes() : 0,
+             recording_worker->SinkSpaceWaits());
 }
 
 void Scheduler::LogRecordingWindow() {
@@ -854,6 +922,8 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
     // worker for submits/borrows and ~1.6% inside vkQueueSubmit.
     Common::FaultMonitor::CountGpuSubmit();
     EndRendering();
+    // P1d: the batch's translated commands (incl. that EndRendering) precede its submission.
+    PublishActiveSink();
     if (asc_enabled) {
         // I1: the ASC work recorded before this batch is submitted first and waited on.
         SubmitAscSegment();
@@ -871,7 +941,7 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
             asc_waited_by_main = need;
         }
     }
-    const u64 signal_value = master_semaphore.NextTick();
+    const u64 signal_value = AdvanceTick();
     NoteAscAtFlush(signal_value);
     info.AddSignal(master_semaphore.Handle(), signal_value);
     // SHADPS4_SUBMIT_LOCK_SKIP=1: take the global submit lock for the overlay's texture uploads
@@ -1083,7 +1153,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
             }
         }
     }
-    const u64 signal_value = master_semaphore.NextTick();
+    const u64 signal_value = AdvanceTick();
     NoteAscAtFlush(signal_value);
     last_batch_draws = Rc().batch_draws;
     Rc().batch_draws = 0;
@@ -1249,7 +1319,7 @@ void Scheduler::SubmitExecutionLaneSync(SubmitInfo& info) {
     Common::FaultMonitor::CountGpuSubmit();
     EndRendering();
     DrainRecording();
-    const u64 signal_value = master_semaphore.NextTick();
+    const u64 signal_value = AdvanceTick();
     NoteAscAtFlush(signal_value);
     last_batch_draws = Rc().batch_draws;
     Rc().batch_draws = 0;
