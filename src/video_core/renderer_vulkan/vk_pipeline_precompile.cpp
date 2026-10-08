@@ -1194,8 +1194,16 @@ void PipelineCache::PrecompileFromExtract() {
         }
         if (any_new) {
             const auto t_table = Clock::now();
-            u32 probed = 0, skipped = 0;
+            const size_t arena_before = Shader::SrtWalkerArenaUsed();
+            u32 probed = 0, skipped = 0, arena_stop = 0;
             for (const auto& [hash, source] : table_sources) {
+                // Opus delta review 2026-10-07: every translation appends SRT walker code to a fixed
+                // 32 MB arena that throws when full (Fable finding 7); the table is an optimization,
+                // so it stops well before (13-14 MB used in the gates of the night).
+                if (Shader::SrtWalkerArenaUsed() > 24_MB) {
+                    ++arena_stop;
+                    break;
+                }
                 const auto it = manifest.find(hash);
                 if (it == manifest.end() || failed.contains(hash)) {
                     ++skipped;
@@ -1230,9 +1238,11 @@ void PipelineCache::PrecompileFromExtract() {
             table_ptr = &compile_table;
             LOG_INFO(Render_Vulkan,
                      "Precompile stride table: sources={} probed={} skipped={} pairs={} ends={} "
-                     "ms={:.0f}",
+                     "ms={:.0f} | SRT arena {} -> {} KiB{}",
                      table_sources.size(), probed, skipped, compile_table.pairs,
-                     compile_table.counts.size(), MsSince(t_table));
+                     compile_table.counts.size(), MsSince(t_table), arena_before >> 10,
+                     Shader::SrtWalkerArenaUsed() >> 10,
+                     arena_stop ? " (stopped at 24 MiB)" : "");
         }
     }
 
