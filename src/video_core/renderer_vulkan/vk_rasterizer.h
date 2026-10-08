@@ -180,7 +180,7 @@ public:
 
     template <typename Func>
     void ForEachMappedRangeInRange(VAddr addr, u64 size, Func&& func) {
-        const auto range = decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
+        const auto range = boost::icl::interval_set<VAddr>::interval_type::right_open(addr, addr + size);
         Common::RecursiveSharedLock lock{mapped_ranges_mutex};
         for (const auto& mapped_range : (mapped_ranges & range)) {
             func(mapped_range);

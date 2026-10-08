@@ -6358,7 +6358,7 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
         // Memory range wrapped the address space, cannot be mapped.
         return false;
     }
-    const auto range = decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
+    const auto range = boost::icl::interval_set<VAddr>::interval_type::right_open(addr, addr + size);
 
     Common::RecursiveSharedLock lock{mapped_ranges_mutex};
     return boost::icl::contains(mapped_ranges, range);
@@ -6367,7 +6367,7 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
 void Rasterizer::MapMemory(VAddr addr, u64 size) {
     {
         std::scoped_lock lock{mapped_ranges_mutex};
-        mapped_ranges += decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
+        mapped_ranges += boost::icl::interval_set<VAddr>::interval_type::right_open(addr, addr + size);
     }
     page_manager.OnGpuMap(addr, size);
     buffer_cache.EndGpuMap(addr, size);
@@ -6380,7 +6380,7 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     page_manager.OnGpuUnmap(addr, size);
     {
         std::scoped_lock lock{mapped_ranges_mutex};
-        mapped_ranges -= decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
+        mapped_ranges -= boost::icl::interval_set<VAddr>::interval_type::right_open(addr, addr + size);
     }
     // SHADPS4_BIND_MEMO_STATS: BeginGpuUnmap bumped before the unmap; bump again after it, so a
     // record taken while it was in progress cannot validate against the final mapping.
