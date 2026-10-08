@@ -1088,11 +1088,20 @@ private:
         recording_worker->RecordWithPayload(bytes, std::forward<Factory>(factory));
     }
     static inline thread_local RecordContext* t_record_ctx = nullptr;
+    /// Set once a translating thread installs a context: until then Rc() costs one predictable
+    /// branch on the back (the thread_local read was ~15-30 per draw; s259, sec. 12).
+    static inline bool record_ctx_installed = false;
     RecordContext& Rc() noexcept {
+        if (!record_ctx_installed) [[likely]] {
+            return rc_main;
+        }
         RecordContext* const ctx = t_record_ctx;
         return ctx ? *ctx : rc_main;
     }
     const RecordContext& Rc() const noexcept {
+        if (!record_ctx_installed) [[likely]] {
+            return rc_main;
+        }
         const RecordContext* const ctx = t_record_ctx;
         return ctx ? *ctx : rc_main;
     }
