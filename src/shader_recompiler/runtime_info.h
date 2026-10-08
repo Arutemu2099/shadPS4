@@ -265,11 +265,10 @@ struct RuntimeInfo {
             return vs_info == other.vs_info;
         case Stage::Compute:
             // num_user_data places tgid after the user SGPRs; keyed for SHADPS4_PRECOMPILE's guesses.
-            // num_allocated_vgprs is folded by translation (V_MOVREL chains) and a guess copies it
-            // from another program (Fable review 2026-10-07 finding 2): keyed too. Fixed per program
-            // by the game, so live dispatches get no extra permutations (inferred).
-            return cs_info == other.cs_info && num_user_data == other.num_user_data &&
-                   num_allocated_vgprs == other.num_allocated_vgprs;
+            // num_allocated_vgprs is NOT keyed (as upstream): a compute translation reads it only for
+            // V_MOVREL* (GetScratchVgpr is fragment-only), and SHADPS4_PRECOMPILE skips programs with
+            // V_MOVREL*, so a guessed value cannot change a precompiled module (Fable finding 2).
+            return cs_info == other.cs_info && num_user_data == other.num_user_data;
         case Stage::Export:
             return es_info == other.es_info;
         case Stage::Geometry:

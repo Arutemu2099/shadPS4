@@ -144,16 +144,25 @@ std::vector<u32> ReadCode(const ExtractEntry& entry) {
     return code;
 }
 
-/// True when the code has an image instruction (decoding only, no translation).
-bool UsesImages(const std::vector<u32>& code) {
+/// What decoding the code (no translation) says about precompiling it.
+struct CodeTraits {
+    bool images{};  ///< an image instruction: not precompiled (images are not guessed)
+    bool movrel{};  ///< V_MOVREL*: its translation reads num_allocated_vgprs, which a guess cannot know
+};
+
+CodeTraits ScanCode(const std::vector<u32>& code) {
+    using Shader::Gcn::Opcode;
+    CodeTraits traits{};
     Shader::Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
     Shader::Gcn::GcnDecodeContext decoder;
     while (!slice.atEnd()) {
-        if (decoder.decodeInstruction(slice).encoding == Shader::Gcn::InstEncoding::MIMG) {
-            return true;
-        }
+        const auto inst = decoder.decodeInstruction(slice);
+        traits.images |= inst.encoding == Shader::Gcn::InstEncoding::MIMG;
+        traits.movrel |= inst.opcode == Opcode::V_MOVRELD_B32 ||
+                         inst.opcode == Opcode::V_MOVRELS_B32 ||
+                         inst.opcode == Opcode::V_MOVRELSD_B32;
     }
-    return false;
+    return traits;
 }
 
 bool IsGuessableBuffer(const Shader::BufferResource& buffer) {
@@ -194,7 +203,6 @@ std::optional<std::pair<u64, Context>> LearnContext(const Shader::Info& info,
     ctx.runtime_info = spec.runtime_info;
     const auto& rt = ctx.runtime_info;
     u64 key = HashCombine(u64(rt.num_user_data), u64(rt.cs_info.shared_memory_size));
-    key = HashCombine(key, u64(rt.num_allocated_vgprs)); // keyed in RuntimeInfo too (finding 2)
     for (const u32 v : rt.cs_info.workgroup_size) {
         key = HashCombine(key, u64(v));
     }
@@ -491,7 +499,8 @@ void PipelineCache::PrecompileFromExtract() {
     };
 
     if (holdout) {
-        u32 tested = 0, image_users = 0, probe_mismatch = 0, no_context = 0, missed = 0;
+        u32 tested = 0, image_users = 0, movrel_users = 0, probe_mismatch = 0, no_context = 0,
+            missed = 0;
         u32 spv_equal = 0, spv_diff = 0, spv_equal_partial = 0, spv_diff_partial = 0;
         std::array<u32, 8> hit_at{};
         const auto t_holdout = Clock::now();
@@ -505,8 +514,9 @@ void PipelineCache::PrecompileFromExtract() {
             if (code.empty()) {
                 continue;
             }
-            if (UsesImages(code)) {
-                ++image_users;
+            const auto traits = ScanCode(code);
+            if (traits.images || traits.movrel) {
+                ++(traits.images ? image_users : movrel_users);
                 continue;
             }
             size_t flat_size = 0;
@@ -595,10 +605,10 @@ void PipelineCache::PrecompileFromExtract() {
             missed += !hit;
         }
         LOG_INFO(Render_Vulkan,
-                 "Precompile holdout: programs={} tested={} image_users={} probe_mismatch={} "
+                 "Precompile holdout: programs={} tested={} image_users={} movrel_users={} probe_mismatch={} "
                  "no_context={} hit@1={} @2={} @3={} @4={} @5+={} missed={} full: spv_equal={} "
                  "spv_diff={} | empty-buffer perms: spv_equal={} spv_diff={} guesses={} ms={:.0f}",
-                 reals.size(), tested, image_users, probe_mismatch, no_context, hit_at[0],
+                 reals.size(), tested, image_users, movrel_users, probe_mismatch, no_context, hit_at[0],
                  hit_at[1], hit_at[2], hit_at[3], hit_at[4] + hit_at[5] + hit_at[6] + hit_at[7],
                  missed, spv_equal, spv_diff, spv_equal_partial, spv_diff_partial, guesses,
                  MsSince(t_holdout));
@@ -608,7 +618,8 @@ void PipelineCache::PrecompileFromExtract() {
     }
 
     // COMPILE: every listed program the cache does not hold.
-    u32 listed_new = 0, image_users = 0, no_shape = 0, drifted = 0, programs_built = 0;
+    u32 listed_new = 0, image_users = 0, movrel_users = 0, no_shape = 0, drifted = 0,
+        programs_built = 0;
     u32 permutations = 0, duplicate_specs = 0, layout_mismatch = 0;
     double translate_ms = 0.0;
     const auto t_compile = Clock::now();
@@ -621,8 +632,9 @@ void PipelineCache::PrecompileFromExtract() {
         if (code.empty()) {
             continue;
         }
-        if (UsesImages(code)) {
-            ++image_users;
+        const auto traits = ScanCode(code);
+        if (traits.images || traits.movrel) {
+            ++(traits.images ? image_users : movrel_users);
             continue;
         }
         const auto t_translate = Clock::now();
@@ -724,10 +736,10 @@ void PipelineCache::PrecompileFromExtract() {
         ++programs_built;
     }
     LOG_INFO(Render_Vulkan,
-             "Precompile compile: listed_new={} image_users={} no_shape={} drifted={} "
+             "Precompile compile: listed_new={} image_users={} movrel_users={} no_shape={} drifted={} "
              "programs={} permutations={} duplicate_specs={} layout_mismatch={} guesses={} "
              "translate_ms={:.0f} compile_phase_ms={:.0f} total_ms={:.0f}",
-             listed_new, image_users, no_shape, drifted, programs_built, permutations,
+             listed_new, image_users, movrel_users, no_shape, drifted, programs_built, permutations,
              duplicate_specs, layout_mismatch, guesses, translate_ms, MsSince(t_compile),
              MsSince(t_start));
     // Fable finding 7: every translation appends an SRT walker to a fixed 32 MB arena.
