@@ -15,6 +15,13 @@ namespace Vulkan {
 
 class Instance;
 class Scheduler;
+class MasterSemaphore;
+
+/// A thread's reserved tick on one MasterSemaphore (see MasterSemaphore::Reserve).
+struct TickReservation {
+    const MasterSemaphore* owner{};
+    u64 tick{};
+};
 
 class MasterSemaphore {
 public:
@@ -33,10 +40,6 @@ public:
     /// translating thread stamps lifetimes with the tick of the batch it translates, which the
     /// committer reserves for it; CurrentTick() of the owning semaphore returns it on that thread.
     /// Serial P1d: always equal to the real current tick (checked at every submission).
-    struct TickReservation {
-        const MasterSemaphore* owner{};
-        u64 tick{};
-    };
     /// Set once at startup when a mode that reserves ticks is on; until then one branch.
     static inline bool reservations_enabled = false;
     static inline thread_local TickReservation t_reservation{};
