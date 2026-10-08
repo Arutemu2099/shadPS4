@@ -20,6 +20,7 @@
 #include "common/thread.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/amdgpu/mtb_census.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/readback_queue.h"
 #include "video_core/buffer_cache/memory_tracker.h"
@@ -4903,6 +4904,7 @@ void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
 }
 
 BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
+    AmdGpu::MtbCensus::Note(AmdGpu::MtbCensus::BufferCreate);
     const VAddr device_addr_end = Common::AlignUp(device_addr + wanted_size, CACHING_PAGESIZE);
     device_addr = Common::AlignDown(device_addr, CACHING_PAGESIZE);
     wanted_size = static_cast<u32>(device_addr_end - device_addr);
@@ -5119,6 +5121,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     }
     last_sync_upload_bytes = total_size_bytes;
     sync_upload_bytes_total += total_size_bytes;
+    if (total_size_bytes != 0) {
+        AmdGpu::MtbCensus::Note(AmdGpu::MtbCensus::BufferUpload);
+    }
     if (g_upload_ahead_stats && src_buffer) [[unlikely]] {
         NoteUploadAhead(buffer, device_addr, size, total_size_bytes);
     }
@@ -5606,6 +5611,7 @@ void BufferCache::TouchBuffer(const Buffer& buffer) {
 }
 
 void BufferCache::DeleteBuffer(BufferId buffer_id) {
+    AmdGpu::MtbCensus::Note(AmdGpu::MtbCensus::BufferDelete);
     Buffer& buffer = slot_buffers[buffer_id];
     Unregister(buffer_id);
     // SHADPS4_READBACK_QUEUE=1/2: a copy on the separate readback queue waits only for its

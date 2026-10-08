@@ -34,6 +34,7 @@
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/amdgpu/mtb_census.h"
 
 namespace Common::FenceWatch {
 
@@ -1348,7 +1349,116 @@ void Liverpool::BackLoop(std::stop_token stoken) {
     front_thread.join();
 }
 
+namespace {
+// SHADPS4_MTB_CENSUS (notes/multithreaded-back-design-2026-10-08.md P0): window statistics.
+struct MtbWindow {
+    u64 seg_draws = 0;
+    bool seg_bailed = false;
+    u64 segments = 0, segments_bailed = 0, seg_len_sum = 0, seqpoints = 0;
+    u64 draws = 0, par_draws = 0;
+    u64 par_cyc = 0, ser_draw_cyc = 0, seq_cyc = 0, other_cyc = 0;
+    std::array<u64, AmdGpu::MtbCensus::Count> bails{};
+};
+MtbWindow g_mtb;
+const u64 g_mtb_segment = [] {
+    const char* env = std::getenv("SHADPS4_MTB_SEGMENT");
+    const u64 v = env ? std::strtoull(env, nullptr, 0) : 0;
+    return v != 0 ? v : u64{128};
+}();
+
+void MtbEndSegment() {
+    if (g_mtb.seg_draws != 0) {
+        ++g_mtb.segments;
+        g_mtb.seg_len_sum += g_mtb.seg_draws;
+        g_mtb.segments_bailed += g_mtb.seg_bailed ? 1 : 0;
+    }
+    g_mtb.seg_draws = 0;
+    g_mtb.seg_bailed = false;
+}
+
+void MtbLog() {
+    auto& w = g_mtb;
+    const double all = double(w.par_cyc + w.ser_draw_cyc + w.seq_cyc + w.other_cyc);
+    const double par = all > 0 ? double(w.par_cyc) / all : 0.0;
+    const auto amdahl = [par](double k) { return 1.0 / ((1.0 - par) + par / k); };
+    const auto& b = w.bails;
+    LOG_INFO(Render,
+             "MtbCensus: segment={} draws={} parallel_draws={} ({:.1f}%) segments={} mean_len={:.1f} "
+             "bailed={:.1f}% seqpoints={} | cycles: parallel {:.1f}% serial_draws {:.1f}% "
+             "seqpoints {:.1f}% other {:.1f}% | Amdahl K=2 {:.2f}x K=4 {:.2f}x | first bails: "
+             "buf_create={} buf_delete={} buf_upload={} img_register={} img_unregister={} "
+             "img_upload={} stream_alloc={} occlusion={}",
+             g_mtb_segment, w.draws, w.par_draws, 100.0 * double(w.par_draws) / double(std::max<u64>(w.draws, 1)),
+             w.segments, double(w.seg_len_sum) / double(std::max<u64>(w.segments, 1)),
+             100.0 * double(w.segments_bailed) / double(std::max<u64>(w.segments, 1)), w.seqpoints,
+             100.0 * par, all > 0 ? 100.0 * double(w.ser_draw_cyc) / all : 0.0,
+             all > 0 ? 100.0 * double(w.seq_cyc) / all : 0.0,
+             all > 0 ? 100.0 * double(w.other_cyc) / all : 0.0, amdahl(2.0), amdahl(4.0),
+             b[AmdGpu::MtbCensus::BufferCreate], b[AmdGpu::MtbCensus::BufferDelete],
+             b[AmdGpu::MtbCensus::BufferUpload], b[AmdGpu::MtbCensus::ImageRegister],
+             b[AmdGpu::MtbCensus::ImageUnregister], b[AmdGpu::MtbCensus::ImageUpload],
+             b[AmdGpu::MtbCensus::StreamAlloc], b[AmdGpu::MtbCensus::OcclusionSlot]);
+    const u64 open = w.seg_draws;
+    const bool open_bailed = w.seg_bailed;
+    w = MtbWindow{};
+    w.seg_draws = open;
+    w.seg_bailed = open_bailed;
+}
+} // namespace
+
 void Liverpool::ExecuteRecord(const CpSplit::RecordHeader& record) {
+    if (!AmdGpu::MtbCensus::g_enabled) [[likely]] {
+        ExecuteRecordImpl(record);
+        return;
+    }
+    namespace MC = AmdGpu::MtbCensus;
+    const bool is_work = record.type == CpSplit::RecordType::Draw ||
+                         record.type == CpSplit::RecordType::Dispatch;
+    if (is_work && g_mtb.seg_draws >= g_mtb_segment) {
+        MtbEndSegment();
+    }
+    MC::g_draw_event = MC::None;
+    const u64 t0 = __rdtsc();
+    ExecuteRecordImpl(record);
+    const u64 cyc = __rdtsc() - t0;
+    switch (record.type) {
+    case CpSplit::RecordType::Draw:
+    case CpSplit::RecordType::Dispatch: {
+        ++g_mtb.draws;
+        ++g_mtb.seg_draws;
+        const u32 ev = MC::g_draw_event;
+        if (!g_mtb.seg_bailed && ev == MC::None) {
+            ++g_mtb.par_draws;
+            g_mtb.par_cyc += cyc;
+        } else {
+            if (!g_mtb.seg_bailed) {
+                g_mtb.seg_bailed = true;
+                ++g_mtb.bails[ev];
+            }
+            g_mtb.ser_draw_cyc += cyc;
+        }
+        if ((g_mtb.draws & 0x7fffff) == 0) {
+            MtbLog();
+        }
+        break;
+    }
+    case CpSplit::RecordType::Packet:
+    case CpSplit::RecordType::Call:
+    case CpSplit::RecordType::Retire:
+    case CpSplit::RecordType::ClearState:
+    case CpSplit::RecordType::EpochBump:
+        g_mtb.seq_cyc += cyc;
+        ++g_mtb.seqpoints;
+        MtbEndSegment();
+        break;
+    default:
+        g_mtb.other_cyc += cyc;
+        break;
+    }
+    MC::g_draw_event = MC::None;
+}
+
+void Liverpool::ExecuteRecordImpl(const CpSplit::RecordHeader& record) {
     const auto* payload = reinterpret_cast<const u8*>(&record + 1);
     switch (record.type) {
     case CpSplit::RecordType::RegWrite: {

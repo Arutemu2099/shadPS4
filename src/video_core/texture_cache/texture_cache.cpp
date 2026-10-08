@@ -24,6 +24,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/host_compatibility.h"
+#include "video_core/amdgpu/mtb_census.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/texture_cache/tile_manager.h"
 
@@ -1471,6 +1472,7 @@ void TextureCache::RefreshImage(Image& image) {
         }
         image.hash = hash;
     }
+    AmdGpu::MtbCensus::Note(AmdGpu::MtbCensus::ImageUpload);
 
     const u32 num_layers = image.info.resources.layers;
     const u32 num_mips = image.info.resources.levels;
@@ -1701,6 +1703,7 @@ void LogImageChurn(const char* what, const VideoCore::Image& image) {
 } // namespace
 
 void TextureCache::RegisterImage(ImageId image_id) {
+    AmdGpu::MtbCensus::Note(AmdGpu::MtbCensus::ImageRegister);
     Image& image = slot_images[image_id];
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
@@ -1721,6 +1724,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
 }
 
 void TextureCache::UnregisterImage(ImageId image_id) {
+    AmdGpu::MtbCensus::Note(AmdGpu::MtbCensus::ImageUnregister);
     Image& image = slot_images[image_id];
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");

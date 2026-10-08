@@ -34,6 +34,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_draw_packet.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/amdgpu/mtb_census.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
@@ -1951,6 +1952,7 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     u32 occlusion_slot = OcclusionQueries::NoSlot;
     if (occlusion && occlusion->Open()) [[unlikely]] {
         occlusion_slot = occlusion->DrawSlot();
+        AmdGpu::MtbCensus::Note(AmdGpu::MtbCensus::OcclusionSlot);
         if (occlusion_slot != OcclusionQueries::NoSlot) {
             scheduler.Record([query_pool = occlusion->Pool(), occlusion_slot,
                               query_flags = occlusion->Flags()](vk::CommandBuffer cmdbuf) {
@@ -2134,6 +2136,7 @@ void Rasterizer::DrawIndirectTail(const GraphicsPipeline* pipeline, bool is_inde
     u32 occlusion_slot = OcclusionQueries::NoSlot;
     if (occlusion && occlusion->Open()) [[unlikely]] {
         occlusion_slot = occlusion->DrawSlot();
+        AmdGpu::MtbCensus::Note(AmdGpu::MtbCensus::OcclusionSlot);
         if (occlusion_slot != OcclusionQueries::NoSlot) {
             scheduler.Record([query_pool = occlusion->Pool(), occlusion_slot,
                               query_flags = occlusion->Flags()](vk::CommandBuffer cmdbuf) {
@@ -5143,6 +5146,7 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
                 buffer_infos.emplace_back(gds_buf->Handle(), 0, gds_buf->SizeBytes());
                 bound_buffer = gds_buf;
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
+                AmdGpu::MtbCensus::Note(AmdGpu::MtbCensus::StreamAlloc);
                 auto& vk_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
                 const u32 ubo_size = bound.flattened_ud_buf.size() * sizeof(u32);
                 const u64 offset =
@@ -5155,6 +5159,7 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
                 if (liverpool->BackRegs().clipper_control.user_clip_plane_enable == 0) {
                     buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
                 } else {
+                    AmdGpu::MtbCensus::Note(AmdGpu::MtbCensus::StreamAlloc);
                     auto& vk_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
                     std::array<float, AmdGpu::NUM_CLIP_PLANES * 4> planes{};
                     for (u32 i = 0; i < AmdGpu::NUM_CLIP_PLANES; ++i) {
@@ -5178,6 +5183,7 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
                 buffer_infos.emplace_back(fault_buffer->Handle(), 0, fault_buffer->SizeBytes());
                 bound_buffer = fault_buffer;
             } else if (desc.buffer_type == Shader::BufferType::SharedMemory) {
+                AmdGpu::MtbCensus::Note(AmdGpu::MtbCensus::StreamAlloc);
                 auto& lds_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
                 const auto& cs_program = liverpool->BackCsRegs();
                 const auto lds_size = cs_program.SharedMemSize() * cs_program.NumWorkgroups();

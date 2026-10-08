@@ -305,6 +305,7 @@ private:
     void FrontProcess(std::stop_token stoken);
     void BackLoop(std::stop_token stoken);
     void ExecuteRecord(const CpSplit::RecordHeader& record);
+    void ExecuteRecordImpl(const CpSplit::RecordHeader& record);
     void ExecuteDrawRecord(const CpSplit::RecordHeader& record);
     void ExecuteDispatchRecord(const CpSplit::RecordHeader& record);
     /// `cs` (dispatches): compared with mapped_queues[cs_queue].cs_state.
