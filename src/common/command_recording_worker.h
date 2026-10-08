@@ -65,7 +65,9 @@ inline const bool g_record_bytes_stats = [] {
  * destroyed.
  */
 // ChunkCount is the capacity; SHADPS4_REC_CHUNKS (default 10, the old fixed count) sets how many chunks are used.
-template <std::size_t ChunkCount = 64, std::size_t ChunkBytes = 64 * 1024>
+// ChunkCount 128 (2026-10-08, P1c): the producer uses at most the first half (the old 64),
+// record sinks the rest.
+template <std::size_t ChunkCount = 128, std::size_t ChunkBytes = 64 * 1024>
 class CommandRecordingWorker {
     static_assert(ChunkCount >= 2, "The command worker needs at least two chunks");
     static_assert(ChunkBytes > 0, "The command worker needs non-empty chunks");
@@ -150,6 +152,156 @@ public:
     /// runs first on each lane thread; `on_failure` runs once if a command throws (wake anything
     /// a lane may be blocked on). lanes == 0: the single ordered worker.
     static constexpr std::size_t MaxLanes = 4;
+    /// Chunks [0, SinkBase) serve the producer (SHADPS4_REC_CHUNKS clamps to it), the rest Sinks.
+    static constexpr std::size_t SinkBase = ChunkCount / 2;
+
+    /**
+     * Multi-threaded back P1c (notes/parrec-build-2026-10-08.md sec. 6): commands recorded by a
+     * translating thread into chunks of this worker's sink region, nothing published until the
+     * producer hands the sink over with PublishSink - in order with its own commands. One thread
+     * fills a sink at a time; the producer publishes it. Callables keep pointers into their
+     * chunk (payloads), so chunks are handed over, never copied.
+     */
+    class Sink {
+    public:
+        explicit Sink(CommandRecordingWorker& owner) : owner_{owner} {
+            chunks_.reserve(8);
+        }
+        ~Sink() {
+            Discard();
+        }
+        Sink(const Sink&) = delete;
+        Sink& operator=(const Sink&) = delete;
+
+        template <typename F>
+            requires std::is_object_v<std::remove_cvref_t<F>>
+        void Record(F&& function) {
+            using Callable = std::remove_cvref_t<F>;
+            static_assert(alignof(Callable) <= alignof(std::max_align_t));
+            static_assert(std::is_invocable_v<Callable&>, "Command callable must be invocable");
+            Append<Callable>(
+                [&](void* object, std::span<std::byte>) {
+                    std::construct_at(reinterpret_cast<Callable*>(object),
+                                      std::forward<F>(function));
+                },
+                sizeof(Callable), alignof(Callable), 0);
+        }
+
+        template <typename Factory>
+            requires std::is_object_v<std::remove_reference_t<Factory>>
+        void RecordWithPayload(const std::size_t payload_bytes, Factory&& factory) {
+            using FactoryType = std::remove_reference_t<Factory>;
+            using Result = std::invoke_result_t<FactoryType&, std::span<std::byte>>;
+            using Callable = std::remove_cvref_t<Result>;
+            static_assert(alignof(Callable) <= alignof(std::max_align_t));
+            static_assert(std::is_invocable_v<Callable&>, "Factory result must be invocable");
+            Append<Callable>(
+                [&](void* object, std::span<std::byte> payload) {
+                    decltype(auto) result = std::invoke(factory, payload);
+                    if constexpr (std::is_lvalue_reference_v<decltype(result)>) {
+                        std::construct_at(reinterpret_cast<Callable*>(object), result);
+                    } else {
+                        std::construct_at(reinterpret_cast<Callable*>(object), std::move(result));
+                    }
+                },
+                sizeof(Callable), alignof(Callable), payload_bytes);
+        }
+
+        /// Monotonic: moves with every command and every MarkBoundary (the RecordSeq of a
+        /// translating context: equal values = nothing recorded in between).
+        [[nodiscard]] std::uint64_t Seq() const noexcept {
+            return seq_;
+        }
+        /// Something was recorded outside this sink between its commands (a submission).
+        void MarkBoundary() noexcept {
+            ++seq_;
+        }
+        [[nodiscard]] bool Empty() const noexcept {
+            return chunks_.empty();
+        }
+        /// Drops everything recorded and not yet published.
+        void Discard() {
+            for (Chunk* chunk : chunks_) {
+                owner_.FreeSinkChunk(*chunk);
+            }
+            chunks_.clear();
+        }
+
+    private:
+        friend class CommandRecordingWorker;
+
+        template <typename Callable, typename Construct>
+        void Append(Construct&& construct, const std::size_t object_bytes,
+                    const std::size_t object_alignment, const std::size_t payload_bytes) {
+            if (!TryLayout(0, object_bytes, object_alignment, payload_bytes)) {
+                throw std::length_error("command recording sink: command exceeds chunk size");
+            }
+            Chunk* chunk = chunks_.empty() ? nullptr : chunks_.back();
+            std::optional<Layout> layout;
+            if (chunk != nullptr) {
+                layout = TryLayout(chunk->used, object_bytes, object_alignment, payload_bytes);
+            }
+            if (!layout) {
+                chunk = owner_.AcquireSinkChunk();
+                chunks_.push_back(chunk);
+                layout = TryLayout(0, object_bytes, object_alignment, payload_bytes);
+            }
+            const std::size_t old_used = chunk->used;
+            chunk->used = layout->end_offset;
+            auto* const header =
+                reinterpret_cast<CommandHeader*>(chunk->storage.data() + layout->header_offset);
+            void* const object = chunk->storage.data() + layout->object_offset;
+            try {
+                construct(object, std::span<std::byte>{
+                                      chunk->storage.data() + layout->payload_offset,
+                                      payload_bytes});
+            } catch (...) {
+                chunk->used = old_used;
+                throw;
+            }
+            std::construct_at(header, CommandHeader{&Invoke<Callable>, &Destroy<Callable>,
+                                                    object, layout->end_offset});
+            if (chunk->command_count == 0) {
+                chunk->first_offset = layout->header_offset;
+            }
+            ++chunk->command_count;
+            ++seq_;
+        }
+
+        CommandRecordingWorker& owner_;
+        std::vector<Chunk*> chunks_;
+        std::uint64_t seq_{};
+    };
+
+    /// Producer: queues everything it recorded so far, then the sink's commands, in that order,
+    /// and empties the sink (lane mode: tagged with the open batch).
+    void PublishSink(Sink& sink) {
+        std::unique_lock lock{mutex_};
+        if (failure_) {
+            lock.unlock();
+            sink.Discard();
+            return;
+        }
+        if (current_ != nullptr && current_->command_count != 0) {
+            PublishCurrentLocked();
+        }
+        for (Chunk* chunk : sink.chunks_) {
+            if (chunk->command_count == 0) {
+                chunk->used = 0;
+                chunk->first_offset = 0;
+                chunk->state = ChunkState::Free;
+                continue;
+            }
+            accepted_commands_ += chunk->command_count;
+            reserved_bytes_ += chunk->used;
+            PublishChunkLocked(chunk);
+        }
+        sink.chunks_.clear();
+    }
+    [[nodiscard]] std::uint64_t SinkSpaceWaits() const noexcept {
+        std::lock_guard lock{mutex_};
+        return sink_space_waits_;
+    }
     explicit CommandRecordingWorker(const bool measure_timing = false, const std::size_t lanes = 0,
                                     std::function<void(std::size_t)> lane_start = {},
                                     std::function<void()> on_failure = {})
@@ -571,7 +723,7 @@ private:
             n = 10; // unparseable or 0: the default, not the 2-chunk floor
         }
         return static_cast<std::size_t>(
-            std::clamp<unsigned long long>(n, 2ull, static_cast<unsigned long long>(ChunkCount)));
+            std::clamp<unsigned long long>(n, 2ull, static_cast<unsigned long long>(SinkBase)));
     }
 
     Chunk* AcquireCurrentLocked(std::unique_lock<std::mutex>& lock) {
@@ -648,27 +800,66 @@ private:
 
     void PublishCurrentLocked() {
         assert(current_ != nullptr);
-        assert(current_->command_count != 0);
-        current_->state = ChunkState::Queued;
+        Chunk* const chunk = current_;
+        current_ = nullptr;
+        PublishChunkLocked(chunk);
+    }
+
+    void PublishChunkLocked(Chunk* chunk) {
+        assert(chunk->command_count != 0);
+        chunk->state = ChunkState::Queued;
         if (lanes_ != 0) {
             // A chunk is tagged when published: batch ends publish the chunk holding the
             // submission first, so a chunk never holds two batches.
-            current_->batch = producer_batch_;
+            chunk->batch = producer_batch_;
             LaneQueue& lane = lane_queues_[producer_batch_ % lanes_];
             assert(lane.size < ChunkCount);
-            lane.queue[(lane.head + lane.size) % ChunkCount] = current_;
+            lane.queue[(lane.head + lane.size) % ChunkCount] = chunk;
             ++lane.size;
             ++published_chunks_;
-            current_ = nullptr;
             lane.cv.notify_one();
             return;
         }
         assert(published_size_ < ChunkCount);
-        published_queue_[(published_head_ + published_size_) % ChunkCount] = current_;
+        published_queue_[(published_head_ + published_size_) % ChunkCount] = chunk;
         ++published_size_;
         ++published_chunks_;
-        current_ = nullptr;
         work_cv_.notify_one();
+    }
+
+    /// A freed chunk wakes whoever allocates from its region.
+    void NotifyFreedLocked(const Chunk& chunk) {
+        if (static_cast<std::size_t>(&chunk - chunks_.data()) >= SinkBase) {
+            sink_space_cv_.notify_all();
+        } else {
+            space_cv_.notify_one();
+        }
+    }
+
+    /// P1c: a free chunk of the sink region for a Sink (blocks until lanes free one).
+    Chunk* AcquireSinkChunk() {
+        std::unique_lock lock{mutex_};
+        for (;;) {
+            CheckAcceptingLocked();
+            for (std::size_t i = SinkBase; i < ChunkCount; ++i) {
+                if (chunks_[i].state == ChunkState::Free) {
+                    chunks_[i].state = ChunkState::Building;
+                    return &chunks_[i];
+                }
+            }
+            ++sink_space_waits_;
+            sink_space_cv_.wait(lock);
+        }
+    }
+
+    void FreeSinkChunk(Chunk& chunk) {
+        DestroyChunkContents(chunk);
+        std::lock_guard lock{mutex_};
+        chunk.used = 0;
+        chunk.first_offset = 0;
+        chunk.command_count = 0;
+        chunk.state = ChunkState::Free;
+        sink_space_cv_.notify_all();
     }
 
     void ReleaseEmptyCurrentLocked() {
@@ -710,7 +901,7 @@ private:
         chunk.command_count = 0;
         chunk.state = ChunkState::Free;
         done_cv_.notify_all();
-        space_cv_.notify_one();
+        NotifyFreedLocked(chunk);
     }
 
     void ReleaseDiscardedChunkLocked(Chunk& chunk) {
@@ -721,7 +912,7 @@ private:
         chunk.command_count = 0;
         chunk.state = ChunkState::Free;
         done_cv_.notify_all();
-        space_cv_.notify_one();
+        NotifyFreedLocked(chunk);
     }
 
     void WorkerLoop() {
@@ -925,6 +1116,8 @@ private:
     std::condition_variable work_cv_;
     std::condition_variable done_cv_;
     std::condition_variable space_cv_;
+    std::condition_variable sink_space_cv_; ///< P1c: sink-region chunks freed.
+    std::uint64_t sink_space_waits_{};
     std::array<Chunk, ChunkCount> chunks_{};
     std::array<Chunk*, ChunkCount> published_queue_{};
     const std::size_t active_chunks_{ReadActiveChunks()};

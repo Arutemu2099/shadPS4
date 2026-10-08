@@ -538,12 +538,28 @@ public:
     void PushDescriptors(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
                          std::span<const vk::WriteDescriptorSet> writes);
 
+    /// Multi-threaded back P1c: commands a translating thread records into chunks of the
+    /// recording worker, queued in stream order when the command processor publishes them.
+    using RecordSink = Common::CommandRecordingWorker<>::Sink;
+    /// A new sink on the recording worker (null without one).
+    [[nodiscard]] std::unique_ptr<RecordSink> NewRecordSink() {
+        return recording_worker ? std::make_unique<RecordSink>(*recording_worker) : nullptr;
+    }
+    /// Command processor: queues everything recorded so far, then the sink's commands.
+    void PublishRecordSink(RecordSink& sink) {
+        recording_worker->PublishSink(sink);
+    }
+
     bool IsAsyncRecording() const {
         return recording_worker && synchronous_scopes == 0;
     }
     /// Command-processor thread: moves whenever anything is recorded (worker commands) or the
     /// command buffer is borrowed directly. Equal values = nothing recorded in between.
     u64 RecordSeq() const {
+        // A translating context with a sink counts its own commands (P1c).
+        if (const RecordSink* const sink = Rc().sink) [[unlikely]] {
+            return sink->Seq();
+        }
         return (recording_worker ? recording_worker->AcceptedCommandsProducer() : 0) +
                synchronous_borrows;
     }
@@ -573,7 +589,7 @@ public:
         }
         // The handle is read when the worker runs the command: with SHADPS4_ASYNC_SUBMIT the
         // worker itself ends, submits and replaces the command buffer, in recording order.
-        recording_worker->Record([this, command = std::forward<F>(command)]() mutable {
+        WorkerRecord([this, command = std::forward<F>(command)]() mutable {
             const vk::CommandBuffer cmdbuf = RecorderCmdbuf();
             if constexpr (!IsTransfer) {
                 CloseTransferGroup(cmdbuf);
@@ -637,7 +653,7 @@ public:
             CloseTransferGroup(access.Handle());
             return;
         }
-        recording_worker->RecordWithPayload(bytes, [&](std::span<std::byte> storage) {
+        WorkerRecordWithPayload(bytes, [&](std::span<std::byte> storage) {
             auto* cursor = storage.data();
             auto copies = std::tuple{CopyPayload(cursor, arrays)...};
             return [this, command = std::forward<F>(command), copies]() mutable {
@@ -1045,8 +1061,27 @@ private:
         u32 batch_dispatches = 0;
         u32 batch_ops = 0;
         std::array<u64, 2> stream_seq{};
+        /// P1c: where this context's recorded commands go (null = the recording worker).
+        RecordSink* sink = nullptr;
     };
     RecordContext rc_main;
+    /// The recording worker, or the translating context's sink.
+    template <typename F>
+    void WorkerRecord(F&& command) {
+        if (RecordSink* const sink = Rc().sink) [[unlikely]] {
+            sink->Record(std::forward<F>(command));
+            return;
+        }
+        recording_worker->Record(std::forward<F>(command));
+    }
+    template <typename Factory>
+    void WorkerRecordWithPayload(size_t bytes, Factory&& factory) {
+        if (RecordSink* const sink = Rc().sink) [[unlikely]] {
+            sink->RecordWithPayload(bytes, std::forward<Factory>(factory));
+            return;
+        }
+        recording_worker->RecordWithPayload(bytes, std::forward<Factory>(factory));
+    }
     static inline thread_local RecordContext* t_record_ctx = nullptr;
     RecordContext& Rc() noexcept {
         RecordContext* const ctx = t_record_ctx;

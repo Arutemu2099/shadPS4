@@ -399,7 +399,7 @@ void Scheduler::RecordDrawPacket(const DrawPacketDesc& desc) {
     const size_t bytes = DrawPacketPayloadBytes(desc.barriers.size(), table.size(),
                                                 buffer_infos.size(), image_infos.size());
     ASSERT_MSG(bytes <= DrawPacketMaxBytes, "Draw packet of {} bytes", bytes);
-    recording_worker->RecordWithPayload(bytes, [&](std::span<std::byte> storage) {
+    WorkerRecordWithPayload(bytes, [&](std::span<std::byte> storage) {
         std::byte* cursor = storage.data();
         auto* header = reinterpret_cast<DrawPacketHeader*>(cursor);
         std::memcpy(header, &desc.header, sizeof(DrawPacketHeader));
@@ -585,7 +585,7 @@ void Scheduler::PushDescriptors(vk::PipelineBindPoint bind_point, vk::PipelineLa
         access.Handle().pushDescriptorSetKHR(bind_point, layout, 0, writes);
         return;
     }
-    recording_worker->RecordWithPayload(bytes, [&](std::span<std::byte> storage) {
+    WorkerRecordWithPayload(bytes, [&](std::span<std::byte> storage) {
         auto* cursor = storage.data();
         auto* copies = reinterpret_cast<vk::WriteDescriptorSet*>(cursor);
         std::memcpy(copies, writes.data(), writes.size_bytes());
