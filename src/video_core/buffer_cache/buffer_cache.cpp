@@ -752,6 +752,54 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, InvalidateOrigin
     if (!IsRegionRegistered(device_addr, size)) {
         return;
     }
+    // SHADPS4_HEAP_WRITE_BLOCK=<bytes> (2026-10-08, notes/zero-copy-build-2026-10-07.md sec. 5-6):
+    // a guest write fault inside the game's per-frame heap span (SHADPS4_HEAP_WRITE_RANGE=lo-hi
+    // hex, default 248000000-269e00000) unprotects and dirties its whole block, not one 4 KB
+    // page. The game writes ~1,200 pages of the span per frame in ~130 64 KB blocks (s215), so
+    // its next writes to the block's other pages fault no more. Extra dirty pages only cost
+    // uploads of unchanged bytes. A block with GPU-modified pages keeps the single page (a write
+    // fault must never start a download for bytes it did not touch).
+    struct HeapBlock {
+        u64 bytes = 0;
+        VAddr lo = 0x248000000ULL, hi = 0x269e00000ULL;
+    };
+    static const HeapBlock heap_block = [] {
+        HeapBlock c{};
+        const char* value = std::getenv("SHADPS4_HEAP_WRITE_BLOCK");
+        const u64 bytes = value ? std::strtoull(value, nullptr, 0) : 0;
+        c.bytes = bytes >= 8192 && std::has_single_bit(bytes) ? bytes : 0;
+        if (const char* range = std::getenv("SHADPS4_HEAP_WRITE_RANGE")) {
+            char* end = nullptr;
+            const VAddr lo = std::strtoull(range, &end, 16);
+            const VAddr hi = end && *end == '-' ? std::strtoull(end + 1, nullptr, 16) : 0;
+            if (hi > lo) {
+                c.lo = lo;
+                c.hi = hi;
+            }
+        }
+        if (c.bytes != 0) {
+            LOG_INFO(Render, "SHADPS4_HEAP_WRITE_BLOCK: {} KB blocks over {:#x}-{:#x}",
+                     c.bytes >> 10, c.lo, c.hi);
+        }
+        return c;
+    }();
+    if (heap_block.bytes != 0 && origin == InvalidateOrigin::GuestWriteFault &&
+        device_addr >= heap_block.lo && device_addr + size <= heap_block.hi) {
+        const VAddr block = Common::AlignDown(device_addr, heap_block.bytes);
+        static std::atomic<u64> widened{0}, kept{0};
+        if (block >= heap_block.lo && block + heap_block.bytes <= heap_block.hi &&
+            !memory_tracker->IsRegionGpuModified(block, heap_block.bytes)) {
+            device_addr = block;
+            size = heap_block.bytes;
+            const u64 n = widened.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((n & 0x3ffff) == 0) {
+                LOG_INFO(Render, "HeapWriteBlock: {} KB blocks widened={} kept_single={}",
+                         heap_block.bytes >> 10, n, kept.load(std::memory_order_relaxed));
+            }
+        } else {
+            kept.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     // SHADPS4_FAULT_WRITE_SKIP_SETTLE=1: a write fault (guest or CP thread) needs no
     // pre-settle. It cannot unmap, and a job neither copies nor publishes a GPU-clean page,
     // while a GPU-dirty page takes the flush callback below, which settles in
