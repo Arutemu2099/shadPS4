@@ -128,13 +128,16 @@ bool SameBindingLayout(const Shader::Info& a, const Shader::Info& b) {
 
 bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
                     std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
-                    Shader::StageSpecialization& spec, size_t& perm_idx) {
+                    Shader::StageSpecialization& spec, size_t& perm_idx, bool* precompiled) {
     Serialization::Reader meta{ar};
 
     u32 meta_version{};
     meta.Read(meta_version);
     if ((meta_version & ~Serialization::PrecompiledMetaBit) != Serialization::ShaderMetaVersion) {
         return false;
+    }
+    if (precompiled) {
+        *precompiled = (meta_version & Serialization::PrecompiledMetaBit) != 0;
     }
 
     u32 binary_version{};
@@ -352,9 +355,13 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     spec.info = &program->info;
     size_t perm_idx{};
     std::optional<Shader::Gcn::FetchShaderData> loaded_fetch;
-    if (!LoadShaderMeta(ar, program->info, loaded_fetch, spec, perm_idx)) {
+    bool marked = false;
+    if (!LoadShaderMeta(ar, program->info, loaded_fetch, spec, perm_idx, &marked)) {
         return false;
     }
+    // SHADPS4_PRECOMPILE (Fable review 2026-10-07 finding 5): keep the marker across launches, so
+    // the first live dispatch still reports PrecompiledUse (diagnostic only).
+    program->precompiled = marked;
     // Preserve loader scratch state on later failure; on success use the module's
     // immutable owner below. Serialized values and cache format stay unchanged.
     fetch_shader = loaded_fetch

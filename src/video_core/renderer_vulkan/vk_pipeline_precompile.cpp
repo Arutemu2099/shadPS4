@@ -37,9 +37,11 @@
 #include "common/hash.h"
 #include "common/logging/log.h"
 #include "common/serdes.h"
+#include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/info.h"
+#include "shader_recompiler/ir/passes/srt.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/cache_storage.h"
@@ -192,6 +194,7 @@ std::optional<std::pair<u64, Context>> LearnContext(const Shader::Info& info,
     ctx.runtime_info = spec.runtime_info;
     const auto& rt = ctx.runtime_info;
     u64 key = HashCombine(u64(rt.num_user_data), u64(rt.cs_info.shared_memory_size));
+    key = HashCombine(key, u64(rt.num_allocated_vgprs)); // keyed in RuntimeInfo too (finding 2)
     for (const u32 v : rt.cs_info.workgroup_size) {
         key = HashCombine(key, u64(v));
     }
@@ -301,7 +304,13 @@ void PipelineCache::PrecompileFromExtract() {
         return;
     }
     const bool verify = (mode & 2) != 0;
-    const bool compile = (mode & 1) != 0;
+    bool compile = (mode & 1) != 0;
+    if (compile && EmulatorSettings.IsPipelineCacheArchived()) {
+        // COMPILE saves entries before FinishPreload, which an archived (zip) cache refuses on the
+        // IO thread (Fable finding 4): only the folder cache can take them.
+        LOG_WARNING(Render_Vulkan, "Precompile: COMPILE needs the folder cache; archived cache, skipped");
+        compile = false;
+    }
     const bool holdout = (mode & 4) != 0;
     const bool learn = compile || holdout;
     const auto t_start = Clock::now();
@@ -317,7 +326,7 @@ void PipelineCache::PrecompileFromExtract() {
     std::unordered_map<u64, ShapeContexts> shapes;
     std::unordered_map<u64, std::vector<RealPerm>> reals; // HOLDOUT only
     u32 metas = 0, unloadable = 0, compute = 0, no_code = 0, no_spv = 0, matched = 0, differed = 0;
-    u32 learned = 0, unlearnable = 0, add_tid_seen = 0;
+    u32 learned = 0, unlearnable = 0, add_tid_seen = 0, precompiled_metas = 0;
     double verify_ms = 0.0;
     Storage::DataBase::Instance().ForEachBlob(
         Storage::BlobType::ShaderMeta, [&](std::vector<u8>&& data) {
@@ -328,7 +337,8 @@ void PipelineCache::PrecompileFromExtract() {
             spec.info = &cached;
             std::optional<Shader::Gcn::FetchShaderData> fetch;
             size_t perm_idx{};
-            if (!LoadShaderMeta(ar, cached, fetch, spec, perm_idx)) {
+            bool marked = false;
+            if (!LoadShaderMeta(ar, cached, fetch, spec, perm_idx, &marked)) {
                 ++unloadable;
                 return;
             }
@@ -337,6 +347,12 @@ void PipelineCache::PrecompileFromExtract() {
             }
             ++compute;
             cached_programs.insert(cached.pgm_hash);
+            if (marked) {
+                // A precompiled (guessed) context is not evidence of what the game dispatches:
+                // never learn from it, never verify or hold it out (Fable finding 5).
+                ++precompiled_metas;
+                return;
+            }
             u64 shape = 0, ctx_key = 0;
             if (learn) {
                 shape = ShapeHash(cached);
@@ -440,8 +456,9 @@ void PipelineCache::PrecompileFromExtract() {
     }
     LOG_INFO(Render_Vulkan,
              "Precompile learn: compute metas={} learned={} unlearnable={} shapes={} "
-             "add_tid_sharps={} programs_cached={}",
-             compute, learned, unlearnable, shapes.size(), add_tid_seen, cached_programs.size());
+             "add_tid_sharps={} programs_cached={} precompiled_metas_skipped={}",
+             compute, learned, unlearnable, shapes.size(), add_tid_seen, cached_programs.size(),
+             precompiled_metas);
 
     const u32 guesses = PrecompileGuesses();
     const std::vector<u32> filler(FlatFillerDwords, FillerDword);
@@ -713,6 +730,9 @@ void PipelineCache::PrecompileFromExtract() {
              listed_new, image_users, no_shape, drifted, programs_built, permutations,
              duplicate_specs, layout_mismatch, guesses, translate_ms, MsSince(t_compile),
              MsSince(t_start));
+    // Fable finding 7: every translation appends an SRT walker to a fixed 32 MB arena.
+    LOG_INFO(Render_Vulkan, "Precompile: SRT walker arena {} KiB used of 32768",
+             Shader::SrtWalkerArenaUsed() >> 10);
 }
 
 } // namespace Vulkan

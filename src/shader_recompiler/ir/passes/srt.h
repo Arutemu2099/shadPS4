@@ -15,6 +15,9 @@ namespace Shader {
 
 using PFN_SrtWalker = void PS4_SYSV_ABI (*)(const u32* /*user_data*/, u32* /*flat_dst*/);
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size);
+/// Bytes of the SRT walker code arena in use (capacity 32 MB on x86-64; every translation and
+/// shader-meta load appends a walker). Diagnostic (SHADPS4_PRECOMPILE logs it after WarmUp).
+size_t SrtWalkerArenaUsed();
 
 struct PersistentSrtInfo {
     // Special case when fetch shader uses step rates.

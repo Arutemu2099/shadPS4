@@ -38,6 +38,10 @@ PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
     return func_addr;
 }
 
+size_t SrtWalkerArenaUsed() {
+    return g_srt_codegen.getSize();
+}
+
 } // namespace Shader
 
 namespace {
@@ -313,6 +317,10 @@ namespace Shader {
 
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
     UNREACHABLE_MSG("RegisterWalkerCode unimplemented for target architecture.");
+}
+
+size_t SrtWalkerArenaUsed() {
+    return 0;
 }
 
 namespace Optimization {
