@@ -14,6 +14,9 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 #include <thread>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_gpu_batch_timer.h"
 
@@ -45,18 +48,58 @@ Scheduler::Scheduler(const Instance& instance, bool allow_recording_worker)
     if (allow_recording_worker && enabled && std::string_view{enabled} == "1") {
         const char* timing = std::getenv("SHADPS4_ASYNC_RECORDING_TIMING");
         recording_measure_timing = timing && std::string_view{timing} == "1";
-        recording_worker =
-            std::make_unique<Common::CommandRecordingWorker<>>(recording_measure_timing);
-        recording_worker->Record([] {
-            Common::SetCurrentThreadName("shadPS4:VkRecorder");
-            Common::ApplyHotThreadPlacement(Common::HotThread::Recorder);
-        });
+        const char* async = std::getenv("SHADPS4_ASYNC_SUBMIT");
+        async_submit = async && std::string_view{async} == "1";
+        // SHADPS4_PAR_REC lanes need the worker to submit (a submission ends a batch); the ASC
+        // stream (two command buffers switched on the worker) and the batch timer (one query
+        // pool) assume one recorder.
+        par_rec = ParRecRequested();
+        if (par_rec != 0) {
+            const char* why = !async_submit                  ? "SHADPS4_ASYNC_SUBMIT is off"
+                              : instance.HasAscQueue()       ? "the ASC stream is on"
+                              : GpuBatchTimer::Enabled()     ? "SHADPS4_GPU_BATCH_TIMING is on"
+                                                             : nullptr;
+            if (why) {
+                LOG_WARNING(Render_Vulkan, "ParRec: {} lanes requested, off because {}", par_rec,
+                            why);
+                par_rec = 0;
+            }
+        }
+        for (u32 i = 0; i < par_rec; ++i) {
+            rec_lanes[i].pool = std::make_unique<CommandPool>(instance, &master_semaphore);
+        }
+        recording_worker = std::make_unique<Common::CommandRecordingWorker<>>(
+            recording_measure_timing, par_rec,
+            [this](std::size_t lane) {
+                t_rec_lane = &rec_lanes[lane];
+                Common::SetCurrentThreadName(
+                    lane == 0 ? "shadPS4:VkRecorder"
+                              : (lane == 1 ? "shadPS4:VkRecorder1"
+                                           : (lane == 2 ? "shadPS4:VkRecorder2"
+                                                        : "shadPS4:VkRecorder3")));
+                if (lane == 0) {
+                    Common::ApplyHotThreadPlacement(Common::HotThread::Recorder);
+                }
+            },
+            [this] {
+                rec_submitted.fetch_or(RecAbortBit, std::memory_order_acq_rel);
+                rec_submitted.notify_all();
+            });
+        if (par_rec == 0) {
+            recording_worker->Record([] {
+                Common::SetCurrentThreadName("shadPS4:VkRecorder");
+                Common::ApplyHotThreadPlacement(Common::HotThread::Recorder);
+            });
+        }
         Common::CommandRecordingWorker<>::SetChunkHook(
             [] { Common::SampleThreadPlacement("recorder", 2); });
         LOG_INFO(Render_Vulkan, "AsyncRecording: enabled, ordered primary command worker, {} chunks",
                  recording_worker->ActiveChunks());
-        const char* async = std::getenv("SHADPS4_ASYNC_SUBMIT");
-        async_submit = async && std::string_view{async} == "1";
+        if (par_rec != 0) {
+            LOG_INFO(Render_Vulkan,
+                     "ParRec: {} recording lanes (batch k on lane k % {}, submitted in batch order)",
+                     par_rec, par_rec);
+        }
         if (async_submit) {
             async_timeline.store(static_cast<VkSemaphore>(master_semaphore.Handle()));
             LOG_INFO(Render_Vulkan, "AsyncSubmit: the recording worker ends and submits batches");
@@ -110,7 +153,8 @@ namespace {
 struct TransferCoalesceStats {
     u64 ops = 0, groups = 0, tt_barriers = 0, overflow = 0;
 };
-TransferCoalesceStats g_tcs; // recording order only (one recorder at a time)
+// Per recorder thread (SHADPS4_PAR_REC lanes record at once); log-only counters.
+thread_local TransferCoalesceStats g_tcs;
 
 bool RangesOverlap(const Scheduler::TransferRange& a, const Scheduler::TransferRange& b) {
     return a.buffer == b.buffer && a.lo < b.hi && b.lo < a.hi;
@@ -119,7 +163,7 @@ bool RangesOverlap(const Scheduler::TransferRange& a, const Scheduler::TransferR
 
 void Scheduler::BeginTransferOnWorker(vk::CommandBuffer cmdbuf, const TransferRange& read,
                                       const TransferRange& write) {
-    TransferGroup& group = transfer_group[worker_stream];
+    TransferGroup& group = RecorderTransferGroup();
     ++g_tcs.ops;
     if (!group.open) {
         // Everything recorded before the group -> the group's transfers (was: one such barrier
@@ -456,8 +500,8 @@ static void DrawPacketRecorderStats(vk::CommandBuffer cmdbuf, const DrawPacketHe
 void Scheduler::ExecuteDrawPacket(const DrawPacketHeader& header) {
     // Recording-worker thread. Order = the legacy records: barrier, push constants, push
     // descriptors, then (when folded) bind + draw / dispatch.
-    CloseTransferGroup(current_cmdbuf);
-    const vk::CommandBuffer cmdbuf = current_cmdbuf;
+    const vk::CommandBuffer cmdbuf = RecorderCmdbuf();
+    CloseTransferGroup(cmdbuf);
     const DrawPacketView view = ViewDrawPacket(header);
     if (header.num_barriers != 0) {
         cmdbuf.pipelineBarrier2(vk::DependencyInfo{
@@ -562,7 +606,7 @@ void Scheduler::PushDescriptors(vk::PipelineBindPoint bind_point, vk::PipelineLa
             }
         }
         return [this, bind_point, layout, copies, count = writes.size()] {
-            current_cmdbuf.pushDescriptorSetKHR(
+            RecorderCmdbuf().pushDescriptorSetKHR(
                 bind_point, layout, 0, std::span<const vk::WriteDescriptorSet>{copies, count});
         };
     });
@@ -765,6 +809,22 @@ void Scheduler::AllocateWorkerCommandBuffers() {
     const vk::CommandBufferBeginInfo begin_info = {
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
     };
+    if (par_rec != 0) {
+        // Every lane always holds one begun command buffer (startup; after a synchronous
+        // submission, the lane that submitted). The open batch's is borrowed while drained.
+        for (u32 i = 0; i < par_rec; ++i) {
+            RecLane& lane = rec_lanes[i];
+            if (!lane.cmdbuf) {
+                lane.cmdbuf = lane.pool->CommitInFlight(lane.cmdbuf_slot);
+                Check(lane.cmdbuf.begin(begin_info));
+            }
+        }
+        current_cmdbuf = OpenLane().cmdbuf;
+        GraphicsBindTracker::Invalidate();
+        dynamic_state.Invalidate();
+        native_heaps_bound = false;
+        return;
+    }
 
     main_cmdbuf = command_pool.Commit();
     Check(main_cmdbuf.begin(begin_info));
@@ -830,6 +890,23 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
     batch_draws = 0;
     batch_dispatches = 0;
     batch_ops = 0;
+    if (par_rec != 0) {
+        // SHADPS4_PAR_REC: this batch's lane ends, submits (in batch order) and replaces its own
+        // command buffer; the batch end routes everything recorded after it to the next lane.
+        const u64 batch = recording_worker->ProducerBatch();
+        recording_worker->Record([this, info, signal_value, batch] {
+            SubmitLaneOnWorker(info, signal_value, batch);
+        });
+        recording_worker->Publish(true);
+        dynamic_state.Invalidate();
+        native_heaps_bound = false;
+        master_semaphore.Refresh();
+        PopPendingOperations();
+        if (++rec_log_batches >= 16384) {
+            LogParRec();
+        }
+        return;
+    }
     recording_worker->Record([this, info, signal_value, draws, dispatches]() mutable {
         if (transfer_group[0].open) {
             CloseTransferGroupSlow(transfer_group[0], main_cmdbuf);
@@ -975,6 +1052,10 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
             }
         }
     }
+    if (par_rec != 0) {
+        SubmitExecutionLaneSync(info);
+        return;
+    }
     std::scoped_lock lk{submit_mutex};
     Common::FaultMonitor::CountGpuSubmit();
     EndRendering();
@@ -1064,6 +1145,168 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     // Apply pending operations
     PopPendingOperations();
+}
+
+bool Scheduler::WaitRecTurn(u64 batch, bool submit) {
+    u64 value = rec_submitted.load(std::memory_order_acquire);
+    if (value == batch) {
+        return true;
+    }
+    using Clock = std::chrono::steady_clock;
+    const auto start = recording_measure_timing ? Clock::now() : Clock::time_point{};
+    for (u32 spins = 0; value != batch; ++spins) {
+        if (value & RecAbortBit) {
+            return false;
+        }
+        ASSERT_MSG(value < batch, "ParRec: batch {} waits, {} batches already submitted", batch,
+                   value);
+        if (spins < 64) {
+#if defined(_M_X64) || defined(__x86_64__)
+            _mm_pause();
+#endif
+        } else {
+            rec_submitted.wait(value, std::memory_order_acquire);
+        }
+        value = rec_submitted.load(std::memory_order_acquire);
+    }
+    if (RecLane* const lane = t_rec_lane) {
+        (submit ? lane->submit_waits : lane->ordered_waits).fetch_add(1, std::memory_order_relaxed);
+        if (recording_measure_timing) {
+            lane->wait_ns.fetch_add(
+                static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     Clock::now() - start)
+                                     .count()),
+                std::memory_order_relaxed);
+        }
+    }
+    return true;
+}
+
+void Scheduler::SubmitLaneCmdbufLocked(RecLane& lane, const SubmitInfo& info, u64 signal_value) {
+    static constexpr std::array<vk::PipelineStageFlags, 3> wait_stage_masks = {
+        vk::PipelineStageFlagBits::eAllCommands,
+        vk::PipelineStageFlagBits::eColorAttachmentOutput,
+        vk::PipelineStageFlagBits::eAllCommands,
+    };
+    const vk::TimelineSemaphoreSubmitInfo timeline_si = {
+        .waitSemaphoreValueCount = info.num_wait_semas,
+        .pWaitSemaphoreValues = info.wait_ticks.data(),
+        .signalSemaphoreValueCount = info.num_signal_semas,
+        .pSignalSemaphoreValues = info.signal_ticks.data(),
+    };
+    const vk::SubmitInfo submit_info = {
+        .pNext = &timeline_si,
+        .waitSemaphoreCount = info.num_wait_semas,
+        .pWaitSemaphores = info.wait_semas.data(),
+        .pWaitDstStageMask = wait_stage_masks.data(),
+        .commandBufferCount = 1U,
+        .pCommandBuffers = &lane.cmdbuf,
+        .signalSemaphoreCount = info.num_signal_semas,
+        .pSignalSemaphores = info.signal_semas.data(),
+    };
+    const auto result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    if (result == vk::Result::eErrorDeviceLost) {
+        instance.LogDeviceFault();
+    }
+    ASSERT_MSG(result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    async_submitted_tick.store(signal_value, std::memory_order_release);
+    // Reusable once the GPU signals this submission (it was tagged in flight until now).
+    lane.pool->Retire(lane.cmdbuf_slot, signal_value);
+    lane.submits.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Scheduler::SubmitLaneOnWorker(const SubmitInfo& info, u64 signal_value, u64 batch) {
+    RecLane* const lane_ptr = t_rec_lane;
+    ASSERT_MSG(lane_ptr != nullptr, "ParRec: a lane submission ran off a lane thread");
+    RecLane& lane = *lane_ptr;
+    if (lane.transfer_group.open) {
+        CloseTransferGroupSlow(lane.transfer_group, lane.cmdbuf);
+    }
+    Check(lane.cmdbuf.end());
+    // Queue order == timeline order == batch order: wait until every earlier batch is submitted.
+    if (!WaitRecTurn(batch, true)) {
+        return;
+    }
+    {
+        std::scoped_lock lk{submit_mutex};
+        SubmitLaneCmdbufLocked(lane, info, signal_value);
+    }
+    rec_submitted.fetch_add(1, std::memory_order_acq_rel);
+    rec_submitted.notify_all();
+    // The lane's next batch is batch + lanes; its signal value is unknown until then.
+    lane.cmdbuf = lane.pool->CommitInFlight(lane.cmdbuf_slot);
+    Check(lane.cmdbuf.begin(vk::CommandBufferBeginInfo{
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+    }));
+    GraphicsBindTracker::Invalidate();
+}
+
+void Scheduler::SubmitExecutionLaneSync(SubmitInfo& info) {
+    // Inside a borrow scope: SubmitExecution drained every lane, nothing new was published.
+    std::scoped_lock lk{submit_mutex};
+    Common::FaultMonitor::CountGpuSubmit();
+    EndRendering();
+    DrainRecording();
+    const u64 signal_value = master_semaphore.NextTick();
+    NoteAscAtFlush(signal_value);
+    last_batch_draws = batch_draws;
+    batch_draws = 0;
+    batch_dispatches = 0;
+    batch_ops = 0;
+    const u64 batch = recording_worker->ProducerBatch();
+    ASSERT_MSG(rec_submitted.load(std::memory_order_acquire) == batch,
+               "ParRec: synchronous submission of batch {} with {} submitted", batch,
+               rec_submitted.load());
+    RecLane& lane = OpenLane();
+    if (lane.transfer_group.open) {
+        CloseTransferGroupSlow(lane.transfer_group, lane.cmdbuf);
+    }
+    Check(lane.cmdbuf.end());
+    info.AddSignal(master_semaphore.Handle(), signal_value);
+    ImGui::Core::TextureManager::Submit();
+    SubmitLaneCmdbufLocked(lane, info, signal_value);
+    rec_submitted.fetch_add(1, std::memory_order_acq_rel);
+    rec_submitted.notify_all();
+    lane.cmdbuf = vk::CommandBuffer{};
+    recording_worker->Publish(true); // what is recorded from now on belongs to the next batch
+    master_semaphore.Refresh();
+    AllocateWorkerCommandBuffers(); // begins this lane's next buffer, borrows the next lane's
+    PopPendingOperations();
+}
+
+void Scheduler::LogParRec() {
+    rec_log_batches = 0;
+    using Clock = std::chrono::steady_clock;
+    struct Prev {
+        u64 submits, submit_waits, ordered_waits, wait_ns, chunk_ns, chunks;
+    };
+    static std::array<Prev, MaxRecLanes> prev{};
+    static u64 prev_borrows = 0;
+    static Clock::time_point prev_time = Clock::now();
+    const auto now = Clock::now();
+    std::string lanes;
+    for (u32 i = 0; i < par_rec; ++i) {
+        const RecLane& lane = rec_lanes[i];
+        const Prev cur{lane.submits.load(std::memory_order_relaxed),
+                       lane.submit_waits.load(std::memory_order_relaxed),
+                       lane.ordered_waits.load(std::memory_order_relaxed),
+                       lane.wait_ns.load(std::memory_order_relaxed),
+                       recording_worker->LaneWorkerNs(i), recording_worker->LaneChunks(i)};
+        const Prev& p = prev[i];
+        const double chunk_ms = double(cur.chunk_ns - p.chunk_ns) / 1e6;
+        const double wait_ms = double(cur.wait_ns - p.wait_ns) / 1e6;
+        lanes += fmt::format(" | lane{} submits={} chunks={} submit_waits={} ordered_waits={} "
+                             "chunk_ms={:.1f} wait_ms={:.1f} run_ms={:.1f}",
+                             i, cur.submits - p.submits, cur.chunks - p.chunks,
+                             cur.submit_waits - p.submit_waits, cur.ordered_waits - p.ordered_waits,
+                             chunk_ms, wait_ms, chunk_ms - wait_ms);
+        prev[i] = cur;
+    }
+    LOG_INFO(Render_Vulkan, "ParRec: lanes={} window_ms={:.1f} borrows={} timing={}{}", par_rec,
+             std::chrono::duration<double, std::milli>(now - prev_time).count(),
+             synchronous_borrows - prev_borrows, recording_measure_timing, lanes);
+    prev_borrows = synchronous_borrows;
+    prev_time = now;
 }
 
 void Scheduler::BeginAscCmdbufOnWorker() {

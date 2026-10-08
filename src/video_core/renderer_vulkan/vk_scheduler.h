@@ -368,16 +368,30 @@ struct DynamicState {
     }
 };
 
+/// SHADPS4_PAR_REC=<lanes> (unset / 0: one ordered recording worker): submission batches are
+/// recorded on `lanes` threads (1-4), batch k on lane k % lanes, submitted in batch order
+/// (notes/multithreaded-back-design-2026-10-08.md sec. 11). The scheduler falls back to 0 where
+/// lanes are not supported (see Scheduler::Scheduler).
+inline u32 ParRecRequested() {
+    static const u32 lanes = [] {
+        const char* value = std::getenv("SHADPS4_PAR_REC");
+        const unsigned long n = value ? std::strtoul(value, nullptr, 10) : 0ul;
+        return static_cast<u32>(n > 4 ? 4 : n);
+    }();
+    return lanes;
+}
+
 /// SHADPS4_SKIP_REBIND=1: the draw paths skip vkCmdBindPipeline(graphics) when the same pipeline
 /// is already bound in the same command buffer. Updated in recording order (the recording worker,
 /// or the back after a drain). Every command-buffer begin and every other graphics bind into a
 /// scheduler command buffer (blit helper, post-process pass) invalidates it, so a missed case
-/// can only cost an extra bind.
+/// can only cost an extra bind. Off with SHADPS4_PAR_REC >= 2: one shared slot is wrong when
+/// several lanes bind at once.
 struct GraphicsBindTracker {
     static bool Enabled() {
         static const bool enabled = [] {
             const char* value = std::getenv("SHADPS4_SKIP_REBIND");
-            return value != nullptr && value[0] == '1';
+            return value != nullptr && value[0] == '1' && ParRecRequested() < 2;
         }();
         return enabled;
     }
@@ -457,6 +471,10 @@ public:
             : scheduler{scheduler} {
             if (scheduler.synchronous_scopes == 0) {
                 scheduler.DrainRecording();
+                if (scheduler.par_rec != 0) {
+                    // Every lane is idle: borrow the open batch's command buffer.
+                    scheduler.current_cmdbuf = scheduler.OpenLane().cmdbuf;
+                }
             }
             // The worker is idle: a coalesced transfer group left open by it is closed before the
             // borrower records directly (SHADPS4_TRANSFER_COALESCE).
@@ -552,11 +570,48 @@ public:
         // The handle is read when the worker runs the command: with SHADPS4_ASYNC_SUBMIT the
         // worker itself ends, submits and replaces the command buffer, in recording order.
         recording_worker->Record([this, command = std::forward<F>(command)]() mutable {
+            const vk::CommandBuffer cmdbuf = RecorderCmdbuf();
             if constexpr (!IsTransfer) {
-                CloseTransferGroup(current_cmdbuf);
+                CloseTransferGroup(cmdbuf);
             }
-            command(current_cmdbuf);
+            command(cmdbuf);
         });
+    }
+
+    /// SHADPS4_PAR_REC: Record / RecordArrays for a command that touches state shared across
+    /// batches when it runs (guest-memory reads and page protection of the deferred uploads, a
+    /// readback-queue submission): it waits until every earlier batch has been submitted (and so
+    /// fully recorded), which restores the single recorder's order for it. Without lanes, or
+    /// recorded inline (every lane drained), it is plain Record / RecordArrays.
+    template <bool IsTransfer = false, typename F>
+    void RecordOrdered(F&& command) {
+        if (par_rec == 0 || !IsAsyncRecording()) {
+            Record<IsTransfer>(std::forward<F>(command));
+            return;
+        }
+        const u64 batch = recording_worker->ProducerBatch();
+        Record<IsTransfer>([this, batch, command = std::forward<F>(command)](
+                               vk::CommandBuffer cmdbuf) mutable {
+            if (WaitRecTurn(batch, false)) {
+                command(cmdbuf);
+            }
+        });
+    }
+    template <bool IsTransfer = false, typename F, typename... T>
+    void RecordArraysOrdered(F&& command, std::span<const T>... arrays) {
+        if (par_rec == 0 || !IsAsyncRecording()) {
+            RecordArrays<IsTransfer>(std::forward<F>(command), arrays...);
+            return;
+        }
+        const u64 batch = recording_worker->ProducerBatch();
+        RecordArrays<IsTransfer>(
+            [this, batch, command = std::forward<F>(command)](vk::CommandBuffer cmdbuf,
+                                                              auto... spans) mutable {
+                if (WaitRecTurn(batch, false)) {
+                    command(cmdbuf, spans...);
+                }
+            },
+            arrays...);
     }
 
     // Clone transient arrays into the same unpublished chunk as their callback.
@@ -582,10 +637,11 @@ public:
             auto* cursor = storage.data();
             auto copies = std::tuple{CopyPayload(cursor, arrays)...};
             return [this, command = std::forward<F>(command), copies]() mutable {
+                const vk::CommandBuffer cmdbuf = RecorderCmdbuf();
                 if constexpr (!IsTransfer) {
-                    CloseTransferGroup(current_cmdbuf);
+                    CloseTransferGroup(cmdbuf);
                 }
-                std::apply([&](auto... spans) { command(current_cmdbuf, spans...); }, copies);
+                std::apply([&](auto... spans) { command(cmdbuf, spans...); }, copies);
             };
         });
     }
@@ -608,7 +664,7 @@ public:
     /// Emits the group's Transfer -> AllCommands barrier (before any other command, a borrow,
     /// or the end of the command buffer).
     void CloseTransferGroup(vk::CommandBuffer cmdbuf) {
-        TransferGroup& group = transfer_group[worker_stream];
+        TransferGroup& group = RecorderTransferGroup();
         if (group.open) [[unlikely]] {
             CloseTransferGroupSlow(group, cmdbuf);
         }
@@ -903,6 +959,61 @@ private:
     void CloseTransferGroupSlow(TransferGroup& group, vk::CommandBuffer cmdbuf);
     void AscSubmitOnWorker(u64 value, u64 wait_main);
     void BeginAscCmdbufOnWorker();
+
+    /// SHADPS4_PAR_REC: what one lane thread owns. The command processor touches a lane only
+    /// while every lane is drained (borrow scopes, synchronous submission, startup).
+    struct RecLane {
+        vk::CommandBuffer cmdbuf{}; ///< Begun; receives the lane's current or next batch.
+        std::size_t cmdbuf_slot{};  ///< Its pool slot (tagged in flight until submitted).
+        std::unique_ptr<CommandPool> pool;
+        TransferGroup transfer_group{};
+        // Diagnostics (written by the lane, read racily by the ParRec log line).
+        std::atomic<u64> submits{0};
+        std::atomic<u64> submit_waits{0};  ///< Submissions that waited for an earlier batch.
+        std::atomic<u64> ordered_waits{0}; ///< Ordered commands that waited likewise.
+        std::atomic<u64> wait_ns{0};       ///< Time in both waits (ASYNC_RECORDING_TIMING=1).
+    };
+    static constexpr u32 MaxRecLanes = 4;
+    /// rec_submitted: batches handed to vkQueueSubmit, in batch order; this bit = a recording
+    /// command failed (wakes and releases every waiting lane).
+    static constexpr u64 RecAbortBit = 1ULL << 63;
+    static inline thread_local RecLane* t_rec_lane = nullptr;
+    u32 par_rec = 0;
+    std::array<RecLane, MaxRecLanes> rec_lanes{};
+    std::atomic<u64> rec_submitted{0};
+    u64 rec_log_batches = 0; ///< Command processor: batches since the last ParRec line.
+
+    /// Command processor: the lane of the batch being recorded.
+    RecLane& OpenLane() noexcept {
+        return rec_lanes[recording_worker->ProducerBatch() % par_rec];
+    }
+    /// The command buffer a recorded command writes into: its lane's, else the ordered worker's
+    /// (or, recorded inline, the borrowed one).
+    vk::CommandBuffer RecorderCmdbuf() const noexcept {
+        if (par_rec != 0) [[unlikely]] {
+            if (RecLane* const lane = t_rec_lane) {
+                return lane->cmdbuf;
+            }
+        }
+        return current_cmdbuf;
+    }
+    /// The transfer group of the command buffer being recorded (SHADPS4_TRANSFER_COALESCE).
+    TransferGroup& RecorderTransferGroup() noexcept {
+        if (par_rec != 0) [[unlikely]] {
+            RecLane* const lane = t_rec_lane;
+            return lane ? lane->transfer_group : OpenLane().transfer_group;
+        }
+        return transfer_group[worker_stream];
+    }
+    /// Lane side: blocks until every batch before `batch` is submitted. False = aborted.
+    bool WaitRecTurn(u64 batch, bool submit);
+    /// Lane side: ends the lane's command buffer, submits it in batch order, begins the next.
+    void SubmitLaneOnWorker(const SubmitInfo& info, u64 signal_value, u64 batch);
+    /// vkQueueSubmit of the lane's ended command buffer; the caller holds submit_mutex.
+    void SubmitLaneCmdbufLocked(RecLane& lane, const SubmitInfo& info, u64 signal_value);
+    /// SubmitExecution inside a borrow scope (every lane drained), on the command processor.
+    void SubmitExecutionLaneSync(SubmitInfo& info);
+    void LogParRec();
 
     u32 last_batch_draws = 0;
     u32 batch_ops = 0;

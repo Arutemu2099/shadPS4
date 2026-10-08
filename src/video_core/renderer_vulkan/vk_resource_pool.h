@@ -60,6 +60,18 @@ public:
 
     vk::CommandBuffer Commit();
 
+    /// SHADPS4_PAR_REC: a buffer whose batch (and so its signal value) is not known yet. It is
+    /// tagged in flight (never reused) until Retire gives it the value its submission signals;
+    /// Commit's tag (the current tick) is too low when the buffer carries a later batch.
+    vk::CommandBuffer CommitInFlight(std::size_t& slot) {
+        slot = CommitResource();
+        ticks[slot] = ~0ULL;
+        return cmd_buffers[slot];
+    }
+    void Retire(std::size_t slot, u64 signal_tick) {
+        ticks[slot] = signal_tick;
+    }
+
 private:
     const Instance& instance;
     vk::UniqueCommandPool cmd_pool;

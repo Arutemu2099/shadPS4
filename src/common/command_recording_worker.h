@@ -97,6 +97,7 @@ class CommandRecordingWorker {
         std::size_t first_offset{};
         std::size_t command_count{};
         ChunkState state{ChunkState::Free};
+        std::uint64_t batch{}; ///< Lane mode: the submission batch the chunk belongs to.
     };
 
     struct Layout {
@@ -142,8 +143,25 @@ public:
         chunk_hook_.store(hook, std::memory_order_relaxed);
     }
 
-    explicit CommandRecordingWorker(const bool measure_timing = false)
-        : measure_timing_{measure_timing}, worker_{&CommandRecordingWorker::WorkerLoop, this} {}
+    /// Lane mode (SHADPS4_PAR_REC, `lanes` >= 1): the producer marks the end of every submission
+    /// batch with Publish(true); chunks are tagged with their batch and batch k runs on lane
+    /// k % lanes, each lane in FIFO order on its own thread. Lanes record different batches at
+    /// once, so their commands must only touch per-lane state (the caller's job). `lane_start`
+    /// runs first on each lane thread; `on_failure` runs once if a command throws (wake anything
+    /// a lane may be blocked on). lanes == 0: the single ordered worker.
+    static constexpr std::size_t MaxLanes = 4;
+    explicit CommandRecordingWorker(const bool measure_timing = false, const std::size_t lanes = 0,
+                                    std::function<void(std::size_t)> lane_start = {},
+                                    std::function<void()> on_failure = {})
+        : measure_timing_{measure_timing}, lanes_{(std::min)(lanes, MaxLanes)},
+          lane_start_{std::move(lane_start)}, on_failure_{std::move(on_failure)},
+          worker_{lanes_ != 0
+                      ? std::thread{&CommandRecordingWorker::LaneLoop, this, std::size_t{0}}
+                      : std::thread{&CommandRecordingWorker::WorkerLoop, this}} {
+        for (std::size_t lane = 1; lane < lanes_; ++lane) {
+            extra_lanes_.emplace_back(&CommandRecordingWorker::LaneLoop, this, lane);
+        }
+    }
 
     ~CommandRecordingWorker() noexcept {
         try {
@@ -157,9 +175,35 @@ public:
             stop_requested_ = true;
         }
         work_cv_.notify_all();
+        for (auto& lane : lane_queues_) {
+            lane.cv.notify_all();
+        }
         if (worker_.joinable()) {
             worker_.join();
         }
+        for (auto& thread : extra_lanes_) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+    }
+
+    [[nodiscard]] std::size_t Lanes() const noexcept {
+        return lanes_;
+    }
+    /// Lane mode: the batch the producer is recording (batch ends published so far). Producer
+    /// thread only.
+    [[nodiscard]] std::uint64_t ProducerBatch() const noexcept {
+        return producer_batch_;
+    }
+    /// Lane mode: nanoseconds lane `lane` spent running chunks (SHADPS4_ASYNC_RECORDING_TIMING).
+    [[nodiscard]] std::uint64_t LaneWorkerNs(const std::size_t lane) const noexcept {
+        std::lock_guard lock{mutex_};
+        return lane < MaxLanes ? lane_queues_[lane].worker_ns : 0;
+    }
+    [[nodiscard]] std::uint64_t LaneChunks(const std::size_t lane) const noexcept {
+        std::lock_guard lock{mutex_};
+        return lane < MaxLanes ? lane_queues_[lane].chunks : 0;
     }
 
     CommandRecordingWorker(const CommandRecordingWorker&) = delete;
@@ -209,10 +253,15 @@ public:
 
     /// Publishes the producer's partial chunk without waiting, so everything recorded so far runs
     /// even if nothing else is recorded for a while (an asynchronous submission, for instance).
-    void Publish() {
+    /// Lane mode: `batch_end` = the command just recorded ended the batch (its submission);
+    /// everything recorded from now on belongs to the next batch.
+    void Publish(const bool batch_end = false) {
         std::unique_lock lock{mutex_};
         if (current_ != nullptr && !failure_ && current_->command_count != 0) {
             PublishCurrentLocked();
+        }
+        if (batch_end) {
+            ++producer_batch_;
         }
     }
 
@@ -600,8 +649,21 @@ private:
     void PublishCurrentLocked() {
         assert(current_ != nullptr);
         assert(current_->command_count != 0);
-        assert(published_size_ < ChunkCount);
         current_->state = ChunkState::Queued;
+        if (lanes_ != 0) {
+            // A chunk is tagged when published: batch ends publish the chunk holding the
+            // submission first, so a chunk never holds two batches.
+            current_->batch = producer_batch_;
+            LaneQueue& lane = lane_queues_[producer_batch_ % lanes_];
+            assert(lane.size < ChunkCount);
+            lane.queue[(lane.head + lane.size) % ChunkCount] = current_;
+            ++lane.size;
+            ++published_chunks_;
+            current_ = nullptr;
+            lane.cv.notify_one();
+            return;
+        }
+        assert(published_size_ < ChunkCount);
         published_queue_[(published_head_ + published_size_) % ChunkCount] = current_;
         ++published_size_;
         ++published_chunks_;
@@ -747,6 +809,118 @@ private:
         }
     }
 
+    /// Lane mode: lane `lane` runs the chunks of batches k with k % lanes_ == lane, in order.
+    void LaneLoop(const std::size_t lane_index) {
+        if (lane_start_) {
+            lane_start_(lane_index);
+        }
+        LaneQueue& lane = lane_queues_[lane_index];
+        for (;;) {
+            Chunk* chunk{};
+            {
+                std::unique_lock lock{mutex_};
+                lane.cv.wait(lock, [&] { return stop_requested_ || failure_ || lane.size != 0; });
+                if (failure_) {
+                    return; // the failing lane discarded every queued chunk
+                }
+                if (lane.size == 0) {
+                    if (stop_requested_) {
+                        return;
+                    }
+                    continue;
+                }
+                chunk = lane.queue[lane.head];
+                lane.head = (lane.head + 1) % ChunkCount;
+                --lane.size;
+                chunk->state = ChunkState::Executing;
+            }
+            if (auto* const hook = chunk_hook_.load(std::memory_order_relaxed)) {
+                hook();
+            }
+
+            const auto worker_start = measure_timing_ ? Clock::now() : Clock::time_point{};
+            std::exception_ptr callback_error;
+            std::size_t offset = chunk->first_offset;
+            for (std::size_t index = 0; index < chunk->command_count; ++index) {
+                auto* const header =
+                    std::launder(reinterpret_cast<CommandHeader*>(chunk->storage.data() + offset));
+                const std::size_t next_offset = header->next_offset;
+                if (!callback_error) {
+                    try {
+                        header->invoke(header->object);
+                    } catch (...) {
+                        callback_error = std::current_exception();
+                    }
+                }
+                header->destroy(header->object);
+                offset = next_offset;
+            }
+            assert(offset == chunk->used);
+            const std::uint64_t chunk_ns =
+                measure_timing_ ? ToNanoseconds(Clock::now() - worker_start) : 0;
+
+            if (!callback_error) {
+                std::lock_guard lock{mutex_};
+                worker_ns_ += chunk_ns;
+                lane.worker_ns += chunk_ns;
+                ++lane.chunks;
+                ReleaseCompletedChunkLocked(*chunk);
+                continue;
+            }
+
+            std::array<Chunk*, ChunkCount> discarded{};
+            std::size_t discarded_count = 0;
+            bool first_failure = false;
+            {
+                std::lock_guard lock{mutex_};
+                first_failure = !failure_;
+                if (first_failure) {
+                    failure_ = callback_error;
+                    failure_flag_.store(true, std::memory_order_release);
+                }
+                worker_ns_ += chunk_ns;
+                lane.worker_ns += chunk_ns;
+                completed_commands_ += chunk->command_count;
+                chunk->used = 0;
+                chunk->first_offset = 0;
+                chunk->command_count = 0;
+                chunk->state = ChunkState::Free;
+                for (auto& other : lane_queues_) {
+                    while (other.size != 0) {
+                        Chunk* const queued = other.queue[other.head];
+                        other.head = (other.head + 1) % ChunkCount;
+                        --other.size;
+                        queued->state = ChunkState::Discarding;
+                        discarded[discarded_count++] = queued;
+                    }
+                    other.cv.notify_all();
+                }
+                done_cv_.notify_all();
+                space_cv_.notify_all();
+            }
+            if (first_failure && on_failure_) {
+                on_failure_();
+            }
+            for (std::size_t index = 0; index < discarded_count; ++index) {
+                Chunk& queued = *discarded[index];
+                DestroyChunkContents(queued);
+                std::lock_guard lock{mutex_};
+                ReleaseDiscardedChunkLocked(queued);
+            }
+            done_cv_.notify_all();
+            return;
+        }
+    }
+
+    struct LaneQueue {
+        std::array<Chunk*, ChunkCount> queue{};
+        std::size_t head{};
+        std::size_t size{};
+        std::condition_variable cv;
+        std::uint64_t worker_ns{};
+        std::uint64_t chunks{};
+    };
+
     mutable std::mutex mutex_;
     std::condition_variable work_cv_;
     std::condition_variable done_cv_;
@@ -769,6 +943,13 @@ private:
     std::uint64_t worker_ns_{};
     std::uint64_t drain_ns_{};
     std::uint64_t space_wait_ns_{};
+    // Lane mode (declared before the threads that read them).
+    const std::size_t lanes_;
+    const std::function<void(std::size_t)> lane_start_;
+    const std::function<void()> on_failure_;
+    std::array<LaneQueue, MaxLanes> lane_queues_{};
+    std::uint64_t producer_batch_{}; ///< Producer + mutex_ (read by the producer alone).
+    std::vector<std::thread> extra_lanes_;
     std::thread worker_;
 };
 

@@ -1826,7 +1826,8 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
                 side_tick = readback_queue->ReserveTick();
                 std::vector<vk::BufferCopy> owned(vk_copies.begin(), vk_copies.end());
                 std::vector<vk::Buffer> owned_src(vk_sources.begin(), vk_sources.end());
-                scheduler.Record([this, rq = readback_queue.get(), side_tick, staging_handle,
+                // SHADPS4_PAR_REC: submitted after every earlier batch (queue order).
+                scheduler.RecordOrdered([this, rq = readback_queue.get(), side_tick, staging_handle,
                                   owned = std::move(owned),
                                   owned_src = std::move(owned_src)](vk::CommandBuffer) {
                     rq->SubmitReserved(side_tick, [&](vk::CommandBuffer cmd) {
@@ -5221,7 +5222,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                 write.lo = std::min<u64>(write.lo, copy.dstOffset);
                 write.hi = std::max<u64>(write.hi, copy.dstOffset + copy.size);
             }
-            scheduler.RecordArrays<true>(
+            // SHADPS4_PAR_REC: protect + guest copy in the single recorder's order.
+            scheduler.RecordArraysOrdered<true>(
                 [src_buffer, destination = buffer.Handle(), write, sched = &scheduler,
                  memory = memory, pm = &page_manager](vk::CommandBuffer cmdbuf, auto owned_copies,
                                                       auto cpu_copies, auto protects) {
@@ -5245,7 +5247,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                 std::span<const PageManager::ProtectRange>{deferred_protects});
             TouchBuffer(buffer);
         } else if (defer) {
-            scheduler.RecordArrays(
+            scheduler.RecordArraysOrdered(
                 [src_buffer, destination = buffer.Handle(), pre_barrier, post_barrier,
                  memory = memory, pm = &page_manager](vk::CommandBuffer cmdbuf, auto owned_copies,
                                                       auto cpu_copies, auto protects) {
