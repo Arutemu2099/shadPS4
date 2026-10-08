@@ -108,9 +108,10 @@ void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx)
 }
 
 bool SameBindingLayout(const Shader::Info& a, const Shader::Info& b) {
+    // ud_mask: dispatch pushes user data by the program's shared mask (Fable finding 1).
     if (a.uses_dma != b.uses_dma || a.buffers.size() != b.buffers.size() ||
         a.images.size() != b.images.size() || a.samplers.size() != b.samplers.size() ||
-        a.fmasks.size() != b.fmasks.size()) {
+        a.fmasks.size() != b.fmasks.size() || a.ud_mask.mask != b.ud_mask.mask) {
         return false;
     }
     for (size_t i = 0; i < a.buffers.size(); ++i) {

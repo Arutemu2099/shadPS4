@@ -619,7 +619,7 @@ void PipelineCache::PrecompileFromExtract() {
 
     // COMPILE: every listed program the cache does not hold.
     u32 listed_new = 0, image_users = 0, movrel_users = 0, no_shape = 0, drifted = 0,
-        programs_built = 0;
+        programs_built = 0, other_nud_skipped = 0;
     u32 permutations = 0, duplicate_specs = 0, layout_mismatch = 0;
     double translate_ms = 0.0;
     const auto t_compile = Clock::now();
@@ -650,6 +650,7 @@ void PipelineCache::PrecompileFromExtract() {
 
         // Pass 2, one permutation per learned context, most frequent first.
         std::unique_ptr<Program> program;
+        u32 first_num_user_data = 0;
         std::vector<std::vector<u32>> flats;
         std::vector<UserData> uds;
         const size_t max_attempts = size_t{guesses} * 2;
@@ -658,6 +659,16 @@ void PipelineCache::PrecompileFromExtract() {
         for (const Context* ctx : it_shape->second.ranked) {
             if ((program && program->modules.size() >= guesses) || uds.size() >= max_attempts) {
                 break;
+            }
+            // Fable finding 1: every permutation is pushed through the program's shared Info, made
+            // with the first guess; a guess with another user-SGPR count would push a different
+            // layout. One num_user_data per program (the most frequent context's).
+            if (program && ctx->runtime_info.num_user_data != first_num_user_data) {
+                ++other_nud_skipped;
+                continue;
+            }
+            if (!program) {
+                first_num_user_data = ctx->runtime_info.num_user_data;
             }
             auto& flat = flats.emplace_back(make_flat(*ctx, flat_size));
             auto& ud = uds.emplace_back();
@@ -736,10 +747,10 @@ void PipelineCache::PrecompileFromExtract() {
         ++programs_built;
     }
     LOG_INFO(Render_Vulkan,
-             "Precompile compile: listed_new={} image_users={} movrel_users={} no_shape={} drifted={} "
+             "Precompile compile: listed_new={} image_users={} movrel_users={} no_shape={} drifted={} other_nud_skipped={} "
              "programs={} permutations={} duplicate_specs={} layout_mismatch={} guesses={} "
              "translate_ms={:.0f} compile_phase_ms={:.0f} total_ms={:.0f}",
-             listed_new, image_users, movrel_users, no_shape, drifted, programs_built, permutations,
+             listed_new, image_users, movrel_users, no_shape, drifted, other_nud_skipped, programs_built, permutations,
              duplicate_specs, layout_mismatch, guesses, translate_ms, MsSince(t_compile),
              MsSince(t_start));
     // Fable finding 7: every translation appends an SRT walker to a fixed 32 MB arena.

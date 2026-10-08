@@ -105,6 +105,10 @@ public:
     void WarmUp();
     // SHADPS4_PRECOMPILE (vk_pipeline_precompile.cpp): run by WarmUp on the main thread.
     void PrecompileFromExtract();
+    // SHADPS4_PRECOMPILE, Fable finding 1: a precompiled program whose first live dispatch matched
+    // none of its guessed permutations leaves program_cache with its compute pipelines; both are
+    // parked (a pool compile of such a pipeline may still be running), never destroyed early.
+    void RetirePrecompiled(u64 hash);
     void Sync();
 
     bool LoadComputePipeline(Serialization::Archive& ar);
@@ -207,6 +211,8 @@ private:
     Shader::Pools pools;
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
+    std::vector<std::unique_ptr<Program>> retired_programs;          ///< RetirePrecompiled
+    std::vector<std::unique_ptr<ComputePipeline>> retired_pipelines; ///< RetirePrecompiled
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
     std::array<const Shader::Info*, MaxShaderStages> infos{};

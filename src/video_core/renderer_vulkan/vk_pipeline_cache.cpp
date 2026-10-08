@@ -1414,6 +1414,30 @@ static std::shared_ptr<const Shader::Gcn::FetchShaderData> SharedFetchMetadata(
     return module.fetch_shader;
 }
 
+void PipelineCache::RetirePrecompiled(u64 hash) {
+    const auto it = program_cache.find(hash);
+    if (it == program_cache.end()) {
+        return;
+    }
+    size_t pipelines = 0;
+    const size_t perms = it.value()->modules.size();
+    for (size_t perm = 0; perm < perms; ++perm) {
+        // A compute pipeline's key is its permutation hash (RefreshComputeKey).
+        const auto pit = compute_pipelines.find(ComputePipelineKey{HashCombine(hash, perm)});
+        if (pit != compute_pipelines.end()) {
+            retired_pipelines.push_back(std::move(pit.value()));
+            compute_pipelines.erase(pit);
+            ++pipelines;
+        }
+    }
+    retired_programs.push_back(std::move(it.value()));
+    program_cache.erase(hash);
+    LOG_INFO(Render_Vulkan,
+             "PrecompiledUse: cs_{:#x} retired after a live miss ({} permutations, {} pipelines; "
+             "retired so far {})",
+             hash, perms, pipelines, retired_programs.size());
+}
+
 PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
@@ -1505,6 +1529,16 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
     if (program->precompiled && !program->precompiled_seen) [[unlikely]] {
         program->precompiled_seen = true;
         NotePrecompiledUse(*program, spec, !compiled);
+        if (compiled && stage == Stage::Compute) {
+            // Fable finding 1: a live MISS. The shared Info (ud_mask, binding layout) came from a
+            // guessed context, and every permutation is pushed and bound through it, so a module
+            // compiled now for the live context could be fed by the guess's layout. Retire the
+            // precompiled program and its pipelines; this dispatch then builds the program from
+            // scratch (the new-program path), exactly as for a program the cache never held.
+            RetirePrecompiled(params.hash);
+            binding = start;
+            return GetProgram(stage, l_stage, params, binding);
+        }
     }
     if (compiled) {
         const auto t_translate = CompileClock::now();
