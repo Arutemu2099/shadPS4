@@ -167,11 +167,13 @@ static const bool g_mtb_break = [] {
     const char* value = std::getenv("SHADPS4_MTB_P1_BREAK");
     return value != nullptr && value[0] == '1';
 }();
-/// SHADPS4_MTB_P3=1 (with SHADPS4_MTB_P1=1; P3.0, notes/parrec-build-2026-10-08.md sec. 14d): the
-/// parked translation worker.
-static const bool g_mtb_p3 = [] {
+/// SHADPS4_MTB_P3 (with SHADPS4_MTB_P1=1; P3.0, notes/parrec-build-2026-10-08.md sec. 14d): the
+/// parked translation worker. =1: it takes the CP identity (t_is_cp_thread) while the back is
+/// parked on its run; =2 (probe): it stays a foreign thread - every texture-cache lock then costs
+/// a FlushProcessWriteBuffers (s265: 20 FPS).
+static const int g_mtb_p3 = [] {
     const char* value = std::getenv("SHADPS4_MTB_P3");
-    return value != nullptr && value[0] == '1';
+    return value != nullptr && (value[0] == '1' || value[0] == '2') ? value[0] - '0' : 0;
 }();
 
 void Liverpool::MtbBreakAtPacket(const PM4Header* header) {
@@ -1331,7 +1333,7 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                 mtb_install = false;
                 // SHADPS4_MTB_P3 (P3.0, sec. 14d): the committer keeps the real tick; the
                 // parked translation worker reserves at each run.
-                const bool want_p3 = g_mtb_p3 && rasterizer->HasMtbWorker();
+                const bool want_p3 = g_mtb_p3 != 0 && rasterizer->HasMtbWorker();
                 mtb_p3 = rasterizer->GetScheduler().InstallMtbContext(!want_p3) && want_p3;
                 if (mtb_p3) {
                     mtb_thread = std::jthread{std::bind_front(&Liverpool::MtbWorkerLoop, this)};
@@ -1403,16 +1405,33 @@ void Liverpool::BackLoop(std::stop_token stoken) {
 }
 
 namespace {
-constexpr bool MtbRunRecord(CpSplit::RecordType type) {
-    return type == CpSplit::RecordType::Draw || type == CpSplit::RecordType::Dispatch ||
-           type == CpSplit::RecordType::RegWrite || type == CpSplit::RecordType::Extent ||
-           type == CpSplit::RecordType::ClearState;
+bool MtbRunRecord(const CpSplit::RecordHeader* record) {
+    switch (record->type) {
+    case CpSplit::RecordType::Draw:
+    case CpSplit::RecordType::Dispatch:
+    case CpSplit::RecordType::RegWrite:
+    case CpSplit::RecordType::Extent:
+    case CpSplit::RecordType::ClearState:
+        return true;
+    case CpSplit::RecordType::Packet: {
+        // The DMA_DATA to 0x3022C (~0.4 per draw) is skipped by ExecuteGfxPacket: it would cut
+        // every run to ~5 draws (s265).
+        if (record->flags & CpSplit::AscReleaseMem) {
+            return false;
+        }
+        const auto* header = reinterpret_cast<const PM4Header*>(record + 1);
+        const auto* dma = reinterpret_cast<const PM4DmaData*>(header);
+        return header->type3.opcode == PM4ItOpcode::DmaData && dma->dst_addr_lo == 0x3022C;
+    }
+    default:
+        return false;
+    }
 }
 constexpr size_t MtbMaxRun = 256;
 } // namespace
 
 bool Liverpool::MtbRunAhead(const CpSplit::RecordHeader* record) {
-    if (!MtbRunRecord(record->type) || num_commands.load(std::memory_order_relaxed) != 0) {
+    if (!MtbRunRecord(record) || num_commands.load(std::memory_order_relaxed) != 0) {
         return false;
     }
     auto& h = mtb_handoff;
@@ -1424,7 +1443,7 @@ bool Liverpool::MtbRunAhead(const CpSplit::RecordHeader* record) {
     u64 pos = split->ReadPos() + record->size;
     while (h.run.size() < MtbMaxRun && num_commands.load(std::memory_order_relaxed) == 0) {
         const auto* next = split->PeekAt(pos);
-        if (!next || !MtbRunRecord(next->type)) {
+        if (!next || !MtbRunRecord(next)) {
             break;
         }
         draws += next->type == CpSplit::RecordType::Draw ||
@@ -1474,8 +1493,13 @@ void Liverpool::MtbWorkerLoop(std::stop_token stoken) {
     }};
     auto& scheduler = rasterizer->GetScheduler();
     scheduler.AttachMtbContext();
-    // The worker only runs while the back is parked on its run: it acts for the CP then.
+    // The worker only runs while the back is parked on its run: it acts for the CP then (=1:
+    // also the CP-only fast paths, whose single-writer rule the hand-off keeps).
     Common::FaultMonitor::t_acting_cp = true;
+    if (g_mtb_p3 == 1) {
+        Common::FaultMonitor::t_is_cp_thread = true;
+    }
+    LOG_INFO(Render, "MtbP3: worker running, mode {}", g_mtb_p3);
     for (;;) {
         u32 state = h.state.load(std::memory_order_acquire);
         for (u32 spins = 0; state != 1 && state != 3;) {
