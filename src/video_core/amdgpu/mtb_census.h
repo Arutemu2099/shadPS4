@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdlib>
+#include <vector>
 #include "common/fault_monitor.h"
 #include "common/types.h"
 
@@ -29,6 +30,7 @@ enum Reason : u32 {
     ImageUpload,
     StreamAlloc,
     OcclusionSlot,
+    ImageInvalidate,
     Count,
 };
 
@@ -39,6 +41,40 @@ inline u32 g_draw_event = None;
 inline void Note(Reason reason) {
     if (g_enabled && g_draw_event == None && ::Common::FaultMonitor::t_is_cp_thread) {
         g_draw_event = reason;
+    }
+}
+
+/// Census v3 (Fable review 2026-10-08 Q4.1): the address ranges a serial-only event of an EARLIER draw of the open
+/// segment touched (uploaded buffer range, uploaded / registered / GPU-invalidated image), and whether the current
+/// draw uses one of them (it would have to wait for that hole's commit). CP thread.
+struct Range {
+    u64 lo;
+    u64 hi;
+};
+inline std::vector<Range> g_seg_events;   ///< events of earlier draws of the open segment
+inline std::vector<Range> g_draw_events;  ///< events of the current draw (merged at its end)
+inline bool g_draw_dependent = false;
+inline u64 g_invalidate_hits = 0;
+
+inline void NoteEventRange(Reason reason, u64 addr, u64 size) {
+    if (!g_enabled || !::Common::FaultMonitor::t_is_cp_thread) {
+        return;
+    }
+    Note(reason);
+    g_draw_events.push_back({addr, addr + size});
+}
+
+inline void NoteUse(u64 addr, u64 size) {
+    if (!g_enabled || g_seg_events.empty() || g_draw_dependent ||
+        !::Common::FaultMonitor::t_is_cp_thread) {
+        return;
+    }
+    const u64 hi = addr + size;
+    for (const Range& r : g_seg_events) {
+        if (addr < r.hi && r.lo < hi) {
+            g_draw_dependent = true;
+            return;
+        }
     }
 }
 

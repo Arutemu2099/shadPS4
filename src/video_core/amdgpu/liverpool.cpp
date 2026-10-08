@@ -1354,6 +1354,8 @@ namespace {
 struct MtbWindow {
     u64 seg_draws = 0;
     bool seg_bailed = false;
+    bool seg_dependent = false;
+    u64 dependents = 0, segments_dependent = 0, tail_draws = 0;
     u64 segments = 0, segments_bailed = 0, seg_len_sum = 0, seqpoints = 0, dma_noop = 0, bookkeeping = 0;
     u64 draws = 0, par_draws = 0;
     u64 par_cyc = 0, ser_draw_cyc = 0, seq_cyc = 0, other_cyc = 0;
@@ -1374,6 +1376,8 @@ void MtbEndSegment() {
     }
     g_mtb.seg_draws = 0;
     g_mtb.seg_bailed = false;
+    g_mtb.seg_dependent = false;
+    AmdGpu::MtbCensus::g_seg_events.clear();
 }
 
 void MtbLog() {
@@ -1387,7 +1391,9 @@ void MtbLog() {
              "bailed={:.1f}% seqpoints={} dma_noop={} bookkeeping={} | cycles: parallel {:.1f}% serial_draws {:.1f}% "
              "seqpoints {:.1f}% other {:.1f}% | Amdahl K=2 {:.2f}x K=4 {:.2f}x | first bails: "
              "buf_create={} buf_delete={} buf_upload={} img_register={} img_unregister={} "
-             "img_upload={} stream_alloc={} occlusion={}",
+             "img_upload={} stream_alloc={} occlusion={} img_invalidate={} | v3: dependent_draws={} "
+             "({:.2f}%) segments_with_dependent={} ({:.1f}%) tail_draws_from_first_dependent={} ({:.1f}%) "
+             "invalidate_hits={}",
              g_mtb_segment, w.draws, w.par_draws, 100.0 * double(w.par_draws) / double(std::max<u64>(w.draws, 1)),
              w.segments, double(w.seg_len_sum) / double(std::max<u64>(w.segments, 1)),
              100.0 * double(w.segments_bailed) / double(std::max<u64>(w.segments, 1)), w.seqpoints,
@@ -1398,12 +1404,20 @@ void MtbLog() {
              b[AmdGpu::MtbCensus::BufferCreate], b[AmdGpu::MtbCensus::BufferDelete],
              b[AmdGpu::MtbCensus::BufferUpload], b[AmdGpu::MtbCensus::ImageRegister],
              b[AmdGpu::MtbCensus::ImageUnregister], b[AmdGpu::MtbCensus::ImageUpload],
-             b[AmdGpu::MtbCensus::StreamAlloc], b[AmdGpu::MtbCensus::OcclusionSlot]);
+             b[AmdGpu::MtbCensus::StreamAlloc], b[AmdGpu::MtbCensus::OcclusionSlot],
+             b[AmdGpu::MtbCensus::ImageInvalidate], w.dependents,
+             100.0 * double(w.dependents) / double(std::max<u64>(w.draws, 1)), w.segments_dependent,
+             100.0 * double(w.segments_dependent) / double(std::max<u64>(w.segments, 1)), w.tail_draws,
+             100.0 * double(w.tail_draws) / double(std::max<u64>(w.draws, 1)),
+             AmdGpu::MtbCensus::g_invalidate_hits);
+    AmdGpu::MtbCensus::g_invalidate_hits = 0;
     const u64 open = w.seg_draws;
     const bool open_bailed = w.seg_bailed;
+    const bool open_dependent = w.seg_dependent;
     w = MtbWindow{};
     w.seg_draws = open;
     w.seg_bailed = open_bailed;
+    w.seg_dependent = open_dependent;
 }
 } // namespace
 
@@ -1419,6 +1433,8 @@ void Liverpool::ExecuteRecord(const CpSplit::RecordHeader& record) {
         MtbEndSegment();
     }
     MC::g_draw_event = MC::None;
+    MC::g_draw_dependent = false;
+    MC::g_draw_events.clear();
     const u64 t0 = __rdtsc();
     ExecuteRecordImpl(record);
     const u64 cyc = __rdtsc() - t0;
@@ -1427,6 +1443,16 @@ void Liverpool::ExecuteRecord(const CpSplit::RecordHeader& record) {
     case CpSplit::RecordType::Dispatch: {
         ++g_mtb.draws;
         ++g_mtb.seg_draws;
+        if (MC::g_draw_dependent) {
+            ++g_mtb.dependents;
+            if (!g_mtb.seg_dependent) {
+                g_mtb.seg_dependent = true;
+                ++g_mtb.segments_dependent;
+            }
+        }
+        g_mtb.tail_draws += g_mtb.seg_dependent ? 1 : 0;
+        MC::g_seg_events.insert(MC::g_seg_events.end(), MC::g_draw_events.begin(),
+                                MC::g_draw_events.end());
         const u32 ev = MC::g_draw_event;
         if (!g_mtb.seg_bailed && ev == MC::None) {
             ++g_mtb.par_draws;

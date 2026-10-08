@@ -426,6 +426,11 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
             return;
         }
         // Ensure image is reuploaded when accessed again.
+        if (AmdGpu::MtbCensus::g_enabled) [[unlikely]] {
+            ++AmdGpu::MtbCensus::g_invalidate_hits;
+            AmdGpu::MtbCensus::NoteEventRange(AmdGpu::MtbCensus::ImageInvalidate,
+                                              image.info.guest_address, image.info.guest_size);
+        }
         image.flags |= ImageFlagBits::GpuDirty;
         g_image_epoch.fetch_add(1, std::memory_order_release);
     });
@@ -1472,7 +1477,8 @@ void TextureCache::RefreshImage(Image& image) {
         }
         image.hash = hash;
     }
-    AmdGpu::MtbCensus::Note(AmdGpu::MtbCensus::ImageUpload);
+    AmdGpu::MtbCensus::NoteEventRange(AmdGpu::MtbCensus::ImageUpload, image.info.guest_address,
+                                      image.info.guest_size);
 
     const u32 num_layers = image.info.resources.layers;
     const u32 num_mips = image.info.resources.levels;
@@ -1703,8 +1709,9 @@ void LogImageChurn(const char* what, const VideoCore::Image& image) {
 } // namespace
 
 void TextureCache::RegisterImage(ImageId image_id) {
-    AmdGpu::MtbCensus::Note(AmdGpu::MtbCensus::ImageRegister);
     Image& image = slot_images[image_id];
+    AmdGpu::MtbCensus::NoteEventRange(AmdGpu::MtbCensus::ImageRegister, image.info.guest_address,
+                                      image.info.guest_size);
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;

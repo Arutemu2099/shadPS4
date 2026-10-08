@@ -4004,6 +4004,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                                is_texel_buffer, size, sample_caller);
     }
     Common::BufferSampleProbe* const sample = sample_storage ? &*sample_storage : nullptr;
+    AmdGpu::MtbCensus::NoteUse(device_addr, size);
     const auto t_entry = Common::FaultMonitor::Now();
     u64 query_ns = 0;
     // SHADPS4_RMEMO_CENSUS: read syncs only, 1 in 64 timed with rdtsc.
@@ -4709,6 +4710,7 @@ bool BufferCache::LeanReadOk() {
 
 std::pair<Buffer*, u32> BufferCache::ObtainReadLean(VAddr device_addr, u32 size,
                                                     BufferId buffer_id) {
+    AmdGpu::MtbCensus::NoteUse(device_addr, size);
     if (IsBufferInvalid(buffer_id)) [[unlikely]] {
         ++lean_stats[4];
         return {};
@@ -5122,7 +5124,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     last_sync_upload_bytes = total_size_bytes;
     sync_upload_bytes_total += total_size_bytes;
     if (total_size_bytes != 0) {
-        AmdGpu::MtbCensus::Note(AmdGpu::MtbCensus::BufferUpload);
+        AmdGpu::MtbCensus::NoteEventRange(AmdGpu::MtbCensus::BufferUpload, device_addr, size);
     }
     if (g_upload_ahead_stats && src_buffer) [[unlikely]] {
         NoteUploadAhead(buffer, device_addr, size, total_size_bytes);

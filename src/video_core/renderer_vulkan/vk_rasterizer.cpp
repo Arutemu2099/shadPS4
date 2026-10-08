@@ -3288,6 +3288,13 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         }
         fault_process_pending = true;
     }
+    if (AmdGpu::MtbCensus::g_enabled) [[unlikely]] {
+        // Census v3: images this draw binds (textures and, for draws, render targets).
+        for (const auto image_id : bound_images) {
+            const auto& image = texture_cache.PeekImage(image_id);
+            AmdGpu::MtbCensus::NoteUse(image.info.guest_address, image.info.guest_size);
+        }
+    }
 
     return true;
 }
