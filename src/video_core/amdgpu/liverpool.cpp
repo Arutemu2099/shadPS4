@@ -1412,6 +1412,10 @@ bool MtbRunRecord(const CpSplit::RecordHeader* record) {
     case CpSplit::RecordType::RegWrite:
     case CpSplit::RecordType::Extent:
     case CpSplit::RecordType::ClearState:
+    // Bookkeeping that translation does not read (s266: runs of ~16 draws without them).
+    case CpSplit::RecordType::Retire:
+    case CpSplit::RecordType::EpochBump:
+    case CpSplit::RecordType::Diag:
         return true;
     case CpSplit::RecordType::Packet: {
         // The DMA_DATA to 0x3022C (~0.4 per draw) is skipped by ExecuteGfxPacket: it would cut
@@ -1465,13 +1469,14 @@ bool Liverpool::MtbRunAhead(const CpSplit::RecordHeader* record) {
         }
     }
     h.state.store(0, std::memory_order_relaxed);
-    for (const auto* r : h.run) {
+    // The worker may stop early for guest commands; the rest is collected again.
+    for (size_t i = 0; i < h.executed; ++i) {
         const auto* executed = split->Next();
-        ASSERT_MSG(executed == r, "MtbP3: ring record order");
+        ASSERT_MSG(executed == h.run[i], "MtbP3: ring record order");
         split->Done(executed);
     }
     ++h.runs;
-    h.records += h.run.size();
+    h.records += h.executed;
     h.draws += draws;
     if (++h.log_runs >= 65536) {
         LOG_INFO(Render, "MtbP3: runs={} records_per_run={:.1f} draws_per_run={:.1f} back_yields={}",
@@ -1517,9 +1522,16 @@ void Liverpool::MtbWorkerLoop(std::stop_token stoken) {
             break;
         }
         scheduler.ReserveTickForRun();
+        size_t executed = 0;
         for (const auto* r : h.run) {
             ExecuteRecordImpl(*r);
+            ++executed;
+            // Guest threads waiting in SendCommand are served at record boundaries, as before.
+            if (num_commands.load(std::memory_order_relaxed) != 0) {
+                break;
+            }
         }
+        h.executed = executed;
         h.state.store(2, std::memory_order_release);
     }
 }

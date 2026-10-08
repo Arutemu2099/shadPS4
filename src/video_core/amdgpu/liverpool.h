@@ -473,6 +473,7 @@ private:
     struct MtbHandoff {
         std::atomic<u32> state{0}; ///< 0 idle, 1 posted, 2 done, 3 stop
         std::vector<const CpSplit::RecordHeader*> run;
+        size_t executed{0}; ///< Records of `run` the worker ran (it stops early for commands).
         u64 runs{0}, records{0}, draws{0}, log_runs{0}, spin_yields{0};
     };
     MtbHandoff mtb_handoff;
