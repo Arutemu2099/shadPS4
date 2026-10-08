@@ -4653,6 +4653,117 @@ BufferId BufferCache::FindBuffer(VAddr device_addr, u32 size) {
     return CreateBuffer(device_addr, size);
 }
 
+BufferId BufferCache::FindBufferHinted(VAddr device_addr, u32 size) {
+    const u64 gen = StructGeneration();
+    if (gen == buffer_hint_gen) {
+        const VAddr end = device_addr + size;
+        for (const BufferHint& hint : buffer_hints) {
+            // An empty hint (hi == 0) never contains a range: end > 0.
+            if (device_addr >= hint.lo && end <= hint.hi) {
+                ++lean_stats[0];
+                if (g_lean_bind == 2) [[unlikely]] {
+                    const BufferId found = FindBuffer(device_addr, size);
+                    if (found != hint.id) {
+                        if (++lean_stats[2] <= 20) {
+                            LOG_ERROR(Render, "LeanBind verify: hint {} vs FindBuffer {} at {:#x}+{:#x}",
+                                      hint.id.index, found.index, device_addr, size);
+                        }
+                        buffer_hint_gen = ~0ULL;
+                        return found;
+                    }
+                }
+                return hint.id;
+            }
+        }
+    }
+    ++lean_stats[1];
+    const BufferId found = FindBuffer(device_addr, size);
+    // FindBuffer may have created or joined buffers (ChangeRegister bumped the generation). Page
+    // tables change only on this thread, so the bounds read now hold until the next bump.
+    const u64 gen_after = StructGeneration();
+    if (gen_after != buffer_hint_gen) {
+        buffer_hints = {};
+        buffer_hint_gen = gen_after;
+    }
+    const Buffer& buffer = slot_buffers[found];
+    buffer_hints[buffer_hint_next++ & 3] = {buffer.CpuAddr(), buffer.CpuAddr() + buffer.SizeBytes(),
+                                            found};
+    return found;
+}
+
+bool BufferCache::LeanReadOk() {
+    if (lean_read_state < 0) [[unlikely]] {
+        // Every per-call option ObtainBuffer tests on a read binding before or around the memo
+        // and the clean check must be off; then its answer is the memo probe plus the check.
+        const bool ok = g_lean_bind != 0 && ::Common::Lean() && StreamCopyMaxSize() == 0 &&
+                        !host_mirror && !g_range_notes && !g_asc_deps && !g_rmemo_census &&
+                        g_pb_census == 0 && !Offload::AscSpanStatsEnabled() &&
+                        !BufferTraffic::Enabled() &&
+                        (g_read_bind_memo == 1 || g_read_bind_memo == 3) && g_read_sync_fast == 1;
+        lean_read_state = ok ? 1 : 0;
+        LOG_INFO(Render, "LeanBind: mode={} lean read path {}", g_lean_bind, ok ? "on" : "off");
+    }
+    return lean_read_state == 1;
+}
+
+std::pair<Buffer*, u32> BufferCache::ObtainReadLean(VAddr device_addr, u32 size,
+                                                    BufferId buffer_id) {
+    if (IsBufferInvalid(buffer_id)) [[unlikely]] {
+        ++lean_stats[4];
+        return {};
+    }
+    Buffer& buffer = slot_buffers[buffer_id];
+    // As ObtainBuffer: NoteMainAccess, then the memo probe with the epoch and guard read first.
+    buffer.NoteMainAccess(scheduler.CurrentTick(), false);
+    const u64 epoch = g_dirty_epoch.load(std::memory_order_acquire);
+    const bool serial_guard = g_read_bind_memo >= 3;
+    const u64 gen = serial_guard ? buffer.memo_serial : StructGeneration();
+    const u64 h = (device_addr * 0x9E3779B97F4A7C15ULL) ^ (u64(size) * 0xC2B2AE3D27D4EB4FULL) ^
+                  u64(buffer_id.index);
+    ReadMemoEntry& entry = read_memo_table[(h ^ (h >> 31)) & (read_memo_table.size() - 1)];
+    std::pair<Buffer*, u32> result{};
+    if (entry.addr == device_addr && entry.size == size && entry.buffer_index == buffer_id.index &&
+        entry.epoch == epoch && entry.gen == gen && (!serial_guard || gen != 0)) {
+        result = {&buffer, buffer.Offset(device_addr)};
+    } else if (memory_tracker->ReadSyncClean(device_addr, size)) {
+        // READ_SYNC_FAST=1's clean answer: record nothing, write the memo as the full path does.
+        last_sync_upload_bytes = 0;
+        entry = {device_addr, size, epoch, gen, buffer_id.index};
+        result = {&buffer, buffer.Offset(device_addr)};
+    } else {
+        ++lean_stats[4];
+        return {};
+    }
+    if ((++lean_stats[3] & 0x1ffffff) == 0) [[unlikely]] {
+        LogLeanStats();
+    }
+    if (g_lean_bind == 2) [[unlikely]] {
+        const u64 uploads = sync_upload_bytes_total;
+        const auto full = ObtainBuffer(device_addr, size, false, false, buffer_id,
+                                       Common::BufferSampleCaller::Uniform);
+        if (full != result || sync_upload_bytes_total != uploads) {
+            if (++lean_stats[5] <= 20) {
+                LOG_ERROR(Render,
+                          "LeanBind verify: lean read {:#x}+{:#x} -> {}+{:#x}, full -> {}+{:#x}, "
+                          "uploaded {}",
+                          device_addr, size, fmt::ptr(result.first), result.second,
+                          fmt::ptr(full.first), full.second, sync_upload_bytes_total - uploads);
+            }
+        }
+        return full;
+    }
+    return result;
+}
+
+void BufferCache::LogLeanStats() {
+    const auto& s = lean_stats;
+    LOG_INFO(Render,
+             "LeanBind: mode={} hint hits={} misses={} ({:.2f}% hit) verify_bad={} | lean reads={} "
+             "fallbacks={} verify_bad={}",
+             g_lean_bind, s[0], s[1], 100.0 * double(s[0]) / double(std::max<u64>(s[0] + s[1], 1)),
+             s[2], s[3], s[4], s[5]);
+}
+
 BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 wanted_size) {
     static constexpr int STREAM_LEAP_THRESHOLD = 16;
     boost::container::small_vector<BufferId, 16> overlap_ids;

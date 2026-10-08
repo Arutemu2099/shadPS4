@@ -10,6 +10,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <immintrin.h>
 #include <atomic>
 #include <memory>
@@ -68,6 +69,14 @@ u64& DiagSyncWalkCycles();
 u64& DiagSyncRestCycles();
 
 using BufferId = Common::SlotId;
+
+/// SHADPS4_LEAN_BIND=1 (=2 verify), default off (notes/lean-draw-path-design-2026-10-08.md item
+/// A): FindBufferHinted in the binding pass 1 and ObtainReadLean for plain read shader bindings.
+inline const int g_lean_bind = [] {
+    const char* env = std::getenv("SHADPS4_LEAN_BIND");
+    const int mode = env ? env[0] - '0' : 0;
+    return mode == 1 || mode == 2 ? mode : 0;
+}();
 
 class TextureCache;
 class MemoryTracker;
@@ -225,6 +234,22 @@ public:
 
     /// Return buffer id for the specified region
     BufferId FindBuffer(VAddr device_addr, u32 size);
+
+    /// SHADPS4_LEAN_BIND=1 (=2 verify): FindBuffer through a 4-entry bounds hint of the buffers
+    /// found last, valid while StructGeneration is unchanged (every page-table edit passes
+    /// ChangeRegister, which bumps it, on the CP thread). Identical to FindBuffer as long as
+    /// cached buffers never overlap; =2 runs FindBuffer on every hint hit and compares. CP thread.
+    BufferId FindBufferHinted(VAddr device_addr, u32 size);
+
+    /// SHADPS4_LEAN_BIND: ObtainBuffer for a plain read shader binding (not written, not
+    /// formatted) when every per-call option it would test is off (see LeanReadOk): the
+    /// READ_BIND_MEMO=1/3 probe, then READ_SYNC_FAST's clean check, without ObtainBuffer's
+    /// statistics and option tests. Returns {nullptr, 0} when the full path must run (invalid id,
+    /// not clean); the full path then repeats the probe and the check. =2 runs the full path
+    /// after every lean answer and compares the pair. CP thread.
+    [[nodiscard]] std::pair<Buffer*, u32> ObtainReadLean(VAddr device_addr, u32 size,
+                                                         BufferId buffer_id);
+    [[nodiscard]] bool LeanReadOk();
 
     /// Processes the fault buffer.
     void ProcessFaultBuffer();
@@ -659,6 +684,20 @@ private:
         u64 pb_written{}; ///< SHADPS4_PB_CENSUS: census draw index of the last write
     };
     std::array<ReadMemoEntry, 8192> read_memo_table{};
+    /// SHADPS4_LEAN_BIND: FindBufferHinted's bounds hints and LeanReadOk's answer (-1 unknown).
+    struct BufferHint {
+        VAddr lo{};
+        VAddr hi{};
+        BufferId id{};
+    };
+    std::array<BufferHint, 4> buffer_hints{};
+    u64 buffer_hint_gen{~0ULL};
+    u32 buffer_hint_next{};
+    int lean_read_state{-1};
+    /// hint hits, hint misses, hint verify mismatches, lean read hits, lean read fallbacks,
+    /// lean read verify mismatches
+    std::array<u64, 6> lean_stats{};
+    void LogLeanStats();
 
 public:
     /// SHADPS4_READ_MEMO_PREFETCH: pulls the READ_BIND_MEMO entry that ObtainBuffer will probe for

@@ -69,6 +69,9 @@ const bool g_prepared_targets = EnvIs1("SHADPS4_PREPARED_TARGETS");
 const bool g_tex_memo_local = EnvIs1("SHADPS4_TEX_MEMO_LOCAL_GEN");
 const bool g_verify_targets = EnvIs1("SHADPS4_PREPARED_TARGETS_VERIFY");
 const bool g_raw_write_invalidate = EnvIs1("SHADPS4_RAW_WRITE_INVALIDATE");
+// SHADPS4_READ_MEMO_PREFETCH (was a function-local static in BindBuffers' pass-1 loop: a guard
+// check per binding).
+const bool g_read_memo_prefetch = EnvIs1("SHADPS4_READ_MEMO_PREFETCH");
 const bool g_cache_decoded_images = [] {
     const char* value = std::getenv("SHADPS4_DECODE_IMAGE_CACHE");
     return !value || value[0] != '0';
@@ -4877,17 +4880,21 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
     // function is 62% of per-draw cost and a stack scan is not trustworthy for apportioning it.
     const auto t_find = Common::FaultMonitor::Now();
     const u64 bb_find_t0 = g_draw_cost ? __rdtsc() : 0;
+    // SHADPS4_LEAN_BIND: ClampRangeSize returns small sizes unchanged (memory.cpp, < 1 GB) - test
+    // that here instead of an out-of-line call per binding; buffers found through the hint.
+    const bool lean_bind = VideoCore::g_lean_bind != 0;
     for (const auto& desc : stage.buffers) {
         const auto vsharp = desc.GetSharp(bound);
         if (!desc.IsSpecial() && vsharp.base_address != 0 && vsharp.GetSize() > 0) {
-            const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
-            const auto buffer_id = buffer_cache.FindBuffer(vsharp.base_address, size);
+            const u64 vsize = vsharp.GetSize();
+            const u64 size = lean_bind && vsize < (u64{1} << 30)
+                                 ? vsize
+                                 : memory->ClampRangeSize(vsharp.base_address, vsize);
+            const auto buffer_id =
+                lean_bind ? buffer_cache.FindBufferHinted(vsharp.base_address, size)
+                          : buffer_cache.FindBuffer(vsharp.base_address, size);
             // SHADPS4_READ_MEMO_PREFETCH: pass 2 probes the read memo for this binding.
-            static const bool memo_prefetch = [] {
-                const char* value = std::getenv("SHADPS4_READ_MEMO_PREFETCH");
-                return value && value[0] == '1';
-            }();
-            if (memo_prefetch && buffer_id && !desc.is_written && !desc.is_formatted) {
+            if (g_read_memo_prefetch && buffer_id && !desc.is_written && !desc.is_formatted) {
                 buffer_cache.PrefetchReadMemo(vsharp.base_address, static_cast<u32>(size),
                                               buffer_id);
             }
@@ -5107,6 +5114,8 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
     const u64 bb_find_cyc = g_draw_cost ? __rdtsc() - bb_find_t0 : 0;
     const u64 bb_find_each = buffer_bindings.empty() ? 0 : bb_find_cyc / buffer_bindings.size();
 
+    // SHADPS4_LEAN_BIND: plain read bindings take BufferCache::ObtainReadLean.
+    const bool lean_read = lean_bind && buffer_cache.LeanReadOk();
     // Second pass to re-bind buffers that were updated after binding
     for (u32 i = 0; i < buffer_bindings.size(); i++) {
         const auto& [buffer_id, vsharp, size] = buffer_bindings[i];
@@ -5188,10 +5197,17 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
                 VideoCore::DiagSyncRestCycles() = 0;
                 bb_t0 = __rdtsc();
             }
-            const auto [vk_buffer, offset] = buffer_cache.ObtainBuffer(
-                vsharp.base_address, size, desc.is_written, desc.is_formatted, buffer_id,
-                is_storage ? Common::BufferSampleCaller::Storage
-                           : Common::BufferSampleCaller::Uniform);
+            std::pair<VideoCore::Buffer*, u32> obtained{};
+            if (lean_read && !desc.is_written && !desc.is_formatted) {
+                obtained = buffer_cache.ObtainReadLean(vsharp.base_address, size, buffer_id);
+            }
+            if (!obtained.first) {
+                obtained = buffer_cache.ObtainBuffer(
+                    vsharp.base_address, size, desc.is_written, desc.is_formatted, buffer_id,
+                    is_storage ? Common::BufferSampleCaller::Storage
+                               : Common::BufferSampleCaller::Uniform);
+            }
+            const auto [vk_buffer, offset] = obtained;
             obtain_ns += Common::FaultMonitor::SinceNs(t_obtain);
             const u64 bb_t1 = g_draw_cost ? __rdtsc() : 0;
             if (bind_memo_active) {
