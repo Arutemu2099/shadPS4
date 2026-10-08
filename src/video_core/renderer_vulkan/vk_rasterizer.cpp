@@ -750,14 +750,36 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     return push_data;
 }
 
+Rasterizer::Shared::Shared(Rasterizer* owner, const Instance& instance, Scheduler& scheduler,
+                           AmdGpu::Liverpool* liverpool)
+    : native_bindings{NativeBindings::Create(instance, scheduler)}, page_manager{owner},
+      buffer_cache{instance, scheduler, liverpool, texture_cache, page_manager},
+      texture_cache{instance, scheduler, liverpool, buffer_cache, page_manager},
+      pipeline_cache{instance, scheduler, liverpool} {}
+
+Rasterizer::Rasterizer(Rasterizer& primary, WorkerTag)
+    : instance{primary.instance}, scheduler{primary.scheduler}, shared{primary.shared},
+      native_bindings{shared.native_bindings}, page_manager{shared.page_manager},
+      buffer_cache{shared.buffer_cache}, texture_cache{shared.texture_cache},
+      liverpool{primary.liverpool}, memory{primary.memory}, mapped_ranges{shared.mapped_ranges},
+      mapped_ranges_mutex{shared.mapped_ranges_mutex}, pipeline_cache{shared.pipeline_cache},
+      occlusion{shared.occlusion} {
+    // The settings the primary's constructor derived; everything else starts empty.
+    build_set_writes = primary.build_set_writes;
+    bind_memo_stats = primary.bind_memo_stats;
+    tex_bind_memo = primary.tex_bind_memo;
+}
+
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
                        AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_},
-      native_bindings{NativeBindings::Create(instance_, scheduler_)}, page_manager{this},
-      buffer_cache{instance, scheduler, liverpool_, texture_cache, page_manager},
-      texture_cache{instance, scheduler, liverpool_, buffer_cache, page_manager},
-      liverpool{liverpool_}, memory{Core::Memory::Instance()},
-      pipeline_cache{instance, scheduler, liverpool} {
+      owned_shared{std::make_unique<Shared>(this, instance_, scheduler_, liverpool_)},
+      shared{*owned_shared}, native_bindings{shared.native_bindings},
+      page_manager{shared.page_manager}, buffer_cache{shared.buffer_cache},
+      texture_cache{shared.texture_cache}, liverpool{liverpool_},
+      memory{Core::Memory::Instance()}, mapped_ranges{shared.mapped_ranges},
+      mapped_ranges_mutex{shared.mapped_ranges_mutex}, pipeline_cache{shared.pipeline_cache},
+      occlusion{shared.occlusion} {
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }

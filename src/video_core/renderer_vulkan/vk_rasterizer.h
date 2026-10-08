@@ -44,6 +44,10 @@ class Rasterizer {
 public:
     explicit Rasterizer(const Instance& instance, Scheduler& scheduler,
                         AmdGpu::Liverpool* liverpool);
+    /// Multi-threaded back P1a: a worker instance on `primary`'s caches with its own per-draw
+    /// scratch and memos (not used yet; notes/parrec-build-2026-10-08.md sec. 6).
+    struct WorkerTag {};
+    Rasterizer(Rasterizer& primary, WorkerTag);
     ~Rasterizer();
 
     [[nodiscard]] Scheduler& GetScheduler() noexcept {
@@ -345,17 +349,36 @@ private:
 
     const Instance& instance;
     Scheduler& scheduler;
-    // Declared before the caches: created before any buffer, view, sampler or pipeline, and
-    // destroyed after them so object-owned heap slots can still be released. Null in legacy.
-    std::unique_ptr<NativeBindings> native_bindings;
-    VideoCore::PageManager page_manager;
-    VideoCore::BufferCache buffer_cache;
-    VideoCore::TextureCache texture_cache;
+    /// What every rasterizer instance shares (multi-threaded back P1a,
+    /// notes/parrec-build-2026-10-08.md sec. 6): owned by the primary rasterizer; a worker
+    /// instance (Rasterizer(primary, WorkerTag)) references the primary's. The members below of
+    /// the same names are references into it, so the draw path reads them as before. Member
+    /// order = the old declaration order (same construction / destruction order).
+    struct Shared {
+        Shared(Rasterizer* owner, const Instance& instance, Scheduler& scheduler,
+               AmdGpu::Liverpool* liverpool);
+        // Declared before the caches: created before any buffer, view, sampler or pipeline, and
+        // destroyed after them so object-owned heap slots can still be released. Null in legacy.
+        std::unique_ptr<NativeBindings> native_bindings;
+        VideoCore::PageManager page_manager;
+        VideoCore::BufferCache buffer_cache;
+        VideoCore::TextureCache texture_cache;
+        boost::icl::interval_set<VAddr> mapped_ranges;
+        Common::SharedFirstMutex mapped_ranges_mutex;
+        PipelineCache pipeline_cache;
+        std::unique_ptr<OcclusionQueries> occlusion;
+    };
+    std::unique_ptr<Shared> owned_shared; ///< Primary instance only.
+    Shared& shared;
+    std::unique_ptr<NativeBindings>& native_bindings;
+    VideoCore::PageManager& page_manager;
+    VideoCore::BufferCache& buffer_cache;
+    VideoCore::TextureCache& texture_cache;
     AmdGpu::Liverpool* liverpool;
     Core::MemoryManager* memory;
-    boost::icl::interval_set<VAddr> mapped_ranges;
-    Common::SharedFirstMutex mapped_ranges_mutex;
-    PipelineCache pipeline_cache;
+    boost::icl::interval_set<VAddr>& mapped_ranges;
+    Common::SharedFirstMutex& mapped_ranges_mutex;
+    PipelineCache& pipeline_cache;
     /// SHADPS4_DRAW_REPEAT (back thread only): the previous direct draw, see DrawRepeatMatch.
     struct DrawRepeatState {
         bool valid{};    ///< the previous direct draw completed and is a base for a repeat
@@ -395,8 +418,8 @@ private:
     void PbCensusEnd(const GraphicsPipeline* pipeline, bool rs_hit, bool repeat_skip,
                      const AmdGpu::CpSplit::VertexInputsPayload* front_vi, bool is_indexed,
                      u32 index_offset);
-    /// Null unless SHADPS4_OCCLUSION_QUERIES=1 (vk_occlusion.h).
-    std::unique_ptr<OcclusionQueries> occlusion;
+    /// Null unless SHADPS4_OCCLUSION_QUERIES=1 (vk_occlusion.h). In Shared (one slot ring).
+    std::unique_ptr<OcclusionQueries>& occlusion;
 
     using RenderTargetInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     std::array<RenderTargetInfo, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
