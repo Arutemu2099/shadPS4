@@ -3,10 +3,14 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cstddef>
+#include <new>
 #include <numeric>
 #include <utility>
 #include <vector>
 #include "common/assert.h"
+#include "common/reserved_memory.h"
 #include "common/types.h"
 
 namespace Common {
@@ -26,9 +30,20 @@ struct SlotId {
     u32 index = INVALID_INDEX;
 };
 
-template <class T>
+/// Capacity of the cache SlotVectors (images, image views, buffers) whose objects must never move:
+/// a resolver thread may hold a reference while the command processor inserts
+/// (notes/parallel-back-design-2026-10-02.md sec. 5 and 7a). Address space only; pages are
+/// committed as the vector grows, exactly where the old doubling would have reallocated.
+inline constexpr std::size_t StableSlotCapacity = std::size_t{1} << 20;
+
+/// StableCapacity == 0: the classic vector (grows by moving every object into a doubled array).
+/// StableCapacity  > 0: storage is one reserved range, committed in place - an object keeps its
+/// address until it is erased, and the occupancy bitset never reallocates either. Exceeding the
+/// capacity is fatal.
+template <class T, std::size_t StableCapacity = 0>
 class SlotVector {
     constexpr static std::size_t InitialCapacity = 2048;
+    constexpr static bool Stable = StableCapacity != 0;
 
 public:
     template <typename ValueType, typename Pointer, typename Reference>
@@ -89,8 +104,18 @@ public:
     using const_reverse_iterator = std::reverse_iterator<const_iterator>;
 
     SlotVector() {
+        if constexpr (Stable) {
+            const std::size_t page = AddressSpacePageSize();
+            reserved_bytes = (StableCapacity * sizeof(Entry) + page - 1) / page * page;
+            values = static_cast<Entry*>(ReserveAddressSpace(reserved_bytes));
+            ASSERT_MSG(values != nullptr, "SlotVector: cannot reserve {} bytes", reserved_bytes);
+            stored_bitset.reserve((StableCapacity + 63) / 64);
+        }
         Reserve(InitialCapacity);
     }
+
+    SlotVector(const SlotVector&) = delete;
+    SlotVector& operator=(const SlotVector&) = delete;
 
     ~SlotVector() noexcept {
         std::size_t index = 0;
@@ -102,7 +127,11 @@ public:
             }
             index += 64;
         }
-        delete[] values;
+        if constexpr (Stable) {
+            ReleaseAddressSpace(values, reserved_bytes);
+        } else {
+            delete[] values;
+        }
     }
 
     [[nodiscard]] T& operator[](SlotId id) noexcept {
@@ -219,7 +248,13 @@ private:
 
     [[nodiscard]] u32 FreeValueIndex() noexcept {
         if (free_list.empty()) {
-            Reserve(values_capacity ? (values_capacity << 1) : 1);
+            std::size_t grown = values_capacity ? (values_capacity << 1) : 1;
+            if constexpr (Stable) {
+                ASSERT_MSG(values_capacity < StableCapacity, "SlotVector: stable capacity {} full",
+                           StableCapacity);
+                grown = std::min(grown, StableCapacity);
+            }
+            Reserve(grown);
         }
 
         const u32 free_index = free_list.back();
@@ -228,6 +263,30 @@ private:
     }
 
     void Reserve(std::size_t new_capacity) noexcept {
+        if constexpr (Stable) {
+            // Commit the pages the new entries need and construct them in place: nothing moves.
+            ASSERT(new_capacity <= StableCapacity);
+            const std::size_t page = AddressSpacePageSize();
+            const std::size_t need =
+                (new_capacity * sizeof(Entry) + page - 1) / page * page;
+            if (need > committed_bytes) {
+                const bool committed =
+                    CommitAddressSpace(values, committed_bytes, need - committed_bytes);
+                ASSERT_MSG(committed, "SlotVector: cannot commit {} bytes", need - committed_bytes);
+                committed_bytes = need;
+            }
+            for (std::size_t i = values_capacity; i < new_capacity; ++i) {
+                new (&values[i]) Entry();
+            }
+            stored_bitset.resize((new_capacity + 63) / 64); // within the reserved capacity
+            const std::size_t old_free_size = free_list.size();
+            free_list.resize(old_free_size + (new_capacity - values_capacity));
+            const std::size_t new_free_size = free_list.size();
+            std::iota(free_list.rbegin(), free_list.rbegin() + new_free_size - old_free_size,
+                      static_cast<u32>(values_capacity));
+            values_capacity = new_capacity;
+            return;
+        }
         Entry* const new_values = new Entry[new_capacity];
         std::size_t index = 0;
         for (u64 bits : stored_bitset) {
@@ -258,6 +317,8 @@ private:
 
     Entry* values = nullptr;
     std::size_t values_capacity = 0;
+    std::size_t reserved_bytes = 0;  ///< Stable only
+    std::size_t committed_bytes = 0; ///< Stable only
 
     std::vector<u64> stored_bitset;
     std::vector<u32> free_list;

@@ -130,7 +130,7 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
 }
 
 Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
-             BlitHelper& blit_helper_, Common::SlotVector<ImageView>& slot_image_views_,
+             BlitHelper& blit_helper_, Common::SlotVector<ImageView, Common::StableSlotCapacity>& slot_image_views_,
              const ImageInfo& info_)
     : instance{&instance_}, scheduler{&scheduler_}, blit_helper{&blit_helper_},
       slot_image_views{&slot_image_views_}, info{info_} {

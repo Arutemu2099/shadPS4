@@ -562,8 +562,8 @@ private:
     PageManager& tracker;
     BlitHelper blit_helper;
     TileManager tile_manager;
-    Common::SlotVector<Image> slot_images;
-    Common::SlotVector<ImageView> slot_image_views;
+    Common::SlotVector<Image, Common::StableSlotCapacity> slot_images;
+    Common::SlotVector<ImageView, Common::StableSlotCapacity> slot_image_views;
     tsl::robin_map<u64, Sampler> samplers;
     std::unordered_set<ImageId> download_images;
     u64 total_used_memory = 0;

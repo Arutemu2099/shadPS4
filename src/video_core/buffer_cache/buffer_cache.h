@@ -811,7 +811,7 @@ private:
     StreamBuffer device_buffer;
     Buffer gds_buffer;
     Buffer bda_pagetable_buffer;
-    Common::SlotVector<Buffer> slot_buffers;
+    Common::SlotVector<Buffer, Common::StableSlotCapacity> slot_buffers;
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;
     u64 critical_gc_memory = 0;
