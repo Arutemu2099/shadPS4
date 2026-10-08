@@ -5124,7 +5124,10 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     last_sync_upload_bytes = total_size_bytes;
     sync_upload_bytes_total += total_size_bytes;
     if (total_size_bytes != 0) {
-        AmdGpu::MtbCensus::NoteEventRange(AmdGpu::MtbCensus::BufferUpload, device_addr, size);
+        // Whole tracker pages: a later binding of the same page would have found it dirty too.
+        const u64 page_lo = device_addr & ~u64{0xfff};
+        const u64 page_hi = (device_addr + size + 0xfff) & ~u64{0xfff};
+        AmdGpu::MtbCensus::NoteEventRange(AmdGpu::MtbCensus::BufferUpload, page_lo, page_hi - page_lo);
     }
     if (g_upload_ahead_stats && src_buffer) [[unlikely]] {
         NoteUploadAhead(buffer, device_addr, size, total_size_bytes);
