@@ -1354,7 +1354,7 @@ namespace {
 struct MtbWindow {
     u64 seg_draws = 0;
     bool seg_bailed = false;
-    u64 segments = 0, segments_bailed = 0, seg_len_sum = 0, seqpoints = 0;
+    u64 segments = 0, segments_bailed = 0, seg_len_sum = 0, seqpoints = 0, dma_noop = 0, bookkeeping = 0;
     u64 draws = 0, par_draws = 0;
     u64 par_cyc = 0, ser_draw_cyc = 0, seq_cyc = 0, other_cyc = 0;
     std::array<u64, AmdGpu::MtbCensus::Count> bails{};
@@ -1384,13 +1384,14 @@ void MtbLog() {
     const auto& b = w.bails;
     LOG_INFO(Render,
              "MtbCensus: segment={} draws={} parallel_draws={} ({:.1f}%) segments={} mean_len={:.1f} "
-             "bailed={:.1f}% seqpoints={} | cycles: parallel {:.1f}% serial_draws {:.1f}% "
+             "bailed={:.1f}% seqpoints={} dma_noop={} bookkeeping={} | cycles: parallel {:.1f}% serial_draws {:.1f}% "
              "seqpoints {:.1f}% other {:.1f}% | Amdahl K=2 {:.2f}x K=4 {:.2f}x | first bails: "
              "buf_create={} buf_delete={} buf_upload={} img_register={} img_unregister={} "
              "img_upload={} stream_alloc={} occlusion={}",
              g_mtb_segment, w.draws, w.par_draws, 100.0 * double(w.par_draws) / double(std::max<u64>(w.draws, 1)),
              w.segments, double(w.seg_len_sum) / double(std::max<u64>(w.segments, 1)),
              100.0 * double(w.segments_bailed) / double(std::max<u64>(w.segments, 1)), w.seqpoints,
+             w.dma_noop, w.bookkeeping,
              100.0 * par, all > 0 ? 100.0 * double(w.ser_draw_cyc) / all : 0.0,
              all > 0 ? 100.0 * double(w.seq_cyc) / all : 0.0,
              all > 0 ? 100.0 * double(w.other_cyc) / all : 0.0, amdahl(2.0), amdahl(4.0),
@@ -1442,14 +1443,32 @@ void Liverpool::ExecuteRecord(const CpSplit::RecordHeader& record) {
         }
         break;
     }
-    case CpSplit::RecordType::Packet:
-    case CpSplit::RecordType::Call:
-    case CpSplit::RecordType::Retire:
-    case CpSplit::RecordType::ClearState:
-    case CpSplit::RecordType::EpochBump:
+    case CpSplit::RecordType::Packet: {
+        // The DMA_DATA to 0x3022C is skipped by ExecuteGfxPacket: not a dependency.
+        const auto* header = reinterpret_cast<const PM4Header*>(&record + 1);
+        const auto* dma = reinterpret_cast<const PM4DmaData*>(header);
+        if (header->type3.opcode == PM4ItOpcode::DmaData && dma->dst_addr_lo == 0x3022C) {
+            ++g_mtb.dma_noop;
+            g_mtb.other_cyc += cyc;
+            break;
+        }
         g_mtb.seq_cyc += cyc;
         ++g_mtb.seqpoints;
         MtbEndSegment();
+        break;
+    }
+    case CpSplit::RecordType::Call:
+        g_mtb.seq_cyc += cyc;
+        ++g_mtb.seqpoints;
+        MtbEndSegment();
+        break;
+    case CpSplit::RecordType::Retire:
+    case CpSplit::RecordType::ClearState:
+    case CpSplit::RecordType::EpochBump:
+        // In-order bookkeeping the committer does; a worker's translation does not read it
+        // (ClearState resets the register mirror, which each worker applies itself).
+        ++g_mtb.bookkeeping;
+        g_mtb.other_cyc += cyc;
         break;
     default:
         g_mtb.other_cyc += cyc;
