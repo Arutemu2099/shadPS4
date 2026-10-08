@@ -458,12 +458,12 @@ public:
 
     /// Returns the current render state.
     const RenderState& GetRenderState() const {
-        return render_state;
+        return Rc().render_state;
     }
 
     /// Returns the current pipeline dynamic state tracking.
     DynamicState& GetDynamicState() {
-        return dynamic_state;
+        return Rc().dynamic_state;
     }
 
     // A raw handle may only be used while this scope is alive. Nested recordings run
@@ -483,16 +483,16 @@ public:
             // borrower records directly (SHADPS4_TRANSFER_COALESCE).
             scheduler.CloseTransferGroup(scheduler.current_cmdbuf);
             // A borrower may bind legacy descriptor state behind the scheduler's back.
-            scheduler.native_heaps_bound = false;
+            scheduler.Rc().native_heaps_bound = false;
             ++scheduler.synchronous_scopes;
             ++scheduler.synchronous_borrows;
-            ++scheduler.stream_seq[scheduler.active_stream];
+            ++scheduler.Rc().stream_seq[scheduler.active_stream];
             if (scheduler.recording_measure_timing) {
                 ++scheduler.recording_borrow_counts[location.function_name()];
             }
         }
         ~CommandBufferAccess() {
-            scheduler.native_heaps_bound = false;
+            scheduler.Rc().native_heaps_bound = false;
             --scheduler.synchronous_scopes;
         }
         CommandBufferAccess(const CommandBufferAccess&) = delete;
@@ -523,7 +523,8 @@ public:
     [[nodiscard]] bool CommitDynamicStateWouldRecord() const;
     /// SHADPS4_DRAW_PACKET: true when BeginRendering(state) would record nothing.
     [[nodiscard]] bool RenderingMatches(const RenderState& state) const noexcept {
-        return is_rendering && render_state == state;
+        const RecordContext& rc = Rc();
+        return rc.is_rendering && rc.render_state == state;
     }
     /// SHADPS4_DRAW_PACKET (vk_draw_packet.h): records one worker command carrying the draw's
     /// buffer barriers, push constants, push descriptors and optionally the draw / dispatch, as
@@ -550,20 +551,20 @@ public:
     /// Descriptor heap binds are invalidated by legacy descriptor state and do not survive a
     /// command buffer. Tracked in recording order on the command-processor thread.
     bool NativeHeapsBound() const {
-        return native_heaps_bound && synchronous_scopes == 0;
+        return Rc().native_heaps_bound && synchronous_scopes == 0;
     }
     void MarkNativeHeapsBound() {
-        native_heaps_bound = true;
+        Rc().native_heaps_bound = true;
     }
     void InvalidateNativeHeaps() {
-        native_heaps_bound = false;
+        Rc().native_heaps_bound = false;
     }
 
     /// IsTransfer: the command records only buffer copies that call BeginTransferOnWorker
     /// (SHADPS4_TRANSFER_COALESCE); every other command first closes an open transfer group.
     template <bool IsTransfer = false, typename F>
     void Record(F&& command) {
-        ++stream_seq[active_stream];
+        ++Rc().stream_seq[active_stream];
         if (!IsAsyncRecording()) {
             CloseTransferGroup(current_cmdbuf);
             command(current_cmdbuf);
@@ -622,7 +623,7 @@ public:
     template <bool IsTransfer = false, typename F, typename... T>
     void RecordArrays(F&& command, std::span<const T>... arrays) {
         static_assert((std::is_trivially_copyable_v<T> && ...));
-        ++stream_seq[active_stream];
+        ++Rc().stream_seq[active_stream];
         if (!IsAsyncRecording()) {
             CloseTransferGroup(current_cmdbuf);
             command(current_cmdbuf, arrays...);
@@ -743,21 +744,23 @@ public:
 
     /// Draws recorded since the last submission, and in the last submitted batch (diagnostic).
     void NoteDraw() noexcept {
-        ++batch_draws;
-        ++batch_ops;
+        RecordContext& rc = Rc();
+        ++rc.batch_draws;
+        ++rc.batch_ops;
     }
     /// Draws plus dispatches recorded since the last submission of any kind (SHADPS4_FLUSH_EVERY_OPS);
     /// NoteDraw counts direct draws, NoteOp dispatches and indirect draws.
     void NoteOp() noexcept {
-        ++batch_ops;
+        ++Rc().batch_ops;
     }
     /// A compute dispatch: NoteOp plus the per-batch dispatch count (SHADPS4_GPU_BATCH_TIMING).
     void NoteDispatch() noexcept {
         if (active_stream != 0) {
             return; // ASC stream: its segments are cut at guest ASC RELEASE_MEMs.
         }
-        ++batch_ops;
-        ++batch_dispatches;
+        RecordContext& rc = Rc();
+        ++rc.batch_ops;
+        ++rc.batch_dispatches;
     }
 
     /**
@@ -792,14 +795,14 @@ public:
     }
     /// Commands recorded into one stream (switch markers excluded).
     u64 RecordSeqOf(u32 stream) const noexcept {
-        return stream_seq[stream];
+        return Rc().stream_seq[stream];
     }
     /// SHADPS4_GPU_BATCH_TIMING timer, or null (diagnostic).
     [[nodiscard]] class GpuBatchTimer* BatchTimer() const noexcept {
         return batch_timer.get();
     }
     [[nodiscard]] u32 BatchOps() const noexcept {
-        return batch_ops;
+        return Rc().batch_ops;
     }
     /// Submissions made only to shorten GPU batches (SHADPS4_FLUSH_EVERY_OPS / _DRAWS, the
     /// readback early flush), counted by their callers just before Flush(). The texture cache
@@ -878,14 +881,11 @@ private:
     bool recording_measure_timing = false;
     std::unordered_map<std::string_view, u64> recording_borrow_counts;
     u32 synchronous_scopes = 0;
-    bool native_heaps_bound = false;
     u64 synchronous_borrows = 0;
     u64 recording_submits = 0;
     bool async_submit = false;
     std::unique_ptr<class GpuBatchTimer> batch_timer;
     void SubmitExecutionAsync(SubmitInfo& info);
-    u32 batch_draws = 0;
-    u32 batch_dispatches = 0;
     // SHADPS4_ASC_STREAM state. Worker side (or the CP while drained): main_cmdbuf, asc_cmdbuf,
     // worker_stream. CP side: the rest.
     bool asc_enabled = false;
@@ -948,7 +948,6 @@ private:
     void AscTimerEnd(u64 value);
     void AscTimerCollect();
     u64 asc_waited_by_main = 0;
-    std::array<u64, 2> stream_seq{};
     struct TransferGroup {
         bool open = false;
         u32 num_reads = 0;
@@ -1019,11 +1018,9 @@ private:
     void LogParRec();
 
     u32 last_batch_draws = 0;
-    u32 batch_ops = 0;
     std::atomic<u64> cadence_flushes{0};
     MasterSemaphore master_semaphore;
     CommandPool command_pool;
-    DynamicState dynamic_state;
     /// SHADPS4_DRAW_PACKET_DELTA (producer thread only): what the last graphics draw packet that
     /// pushed descriptors pushed, and with which layout.
     struct PacketPushState {
@@ -1033,7 +1030,32 @@ private:
         std::vector<vk::DescriptorImageInfo> image_infos;
         u64 packets{}, kept{}, unknown{}, layout_changed{}, differs{};
     };
-    PacketPushState packet_push;
+    /// Translation-time recording state (multi-threaded back P1b, notes/parrec-build-2026-10-08.md
+    /// sec. 6): what the thread translating draws decides about the command buffer it records
+    /// into. The scheduler's own serves the command processor; a translating worker installs its
+    /// own with SetThreadRecordContext (none do yet).
+    struct RecordContext {
+        DynamicState dynamic_state;
+        PacketPushState packet_push;
+        RenderState render_state{};
+        bool is_rendering = false;
+        u32 last_end_site = ~0u;
+        bool native_heaps_bound = false;
+        u32 batch_draws = 0;
+        u32 batch_dispatches = 0;
+        u32 batch_ops = 0;
+        std::array<u64, 2> stream_seq{};
+    };
+    RecordContext rc_main;
+    static inline thread_local RecordContext* t_record_ctx = nullptr;
+    RecordContext& Rc() noexcept {
+        RecordContext* const ctx = t_record_ctx;
+        return ctx ? *ctx : rc_main;
+    }
+    const RecordContext& Rc() const noexcept {
+        const RecordContext* const ctx = t_record_ctx;
+        return ctx ? *ctx : rc_main;
+    }
     vk::CommandBuffer current_cmdbuf;
     std::condition_variable_any event_cv;
     struct PendingOp {
@@ -1045,9 +1067,6 @@ private:
     std::mutex priority_pending_ops_mutex;
     std::condition_variable_any priority_pending_ops_cv;
     std::jthread priority_pending_ops_thread;
-    RenderState render_state;
-    bool is_rendering = false;
-    u32 last_end_site = ~0u;
     tracy::VkCtxScope* profiler_scope{};
 };
 

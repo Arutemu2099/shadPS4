@@ -264,7 +264,7 @@ void Scheduler::LogRecordingWindow() {
 
 void Scheduler::CommitDynamicState() {
     if (!IsAsyncRecording()) {
-        dynamic_state.Commit(instance, current_cmdbuf);
+        Rc().dynamic_state.Commit(instance, current_cmdbuf);
         return;
     }
     // SHADPS4_SKIP_EMPTY_DYNSTATE=1: do not record a ~0.8 KB DynamicState snapshot when Commit
@@ -272,7 +272,7 @@ void Scheduler::CommitDynamicState() {
     // postponed set computed below equals the current dirty set (padding bits only make the
     // comparison conservative). =2 also logs the skip rate every 2^20 calls.
     const int skip_empty = g_skip_empty_dynstate;
-    auto& state = dynamic_state;
+    auto& state = Rc().dynamic_state;
     const auto old_dirty = state.dirty_state;
     // Keep the conditional dirtiness which Commit deliberately postpones until
     // its corresponding test is enabled. All values in the packet are owned.
@@ -298,7 +298,7 @@ void Scheduler::CommitDynamicState() {
 }
 
 Scheduler::DynamicDirtyBits Scheduler::PostponedDynamicDirty() const {
-    const auto& state = dynamic_state;
+    const auto& state = Rc().dynamic_state;
     const auto old_dirty = state.dirty_state;
     DynamicDirtyBits kept{};
     kept.depth_compare_op = old_dirty.depth_compare_op && !state.depth_test_enabled;
@@ -325,14 +325,14 @@ bool Scheduler::CommitDynamicStateWouldRecord() const {
     }
     // CommitDynamicState's own skip test, on the same inputs.
     const DynamicDirtyBits kept = PostponedDynamicDirty();
-    return std::memcmp(&kept, &dynamic_state.dirty_state, sizeof(kept)) != 0;
+    return std::memcmp(&kept, &Rc().dynamic_state.dirty_state, sizeof(kept)) != 0;
 }
 
 void Scheduler::RecordDrawPacket(const DrawPacketDesc& desc) {
     ASSERT_MSG(IsAsyncRecording(), "Draw packets need the recording worker");
-    ++stream_seq[active_stream];
+    ++Rc().stream_seq[active_stream];
     if (desc.header.num_writes != 0) {
-        native_heaps_bound = false; // as PushDescriptors
+        Rc().native_heaps_bound = false; // as PushDescriptors
     }
     std::span<const PacketBinding> table = desc.table;
     std::span<const vk::DescriptorBufferInfo> buffer_infos = desc.buffer_infos;
@@ -347,10 +347,10 @@ void Scheduler::RecordDrawPacket(const DrawPacketDesc& desc) {
     }();
     if (packet_delta && desc.header.bind_point == vk::PipelineBindPoint::eGraphics &&
         !table.empty()) {
-        auto& ps = packet_push;
+        auto& ps = Rc().packet_push;
         ++ps.packets;
         const VkPipelineLayout layout = desc.header.layout;
-        if (dynamic_state.packet_state_unknown) {
+        if (Rc().dynamic_state.packet_state_unknown) {
             ++ps.unknown;
         } else if (ps.layout != layout) {
             ++ps.layout_changed;
@@ -385,7 +385,7 @@ void Scheduler::RecordDrawPacket(const DrawPacketDesc& desc) {
             std::memcpy(ps.table.data(), table.data(), table.size_bytes());
             ps.buffer_infos.assign(buffer_infos.begin(), buffer_infos.end());
             ps.image_infos.assign(image_infos.begin(), image_infos.end());
-            dynamic_state.packet_state_unknown = false;
+            Rc().dynamic_state.packet_state_unknown = false;
         }
         if ((ps.packets & 0x1fffff) == 0) {
             LOG_INFO(Render_Vulkan,
@@ -555,8 +555,8 @@ void Scheduler::ExecuteDrawPacket(const DrawPacketHeader& header) {
 
 void Scheduler::PushDescriptors(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
                                 std::span<const vk::WriteDescriptorSet> writes) {
-    native_heaps_bound = false;
-    dynamic_state.packet_state_unknown = true; // a push outside the draw packets
+    Rc().native_heaps_bound = false;
+    Rc().dynamic_state.packet_state_unknown = true; // a push outside the draw packets
     if (!IsAsyncRecording()) {
         current_cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, writes);
         return;
@@ -614,19 +614,20 @@ void Scheduler::PushDescriptors(vk::PipelineBindPoint bind_point, vk::PipelineLa
 }
 
 void Scheduler::BeginRendering(const RenderState& new_state) {
-    if (is_rendering && render_state == new_state) {
+    if (Rc().is_rendering && Rc().render_state == new_state) {
         return;
     }
-    if (batch_timer && !is_rendering && last_end_site != ~0u && render_state == new_state) {
-        GpuBreakSites().Resumed(last_end_site);
+    if (batch_timer && !Rc().is_rendering && Rc().last_end_site != ~0u &&
+        Rc().render_state == new_state) {
+        GpuBreakSites().Resumed(Rc().last_end_site);
     }
     EndRendering();
-    is_rendering = true;
+    Rc().is_rendering = true;
     if (batch_timer) {
         GpuBreaks().render_begins.fetch_add(1, std::memory_order_relaxed);
-        last_end_site = ~0u;
+        Rc().last_end_site = ~0u;
     }
-    render_state = new_state;
+    Rc().render_state = new_state;
 
     Record([render_state = new_state](vk::CommandBuffer cmdbuf) {
         std::array<vk::RenderingAttachmentInfo, 8> color_attachments;
@@ -680,13 +681,13 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
 }
 
 void Scheduler::EndRendering(std::source_location loc) {
-    if (!is_rendering) {
+    if (!Rc().is_rendering) {
         return;
     }
-    is_rendering = false;
+    Rc().is_rendering = false;
     if (batch_timer) {
-        last_end_site = GpuBreakSites().Site(loc);
-        GpuBreakSites().End(last_end_site);
+        Rc().last_end_site = GpuBreakSites().Site(loc);
+        GpuBreakSites().End(Rc().last_end_site);
     }
     Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
 }
@@ -822,8 +823,8 @@ void Scheduler::AllocateWorkerCommandBuffers() {
         }
         current_cmdbuf = OpenLane().cmdbuf;
         GraphicsBindTracker::Invalidate();
-        dynamic_state.Invalidate();
-        native_heaps_bound = false;
+        Rc().dynamic_state.Invalidate();
+        Rc().native_heaps_bound = false;
         return;
     }
 
@@ -833,8 +834,8 @@ void Scheduler::AllocateWorkerCommandBuffers() {
     GraphicsBindTracker::Invalidate();
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
-    dynamic_state.Invalidate();
-    native_heaps_bound = false;
+    Rc().dynamic_state.Invalidate();
+    Rc().native_heaps_bound = false;
 
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();
@@ -886,11 +887,11 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
         std::scoped_lock lk{submit_mutex};
         ImGui::Core::TextureManager::Submit();
     }
-    const u32 draws = batch_draws;
-    const u32 dispatches = batch_dispatches;
-    batch_draws = 0;
-    batch_dispatches = 0;
-    batch_ops = 0;
+    const u32 draws = Rc().batch_draws;
+    const u32 dispatches = Rc().batch_dispatches;
+    Rc().batch_draws = 0;
+    Rc().batch_dispatches = 0;
+    Rc().batch_ops = 0;
     if (par_rec != 0) {
         // SHADPS4_PAR_REC: this batch's lane ends, submits (in batch order) and replaces its own
         // command buffer; the batch end routes everything recorded after it to the next lane.
@@ -899,8 +900,8 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
             SubmitLaneOnWorker(info, signal_value, batch);
         });
         recording_worker->Publish(true);
-        dynamic_state.Invalidate();
-        native_heaps_bound = false;
+        Rc().dynamic_state.Invalidate();
+        Rc().native_heaps_bound = false;
         master_semaphore.Refresh();
         PopPendingOperations();
         if (++rec_log_batches >= 16384) {
@@ -1026,8 +1027,8 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
     // would then wait for commands nobody records.
     recording_worker->Publish();
     // What AllocateWorkerCommandBuffers resets on this thread for a new command buffer.
-    dynamic_state.Invalidate();
-    native_heaps_bound = false;
+    Rc().dynamic_state.Invalidate();
+    Rc().native_heaps_bound = false;
     master_semaphore.Refresh();
     PopPendingOperations();
 }
@@ -1084,10 +1085,10 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     }
     const u64 signal_value = master_semaphore.NextTick();
     NoteAscAtFlush(signal_value);
-    last_batch_draws = batch_draws;
-    batch_draws = 0;
-    batch_dispatches = 0;
-    batch_ops = 0;
+    last_batch_draws = Rc().batch_draws;
+    Rc().batch_draws = 0;
+    Rc().batch_dispatches = 0;
+    Rc().batch_ops = 0;
 
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();
@@ -1250,10 +1251,10 @@ void Scheduler::SubmitExecutionLaneSync(SubmitInfo& info) {
     DrainRecording();
     const u64 signal_value = master_semaphore.NextTick();
     NoteAscAtFlush(signal_value);
-    last_batch_draws = batch_draws;
-    batch_draws = 0;
-    batch_dispatches = 0;
-    batch_ops = 0;
+    last_batch_draws = Rc().batch_draws;
+    Rc().batch_draws = 0;
+    Rc().batch_dispatches = 0;
+    Rc().batch_ops = 0;
     const u64 batch = recording_worker->ProducerBatch();
     ASSERT_MSG(rec_submitted.load(std::memory_order_acquire) == batch,
                "ParRec: synchronous submission of batch {} with {} submitted", batch,
@@ -1396,7 +1397,7 @@ void Scheduler::SwitchStream(u32 stream) {
         asc_wait_main = 0;
     }
     active_stream = stream;
-    native_heaps_bound = false;
+    Rc().native_heaps_bound = false;
     VideoCore::g_record_stream = stream;
     auto apply = [this, stream] {
         if (stream == 1 && !asc_cmdbuf) {
