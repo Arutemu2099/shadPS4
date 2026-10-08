@@ -11,6 +11,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <fmt/format.h>
@@ -186,6 +187,17 @@ struct WritePage {
 };
 std::mutex write_page_mutex;
 std::unordered_map<u64, WritePage> write_fault_pages;
+/// 2026-10-08 (zero-copy successor sizing, notes/zero-copy-build-2026-10-07.md sec. 5): per
+/// frame, the distinct 4 KB pages and 64 KB / 256 KB / 1 MB blocks write-faulted inside the
+/// per-frame heap span [0x248000000, 0x269e00000): what protecting at a coarser grain would
+/// leave (faults ~ blocks) and upload (blocks x size). Under write_page_mutex.
+struct SpanFrameBlocks {
+    u64 frame{~0ULL};
+    std::unordered_set<u64> sets[4]; // 4 KB pages, 64 KB, 256 KB, 1 MB blocks
+    u64 sums[4]{};
+    u64 frames{};
+};
+SpanFrameBlocks span_blocks;
 } // namespace
 
 void RecordWriteFaultPage(u64 addr) {
@@ -193,6 +205,22 @@ void RecordWriteFaultPage(u64 addr) {
     std::scoped_lock lk(write_page_mutex);
     auto& page = write_fault_pages[addr >> 12];
     ++page.faults;
+    if (span_blocks.frame != frame) {
+        if (span_blocks.frame != ~0ULL) {
+            for (int k = 0; k < 4; ++k) {
+                span_blocks.sums[k] += span_blocks.sets[k].size();
+                span_blocks.sets[k].clear();
+            }
+            ++span_blocks.frames;
+        }
+        span_blocks.frame = frame;
+    }
+    if (addr >= 0x248000000ULL && addr < 0x269e00000ULL) {
+        span_blocks.sets[0].insert(addr >> 12);
+        span_blocks.sets[1].insert(addr >> 16);
+        span_blocks.sets[2].insert(addr >> 18);
+        span_blocks.sets[3].insert(addr >> 20);
+    }
     if (page.last_frame != frame) {
         page.last_frame = frame;
         ++page.frames;
@@ -204,10 +232,18 @@ namespace {
 /// Summarise and reset the window. "hot" = faulted in at least 90% of the window's frames.
 std::string WriteFaultPageReport(u64 frames, u64 d_gfx, u64 d_asc) {
     std::vector<std::pair<u64, WritePage>> pages;
+    u64 sb_sums[4]{};
+    u64 sb_frames = 0;
     {
         std::scoped_lock lk(write_page_mutex);
         pages.assign(write_fault_pages.begin(), write_fault_pages.end());
         write_fault_pages.clear();
+        for (int k = 0; k < 4; ++k) {
+            sb_sums[k] = span_blocks.sums[k];
+            span_blocks.sums[k] = 0;
+        }
+        sb_frames = span_blocks.frames;
+        span_blocks.frames = 0;
     }
     if (frames == 0) {
         return "no frames";
@@ -263,6 +299,11 @@ std::string WriteFaultPageReport(u64 frames, u64 d_gfx, u64 d_asc) {
     std::vector<std::pair<u64, std::pair<u64, u64>>> by_region(regions.begin(), regions.end());
     std::sort(by_region.begin(), by_region.end(),
               [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+    const double sbf = static_cast<double>(std::max<u64>(sb_frames, 1));
+    out += fmt::format(" | span per frame: pages={:.1f} blocks64K={:.1f} blocks256K={:.1f} "
+                       "blocks1M={:.1f} (frames {})",
+                       sb_sums[0] / sbf, sb_sums[1] / sbf, sb_sums[2] / sbf, sb_sums[3] / sbf,
+                       sb_frames);
     out += fmt::format(" regions16M={} top_regions:", by_region.size());
     for (size_t i = 0; i < std::min<size_t>(8, by_region.size()); ++i) {
         out += fmt::format(" {:#x}:{}p/{:.0f}f", by_region[i].first << 24,
