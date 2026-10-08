@@ -167,6 +167,12 @@ static const bool g_mtb_break = [] {
     const char* value = std::getenv("SHADPS4_MTB_P1_BREAK");
     return value != nullptr && value[0] == '1';
 }();
+/// SHADPS4_MTB_P3=1 (with SHADPS4_MTB_P1=1; P3.0, notes/parrec-build-2026-10-08.md sec. 14d): the
+/// parked translation worker.
+static const bool g_mtb_p3 = [] {
+    const char* value = std::getenv("SHADPS4_MTB_P3");
+    return value != nullptr && value[0] == '1';
+}();
 
 void Liverpool::MtbBreakAtPacket(const PM4Header* header) {
     // The DMA_DATA to 0x3022C is skipped by ExecuteGfxPacket: not a sequence point.
@@ -1318,11 +1324,23 @@ void Liverpool::BackLoop(std::stop_token stoken) {
     // SHADPS4_MTB_P1 (P1d, notes/parrec-build-2026-10-08.md sec. 14): the translating context is
     // installed before the first record that can record a command (a rasterizer is bound).
     bool mtb_install = Vulkan::MtbP1Requested();
+    bool mtb_p3 = false;
     for (;;) {
         if (const auto* record = split->Next()) {
             if (mtb_install && rasterizer) [[unlikely]] {
                 mtb_install = false;
-                rasterizer->GetScheduler().InstallMtbContext();
+                // SHADPS4_MTB_P3 (P3.0, sec. 14d): the committer keeps the real tick; the
+                // parked translation worker reserves at each run.
+                const bool want_p3 = g_mtb_p3 && rasterizer->HasMtbWorker();
+                mtb_p3 = rasterizer->GetScheduler().InstallMtbContext(!want_p3) && want_p3;
+                if (mtb_p3) {
+                    mtb_thread = std::jthread{std::bind_front(&Liverpool::MtbWorkerLoop, this)};
+                    LOG_INFO(Render, "MtbP3: parked translation worker started");
+                }
+            }
+            if (mtb_p3 && MtbRunAhead(record)) {
+                ProcessCommands();
+                continue;
             }
             Common::SampleThreadPlacement("back", 8);
             ExecuteRecord(*record);
@@ -1374,7 +1392,112 @@ void Liverpool::BackLoop(std::stop_token stoken) {
             }
         }
     }
+    if (mtb_thread.joinable()) {
+        mtb_thread.request_stop();
+        mtb_thread.join();
+    }
+    if (rasterizer) {
+        rasterizer->GetScheduler().MtbBackExit();
+    }
     front_thread.join();
+}
+
+namespace {
+constexpr bool MtbRunRecord(CpSplit::RecordType type) {
+    return type == CpSplit::RecordType::Draw || type == CpSplit::RecordType::Dispatch ||
+           type == CpSplit::RecordType::RegWrite || type == CpSplit::RecordType::Extent ||
+           type == CpSplit::RecordType::ClearState;
+}
+constexpr size_t MtbMaxRun = 256;
+} // namespace
+
+bool Liverpool::MtbRunAhead(const CpSplit::RecordHeader* record) {
+    if (!MtbRunRecord(record->type) || num_commands.load(std::memory_order_relaxed) != 0) {
+        return false;
+    }
+    auto& h = mtb_handoff;
+    h.run.clear();
+    h.run.push_back(record);
+    u32 draws = record->type == CpSplit::RecordType::Draw ||
+                record->type == CpSplit::RecordType::Dispatch;
+    // Read ahead: every record from ReadPos() on stays valid until Done passes it.
+    u64 pos = split->ReadPos() + record->size;
+    while (h.run.size() < MtbMaxRun && num_commands.load(std::memory_order_relaxed) == 0) {
+        const auto* next = split->PeekAt(pos);
+        if (!next || !MtbRunRecord(next->type)) {
+            break;
+        }
+        draws += next->type == CpSplit::RecordType::Draw ||
+                 next->type == CpSplit::RecordType::Dispatch;
+        h.run.push_back(next);
+        pos += next->size;
+    }
+    if (draws == 0) {
+        return false; // register state only: cheaper on the back
+    }
+    h.state.store(1, std::memory_order_release);
+    h.state.notify_one();
+    for (u32 spins = 0; h.state.load(std::memory_order_acquire) != 2;) {
+        if (++spins < 4096) {
+            _mm_pause();
+        } else {
+            ++h.spin_yields;
+            std::this_thread::yield();
+        }
+    }
+    h.state.store(0, std::memory_order_relaxed);
+    for (const auto* r : h.run) {
+        const auto* executed = split->Next();
+        ASSERT_MSG(executed == r, "MtbP3: ring record order");
+        split->Done(executed);
+    }
+    ++h.runs;
+    h.records += h.run.size();
+    h.draws += draws;
+    if (++h.log_runs >= 65536) {
+        LOG_INFO(Render, "MtbP3: runs={} records_per_run={:.1f} draws_per_run={:.1f} back_yields={}",
+                 h.runs, double(h.records) / double(h.runs), double(h.draws) / double(h.runs),
+                 h.spin_yields);
+        h.log_runs = 0;
+    }
+    return true;
+}
+
+void Liverpool::MtbWorkerLoop(std::stop_token stoken) {
+    Common::SetCurrentThreadName("shadPS4:MtbWorker");
+    // As urgent as the back it stands in for (SHADPS4_CP_QOS keeps one P-core for the back).
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+    auto& h = mtb_handoff;
+    std::stop_callback wake{stoken, [&h] {
+        h.state.store(3, std::memory_order_release);
+        h.state.notify_one();
+    }};
+    auto& scheduler = rasterizer->GetScheduler();
+    scheduler.AttachMtbContext();
+    // The worker only runs while the back is parked on its run: it acts for the CP then.
+    Common::FaultMonitor::t_acting_cp = true;
+    for (;;) {
+        u32 state = h.state.load(std::memory_order_acquire);
+        for (u32 spins = 0; state != 1 && state != 3;) {
+            if (++spins < 16384) {
+                _mm_pause();
+            } else if (spins < 16384 + 2048) {
+                std::this_thread::yield();
+            } else {
+                h.state.wait(state, std::memory_order_acquire);
+                spins = 0;
+            }
+            state = h.state.load(std::memory_order_acquire);
+        }
+        if (state == 3) {
+            break;
+        }
+        scheduler.ReserveTickForRun();
+        for (const auto* r : h.run) {
+            ExecuteRecordImpl(*r);
+        }
+        h.state.store(2, std::memory_order_release);
+    }
 }
 
 namespace {

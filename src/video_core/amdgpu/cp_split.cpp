@@ -499,6 +499,22 @@ const RecordHeader* Channel::Next() {
     }
 }
 
+const RecordHeader* Channel::PeekAt(u64& pos) {
+    for (;;) {
+        if (pos == cached_write) {
+            cached_write = write_pos.load(std::memory_order_acquire);
+            if (pos == cached_write) {
+                return nullptr;
+            }
+        }
+        const auto* header = reinterpret_cast<const RecordHeader*>(storage + (pos & mask));
+        if (header->type != RecordType::Wrap) {
+            return header;
+        }
+        pos += header->size;
+    }
+}
+
 void Channel::Done(const RecordHeader* record) {
     const u64 seq = record->seq;
     read += record->size;

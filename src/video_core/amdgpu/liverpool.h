@@ -16,6 +16,7 @@
 #include <deque>
 
 #include "common/assert.h"
+#include "common/fault_monitor.h"
 #include "common/slot_vector.h"
 #include "common/types.h"
 #include "common/unique_function.h"
@@ -126,14 +127,15 @@ public:
 
     /// True on the command processor thread, where SendCommand runs its callback inline.
     bool IsGpuThread() const {
-        return std::this_thread::get_id() == gpu_id;
+        // SHADPS4_MTB_P3: the parked-mode translation worker acts for the back during a run.
+        return std::this_thread::get_id() == gpu_id || Common::FaultMonitor::t_acting_cp;
     }
 
     /// Runs `func` on the CP thread. With SHADPS4_CP_SPLIT that is the back thread, which owns
     /// the caches and the scheduler; it runs queued commands between records and while idle.
     template <bool wait_done = false>
     void SendCommand(auto&& func) {
-        if (std::this_thread::get_id() == gpu_id) {
+        if (IsGpuThread()) { // incl. the SHADPS4_MTB_P3 worker while the back is parked on it
             return func();
         }
         if constexpr (wait_done) {
@@ -465,6 +467,20 @@ private:
     std::unique_ptr<CpSplit::Channel> split;
     std::unique_ptr<CpSplit::BackMirror> mirror;
     std::jthread front_thread{}; ///< Started and joined by the back (process_thread).
+    /// SHADPS4_MTB_P3=1 (multi-threaded back P3.0, notes/parrec-build-2026-10-08.md sec. 14d):
+    /// a translation thread runs runs of Draw / Dispatch / RegWrite / Extent / ClearState records
+    /// while the back is parked on it (one hand-off per run).
+    struct MtbHandoff {
+        std::atomic<u32> state{0}; ///< 0 idle, 1 posted, 2 done, 3 stop
+        std::vector<const CpSplit::RecordHeader*> run;
+        u64 runs{0}, records{0}, draws{0}, log_runs{0}, spin_yields{0};
+    };
+    MtbHandoff mtb_handoff;
+    std::jthread mtb_thread{};
+    void MtbWorkerLoop(std::stop_token stoken);
+    /// Back: collects the run starting at `record` (read-ahead), runs it on the worker, releases
+    /// its records. Returns false when `record` does not start a run.
+    bool MtbRunAhead(const CpSplit::RecordHeader* record);
     // What the Back* accessors read: the front's own state when the split is off.
     const Regs* back_regs{&regs};
     const CbDbExtent* back_cb_extent{last_cb_extent.data()};

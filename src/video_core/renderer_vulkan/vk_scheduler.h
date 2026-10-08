@@ -544,7 +544,16 @@ public:
     /// SHADPS4_MTB_P1: installs the translating context on the calling thread (the back), once:
     /// submits what was recorded so far, then every later command of this thread goes through
     /// the context's sink (P1d, serial). False when the mode is off.
-    bool InstallMtbContext();
+    bool InstallMtbContext(bool reserve_tick = true);
+    /// SHADPS4_MTB_P3 (parked translation worker): the calling thread shares the installed
+    /// context (it records only while the installing thread is parked on it). False if none.
+    bool AttachMtbContext();
+    /// SHADPS4_MTB_P1: the back is leaving its loop - end its pass and publish its sink.
+    void MtbBackExit();
+    /// SHADPS4_MTB_P3: a translating thread reserves the open batch's tick for its next run.
+    void ReserveTickForRun() noexcept {
+        master_semaphore.Reserve(master_semaphore.CurrentTickRaw());
+    }
     /// SHADPS4_MTB_P1_BREAK (pricing option b): a render pass ended before a packet.
     void NoteMtbBreak() noexcept {
         ++mtb_breaks;
@@ -1112,6 +1121,10 @@ private:
     u64 mtb_batches = 0;
     u64 mtb_log_batches = 0;
     void LogMtbP1();
+    /// The calling thread's translating sink (null without one).
+    RecordSink* ActiveSink() noexcept {
+        return record_ctx_installed ? Rc().sink : nullptr;
+    }
     /// Committer: hands the translating context's unpublished commands to the recorder, before
     /// anything this thread records outside the sink (submission lambda, borrow, drain).
     void PublishActiveSink() {

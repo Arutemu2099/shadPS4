@@ -433,6 +433,14 @@ public:
 
     /// The next published record, or null. Stays valid until Done(it).
     const RecordHeader* Next();
+    /// SHADPS4_MTB_P3: the ring position of the record Next() returned (unmasked).
+    [[nodiscard]] u64 ReadPos() const noexcept {
+        return read;
+    }
+    /// SHADPS4_MTB_P3 read-ahead: the published record at ring position `pos` (>= ReadPos(),
+    /// Wrap records skipped and `pos` moved past them), or null when the front has not published
+    /// it yet. Releases nothing: every record from ReadPos() on stays valid until Done passes it.
+    const RecordHeader* PeekAt(u64& pos);
     /// Releases the record returned by Next() and reports it executed.
     void Done(const RecordHeader* record);
     /// Returns when a record is published, `num_commands` is non-zero, `stoken` is stopped or the

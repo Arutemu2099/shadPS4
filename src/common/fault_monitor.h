@@ -87,6 +87,10 @@ inline thread_local bool t_is_cp_thread = false;
 inline void MarkCpThread() {
     t_is_cp_thread = true;
 }
+/// SHADPS4_MTB_P3 (parked translation worker): set on the worker while the back is parked on
+/// its run - its own faults are the command stream's (CpWriteFault, handled inline like the
+/// CP's), while the CP-only fast paths keyed on t_is_cp_thread stay off on it.
+inline thread_local bool t_acting_cp = false;
 
 /**
  * Fragmentation of `BufferCache::gpu_modified_ranges`.

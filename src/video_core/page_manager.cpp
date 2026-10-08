@@ -387,8 +387,9 @@ struct PageManager::Impl {
             // only guest threads' faults may be deferred (submit_epoch.h).
             const bool handled = rasterizer->InvalidateMemory(
                 addr, 8,
-                Common::FaultMonitor::t_is_cp_thread ? VideoCore::InvalidateOrigin::CpWriteFault
-                                                     : VideoCore::InvalidateOrigin::GuestWriteFault);
+                Common::FaultMonitor::t_is_cp_thread || Common::FaultMonitor::t_acting_cp
+                    ? VideoCore::InvalidateOrigin::CpWriteFault
+                    : VideoCore::InvalidateOrigin::GuestWriteFault);
             Common::ReadbackOffload::t_read_fault_rip = 0;
             Common::FaultMonitor::CountGuestWriteFault(handled,
                                                        Common::FaultMonitor::SinceNs(start));

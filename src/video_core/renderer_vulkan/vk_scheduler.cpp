@@ -105,14 +105,17 @@ Scheduler::Scheduler(const Instance& instance, bool allow_recording_worker)
             // P1d (notes/parrec-build-2026-10-08.md sec. 14): the back installs its translating
             // context later (InstallMtbContext); these gates are fixed before any other thread
             // reads them.
-            if (async_submit) {
+            // The ASC stream records stream switches and segment submissions straight into
+            // the worker (Opus review 10-08 night): they would overtake the sink.
+            if (async_submit && !instance.HasAscQueue()) {
                 g_mtb_p1 = true;
                 record_ctx_installed = true;
                 MasterSemaphore::reservations_enabled = true;
                 LOG_INFO(Render_Vulkan, "MtbP1: on (worker rasterizer, record sink, reserved tick "
                                         "on the back; serial)");
             } else {
-                LOG_WARNING(Render_Vulkan, "MtbP1: off because SHADPS4_ASYNC_SUBMIT is off");
+                LOG_WARNING(Render_Vulkan, "MtbP1: off because {}",
+                            async_submit ? "the ASC stream is on" : "SHADPS4_ASYNC_SUBMIT is off");
             }
         }
         if (async_submit) {
@@ -262,7 +265,7 @@ void Scheduler::DrainRecording() {
     }
 }
 
-bool Scheduler::InstallMtbContext() {
+bool Scheduler::InstallMtbContext(const bool reserve_tick) {
     if (!g_mtb_p1 || !recording_worker) {
         return false;
     }
@@ -283,9 +286,32 @@ bool Scheduler::InstallMtbContext() {
     mtb->rc.dynamic_state.Invalidate();
     mtb->rc.native_heaps_bound = false;
     t_record_ctx = &mtb->rc;
-    master_semaphore.Reserve(master_semaphore.CurrentTickRaw());
-    LOG_INFO(Render_Vulkan, "MtbP1: translating context installed at tick {}",
-             master_semaphore.CurrentTickRaw());
+    // P1d: the back translates and reserves; P3: the committer carries the real tick and only a
+    // translating worker reserves (at each run).
+    if (reserve_tick) {
+        master_semaphore.Reserve(master_semaphore.CurrentTickRaw());
+    }
+    LOG_INFO(Render_Vulkan, "MtbP1: translating context installed at tick {} (reserved: {})",
+             master_semaphore.CurrentTickRaw(), reserve_tick);
+    return true;
+}
+
+void Scheduler::MtbBackExit() {
+    if (!mtb || t_record_ctx != &mtb->rc) {
+        return;
+    }
+    // Shutdown runs on other threads through rc_main: close the back's pass and hand over the
+    // sink's tail here (Opus review 10-08 night).
+    EndRendering();
+    PublishActiveSink();
+    recording_worker->Publish();
+}
+
+bool Scheduler::AttachMtbContext() {
+    if (!mtb) {
+        return false;
+    }
+    t_record_ctx = &mtb->rc;
     return true;
 }
 
@@ -294,11 +320,14 @@ void Scheduler::MtbTickAdvanced(const u64 signal_value) {
     if (!ctx || ctx->owner != this) {
         return;
     }
-    // The batch just submitted was translated with the tick its NextTick returned.
-    if (master_semaphore.ReservedTick() != signal_value) {
-        ++mtb_res_mismatch;
+    // The batch just submitted was translated with the tick its NextTick returned (checked and
+    // moved on the thread that holds a reservation: the translating one).
+    if (const u64 reserved = master_semaphore.ReservedTick(); reserved != 0) {
+        if (reserved != signal_value) {
+            ++mtb_res_mismatch;
+        }
+        master_semaphore.Reserve(master_semaphore.CurrentTickRaw());
     }
-    master_semaphore.Reserve(master_semaphore.CurrentTickRaw());
     ctx->sink->MarkBoundary(); // the submission was recorded outside the sink
     ++mtb_batches;
     if (++mtb_log_batches >= 16384) {
@@ -922,8 +951,11 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
     // worker for submits/borrows and ~1.6% inside vkQueueSubmit.
     Common::FaultMonitor::CountGpuSubmit();
     EndRendering();
-    // P1d: the batch's translated commands (incl. that EndRendering) precede its submission.
-    PublishActiveSink();
+    // P1d: the batch's translated commands (incl. that EndRendering) precede its submission. With
+    // lanes the submission itself goes into the sink below (one chunk run per batch).
+    if (par_rec == 0) {
+        PublishActiveSink();
+    }
     if (asc_enabled) {
         // I1: the ASC work recorded before this batch is submitted first and waited on.
         SubmitAscSegment();
@@ -966,9 +998,17 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
         // SHADPS4_PAR_REC: this batch's lane ends, submits (in batch order) and replaces its own
         // command buffer; the batch end routes everything recorded after it to the next lane.
         const u64 batch = recording_worker->ProducerBatch();
-        recording_worker->Record([this, info, signal_value, batch] {
+        auto submit = [this, info, signal_value, batch] {
             SubmitLaneOnWorker(info, signal_value, batch);
-        });
+        };
+        if (RecordSink* const sink = ActiveSink()) [[unlikely]] {
+            // P1d: the submission closes the batch's own sink chunks, so a batch does not cost
+            // the lanes an extra producer chunk (s264 m1: +50% chunks per lane).
+            sink->Record(std::move(submit));
+            recording_worker->PublishSink(*sink);
+        } else {
+            recording_worker->Record(std::move(submit));
+        }
         recording_worker->Publish(true);
         Rc().dynamic_state.Invalidate();
         Rc().native_heaps_bound = false;
