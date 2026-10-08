@@ -16,6 +16,7 @@
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 namespace Serialization {
@@ -209,6 +210,26 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
     if (meta_blob.empty()) {
         return false;
     }
+    // SHADPS4_PRECOMPILE fix A: a guessed (marked) meta loads after every unmarked one. The
+    // version word written first by RegisterShaderMeta carries the marker.
+    if (defer_marked_compute && meta_blob.size() >= sizeof(u32)) {
+        u32 meta_version{};
+        std::memcpy(&meta_version, meta_blob.data(), sizeof(meta_version));
+        if ((meta_version & Serialization::PrecompiledMetaBit) != 0) {
+            defer_marked_compute->push_back({compute_key, std::move(sdata), std::move(meta_blob)});
+            return true; // counted as loaded; WarmUp corrects the count if it fails later
+        }
+    }
+    return BuildComputePipeline(compute_key, sdata, std::move(meta_blob));
+}
+
+bool PipelineCache::BuildComputePipeline(const ComputePipelineKey& key,
+                                         ComputePipeline::SerializationSupport& sdata,
+                                         std::vector<u8>&& meta_blob) {
+    infos.fill(nullptr);
+    modules.fill(nullptr);
+    fetch_shader.reset();
+    compute_key = key;
 
     Serialization::Archive meta_ar{std::move(meta_blob)};
 
@@ -360,8 +381,14 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     if (!LoadShaderMeta(ar, program->info, loaded_fetch, spec, perm_idx, &marked)) {
         return false;
     }
+    if (marked && precompile_retired.contains(program->info.pgm_hash)) {
+        // Fix A: a guess left over from a program retired after a live miss in an earlier launch.
+        ++retired_metas_skipped;
+        return false;
+    }
     // SHADPS4_PRECOMPILE (Fable review 2026-10-07 finding 5): keep the marker across launches, so
-    // the first live dispatch still reports PrecompiledUse (diagnostic only).
+    // the first live dispatch still reports PrecompiledUse and a MISS still retires the program.
+    // A program counts as precompiled only while every loaded permutation is (fix A, below).
     program->precompiled = marked;
     // Preserve loader scratch state on later failure; on success use the module's
     // immutable owner below. Serialized values and cache format stay unchanged.
@@ -414,6 +441,11 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
             }
             module = CompileSPV(spv, instance.GetDevice());
         }
+        // Fix A: one live (unmarked) permutation makes the program a live one: no PrecompiledUse
+        // line and no retire on its first dispatch. Set only for a permutation actually inserted;
+        // a live meta skipped above for its layout leaves a guessed program to retire at its
+        // first miss.
+        it_pgm.value()->precompiled = it_pgm.value()->precompiled && marked;
     }
     it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx);
     fetch_shader = it_pgm.value()->modules[perm_idx].fetch_shader;
@@ -486,6 +518,11 @@ void PipelineCache::WarmUp() {
     if (ParallelWarmUpEnabled()) {
         g_preload_jobs = &preload_jobs;
     }
+    // SHADPS4_PRECOMPILE fix A (any build of this branch, whatever the flag: the cache may hold
+    // marked metas from an earlier PRECOMPILE launch).
+    precompile_retired = ReadPrecompileHashes(PrecompileRetiredFile);
+    std::vector<DeferredComputeLoad> deferred_marked;
+    defer_marked_compute = &deferred_marked;
     Storage::DataBase::Instance().ForEachBlob(
         Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
             ++num_total_pipelines;
@@ -513,6 +550,21 @@ void PipelineCache::WarmUp() {
                 ++num_pipelines;
             }
         });
+    defer_marked_compute = nullptr;
+    // Fix A: guessed permutations after every live one (counted as loaded above).
+    u32 deferred_failed = 0;
+    for (auto& load : deferred_marked) {
+        if (!BuildComputePipeline(load.key, load.sdata, std::move(load.meta))) {
+            --num_pipelines;
+            ++deferred_failed;
+        }
+    }
+    if (!deferred_marked.empty() || !precompile_retired.empty()) {
+        LOG_INFO(Render, "WarmUp: precompiled compute pipelines loaded last {} (not loaded {}), "
+                         "retired programs {} (their guessed metas skipped {})",
+                 deferred_marked.size(), deferred_failed, precompile_retired.size(),
+                 retired_metas_skipped);
+    }
     g_preload_jobs = nullptr;
 
     if (!preload_jobs.empty()) {

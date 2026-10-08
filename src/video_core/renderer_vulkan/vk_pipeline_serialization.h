@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <string_view>
+#include <unordered_set>
+
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -23,6 +26,12 @@ void RegisterShaderMeta(const Shader::Info& info,
 void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx);
 // SHADPS4_PRECOMPILE: the game's first dispatch of a pre-compiled program, matched or not.
 void NotePrecompiledUse(const Program& program, const Shader::StageSpecialization& live, bool hit);
+// SHADPS4_PRECOMPILE sidecars in the cache folder (vk_pipeline_precompile.cpp): one program hash
+// per line, hex. Written synchronously (flushed), so a crash right after keeps the line.
+// retired: programs retired after a live miss (fix A); their guessed metas are never loaded.
+inline constexpr std::string_view PrecompileRetiredFile = "precompile-retired.txt";
+std::unordered_set<u64> ReadPrecompileHashes(std::string_view file_name);
+void AppendPrecompileHash(std::string_view file_name, u64 hash);
 // `precompiled` (optional): set when the meta carries the SHADPS4_PRECOMPILE marker.
 bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
                     std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,

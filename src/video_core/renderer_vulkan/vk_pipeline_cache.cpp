@@ -299,7 +299,8 @@ double MsSince(CompileClock::time_point start) {
 
 // SHADPS4_ASYNC_PIPELINES: one graphics pipeline construction, owned end to end. The compiler
 // thread reads only copies, plus two kinds of handle to objects the cache never destroys while a
-// job can exist: `infos` point into program_cache's Programs (unique_ptr, never erased; the
+// job can exist: `infos` point into program_cache's Programs (unique_ptr, never destroyed:
+// RetirePrecompiled erases compute Programs from the map but parks them in retired_programs; the
 // constructor dereferences them only for the immutable stage/pgm_hash of its debug name, every
 // per-draw field was read by DeriveStageInputs on the lookup thread) and `modules`, which only
 // ReplaceShader destroys, after WaitIdle.
@@ -1419,12 +1420,14 @@ void PipelineCache::RetirePrecompiled(u64 hash) {
     if (it == program_cache.end()) {
         return;
     }
-    size_t pipelines = 0;
+    size_t pipelines = 0, cancelled = 0;
     const size_t perms = it.value()->modules.size();
     for (size_t perm = 0; perm < perms; ++perm) {
         // A compute pipeline's key is its permutation hash (RefreshComputeKey).
         const auto pit = compute_pipelines.find(ComputePipelineKey{HashCombine(hash, perm)});
         if (pit != compute_pipelines.end()) {
+            // Fix B: never used again, so a still-queued pool compile of it is dropped.
+            cancelled += pit.value()->CancelDeferred() ? 1 : 0;
             retired_pipelines.push_back(std::move(pit.value()));
             compute_pipelines.erase(pit);
             ++pipelines;
@@ -1432,10 +1435,14 @@ void PipelineCache::RetirePrecompiled(u64 hash) {
     }
     retired_programs.push_back(std::move(it.value()));
     program_cache.erase(hash);
+    // Fix A: later launches skip this program's guessed metas (the live rebuild overwrites only
+    // the permutation indices it reaches).
+    precompile_retired.insert(hash);
+    AppendPrecompileHash(PrecompileRetiredFile, hash);
     LOG_INFO(Render_Vulkan,
-             "PrecompiledUse: cs_{:#x} retired after a live miss ({} permutations, {} pipelines; "
-             "retired so far {})",
-             hash, perms, pipelines, retired_programs.size());
+             "PrecompiledUse: cs_{:#x} retired after a live miss ({} permutations, {} pipelines, "
+             "{} queued compiles dropped; retired so far {})",
+             hash, perms, pipelines, cancelled, retired_programs.size());
 }
 
 PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stage,
@@ -1566,7 +1573,12 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         binding = bind_start;
         info.AddBindings(binding);
 
-        RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
+        // SHADPS4_PRECOMPILE (Opus review 2026-10-07 finding 3): the meta stores the program's
+        // shared Info; while that Info is a guess (a precompiled program that matched its first
+        // dispatch), the new permutation is saved marked too, so a later launch neither creates
+        // the program from it as a live one nor learns from the guessed Info.
+        RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx,
+                           program->precompiled);
         program->AddPermut(module, std::move(spec));
         lookup_translate_ms += MsSince(t_translate);
     } else {

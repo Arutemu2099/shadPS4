@@ -30,12 +30,18 @@ struct BufferSpecialization {
     u32 num_format : 4;
     u32 index_stride : 2;
     u32 element_size : 2;
+    // The V#'s add_tid_enable changes the address math (CalculateBufferAddress adds the lane id
+    // to the index). Keyed since 2026-10-07 (SHADPS4_PRECOMPILE review finding 3) in the spare
+    // bit, so the struct (serialized raw in the shader meta) keeps its size; every older meta has
+    // it 0 (value-initialized), as had every cached sharp counted (0 of 4,371).
+    u32 add_tid_enable : 1;
     AmdGpu::CompMapping dst_select{};
     AmdGpu::NumberConversion num_conversion{};
 
     bool operator==(const BufferSpecialization& other) const {
         return stride == other.stride && is_storage == other.is_storage &&
                is_formatted == other.is_formatted && swizzle_enable == other.swizzle_enable &&
+               add_tid_enable == other.add_tid_enable &&
                (!is_formatted ||
                 (data_format == other.data_format && num_format == other.num_format &&
                  dst_select == other.dst_select && num_conversion == other.num_conversion)) &&
@@ -43,6 +49,8 @@ struct BufferSpecialization {
                 (index_stride == other.index_stride && element_size == other.element_size));
     }
 };
+// Serialized raw in every shader meta: a size change would invalidate the whole cache.
+static_assert(sizeof(BufferSpecialization) == 12);
 
 struct ImageSpecialization {
     AmdGpu::ImageType type = AmdGpu::ImageType::Color2D;
@@ -124,6 +132,7 @@ struct StageSpecialization {
                          spec.is_storage = desc.IsStorage(sharp);
                          spec.is_formatted = desc.is_formatted;
                          spec.swizzle_enable = sharp.swizzle_enable;
+                         spec.add_tid_enable = sharp.add_tid_enable;
                          if (spec.is_formatted) {
                              spec.data_format = static_cast<u32>(sharp.GetDataFmt());
                              spec.num_format = static_cast<u32>(sharp.GetNumberFmt());

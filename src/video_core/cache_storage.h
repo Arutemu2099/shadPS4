@@ -8,6 +8,7 @@
 #include "common/types.h"
 
 #include <functional>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -34,6 +35,9 @@ public:
     void FinishPreload();
     // SHADPS4_CACHE_PREFETCH=1: read every cache file once on several threads (folder mode).
     void Prefetch();
+    // SHADPS4_PRECOMPILE's sidecar files (plain text, written synchronously so a crash keeps
+    // them) live in the cache folder; empty in archive mode or before Open.
+    [[nodiscard]] std::filesystem::path SidecarPath(std::string_view file_name) const;
 
     bool Save(BlobType type, const std::string& name, std::vector<u8>&& data);
     bool Save(BlobType type, const std::string& name, std::vector<u32>&& data);

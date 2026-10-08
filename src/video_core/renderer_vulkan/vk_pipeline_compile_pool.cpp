@@ -256,6 +256,15 @@ bool DeferredPipeline::TryRun(bool by_waiter) {
     return true;
 }
 
+bool DeferredPipeline::TryCancel() {
+    u32 expected = Queued;
+    if (!state.compare_exchange_strong(expected, Done, std::memory_order_acq_rel)) {
+        return false;
+    }
+    state.notify_all();
+    return true;
+}
+
 void DeferredPipeline::Wait() {
     if (IsDone()) {
         return;

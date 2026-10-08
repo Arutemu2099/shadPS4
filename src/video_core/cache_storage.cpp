@@ -324,6 +324,13 @@ void DataBase::Prefetch() {
                  .count());
 }
 
+std::filesystem::path DataBase::SidecarPath(std::string_view file_name) const {
+    if (!opened || EmulatorSettings.IsPipelineCacheArchived()) {
+        return {};
+    }
+    return cache_path / file_name;
+}
+
 void DataBase::FinishPreload() {
     if (EmulatorSettings.IsPipelineCacheArchived()) {
         mz_zip_writer_init_from_reader(&zip_ar, cache_path.string().c_str());

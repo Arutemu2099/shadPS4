@@ -56,6 +56,10 @@ public:
         }
     }
 
+    /// SHADPS4_PRECOMPILE (fix B): drop a still-queued deferred compile of a pipeline that will
+    /// never be used again (RetirePrecompiled). True if a queued compile was dropped.
+    bool CancelDeferred() noexcept;
+
     vk::PipelineLayout GetLayout() const noexcept {
         return *pipeline_layout;
     }

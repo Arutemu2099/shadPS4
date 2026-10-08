@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <unordered_set>
 #include <variant>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/prepared_specialization.h"
@@ -112,6 +113,10 @@ public:
     void Sync();
 
     bool LoadComputePipeline(Serialization::Archive& ar);
+    // The second half of LoadComputePipeline (WarmUp runs it later for precompiled metas).
+    bool BuildComputePipeline(const ComputePipelineKey& key,
+                              ComputePipeline::SerializationSupport& sdata,
+                              std::vector<u8>&& meta_blob);
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
     bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
 
@@ -213,6 +218,19 @@ private:
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     std::vector<std::unique_ptr<Program>> retired_programs;          ///< RetirePrecompiled
     std::vector<std::unique_ptr<ComputePipeline>> retired_pipelines; ///< RetirePrecompiled
+    // SHADPS4_PRECOMPILE, Opus review 2026-10-07 fix A. A retire leaves the guessed (marked)
+    // metas of the program's higher permutation indices in the cache next to the live rebuild's.
+    // Programs retired in any earlier launch (sidecar precompile-retired.txt, read by WarmUp):
+    // their marked metas are not loaded. All other marked compute metas load after the unmarked
+    // ones (deferred), so a live meta, never a guessed one, creates a program's shared Info.
+    std::unordered_set<u64> precompile_retired;
+    struct DeferredComputeLoad {
+        ComputePipelineKey key{};
+        ComputePipeline::SerializationSupport sdata{};
+        std::vector<u8> meta;
+    };
+    std::vector<DeferredComputeLoad>* defer_marked_compute{}; ///< set only during WarmUp's pass
+    u32 retired_metas_skipped{};
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
     std::array<const Shader::Info*, MaxShaderStages> infos{};

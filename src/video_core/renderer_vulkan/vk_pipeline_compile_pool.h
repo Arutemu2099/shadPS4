@@ -50,6 +50,12 @@ struct DeferredPipeline {
     bool TryRun(bool by_waiter);
     /// Returns once Done: runs the compile if it is still queued, else waits for its runner.
     void Wait();
+    /// SHADPS4_PRECOMPILE (Opus review 2026-10-07, fix B): Queued -> Done without compiling, for
+    /// a pipeline that will never be used (RetirePrecompiled). `out` stays empty, so the owner
+    /// must never call Handle() afterwards. False if a worker or waiter already took it (that
+    /// compile then finishes into the parked pipeline, harmless). Queues keep the raw pointer;
+    /// a worker that pops it finds it taken.
+    bool TryCancel();
     [[nodiscard]] bool IsDone() const noexcept {
         return state.load(std::memory_order_acquire) == Done;
     }

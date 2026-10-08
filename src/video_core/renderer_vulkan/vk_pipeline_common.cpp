@@ -43,6 +43,10 @@ void Pipeline::WaitDeferred() const noexcept {
     deferred->Wait();
 }
 
+bool Pipeline::CancelDeferred() noexcept {
+    return deferred && deferred->TryCancel();
+}
+
 void Pipeline::PromoteDeferredSlow() const noexcept {
     if (deferred->preload && !deferred->IsDone()) {
         PipelineCompilePool::Promote(deferred.get());
