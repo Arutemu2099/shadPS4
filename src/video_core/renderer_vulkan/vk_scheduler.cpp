@@ -65,6 +65,7 @@ Scheduler::Scheduler(const Instance& instance, bool allow_recording_worker)
                 par_rec = 0;
             }
         }
+        g_par_rec_lanes = par_rec;
         for (u32 i = 0; i < par_rec; ++i) {
             rec_lanes[i].pool = std::make_unique<CommandPool>(instance, &master_semaphore);
         }

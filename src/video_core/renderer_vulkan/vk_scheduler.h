@@ -380,6 +380,9 @@ inline u32 ParRecRequested() {
     }();
     return lanes;
 }
+/// Lanes the draw scheduler actually runs (0 = the ordered worker), written once by its
+/// constructor (after the fallbacks) before any draw.
+inline u32 g_par_rec_lanes = 0;
 
 /// SHADPS4_SKIP_REBIND=1: the draw paths skip vkCmdBindPipeline(graphics) when the same pipeline
 /// is already bound in the same command buffer. Updated in recording order (the recording worker,
@@ -391,7 +394,7 @@ struct GraphicsBindTracker {
     static bool Enabled() {
         static const bool enabled = [] {
             const char* value = std::getenv("SHADPS4_SKIP_REBIND");
-            return value != nullptr && value[0] == '1' && ParRecRequested() < 2;
+            return value != nullptr && value[0] == '1' && g_par_rec_lanes < 2;
         }();
         return enabled;
     }
