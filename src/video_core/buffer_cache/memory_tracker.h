@@ -192,9 +192,10 @@ public:
         if (block_bytes != 0) {
             // An aligned power-of-two block <= 4 MB lies inside one region manager.
             const VAddr block = Common::AlignDown(cpu_addr, block_bytes);
-            RegionManager* manager = top_tier[block >> TRACKER_HIGHER_PAGE_BITS];
-            if (manager && block_bytes <= TRACKER_HIGHER_PAGE_SIZE &&
-                cpu_addr + size <= block + block_bytes) {
+            RegionManager* manager = block_bytes <= TRACKER_HIGHER_PAGE_SIZE
+                                         ? top_tier[block >> TRACKER_HIGHER_PAGE_BITS]
+                                         : nullptr;
+            if (manager && cpu_addr + size <= block + block_bytes) {
                 if (g_fault_watch_outside && from_guest_fault) {
                     g_deferred_watch = &deferred_watches;
                 }

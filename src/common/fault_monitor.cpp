@@ -972,7 +972,7 @@ void ReportLoop() {
                 const double f = static_cast<double>(d_frames);
                 LOG_INFO(Render,
                          "HeapWriteBlock: t={:.0f}s widened/frame={:.1f} kept_single/frame={:.1f} "
-                         "settles/frame={:.2f} settle_ms/frame={:.3f} settle_pct_of_wall={:.2f}% "
+                         "settles/frame={:.2f} settle_ms/frame={:.3f} settle_thread_ms_pct_of_wall={:.2f}% "
                          "write_faults/frame={:.1f} (totals widened={} kept={} settles={})",
                          elapsed, (w - prev_w) / f, (k - prev_k) / f, (sn - prev_s) / f,
                          (sns - prev_sns) / f / 1e6,

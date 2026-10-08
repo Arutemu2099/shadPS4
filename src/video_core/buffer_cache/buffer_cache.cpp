@@ -767,7 +767,7 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, InvalidateOrigin
         HeapBlock c{};
         const char* value = std::getenv("SHADPS4_HEAP_WRITE_BLOCK");
         const u64 bytes = value ? std::strtoull(value, nullptr, 0) : 0;
-        c.bytes = bytes >= 8192 && std::has_single_bit(bytes) ? bytes : 0;
+        c.bytes = bytes >= 8192 && bytes <= (4ULL << 20) && std::has_single_bit(bytes) ? bytes : 0;
         if (const char* range = std::getenv("SHADPS4_HEAP_WRITE_RANGE")) {
             char* end = nullptr;
             const VAddr lo = std::strtoull(range, &end, 16);
