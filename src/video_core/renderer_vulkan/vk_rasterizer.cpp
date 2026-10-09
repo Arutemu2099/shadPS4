@@ -282,8 +282,15 @@ const bool g_static_key_census = [] {
 }();
 constexpr VAddr HeapLo = 0x248000000ULL;
 constexpr VAddr HeapHi = 0x24c000000ULL;
+struct StaticKeyRec {
+    u64 frame = 0;
+    u64 clock = 0; // granule clock when stored (before this draw's resolution)
+    u64 img_epoch = 0, tex_gen = 0, smp_gen = 0, buf_gen = 0;
+};
 struct StaticKeyCensus {
-    std::unordered_map<u64, u64> seen; // key hash -> frame last seen
+    std::unordered_map<u64, StaticKeyRec> seen; // key hash -> last occurrence
+    std::vector<std::pair<VAddr, VAddr>> ranges; // this draw's static buffer ranges
+    u64 hit_buf_ok = 0, hit_img_ok = 0, hit_both_ok = 0, big_bindings = 0, hit_textured_ok = 0;
     std::unordered_set<u32> heap_ids;  // heap buffer ids this window
     u64 frame = 0;
     u64 draws = 0, textured = 0, hit = 0, hit_textured = 0, hit_same_frame = 0;
@@ -5049,6 +5056,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         u64 h = 0xcbf29ce484222325ULL;
         h = KeyMix(h, &pipeline, sizeof(pipeline));
         bool textured = false;
+        c.ranges.clear();
+        bool big = false;
         for (const auto& bound : BoundStages(pipeline)) {
             const auto* stage = bound.info;
             if (!stage) {
@@ -5061,6 +5070,13 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
                     ++c.heap_bindings;
                 } else if (!desc.IsSpecial()) {
                     ++c.static_bindings;
+                    const u64 sz = vsharp.GetSize();
+                    if (sz > (u64{64} << 20)) {
+                        big = true;
+                        ++c.big_bindings;
+                    } else if (vsharp.base_address != 0 && sz != 0) {
+                        c.ranges.emplace_back(vsharp.base_address, vsharp.base_address + sz);
+                    }
                 }
                 h = KeyMix(h, &vsharp, sizeof(vsharp));
             }
@@ -5076,17 +5092,37 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         }
         ++c.draws;
         c.textured += textured;
-        const auto [it, inserted] = c.seen.try_emplace(h, frame);
+        StaticKeyRec now{};
+        now.frame = frame;
+        now.clock = VideoCore::g_granule_clock.load(std::memory_order_acquire);
+        now.img_epoch = VideoCore::g_image_epoch.load(std::memory_order_acquire);
+        now.tex_gen = texture_cache.StructGeneration();
+        now.smp_gen = texture_cache.SamplerGeneration();
+        now.buf_gen = buffer_cache.StructGeneration();
+        const auto [it, inserted] = c.seen.try_emplace(h, now);
         if (!inserted) {
-            if (it->second + 1 >= frame) {
+            const auto& old = it->second;
+            if (old.frame + 1 >= frame) {
                 ++c.hit;
                 c.hit_textured += textured;
-                c.hit_same_frame += it->second == frame;
+                c.hit_same_frame += old.frame == frame;
+                // Would the cached record still be valid? (a) no static range marked since it was
+                // stored, (b) no image / texture / sampler / buffer structure change since.
+                bool buf_ok = !big && old.buf_gen == now.buf_gen;
+                for (const auto& [lo, hi] : c.ranges) {
+                    buf_ok = buf_ok && VideoCore::GranulesUnchangedSince(lo, hi, old.clock);
+                }
+                const bool img_ok = old.img_epoch == now.img_epoch &&
+                                    old.tex_gen == now.tex_gen && old.smp_gen == now.smp_gen;
+                c.hit_buf_ok += buf_ok;
+                c.hit_img_ok += img_ok;
+                c.hit_both_ok += buf_ok && img_ok;
+                c.hit_textured_ok += buf_ok && img_ok && textured;
             }
-            if (it->second != frame) {
+            if (old.frame != frame) {
                 ++c.keys_this_frame;
             }
-            it->second = frame;
+            it->second = now;
         } else {
             ++c.distinct_new;
             ++c.keys_this_frame;
@@ -5103,6 +5139,16 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
                      double(c.keys_frames_sum) / double(std::max<u64>(c.frames, 1)), c.distinct_new,
                      double(c.heap_bindings) / double(c.draws),
                      double(c.static_bindings) / double(c.draws), c.heap_ids.size(), c.seen.size());
+            LOG_INFO(Render_Vulkan,
+                     "StaticKeyValid: of {} hits: static buffers unchanged {:.1f}%, image / texture / "
+                     "sampler / buffer structure unchanged {:.1f}%, both {:.1f}% (textured hits "
+                     "valid {:.1f}% of textured full draws) | draws with a > 64 MB static binding {}",
+                     c.hit, 100.0 * double(c.hit_buf_ok) / double(std::max<u64>(c.hit, 1)),
+                     100.0 * double(c.hit_img_ok) / double(std::max<u64>(c.hit, 1)),
+                     100.0 * double(c.hit_both_ok) / double(std::max<u64>(c.hit, 1)),
+                     100.0 * double(c.hit_textured_ok) / double(std::max<u64>(c.textured, 1)),
+                     c.big_bindings);
+            c.hit_buf_ok = c.hit_img_ok = c.hit_both_ok = c.big_bindings = c.hit_textured_ok = 0;
             c.draws = c.textured = c.hit = c.hit_textured = c.hit_same_frame = 0;
             c.heap_bindings = c.static_bindings = c.frames = c.distinct_new = 0;
             c.keys_frames_sum = 0;

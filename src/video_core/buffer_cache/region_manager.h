@@ -244,10 +244,16 @@ public:
                     MarkDirty();
                     bits.SetRange(start_page, end_page);
                 });
+                BumpGranules(cpu_addr + start_page * TRACKER_BYTES_PER_PAGE,
+                             cpu_addr + std::min<size_t>(end_page, NUM_PAGES_PER_REGION) *
+                                            TRACKER_BYTES_PER_PAGE);
             } else {
                 // Counts every GPU write marking, including one that finds all bits already
                 // set, so an in-flight fault download can tell its snapshot went stale.
                 ++gpu_write_seq;
+                BumpGranules(cpu_addr + start_page * TRACKER_BYTES_PER_PAGE,
+                             cpu_addr + std::min<size_t>(end_page, NUM_PAGES_PER_REGION) *
+                                            TRACKER_BYTES_PER_PAGE);
                 if (GpuWriteLog::Mode() != 0) {
                     GpuWriteLog::Append(
                         cpu_addr + start_page * TRACKER_BYTES_PER_PAGE,
