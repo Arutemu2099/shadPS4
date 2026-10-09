@@ -504,6 +504,10 @@ private:
         // pipeline has a native variant / DrawTail of any other draw) and the join's phases.
         u64 c_join_ok{}, n_join_ok{}, c_join_fail{}, n_join_fail{}, c_tail_nat{}, n_tail_nat{},
             c_tail_other{}, n_tail_other{};
+        // "other" DrawTail split (2026-10-09, dcb note sec. 8): bit 0 draw-repeat hit, bit 1 the
+        // pipeline samples images. Real cycles, one rdtsc pair per draw.
+        std::array<u64, 4> c_tail_cls{}, n_tail_cls{};
+        bool last_tail_repeat{};
         std::array<u64, 4> c_phase{};
         // SHADPS4_NATIVE_TIMING, colour split: colour joins (and their phases) and the DrawTail
         // of draws that opened a colour batch.

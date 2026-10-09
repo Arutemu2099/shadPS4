@@ -2161,6 +2161,13 @@ void Rasterizer::ExecuteDraw(const SplitDraw& draw,
             } else {
                 native_stats.c_tail_other += dt;
                 ++native_stats.n_tail_other;
+                bool images = false;
+                for (const auto* stage : draw.pipeline->GetStages()) {
+                    images = images || (stage && !stage->images.empty());
+                }
+                const u32 cls = (native_stats.last_tail_repeat ? 1u : 0u) | (images ? 2u : 0u);
+                native_stats.c_tail_cls[cls] += dt;
+                ++native_stats.n_tail_cls[cls];
             }
         }
     }
@@ -2913,6 +2920,14 @@ void Rasterizer::NativeLog() {
                  per(st.c_tail_copen, st.n_tail_copen), st.n_tail_copen,
                  per(st.c_cphase[0], st.n_cjoin_ok), per(st.c_cphase[1], st.n_cjoin_ok),
                  per(st.c_cphase[2], st.n_cjoin_ok));
+        LOG_INFO(Render_Vulkan,
+                 "NativeTiming: other DrawTail by class, cycles per draw: full_untextured {:.0f} "
+                 "(n={}) repeat_untextured {:.0f} (n={}) full_textured {:.0f} (n={}) "
+                 "repeat_textured {:.0f} (n={})",
+                 per(st.c_tail_cls[0], st.n_tail_cls[0]), st.n_tail_cls[0],
+                 per(st.c_tail_cls[1], st.n_tail_cls[1]), st.n_tail_cls[1],
+                 per(st.c_tail_cls[2], st.n_tail_cls[2]), st.n_tail_cls[2],
+                 per(st.c_tail_cls[3], st.n_tail_cls[3]), st.n_tail_cls[3]);
     }
 }
 
@@ -3192,6 +3207,7 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     const int repeat_mode = g_draw_repeat;
     const bool repeat =
         repeat_mode != 0 && native_carry.empty() && DrawRepeatMatch(pipeline, rs_hit);
+    native_stats.last_tail_repeat = repeat && repeat_mode == 1;
     bool bound;
     if (repeat && repeat_mode == 1) {
         DrawRepeatApply(pipeline);
