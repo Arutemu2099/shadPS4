@@ -1785,6 +1785,37 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         b.vb_off[k] = vi.off[k];
         b.vb_stride[k] = vi.stride[k];
     }
+    // Rebase the per-vertex bindings to the lowest offset of the same stride residue, so a
+    // later draw's vertex data below draw 0's still has a non-negative vertexOffset (s287: 3.1 M
+    // refusals). Needs one common quotient over the per-vertex bindings; instance-rate bindings
+    // keep draw 0's offset (they may not move).
+    {
+        const auto* attribs = AmdGpu::CpSplit::VertexInputAttribs(*front_vi);
+        bool ok = true;
+        bool any = false;
+        u64 q0 = 0;
+        for (u32 k = 0; k < vi.n; ++k) {
+            if (vi.buf[k] == 0 || attribs[k].desc.instanced || vi.stride[k] == 0) {
+                continue;
+            }
+            const u64 qk = vi.off[k] / vi.stride[k];
+            if (any && qk != q0) {
+                ok = false;
+            }
+            q0 = qk;
+            any = true;
+        }
+        if (ok && any && q0 <= 0x7fffffffull) {
+            for (u32 k = 0; k < vi.n; ++k) {
+                if (vi.buf[k] == 0 || attribs[k].desc.instanced || vi.stride[k] == 0) {
+                    continue;
+                }
+                b.vb_off[k] = vi.off[k] % vi.stride[k];
+            }
+            b.vb_rebased = true;
+            b.vb_q0 = static_cast<u32>(q0);
+        }
+    }
     // Buffer bindings, in BindResources order.
     std::array<u32, Shader::NUM_BUFFERS> rec_off{};
     u32 bi = 0;
@@ -1839,8 +1870,13 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
     const auto& vs_info = GetBoundStage(Shader::LogicalStage::Vertex);
     const auto [vertex_offset, instance_offset] =
         GetDrawOffsets(regs, vs_info, base->GetFetchShader());
+    const s64 vo0 = s64(s32(vertex_offset)) + (b.vb_rebased ? s64(b.vb_q0) : 0);
+    if (vo0 < 0 || vo0 > INT32_MAX) {
+        return fail();
+    }
     const u32 cmd[5] = {regs.num_indices, regs.num_instances.NumInstances(),
-                        static_cast<u32>(vi.ib_off / vi.ib_type), vertex_offset, instance_offset};
+                        static_cast<u32>(vi.ib_off / vi.ib_type), static_cast<u32>(vo0),
+                        instance_offset};
     std::memcpy(b.cmds, cmd, sizeof(cmd));
     b.n = 1;
     *b.count = 1;
@@ -2685,7 +2721,14 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
         const u64 base_off = native_batch.stream_off;
         const u64 cmd_off = base_off + u64(NativeMaxDraws) * NativeRecBytes;
         const u64 count_off = cmd_off + u64(NativeMaxDraws) * NativeCmdBytes;
+        std::array<vk::Buffer, 16> vbufs{};
+        std::array<vk::DeviceSize, 16> voffs{};
+        for (u32 k = 0; k < native_batch.vb_n; ++k) {
+            vbufs[k] = vk::Buffer{std::bit_cast<VkBuffer>(native_batch.vb[k])};
+            voffs[k] = native_batch.vb_off[k];
+        }
         scheduler.Record([handle = pipeline->Handle(), sb = stream.Handle(), cmd_off, count_off,
+                          rebind = native_batch.vb_rebased, vb_n = native_batch.vb_n, vbufs, voffs,
                           ib = vk::Buffer{std::bit_cast<VkBuffer>(native_batch.ib)},
                           type = native_batch.index_size == 2 ? vk::IndexType::eUint16
                                                               : vk::IndexType::eUint32](
@@ -2694,6 +2737,9 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
                 cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
             }
             cmdbuf.bindIndexBuffer(ib, 0, type);
+            if (rebind && vb_n != 0) {
+                cmdbuf.bindVertexBuffers(0, vb_n, vbufs.data(), voffs.data());
+            }
             cmdbuf.drawIndexedIndirectCount(sb, cmd_off, sb, count_off, NativeMaxDraws,
                                             NativeCmdBytes);
         });

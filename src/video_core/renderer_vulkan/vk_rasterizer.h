@@ -444,6 +444,8 @@ private:
         std::array<u64, 16> vb{};
         std::array<u64, 16> vb_off{};
         std::array<u32, 16> vb_stride{};
+        bool vb_rebased{};
+        u32 vb_q0{};
         std::array<u64, Shader::NUM_BUFFERS> buf{};
         u64 guest_mask{};
         u64 stream_off{};
