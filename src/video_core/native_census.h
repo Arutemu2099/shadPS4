@@ -20,6 +20,7 @@ struct NativeCensusVi {
     u64 ib_buf{};
     u64 ib_off{};
     u32 ib_type{};
+    bool gpu_mod{}; ///< some vertex range of this draw is GPU-written (SHADPS4_NATIVE_COLOUR)
 };
 extern const bool g_native_census;
 /// SHADPS4_NATIVE_PASS: 0 off, 1 native shadow batches, 2 verify (generic path renders).

@@ -505,6 +505,12 @@ private:
         u64 c_join_ok{}, n_join_ok{}, c_join_fail{}, n_join_fail{}, c_tail_nat{}, n_tail_nat{},
             c_tail_other{}, n_tail_other{};
         std::array<u64, 4> c_phase{};
+        // SHADPS4_NATIVE_TIMING, colour split: colour joins (and their phases) and the DrawTail
+        // of draws that opened a colour batch.
+        u64 c_cjoin_ok{}, n_cjoin_ok{}, c_tail_copen{}, n_tail_copen{};
+        std::array<u64, 4> c_cphase{};
+        bool last_open_colour{};
+        u64 peek_yes{}, peek_no{}, peek_unknown{};
     } native_stats;
     bool NativeJoin(const SplitDraw& draw, const AmdGpu::CpSplit::VertexInputsPayload* front_vi);
     bool NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline* native, bool is_indexed,

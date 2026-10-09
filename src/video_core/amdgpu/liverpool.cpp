@@ -1831,7 +1831,40 @@ void Liverpool::ExecuteRecordImpl(const CpSplit::RecordHeader& record) {
     }
 }
 
+int Liverpool::NativePeekNextDraw(const void* pipeline) {
+    if (!split || !back_draw_record) {
+        return -1;
+    }
+    u64 pos = split->ReadPos() + back_draw_record->size;
+    for (u32 i = 0; i < 16; ++i) {
+        const auto* next = split->PeekAt(pos);
+        if (!next) {
+            return -1;
+        }
+        switch (next->type) {
+        case CpSplit::RecordType::RegWrite:
+        case CpSplit::RecordType::Diag:
+            pos += next->size;
+            continue;
+        case CpSplit::RecordType::Draw: {
+            const auto& r = *reinterpret_cast<const SplitDrawRecord*>(next + 1);
+            return r.draw.pipeline == pipeline ? 1 : 0;
+        }
+        default:
+            return 0;
+        }
+    }
+    return -1;
+}
+
 void Liverpool::ExecuteDrawRecord(const CpSplit::RecordHeader& record) {
+    back_draw_record = &record;
+    struct ResetPeek {
+        const CpSplit::RecordHeader*& ref;
+        ~ResetPeek() {
+            ref = nullptr;
+        }
+    } reset_peek{back_draw_record};
     const auto& rec = *reinterpret_cast<const SplitDrawRecord*>(&record + 1);
     mirror->ctx_epoch = rec.ctx_epoch;
     std::array<Shader::BoundStage, Shader::MaxStageTypes> stages{};

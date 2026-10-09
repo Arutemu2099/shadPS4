@@ -193,6 +193,11 @@ public:
     const CbDbExtent& BackDbExtent() const {
         return *back_db_extent;
     }
+    /// SHADPS4_NATIVE_COLOUR open gate (back thread, inside the draw record being executed):
+    /// 1 = the next published draw record (past register-only records) uses `pipeline`, 0 = it
+    /// does not or something heavier comes first, -1 = not published yet / unknown.
+    int NativePeekNextDraw(const void* pipeline);
+
     u64 BackContextEpoch() const {
         return *back_ctx_epoch;
     }
@@ -309,6 +314,7 @@ private:
     void ExecuteRecord(const CpSplit::RecordHeader& record);
     void ExecuteRecordImpl(const CpSplit::RecordHeader& record);
     void ExecuteDrawRecord(const CpSplit::RecordHeader& record);
+    const CpSplit::RecordHeader* back_draw_record{}; ///< SHADPS4_NATIVE_COLOUR peek
     void ExecuteDispatchRecord(const CpSplit::RecordHeader& record);
     /// SHADPS4_MTB_P1_BREAK=1 (P1d pricing): ends an open render pass before a packet record.
     void MtbBreakAtPacket(const PM4Header* header);

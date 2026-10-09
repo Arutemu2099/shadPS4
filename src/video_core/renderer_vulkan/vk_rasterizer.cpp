@@ -2004,23 +2004,32 @@ void Rasterizer::ExecuteDraw(const SplitDraw& draw,
         }();
         if (VideoCore::g_native_pass != 0 && native_batch.open) {
             const u64 t0 = native_timing ? __rdtsc() : 0;
+            const bool was_colour = native_batch.colour;
             const bool joined = NativeJoin(draw, front_vi);
             if (native_timing) {
                 const u64 dt = __rdtsc() - t0;
                 (joined ? native_stats.c_join_ok : native_stats.c_join_fail) += dt;
                 ++(joined ? native_stats.n_join_ok : native_stats.n_join_fail);
+                if (joined && was_colour) {
+                    native_stats.c_cjoin_ok += dt;
+                    ++native_stats.n_cjoin_ok;
+                }
             }
             if (joined) {
                 return;
             }
         }
         const u64 t1 = native_timing ? __rdtsc() : 0;
+        native_stats.last_open_colour = false;
         // The lookup ran on the front: the Pipeline phase and pipeline_ns are 0 here.
         DrawTail(draw.pipeline, draw.args.is_indexed, draw.args.index_offset, sample, t_entry,
                  t_entry, 0, front_vi);
         if (native_timing) {
             const u64 dt = __rdtsc() - t1;
-            if (draw.pipeline->native_variant.load(std::memory_order_relaxed)) {
+            if (native_stats.last_open_colour) {
+                native_stats.c_tail_copen += dt;
+                ++native_stats.n_tail_copen;
+            } else if (draw.pipeline->native_variant.load(std::memory_order_relaxed)) {
                 native_stats.c_tail_nat += dt;
                 ++native_stats.n_tail_nat;
             } else {
@@ -2176,8 +2185,21 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         if (b.verify) {
             native_open_images.assign(image_infos.begin(), image_infos.end());
         }
-        // GPU-written vertex data: the vertex binds requested storage-read visibility too
-        // (buffer_cache.cpp VertexReadAccess while SHADPS4_NATIVE_COLOUR is on).
+        // GPU-written vertex data (compute skinning): the generic vertex barrier made it visible
+        // to vertex-input reads only (and the tracker may have skipped it); the native VS reads it
+        // as storage. One explicit whole-buffer barrier at the open (s329: doing this for every
+        // vertex barrier of every draw cost 2.4%). Joins refuse on any later write (RecordSeq).
+        if (!b.verify && vi.gpu_mod && b.vbuf != 0) {
+            buffer_barriers.push_back(vk::BufferMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eVertexShader,
+                .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead,
+                .buffer = vk::Buffer{std::bit_cast<VkBuffer>(b.vbuf)},
+                .offset = 0,
+                .size = VK_WHOLE_SIZE,
+            });
+        }
     }
     // Rebase the per-vertex bindings to the lowest offset of the same stride residue, so a
     // later draw's vertex data below draw 0's still has a non-negative vertexOffset (s287: 3.1 M
@@ -2451,6 +2473,9 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
         if (join_timing) {
             const u64 now = __rdtsc();
             native_stats.c_phase[phase] += now - tp;
+            if (b.colour) {
+                native_stats.c_cphase[phase] += now - tp;
+            }
             tp = now;
         }
     };
@@ -2721,9 +2746,10 @@ void Rasterizer::NativeLog() {
     if (VideoCore::g_native_colour) {
         LOG_INFO(Render_Vulkan,
                  "NativeColour: opens={} joins={} open_fail={} verify={} | textured draws={} "
-                 "with a variant {:.1f}%",
+                 "with a variant {:.1f}% | peek yes={} no={} unknown={}",
                  st.col_opens, st.col_joins, st.col_open_fail, st.col_verify, st.col_tex_draws,
-                 100.0 * double(st.col_tex_variant) / double(std::max<u64>(st.col_tex_draws, 1)));
+                 100.0 * double(st.col_tex_variant) / double(std::max<u64>(st.col_tex_draws, 1)),
+                 st.peek_yes, st.peek_no, st.peek_unknown);
     }
     if (st.n_join_ok + st.n_tail_other != 0) {
         const auto per = [](u64 c, u64 n) { return n ? double(c) / double(n) : 0.0; };
@@ -2737,6 +2763,14 @@ void Rasterizer::NativeLog() {
                  per(st.c_phase[0], st.n_join_ok + st.n_join_fail),
                  per(st.c_phase[1], st.n_join_ok + st.n_join_fail),
                  per(st.c_phase[2], st.n_join_ok));
+        LOG_INFO(Render_Vulkan,
+                 "NativeTiming: colour join_ok {:.0f} (n={}) colour opener DrawTail {:.0f} (n={}) | "
+                 "colour join phases per join: checks+ud+buffers {:.0f} vertex+index {:.0f} "
+                 "record {:.0f}",
+                 per(st.c_cjoin_ok, st.n_cjoin_ok), st.n_cjoin_ok,
+                 per(st.c_tail_copen, st.n_tail_copen), st.n_tail_copen,
+                 per(st.c_cphase[0], st.n_cjoin_ok), per(st.c_cphase[1], st.n_cjoin_ok),
+                 per(st.c_cphase[2], st.n_cjoin_ok));
     }
 }
 
@@ -2945,6 +2979,7 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
         VideoCore::t_native_vi.n = 0;
         VideoCore::t_native_vi.ib_buf = 0;
         VideoCore::t_native_vi.ib_type = 0;
+        VideoCore::t_native_vi.gpu_mod = false;
     }
     if (pb_census) [[unlikely]] {
         PbCensusBegin();
@@ -3197,6 +3232,22 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
                 ++native_stats.col_tex_draws;
                 native_stats.col_tex_variant += colour;
             }
+            // SHADPS4_NATIVE_COLOUR_PEEK (default on): open only if the next queued draw uses the
+            // same pipeline (s327 / s328: 62% of colour batches stayed single draws, each paying
+            // the open and an indirect draw).
+            static const bool peek = [] {
+                const char* e = std::getenv("SHADPS4_NATIVE_COLOUR_PEEK");
+                return !e || e[0] != '0';
+            }();
+            if (colour && peek) {
+                const int next = liverpool->NativePeekNextDraw(pipeline);
+                ++(next > 0 ? native_stats.peek_yes
+                            : next == 0 ? native_stats.peek_no : native_stats.peek_unknown);
+                if (next == 0) {
+                    native = nullptr;
+                    colour = false;
+                }
+            }
         }
         if (native && !(repeat && repeat_mode == 1) && !(occlusion && occlusion->Open()) &&
             build_set_writes && !native_bindings &&
@@ -3319,6 +3370,7 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
         native_batch.open = true;
         ++native_stats.opens;
         native_stats.col_opens += native_batch.colour;
+        native_stats.last_open_colour = native_batch.colour;
         if ((native_stats.opens & 0xffff) == 0) {
             NativeLog();
         }
