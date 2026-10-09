@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstddef>
 #include <immintrin.h>
+#include <unordered_map>
 #include <unordered_set>
 #include <boost/preprocessor/stringize.hpp>
 
@@ -2300,6 +2301,77 @@ void Liverpool::RunAscPacket(const PM4Header* header, std::span<const u32> rest,
     split->MaybeLog();
 }
 
+namespace {
+// SHADPS4_FENCE_CENSUS=1 (2026-10-09, notes/dcb-parallel-2026-10-09.md sec. 4): when a posted fence
+// syncs because its label lies in command memory the front has not parsed yet, where does the
+// label sit? Inside a packet the front will read (header / body of which opcode), or in data it
+// skips (a NOP body), and does a later WAIT_REG_MEM of the same span poll it? Front thread only.
+const bool g_fence_census = [] {
+    const char* v = std::getenv("SHADPS4_FENCE_CENSUS");
+    return v && v[0] == '1';
+}();
+struct FenceCensusState {
+    std::unordered_map<u32, u64> where; // key: asc << 24 | in_rest << 23 | body << 22 | type << 8 | opcode
+    std::array<u64, 5> dist{};          // dwords from span start to the label: <16, <256, <4K, <64K, more
+    u64 syncs = 0, polled_later = 0, not_found = 0;
+} g_fence_census_state;
+
+void FenceCensusNote(std::span<const u32> span, VAddr label, bool asc, bool in_rest) {
+    auto& st = g_fence_census_state;
+    ++st.syncs;
+    const u32* p = span.data();
+    const u32* end = p + span.size();
+    const VAddr base = reinterpret_cast<VAddr>(p);
+    const u64 dw = (label - base) / 4;
+    st.dist[dw < 16 ? 0 : dw < 256 ? 1 : dw < 4096 ? 2 : dw < 65536 ? 3 : 4] += 1;
+    bool found = false;
+    bool polled = false;
+    while (p < end) {
+        const auto* h = reinterpret_cast<const PM4Header*>(p);
+        u32 n = 1;
+        u32 opcode = 0;
+        const u32 type = h->type;
+        if (type == 3) {
+            n = h->type3.NumWords() + 1;
+            opcode = static_cast<u32>(h->type3.opcode.Value());
+            if (h->type3.opcode == PM4ItOpcode::WaitRegMem && !polled) {
+                const auto* w = reinterpret_cast<const PM4CmdWaitRegMem*>(h);
+                const VAddr a = reinterpret_cast<VAddr>(w->Address<u64*>());
+                polled = a >= label && a < label + 8;
+            }
+        } else if (type == 0) {
+            n = h->type0.NumWords() + 1;
+        }
+        const VAddr lo = reinterpret_cast<VAddr>(p);
+        if (!found && label >= lo && label < lo + u64{n} * 4) {
+            found = true;
+            const u32 body = label != lo ? 1u : 0u;
+            ++st.where[(asc ? 1u << 24 : 0u) | (in_rest ? 1u << 23 : 0u) | (body << 22) |
+                       (type << 8) | (opcode & 0xff)];
+        }
+        p += n;
+    }
+    st.not_found += !found;
+    st.polled_later += polled;
+    if ((st.syncs & 0x3fff) == 0) {
+        std::vector<std::pair<u32, u64>> top(st.where.begin(), st.where.end());
+        std::sort(top.begin(), top.end(), [](auto& a, auto& b) { return a.second > b.second; });
+        std::string line;
+        for (size_t i = 0; i < std::min<size_t>(top.size(), 12); ++i) {
+            const u32 k = top[i].first;
+            line += fmt::format(" [{}{}{} type{} op{:#04x}]={}", (k >> 24) & 1 ? "asc " : "gfx ",
+                                (k >> 23) & 1 ? "rest " : "other ", (k >> 22) & 1 ? "body" : "header",
+                                (k >> 8) & 3, k & 0xff, top[i].second);
+        }
+        LOG_INFO(Render,
+                 "FenceCensus: syncs={} not_found={} polled_by_later_wait={} dist(dw <16/<256/<4K/<64K/more)="
+                 "{}/{}/{}/{}/{} |{}",
+                 st.syncs, st.not_found, st.polled_later, st.dist[0], st.dist[1], st.dist[2],
+                 st.dist[3], st.dist[4], line);
+    }
+}
+} // namespace
+
 void Liverpool::RunFence(const PM4Header* header, std::span<const u32> rest, VAddr label,
                          u16 flags, CpSplit::DrainReason sync_reason) {
     // POST_FENCE: the label is written (and the interrupt raised) when the back reaches this
@@ -2318,6 +2390,24 @@ void Liverpool::RunFence(const PM4Header* header, std::span<const u32> rest, VAd
     const VAddr hi = lo + rest.size_bytes();
     if ((label < hi && lo < label + LabelBytes) ||
         SplitSpansOverlap(label, label + LabelBytes)) {
+        if (g_fence_census) [[unlikely]] {
+            const bool asc = (flags & CpSplit::AscReleaseMem) != 0;
+            if (label < hi && lo < label + LabelBytes) {
+                FenceCensusNote(rest, label, asc, true);
+            } else {
+                for (u32 i = 0; i < split_span_hwm; ++i) {
+                    const auto* span = split_spans[i];
+                    if (!span) {
+                        continue;
+                    }
+                    const auto s_lo = reinterpret_cast<VAddr>(span->data());
+                    if (label < s_lo + span->size_bytes() && s_lo < label + LabelBytes) {
+                        FenceCensusNote(*span, label, asc, false);
+                        break;
+                    }
+                }
+            }
+        }
         split->Sync(sync_reason);
         return;
     }
