@@ -7105,6 +7105,33 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
             buffer_bindings.emplace_back(buffer_id, vsharp, size);
             if (desc.is_formatted && size > (u64{64} << 20)) {
                 native_stats.giant_bound = true;
+                // s369 census (NATIVE_TIMING): what the giant formatted view is, once per
+                // distinct (base, shader).
+                static const bool giant_log = [] {
+                    const char* e = std::getenv("SHADPS4_NATIVE_TIMING");
+                    return e && e[0] == '1';
+                }();
+                static std::set<std::pair<u64, u64>> giant_seen;
+                if (giant_log && giant_seen.size() < 24 &&
+                    giant_seen.insert({vsharp.base_address, stage.pgm_hash}).second) [[unlikely]] {
+                    std::string img = "none";
+                    if (const auto id = texture_cache.FindImageFromRange(vsharp.base_address,
+                                                                         size, false)) {
+                        const auto& im = texture_cache.PeekImage(id);
+                        img = fmt::format("{:#x}+{:#x} {}x{}x{} {} target={} ", im.info.guest_address,
+                                          im.info.guest_size, im.info.size.width,
+                                          im.info.size.height, im.info.size.depth,
+                                          vk::to_string(im.info.pixel_format),
+                                          im.binding.is_target ? 1 : 0);
+                    }
+                    LOG_WARNING(Render_Vulkan,
+                                "GiantView: base {:#x} size {:#x} stride {} num_records {:#x} dfmt {} "
+                                "nfmt {} swizzle {} written {} | shader {:#x} stage {} | image at base: {}",
+                                u64(vsharp.base_address), size, u32(vsharp.stride), vsharp.num_records,
+                                u32(vsharp.data_format), u32(vsharp.num_format),
+                                u32(vsharp.swizzle_enable), desc.is_written ? 1 : 0, stage.pgm_hash,
+                                static_cast<u32>(stage.l_stage), img);
+                }
             }
             if (g_static_key_census && !binding_compute && buffer_id &&
                 vsharp.base_address >= HeapLo && vsharp.base_address < HeapHi) [[unlikely]] {
