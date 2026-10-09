@@ -176,6 +176,13 @@ public:
         return smart_barriers_enabled;
     }
 
+    /// SHADPS4_MTB_CONFLICT: the hazard state GetBarrier may change.
+    auto HazardTuple() const {
+        return std::tuple{hz_write_stages,   hz_write_access, hz_read_stages, hz_visible_stages,
+                          hz_visible_access, hz_run,          hz_run_wrote,   access_mask,
+                          stage};
+    }
+
     /// `run` (SHADPS4_GUEST_DISPATCH_ORDER, smart barriers only): nonzero for a dispatch binding;
     /// equal values mean consecutive dispatches of one guest queue with no guest sync packet and
     /// nothing else recorded in between. GCN overlaps such dispatches (the game orders dependent
@@ -238,11 +245,6 @@ public:
 
     /// SHADPS4_MTB_CONFLICT (diagnostic): batch of the last hazard-state change / draw touch.
     AmdGpu::MtbConflict::Stamp cf{};
-    auto HazardTuple() const {
-        return std::tuple{hz_write_stages, hz_write_access,   hz_read_stages, hz_visible_stages,
-                          hz_visible_access, hz_run,          hz_run_wrote,   access_mask,
-                          stage};
-    }
 
 private:
     static constexpr vk::AccessFlags2 WriteAccessBits =
