@@ -438,6 +438,7 @@ private:
         /// a repeat with planes enabled reuses the base's stream copy when both are equal.
         std::array<u32, 1 + 4 * AmdGpu::NUM_CLIP_PLANES> clip_base{}, clip_cur{};
         u64 f_clip{}, clip_repeats{};
+        u32 clip_info_idx{~0u}; ///< BindBuffers: info index of the clip-plane copy (verify)
         // Verify scratch.
         std::vector<vk::DescriptorBufferInfo> v_buffers;
         std::vector<vk::DescriptorImageInfo> v_images;

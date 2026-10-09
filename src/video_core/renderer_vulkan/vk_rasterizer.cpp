@@ -4534,8 +4534,9 @@ void Rasterizer::DrawRepeatVerify(const GraphicsPipeline* pipeline) {
     for (size_t i = 0; !what && i < buffer_infos.size(); ++i) {
         const auto& a = st.v_buffers[i];
         const auto& b = buffer_infos[i];
-        if (a.buffer != b.buffer || a.offset != b.offset || a.range != b.range) {
-            what = "buffer info";
+        const bool clip_slot = g_repeat_heap && st.clip_cur[0] != 0 && i == st.clip_info_idx;
+        if (a.buffer != b.buffer || (!clip_slot && a.offset != b.offset) || a.range != b.range) {
+            what = clip_slot ? "clip-plane buffer info" : "buffer info";
         }
     }
     for (size_t i = 0; !what && i < image_infos.size(); ++i) {
@@ -5181,6 +5182,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     image_infos.clear();
     draw_repeat.tex_nonhit_stages = 0;
     draw_repeat.heap_pending.clear();
+    draw_repeat.clip_info_idx = ~0u;
     if (g_draw_repeat == 2) {
         g_rp_seq_who.clear();
     }
@@ -7322,6 +7324,9 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
                     const u32 ubo_size = static_cast<u32>(sizeof(planes));
                     const u64 offset = vk_buffer.Copy(planes.data(), ubo_size, alignment);
                     buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
+                    // DRAW_REPEAT=2 + HEAP: a clip-plane repeat reuses the base's copy of equal
+                    // planes; verify compares this slot by range (its offset is a fresh copy).
+                    draw_repeat.clip_info_idx = static_cast<u32>(buffer_infos.size() - 1);
                     bound_buffer = &vk_buffer;
                 }
             } else if (desc.buffer_type == Shader::BufferType::BdaPagetable) {
