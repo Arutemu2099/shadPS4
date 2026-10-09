@@ -4101,8 +4101,14 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
                 mask &= ~(1U << index);
                 key.push_back(bound.user_data[index]);
             }
+            // The flat buffer starts with a copy of ALL user-data registers, unread ones included
+            // (per-draw values): compare only what the SRT walk appended after them.
             key.push_back(0xf1a7f1a7u);
-            key.insert(key.end(), bound.flattened_ud_buf.begin(), bound.flattened_ud_buf.end());
+            constexpr size_t walked = Shader::NUM_USER_DATA_REGS;
+            if (bound.flattened_ud_buf.size() > walked) {
+                key.insert(key.end(), bound.flattened_ud_buf.begin() + walked,
+                           bound.flattened_ud_buf.end());
+            }
         }
         const u32 g = census_control ? 1 : 0;
         ++fc.c_draws[g];
