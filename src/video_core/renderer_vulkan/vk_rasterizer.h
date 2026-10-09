@@ -532,6 +532,12 @@ private:
         // pipeline samples images. Real cycles, one rdtsc pair per draw.
         std::array<u64, 4> c_tail_cls{}, n_tail_cls{};
         bool last_tail_repeat{};
+        // Full textured draws by what happened in BindResources (dcb note sec. 9, s368): bit 0 a
+        // texture stage took the full path, 1 commands recorded, 2 bytes uploaded, 3 a > 64 MB
+        // formatted view bound, 4 clip planes copied.
+        u32 last_flags{};
+        bool giant_bound{};
+        std::array<u64, 32> c_flags{}, n_flags{};
         std::array<u64, 4> c_phase{};
         // SHADPS4_NATIVE_TIMING, colour split: colour joins (and their phases) and the DrawTail
         // of draws that opened a colour batch.
