@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <array>
 #include <cstdlib>
+#include <string>
+#include <thread>
 #include "gnm_error.h"
 #include "gnmdriver.h"
 
@@ -477,9 +480,54 @@ u32 PS4_SYSV_ABI sceGnmDispatchInitDefaultHardwareState(u32* cmdbuf, u32 size) {
     return HwInitPacketSize;
 }
 
+namespace {
+// SHADPS4_DRAW_THREAD_CENSUS=1 (2026-10-09, notes/native-hook-study-2026-10-09.md): which guest
+// threads call sceGnmDrawIndex (the game's per-draw entry, 93% of draws) and how evenly - is the
+// game's 6-core command-buffer recording visible at this HLE point?
+const bool g_draw_thread_census = [] {
+    const char* v = std::getenv("SHADPS4_DRAW_THREAD_CENSUS");
+    return v && v[0] == '1';
+}();
+struct DrawThreadSlot {
+    std::atomic<u64> draws{0};
+    std::atomic<u32> os_tid{0};
+};
+std::array<DrawThreadSlot, 64> g_draw_threads{};
+std::atomic<u32> g_draw_thread_slots{0};
+std::atomic<u64> g_draw_total{0};
+thread_local int t_draw_slot = -1;
+
+void DrawThreadCensusNote() {
+    if (t_draw_slot < 0) {
+        const u32 slot = g_draw_thread_slots.fetch_add(1, std::memory_order_relaxed);
+        t_draw_slot = slot < g_draw_threads.size() ? int(slot) : int(g_draw_threads.size() - 1);
+        g_draw_threads[t_draw_slot].os_tid.store(static_cast<u32>(std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xffff),
+                                                 std::memory_order_relaxed);
+    }
+    g_draw_threads[t_draw_slot].draws.fetch_add(1, std::memory_order_relaxed);
+    if ((g_draw_total.fetch_add(1, std::memory_order_relaxed) & 0xfffff) == 0xfffff) {
+        std::string line;
+        const u32 n = std::min<u32>(g_draw_thread_slots.load(), u32(g_draw_threads.size()));
+        u64 sum = 0;
+        for (u32 i = 0; i < n; ++i) {
+            sum += g_draw_threads[i].draws.load(std::memory_order_relaxed);
+        }
+        for (u32 i = 0; i < n; ++i) {
+            const u64 d = g_draw_threads[i].draws.exchange(0, std::memory_order_relaxed);
+            line += fmt::format(" tid{}={:.1f}%", g_draw_threads[i].os_tid.load(),
+                                sum ? 100.0 * double(d) / double(sum) : 0.0);
+        }
+        LOG_INFO(Lib_GnmDriver, "DrawThreadCensus: {} draws, {} threads:{}", sum, n, line);
+    }
+}
+} // namespace
+
 s32 PS4_SYSV_ABI sceGnmDrawIndex(u32* cmdbuf, u32 size, u32 index_count, uintptr_t index_addr,
                                  u32 flags, u32 type) {
     LOG_TRACE(Lib_GnmDriver, "called");
+    if (g_draw_thread_census) [[unlikely]] {
+        DrawThreadCensusNote();
+    }
 
     if (cmdbuf && (size == 10) && (index_addr != 0) && (index_addr & 1) == 0 &&
         (flags & 0x1ffffffe) == 0) { // no predication will be set in the packet
