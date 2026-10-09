@@ -447,6 +447,12 @@ struct PipelineCache::NativeColourCompiler {
         cv.notify_one();
     }
 
+    /// Returns once nothing is queued or in construction (shader replacement erases bases).
+    void WaitIdle() {
+        std::unique_lock lk{mutex};
+        idle_cv.wait(lk, [&] { return queue.empty() && !busy; });
+    }
+
 private:
     void Run(std::stop_token stoken) {
         Common::SetCurrentThreadName("shadPS4:NativeColourCompiler");
@@ -460,6 +466,7 @@ private:
                 }
                 job = std::move(queue.front());
                 queue.pop_front();
+                busy = true;
             }
             const auto t0 = CompileClock::now();
             auto variant = std::make_unique<GraphicsPipeline>(
@@ -481,8 +488,12 @@ private:
                 LOG_INFO(Render_Vulkan, "NativeColour: variant #{} of {:#x} slot {} built in {:.1f} ms",
                          built, std::hash<GraphicsPipelineKey>{}(job->key), job->slot, ms);
             }
-            std::scoped_lock lk{mutex};
-            owned.push_back(std::move(variant));
+            {
+                std::scoped_lock lk{mutex};
+                owned.push_back(std::move(variant));
+                busy = false;
+            }
+            idle_cv.notify_all();
         }
     }
 
@@ -493,6 +504,8 @@ private:
     vk::PipelineCache pipeline_cache;
     std::mutex mutex;
     std::condition_variable_any cv;
+    std::condition_variable_any idle_cv;
+    bool busy{};
     std::deque<std::unique_ptr<NativeColourJob>> queue;
     std::vector<std::unique_ptr<GraphicsPipeline>> owned;
     u32 built{};
@@ -1379,13 +1392,9 @@ void PipelineCache::PrepareNativeColour(const GraphicsPipeline* base,
                 return w;
             }
             // + the records and vertex SSBOs in buffer_infos (static_vector of NUM_BUFFERS).
-            if (vs->buffers.size() + fs->buffers.size() + 2 > Shader::NUM_BUFFERS) {
+            const u32 extra = (VideoCore::g_native_colour_diag & 4096) ? 3u : 2u; // review #5
+            if (vs->buffers.size() + fs->buffers.size() + extra > Shader::NUM_BUFFERS) {
                 return "buffer count";
-            }
-            for (u32 p = 30; p < Shader::IR::NumParams; ++p) {
-                if (vs->stores.GetAny(Shader::IR::Attribute::Param0 + p)) {
-                    return "vs output 30-31";
-                }
             }
             return nullptr;
         }();
@@ -1488,13 +1497,41 @@ void PipelineCache::PrepareNativeColour(const GraphicsPipeline* base,
         log_not("key did not rebuild");
         return;
     }
+    // s324 validation: a tessellated pipeline slipped through (its PS followed a TES); recheck
+    // the stage selection the refresh just made.
+    if (regs.stage_enable.raw != AmdGpu::ShaderStageEnable::VgtStages::Vs) {
+        log_not("stages at refresh");
+        return;
+    }
+    for (u32 i = 0; i < infos.size(); ++i) {
+        if (infos[i] && i != u32(LogicalStage::Vertex) && i != u32(LogicalStage::Fragment)) {
+            log_not("extra stage at refresh");
+            return;
+        }
+    }
+    if (runtime_infos[u32(LogicalStage::Vertex)].vs_info.tess_emulated_primitive) {
+        // Quad / rect lists: a generated TCS / TES sits between VS and PS and would drop the
+        // draw-index varying (s325 validation).
+        log_not("emulated primitive (generated tessellation)");
+        return;
+    }
     {
+        // The draw-index varying goes just above every VS output and PS input (+1 for the
+        // clip-distance emulation shift).
+        s32 hi = -1;
+        for (u32 p = 0; p < Shader::IR::NumParams; ++p) {
+            if (vs->stores.GetAny(Shader::IR::Attribute::Param0 + p)) {
+                hi = std::max<s32>(hi, s32(p));
+            }
+        }
         const auto& fsi = runtime_infos[u32(LogicalStage::Fragment)].fs_info;
         for (u32 i = 0; i < fsi.num_inputs; ++i) {
-            if (fsi.inputs[i].param_index >= 30) {
-                log_not("ps input 30-31");
-                return;
-            }
+            hi = std::max<s32>(hi, s32(fsi.inputs[i].param_index));
+        }
+        emit.draw_location = static_cast<u32>(hi + 2);
+        if (emit.draw_location > Shader::NativeDrawIndexMaxLocation) {
+            log_not("no free varying location");
+            return;
         }
     }
     Shader::Backend::Bindings total{};
@@ -2261,6 +2298,9 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
         // SHADPS4_ASYNC_PIPELINES: a queued job copied module handles; let the compiler drain
         // before any handle below is destroyed. Its finished jobs are published by the next
         // lookup, not here (this may be the back thread while the front is mid-lookup).
+        if (native_colour_compiler) {
+            native_colour_compiler->WaitIdle();
+        }
         if (async_compiler) {
             async_compiler->WaitIdle();
         }

@@ -81,12 +81,20 @@ Id EmitReadConst(EmitContext& ctx, IR::Inst* inst, Id addr, Id offset) {
 
 Id EmitReadConstBuffer(EmitContext& ctx, u32 handle, Id index) {
     const auto& buffer = ctx.buffers[handle];
+    const Id rel_index = index;
     if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         index = ctx.OpIAdd(ctx.U32[1], index, offset);
     }
     const auto [id, pointer_type] = buffer.Alias(PointerType::U32);
     const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index)};
-    const Id result{ctx.OpLoad(ctx.U32[1], ptr)};
+    Id result{ctx.OpLoad(ctx.U32[1], ptr)};
+    // SHADPS4_NATIVE_PASS: whole-buffer descriptors; the guest V# bound (Opus code review #3).
+    if (ctx.native && handle < ctx.native_size_dw.size() &&
+        Sirit::ValidId(ctx.native_size_dw[handle])) {
+        result = ctx.OpSelect(ctx.U32[1],
+                              ctx.OpULessThan(ctx.U1[1], rel_index, ctx.native_size_dw[handle]),
+                              result, ctx.u32_zero_value);
+    }
     return result;
 }
 

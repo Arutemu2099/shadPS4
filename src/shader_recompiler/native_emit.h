@@ -59,6 +59,9 @@ struct NativeEmit {
     /// entries of 16 dwords from dword 16: location, vertex index, draw, stream offset, pulled
     /// x y z w bits, real x y z w bits, vs hash, kind, bits, count; slot 64 = discard).
     bool compare{};
+    /// The flat draw-index varying's location: just above every VS output / PS input (the
+    /// fixed 31 overflowed maxVertexOutputComponents with the built-ins, s324 validation).
+    u32 draw_location{};
     u32 debug_binding{};
     u32 vs_hash{};
 };
@@ -76,7 +79,8 @@ constexpr u32 NativeRecordVoffOffset = NUM_USER_DATA_REGS + 2 * NUM_BUFFERS;
 constexpr u32 NativeRecordVsizeOffset = NativeRecordVoffOffset + NativeMaxPulledLocations;
 constexpr u32 NativeRecordDwords = NativeRecordVsizeOffset + NativeMaxPulledLocations; // 128
 static_assert(NativeRecordDwords == 128);
-/// The flat varying carrying the draw index from the native VS to the native PS.
-constexpr u32 NativeDrawIndexLocation = 31;
+/// The highest location the flat draw-index varying may use (with 4 built-in components the
+/// 128-component output budget allows locations up to 30; one spare).
+constexpr u32 NativeDrawIndexMaxLocation = 29;
 
 } // namespace Shader

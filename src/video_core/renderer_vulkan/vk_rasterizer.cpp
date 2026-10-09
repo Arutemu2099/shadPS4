@@ -2142,6 +2142,18 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         if (!NativeColourGates() || !NativeImageKey(base, native_img_key, b.img_n)) {
             return fail();
         }
+        // Opus code review 2026-10-09 #1: a draw that samples a bound target (feedback loop)
+        // records a Transit barrier per draw on the generic path; a join would skip it.
+        if (attachment_feedback_loop) {
+            return fail();
+        }
+        for (const auto id : bound_images) {
+            const auto& image = texture_cache.PeekImage(id);
+            if ((image.binding.is_target && image.binding.is_bound) ||
+                image.binding.force_general) {
+                return fail();
+            }
+        }
         b.smp_gen = texture_cache.SamplerGeneration();
         b.border = regs.ta_bc_base.base_addr;
         const auto* attribs = AmdGpu::CpSplit::VertexInputAttribs(*front_vi);
@@ -3175,7 +3187,9 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
         }
         const auto* native = pipeline->native_variant.load(std::memory_order_acquire);
         bool colour = false;
-        if (!native && VideoCore::g_native_colour && front_vi) [[unlikely]] {
+        // Opus code review #7: slots fill in order, so slot 0 empty = no variant at all.
+        if (!native && VideoCore::g_native_colour && front_vi &&
+            pipeline->native_colour[0].key.load(std::memory_order_relaxed) != 0) [[unlikely]] {
             native = pipeline->NativeColourVariant(VideoCore::NativeVertexKey(
                 AmdGpu::CpSplit::VertexInputAttribs(*front_vi), front_vi->count));
             colour = native != nullptr;
@@ -3351,6 +3365,7 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
         native_batch.open = false;
         const bool colour_cand =
             VideoCore::g_native_colour && front_vi &&
+            pipeline->native_colour[0].key.load(std::memory_order_relaxed) != 0 &&
             pipeline->NativeColourVariant(VideoCore::NativeVertexKey(
                 AmdGpu::CpSplit::VertexInputAttribs(*front_vi), front_vi->count)) != nullptr;
         if ((pipeline->native_variant.load(std::memory_order_acquire) || colour_cand) &&

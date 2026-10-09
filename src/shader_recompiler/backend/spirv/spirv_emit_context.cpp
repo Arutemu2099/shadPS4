@@ -391,7 +391,7 @@ void EmitContext::DefineInputs() {
     }
     case LogicalStage::Fragment: {
         if (native_colour) {
-            native_draw_in = DefineInput(U32[1], Shader::NativeDrawIndexLocation);
+            native_draw_in = DefineInput(U32[1], Shader::t_native_emit.draw_location);
             Decorate(native_draw_in, spv::Decoration::Flat);
             Name(native_draw_in, "native_draw_in");
         }
@@ -664,7 +664,7 @@ void EmitContext::DefineOutputs() {
             }
 
             if (native_colour) {
-                native_draw_out = DefineOutput(U32[1], Shader::NativeDrawIndexLocation);
+                native_draw_out = DefineOutput(U32[1], Shader::t_native_emit.draw_location);
                 Decorate(native_draw_out, spv::Decoration::Flat);
                 Name(native_draw_out, "native_draw_out");
             }
@@ -1143,8 +1143,11 @@ Id EmitContext::NativePullAttribute(u32 loc, Id vindex) {
             UNREACHABLE_MSG("native pull: kind {}", u32(a.kind));
         }
     }
+    // Out of bounds (robustBufferAccess2): components the format has read 0, missing ones
+    // keep the (0, 0, 1) fill (Opus code review #2).
+    const u32 present = packed ? 4u : u32(a.count);
     for (u32 i = 0; i < 4; ++i) {
-        c[i] = OpSelect(comp_type, in_bounds, c[i], i == 3 ? one : zero);
+        c[i] = OpSelect(comp_type, in_bounds, c[i], (i == 3 && i >= present) ? one : zero);
     }
     const Id vec_type = !is_int ? F32[4] : is_uint ? U32[4] : S32[4];
     const Id value{OpCompositeConstruct(vec_type, c[0], c[1], c[2], c[3])};
