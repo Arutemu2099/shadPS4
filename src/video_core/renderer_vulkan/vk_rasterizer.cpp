@@ -1724,6 +1724,16 @@ void Rasterizer::ExecuteDraw(const SplitDraw& draw,
     }
 }
 
+// SHADPS4_NATIVE_DIAG=1 (diagnostic): which context registers changed when a join is refused
+// for a context-epoch change (close reason 6). Copies the context block at every batch open.
+static const bool g_native_diag = [] {
+    const char* e = std::getenv("SHADPS4_NATIVE_DIAG");
+    return e && e[0] == '1';
+}();
+static std::vector<u32> g_native_diag_ctx;
+static std::unordered_map<u32, u64> g_native_diag_regs;
+static u64 g_native_diag_n = 0;
+
 bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline* native,
                             bool is_indexed, u32 index_offset,
                             const AmdGpu::CpSplit::VertexInputsPayload* front_vi) {
@@ -1746,6 +1756,10 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
     const auto& regs = liverpool->BackRegs();
     b.base = base;
     b.ctx_epoch = liverpool->BackContextEpoch();
+    if (g_native_diag) [[unlikely]] {
+        g_native_diag_ctx.assign(regs.reg_array.begin() + AmdGpu::Regs::ContextRegWordOffset,
+                                 regs.reg_array.begin() + AmdGpu::Regs::ContextRegWordOffset + 0x400);
+    }
     b.desc_id = front_vi->desc_id;
     for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
         b.extents[cb] = liverpool->BackCbExtent(cb).raw;
@@ -1862,6 +1876,25 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
         return false;
     }
     if (liverpool->BackContextEpoch() != b.ctx_epoch) {
+        if (g_native_diag && g_native_diag_ctx.size() == 0x400) [[unlikely]] {
+            for (u32 i = 0; i < 0x400; ++i) {
+                if (regs.reg_array[AmdGpu::Regs::ContextRegWordOffset + i] != g_native_diag_ctx[i]) {
+                    ++g_native_diag_regs[i];
+                }
+            }
+            if ((++g_native_diag_n & 0xffff) == 0) {
+                std::vector<std::pair<u32, u64>> top(g_native_diag_regs.begin(),
+                                                     g_native_diag_regs.end());
+                std::sort(top.begin(), top.end(),
+                          [](const auto& x, const auto& y) { return x.second > y.second; });
+                std::string line;
+                for (size_t k = 0; k < std::min<size_t>(top.size(), 16); ++k) {
+                    line += fmt::format(" {:#x}={}", top[k].first, top[k].second);
+                }
+                LOG_INFO(Render_Vulkan, "NativeDiag: {} epoch closes, changed context regs:{}",
+                         g_native_diag_n, line);
+            }
+        }
         NativeClose(6);
         return false;
     }
