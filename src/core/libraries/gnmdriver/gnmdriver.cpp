@@ -1,11 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <atomic>
 #include <array>
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <vector>
 #include "gnm_error.h"
 #include "gnmdriver.h"
 
@@ -520,6 +522,280 @@ void DrawThreadCensusNote() {
         LOG_INFO(Lib_GnmDriver, "DrawThreadCensus: {} draws, {} threads:{}", sum, n, line);
     }
 }
+// SHADPS4_DRAW_TAG=1 (2026-10-09 evening, notes/native-path-2026-10-09.md): the game's job
+// threads stamp every DrawIndex with (thread slot, sub-run id) in the trailing NOP. The sub-run id
+// moves at every Set/Update Vs/Ps shader call on that thread (a draw-class object change), so
+// consecutive draws with one id are the game's own run: same shaders, one job, one command buffer.
+// The front copies the tag into the draw record; the back groups its per-draw cost by run.
+const bool g_draw_tag = [] {
+    const char* v = std::getenv("SHADPS4_DRAW_TAG");
+    return v && (v[0] == '1' || v[0] == '2');
+}();
+std::atomic<u32> g_draw_tag_slots{0};
+thread_local u32 t_draw_tag_slot = 0; // 1..15, 0 = not assigned yet
+thread_local u32 t_draw_tag_run = 0;
+thread_local u32 t_draw_tag_pgm[2] = {};  // current VS / PS program address (>> 8)
+thread_local u64 t_draw_tag_hash[2] = {}; // and its shader hash (binary info)
+std::atomic<u64> g_draw_tag_calls{0}, g_draw_tag_addr_changes{0}, g_draw_tag_hash_changes{0};
+
+// s373 / s374: the game calls Set/Update for every draw-class object, and binds the same shader
+// code from different addresses; a run ends only when the shader HASH changes (the emulator keys
+// pipelines on it).
+inline void DrawTagShaderChange(u32 stage, const u32* regs) {
+    const u32 pgm = regs ? regs[0] : 0;
+    const u64 calls = g_draw_tag_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (pgm != t_draw_tag_pgm[stage]) {
+        t_draw_tag_pgm[stage] = pgm;
+        g_draw_tag_addr_changes.fetch_add(1, std::memory_order_relaxed);
+        const u64 hash =
+            pgm ? AmdGpu::SearchBinaryInfo(reinterpret_cast<const u32*>(u64{pgm} << 8)).shader_hash
+                : 0;
+        if (hash != t_draw_tag_hash[stage]) {
+            t_draw_tag_hash[stage] = hash;
+            g_draw_tag_hash_changes.fetch_add(1, std::memory_order_relaxed);
+            ++t_draw_tag_run;
+        }
+    }
+    if ((calls & 0x3ffff) == 0) {
+        LOG_INFO(Lib_GnmDriver, "DrawTagShader: {} Set/Update calls, program address changed {}, "
+                                "shader hash changed {}",
+                 calls, g_draw_tag_addr_changes.load(), g_draw_tag_hash_changes.load());
+    }
+}
+
+// SHADPS4_DRAW_TAG=2 (2026-10-09 evening, notes/native-path-2026-10-09.md sec. 2): what the game
+// writes between consecutive draws on one job thread. A thread-local cursor sits at the end of
+// the last HLE call that reserved packets (DrawIndex, Set/Update Vs/Ps: the game reserves `size`
+// dwords and continues after them); at each DrawIndex the packets from the cursor to `cmdbuf`
+// are walked (exact landing required) and classified.
+const bool g_draw_gap = [] {
+    const char* v = std::getenv("SHADPS4_DRAW_TAG");
+    return v && v[0] == '2';
+}();
+struct GapStats {
+    std::array<u64, 256> op{};
+    std::array<u64, 0x400> ctx{};
+    std::array<u64, 0x100> uc{};
+    std::array<u64, 16> s{}; // see GapFlushLog
+};
+struct GapGlobal {
+    std::array<std::atomic<u64>, 256> op{};
+    std::array<std::atomic<u64>, 0x400> ctx{};
+    std::array<std::atomic<u64>, 0x100> uc{};
+    std::array<std::atomic<u64>, 16> s{};
+    std::atomic<u64> total{};
+};
+GapGlobal g_gap;
+thread_local GapStats t_gap;
+thread_local const u32* t_gap_cursor = nullptr;
+thread_local u32 t_gap_need[2] = {};  // user-SGPR window of the bound VS / PS (RSRC2 count)
+thread_local u32 t_gap_since[2] = {}; // ud registers written since the shader was set
+enum GapStat : u32 {
+    GsDraws,
+    GsOk,
+    GsNoCursor,
+    GsRange,
+    GsBadType,
+    GsNoLand,
+    GsDwords,
+    GsPackets,
+    GsShOther,
+    GsNopDw,
+    GsFullGapVs,
+    GsFullGapPs,
+    GsFullSinceVs,
+    GsFullSincePs,
+    GsFullBoth,
+    GsEmptyNeed,
+};
+
+void GapFlushLog() {
+    auto& t = t_gap;
+    for (u32 i = 0; i < 256; ++i) {
+        if (t.op[i]) {
+            g_gap.op[i].fetch_add(t.op[i], std::memory_order_relaxed);
+        }
+    }
+    for (u32 i = 0; i < 0x400; ++i) {
+        if (t.ctx[i]) {
+            g_gap.ctx[i].fetch_add(t.ctx[i], std::memory_order_relaxed);
+        }
+    }
+    for (u32 i = 0; i < 0x100; ++i) {
+        if (t.uc[i]) {
+            g_gap.uc[i].fetch_add(t.uc[i], std::memory_order_relaxed);
+        }
+    }
+    for (u32 i = 0; i < 16; ++i) {
+        g_gap.s[i].fetch_add(t.s[i], std::memory_order_relaxed);
+    }
+    const u64 n_draws = t.s[GsDraws];
+    const u64 before = g_gap.total.fetch_add(n_draws, std::memory_order_relaxed);
+    t = {};
+    if ((before >> 20) == ((before + n_draws) >> 20)) {
+        return;
+    }
+    std::array<u64, 16> v{};
+    for (u32 i = 0; i < 16; ++i) {
+        v[i] = g_gap.s[i].exchange(0, std::memory_order_relaxed);
+    }
+    const double ok = double(std::max<u64>(v[GsOk], 1));
+    const auto pct = [](u64 x, u64 n) { return n ? 100.0 * double(x) / double(n) : 0.0; };
+    std::string ops, ctxs, ucs;
+    for (u32 i = 0; i < 256; ++i) {
+        if (const u64 n = g_gap.op[i].exchange(0, std::memory_order_relaxed)) {
+            ops += fmt::format(" {:#x}:{:.3f}", i, double(n) / ok);
+        }
+    }
+    std::vector<std::pair<u64, u32>> top;
+    for (u32 i = 0; i < 0x400; ++i) {
+        if (const u64 n = g_gap.ctx[i].exchange(0, std::memory_order_relaxed)) {
+            top.emplace_back(n, i);
+        }
+    }
+    std::sort(top.rbegin(), top.rend());
+    for (size_t k = 0; k < std::min<size_t>(top.size(), 24); ++k) {
+        ctxs += fmt::format(" {:#x}:{:.4f}", top[k].second, double(top[k].first) / ok);
+    }
+    for (u32 i = 0; i < 0x100; ++i) {
+        if (const u64 n = g_gap.uc[i].exchange(0, std::memory_order_relaxed)) {
+            ucs += fmt::format(" {:#x}:{:.3f}", i, double(n) / ok);
+        }
+    }
+    LOG_INFO(Lib_GnmDriver,
+             "DrawGap: {} draws, walked {:.2f}% (no cursor {:.2f}% out of range {:.2f}% bad "
+             "type {:.2f}% no landing {:.2f}%) | per walked gap: {:.1f} dwords {:.2f} packets "
+             "{:.2f} other-SH regs {:.1f} NOP dwords | ud window rewritten in this gap: VS "
+             "{:.1f}% PS {:.1f}%; since the shader set: VS {:.1f}% PS {:.1f}% both {:.1f}% "
+             "(empty VS need {:.1f}%)",
+             v[GsDraws], pct(v[GsOk], v[GsDraws]), pct(v[GsNoCursor], v[GsDraws]),
+             pct(v[GsRange], v[GsDraws]), pct(v[GsBadType], v[GsDraws]),
+             pct(v[GsNoLand], v[GsDraws]), double(v[GsDwords]) / ok, double(v[GsPackets]) / ok,
+             double(v[GsShOther]) / ok, double(v[GsNopDw]) / ok, pct(v[GsFullGapVs], v[GsOk]),
+             pct(v[GsFullGapPs], v[GsOk]), pct(v[GsFullSinceVs], v[GsOk]),
+             pct(v[GsFullSincePs], v[GsOk]), pct(v[GsFullBoth], v[GsOk]),
+             pct(v[GsEmptyNeed], v[GsOk]));
+    LOG_INFO(Lib_GnmDriver, "DrawGap opcodes per walked gap:{}", ops);
+    LOG_INFO(Lib_GnmDriver, "DrawGap context regs per walked gap (top 24):{}", ctxs);
+    LOG_INFO(Lib_GnmDriver, "DrawGap uconfig regs per walked gap:{}", ucs);
+}
+
+void GapShaderSet(u32 stage, const u32* regs, const u32* cmdbuf, u32 size) {
+    t_gap_cursor = cmdbuf + size;
+    const u32 rsrc2 = regs ? regs[3] : 0;
+    const u32 n = std::min<u32>((rsrc2 >> 1) & 0x1f, 16);
+    t_gap_need[stage] = n == 16 ? 0xffffu : ((1u << n) - 1);
+    t_gap_since[stage] = 0;
+}
+
+void GapDraw(const u32* cmdbuf) {
+    auto& t = t_gap;
+    ++t.s[GsDraws];
+    const u32* p = t_gap_cursor;
+    t_gap_cursor = cmdbuf + 10;
+    const auto done = [&] {
+        if (t.s[GsDraws] >= 8192) {
+            GapFlushLog();
+        }
+    };
+    if (!p) {
+        ++t.s[GsNoCursor];
+        return done();
+    }
+    if (cmdbuf < p || cmdbuf - p > 16384) {
+        ++t.s[GsRange];
+        return done();
+    }
+    u32 vs = 0, ps = 0, packets = 0, sh_other = 0, nop_dw = 0;
+    std::array<u16, 64> ops{};
+    u32 nops = 0;
+    std::array<u16, 64> ctx{};
+    u32 nctx = 0;
+    std::array<u16, 16> uc{};
+    u32 nuc = 0;
+    const u32* q = p;
+    while (q < cmdbuf) {
+        const u32 h = *q;
+        const u32 type = h >> 30;
+        if (type == 2) {
+            ++q;
+            continue;
+        }
+        if (type != 3) {
+            ++t.s[GsBadType];
+            return done();
+        }
+        const u32 n = ((h >> 16) & 0x3fff) + 1;
+        const u32 op = (h >> 8) & 0xff;
+        if (q + 1 + n > cmdbuf) {
+            break;
+        }
+        ++packets;
+        if (nops < ops.size()) {
+            ops[nops++] = static_cast<u16>(op);
+        }
+        if (op == static_cast<u32>(PM4ItOpcode::SetShReg)) {
+            const u32 off = q[1] & 0xffff;
+            for (u32 r = off; r < off + n - 1; ++r) {
+                if (r >= 0x4c && r < 0x5c) {
+                    vs |= 1u << (r - 0x4c);
+                } else if (r >= 0x0c && r < 0x1c) {
+                    ps |= 1u << (r - 0x0c);
+                } else {
+                    ++sh_other;
+                }
+            }
+        } else if (op == static_cast<u32>(PM4ItOpcode::SetContextReg)) {
+            const u32 off = q[1] & 0xffff;
+            for (u32 r = off; r < off + n - 1 && nctx < ctx.size(); ++r) {
+                ctx[nctx++] = static_cast<u16>(r & 0x3ff);
+            }
+        } else if (op == static_cast<u32>(PM4ItOpcode::SetUconfigReg)) {
+            if (nuc < uc.size()) {
+                uc[nuc++] = static_cast<u16>(q[1] & 0xff);
+            }
+        } else if (op == static_cast<u32>(PM4ItOpcode::Nop)) {
+            nop_dw += n;
+        }
+        q += 1 + n;
+    }
+    if (q != cmdbuf) {
+        ++t.s[GsNoLand];
+        return done();
+    }
+    ++t.s[GsOk];
+    t.s[GsDwords] += u64(cmdbuf - p);
+    t.s[GsPackets] += packets;
+    t.s[GsShOther] += sh_other;
+    t.s[GsNopDw] += nop_dw;
+    for (u32 i = 0; i < nops; ++i) {
+        ++t.op[ops[i]];
+    }
+    for (u32 i = 0; i < nctx; ++i) {
+        ++t.ctx[ctx[i]];
+    }
+    for (u32 i = 0; i < nuc; ++i) {
+        ++t.uc[uc[i]];
+    }
+    t_gap_since[0] |= vs;
+    t_gap_since[1] |= ps;
+    t.s[GsFullGapVs] += (vs & t_gap_need[0]) == t_gap_need[0];
+    t.s[GsFullGapPs] += (ps & t_gap_need[1]) == t_gap_need[1];
+    const bool fvs = (t_gap_since[0] & t_gap_need[0]) == t_gap_need[0];
+    const bool fps = (t_gap_since[1] & t_gap_need[1]) == t_gap_need[1];
+    t.s[GsFullSinceVs] += fvs;
+    t.s[GsFullSincePs] += fps;
+    t.s[GsFullBoth] += fvs && fps;
+    t.s[GsEmptyNeed] += t_gap_need[0] == 0;
+    done();
+}
+
+inline u32 DrawTagValue() {
+    if (t_draw_tag_slot == 0) [[unlikely]] {
+        t_draw_tag_slot = std::min<u32>(g_draw_tag_slots.fetch_add(1) + 1, 15u);
+    }
+    return (t_draw_tag_slot << 28) | (t_draw_tag_run & 0x0fffffffu);
+}
 } // namespace
 
 s32 PS4_SYSV_ABI sceGnmDrawIndex(u32* cmdbuf, u32 size, u32 index_count, uintptr_t index_addr,
@@ -527,6 +803,9 @@ s32 PS4_SYSV_ABI sceGnmDrawIndex(u32* cmdbuf, u32 size, u32 index_count, uintptr
     LOG_TRACE(Lib_GnmDriver, "called");
     if (g_draw_thread_census) [[unlikely]] {
         DrawThreadCensusNote();
+    }
+    if (g_draw_gap && cmdbuf && size == 10) [[unlikely]] {
+        GapDraw(cmdbuf);
     }
 
     if (cmdbuf && (size == 10) && (index_addr != 0) && (index_addr & 1) == 0 &&
@@ -541,6 +820,12 @@ s32 PS4_SYSV_ABI sceGnmDrawIndex(u32* cmdbuf, u32 size, u32 index_count, uintptr
         draw_index->draw_initiator = sceKernelIsNeoMode() ? flags & 0xe0000000u : 0;
 
         WriteTrailingNop<3>(cmdbuf + 6);
+        if (g_draw_tag) [[unlikely]] {
+            auto* nop = reinterpret_cast<PM4CmdNop*>(cmdbuf + 6);
+            nop->data_block[0] = PM4CmdNop::PayloadType::NativeDrawTag;
+            nop->data_block[1] = DrawTagValue();
+            nop->data_block[2] = 0;
+        }
         return ORBIS_OK;
     }
     return -1;
@@ -1799,6 +2084,12 @@ s32 PS4_SYSV_ABI sceGnmSetPsShader(u32* cmdbuf, u32 size, const u32* ps_regs) {
 
 s32 PS4_SYSV_ABI sceGnmSetPsShader350(u32* cmdbuf, u32 size, const u32* ps_regs) {
     LOG_TRACE(Lib_GnmDriver, "called");
+    if (g_draw_tag) [[unlikely]] {
+        DrawTagShaderChange(1, ps_regs);
+        if (g_draw_gap) {
+            GapShaderSet(1, ps_regs, cmdbuf, size);
+        }
+    }
 
     if (!cmdbuf || size <= 0x27) {
         return -1;
@@ -1897,6 +2188,12 @@ s32 PS4_SYSV_ABI sceGnmSetVgtControl(u32* cmdbuf, u32 size, u32 prim_group_sz_mi
 
 s32 PS4_SYSV_ABI sceGnmSetVsShader(u32* cmdbuf, u32 size, const u32* vs_regs, u32 shader_modifier) {
     LOG_TRACE(Lib_GnmDriver, "called");
+    if (g_draw_tag) [[unlikely]] {
+        DrawTagShaderChange(0, vs_regs);
+        if (g_draw_gap) {
+            GapShaderSet(0, vs_regs, cmdbuf, size);
+        }
+    }
 
     if (!cmdbuf || size <= 0x1c) {
         return -1;
@@ -2553,6 +2850,12 @@ s32 PS4_SYSV_ABI sceGnmUpdatePsShader(u32* cmdbuf, u32 size, const u32* ps_regs)
 
 s32 PS4_SYSV_ABI sceGnmUpdatePsShader350(u32* cmdbuf, u32 size, const u32* ps_regs) {
     LOG_TRACE(Lib_GnmDriver, "called");
+    if (g_draw_tag) [[unlikely]] {
+        DrawTagShaderChange(1, ps_regs);
+        if (g_draw_gap) {
+            GapShaderSet(1, ps_regs, cmdbuf, size);
+        }
+    }
 
     if (!cmdbuf || size <= 0x27) {
         return -1;
@@ -2599,6 +2902,12 @@ s32 PS4_SYSV_ABI sceGnmUpdatePsShader350(u32* cmdbuf, u32 size, const u32* ps_re
 s32 PS4_SYSV_ABI sceGnmUpdateVsShader(u32* cmdbuf, u32 size, const u32* vs_regs,
                                       u32 shader_modifier) {
     LOG_TRACE(Lib_GnmDriver, "called");
+    if (g_draw_tag) [[unlikely]] {
+        DrawTagShaderChange(0, vs_regs);
+        if (g_draw_gap) {
+            GapShaderSet(0, vs_regs, cmdbuf, size);
+        }
+    }
 
     if (!cmdbuf || size <= 0x1c) {
         return -1;

@@ -2042,6 +2042,13 @@ const GraphicsPipeline* Rasterizer::RelookupDrawFront() {
     return pipeline_cache.GetGraphicsPipeline();
 }
 
+// SHADPS4_DRAW_TAG=1 (with SHADPS4_NATIVE_TIMING=1): the back groups draw cycles by the game's
+// job-thread runs (DrawTagNote).
+static const bool g_draw_tag_back = [] {
+    const char* e = std::getenv("SHADPS4_DRAW_TAG");
+    return e && e[0] == '1';
+}();
+
 void Rasterizer::ExecuteDraw(const SplitDraw& draw,
                              const std::array<Shader::BoundStage, Shader::MaxStageTypes>& stages,
                              const AmdGpu::CpSplit::VertexInputsPayload* front_vi) {
@@ -2195,6 +2202,9 @@ void Rasterizer::ExecuteDraw(const SplitDraw& draw,
                     native_stats.c_cjoin_ok += dt;
                     ++native_stats.n_cjoin_ok;
                 }
+                if (joined && g_draw_tag_back) [[unlikely]] {
+                    DrawTagNote(draw.pipeline, was_colour ? 2u : 0u, dt);
+                }
             }
             if (joined) {
                 return;
@@ -2210,9 +2220,15 @@ void Rasterizer::ExecuteDraw(const SplitDraw& draw,
             if (native_stats.last_open_colour) {
                 native_stats.c_tail_copen += dt;
                 ++native_stats.n_tail_copen;
+                if (g_draw_tag_back) [[unlikely]] {
+                    DrawTagNote(draw.pipeline, 3u, dt);
+                }
             } else if (draw.pipeline->native_variant.load(std::memory_order_relaxed)) {
                 native_stats.c_tail_nat += dt;
                 ++native_stats.n_tail_nat;
+                if (g_draw_tag_back) [[unlikely]] {
+                    DrawTagNote(draw.pipeline, 1u, dt);
+                }
             } else {
                 native_stats.c_tail_other += dt;
                 ++native_stats.n_tail_other;
@@ -2226,6 +2242,9 @@ void Rasterizer::ExecuteDraw(const SplitDraw& draw,
                 if (cls == 2) {
                     native_stats.c_flags[native_stats.last_flags & 127] += dt;
                     ++native_stats.n_flags[native_stats.last_flags & 127];
+                }
+                if (g_draw_tag_back) [[unlikely]] {
+                    DrawTagNote(draw.pipeline, 4u + cls, dt);
                 }
             }
         }
@@ -2911,6 +2930,101 @@ void Rasterizer::NativeVerifyCompare(const GraphicsPipeline* pipeline, bool is_i
     if ((native_stats.verify_draws & 0x3ffff) == 0) {
         NativeLog();
     }
+}
+
+void Rasterizer::DrawTagNote(const GraphicsPipeline* pipeline, u32 cls, u64 dt) {
+    auto& st = draw_tag_stats;
+    const u32 tag = draw_tag;
+    if (tag == 0 || tag != st.tag) {
+        DrawTagFlush();
+    }
+    if (tag == 0) {
+        ++st.untagged;
+        st.c_untagged += dt;
+    } else {
+        const u64 epoch = liverpool->BackContextEpoch();
+        if (st.n != 0) {
+            st.pipe_changes += pipeline != st.last_pipe;
+            st.epoch_changes += epoch != st.last_epoch;
+            // Full textured draw whose static key differs from the previous full draw's (bit 6
+            // = PREV, set only with SHADPS4_STATIC_KEY_CENSUS).
+            st.key_changes += cls == 6 && (native_stats.last_flags & 64) == 0;
+        }
+        st.tag = tag;
+        ++st.n;
+        st.cycles += dt;
+        ++st.cls[cls];
+        st.cls_cycles[cls] += dt;
+        if (cls == 6) {
+            st.texmiss += (native_stats.last_flags & 1) != 0;
+            st.uploads += (native_stats.last_flags & 4) != 0;
+        }
+        st.last_pipe = pipeline;
+        st.last_epoch = epoch;
+    }
+    if ((++st.total & 0xfffff) != 0) {
+        return;
+    }
+    static constexpr std::array<const char*, 3> names{"shadow", "textured", "untextured"};
+    const auto per = [](u64 c, u64 n) { return n ? double(c) / double(n) : 0.0; };
+    u64 tagged = 0;
+    for (const auto& k : st.kind) {
+        tagged += k.draws;
+    }
+    LOG_INFO(Render_Vulkan,
+             "DrawTag: {} draws, tagged {:.1f}%, untagged {} at {:.0f} cycles (whole run "
+             "since the last line)",
+             tagged + st.untagged, 100.0 * per(tagged, tagged + st.untagged), st.untagged,
+             per(st.c_untagged, st.untagged));
+    for (u32 i = 0; i < 3; ++i) {
+        const auto& k = st.kind[i];
+        std::string h, c;
+        for (u32 b = 0; b < 8; ++b) {
+            h += fmt::format(" {:.1f}", 100.0 * per(k.hist[b], k.draws));
+            c += fmt::format(" {}:{}@{:.0f}", b, k.cls[b], per(k.cls_cycles[b], k.cls[b]));
+        }
+        LOG_INFO(Render_Vulkan,
+                 "DrawTag {}: runs={} draws={} mean_run={:.2f} cycles/draw={:.0f} | per run: "
+                 "pipeline changes {:.2f} ctx-epoch changes {:.2f} static-key changes {:.2f} "
+                 "texmiss draws {:.2f} upload draws {:.3f} | draws % in runs of 1/2-3/4-7/8-15/"
+                 "16-31/32-63/64-127/128+:{} | classes n@cycles:{}",
+                 names[i], k.runs, k.draws, per(k.draws, k.runs), per(k.cycles, k.draws),
+                 per(k.pipe_changes, k.runs), per(k.epoch_changes, k.runs),
+                 per(k.key_changes, k.runs), per(k.texmiss, k.runs), per(k.uploads, k.runs), h,
+                 c);
+    }
+    st.kind = {};
+    st.untagged = st.c_untagged = 0;
+}
+
+void Rasterizer::DrawTagFlush() {
+    auto& st = draw_tag_stats;
+    if (st.n != 0) {
+        const u32 i = (st.cls[0] + st.cls[1]) != 0                              ? 0u
+                      : (st.cls[2] + st.cls[3] + st.cls[6] + st.cls[7]) != 0 ? 1u
+                                                                             : 2u;
+        auto& k = st.kind[i];
+        ++k.runs;
+        k.draws += st.n;
+        k.cycles += st.cycles;
+        k.pipe_changes += st.pipe_changes;
+        k.epoch_changes += st.epoch_changes;
+        k.key_changes += st.key_changes;
+        k.texmiss += st.texmiss;
+        k.uploads += st.uploads;
+        for (u32 b = 0; b < 8; ++b) {
+            k.cls[b] += st.cls[b];
+            k.cls_cycles[b] += st.cls_cycles[b];
+        }
+        k.hist[std::min<u32>(std::bit_width(st.n) - 1, 7u)] += st.n;
+    }
+    st.tag = 0;
+    st.n = 0;
+    st.cycles = 0;
+    st.cls = {};
+    st.cls_cycles = {};
+    st.pipe_changes = st.epoch_changes = st.key_changes = st.texmiss = st.uploads = 0;
+    st.last_pipe = nullptr;
 }
 
 void Rasterizer::NativeLog() {

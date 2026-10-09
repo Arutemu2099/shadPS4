@@ -2005,6 +2005,7 @@ void Liverpool::ExecuteDrawRecord(const CpSplit::RecordHeader& record) {
     }
     // SHADPS4_MTB_P1: split draws translate on the worker instance (P1d).
     Vulkan::Rasterizer& translating = rasterizer->Translating();
+    translating.draw_tag = rec.pad;
     MtbConflict::g_in_draw = MtbConflict::g_enabled;
     SCOPE_EXIT {
         MtbConflict::g_in_draw = false;
@@ -2857,8 +2858,47 @@ bool Liverpool::SplitSpansOverlap(VAddr lo, VAddr hi) const {
     return false;
 }
 
+namespace {
+// SHADPS4_DRAW_TAG=1: see gnmdriver.cpp. The front copies the job thread's tag from the
+// DrawIndex trailing NOP into the draw record (SplitDrawRecord::pad) and times EmitDraw.
+const bool g_draw_tag_front = [] {
+    const char* v = std::getenv("SHADPS4_DRAW_TAG");
+    return v && v[0] == '1';
+}();
+struct FrontTagStats {
+    u64 c_tagged{}, n_tagged{}, c_untagged{}, n_untagged{};
+} g_front_tag;
+} // namespace
+
 void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_marker,
                          const CpSplit::DrawArgs& args) {
+    u32 tag = 0;
+    u64 t_front = 0;
+    if (g_draw_tag_front) [[unlikely]] {
+        t_front = __rdtsc();
+        if (header->type3.opcode == PM4ItOpcode::DrawIndex2) {
+            const auto* w = reinterpret_cast<const u32*>(header);
+            if (w[6] == 0xc0021000u && w[7] == PM4CmdNop::PayloadType::NativeDrawTag) {
+                tag = w[8];
+            }
+        }
+    }
+    SCOPE_EXIT {
+        if (g_draw_tag_front) [[unlikely]] {
+            const u64 dt = __rdtsc() - t_front;
+            auto& f = g_front_tag;
+            (tag ? f.c_tagged : f.c_untagged) += dt;
+            ++(tag ? f.n_tagged : f.n_untagged);
+            if (((f.n_tagged + f.n_untagged) & 0xfffff) == 0) {
+                LOG_INFO(Render, "DrawTagFront: EmitDraw cycles per draw: tagged {:.0f} (n={}) "
+                                 "untagged {:.0f} (n={})",
+                         f.n_tagged ? double(f.c_tagged) / double(f.n_tagged) : 0.0, f.n_tagged,
+                         f.n_untagged ? double(f.c_untagged) / double(f.n_untagged) : 0.0,
+                         f.n_untagged);
+                f = {};
+            }
+        }
+    };
     Vulkan::Rasterizer::SplitDraw draw{.args = args};
     // Keep this lookup before the Sync below, also for the periodic VERIFY draw: the back's
     // re-lookup of that draw (DrawRelookup) is only meaningful because this one ran while
@@ -2929,7 +2969,7 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
     rec->stage_count = 0;
     rec->verify = verify;
     rec->vi_bytes = vi_bytes;
-    rec->pad = 0;
+    rec->pad = tag;
     // Copied now: the front's next lookup rewrites these Info fields (inventory 4.4). With
     // run-ahead this is what makes the record self-contained: the back reads user data, flat
     // buffer and pgm_base only from here, and the Info only for its immutable part.

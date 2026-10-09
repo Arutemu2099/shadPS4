@@ -246,6 +246,9 @@ struct PM4CmdNop {
         PrepareFlipLabel = 0x68750778u,     ///< Flip marker with label address
         PrepareFlipInterrupt = 0x68750780u, ///< Flip marker with interrupt
         PrepareFlipInterruptLabel = 0x68750781u, ///< Flip marker with interrupt and label
+        /// Emulator-private (SHADPS4_DRAW_TAG): trailing NOP of an HLE DrawIndex carries the
+        /// game job thread's (slot, sub-run) tag in data_block[1]. No back effect.
+        NativeDrawTag = 0x4e415430u, // 'NAT0'
     };
 };
 

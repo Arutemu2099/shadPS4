@@ -121,6 +121,9 @@ public:
     void ExecuteDraw(const SplitDraw& draw,
                      const std::array<Shader::BoundStage, Shader::MaxStageTypes>& stages,
                      const AmdGpu::CpSplit::VertexInputsPayload* front_vi);
+    /// SHADPS4_DRAW_TAG: the game job thread's (slot, sub-run) tag of the draw ExecuteDraw runs
+    /// next (0 = untagged), set by Liverpool::ExecuteDrawRecord.
+    u32 draw_tag{};
     /// Back thread: runs a dispatch the front looked up. The caller points
     /// Liverpool::BackCsRegs() at the record's ComputeProgram snapshot.
     void ExecuteDispatch(const ComputePipeline* pipeline,
@@ -555,6 +558,31 @@ private:
     void NativeClose(u32 why);
     void NativeVerifyCompare(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset);
     void NativeLog();
+    /// SHADPS4_DRAW_TAG + SHADPS4_NATIVE_TIMING: the back's real cycles grouped by the game's
+    /// runs (consecutive draws with one job-thread tag). cls: 0 shadow join, 1 shadow opener,
+    /// 2 colour join, 3 colour opener, 4 full untextured, 5 repeat untextured, 6 full textured,
+    /// 7 repeat textured.
+    void DrawTagNote(const GraphicsPipeline* pipeline, u32 cls, u64 dt);
+    void DrawTagFlush();
+    struct DrawTagKind {
+        u64 runs{}, draws{}, cycles{}, pipe_changes{}, epoch_changes{}, key_changes{},
+            texmiss{}, uploads{};
+        std::array<u64, 8> cls{};
+        std::array<u64, 8> cls_cycles{};
+        std::array<u64, 8> hist{}; // draws in runs of 1, 2-3, 4-7, ..., 64-127, 128+
+    };
+    struct DrawTagStats {
+        u32 tag{};
+        u32 n{};
+        u64 cycles{};
+        std::array<u32, 8> cls{};
+        std::array<u64, 8> cls_cycles{};
+        u32 pipe_changes{}, epoch_changes{}, key_changes{}, texmiss{}, uploads{};
+        const GraphicsPipeline* last_pipe{};
+        u64 last_epoch{};
+        std::array<DrawTagKind, 3> kind{}; // shadow, textured, untextured
+        u64 untagged{}, c_untagged{}, total{};
+    } draw_tag_stats;
     bool DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit);
     void DrawRepeatApply(const GraphicsPipeline* pipeline, bool patch_infos = true);
     void DrawRepeatVerify(const GraphicsPipeline* pipeline);
