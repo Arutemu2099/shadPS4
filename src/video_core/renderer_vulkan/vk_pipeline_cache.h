@@ -122,6 +122,12 @@ public:
 
     const GraphicsPipeline* GetGraphicsPipeline();
 
+    /// SHADPS4_NATIVE_PASS (front / lookup thread, right after GetGraphicsPipeline returned
+    /// `base` for the current registers): decides once whether `base` can draw native batches
+    /// and, if so, builds its native variant (vertex shader re-emitted to read per-draw records,
+    /// layout + one records SSBO) and publishes it in base->native_variant.
+    void PrepareNativeVariant(const GraphicsPipeline* base);
+
     const ComputePipeline* GetComputePipeline();
 
     using Result = std::tuple<const Shader::Info*, vk::ShaderModule,
@@ -232,6 +238,7 @@ private:
     std::vector<DeferredComputeLoad>* defer_marked_compute{}; ///< set only during WarmUp's pass
     u32 retired_metas_skipped{};
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
+    std::vector<std::unique_ptr<GraphicsPipeline>> native_variants; // SHADPS4_NATIVE_PASS
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
     std::array<const Shader::Info*, MaxShaderStages> infos{};
     std::array<vk::ShaderModule, MaxShaderStages> modules{};

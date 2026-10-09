@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/div_ceil.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+#include "shader_recompiler/native_emit.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -70,6 +71,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
                          Bindings& binding_)
     : Sirit::Module(profile_.supported_spirv), info{info_}, runtime_info{runtime_info_},
       profile{profile_}, stage{info.stage}, l_stage{info.l_stage}, binding{binding_} {
+    native = Shader::t_native_emit.active && info.l_stage == LogicalStage::Vertex;
     if (info.uses_dma) {
         SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
     } else {
@@ -231,7 +233,12 @@ Id EmitContext::GetBufferSize(const u32 sharp_idx) {
 }
 
 void EmitContext::DefineBufferProperties() {
-    if (!profile.needs_buffer_offsets) {
+    if (native) {
+        native_rec_base = OpIMul(U32[1], OpLoad(U32[1], draw_index),
+                                 ConstU32(Shader::NativeRecordDwords));
+        Name(native_rec_base, "native_rec_base");
+    }
+    if (!profile.needs_buffer_offsets && !native) {
         return;
     }
     for (u32 i = 0; i < buffers.size(); i++) {
@@ -242,14 +249,19 @@ void EmitContext::DefineBufferProperties() {
             continue;
         }
 
-        const u32 half = PushData::BufOffsetIndex + (binding >> 4);
-        const u32 comp = (binding & 0xf) >> 2;
-        const u32 offset = (binding & 0x3) << 3;
-        const Id ptr{OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U32[1]),
-                                   push_data_block, ConstU32(half), ConstU32(comp))};
-        const Id value{OpLoad(U32[1], ptr)};
-
-        const Id buf_offset{OpBitFieldUExtract(U32[1], value, ConstU32(offset), ConstU32(8U))};
+        Id buf_offset;
+        if (native) {
+            // The full byte offset of this draw's binding inside the bound VkBuffer.
+            buf_offset = NativeRecordLoad(Shader::NativeRecordOffOffset + binding);
+        } else {
+            const u32 half = PushData::BufOffsetIndex + (binding >> 4);
+            const u32 comp = (binding & 0xf) >> 2;
+            const u32 offset = (binding & 0x3) << 3;
+            const Id ptr{OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U32[1]),
+                                       push_data_block, ConstU32(half), ConstU32(comp))};
+            const Id value{OpLoad(U32[1], ptr)};
+            buf_offset = OpBitFieldUExtract(U32[1], value, ConstU32(offset), ConstU32(8U));
+        }
         Name(buf_offset, fmt::format("buf{}_off", binding));
         buffer.Offset(PointerSize::B8) = buf_offset;
 
@@ -316,6 +328,9 @@ void EmitContext::DefineInputs() {
     case LogicalStage::Vertex: {
         vertex_index = DefineVariable(U32[1], spv::BuiltIn::VertexIndex, spv::StorageClass::Input);
         base_vertex = DefineVariable(U32[1], spv::BuiltIn::BaseVertex, spv::StorageClass::Input);
+        if (native) {
+            draw_index = DefineVariable(U32[1], spv::BuiltIn::DrawIndex, spv::StorageClass::Input);
+        }
         instance_id = DefineVariable(U32[1], spv::BuiltIn::InstanceIndex, spv::StorageClass::Input);
 
         const auto fetch_shader = Gcn::ParseFetchShader(info);
@@ -859,6 +874,32 @@ void EmitContext::DefineBuffers() {
         }
         ++binding.unified;
     }
+    if (native) {
+        // The records SSBO sits after every binding of every stage (records_binding = the base
+        // pipeline's binding count); binding.unified is not advanced for it.
+        const Id array_type{TypeRuntimeArray(U32[1])};
+        const Id struct_type{TypeStruct(array_type)};
+        if (std::ranges::find(buf_type_ids, array_type.value, &Id::value) == buf_type_ids.end()) {
+            Decorate(array_type, spv::Decoration::ArrayStride, 4U);
+            Decorate(struct_type, spv::Decoration::Block);
+            MemberName(struct_type, 0, "data");
+            MemberDecorate(struct_type, 0, spv::Decoration::Offset, 0U);
+            buf_type_ids.push_back(array_type);
+        }
+        const Id struct_pointer_type{TypePointer(spv::StorageClass::StorageBuffer, struct_type)};
+        native_records_ptr = TypePointer(spv::StorageClass::StorageBuffer, U32[1]);
+        native_records = AddGlobalVariable(struct_pointer_type, spv::StorageClass::StorageBuffer);
+        Decorate(native_records, spv::Decoration::Binding, Shader::t_native_emit.records_binding);
+        Decorate(native_records, spv::Decoration::DescriptorSet, 0U);
+        Decorate(native_records, spv::Decoration::NonWritable);
+        Name(native_records, "native_records");
+        interfaces.push_back(native_records);
+    }
+}
+
+Id EmitContext::NativeRecordLoad(u32 dword) {
+    const Id index{OpIAdd(U32[1], native_rec_base, ConstU32(dword))};
+    return OpLoad(U32[1], OpAccessChain(native_records_ptr, native_records, u32_zero_value, index));
 }
 
 spv::ImageFormat GetFormat(const AmdGpu::Image& image) {

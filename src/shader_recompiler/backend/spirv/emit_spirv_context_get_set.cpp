@@ -5,6 +5,7 @@
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+#include "shader_recompiler/native_emit.h"
 #include "shader_recompiler/ir/attribute.h"
 #include "shader_recompiler/ir/patch.h"
 #include "shader_recompiler/runtime_info.h"
@@ -47,6 +48,12 @@ static std::pair<Id, bool> OutputAttrComponentType(EmitContext& ctx, IR::Attribu
 
 Id EmitGetUserData(EmitContext& ctx, IR::ScalarReg reg) {
     const u32 index = ctx.binding.user_data + ctx.info.ud_mask.Index(reg);
+    if (ctx.native) {
+        // SHADPS4_NATIVE_PASS: this draw's registers, from the records SSBO.
+        const Id ud_reg{ctx.NativeRecordLoad(Shader::NativeRecordUdOffset + index)};
+        ctx.Name(ud_reg, fmt::format("ud_{}", u32(reg)));
+        return ud_reg;
+    }
     const u32 half = PushData::UdRegsIndex + (index >> 2);
     const Id ud_ptr{ctx.OpAccessChain(ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1]),
                                       ctx.push_data_block, ctx.ConstU32(half),

@@ -1561,6 +1561,10 @@ void Rasterizer::PrepareDrawFront(SplitDraw& draw) {
         }
     }
     draw.pipeline = pipeline_cache.GetGraphicsPipeline();
+    if (VideoCore::g_native_pass != 0 && draw.pipeline && !draw.pipeline->native_checked)
+        [[unlikely]] {
+        pipeline_cache.PrepareNativeVariant(draw.pipeline);
+    }
 }
 
 const ComputePipeline* Rasterizer::PrepareDispatchFront() {
@@ -1711,10 +1715,362 @@ void Rasterizer::ExecuteDraw(const SplitDraw& draw,
     auto sample = Common::DrawSampleProbe::Begin();
     const auto t_entry = Common::FaultMonitor::Now();
     if (begin()) {
+        if (VideoCore::g_native_pass != 0 && native_batch.open && NativeJoin(draw, front_vi)) {
+            return;
+        }
         // The lookup ran on the front: the Pipeline phase and pipeline_ns are 0 here.
         DrawTail(draw.pipeline, draw.args.is_indexed, draw.args.index_offset, sample, t_entry,
                  t_entry, 0, front_vi);
     }
+}
+
+bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline* native,
+                            bool is_indexed, u32 index_offset,
+                            const AmdGpu::CpSplit::VertexInputsPayload* front_vi) {
+    // Back thread, inside DrawTail after BindResources and the vertex / index binds of `base`.
+    // native == nullptr: verify mode (only the batch keys are captured; nothing changes).
+    auto& b = native_batch;
+    b = NativeBatch{.verify = native == nullptr};
+    const auto fail = [&] {
+        ++native_stats.open_fail;
+        b.open = false;
+        return false;
+    };
+    if (!front_vi || !is_indexed) {
+        return fail();
+    }
+    const auto& vi = VideoCore::t_native_vi;
+    if (vi.ib_type == 0 || vi.ib_off % vi.ib_type != 0 || vi.n > b.vb.size()) {
+        return fail();
+    }
+    const auto& regs = liverpool->BackRegs();
+    b.base = base;
+    b.ctx_epoch = liverpool->BackContextEpoch();
+    b.desc_id = front_vi->desc_id;
+    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        b.extents[cb] = liverpool->BackCbExtent(cb).raw;
+    }
+    b.extents[AmdGpu::NUM_COLOR_BUFFERS] = liverpool->BackDbExtent().raw;
+    b.index_size = vi.ib_type;
+    b.ib = vi.ib_buf;
+    b.vb_n = vi.n;
+    for (u32 k = 0; k < vi.n; ++k) {
+        b.vb[k] = vi.buf[k];
+        b.vb_off[k] = vi.off[k];
+        b.vb_stride[k] = vi.stride[k];
+    }
+    // Buffer bindings, in BindResources order.
+    std::array<u32, Shader::NUM_BUFFERS> rec_off{};
+    u32 bi = 0;
+    for (const auto& bound : BoundStages(base)) {
+        if (!bound.info) {
+            continue;
+        }
+        for (const auto& desc : bound.info->buffers) {
+            if (bi >= buffer_infos.size()) {
+                return fail();
+            }
+            if (desc.buffer_type == Shader::BufferType::Guest) {
+                const u64 full = buffer_infos[bi].offset + push_data.buf_offsets[bi];
+                if (full > 0xffffffffull || !buffer_infos[bi].buffer) {
+                    return fail();
+                }
+                rec_off[bi] = static_cast<u32>(full);
+                b.buf[bi] = std::bit_cast<u64>(static_cast<VkBuffer>(buffer_infos[bi].buffer));
+                b.guest_mask |= u64{1} << bi;
+            }
+            ++bi;
+        }
+    }
+    if (bi != buffer_infos.size()) {
+        return fail();
+    }
+    if (b.verify) {
+        b.open = true;
+        return true;
+    }
+    auto& stream = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
+    if (!stream.IsCoherent()) {
+        return fail();
+    }
+    const u64 total = u64(NativeMaxDraws) * (NativeRecBytes + NativeCmdBytes) + 16;
+    const auto [ptr, offset] = stream.Map(total, instance.StorageMinAlignment());
+    if (!ptr) {
+        return fail();
+    }
+    stream.Commit();
+    b.stream_off = offset;
+    b.recs = ptr;
+    b.cmds = ptr + u64(NativeMaxDraws) * NativeRecBytes;
+    b.count = reinterpret_cast<u32*>(b.cmds + u64(NativeMaxDraws) * NativeCmdBytes);
+    // Draw 0's record and command.
+    auto* rec = reinterpret_cast<u32*>(b.recs);
+    std::memcpy(rec, push_data.ud_regs.data(), sizeof(u32) * Shader::NUM_USER_DATA_REGS);
+    std::memcpy(rec + Shader::NUM_USER_DATA_REGS, rec_off.data(), sizeof(u32) * Shader::NUM_BUFFERS);
+    const auto& vs_info = GetBoundStage(Shader::LogicalStage::Vertex);
+    const auto [vertex_offset, instance_offset] =
+        GetDrawOffsets(regs, vs_info, base->GetFetchShader());
+    const u32 cmd[5] = {regs.num_indices, regs.num_instances.NumInstances(),
+                        static_cast<u32>(vi.ib_off / vi.ib_type), vertex_offset, instance_offset};
+    std::memcpy(b.cmds, cmd, sizeof(cmd));
+    b.n = 1;
+    *b.count = 1;
+    // Rewrite the guest bindings to whole buffers (the record carries each draw's offset) and
+    // add the records SSBO as the last binding.
+    for (u32 i = 0; i < bi; ++i) {
+        if (b.guest_mask & (u64{1} << i)) {
+            buffer_infos[i].offset = 0;
+            buffer_infos[i].range = VK_WHOLE_SIZE;
+            push_data.buf_offsets[i] = 0;
+        }
+    }
+    buffer_infos.emplace_back(stream.Handle(), offset, u64(NativeMaxDraws) * NativeRecBytes);
+    auto& w = set_writes.emplace_back();
+    w.dstSet = VK_NULL_HANDLE;
+    w.dstBinding = native->native_records_binding;
+    w.dstArrayElement = 0;
+    w.descriptorCount = 1;
+    w.descriptorType = vk::DescriptorType::eStorageBuffer;
+    w.pBufferInfo = &buffer_infos.back();
+    ++set_write_index;
+    return true;
+}
+
+void Rasterizer::NativeClose(u32 why) {
+    native_batch.open = false;
+    native_batch.cand_valid = false;
+    ++native_stats.close[std::min<u32>(why, 15)];
+}
+
+bool Rasterizer::NativeJoin(const SplitDraw& draw,
+                            const AmdGpu::CpSplit::VertexInputsPayload* front_vi) {
+    // Back thread, ExecuteDraw after the prologue. True: the draw went into the open batch.
+    auto& b = native_batch;
+    const auto& regs = liverpool->BackRegs();
+    b.cand_valid = false;
+    if (draw.pipeline != b.base) {
+        NativeClose(2);
+        return false;
+    }
+    if (!draw.args.is_indexed || !front_vi || front_vi->desc_id != b.desc_id) {
+        NativeClose(3);
+        return false;
+    }
+    if (!b.verify && (b.n >= NativeMaxDraws || scheduler.RecordSeq() != b.seq ||
+                      scheduler.CurrentTick() != b.tick)) {
+        NativeClose(b.n >= NativeMaxDraws ? 4 : 5);
+        return false;
+    }
+    if (liverpool->BackContextEpoch() != b.ctx_epoch) {
+        NativeClose(6);
+        return false;
+    }
+    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        if (liverpool->BackCbExtent(cb).raw != b.extents[cb]) {
+            NativeClose(7);
+            return false;
+        }
+    }
+    const bool is_index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
+    if (liverpool->BackDbExtent().raw != b.extents[AmdGpu::NUM_COLOR_BUFFERS] ||
+        (is_index16 ? 2u : 4u) != b.index_size || (occlusion && occlusion->Open())) {
+        NativeClose(7);
+        return false;
+    }
+    // User data, as BindResources pushes it.
+    Shader::PushData push = MakeUserData(regs);
+    Shader::Backend::Bindings bnd{};
+    for (const auto& bound : BoundStages(b.base)) {
+        if (bound.info) {
+            bound.PushUd(bnd, push);
+        }
+    }
+    // Buffers: the same lookups / syncs as BindBuffers.
+    const u64 seq0 = scheduler.RecordSeq();
+    auto* barriers = b.verify ? nullptr : &native_carry;
+    const size_t carry0 = native_carry.size();
+    std::array<u32, Shader::NUM_BUFFERS> rec_off{};
+    bool ok = true;
+    u32 bi = 0;
+    for (const auto& bound : BoundStages(b.base)) {
+        if (!bound.info) {
+            continue;
+        }
+        for (const auto& desc : bound.info->buffers) {
+            if (b.guest_mask & (u64{1} << bi)) {
+                const auto vsharp = desc.GetSharp(bound);
+                if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
+                    ok = false;
+                    break;
+                }
+                const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+                const auto [vk_buffer, offset] =
+                    buffer_cache.ObtainBuffer(vsharp.base_address, static_cast<u32>(size), false,
+                                              false, VideoCore::BufferId{},
+                                              Common::BufferSampleCaller::Storage);
+                const u64 handle = std::bit_cast<u64>(static_cast<VkBuffer>(vk_buffer->Handle()));
+                if (barriers) {
+                    if (auto barrier = vk_buffer->GetBarrier(vk::AccessFlagBits2::eShaderRead,
+                                                             vk::PipelineStageFlagBits2::eAllCommands,
+                                                             0, cur_dispatch_run)) {
+                        barriers->emplace_back(*barrier);
+                    }
+                }
+                b.cand_buf[bi] = handle;
+                b.cand_off[bi] = offset;
+                if (handle != b.buf[bi]) {
+                    ok = false;
+                }
+                rec_off[bi] = offset;
+            }
+            ++bi;
+        }
+        if (!ok) {
+            break;
+        }
+    }
+    VideoCore::NativeJoinVi jvi{};
+    if (ok) {
+        buffer_cache.NativeJoinVertexIndex(*front_vi, draw.args.index_offset, jvi, barriers);
+    }
+    s64 q = 0;
+    bool q_set = false;
+    if (ok && (jvi.n != b.vb_n || jvi.ib_buf != b.ib || jvi.ib_off % b.index_size != 0)) {
+        ok = false;
+    }
+    for (u32 k = 0; ok && k < jvi.n; ++k) {
+        if (jvi.buf[k] != b.vb[k] || jvi.stride[k] != b.vb_stride[k]) {
+            ok = false;
+            break;
+        }
+        if (jvi.buf[k] == 0) {
+            continue;
+        }
+        const s64 d = s64(jvi.off[k]) - s64(b.vb_off[k]);
+        if (b.vb_stride[k] == 0 ? d != 0 : d % s64(b.vb_stride[k]) != 0) {
+            ok = false;
+            break;
+        }
+        const s64 qk = b.vb_stride[k] == 0 ? 0 : d / s64(b.vb_stride[k]);
+        if (b.vb_stride[k] != 0) {
+            if (q_set && qk != q) {
+                ok = false;
+                break;
+            }
+            q = qk;
+            q_set = true;
+        }
+    }
+    const auto& vs_info = GetBoundStage(Shader::LogicalStage::Vertex);
+    const auto [vertex_offset, instance_offset] =
+        GetDrawOffsets(regs, vs_info, b.base->GetFetchShader());
+    if (b.verify) {
+        // The generic path renders; keep the candidate for NativeVerifyCompare.
+        b.cand_valid = ok;
+        std::memcpy(b.cand_ud.data(), push.ud_regs.data(), sizeof(u32) * Shader::NUM_USER_DATA_REGS);
+        b.cand_vi = jvi;
+        b.cand_vertex_offset = vertex_offset;
+        b.cand_instance_offset = instance_offset;
+        if (!ok) {
+            NativeClose(8);
+        }
+        return false;
+    }
+    if (!ok || native_carry.size() != carry0 || scheduler.RecordSeq() != seq0 ||
+        scheduler.CurrentTick() != b.tick) {
+        // A barrier, an upload record or a different VkBuffer: the generic path takes the draw
+        // (with the carried barriers) and may open a new batch.
+        NativeClose(!ok ? 8 : native_carry.size() != carry0 ? 9 : 10);
+        return false;
+    }
+    const s64 vo = s64(s32(vertex_offset)) + q;
+    if (vo < INT32_MIN || vo > INT32_MAX) {
+        NativeClose(11);
+        return false;
+    }
+    auto* rec = reinterpret_cast<u32*>(b.recs + u64(b.n) * NativeRecBytes);
+    std::memcpy(rec, push.ud_regs.data(), sizeof(u32) * Shader::NUM_USER_DATA_REGS);
+    std::memcpy(rec + Shader::NUM_USER_DATA_REGS, rec_off.data(), sizeof(u32) * Shader::NUM_BUFFERS);
+    const u32 cmd[5] = {regs.num_indices, regs.num_instances.NumInstances(),
+                        static_cast<u32>(jvi.ib_off / b.index_size), static_cast<u32>(s32(vo)),
+                        instance_offset};
+    std::memcpy(b.cmds + u64(b.n) * NativeCmdBytes, cmd, sizeof(cmd));
+    ++b.n;
+    *b.count = b.n;
+    ++native_stats.joins;
+    DebugState.IncDrawCall();
+    scheduler.NoteDraw();
+    MaybeFlushEveryOps(scheduler);
+    if ((native_stats.joins & 0x3ffff) == 0) {
+        NativeLog();
+    }
+    return true;
+}
+
+void Rasterizer::NativeVerifyCompare(const GraphicsPipeline* pipeline, bool is_indexed,
+                                     u32 index_offset) {
+    // Verify mode, end of the generic draw: the join's candidate vs what the generic path bound.
+    auto& b = native_batch;
+    b.cand_valid = false;
+    ++native_stats.verify_draws;
+    std::string why;
+    if (std::memcmp(b.cand_ud.data(), push_data.ud_regs.data(),
+                    sizeof(u32) * Shader::NUM_USER_DATA_REGS) != 0) {
+        why = "user data";
+    }
+    for (u32 i = 0; why.empty() && i < buffer_infos.size() && i < Shader::NUM_BUFFERS; ++i) {
+        if (!(b.guest_mask & (u64{1} << i))) {
+            continue;
+        }
+        const u64 handle = std::bit_cast<u64>(static_cast<VkBuffer>(buffer_infos[i].buffer));
+        const u64 full = buffer_infos[i].offset + push_data.buf_offsets[i];
+        if (handle != b.cand_buf[i] || full != b.cand_off[i]) {
+            why = fmt::format("buffer {} ({:#x}+{:#x} vs {:#x}+{:#x})", i, handle, full,
+                              b.cand_buf[i], b.cand_off[i]);
+        }
+    }
+    const auto& vi = VideoCore::t_native_vi;
+    if (why.empty() && (vi.n != b.cand_vi.n || vi.ib_buf != b.cand_vi.ib_buf ||
+                        vi.ib_off != b.cand_vi.ib_off)) {
+        why = fmt::format("index / vertex count (ib {:#x}+{:#x} vs {:#x}+{:#x}, n {} vs {})",
+                          vi.ib_buf, vi.ib_off, b.cand_vi.ib_buf, b.cand_vi.ib_off, vi.n,
+                          b.cand_vi.n);
+    }
+    for (u32 k = 0; why.empty() && k < vi.n; ++k) {
+        if (vi.buf[k] != b.cand_vi.buf[k] || vi.off[k] != b.cand_vi.off[k] ||
+            vi.stride[k] != b.cand_vi.stride[k]) {
+            why = fmt::format("vertex {}", k);
+        }
+    }
+    const auto& vs_info = GetBoundStage(Shader::LogicalStage::Vertex);
+    const auto [vertex_offset, instance_offset] =
+        GetDrawOffsets(liverpool->BackRegs(), vs_info, pipeline->GetFetchShader());
+    if (why.empty() && (vertex_offset != b.cand_vertex_offset ||
+                        instance_offset != b.cand_instance_offset)) {
+        why = "draw offsets";
+    }
+    if (!why.empty()) {
+        if (++native_stats.verify_mismatch <= 16) {
+            LOG_CRITICAL(Render_Vulkan, "NativePass verify MISMATCH: {}", why);
+        }
+    }
+    if ((native_stats.verify_draws & 0x3ffff) == 0) {
+        NativeLog();
+    }
+}
+
+void Rasterizer::NativeLog() {
+    const auto& st = native_stats;
+    std::string closes;
+    for (u32 i = 0; i < st.close.size(); ++i) {
+        if (st.close[i]) {
+            closes += fmt::format(" c{}={}", i, st.close[i]);
+        }
+    }
+    LOG_INFO(Render_Vulkan,
+             "NativePass: opens={} joins={} open_fail={} verify_draws={} verify_mismatch={} "
+             "closes:{}",
+             st.opens, st.joins, st.open_fail, st.verify_draws, st.verify_mismatch, closes);
 }
 
 void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
@@ -1915,7 +2271,7 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     const auto& regs = liverpool->BackRegs();
     const bool pb_census = VideoCore::g_pb_census != 0;
     const u64 nc_entry_seq = VideoCore::g_native_census ? scheduler.RecordSeq() : 0;
-    if (VideoCore::g_native_census) [[unlikely]] {
+    if (VideoCore::g_native_census || VideoCore::g_native_pass != 0) [[unlikely]] {
         VideoCore::t_native_vi.n = 0;
         VideoCore::t_native_vi.ib_buf = 0;
         VideoCore::t_native_vi.ib_type = 0;
@@ -1987,7 +2343,8 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     // SHADPS4_DRAW_REPEAT: the previous draw's resolved bindings stand when this draw repeats
     // its binding inputs and nothing changed in between (DrawRepeatMatch).
     const int repeat_mode = g_draw_repeat;
-    const bool repeat = repeat_mode != 0 && DrawRepeatMatch(pipeline, rs_hit);
+    const bool repeat =
+        repeat_mode != 0 && native_carry.empty() && DrawRepeatMatch(pipeline, rs_hit);
     bool bound;
     if (repeat && repeat_mode == 1) {
         DrawRepeatApply(pipeline);
@@ -2152,6 +2509,21 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     }
     const auto t_descwrite = Common::FaultMonitor::Now();
 
+    // SHADPS4_NATIVE_PASS: this draw opens a native batch (its own records go first).
+    bool native_open = false;
+    if (VideoCore::g_native_pass == 1 && is_indexed) [[unlikely]] {
+        if (native_batch.open) {
+            NativeClose(1);
+        }
+        const auto* native = pipeline->native_variant.load(std::memory_order_acquire);
+        if (native && !(repeat && repeat_mode == 1) && !(occlusion && occlusion->Open()) &&
+            build_set_writes && !native_bindings &&
+            NativeOpen(pipeline, native, is_indexed, index_offset, front_vi)) {
+            native_open = true;
+            pipeline = native;
+        }
+    }
+
     sample.BeginPhase(Common::DrawSampleProbe::Phase::PipelineResources);
     // SHADPS4_DRAW_PACKET: `packet` = the resources are pending as one record that must go out
     // before anything else of this draw is recorded (the legacy order is barrier, push
@@ -2222,7 +2594,32 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
             });
         }
     }
-    if (packet) {
+    if (native_open) [[unlikely]] {
+        if (packet) {
+            RecordPacket(pipeline, DrawPacketHeader{});
+            packet = false;
+        }
+        auto& stream = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
+        const u64 base_off = native_batch.stream_off;
+        const u64 cmd_off = base_off + u64(NativeMaxDraws) * NativeRecBytes;
+        const u64 count_off = cmd_off + u64(NativeMaxDraws) * NativeCmdBytes;
+        scheduler.Record([handle = pipeline->Handle(), sb = stream.Handle(), cmd_off, count_off,
+                          ib = vk::Buffer{std::bit_cast<VkBuffer>(native_batch.ib)},
+                          type = native_batch.index_size == 2 ? vk::IndexType::eUint16
+                                                              : vk::IndexType::eUint32](
+                             vk::CommandBuffer cmdbuf) {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+            cmdbuf.bindIndexBuffer(ib, 0, type);
+            cmdbuf.drawIndexedIndirectCount(sb, cmd_off, sb, count_off, NativeMaxDraws,
+                                            NativeCmdBytes);
+        });
+        GraphicsBindTracker::Invalidate();
+        scheduler.GetDynamicState().packet_state_unknown = true;
+        native_batch.seq = scheduler.RecordSeq();
+        native_batch.tick = scheduler.CurrentTick();
+        native_batch.open = true;
+        ++native_stats.opens;
+    } else if (packet) {
         // Nothing was recorded since the descriptors: the draw rides in the packet.
         DrawPacketHeader tail{};
         tail.flags = DrawPacketDraw | (is_indexed ? DrawPacketIndexed : 0u);
@@ -2254,6 +2651,20 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     }
     DebugState.IncDrawCall();
     scheduler.NoteDraw();
+    if (native_batch.verify && native_batch.cand_valid) [[unlikely]] {
+        NativeVerifyCompare(pipeline, is_indexed, index_offset);
+    }
+    if (native_open) [[unlikely]] {
+        draw_repeat.valid = false;
+    }
+    if (VideoCore::g_native_pass == 2 && is_indexed) [[unlikely]] {
+        // Verify: key the next draw's candidate on this one.
+        native_batch.open = false;
+        if (pipeline->native_variant.load(std::memory_order_acquire) &&
+            occlusion_slot == OcclusionQueries::NoSlot) {
+            NativeOpen(pipeline, nullptr, is_indexed, index_offset, front_vi);
+        }
+    }
     if (VideoCore::g_native_census) [[unlikely]] {
         NativeCensusNote(pipeline, state, nc_entry_seq, scheduler.RecordSeq(), nc_dyn,
                          !buffer_barriers.empty(), image_infos, buffer_infos, push_data,
@@ -2263,7 +2674,7 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     sample.EndPhase(Common::DrawSampleProbe::Phase::ActualDraw);
     sample.BeginPhase(Common::DrawSampleProbe::Phase::ResetImageBindings);
     ResetBindings();
-    if (repeat_mode != 0) {
+    if (repeat_mode != 0 && !native_open) {
         // An occlusion-query draw goes through the legacy records: not a base for a repeat.
         DrawRepeatStore(pipeline, occlusion_slot == OcclusionQueries::NoSlot &&
                                       !(occlusion && occlusion->Open()));
@@ -3486,6 +3897,11 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     set_write_index = 0;
     set_writes.clear();
     buffer_barriers.clear();
+    if (!native_carry.empty()) [[unlikely]] {
+        // SHADPS4_NATIVE_PASS: barriers a failed join already took from the hazard state.
+        buffer_barriers.insert(buffer_barriers.end(), native_carry.begin(), native_carry.end());
+        native_carry.clear();
+    }
     buffer_infos.clear();
     image_infos.clear();
     draw_repeat.tex_nonhit_stages = 0;

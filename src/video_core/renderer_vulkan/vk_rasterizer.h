@@ -419,6 +419,55 @@ private:
             f_epoch{}, f_image{}, f_gen{}, f_other{}, verified{}, mismatches{}, f_gated{};
     };
     DrawRepeatState draw_repeat;
+
+    /// SHADPS4_NATIVE_PASS (notes/native-renderer-2026-10-09.md sec. 3): an open native batch =
+    /// one recorded drawIndexedIndirectCount whose commands, per-draw records and count live in
+    /// a stream-buffer reservation the back keeps appending to while nothing else records.
+    static constexpr u32 NativeMaxDraws = 64;
+    static constexpr u32 NativeRecBytes = Shader::NUM_USER_DATA_REGS * 4 + Shader::NUM_BUFFERS * 4;
+    static constexpr u32 NativeCmdBytes = 20; // VkDrawIndexedIndirectCommand
+    struct NativeBatch {
+        bool open{};
+        bool verify{};
+        const GraphicsPipeline* base{};
+        u64 seq{};
+        u64 tick{};
+        u64 ctx_epoch{};
+        u64 desc_id{};
+        std::array<u32, AmdGpu::NUM_COLOR_BUFFERS + 1> extents{};
+        u32 index_size{};
+        u64 ib{};
+        u32 vb_n{};
+        std::array<u64, 16> vb{};
+        std::array<u64, 16> vb_off{};
+        std::array<u32, 16> vb_stride{};
+        std::array<u64, Shader::NUM_BUFFERS> buf{};
+        u64 guest_mask{};
+        u64 stream_off{};
+        u8* recs{};
+        u8* cmds{};
+        u32* count{};
+        u32 n{};
+        // Verify mode: the join's candidate for the draw the generic path is rendering now.
+        bool cand_valid{};
+        std::array<u32, Shader::NUM_USER_DATA_REGS> cand_ud{};
+        std::array<u64, Shader::NUM_BUFFERS> cand_buf{};
+        std::array<u64, Shader::NUM_BUFFERS> cand_off{};
+        VideoCore::NativeJoinVi cand_vi{};
+        u32 cand_vertex_offset{};
+        u32 cand_instance_offset{};
+    } native_batch;
+    boost::container::small_vector<vk::BufferMemoryBarrier2, 16> native_carry;
+    struct NativeStats {
+        u64 opens{}, joins{}, open_fail{}, verify_draws{}, verify_mismatch{};
+        std::array<u64, 16> close{};
+    } native_stats;
+    bool NativeJoin(const SplitDraw& draw, const AmdGpu::CpSplit::VertexInputsPayload* front_vi);
+    bool NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline* native, bool is_indexed,
+                    u32 index_offset, const AmdGpu::CpSplit::VertexInputsPayload* front_vi);
+    void NativeClose(u32 why);
+    void NativeVerifyCompare(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset);
+    void NativeLog();
     bool DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit);
     void DrawRepeatApply(const GraphicsPipeline* pipeline);
     void DrawRepeatVerify(const GraphicsPipeline* pipeline);

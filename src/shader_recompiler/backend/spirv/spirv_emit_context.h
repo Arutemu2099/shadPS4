@@ -251,6 +251,12 @@ public:
     Id output_viewport_index{};
     Id primitive_id{};
     Id vertex_index{};
+    Id NativeRecordLoad(u32 dword);
+    Id draw_index{};          // SHADPS4_NATIVE_PASS: DrawIndex built-in (native variant VS)
+    Id native_records{};      // SHADPS4_NATIVE_PASS: records SSBO (uint data[])
+    Id native_records_ptr{};  // pointer type to one u32 of it
+    Id native_rec_base{};     // records index of this draw's first dword
+    bool native{};
     Id instance_id{};
     Id push_data_block{};
     Id base_vertex{};

@@ -24,6 +24,7 @@
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/info.h"
+#include "shader_recompiler/native_emit.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -32,6 +33,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_compile_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
+#include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
@@ -981,6 +983,121 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
         SeedPreparedPipeline(prepared_state, it->second.get());
     }
     return it->second.get();
+}
+
+void PipelineCache::PrepareNativeVariant(const GraphicsPipeline* base) {
+    // Front thread, registers = the draw that just looked `base` up. Decided once per pipeline.
+    base->native_checked = true;
+    const auto& regs = liverpool->regs;
+    const auto why_not = [&]() -> const char* {
+        if (regs.stage_enable.raw != AmdGpu::ShaderStageEnable::VgtStages::Vs) {
+            return "stages";
+        }
+        const auto stages = base->GetStages();
+        const auto* vs = stages[u32(LogicalStage::Vertex)];
+        const auto* fs = stages[u32(LogicalStage::Fragment)];
+        if (!vs) {
+            return "no vs";
+        }
+        for (u32 i = 0; i < stages.size(); ++i) {
+            if (stages[i] && i != u32(LogicalStage::Vertex) && i != u32(LogicalStage::Fragment)) {
+                return "extra stage";
+            }
+        }
+        if (fs && (!fs->buffers.empty() || !fs->images.empty() || !fs->samplers.empty() ||
+                   fs->ud_mask.mask != 0 || fs->uses_dma)) {
+            return "fs resources";
+        }
+        if (!vs->images.empty() || !vs->samplers.empty() || vs->uses_dma) {
+            return "vs images";
+        }
+        if (vs->buffers.empty()) {
+            return "vs no buffers";
+        }
+        for (const auto& desc : vs->buffers) {
+            if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
+                continue;
+            }
+            if (desc.buffer_type != Shader::BufferType::Guest || desc.is_written ||
+                desc.is_formatted || !desc.IsStorage(desc.GetSharp(*vs))) {
+                return "vs buffer kind";
+            }
+        }
+        return nullptr;
+    }();
+    static u32 logged = 0;
+    if (why_not) {
+        if (logged++ < 64) {
+            LOG_INFO(Render_Vulkan, "NativePass: pipeline {:#x} not eligible ({})",
+                     std::hash<GraphicsPipelineKey>{}(base->GetGraphicsKey()), why_not);
+        }
+        return;
+    }
+    // Rebuild the stage selection for the current registers (members infos / modules /
+    // runtime_infos / fetch_shader) and make sure it is `base`.
+    if (!RefreshGraphicsKey() || !(graphics_key == base->GetGraphicsKey())) {
+        if (logged++ < 64) {
+            LOG_WARNING(Render_Vulkan, "NativePass: pipeline {:#x} key did not rebuild",
+                        std::hash<GraphicsPipelineKey>{}(base->GetGraphicsKey()));
+        }
+        return;
+    }
+    // Binding numbering as GraphicsPipeline::CollectDescSetBindings / the stage loop: every
+    // stage in LogicalStage order advances the counters by its shared Info.
+    Shader::Backend::Bindings total{};
+    std::array<Shader::Backend::Bindings, MaxShaderStages> starts{};
+    // RefreshGraphicsStages binds the fragment stage first, then the vertex stage.
+    const std::array<LogicalStage, 2> order{LogicalStage::Fragment, LogicalStage::Vertex};
+    for (const auto l : order) {
+        starts[u32(l)] = total;
+        if (infos[u32(l)]) {
+            infos[u32(l)]->AddBindings(total);
+        }
+    }
+    const u32 records_binding = total.unified;
+    auto native_modules = modules;
+    {
+        const u32 vs_idx = u32(LogicalStage::Vertex);
+        const auto* pgm = regs.ProgramForStage(u32(Shader::Stage::Vertex));
+        if (!pgm || !pgm->Address<u32*>()) {
+            return;
+        }
+        const auto params = AmdGpu::GetParams(*pgm);
+        auto new_info = Shader::Info(Shader::Stage::Vertex, LogicalStage::Vertex, params);
+        new_info.pinned_uses_dma = infos[vs_idx]->uses_dma;
+        auto runtime_info = runtime_infos[vs_idx];
+        auto binding = starts[vs_idx];
+        Shader::t_native_emit = {true, records_binding};
+        const auto ir_program = Shader::TranslateProgram(params.code, pools, new_info, runtime_info,
+                                                         profile);
+        const auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
+        Shader::t_native_emit = {};
+        if (!SameBindingLayout(new_info, *infos[vs_idx])) {
+            LOG_ERROR(Render_Vulkan, "NativePass: vs_{:#x} native layout differs; not used",
+                      params.hash);
+            return;
+        }
+        DumpShader(spv, params.hash, Shader::Stage::Vertex, 0x4e41, "native.spv");
+        native_modules[vs_idx] = CompileSPV(spv, instance.GetDevice());
+        Vulkan::SetObjectName(instance.GetDevice(), native_modules[vs_idx], "vs_{:#x}_native",
+                              params.hash);
+    }
+    GraphicsPipeline::SerializationSupport sdata{};
+    auto variant = std::make_unique<GraphicsPipeline>(
+        instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
+        runtime_infos, fetch_shader, native_modules, sdata, false, nullptr, records_binding);
+    if (!variant->UsesPushDescriptors()) {
+        LOG_WARNING(Render_Vulkan, "NativePass: variant of {:#x} has no push descriptors",
+                    std::hash<GraphicsPipelineKey>{}(graphics_key));
+        native_variants.push_back(std::move(variant));
+        return;
+    }
+    base->native_variant.store(variant.get(), std::memory_order_release);
+    if (logged++ < 64) {
+        LOG_INFO(Render_Vulkan, "NativePass: variant of pipeline {:#x} built (records binding {})",
+                 std::hash<GraphicsPipelineKey>{}(graphics_key), records_binding);
+    }
+    native_variants.push_back(std::move(variant));
 }
 
 void PipelineCache::QueueAsyncPipeline(u64 pipeline_hash) {

@@ -36,9 +36,11 @@ GraphicsPipeline::GraphicsPipeline(
     std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
     std::shared_ptr<const Shader::Gcn::FetchShaderData> fetch_shader_,
     std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading,
-    const DescSetBindings* derived /*= nullptr*/)
+    const DescSetBindings* derived /*= nullptr*/,
+    u32 native_records_binding_ /*= NoNativeRecords*/)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_},
       fetch_shader{std::move(fetch_shader_)} {
+    native_records_binding = native_records_binding_;
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
     // With `derived`, the lookup thread already read everything below that needs an Info's
@@ -50,6 +52,19 @@ GraphicsPipeline::GraphicsPipeline(
     } else {
         DescSetBindings bindings;
         CollectDescSetBindings(stages, sdata, preloading, bindings);
+        if (native_records_binding != NoNativeRecords) {
+            // SHADPS4_NATIVE_PASS: the per-draw records the native vertex shader reads.
+            const u32 next =
+                bindings.empty() ? 0u : bindings.back().binding + bindings.back().descriptorCount;
+            ASSERT_MSG(next == native_records_binding, "native records binding {} vs {}", next,
+                       native_records_binding);
+            bindings.push_back({
+                .binding = native_records_binding,
+                .descriptorType = vk::DescriptorType::eStorageBuffer,
+                .descriptorCount = 1,
+                .stageFlags = vk::ShaderStageFlagBits::eVertex,
+            });
+        }
         BuildDescSetLayout(std::span{bindings.data(), bindings.size()});
     }
     const auto debug_str = GetDebugString();

@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include <memory>
 
 #include <boost/container/static_vector.hpp>
@@ -106,8 +108,11 @@ public:
                      std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
                      std::shared_ptr<const Shader::Gcn::FetchShaderData> fetch_shader,
                      std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
-                     bool preloading, const DescSetBindings* derived = nullptr);
+                     bool preloading, const DescSetBindings* derived = nullptr,
+                     u32 native_records_binding = NoNativeRecords);
     ~GraphicsPipeline();
+
+    static constexpr u32 NoNativeRecords = ~0u;
 
     /// SHADPS4_ASYNC_PIPELINES: the parts of construction that read the stage Infos' per-draw
     /// state (user data behind image sharps and fetch V#s), run on the lookup thread. Fills
@@ -154,6 +159,12 @@ public:
     mutable u8 pb_last_pure = 0;
     mutable u64 pb_last_draw = 0;
     mutable std::vector<u32> pb_key;
+    /// SHADPS4_NATIVE_PASS (notes/native-renderer-2026-10-09.md sec. 3): the native batch
+    /// variant of this pipeline (front thread writes once, back reads), whether the front has
+    /// decided eligibility, and for a variant itself the records binding.
+    mutable std::atomic<const GraphicsPipeline*> native_variant{nullptr};
+    mutable bool native_checked = false;
+    u32 native_records_binding = NoNativeRecords;
 
 private:
     /// One binding per buffer and sampler, one per image with its descriptor count (recorded

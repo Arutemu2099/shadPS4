@@ -738,6 +738,10 @@ public:
     explicit StreamBuffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                           MemoryUsage usage, u64 size_bytes_);
 
+    bool IsCoherent() const noexcept {
+        return is_coherent;
+    }
+
     /// Reserves a region of memory from the stream buffer.
     std::pair<u8*, u64> Map(u64 size, u64 alignment = 0, bool allow_wait = true);
 

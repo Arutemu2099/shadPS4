@@ -21,6 +21,18 @@ struct NativeCensusVi {
     u32 ib_type{};
 };
 extern const bool g_native_census;
+/// SHADPS4_NATIVE_PASS: 0 off, 1 native shadow batches, 2 verify (generic path renders).
+extern const int g_native_pass;
+
+/// SHADPS4_NATIVE_PASS join: one draw's vertex / index bindings as the batch would use them.
+struct NativeJoinVi {
+    u32 n{};
+    std::array<u64, 16> buf{};
+    std::array<u64, 16> off{};
+    std::array<u32, 16> stride{};
+    u64 ib_buf{};
+    u64 ib_off{};
+};
 inline thread_local NativeCensusVi t_native_vi{};
 
 } // namespace VideoCore

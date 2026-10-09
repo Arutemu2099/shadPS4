@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "video_core/native_census.h"
+
 #include <shared_mutex>
 
 #include <map>
@@ -177,6 +179,14 @@ public:
                            const AmdGpu::CpSplit::VertexInputsPayload* front_vi = nullptr);
 
     /// Bind host index buffer for the current draw.
+    /// SHADPS4_NATIVE_PASS join (notes/native-renderer-2026-10-09.md sec. 3): the same buffer
+    /// lookups / syncs BindVertexBuffersDerived and BindIndexBuffer make, without recording
+    /// anything; host handles and offsets go to `out`. With `barriers` non-null the hazard state
+    /// is advanced exactly as those functions do and any barrier is appended there.
+    void NativeJoinVertexIndex(const AmdGpu::CpSplit::VertexInputsPayload& vi, u32 index_offset,
+                               NativeJoinVi& out,
+                               boost::container::small_vector<vk::BufferMemoryBarrier2, 16>* barriers);
+
     void BindIndexBuffer(u32 index_offset,
                          boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers);
 

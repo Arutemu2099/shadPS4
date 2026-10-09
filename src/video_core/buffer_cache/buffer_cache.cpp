@@ -42,6 +42,10 @@ const bool g_native_census = [] {
     const char* e = std::getenv("SHADPS4_NATIVE_CENSUS");
     return e && e[0] == '1';
 }();
+const int g_native_pass = [] {
+    const char* e = std::getenv("SHADPS4_NATIVE_PASS");
+    return e ? e[0] - '0' : 0;
+}();
 
 namespace {
 // SHADPS4_DRAW_COST=1 (diagnostic): ObtainBufferForImage path and cycle split for calls over
@@ -3568,7 +3572,7 @@ void BufferCache::BindVertexBuffers(
         host_sizes.push_back(buffer.GetSize());
         host_strides.push_back(buffer.GetStride());
     }
-    if (g_native_census) [[unlikely]] {
+    if (g_native_census || g_native_pass != 0) [[unlikely]] {
         auto& nv = t_native_vi;
         nv.n = static_cast<u32>(std::min<size_t>(host_buffers.size(), nv.buf.size()));
         for (u32 k = 0; k < nv.n; ++k) {
@@ -3685,7 +3689,7 @@ void BufferCache::BindVertexBuffersDerived(
             host_strides.push_back(attrib.desc.stride);
         }
     }
-    if (g_native_census) [[unlikely]] {
+    if (g_native_census || g_native_pass != 0) [[unlikely]] {
         auto& nv = t_native_vi;
         nv.n = std::min<u32>(vi.count, static_cast<u32>(nv.buf.size()));
         for (u32 k = 0; k < nv.n; ++k) {
@@ -3706,6 +3710,61 @@ void BufferCache::BindVertexBuffersDerived(
         },
         std::span<const vk::Buffer>{host_buffers}, std::span<const vk::DeviceSize>{host_offsets},
         std::span<const vk::DeviceSize>{host_sizes}, std::span<const vk::DeviceSize>{host_strides});
+}
+
+void BufferCache::NativeJoinVertexIndex(
+    const AmdGpu::CpSplit::VertexInputsPayload& vi, u32 index_offset, NativeJoinVi& out,
+    boost::container::small_vector<vk::BufferMemoryBarrier2, 16>* barriers) {
+    using namespace AmdGpu::CpSplit;
+    const auto* attribs = VertexInputAttribs(vi);
+    const auto* vi_ranges = VertexInputRanges(vi);
+    struct Mapped {
+        vk::Buffer vk_buffer;
+        u64 offset;
+    };
+    std::array<Mapped, MaxVertexInputs> mapped{};
+    for (u32 i = 0; i < vi.range_count; ++i) {
+        const auto& range = vi_ranges[i];
+        const u64 size =
+            memory->ClampRangeSize(range.base_address, range.end_address - range.base_address);
+        const auto [buffer, offset] = ObtainBuffer(range.base_address, size, false);
+        mapped[i] = {buffer->buffer, offset};
+        if (barriers && IsRegionGpuModified(range.base_address, size)) {
+            if (auto barrier =
+                    buffer->GetBarrier(vk::AccessFlagBits2::eVertexAttributeRead,
+                                       vk::PipelineStageFlagBits2::eVertexAttributeInput)) {
+                barriers->emplace_back(*barrier);
+            }
+        }
+    }
+    out.n = std::min<u32>(vi.count, static_cast<u32>(out.buf.size()));
+    for (u32 k = 0; k < out.n; ++k) {
+        const auto& attrib = attribs[k];
+        if (attrib.range != VertexInputNoRange) {
+            out.buf[k] = std::bit_cast<u64>(static_cast<VkBuffer>(mapped[attrib.range].vk_buffer));
+            out.off[k] = mapped[attrib.range].offset + attrib.base_address -
+                         vi_ranges[attrib.range].base_address;
+        } else {
+            out.buf[k] = 0;
+            out.off[k] = 0;
+        }
+        out.stride[k] = attrib.desc.stride;
+    }
+    const auto& regs = liverpool->BackRegs();
+    const bool is_index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
+    const u32 index_size = is_index16 ? sizeof(u16) : sizeof(u32);
+    const VAddr index_address =
+        regs.index_base_address.Address<VAddr>() + index_offset * index_size;
+    const u32 index_buffer_size = regs.num_indices * index_size;
+    const auto [vk_buffer, offset] = ObtainBuffer(index_address, index_buffer_size, false);
+    if (barriers && IsRegionGpuModified(index_address, index_buffer_size)) {
+        if (auto barrier = vk_buffer->GetBarrier(vk::AccessFlagBits2::eIndexRead,
+                                                 vk::PipelineStageFlagBits2::eIndexInput)) {
+            barriers->emplace_back(*barrier);
+        }
+    }
+    out.ib_buf = std::bit_cast<u64>(static_cast<VkBuffer>(vk_buffer->Handle()));
+    out.ib_off = offset;
 }
 
 void BufferCache::BindIndexBuffer(
@@ -3736,7 +3795,7 @@ void BufferCache::BindIndexBuffer(
             barriers.emplace_back(*barrier);
         }
     }
-    if (g_native_census) [[unlikely]] {
+    if (g_native_census || g_native_pass != 0) [[unlikely]] {
         t_native_vi.ib_buf = std::bit_cast<u64>(static_cast<VkBuffer>(vk_buffer->Handle()));
         t_native_vi.ib_off = offset;
         t_native_vi.ib_type = index_size;
