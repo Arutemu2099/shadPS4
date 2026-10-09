@@ -291,6 +291,10 @@ struct StaticKeyCensus {
     std::unordered_map<u64, StaticKeyRec> seen; // key hash -> last occurrence
     std::vector<std::pair<VAddr, VAddr>> ranges; // this draw's static buffer ranges
     u64 hit_buf_ok = 0, hit_img_ok = 0, hit_both_ok = 0, big_bindings = 0, hit_textured_ok = 0;
+    // Previous FULL draw (BindResources) had the same static key; and the previous draw of any
+    // kind was that full draw (no repeat / join in between), the draw-repeat shape.
+    u64 prev_key = 0, prev_full_seq = 0, prev_match = 0, prev_match_textured = 0,
+        prev_match_adjacent = 0;
     std::unordered_set<u32> heap_ids;  // heap buffer ids this window
     u64 frame = 0;
     u64 draws = 0, textured = 0, hit = 0, hit_textured = 0, hit_same_frame = 0;
@@ -5093,6 +5097,16 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         }
         ++c.draws;
         c.textured += textured;
+        {
+            const u64 seq = draw_repeat.draws; // DrawRepeatMatch counts every draw
+            if (h == c.prev_key) {
+                ++c.prev_match;
+                c.prev_match_textured += textured;
+                c.prev_match_adjacent += seq == c.prev_full_seq + 1;
+            }
+            c.prev_key = h;
+            c.prev_full_seq = seq;
+        }
         StaticKeyRec now{};
         now.frame = frame;
         now.clock = VideoCore::g_granule_clock.load(std::memory_order_acquire);
@@ -5149,6 +5163,14 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
                      100.0 * double(c.hit_both_ok) / double(std::max<u64>(c.hit, 1)),
                      100.0 * double(c.hit_textured_ok) / double(std::max<u64>(c.textured, 1)),
                      c.big_bindings);
+            LOG_INFO(Render_Vulkan,
+                     "StaticKeyPrev: same static key as the previous full draw {} ({:.1f}% of full "
+                     "draws; textured {:.1f}% of textured full draws), adjacent (no repeat / join "
+                     "between) {}",
+                     c.prev_match, 100.0 * double(c.prev_match) / double(c.draws),
+                     100.0 * double(c.prev_match_textured) / double(std::max<u64>(c.textured, 1)),
+                     c.prev_match_adjacent);
+            c.prev_match = c.prev_match_textured = c.prev_match_adjacent = 0;
             c.hit_buf_ok = c.hit_img_ok = c.hit_both_ok = c.big_bindings = c.hit_textured_ok = 0;
             c.draws = c.textured = c.hit = c.hit_textured = c.hit_same_frame = 0;
             c.heap_bindings = c.static_bindings = c.frames = c.distinct_new = 0;
