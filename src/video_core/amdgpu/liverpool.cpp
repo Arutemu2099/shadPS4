@@ -2383,6 +2383,95 @@ void FenceCensusNote(std::span<const u32> span, VAddr label, bool asc, bool in_r
                  st.at_type[3], double(st.span_dw) / double(st.syncs), line);
     }
 }
+/// Census v3: from the fence forward to the end of the span, the first WAIT_REG_MEM on memory
+/// polling the label: distance (packets, draws) and whether the fence's own value passes it.
+struct FenceWaitState {
+    u64 n = 0, eos = 0, no_wait = 0, pass = 0, fail = 0, other_writer = 0;
+    std::array<u64, 5> draws_between{}; // 0, 1-3, 4-15, 16-63, 64+
+    std::array<u64, 5> packets_between{};
+} g_fence_wait;
+
+void FenceWaitNote(const PM4Header* fence, const u32* end, VAddr label) {
+    auto& st = g_fence_wait;
+    ++st.n;
+    u32 value = 0;
+    switch (fence->type3.opcode.Value()) {
+    case PM4ItOpcode::EventWriteEop:
+        value = reinterpret_cast<const PM4CmdEventWriteEop*>(fence)->DataDWord();
+        break;
+    case PM4ItOpcode::ReleaseMem:
+        value = reinterpret_cast<const PM4CmdReleaseMem*>(fence)->DataDWord();
+        break;
+    default:
+        ++st.eos;
+        return;
+    }
+    const auto bucket = [](u64 v) { return v == 0 ? 0 : v < 4 ? 1 : v < 16 ? 2 : v < 64 ? 3 : 4; };
+    const u32* p = reinterpret_cast<const u32*>(fence) + fence->type3.NumWords() + 1;
+    u64 draws = 0, packets = 0;
+    while (p < end) {
+        const auto* h = reinterpret_cast<const PM4Header*>(p);
+        u32 n = 1;
+        if (h->type == 3) {
+            n = h->type3.NumWords() + 1;
+            const auto op = h->type3.opcode.Value();
+            using O = PM4ItOpcode;
+            draws += op == O::DrawIndex2 || op == O::DrawIndexOffset2 || op == O::DrawIndexAuto ||
+                     op == O::DispatchDirect || op == O::DrawIndexIndirect ||
+                     op == O::DispatchIndirect;
+            if (op == O::WaitRegMem) {
+                const auto* w = reinterpret_cast<const PM4CmdWaitRegMem*>(h);
+                const VAddr a = reinterpret_cast<VAddr>(w->Address<u32*>());
+                if (w->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory && a == label) {
+                    std::array<u32, 1> fake{};
+                    // Evaluate the predicate on the value the fence will write.
+                    const u32 v = value & w->mask;
+                    bool ok = false;
+                    using F = PM4CmdWaitRegMem::Function;
+                    switch (w->function.Value()) {
+                    case F::Always: ok = true; break;
+                    case F::LessThan: ok = v < w->ref; break;
+                    case F::LessThanEqual: ok = v <= w->ref; break;
+                    case F::Equal: ok = v == w->ref; break;
+                    case F::NotEqual: ok = v != w->ref; break;
+                    case F::GreaterThanEqual: ok = v >= w->ref; break;
+                    case F::GreaterThan: ok = v > w->ref; break;
+                    default: break;
+                    }
+                    (void)fake;
+                    ++(ok ? st.pass : st.fail);
+                    ++st.draws_between[bucket(draws)];
+                    ++st.packets_between[bucket(packets)];
+                    break;
+                }
+            }
+            if ((op == O::EventWriteEop || op == O::ReleaseMem || op == O::WriteData) && p != reinterpret_cast<const u32*>(fence)) {
+                // another writer that might target the label before the wait
+                if (op == O::EventWriteEop &&
+                    reinterpret_cast<VAddr>(reinterpret_cast<const PM4CmdEventWriteEop*>(h)->Address<u32>()) == label) {
+                    ++st.other_writer;
+                }
+            }
+        } else if (h->type == 0) {
+            n = h->type0.NumWords() + 1;
+        }
+        ++packets;
+        p += n;
+    }
+    if (p >= end) {
+        ++st.no_wait;
+    }
+    if ((st.n & 0x3fff) == 0) {
+        LOG_INFO(Render,
+                 "FenceWait: fences={} eos={} no_wait_in_span={} wait_pass_with_fence_value={} "
+                 "wait_fail={} other_eop_writer={} draws_between 0/1-3/4-15/16-63/64+={}/{}/{}/{}/{} "
+                 "packets_between={}/{}/{}/{}/{}",
+                 st.n, st.eos, st.no_wait, st.pass, st.fail, st.other_writer, st.draws_between[0],
+                 st.draws_between[1], st.draws_between[2], st.draws_between[3],
+                 st.draws_between[4], st.packets_between[0], st.packets_between[1],
+                 st.packets_between[2], st.packets_between[3], st.packets_between[4]);
+    }
+}
 } // namespace
 
 void Liverpool::RunFence(const PM4Header* header, std::span<const u32> rest, VAddr label,
@@ -2404,6 +2493,7 @@ void Liverpool::RunFence(const PM4Header* header, std::span<const u32> rest, VAd
     if ((label < hi && lo < label + LabelBytes) ||
         SplitSpansOverlap(label, label + LabelBytes)) {
         if (g_fence_census) [[unlikely]] {
+            FenceWaitNote(header, reinterpret_cast<const u32*>(hi), label);
             const bool asc = (flags & CpSplit::AscReleaseMem) != 0;
             if (label < hi && lo < label + LabelBytes) {
                 FenceCensusNote(rest, label, asc, true, header);
