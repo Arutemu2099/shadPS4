@@ -27,6 +27,15 @@
 #include "core/tls.h"
 #include "ipc/ipc.h"
 
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include <vector>
+#include <memory>
+#include <mutex>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #ifndef _WIN32
 #include <signal.h>
 #endif
@@ -298,6 +307,76 @@ Module* Linker::FindByAddress(VAddr address) {
     return nullptr;
 }
 
+// ---- Import census (SHADPS4_IMPORT_CENSUS=1; 2026-10-09 native-path study) ----
+// Every resolved function import of a non-system module is routed through a tiny trampoline
+// that bumps a per-import counter; a thread logs the per-import call deltas every 10 s.
+namespace {
+struct ImportCensusEntry {
+    std::string lib;
+    std::string name;
+    VAddr got;
+    u64 target;
+    std::atomic<u64> count{0};
+    u64 last{0};
+};
+std::vector<std::unique_ptr<ImportCensusEntry>>* g_import_census = nullptr;
+u8* g_import_tramp = nullptr;
+std::mutex g_import_census_mutex;
+size_t g_import_tramp_used = 0;
+constexpr size_t kImportTrampSize = 1u << 20;
+bool ImportCensusOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("SHADPS4_IMPORT_CENSUS");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+u64 MakeImportTrampoline(ImportCensusEntry* e) {
+    if (!g_import_tramp) {
+#ifdef _WIN32
+        g_import_tramp = static_cast<u8*>(
+            VirtualAlloc(nullptr, kImportTrampSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+#endif
+        g_import_census = new std::vector<std::unique_ptr<ImportCensusEntry>>();
+        std::thread([] {
+            Common::SetCurrentThreadName("shadPS4:ImportCensus");
+            u32 window = 0;
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::seconds(10));
+                ++window;
+                std::string line;
+                std::scoped_lock lk{g_import_census_mutex};
+                for (auto& ent : *g_import_census) {
+                    const u64 c = ent->count.load(std::memory_order_relaxed);
+                    const u64 d = c - ent->last;
+                    ent->last = c;
+                    if (d) {
+                        line += fmt::format(" {}:{}={}", ent->lib, ent->name, d);
+                    }
+                }
+                LOG_INFO(Core_Linker, "ImportCensus w{} (10 s):{}", window, line);
+            }
+        }).detach();
+    }
+    if (!g_import_tramp || g_import_tramp_used + 32 > kImportTrampSize) {
+        return e->target;
+    }
+    u8* p = g_import_tramp + g_import_tramp_used;
+    u8* code = p;
+    const u64 cnt = reinterpret_cast<u64>(&e->count);
+    // mov r11, imm64 (counter)
+    *p++ = 0x49; *p++ = 0xBB; std::memcpy(p, &cnt, 8); p += 8;
+    // lock inc qword [r11]
+    *p++ = 0xF0; *p++ = 0x49; *p++ = 0xFF; *p++ = 0x03;
+    // mov r11, imm64 (target)
+    *p++ = 0x49; *p++ = 0xBB; std::memcpy(p, &e->target, 8); p += 8;
+    // jmp r11
+    *p++ = 0x41; *p++ = 0xFF; *p++ = 0xE3;
+    g_import_tramp_used = ((p - g_import_tramp) + 15) & ~size_t(15);
+    return reinterpret_cast<u64>(code);
+}
+} // namespace
+
 void Linker::Relocate(Module* module) {
     module->ForEachRelocation([&](elf_relocation* rel, u32 i, bool is_jmp_rel) {
         const u32 num_relocs = module->dynamic_info.relocation_table_size / sizeof(elf_relocation);
@@ -385,6 +464,22 @@ void Linker::Relocate(Module* module) {
             LOG_INFO(Core_Linker, "UNK type {:#010x} rel symbol : {:#010x}", type, symbol);
         }
 
+        if (rel_is_resolved && ImportCensusOn() && rel_sym_type == Loader::SymbolType::Function &&
+            (type == R_X86_64_JUMP_SLOT || type == R_X86_64_GLOB_DAT) && !module->IsSystemLib()) {
+            const auto ids = Common::SplitString(names_tlb + symbol_table[symbol].st_name, '#');
+            const LibraryInfo* lib = ids.size() == 3 ? module->FindLibrary(ids[1]) : nullptr;
+            auto ent = std::make_unique<ImportCensusEntry>();
+            ent->lib = lib ? lib->name : std::string("?");
+            ent->name = rel_name;
+            ent->got = rel_virtual_addr;
+            ent->target = rel_value;
+            const u64 tramp = MakeImportTrampoline(ent.get());
+            LOG_INFO(Core_Linker, "ImportCensus map got={:#x} type={} {}:{} target={:#x}",
+                     rel_virtual_addr, type, ent->lib, ent->name, rel_value);
+            rel_value = tramp;
+            std::scoped_lock lk{g_import_census_mutex};
+            g_import_census->push_back(std::move(ent));
+        }
         if (rel_is_resolved) {
             std::memcpy(reinterpret_cast<void*>(rel_virtual_addr), &rel_value, sizeof(rel_value));
         } else if (rel_sym_type == Loader::SymbolType::Function) {

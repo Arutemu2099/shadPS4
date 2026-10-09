@@ -28,6 +28,7 @@
 #include "video_core/buffer_cache/dirty_epoch.h"
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/pb_census.h"
+#include "video_core/native_census.h"
 #include "video_core/host_shaders/neo_id_derive_comp.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -651,6 +652,219 @@ void NoteMergeProbe(const GraphicsPipeline* pipeline, std::span<const Shader::Bo
     stats.clear();
     draws = 0;
 }
+// SHADPS4_NATIVE_CENSUS=1 (diagnostic, default off; native-path study 2026-10-09): could this
+// draw join the previous draw in ONE host multi-draw-indirect call? Host-level conditions: same
+// pipeline, same rendering state, nothing recorded between the two draws, no dynamic-state
+// change, no buffer barrier, identical image / sampler bindings, the same VkBuffer in every
+// buffer slot (offsets may differ: they would travel in a per-draw record), the same VkBuffer in
+// every vertex slot with offsets one common multiple of the strides apart (a vertexOffset), the
+// same index VkBuffer / type, the same viewport push data, no occlusion query. The first failing
+// condition is counted. Groups: depth-only (no colour attachment) vs colour. Logged every 2^20
+// draws.
+enum NativeBreak : u32 {
+    NbFirst,
+    NbBetween,
+    NbPipeline,
+    NbRendering,
+    NbDynState,
+    NbBarrier,
+    NbImages,
+    NbBuffers,
+    NbVertex,
+    NbIndex,
+    NbViewport,
+    NbOcclusion,
+    NbGroup,
+    NbCount
+};
+constexpr std::array<const char*, NbCount> kNativeBreakNames{
+    "first",  "between", "pipeline", "rendering", "dynstate", "barrier",   "images",
+    "buffers", "vertex", "index",    "viewport",  "occlusion", "group"};
+struct NativeCensusGroup {
+    u64 draws{};
+    u64 joins{};
+    u64 runs{};
+    u64 run_hist[6]{}; // run lengths 1, 2-3, 4-7, 8-15, 16-63, 64+
+    u64 cur_run{};
+    std::array<u64, NbCount> breaks{};
+};
+struct NativeCensusPrev {
+    const void* pipeline{};
+    RenderState state{};
+    u64 end_seq{~0ULL};
+    std::vector<vk::DescriptorImageInfo> images;
+    std::vector<VkBuffer> buffers;
+    VideoCore::NativeCensusVi vi{};
+    std::array<float, 4> vp{};
+    u32 group{};
+};
+thread_local NativeCensusPrev t_nc_prev;
+thread_local std::array<NativeCensusGroup, 2> t_nc_groups;
+thread_local std::unordered_map<u64, std::array<u64, 3>> t_nc_pipes; // fs -> draws, joins, runs
+thread_local u64 t_nc_draws = 0;
+
+void NativeCensusCloseRun(NativeCensusGroup& g) {
+    if (g.cur_run == 0) {
+        return;
+    }
+    ++g.runs;
+    const u64 r = g.cur_run;
+    g.run_hist[r == 1 ? 0 : r < 4 ? 1 : r < 8 ? 2 : r < 16 ? 3 : r < 64 ? 4 : 5]++;
+    g.cur_run = 0;
+}
+
+u32 NativeCensusWhy(const NativeCensusPrev& prev, const GraphicsPipeline* pipeline,
+                    const RenderState& state, u64 entry_seq, bool dyn_change, bool barriers,
+                    std::span<const vk::DescriptorImageInfo> images,
+                    std::span<const vk::DescriptorBufferInfo> buffers,
+                    const Shader::PushData& push, bool occlusion, u32 group) {
+    const auto& vi = VideoCore::t_native_vi;
+    if (prev.pipeline == nullptr) {
+        return NbFirst;
+    }
+    if (entry_seq != prev.end_seq) {
+        return NbBetween;
+    }
+    if (prev.pipeline != pipeline) {
+        return NbPipeline;
+    }
+    if (prev.group != group || !(prev.state == state)) {
+        return NbRendering;
+    }
+    if (dyn_change) {
+        return NbDynState;
+    }
+    if (barriers) {
+        return NbBarrier;
+    }
+    if (occlusion) {
+        return NbOcclusion;
+    }
+    if (images.size() != prev.images.size() ||
+        !std::equal(images.begin(), images.end(), prev.images.begin())) {
+        return NbImages;
+    }
+    if (buffers.size() != prev.buffers.size()) {
+        return NbBuffers;
+    }
+    for (size_t i = 0; i < buffers.size(); ++i) {
+        if (static_cast<VkBuffer>(buffers[i].buffer) != prev.buffers[i]) {
+            return NbBuffers;
+        }
+    }
+    if (vi.n != prev.vi.n) {
+        return NbVertex;
+    }
+    s64 q = 0;
+    bool q_set = false;
+    for (u32 k = 0; k < vi.n; ++k) {
+        if (vi.buf[k] != prev.vi.buf[k] || vi.stride[k] != prev.vi.stride[k]) {
+            return NbVertex;
+        }
+        if (vi.buf[k] == 0 || vi.off[k] == prev.vi.off[k]) {
+            continue;
+        }
+        const s64 d = s64(vi.off[k]) - s64(prev.vi.off[k]);
+        if (vi.stride[k] == 0 || d % s64(vi.stride[k]) != 0) {
+            return NbVertex;
+        }
+        const s64 qk = d / s64(vi.stride[k]);
+        if (q_set && qk != q) {
+            return NbVertex;
+        }
+        q = qk;
+        q_set = true;
+    }
+    if (vi.ib_buf != prev.vi.ib_buf || vi.ib_type != prev.vi.ib_type ||
+        (vi.ib_type != 0 && (s64(vi.ib_off) - s64(prev.vi.ib_off)) % s64(vi.ib_type) != 0)) {
+        return NbIndex;
+    }
+    if (push.xoffset != prev.vp[0] || push.yoffset != prev.vp[1] || push.xscale != prev.vp[2] ||
+        push.yscale != prev.vp[3]) {
+        return NbViewport;
+    }
+    return NbCount;
+}
+
+void NativeCensusNote(const GraphicsPipeline* pipeline, const RenderState& state, u64 entry_seq,
+                      u64 end_seq, bool dyn_change, bool barriers,
+                      std::span<const vk::DescriptorImageInfo> images,
+                      std::span<const vk::DescriptorBufferInfo> buffers,
+                      const Shader::PushData& push, bool occlusion) {
+    auto& prev = t_nc_prev;
+    const u32 group = state.num_color_attachments == 0 ? 0 : 1;
+    const u32 why = NativeCensusWhy(prev, pipeline, state, entry_seq, dyn_change, barriers, images,
+                                    buffers, push, occlusion, group);
+    u64 fs = 0;
+    for (const auto* stage : pipeline->GetStages()) {
+        if (stage && stage->l_stage == Shader::LogicalStage::Fragment) {
+            fs = stage->pgm_hash;
+        }
+    }
+    auto& pp = t_nc_pipes[fs];
+    ++pp[0];
+    auto& g = t_nc_groups[group];
+    ++g.draws;
+    if (why == NbCount) {
+        ++g.joins;
+        ++pp[1];
+        ++g.cur_run;
+    } else {
+        NativeCensusCloseRun(t_nc_groups[0]);
+        NativeCensusCloseRun(t_nc_groups[1]);
+        ++g.breaks[why];
+        g.cur_run = 1;
+        ++pp[2];
+    }
+    prev.pipeline = pipeline;
+    prev.state = state;
+    prev.end_seq = end_seq;
+    prev.images.assign(images.begin(), images.end());
+    prev.buffers.clear();
+    for (const auto& b : buffers) {
+        prev.buffers.push_back(static_cast<VkBuffer>(b.buffer));
+    }
+    prev.vi = VideoCore::t_native_vi;
+    prev.vp = {push.xoffset, push.yoffset, push.xscale, push.yscale};
+    prev.group = group;
+    if ((++t_nc_draws & 0xFFFFF) != 0) {
+        return;
+    }
+    for (u32 gi = 0; gi < 2; ++gi) {
+        auto& gg = t_nc_groups[gi];
+        std::string br;
+        for (u32 b = 0; b < NbCount; ++b) {
+            if (gg.breaks[b]) {
+                br += fmt::format(" {}={:.1f}%", kNativeBreakNames[b],
+                                  100.0 * double(gg.breaks[b]) / double(std::max<u64>(gg.draws, 1)));
+            }
+        }
+        LOG_INFO(Render_Vulkan,
+                 "NativeCensus: {} draws={} joinable={:.1f}% runs={} mean_run={:.2f} "
+                 "runs[1,2-3,4-7,8-15,16-63,64+]={},{},{},{},{},{} breaks:{}",
+                 gi == 0 ? "depth-only" : "colour", gg.draws,
+                 100.0 * double(gg.joins) / double(std::max<u64>(gg.draws, 1)), gg.runs,
+                 double(gg.draws) / double(std::max<u64>(gg.runs, 1)), gg.run_hist[0],
+                 gg.run_hist[1], gg.run_hist[2], gg.run_hist[3], gg.run_hist[4], gg.run_hist[5],
+                 br);
+        const u64 carry = gg.cur_run;
+        gg = NativeCensusGroup{};
+        gg.cur_run = carry;
+    }
+    std::vector<std::pair<u64, std::array<u64, 3>>> order(t_nc_pipes.begin(), t_nc_pipes.end());
+    std::sort(order.begin(), order.end(),
+              [](const auto& a, const auto& b) { return a.second[0] > b.second[0]; });
+    std::string top;
+    for (size_t k = 0; k < std::min<size_t>(order.size(), 12); ++k) {
+        top += fmt::format(" fs_{:08x}:{}/{:.0f}%/run{:.1f}", order[k].first, order[k].second[0],
+                           100.0 * double(order[k].second[1]) / double(order[k].second[0]),
+                           double(order[k].second[0]) /
+                               double(std::max<u64>(order[k].second[2], 1)));
+    }
+    LOG_INFO(Render_Vulkan, "NativeCensus: top fs (draws/joinable/mean run):{}", top);
+    t_nc_pipes.clear();
+}
+
 } // namespace
 
 // SHADPS4_FLUSH_EVERY_OPS=N: submit once N draws + dispatches have been recorded since the last
@@ -1700,6 +1914,12 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
                           const AmdGpu::CpSplit::VertexInputsPayload* front_vi) {
     const auto& regs = liverpool->BackRegs();
     const bool pb_census = VideoCore::g_pb_census != 0;
+    const u64 nc_entry_seq = VideoCore::g_native_census ? scheduler.RecordSeq() : 0;
+    if (VideoCore::g_native_census) [[unlikely]] {
+        VideoCore::t_native_vi.n = 0;
+        VideoCore::t_native_vi.ib_buf = 0;
+        VideoCore::t_native_vi.ib_type = 0;
+    }
     if (pb_census) [[unlikely]] {
         PbCensusBegin();
     }
@@ -1944,6 +2164,8 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     const auto t_dynstate = Common::FaultMonitor::Now();
     sample.BeginPhase(Common::DrawSampleProbe::Phase::DynamicState);
     UpdateDynamicState(pipeline, is_indexed, !packet);
+    const bool nc_dyn =
+        VideoCore::g_native_census && (!packet || scheduler.CommitDynamicStateWouldRecord());
     if (packet) {
         if (scheduler.CommitDynamicStateWouldRecord()) {
             RecordPacket(pipeline, DrawPacketHeader{});
@@ -2032,6 +2254,11 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     }
     DebugState.IncDrawCall();
     scheduler.NoteDraw();
+    if (VideoCore::g_native_census) [[unlikely]] {
+        NativeCensusNote(pipeline, state, nc_entry_seq, scheduler.RecordSeq(), nc_dyn,
+                         !buffer_barriers.empty(), image_infos, buffer_infos, push_data,
+                         occlusion_slot != OcclusionQueries::NoSlot);
+    }
 
     sample.EndPhase(Common::DrawSampleProbe::Phase::ActualDraw);
     sample.BeginPhase(Common::DrawSampleProbe::Phase::ResetImageBindings);

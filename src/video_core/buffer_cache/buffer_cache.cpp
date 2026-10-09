@@ -25,6 +25,7 @@
 #include "video_core/buffer_cache/readback_queue.h"
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/pb_census.h"
+#include "video_core/native_census.h"
 #include "video_core/renderer_vulkan/vk_gpu_batch_timer.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -36,6 +37,11 @@
 #include "video_core/buffer_cache/protect_queue.h"
 
 namespace VideoCore {
+
+const bool g_native_census = [] {
+    const char* e = std::getenv("SHADPS4_NATIVE_CENSUS");
+    return e && e[0] == '1';
+}();
 
 namespace {
 // SHADPS4_DRAW_COST=1 (diagnostic): ObtainBufferForImage path and cycle split for calls over
@@ -3562,6 +3568,15 @@ void BufferCache::BindVertexBuffers(
         host_sizes.push_back(buffer.GetSize());
         host_strides.push_back(buffer.GetStride());
     }
+    if (g_native_census) [[unlikely]] {
+        auto& nv = t_native_vi;
+        nv.n = static_cast<u32>(std::min<size_t>(host_buffers.size(), nv.buf.size()));
+        for (u32 k = 0; k < nv.n; ++k) {
+            nv.buf[k] = std::bit_cast<u64>(static_cast<VkBuffer>(host_buffers[k]));
+            nv.off[k] = host_offsets[k];
+            nv.stride[k] = static_cast<u32>(host_strides[k]);
+        }
+    }
 
     scheduler.RecordArrays(
         [dynamic = instance.IsVertexInputDynamicState()](vk::CommandBuffer cmdbuf, auto buffers,
@@ -3670,6 +3685,15 @@ void BufferCache::BindVertexBuffersDerived(
             host_strides.push_back(attrib.desc.stride);
         }
     }
+    if (g_native_census) [[unlikely]] {
+        auto& nv = t_native_vi;
+        nv.n = std::min<u32>(vi.count, static_cast<u32>(nv.buf.size()));
+        for (u32 k = 0; k < nv.n; ++k) {
+            nv.buf[k] = std::bit_cast<u64>(static_cast<VkBuffer>(host_buffers[k]));
+            nv.off[k] = host_offsets[k];
+            nv.stride[k] = attribs[k].desc.stride;
+        }
+    }
 
     scheduler.RecordArrays(
         [dynamic](vk::CommandBuffer cmdbuf, auto buffers, auto offsets, auto sizes, auto strides) {
@@ -3711,6 +3735,11 @@ void BufferCache::BindIndexBuffer(
                                                  vk::PipelineStageFlagBits2::eIndexInput)) {
             barriers.emplace_back(*barrier);
         }
+    }
+    if (g_native_census) [[unlikely]] {
+        t_native_vi.ib_buf = std::bit_cast<u64>(static_cast<VkBuffer>(vk_buffer->Handle()));
+        t_native_vi.ib_off = offset;
+        t_native_vi.ib_type = index_size;
     }
     scheduler.Record([buffer = vk_buffer->Handle(), offset, index_type](vk::CommandBuffer cmdbuf) {
         cmdbuf.bindIndexBuffer(buffer, offset, index_type);
