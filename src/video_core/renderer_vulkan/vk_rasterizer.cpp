@@ -1718,12 +1718,36 @@ void Rasterizer::ExecuteDraw(const SplitDraw& draw,
     auto sample = Common::DrawSampleProbe::Begin();
     const auto t_entry = Common::FaultMonitor::Now();
     if (begin()) {
-        if (VideoCore::g_native_pass != 0 && native_batch.open && NativeJoin(draw, front_vi)) {
-            return;
+        static const bool native_timing = [] {
+            const char* e = std::getenv("SHADPS4_NATIVE_TIMING");
+            return e && e[0] == '1';
+        }();
+        if (VideoCore::g_native_pass != 0 && native_batch.open) {
+            const u64 t0 = native_timing ? __rdtsc() : 0;
+            const bool joined = NativeJoin(draw, front_vi);
+            if (native_timing) {
+                const u64 dt = __rdtsc() - t0;
+                (joined ? native_stats.c_join_ok : native_stats.c_join_fail) += dt;
+                ++(joined ? native_stats.n_join_ok : native_stats.n_join_fail);
+            }
+            if (joined) {
+                return;
+            }
         }
+        const u64 t1 = native_timing ? __rdtsc() : 0;
         // The lookup ran on the front: the Pipeline phase and pipeline_ns are 0 here.
         DrawTail(draw.pipeline, draw.args.is_indexed, draw.args.index_offset, sample, t_entry,
                  t_entry, 0, front_vi);
+        if (native_timing) {
+            const u64 dt = __rdtsc() - t1;
+            if (draw.pipeline->native_variant.load(std::memory_order_relaxed)) {
+                native_stats.c_tail_nat += dt;
+                ++native_stats.n_tail_nat;
+            } else {
+                native_stats.c_tail_other += dt;
+                ++native_stats.n_tail_other;
+            }
+        }
     }
 }
 
@@ -2006,6 +2030,18 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
         NativeClose(7);
         return false;
     }
+    static const bool join_timing = [] {
+        const char* e = std::getenv("SHADPS4_NATIVE_TIMING");
+        return e && e[0] == '1';
+    }();
+    u64 tp = join_timing ? __rdtsc() : 0;
+    const auto lap = [&](u32 phase) {
+        if (join_timing) {
+            const u64 now = __rdtsc();
+            native_stats.c_phase[phase] += now - tp;
+            tp = now;
+        }
+    };
     // User data, as BindResources pushes it.
     Shader::PushData push = MakeUserData(regs);
     Shader::Backend::Bindings bnd{};
@@ -2061,10 +2097,12 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
             break;
         }
     }
+    lap(0); // checks + user data + buffers
     VideoCore::NativeJoinVi jvi{};
     if (ok) {
         buffer_cache.NativeJoinVertexIndex(*front_vi, draw.args.index_offset, jvi, barriers);
     }
+    lap(1); // vertex / index
     s64 q = 0;
     bool q_set = false;
     if (ok && (jvi.n != b.vb_n || jvi.ib_buf != b.ib || jvi.ib_off % b.index_size != 0)) {
@@ -2145,6 +2183,7 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
     std::memcpy(b.cmds + u64(b.n) * NativeCmdBytes, cmd, sizeof(cmd));
     ++b.n;
     *b.count = b.n;
+    lap(2); // compare + record write
     ++native_stats.joins;
     DebugState.IncDrawCall();
     scheduler.NoteDraw();
@@ -2221,6 +2260,19 @@ void Rasterizer::NativeLog() {
              "epoch_same={} tick_moved={} closes:{}",
              st.opens, st.joins, st.open_fail, st.verify_draws, st.verify_mismatch,
              st.epoch_same, st.tick_moved, closes);
+    if (st.n_join_ok + st.n_tail_other != 0) {
+        const auto per = [](u64 c, u64 n) { return n ? double(c) / double(n) : 0.0; };
+        LOG_INFO(Render_Vulkan,
+                 "NativeTiming: cycles per draw: join_ok {:.0f} (n={}) join_fail {:.0f} (n={}) "
+                 "tail_native_pipe {:.0f} (n={}) tail_other {:.0f} (n={}) | join phases per "
+                 "attempt: checks+ud+buffers {:.0f} vertex+index {:.0f} record {:.0f}",
+                 per(st.c_join_ok, st.n_join_ok), st.n_join_ok, per(st.c_join_fail, st.n_join_fail),
+                 st.n_join_fail, per(st.c_tail_nat, st.n_tail_nat), st.n_tail_nat,
+                 per(st.c_tail_other, st.n_tail_other), st.n_tail_other,
+                 per(st.c_phase[0], st.n_join_ok + st.n_join_fail),
+                 per(st.c_phase[1], st.n_join_ok + st.n_join_fail),
+                 per(st.c_phase[2], st.n_join_ok));
+    }
 }
 
 void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,

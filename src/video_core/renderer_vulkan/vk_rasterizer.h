@@ -471,6 +471,11 @@ private:
         u64 opens{}, joins{}, open_fail{}, verify_draws{}, verify_mismatch{}, epoch_same{};
         std::array<u64, 16> close{};
         u64 tick_moved{};
+        // SHADPS4_NATIVE_TIMING=1: TSC cycles (join ok / join refused / DrawTail of a draw whose
+        // pipeline has a native variant / DrawTail of any other draw) and the join's phases.
+        u64 c_join_ok{}, n_join_ok{}, c_join_fail{}, n_join_fail{}, c_tail_nat{}, n_tail_nat{},
+            c_tail_other{}, n_tail_other{};
+        std::array<u64, 4> c_phase{};
     } native_stats;
     bool NativeJoin(const SplitDraw& draw, const AmdGpu::CpSplit::VertexInputsPayload* front_vi);
     bool NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline* native, bool is_indexed,
