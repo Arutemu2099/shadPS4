@@ -32,6 +32,7 @@
 #include "core/platform.h"
 #include "video_core/native_census.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/amdgpu/native_rec.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "common/readback_offload.h"
 #include "video_core/amdgpu/split_hazard.h"
@@ -2870,6 +2871,157 @@ struct FrontTagStats {
 } g_front_tag;
 } // namespace
 
+namespace {
+// SHADPS4_NATIVE_REC=1 (native_rec.h): the front checks every job-thread record against its own
+// state for the same draw - user data (each register the bound VS / PS reads), index base /
+// count, instance count - and that a run keeps one pipeline and one context epoch. Front thread.
+struct NativeRecFrontStats {
+    u64 draws{}, tagged{}, no_ring{}, stale{}, heads{}, members{}, broken{}, pipe_moved{},
+        epoch_moved{}, ud_ok{}, ud_bad{}, ud_unknown{}, idx_bad{}, inst_bad{}, inst_unknown{},
+        other_stage{}, run_draws_2plus{}, gap_dw{};
+    std::array<u64, 8> hist{}; // run length of heads: 1, 2-3, 4-7, ..., 128+
+    u32 run_tag{};
+    u32 run_head{};
+    u32 run_next_k{};
+    const void* run_pipeline{};
+    u64 run_epoch{};
+    u32 logged{};
+};
+NativeRecFrontStats g_nrf;
+
+void NativeRecFront(const PM4Header* header, const Vulkan::Rasterizer::SplitDraw& draw,
+                    const Regs& regs, u64 ctx_epoch) {
+    namespace NR = AmdGpu::NativeRec;
+    auto& st = g_nrf;
+    ++st.draws;
+    const auto log = [&] {
+        if ((st.draws & 0x3ffff) != 0) {
+            return;
+        }
+        std::string h;
+        for (u32 b = 0; b < 8; ++b) {
+            h += fmt::format(" {}", st.hist[b]);
+        }
+        LOG_INFO(Render,
+                 "NativeRec front: draws={} tagged={} no_ring={} stale={} | runs={} members={} "
+                 "(draws in runs of 2+ {:.1f}%) broken={} pipeline_moved={} epoch_moved={} | ud "
+                 "regs ok={} MISMATCH={} unknown={} | index MISMATCH={} instances MISMATCH={} "
+                 "unknown={} | other-stage draws={} | gap dwords per member {:.1f} | heads by run "
+                 "length 1/2-3/4-7/8-15/16-31/32-63/64-127/128+:{}",
+                 st.draws, st.tagged, st.no_ring, st.stale, st.heads, st.members,
+                 st.tagged ? 100.0 * double(st.run_draws_2plus) / double(st.tagged) : 0.0,
+                 st.broken, st.pipe_moved, st.epoch_moved, st.ud_ok, st.ud_bad, st.ud_unknown,
+                 st.idx_bad, st.inst_bad, st.inst_unknown, st.other_stage,
+                 st.members ? double(st.gap_dw) / double(st.members) : 0.0, h);
+    };
+    const auto* w = reinterpret_cast<const u32*>(header);
+    if (header->type3.opcode != PM4ItOpcode::DrawIndex2 || w[6] != 0xc0021000u ||
+        w[7] != NR::Magic) {
+        return log();
+    }
+    ++st.tagged;
+    const u32 tag = w[8];
+    const u32 idx = w[9];
+    const NR::Record* ring = NR::g_rings[tag >> 28].load(std::memory_order_acquire);
+    if (!ring) {
+        ++st.no_ring;
+        return log();
+    }
+    const NR::Record& src = ring[idx & (NR::RingSize - 1)];
+    if (src.stamp.load(std::memory_order_acquire) != idx + 1 || src.cmd != w) {
+        ++st.stale;
+        return log();
+    }
+    const u32 run_k = src.run_k;
+    const u32 head_idx = src.head_idx;
+    const auto ud_vs = src.ud_vs;
+    const auto ud_ps = src.ud_ps;
+    const u32 vs_known = src.vs_known, ps_known = src.ps_known;
+    const u64 index_addr = src.index_addr;
+    const u32 index_count = src.index_count, instances = src.instances;
+    const bool inst_known = src.inst_known != 0;
+    const u32 gap = src.gap_dwords;
+    const u32 count = run_k == 0 ? src.count : 0;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (src.stamp.load(std::memory_order_relaxed) != idx + 1) {
+        ++st.stale;
+        return log();
+    }
+    if (run_k == 0) {
+        ++st.heads;
+        st.hist[std::min<u32>(std::bit_width(std::max<u32>(count, 1)) - 1, 7u)] += 1;
+        st.run_draws_2plus += count >= 2 ? count : 0;
+        st.run_tag = tag;
+        st.run_head = idx;
+        st.run_next_k = 1;
+        st.run_pipeline = draw.pipeline;
+        st.run_epoch = ctx_epoch;
+    } else {
+        ++st.members;
+        st.gap_dw += gap;
+        if (tag != st.run_tag || head_idx != st.run_head || run_k != st.run_next_k) {
+            ++st.broken;
+        } else {
+            st.pipe_moved += draw.pipeline != st.run_pipeline;
+            st.epoch_moved += ctx_epoch != st.run_epoch;
+        }
+        st.run_next_k = run_k + 1;
+    }
+    if (regs.index_base_address.Address() != index_addr || regs.num_indices != index_count) {
+        if (++st.idx_bad <= 8) {
+            LOG_WARNING(Render, "NativeRec MISMATCH index: front {:#x} x{} record {:#x} x{}",
+                        regs.index_base_address.Address(), regs.num_indices, index_addr,
+                        index_count);
+        }
+    }
+    if (!inst_known) {
+        ++st.inst_unknown;
+    } else if (regs.num_instances.NumInstances() != std::max<u32>(instances, 1)) {
+        ++st.inst_bad;
+    }
+    if (draw.pipeline && draw.draw_class == Vulkan::Rasterizer::DrawClass::Draw && !draw.skip) {
+        for (const Shader::Info* info : draw.pipeline->GetStages()) {
+            if (!info) {
+                continue;
+            }
+            const bool vs = info->l_stage == Shader::LogicalStage::Vertex &&
+                            info->stage == Shader::Stage::Vertex;
+            const bool ps = info->l_stage == Shader::LogicalStage::Fragment;
+            if (!vs && !ps) {
+                ++st.other_stage;
+                continue;
+            }
+            const auto& rec_ud = vs ? ud_vs : ud_ps;
+            const u32 known = vs ? vs_known : ps_known;
+            // Every user-data register the stage is given (RSRC2 USER_SGPR): direct reads, the
+            // SRT walker's pointers and the fetch shader address all come from these.
+            const u32 n_ud = std::min<u32>(
+                vs ? regs.vs_program.settings.num_user_regs : regs.ps_program.settings.num_user_regs,
+                16u);
+            for (u32 i = 0; i < n_ud; ++i) {
+                if (i >= info->user_data.size()) {
+                    continue;
+                }
+                if ((known >> i & 1) == 0) {
+                    ++st.ud_unknown;
+                } else if (rec_ud[i] != info->user_data[i]) {
+                    if (++st.ud_bad <= 16) {
+                        LOG_WARNING(Render,
+                                    "NativeRec MISMATCH ud: stage {} reg {} front {:#x} record "
+                                    "{:#x} (run k {}, gap {} dw)",
+                                    vs ? "VS" : "PS", i, info->user_data[i], rec_ud[i], run_k,
+                                    gap);
+                    }
+                } else {
+                    ++st.ud_ok;
+                }
+            }
+        }
+    }
+    log();
+}
+} // namespace
+
 void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_marker,
                          const CpSplit::DrawArgs& args) {
     u32 tag = 0;
@@ -2904,6 +3056,9 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
     // re-lookup of that draw (DrawRelookup) is only meaningful because this one ran while
     // earlier posted records could still be outstanding. A drain before this line would blind it.
     rasterizer->PrepareDrawFront(draw);
+    if (AmdGpu::NativeRec::g_mode != 0) [[unlikely]] {
+        NativeRecFront(header, draw, regs, context_change_epoch);
+    }
     const bool has_stages = draw.pipeline && draw.draw_class ==
                                                  Vulkan::Rasterizer::DrawClass::Draw &&
                             !draw.skip;

@@ -29,6 +29,7 @@
 #include "core/memory.h"
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/amdgpu/native_rec.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
@@ -790,6 +791,234 @@ void GapDraw(const u32* cmdbuf) {
     done();
 }
 
+// SHADPS4_NATIVE_REC (native_rec.h): the job thread's side. A cursor at the end of the last HLE
+// call that reserved packets; at every DrawIndex the packets the game wrote since are walked
+// (exact landing) into a per-thread mirror of the VS / PS user-data registers and the per-draw
+// state, and the draw either continues the thread's open run or starts a new one.
+namespace NR = AmdGpu::NativeRec;
+struct RecThread {
+    const u32* cursor{};
+    std::array<u32, 16> vs{}, ps{};
+    u32 vs_known{}, ps_known{};
+    u32 index_type{}, prim{}, instances{1};
+    bool it_known{}, prim_known{}, inst_known{};
+    bool set_called{}; ///< a Set (not Update) shader call since the last draw: ends the run
+    bool wl{true};     ///< every packet since the last draw was on the run whitelist
+    u32 gap{};         ///< dwords walked since the last draw
+    NR::Record* ring{};
+    u32 next{};
+    NR::Record* head{};
+    u32 head_idx{};
+    u32 run_id{};
+    u32 run_index_type{}, run_prim{};
+};
+thread_local RecThread t_rec;
+// Diagnostic: which packet put a gap off the whitelist (opcode; 256 = other SH register, 257 = a
+// marker / flip NOP, 258 = other uconfig, 259 = other DMA).
+std::array<std::atomic<u64>, 260> g_nr_off{};
+std::atomic<u32> g_nr_last_nop{0};
+
+/// Walks the packets the game wrote from the cursor to `to` into the mirror. False (and every
+/// known bit cleared) when the walk does not land exactly on `to`.
+bool NativeRecWalk(const u32* to) {
+    auto& r = t_rec;
+    const u32* p = r.cursor;
+    bool landed = false;
+    if (p && to >= p && to - p <= 16384) {
+        const u32* q = p;
+        while (q < to) {
+            const u32 h = *q;
+            const u32 type = h >> 30;
+            if (type == 2) {
+                ++q;
+                continue;
+            }
+            if (type != 3) {
+                break;
+            }
+            const u32 n = ((h >> 16) & 0x3fff) + 1;
+            if (q + 1 + n > to) {
+                break;
+            }
+            switch (static_cast<PM4ItOpcode>((h >> 8) & 0xff)) {
+            case PM4ItOpcode::SetShReg: {
+                const u32 off = q[1] & 0xffff;
+                for (u32 j = 0; j + 1 < n; ++j) {
+                    const u32 reg = off + j;
+                    if (reg >= 0x4c && reg < 0x5c) {
+                        r.vs[reg - 0x4c] = q[2 + j];
+                        r.vs_known |= 1u << (reg - 0x4c);
+                    } else if (reg >= 0x0c && reg < 0x1c) {
+                        r.ps[reg - 0x0c] = q[2 + j];
+                        r.ps_known |= 1u << (reg - 0x0c);
+                    } else {
+                        r.wl = false;
+                        g_nr_off[256].fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                break;
+            }
+            case PM4ItOpcode::Nop: {
+                // The game's own 0x6875xxxx hints (sharp follows, s379: 0x6875000d before most
+                // draws) are plain; flip payloads and debug markers have back effects.
+                const u32 pl = q[1];
+                const bool marker = pl == 0x68750001u || pl == 0x68750002u || pl == 0x68750003u ||
+                                    pl == 0x6875000eu || (pl >= 0x68750776u && pl <= 0x68750781u);
+                if (marker) {
+                    r.wl = false;
+                    g_nr_off[257].fetch_add(1, std::memory_order_relaxed);
+                    g_nr_last_nop.store(pl, std::memory_order_relaxed);
+                }
+                break;
+            }
+            case PM4ItOpcode::IndexType:
+                r.index_type = q[1];
+                r.it_known = true;
+                break;
+            case PM4ItOpcode::NumInstances:
+                r.instances = q[1];
+                r.inst_known = true;
+                break;
+            case PM4ItOpcode::SetUconfigReg:
+                if ((q[1] & 0xffff) == 0x242 && n >= 2) { // VGT_PRIMITIVE_TYPE
+                    r.prim = q[2];
+                    r.prim_known = true;
+                } else {
+                    r.wl = false;
+                    g_nr_off[258].fetch_add(1, std::memory_order_relaxed);
+                }
+                break;
+            case PM4ItOpcode::DmaData:
+                if (n < 6 || q[4] != 0x3022Cu) {
+                    r.wl = false; // only the L2 code prefetch (a no-op for the emulator)
+                    g_nr_off[259].fetch_add(1, std::memory_order_relaxed);
+                }
+                break;
+            default:
+                r.wl = false;
+                g_nr_off[(h >> 8) & 0xff].fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+            q += 1 + n;
+        }
+        landed = q == to;
+        r.gap += static_cast<u32>(to - p);
+        // s378: walks of ~8,300 dwords landed across another command buffer's packets and left
+        // the mirror wrong; a job's own gaps are ~30 dwords.
+        if (to - p > 1024) {
+            landed = false;
+        }
+    }
+    if (!landed) {
+        r.vs_known = r.ps_known = 0;
+        r.it_known = r.prim_known = r.inst_known = false;
+        r.wl = false;
+    }
+    return landed;
+}
+
+void NativeRecShader(const u32* cmdbuf, u32 size, bool is_set) {
+    NativeRecWalk(cmdbuf);
+    t_rec.cursor = cmdbuf + size;
+    t_rec.set_called = t_rec.set_called || is_set;
+}
+
+std::array<std::atomic<u64>, 12> g_nr_why{};
+
+/// Returns the ring index written for this draw.
+u32 NativeRecDraw(const u32* cmdbuf, u64 index_addr, u32 index_count, u32 tag) {
+    auto& r = t_rec;
+    if (!r.ring) [[unlikely]] {
+        r.ring = new NR::Record[NR::RingSize]();
+        NR::g_rings[tag >> 28].store(r.ring, std::memory_order_release);
+    }
+    const bool landed = NativeRecWalk(cmdbuf);
+    const bool wl = landed && r.wl;
+    const u32 gap = landed ? r.gap : 0;
+    r.wl = true;
+    r.gap = 0;
+    r.cursor = cmdbuf + 10;
+    const u32 run_id = tag & 0x0fffffffu;
+    const bool cont = r.head && wl && !r.set_called && run_id == r.run_id &&
+                      r.head->count < NR::MaxRun && r.it_known && r.index_type == r.run_index_type &&
+                      r.prim_known && r.prim == r.run_prim &&
+                      r.head->stamp.load(std::memory_order_relaxed) == r.head_idx + 1;
+    {
+        // Why a draw did not continue the open run (first failing condition), logged per 2^20.
+        const u32 why = cont                                ? 0
+                        : !r.head                           ? 1
+                        : !landed                           ? 2
+                        : !wl                               ? 3
+                        : r.set_called                      ? 4
+                        : run_id != r.run_id                ? 5
+                        : r.head->count >= NR::MaxRun       ? 6
+                        : !r.it_known                       ? 7
+                        : r.index_type != r.run_index_type  ? 8
+                        : !r.prim_known                     ? 9
+                        : r.prim != r.run_prim              ? 10
+                                                            : 11;
+        g_nr_why[why].fetch_add(1, std::memory_order_relaxed);
+        const u64 n = g_nr_why[0].load(std::memory_order_relaxed) + 1;
+        static std::atomic<u64> total{0};
+        if ((total.fetch_add(1, std::memory_order_relaxed) & 0xfffff) == 0xfffff) {
+            std::string line;
+            for (u32 i = 0; i < g_nr_why.size(); ++i) {
+                line += fmt::format(" {}={}", i, g_nr_why[i].exchange(0));
+            }
+            std::string off;
+            for (u32 i = 0; i < g_nr_off.size(); ++i) {
+                if (const u64 c = g_nr_off[i].exchange(0)) {
+                    off += fmt::format(" {:#x}={}", i, c);
+                }
+            }
+            LOG_INFO(Lib_GnmDriver, "NativeRec off-whitelist packets (256 SH 257 NOP 258 uconfig 259 DMA):{} last NOP payload {:#x}",
+                     off, g_nr_last_nop.load());
+            LOG_INFO(Lib_GnmDriver,
+                     "NativeRec job side: 0=continued 1=no head 2=walk failed 3=packet off the "
+                     "whitelist 4=Set shader call 5=shader hash 6=max run 7/8 index type 9/10 "
+                     "primitive 11=head overwritten:{}",
+                     line);
+        }
+        (void)n;
+    }
+    r.set_called = false;
+    const u32 idx = r.next++;
+    NR::Record& rec = r.ring[idx & (NR::RingSize - 1)];
+    rec.stamp.store(0, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    rec.tag = tag;
+    rec.cmd = cmdbuf;
+    rec.index_addr = index_addr;
+    rec.index_count = index_count;
+    rec.instances = r.instances;
+    rec.inst_known = r.inst_known ? 1u : 0u;
+    rec.vs_known = r.vs_known;
+    rec.ps_known = r.ps_known;
+    rec.gap_dwords = gap;
+    rec.ud_vs = r.vs;
+    rec.ud_ps = r.ps;
+    if (cont) {
+        rec.run_k = r.head->count;
+        rec.head_idx = r.head_idx;
+        rec.count = 0;
+        rec.end = nullptr;
+        r.head->count = rec.run_k + 1;
+        r.head->end = cmdbuf + 10;
+    } else {
+        rec.run_k = 0;
+        rec.head_idx = idx;
+        rec.count = 1;
+        rec.end = cmdbuf + 10;
+        r.head = &rec;
+        r.head_idx = idx;
+        r.run_id = run_id;
+        r.run_index_type = r.index_type;
+        r.run_prim = r.prim;
+    }
+    rec.stamp.store(idx + 1, std::memory_order_release);
+    return idx;
+}
+
 inline u32 DrawTagValue() {
     if (t_draw_tag_slot == 0) [[unlikely]] {
         t_draw_tag_slot = std::min<u32>(g_draw_tag_slots.fetch_add(1) + 1, 15u);
@@ -820,7 +1049,14 @@ s32 PS4_SYSV_ABI sceGnmDrawIndex(u32* cmdbuf, u32 size, u32 index_count, uintptr
         draw_index->draw_initiator = sceKernelIsNeoMode() ? flags & 0xe0000000u : 0;
 
         WriteTrailingNop<3>(cmdbuf + 6);
-        if (g_draw_tag) [[unlikely]] {
+        if (NR::g_mode) [[unlikely]] {
+            const u32 tag = DrawTagValue();
+            const u32 idx = NativeRecDraw(cmdbuf, index_addr, index_count, tag);
+            auto* nop = reinterpret_cast<PM4CmdNop*>(cmdbuf + 6);
+            nop->data_block[0] = NR::Magic;
+            nop->data_block[1] = tag;
+            nop->data_block[2] = idx;
+        } else if (g_draw_tag) [[unlikely]] {
             auto* nop = reinterpret_cast<PM4CmdNop*>(cmdbuf + 6);
             nop->data_block[0] = PM4CmdNop::PayloadType::NativeDrawTag;
             nop->data_block[1] = DrawTagValue();
@@ -2084,10 +2320,13 @@ s32 PS4_SYSV_ABI sceGnmSetPsShader(u32* cmdbuf, u32 size, const u32* ps_regs) {
 
 s32 PS4_SYSV_ABI sceGnmSetPsShader350(u32* cmdbuf, u32 size, const u32* ps_regs) {
     LOG_TRACE(Lib_GnmDriver, "called");
-    if (g_draw_tag) [[unlikely]] {
+    if (g_draw_tag || NR::g_mode) [[unlikely]] {
         DrawTagShaderChange(1, ps_regs);
         if (g_draw_gap) {
             GapShaderSet(1, ps_regs, cmdbuf, size);
+        }
+        if (NR::g_mode) {
+            NativeRecShader(cmdbuf, size, true);
         }
     }
 
@@ -2188,10 +2427,13 @@ s32 PS4_SYSV_ABI sceGnmSetVgtControl(u32* cmdbuf, u32 size, u32 prim_group_sz_mi
 
 s32 PS4_SYSV_ABI sceGnmSetVsShader(u32* cmdbuf, u32 size, const u32* vs_regs, u32 shader_modifier) {
     LOG_TRACE(Lib_GnmDriver, "called");
-    if (g_draw_tag) [[unlikely]] {
+    if (g_draw_tag || NR::g_mode) [[unlikely]] {
         DrawTagShaderChange(0, vs_regs);
         if (g_draw_gap) {
             GapShaderSet(0, vs_regs, cmdbuf, size);
+        }
+        if (NR::g_mode) {
+            NativeRecShader(cmdbuf, size, true);
         }
     }
 
@@ -2850,10 +3092,13 @@ s32 PS4_SYSV_ABI sceGnmUpdatePsShader(u32* cmdbuf, u32 size, const u32* ps_regs)
 
 s32 PS4_SYSV_ABI sceGnmUpdatePsShader350(u32* cmdbuf, u32 size, const u32* ps_regs) {
     LOG_TRACE(Lib_GnmDriver, "called");
-    if (g_draw_tag) [[unlikely]] {
+    if (g_draw_tag || NR::g_mode) [[unlikely]] {
         DrawTagShaderChange(1, ps_regs);
         if (g_draw_gap) {
             GapShaderSet(1, ps_regs, cmdbuf, size);
+        }
+        if (NR::g_mode) {
+            NativeRecShader(cmdbuf, size, ps_regs == nullptr);
         }
     }
 
@@ -2902,10 +3147,13 @@ s32 PS4_SYSV_ABI sceGnmUpdatePsShader350(u32* cmdbuf, u32 size, const u32* ps_re
 s32 PS4_SYSV_ABI sceGnmUpdateVsShader(u32* cmdbuf, u32 size, const u32* vs_regs,
                                       u32 shader_modifier) {
     LOG_TRACE(Lib_GnmDriver, "called");
-    if (g_draw_tag) [[unlikely]] {
+    if (g_draw_tag || NR::g_mode) [[unlikely]] {
         DrawTagShaderChange(0, vs_regs);
         if (g_draw_gap) {
             GapShaderSet(0, vs_regs, cmdbuf, size);
+        }
+        if (NR::g_mode) {
+            NativeRecShader(cmdbuf, size, vs_regs == nullptr);
         }
     }
 
