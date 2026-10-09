@@ -4807,6 +4807,10 @@ bool BufferCache::LeanReadOk() {
     return lean_read_state == 1;
 }
 
+bool BufferCache::ReadRangeClean(VAddr addr, u64 size) {
+    return memory_tracker->ReadSyncClean(addr, size);
+}
+
 std::pair<Buffer*, u32> BufferCache::ObtainReadLean(VAddr device_addr, u32 size,
                                                     BufferId buffer_id) {
     AmdGpu::MtbCensus::NoteUse(device_addr, size);
