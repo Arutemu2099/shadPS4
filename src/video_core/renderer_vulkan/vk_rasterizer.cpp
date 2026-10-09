@@ -5075,7 +5075,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
                         big = true;
                         ++c.big_bindings;
                     } else if (vsharp.base_address != 0 && sz != 0) {
-                        c.ranges.emplace_back(vsharp.base_address, vsharp.base_address + sz);
+                        const VAddr lo = vsharp.base_address;
+                        c.ranges.emplace_back(lo, lo + sz);
                     }
                 }
                 h = KeyMix(h, &vsharp, sizeof(vsharp));
