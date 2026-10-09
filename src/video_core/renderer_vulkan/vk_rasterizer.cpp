@@ -7452,10 +7452,47 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
                 obtained = buffer_cache.ObtainReadLean(vsharp.base_address, size, buffer_id);
             }
             if (!obtained.first) {
+                // s370 census (NATIVE_TIMING): the memory-window binds (formatted, > 64 MB).
+                static const bool window_census = [] {
+                    const char* e = std::getenv("SHADPS4_NATIVE_TIMING");
+                    return e && e[0] == '1';
+                }();
+                const bool window = window_census && desc.is_formatted && size > (u64{64} << 20);
+                const u64 w0 = window ? __rdtsc() : 0;
+                const u64 wup0 = window ? buffer_cache.SyncUploadBytesTotal() : 0;
+                const u64 wseq0 = window ? scheduler.RecordSeq() : 0;
                 obtained = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted, buffer_id,
                     is_storage ? Common::BufferSampleCaller::Storage
                                : Common::BufferSampleCaller::Uniform);
+                if (window) [[unlikely]] {
+                    struct WindowStats {
+                        u64 n = 0, cyc = 0, up_n = 0, up_bytes = 0, up_cyc = 0, rec_n = 0, max_cyc = 0;
+                    };
+                    static WindowStats ws;
+                    const u64 dt = __rdtsc() - w0;
+                    const u64 ub = buffer_cache.SyncUploadBytesTotal() - wup0;
+                    ++ws.n;
+                    ws.cyc += dt;
+                    ws.max_cyc = std::max(ws.max_cyc, dt);
+                    if (ub != 0) {
+                        ++ws.up_n;
+                        ws.up_bytes += ub;
+                        ws.up_cyc += dt;
+                    }
+                    ws.rec_n += scheduler.RecordSeq() != wseq0;
+                    if ((ws.n & 0x3ffff) == 0) {
+                        LOG_INFO(Render_Vulkan,
+                                 "WindowBind: {} binds, {:.0f} cycles each (max {}); uploading binds "
+                                 "{} ({:.0f} cycles each, {:.0f} KB each); binds that recorded "
+                                 "commands {}",
+                                 ws.n, double(ws.cyc) / double(ws.n), ws.max_cyc, ws.up_n,
+                                 ws.up_n ? double(ws.up_cyc) / double(ws.up_n) : 0.0,
+                                 ws.up_n ? double(ws.up_bytes) / 1024.0 / double(ws.up_n) : 0.0,
+                                 ws.rec_n);
+                        ws = {};
+                    }
+                }
             }
             const auto [vk_buffer, offset] = obtained;
             obtain_ns += Common::FaultMonitor::SinceNs(t_obtain);
