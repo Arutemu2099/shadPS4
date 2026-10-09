@@ -3915,7 +3915,8 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
         u64 draw = 0; // st.draws of the stored draw
         u64 dirty = 0, image = 0, buf_gen = 0, tex_gen = 0, smp_gen = 0, border = 0;
         u64 draws = 0, flat_only = 0, textured = 0, same_pipe_prev = 0, match = 0,
-            match_textured = 0;
+            match_textured = 0, fmt_bindings = 0, fmt_image_backed = 0;
+        std::array<u64, 8> special_type{}; // ineligible draws by first special BufferType
     };
     static FlatCensus fc;
     if ((++st.draws & 0x1fffff) == 0) {
@@ -3937,11 +3938,18 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
         why = {};
         if (flat_census) {
             LOG_INFO(Render_Vulkan,
-                     "DrawRepeatFlatCensus: draws={} flat_only_ineligible={} (textured {}) "
-                     "previous_draw_same_pipeline={} would_repeat={} (textured {})",
+                     "DrawRepeatFlatCensus: draws={} liftable_ineligible={} (textured {}) "
+                     "previous_draw_same_pipeline={} would_repeat={} (textured {}) "
+                     "formatted_bindings={} image_backed={} | special first type "
+                     "guest/flat/bda/fault/gds/lds/clip/other={}/{}/{}/{}/{}/{}/{}/{}",
                      st.draws, fc.flat_only, fc.textured, fc.same_pipe_prev, fc.match,
-                     fc.match_textured);
+                     fc.match_textured, fc.fmt_bindings, fc.fmt_image_backed,
+                     fc.special_type[0], fc.special_type[1], fc.special_type[2],
+                     fc.special_type[3], fc.special_type[4], fc.special_type[5],
+                     fc.special_type[6], fc.special_type[7]);
             fc.flat_only = fc.textured = fc.same_pipe_prev = fc.match = fc.match_textured = 0;
+            fc.fmt_bindings = fc.fmt_image_backed = 0;
+            fc.special_type = {};
         }
         st.draws = st.repeats = st.f_ineligible = st.f_pipeline = st.f_key = st.f_rs = st.f_seq =
             st.f_epoch = st.f_image = st.f_gen = st.f_other = st.verified = st.f_gated = 0;
@@ -3996,6 +4004,10 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
                     if (desc.buffer_type == Shader::BufferType::Flatbuf) {
                         bad(6);
                     } else if (desc.buffer_type != Shader::BufferType::ClipPlanes) {
+                        if (first == 0) {
+                            pipeline->repeat_special_type =
+                                static_cast<u8>(std::min<u32>(u32(desc.buffer_type), 7u));
+                        }
                         bad(4);
                     } else if (cls == 1) {
                         cls = 2;
@@ -4020,7 +4032,8 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
                 }
                 flat = flat && !stage->uses_dma;
                 for (const auto& desc : stage->buffers) {
-                    if (desc.buffer_type == Shader::BufferType::Flatbuf) {
+                    if (desc.buffer_type == Shader::BufferType::Flatbuf ||
+                        (desc.is_formatted && !desc.is_written && !desc.IsSpecial())) {
                         any = true;
                     } else if (desc.is_written || desc.is_formatted ||
                                (desc.IsSpecial() &&
@@ -4056,6 +4069,16 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
             for (const auto& desc : stage->images) {
                 push(desc.GetSharp(bound));
                 textured = true;
+            }
+            for (const auto& desc : stage->buffers) {
+                if (desc.is_formatted && !desc.IsSpecial()) {
+                    const auto vsharp = desc.GetSharp(bound);
+                    ++fc.fmt_bindings;
+                    if (vsharp.base_address != 0 &&
+                        texture_cache.FindImageFromRange(vsharp.base_address, vsharp.GetSize())) {
+                        ++fc.fmt_image_backed;
+                    }
+                }
             }
             for (const auto& desc : stage->samplers) {
                 push(desc.GetSharp(bound));
@@ -4152,6 +4175,9 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
     if (!eligible) {
         ++st.f_ineligible;
         ++why[reason < why.size() ? reason : 0];
+        if (reason == 4) {
+            ++fc.special_type[pipeline->repeat_special_type & 7];
+        }
         if ((st.f_ineligible & 0xfffff) == 0) {
             LOG_INFO(Render_Vulkan,
                      "DrawRepeatWhy: ineligible by global={} dma={} written={} formatted={} "

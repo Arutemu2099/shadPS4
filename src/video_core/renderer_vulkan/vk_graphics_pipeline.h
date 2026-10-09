@@ -151,6 +151,8 @@ public:
     mutable u8 repeat_why = 0;
     /// SHADPS4_DRAW_REPEAT_FLAT_CENSUS: ineligible only because of flat-buffer (SRT) bindings.
     mutable u8 repeat_flat_only = 0;
+    /// First special BufferType that made the pipeline ineligible (census).
+    mutable u8 repeat_special_type = 0;
     mutable u8 repeat_miss_run = 0;
     mutable u8 repeat_skip = 0;
     /// SHADPS4_PB_CENSUS (Rasterizer::PbCensusEnd, back thread only): static class bits
