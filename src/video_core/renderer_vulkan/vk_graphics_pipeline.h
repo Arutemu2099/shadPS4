@@ -149,6 +149,8 @@ public:
     /// clip planes are off), its first ineligibility reason, and the adaptive gate.
     mutable u8 repeat_static = 0xff;
     mutable u8 repeat_why = 0;
+    /// SHADPS4_DRAW_REPEAT_FLAT_CENSUS: ineligible only because of flat-buffer (SRT) bindings.
+    mutable u8 repeat_flat_only = 0;
     mutable u8 repeat_miss_run = 0;
     mutable u8 repeat_skip = 0;
     /// SHADPS4_PB_CENSUS (Rasterizer::PbCensusEnd, back thread only): static class bits

@@ -3899,6 +3899,25 @@ void Rasterizer::OnSubmit() {
 
 bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) {
     auto& st = draw_repeat;
+    // global, dma, written, formatted, special (other), image written, flat buffer (SRT copy)
+    static std::array<u64, 7> why{};
+    // SHADPS4_DRAW_REPEAT_FLAT_CENSUS=1 (2026-10-09, dcb-parallel note sec. 7): draws ineligible
+    // only because of flat-buffer bindings whose binding inputs - including the flat buffer's
+    // CONTENT - equal the immediately previous draw's, with the same epochs and generations.
+    static const bool flat_census = [] {
+        const char* v = std::getenv("SHADPS4_DRAW_REPEAT_FLAT_CENSUS");
+        return v && v[0] == '1';
+    }();
+    struct FlatCensus {
+        std::vector<u32> key[2];
+        u32 kidx = 0;
+        const GraphicsPipeline* pipeline = nullptr;
+        u64 draw = 0; // st.draws of the stored draw
+        u64 dirty = 0, image = 0, buf_gen = 0, tex_gen = 0, smp_gen = 0, border = 0;
+        u64 draws = 0, flat_only = 0, textured = 0, same_pipe_prev = 0, match = 0,
+            match_textured = 0;
+    };
+    static FlatCensus fc;
     if ((++st.draws & 0x1fffff) == 0) {
         const double d = static_cast<double>(st.draws);
         LOG_INFO(Render_Vulkan,
@@ -3911,6 +3930,19 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
                  100.0 * st.f_rs / d, 100.0 * st.f_seq / d, 100.0 * st.f_epoch / d,
                  100.0 * st.f_image / d, 100.0 * st.f_gen / d, 100.0 * st.f_other / d,
                  100.0 * st.f_gated / d, st.verified, st.mismatches);
+        LOG_INFO(Render_Vulkan,
+                 "DrawRepeatWhy: ineligible draws by global={} dma={} written={} formatted={} "
+                 "special={} image_written={} flatbuf={}",
+                 why[0], why[1], why[2], why[3], why[4], why[5], why[6]);
+        why = {};
+        if (flat_census) {
+            LOG_INFO(Render_Vulkan,
+                     "DrawRepeatFlatCensus: draws={} flat_only_ineligible={} (textured {}) "
+                     "previous_draw_same_pipeline={} would_repeat={} (textured {})",
+                     st.draws, fc.flat_only, fc.textured, fc.same_pipe_prev, fc.match,
+                     fc.match_textured);
+            fc.flat_only = fc.textured = fc.same_pipe_prev = fc.match = fc.match_textured = 0;
+        }
         st.draws = st.repeats = st.f_ineligible = st.f_pipeline = st.f_key = st.f_rs = st.f_seq =
             st.f_epoch = st.f_image = st.f_gen = st.f_other = st.verified = st.f_gated = 0;
     }
@@ -3935,7 +3967,6 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
                     !bind_memo_stats && pending_stencil_writebacks.empty() && config_ok &&
                     scheduler.IsAsyncRecording();
     // Why a draw is ineligible (diagnostic split of f_ineligible; first reason per pipeline).
-    static std::array<u64, 6> why{}; // global, dma, written, formatted, special, image written
     u32 reason = eligible ? ~0u : 0u;
     if (pipeline->repeat_static == 0xff) {
         // Static per pipeline: the stage infos are the pipeline's own (BoundStages). Special
@@ -3962,7 +3993,9 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
                 } else if (desc.is_formatted) {
                     bad(3);
                 } else if (desc.IsSpecial()) {
-                    if (desc.buffer_type != Shader::BufferType::ClipPlanes) {
+                    if (desc.buffer_type == Shader::BufferType::Flatbuf) {
+                        bad(6);
+                    } else if (desc.buffer_type != Shader::BufferType::ClipPlanes) {
                         bad(4);
                     } else if (cls == 1) {
                         cls = 2;
@@ -3977,6 +4010,86 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
         }
         pipeline->repeat_static = cls;
         pipeline->repeat_why = first;
+        if (cls == 0) {
+            // Flat-only: every bad reason is a flat buffer (re-run of the walk, reasons only).
+            bool flat = true, any = false;
+            for (const auto& bound : BoundStages(pipeline)) {
+                const auto* stage = bound.info;
+                if (!stage) {
+                    continue;
+                }
+                flat = flat && !stage->uses_dma;
+                for (const auto& desc : stage->buffers) {
+                    if (desc.buffer_type == Shader::BufferType::Flatbuf) {
+                        any = true;
+                    } else if (desc.is_written || desc.is_formatted ||
+                               (desc.IsSpecial() &&
+                                desc.buffer_type != Shader::BufferType::ClipPlanes)) {
+                        flat = false;
+                    }
+                }
+                for (const auto& desc : stage->images) {
+                    flat = flat && !desc.is_written;
+                }
+            }
+            pipeline->repeat_flat_only = flat && any ? 1 : 0;
+        }
+    }
+    if (flat_census && eligible && pipeline->repeat_static == 0 &&
+        pipeline->repeat_flat_only != 0) [[unlikely]] {
+        // Census only: the key a flat-capable repeat would compare, never used for the draw.
+        auto& key = fc.key[fc.kidx ^ 1];
+        key.clear();
+        bool textured = false;
+        for (const auto& bound : BoundStages(pipeline)) {
+            const auto* stage = bound.info;
+            if (!stage) {
+                continue;
+            }
+            const auto push = [&](const auto& sharp) {
+                const auto* w = reinterpret_cast<const u32*>(&sharp);
+                key.insert(key.end(), w, w + sizeof(sharp) / sizeof(u32));
+            };
+            for (const auto& desc : stage->buffers) {
+                push(desc.GetSharp(bound));
+            }
+            for (const auto& desc : stage->images) {
+                push(desc.GetSharp(bound));
+                textured = true;
+            }
+            for (const auto& desc : stage->samplers) {
+                push(desc.GetSharp(bound));
+            }
+            u32 mask = stage->ud_mask.mask;
+            while (mask) {
+                const u32 index = std::countr_zero(mask);
+                mask &= ~(1U << index);
+                key.push_back(bound.user_data[index]);
+            }
+            key.push_back(0xf1a7f1a7u);
+            key.insert(key.end(), bound.flattened_ud_buf.begin(), bound.flattened_ud_buf.end());
+        }
+        ++fc.flat_only;
+        fc.textured += textured;
+        const u64 dirty = st.c_dirty_epoch, image = st.c_image_epoch;
+        if (fc.pipeline == pipeline && fc.draw + 1 == st.draws) {
+            ++fc.same_pipe_prev;
+            if (fc.key[fc.kidx] == key && fc.dirty == dirty && fc.image == image &&
+                fc.buf_gen == st.c_buf_gen && fc.tex_gen == st.c_tex_gen &&
+                fc.smp_gen == st.c_smp_gen && fc.border == st.c_border) {
+                ++fc.match;
+                fc.match_textured += textured;
+            }
+        }
+        fc.kidx ^= 1;
+        fc.pipeline = pipeline;
+        fc.draw = st.draws;
+        fc.dirty = dirty;
+        fc.image = image;
+        fc.buf_gen = st.c_buf_gen;
+        fc.tex_gen = st.c_tex_gen;
+        fc.smp_gen = st.c_smp_gen;
+        fc.border = st.c_border;
     }
     if (eligible) {
         if (pipeline->repeat_static == 0) {
