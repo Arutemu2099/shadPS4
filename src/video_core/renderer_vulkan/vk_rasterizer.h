@@ -418,6 +418,21 @@ private:
         u32 tex_nonhit_stages{};
         u64 end_seq{}; ///< Scheduler::RecordSeq after the previous draw's records
         Shader::PushData push_data{};
+        /// SHADPS4_DRAW_REPEAT_HEAP (dcb note sec. 9): bindings into the per-frame heap may differ
+        /// in address only; a repeat re-points them (same Buffer, new offset / push adjust).
+        struct HeapSlot {
+            u32 info_idx;
+            u32 bind_idx;
+            const VideoCore::Buffer* buffer;
+        };
+        struct HeapNew {
+            vk::DescriptorBufferInfo info;
+            u32 adjust;
+        };
+        std::vector<HeapSlot> heap_base, heap_pending;
+        std::vector<AmdGpu::Buffer> heap_cand;
+        std::vector<HeapNew> heap_new;
+        u64 f_heap{}, heap_repeats{};
         // Verify scratch.
         std::vector<vk::DescriptorBufferInfo> v_buffers;
         std::vector<vk::DescriptorImageInfo> v_images;
@@ -526,7 +541,7 @@ private:
     void NativeVerifyCompare(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset);
     void NativeLog();
     bool DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit);
-    void DrawRepeatApply(const GraphicsPipeline* pipeline);
+    void DrawRepeatApply(const GraphicsPipeline* pipeline, bool patch_infos = true);
     void DrawRepeatVerify(const GraphicsPipeline* pipeline);
     void DrawRepeatStore(const GraphicsPipeline* pipeline, bool completed);
     /// SHADPS4_PB_CENSUS (diagnostic): the parallel-back census, see PbCensusEnd.

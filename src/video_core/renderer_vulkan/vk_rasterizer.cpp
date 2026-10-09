@@ -255,6 +255,14 @@ constexpr std::array<const char*, P5Count> kP5Names{"buf_find", "buf_special", "
                                                     "tex_key",  "tex_valid",   "tex_emit",
                                                     "tex_miss", "tex_empty"};
 thread_local std::array<u64, P5Count> g_p5{};
+// SHADPS4_DRAW_REPEAT_HEAP=1 (2026-10-09, dcb note sec. 9): a draw repeats the previous one when
+// only its per-frame-heap V#s moved (same buffer, new offset); identical formatted reads allowed.
+const bool g_repeat_heap = [] {
+    const char* v = std::getenv("SHADPS4_DRAW_REPEAT_HEAP");
+    return v && v[0] == '1';
+}();
+constexpr VAddr RepeatHeapLo = 0x248000000ULL;
+constexpr VAddr RepeatHeapHi = 0x24c000000ULL;
 
 // SHADPS4_BIND_REGION_CENSUS=1 (2026-10-09, native resource model, dcb-parallel note sec. 8): which
 // guest memory regions (16 MB granules) the graphics bindings read, what each costs on the back and
@@ -3257,6 +3265,12 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
         bound = true;
     } else if (repeat) {
         draw_repeat.v_buffers.assign(buffer_infos.begin(), buffer_infos.end());
+        for (size_t k = 0; k < draw_repeat.heap_new.size(); ++k) {
+            const u32 idx = draw_repeat.heap_base[k].info_idx;
+            if (idx < draw_repeat.v_buffers.size()) {
+                draw_repeat.v_buffers[idx] = draw_repeat.heap_new[k].info;
+            }
+        }
         draw_repeat.v_images.assign(image_infos.begin(), image_infos.end());
         draw_repeat.v_seq = scheduler.RecordSeq();
         bound = BindResources(pipeline);
@@ -4043,12 +4057,15 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
                  "DrawRepeatSkip: mode={} draws={} repeats={} ({:.1f}%) | not a repeat: "
                  "ineligible={:.1f}% pipeline={:.1f}% key={:.1f}% render_state={:.1f}% "
                  "recorded_between={:.1f}% dirty_epoch={:.1f}% image_epoch={:.1f}% "
-                 "cache_gen={:.1f}% other={:.1f}% gated={:.1f}% | verified={} mismatches={}",
+                 "cache_gen={:.1f}% other={:.1f}% gated={:.1f}% heap={:.1f}% | verified={} "
+                 "mismatches={} heap_repeats={}",
                  g_draw_repeat, st.draws, st.repeats, 100.0 * st.repeats / d,
                  100.0 * st.f_ineligible / d, 100.0 * st.f_pipeline / d, 100.0 * st.f_key / d,
                  100.0 * st.f_rs / d, 100.0 * st.f_seq / d, 100.0 * st.f_epoch / d,
                  100.0 * st.f_image / d, 100.0 * st.f_gen / d, 100.0 * st.f_other / d,
-                 100.0 * st.f_gated / d, st.verified, st.mismatches);
+                 100.0 * st.f_gated / d, 100.0 * st.f_heap / d, st.verified, st.mismatches,
+                 st.heap_repeats);
+        st.f_heap = st.heap_repeats = 0;
         LOG_INFO(Render_Vulkan,
                  "DrawRepeatWhy: ineligible draws by global={} dma={} written={} formatted={} "
                  "special={} image_written={} flatbuf={}",
@@ -4122,7 +4139,7 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
             for (const auto& desc : stage->buffers) {
                 if (desc.is_written) {
                     bad(2);
-                } else if (desc.is_formatted) {
+                } else if (desc.is_formatted && !g_repeat_heap) {
                     bad(3);
                 } else if (desc.IsSpecial()) {
                     if (desc.buffer_type == Shader::BufferType::Flatbuf) {
@@ -4288,20 +4305,35 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
         std::memcpy(&cand[n], &sharp, sizeof(sharp));
         n += words;
     };
+    st.heap_cand.clear();
     if (eligible) {
+        bool heap_formatted = false;
         for (const auto& bound : BoundStages(pipeline)) {
             const auto* stage = bound.info;
             if (!stage) {
                 continue;
             }
             for (const auto& desc : stage->buffers) {
-                add(desc.GetSharp(bound));
+                auto v = desc.GetSharp(bound);
+                if (g_repeat_heap && !desc.IsSpecial() && v.base_address >= RepeatHeapLo &&
+                    v.base_address < RepeatHeapHi && v.GetSize() > 0) {
+                    // The address is re-pointed at the repeat; size / stride / format stay keyed.
+                    heap_formatted = heap_formatted || desc.is_formatted;
+                    st.heap_cand.push_back(v);
+                    v.base_address = 1;
+                }
+                add(v);
             }
             for (const auto& desc : stage->images) {
                 add(desc.GetSharp(bound));
             }
             for (const auto& desc : stage->samplers) {
                 add(desc.GetSharp(bound));
+            }
+            if (g_repeat_heap) {
+                // Heap mode: user-data registers reach the bindings only through the sharps keyed
+                // above; DrawRepeatApply pushes this draw's own registers (verify: mode 2).
+                continue;
             }
             u32 mask = stage->ud_mask.mask;
             while (mask) {
@@ -4313,6 +4345,10 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
         if (overflow) {
             eligible = false;
             reason = 0;
+        }
+        if (heap_formatted) {
+            eligible = false;
+            reason = 3;
         }
     }
     st.sizes[st.kidx ^ 1] = n;
@@ -4370,11 +4406,42 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
         ++st.f_gen;
         return false;
     }
+    st.heap_new.clear();
+    if (g_repeat_heap) {
+        if (st.heap_cand.size() != st.heap_base.size()) {
+            ++st.f_heap;
+            return false;
+        }
+        const bool lean = VideoCore::g_lean_bind != 0;
+        const u32 alignment = instance.StorageMinAlignment();
+        for (size_t k = 0; k < st.heap_cand.size(); ++k) {
+            const auto& v = st.heap_cand[k];
+            const auto& slot = st.heap_base[k];
+            const VAddr addr = v.base_address;
+            const u64 vsize = v.GetSize();
+            const u64 size =
+                lean && vsize < (u64{1} << 30) ? vsize : memory->ClampRangeSize(addr, vsize);
+            // Same Buffer as the base binding (the generation test above keeps it alive), its
+            // pages verified clean (no upload due), as BindBuffers' lean read would find.
+            if (!slot.buffer->IsInBounds(addr, size) || !buffer_cache.ReadRangeClean(addr, size)) {
+                ++st.f_heap;
+                st.heap_new.clear();
+                return false;
+            }
+            const u32 offset = static_cast<u32>(slot.buffer->Offset(addr));
+            const u32 offset_aligned = Common::AlignDown(offset, alignment);
+            const u32 adjust = offset - offset_aligned;
+            st.heap_new.push_back(
+                {vk::DescriptorBufferInfo{slot.buffer->Handle(), offset_aligned, size + adjust},
+                 adjust});
+        }
+        st.heap_repeats += !st.heap_new.empty();
+    }
     ++st.repeats;
     return true;
 }
 
-void Rasterizer::DrawRepeatApply(const GraphicsPipeline* pipeline) {
+void Rasterizer::DrawRepeatApply(const GraphicsPipeline* pipeline, bool patch_infos) {
     // What BindResources leaves besides the resolved infos (still those of the previous draw):
     // push_data. The viewport transform and the pushed registers come from this draw, the
     // buffer offsets from the bindings, which are the previous draw's.
@@ -4390,6 +4457,15 @@ void Rasterizer::DrawRepeatApply(const GraphicsPipeline* pipeline) {
         }
     }
     push_data.buf_offsets = draw_repeat.push_data.buf_offsets;
+    // SHADPS4_DRAW_REPEAT_HEAP: the heap bindings point at this draw's data.
+    const auto& st = draw_repeat;
+    for (size_t k = 0; k < st.heap_new.size(); ++k) {
+        const auto& slot = st.heap_base[k];
+        push_data.buf_offsets[slot.bind_idx] = st.heap_new[k].adjust;
+        if (patch_infos) {
+            buffer_infos[slot.info_idx] = st.heap_new[k].info;
+        }
+    }
 }
 
 void Rasterizer::DrawRepeatVerify(const GraphicsPipeline* pipeline) {
@@ -4422,7 +4498,7 @@ void Rasterizer::DrawRepeatVerify(const GraphicsPipeline* pipeline) {
     if (!what) {
         // push_data as the skip would have built it against the full path's.
         const Shader::PushData full = push_data;
-        DrawRepeatApply(pipeline);
+        DrawRepeatApply(pipeline, false);
         if (push_data.xoffset != full.xoffset || push_data.yoffset != full.yoffset ||
             push_data.xscale != full.xscale || push_data.yscale != full.yscale ||
             push_data.ud_regs != full.ud_regs || push_data.buf_offsets != full.buf_offsets) {
@@ -5014,6 +5090,7 @@ void Rasterizer::DrawRepeatStore(const GraphicsPipeline* pipeline, bool complete
     st.border = st.c_border;
     st.push_data = push_data;
     st.end_seq = scheduler.RecordSeq();
+    st.heap_base = st.heap_pending;
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
@@ -5040,6 +5117,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     buffer_infos.clear();
     image_infos.clear();
     draw_repeat.tex_nonhit_stages = 0;
+    draw_repeat.heap_pending.clear();
     g_dc_bind_buf = 0;
     g_dc_bind_tex = 0;
     g_dc_tex_sub = {};
@@ -7226,6 +7304,11 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
             push_data.AddOffset(binding.buffer, adjust);
             buffer_infos.emplace_back(vk_buffer->Handle(), offset_aligned, size + adjust);
             bound_buffer = vk_buffer;
+            if (g_repeat_heap && !binding_compute && vsharp.base_address >= RepeatHeapLo &&
+                vsharp.base_address < RepeatHeapHi) {
+                draw_repeat.heap_pending.push_back(
+                    {static_cast<u32>(buffer_infos.size() - 1), binding.buffer, vk_buffer});
+            }
             if (auto barrier =
                     vk_buffer->GetBarrier(desc.is_written ? vk::AccessFlagBits2::eShaderWrite
                                                           : vk::AccessFlagBits2::eShaderRead,

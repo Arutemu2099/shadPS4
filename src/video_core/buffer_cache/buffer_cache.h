@@ -261,6 +261,11 @@ public:
                                                          BufferId buffer_id);
     [[nodiscard]] bool LeanReadOk();
 
+    /// SHADPS4_DRAW_REPEAT_HEAP: the read-sync fast path's clean answer for a range (no upload due).
+    [[nodiscard]] bool ReadRangeClean(VAddr addr, u64 size) {
+        return memory_tracker->ReadSyncClean(addr, size);
+    }
+
     /// Processes the fault buffer.
     void ProcessFaultBuffer();
 
