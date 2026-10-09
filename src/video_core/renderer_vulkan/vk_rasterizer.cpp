@@ -323,6 +323,7 @@ inline u64 KeyMix(u64 h, const void* data, size_t bytes) {
     return h;
 }
 thread_local bool g_skey_last_hit = false; // the current full draw's static key was seen recently
+thread_local bool g_skey_last_prev = false; // ... and equals the previous full draw's
 void NoteStaticKeyHeapId(u32 id) {
     GetStaticKeyCensus().heap_ids.insert(id);
 }
@@ -2223,8 +2224,8 @@ void Rasterizer::ExecuteDraw(const SplitDraw& draw,
                 native_stats.c_tail_cls[cls] += dt;
                 ++native_stats.n_tail_cls[cls];
                 if (cls == 2) {
-                    native_stats.c_flags[native_stats.last_flags & 63] += dt;
-                    ++native_stats.n_flags[native_stats.last_flags & 63];
+                    native_stats.c_flags[native_stats.last_flags & 127] += dt;
+                    ++native_stats.n_flags[native_stats.last_flags & 127];
                 }
             }
         }
@@ -2987,9 +2988,10 @@ void Rasterizer::NativeLog() {
                  per(st.c_tail_cls[2], st.n_tail_cls[2]), st.n_tail_cls[2],
                  per(st.c_tail_cls[3], st.n_tail_cls[3]), st.n_tail_cls[3]);
         std::string fl;
-        for (u32 f = 0; f < 64; ++f) {
+        for (u32 f = 0; f < 128; ++f) {
             if (st.n_flags[f] != 0) {
-                fl += fmt::format(" | {}{}{}{}{}{}: n={} {:.0f}", (f & 32) ? "KEYHIT " : "",
+                fl += fmt::format(" | {}{}{}{}{}{}{}: n={} {:.0f}", (f & 64) ? "PREV " : "",
+                                  (f & 32) ? "KEYHIT " : "",
                                   (f & 1) ? "texmiss " : "",
                                   (f & 2) ? "recorded " : "", (f & 4) ? "uploaded " : "",
                                   (f & 8) ? "giant " : "", (f & 16) ? "clip " : "",
@@ -3306,7 +3308,8 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
                                   (buffer_cache.SyncUploadBytesTotal() != fc_up0 ? 4u : 0u) |
                                   (native_stats.giant_bound ? 8u : 0u) |
                                   (draw_repeat.clip_info_idx != ~0u ? 16u : 0u) |
-                                  (g_static_key_census && g_skey_last_hit ? 32u : 0u);
+                                  (g_static_key_census && g_skey_last_hit ? 32u : 0u) |
+                                  (g_static_key_census && g_skey_last_prev ? 64u : 0u);
     }
     sample.EndPhase(Common::DrawSampleProbe::Phase::BindResources);
     const auto bindres_ns = Common::FaultMonitor::SinceNs(t_bindres);
@@ -5307,6 +5310,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         c.textured += textured;
         {
             const u64 seq = draw_repeat.draws; // DrawRepeatMatch counts every draw
+            g_skey_last_prev = h == c.prev_key;
             if (h == c.prev_key) {
                 ++c.prev_match;
                 c.prev_match_textured += textured;

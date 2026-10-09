@@ -537,7 +537,7 @@ private:
         // formatted view bound, 4 clip planes copied.
         u32 last_flags{};
         bool giant_bound{};
-        std::array<u64, 64> c_flags{}, n_flags{};
+        std::array<u64, 128> c_flags{}, n_flags{};
         std::array<u64, 4> c_phase{};
         // SHADPS4_NATIVE_TIMING, colour split: colour joins (and their phases) and the DrawTail
         // of draws that opened a colour batch.
