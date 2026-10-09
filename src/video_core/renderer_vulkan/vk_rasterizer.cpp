@@ -3917,6 +3917,7 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
         u64 draws = 0, flat_only = 0, textured = 0, same_pipe_prev = 0, match = 0,
             match_textured = 0, fmt_bindings = 0, fmt_image_backed = 0;
         std::array<u64, 8> special_type{}; // ineligible draws by first special BufferType
+        std::array<u64, 2> c_draws{}, c_same{}, c_match{}; // [0] liftable, [1] eligible control
     };
     static FlatCensus fc;
     if ((++st.draws & 0x1fffff) == 0) {
@@ -3948,8 +3949,14 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
                      fc.special_type[3], fc.special_type[4], fc.special_type[5],
                      fc.special_type[6], fc.special_type[7]);
             fc.flat_only = fc.textured = fc.same_pipe_prev = fc.match = fc.match_textured = 0;
+            LOG_INFO(Render_Vulkan,
+                     "DrawRepeatFlatControl: eligible draws={} prev same pipeline={} census key "
+                     "match={} (real repeats this window {}); liftable draws={} same={} match={}",
+                     fc.c_draws[1], fc.c_same[1], fc.c_match[1], st.repeats, fc.c_draws[0],
+                     fc.c_same[0], fc.c_match[0]);
             fc.fmt_bindings = fc.fmt_image_backed = 0;
             fc.special_type = {};
+            fc.c_draws = fc.c_same = fc.c_match = {};
         }
         st.draws = st.repeats = st.f_ineligible = st.f_pipeline = st.f_key = st.f_rs = st.f_seq =
             st.f_epoch = st.f_image = st.f_gen = st.f_other = st.verified = st.f_gated = 0;
@@ -4048,8 +4055,13 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
             pipeline->repeat_flat_only = flat && any ? 1 : 0;
         }
     }
-    if (flat_census && eligible && pipeline->repeat_static == 0 &&
-        pipeline->repeat_flat_only != 0) [[unlikely]] {
+    // Positive control: the same census key on draws the repeat path accepts as eligible.
+    const bool census_control = eligible && pipeline->repeat_static != 0 &&
+                                !(pipeline->repeat_static == 2 &&
+                                  liverpool->BackRegs().clipper_control.user_clip_plane_enable != 0);
+    if (flat_census && eligible &&
+        ((pipeline->repeat_static == 0 && pipeline->repeat_flat_only != 0) || census_control))
+        [[unlikely]] {
         // Census only: the key a flat-capable repeat would compare, never used for the draw.
         auto& key = fc.key[fc.kidx ^ 1];
         key.clear();
@@ -4092,16 +4104,26 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
             key.push_back(0xf1a7f1a7u);
             key.insert(key.end(), bound.flattened_ud_buf.begin(), bound.flattened_ud_buf.end());
         }
-        ++fc.flat_only;
-        fc.textured += textured;
+        const u32 g = census_control ? 1 : 0;
+        ++fc.c_draws[g];
+        if (!census_control) {
+            ++fc.flat_only;
+            fc.textured += textured;
+        }
         const u64 dirty = st.c_dirty_epoch, image = st.c_image_epoch;
         if (fc.pipeline == pipeline && fc.draw + 1 == st.draws) {
-            ++fc.same_pipe_prev;
+            ++fc.c_same[g];
+            if (!census_control) {
+                ++fc.same_pipe_prev;
+            }
             if (fc.key[fc.kidx] == key && fc.dirty == dirty && fc.image == image &&
                 fc.buf_gen == st.c_buf_gen && fc.tex_gen == st.c_tex_gen &&
                 fc.smp_gen == st.c_smp_gen && fc.border == st.c_border) {
-                ++fc.match;
-                fc.match_textured += textured;
+                ++fc.c_match[g];
+                if (!census_control) {
+                    ++fc.match;
+                    fc.match_textured += textured;
+                }
             }
         }
         fc.kidx ^= 1;
