@@ -8,11 +8,13 @@
 #include <cstdlib>
 #include <memory>
 #include <optional>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 #include "common/fault_monitor.h"
 #include "common/logging/log.h"
+#include "video_core/amdgpu/mtb_conflict.h"
 #include "common/types.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/resource.h"
@@ -192,6 +194,22 @@ public:
             }
         }
         SelectStreamState();
+        if (AmdGpu::MtbConflict::g_enabled) [[unlikely]] {
+            // SHADPS4_MTB_CONFLICT (diagnostic): a draw's first touch, and any hazard-state change.
+            AmdGpu::MtbConflict::Touch(cf, AmdGpu::MtbConflict::Buffer);
+            const auto before = HazardTuple();
+            auto result = GetBarrierImpl(dst_acess_mask, dst_stage, offset, run);
+            if (HazardTuple() != before) {
+                AmdGpu::MtbConflict::Change(cf);
+            }
+            return result;
+        }
+        return GetBarrierImpl(dst_acess_mask, dst_stage, offset, run);
+    }
+
+    std::optional<vk::BufferMemoryBarrier2> GetBarrierImpl(vk::AccessFlags2 dst_acess_mask,
+                                                           vk::PipelineStageFlagBits2 dst_stage,
+                                                           u32 offset, u64 run) {
         if (SmartBarriers()) {
             return GetHazardBarrier(dst_acess_mask, vk::PipelineStageFlags2{dst_stage}, offset,
                                     run);
@@ -217,6 +235,14 @@ public:
     }
 
     void Fill(u64 offset, u32 num_bytes, u32 value);
+
+    /// SHADPS4_MTB_CONFLICT (diagnostic): batch of the last hazard-state change / draw touch.
+    AmdGpu::MtbConflict::Stamp cf{};
+    auto HazardTuple() const {
+        return std::tuple{hz_write_stages, hz_write_access,   hz_read_stages, hz_visible_stages,
+                          hz_visible_access, hz_run,          hz_run_wrote,   access_mask,
+                          stage};
+    }
 
 private:
     static constexpr vk::AccessFlags2 WriteAccessBits =

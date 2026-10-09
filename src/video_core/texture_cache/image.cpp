@@ -7,6 +7,7 @@
 #include "common/assert.h"
 #include "common/fault_monitor.h"
 #include "common/lean.h"
+#include "common/scope_exit.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -235,6 +236,18 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
     if (!raw_layout) {
         dst_layout = Vulkan::GuestLayout(dst_layout);
     }
+    // SHADPS4_MTB_CONFLICT (diagnostic): a draw's first touch in the batch, and any state change.
+    const bool cf = AmdGpu::MtbConflict::g_enabled;
+    const u64 cf_serial = cf ? backing->state_serial : 0;
+    if (cf) [[unlikely]] {
+        AmdGpu::MtbConflict::Touch(backing->cf, AmdGpu::MtbConflict::Image);
+    }
+    BackingImage* const cf_backing = backing;
+    SCOPE_EXIT {
+        if (cf && cf_backing->state_serial != cf_serial) [[unlikely]] {
+            AmdGpu::MtbConflict::Change(cf_backing->cf);
+        }
+    };
     auto& last_state = backing->state;
     auto& runs = backing->subresource_runs;
 
@@ -1070,6 +1083,9 @@ void Image::SetBackingSamples(u32 num_samples, bool copy_backing) {
         new_backing->state.access_mask = dst_access;
         new_backing->state.pl_stage = dst_stage;
         ++new_backing->state_serial; // SHADPS4_TEX_TRANSIT_SKIP: a state write outside GetBarriers
+        if (AmdGpu::MtbConflict::g_enabled) [[unlikely]] {
+            AmdGpu::MtbConflict::Change(new_backing->cf);
+        }
     }
 
     backing = new_backing;

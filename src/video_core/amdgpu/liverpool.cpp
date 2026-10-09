@@ -20,6 +20,7 @@
 #include "video_core/buffer_cache/protect_queue.h"
 #include "video_core/buffer_cache/submit_epoch.h"
 #include "common/polyfill_thread.h"
+#include "common/scope_exit.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -35,6 +36,7 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/amdgpu/mtb_census.h"
+#include "video_core/amdgpu/mtb_conflict.h"
 
 namespace Common::FenceWatch {
 
@@ -1867,6 +1869,10 @@ void Liverpool::ExecuteDrawRecord(const CpSplit::RecordHeader& record) {
     }
     // SHADPS4_MTB_P1: split draws translate on the worker instance (P1d).
     Vulkan::Rasterizer& translating = rasterizer->Translating();
+    MtbConflict::g_in_draw = MtbConflict::g_enabled;
+    SCOPE_EXIT {
+        MtbConflict::g_in_draw = false;
+    };
     if (rec.marker) {
         translating.ScopeMarkerBegin(fmt::format("gfx:{}:{}", rec.cmd_address, rec.marker));
         translating.ExecuteDraw(rec.draw, stages, vi_block);
@@ -1914,6 +1920,10 @@ void Liverpool::ExecuteDispatchRecord(const CpSplit::RecordHeader& record) {
     back_cs = &rec.cs;
     // SHADPS4_MTB_P1: split dispatches (and their run / queue) go to the worker instance (P1d).
     Vulkan::Rasterizer& translating = rasterizer->Translating();
+    MtbConflict::g_in_draw = MtbConflict::g_enabled;
+    SCOPE_EXIT {
+        MtbConflict::g_in_draw = false;
+    };
     translating.SetDispatchRun(rec.run);
     translating.SetDispatchQueue(rec.queue);
     Common::ReadbackOffload::AscSpan().in_asc_dispatch = rec.queue != GfxQueueId;

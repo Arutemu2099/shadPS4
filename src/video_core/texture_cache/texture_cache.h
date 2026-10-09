@@ -309,6 +309,9 @@ public:
     bool IsMetaCleared(VAddr address, u32 slice) const {
         const auto& it = surface_metas.find(address);
         if (it != surface_metas.end()) {
+            if (AmdGpu::MtbConflict::g_enabled) [[unlikely]] {
+                AmdGpu::MtbConflict::Touch(it.value().cf, AmdGpu::MtbConflict::Meta);
+            }
             return it.value().clear_mask & (1u << slice);
         }
         return false;
@@ -320,6 +323,9 @@ public:
         if (it != surface_metas.end()) {
             it.value().clear_mask = u32(-1);
             ++meta_clear_epoch;
+            if (AmdGpu::MtbConflict::g_enabled) [[unlikely]] {
+                AmdGpu::MtbConflict::Change(it.value().cf);
+            }
             return true;
         }
         return false;
@@ -343,11 +349,18 @@ public:
     bool TouchMeta(VAddr address, u32 slice, bool is_clear) {
         auto it = surface_metas.find(address);
         if (it != surface_metas.end()) {
+            if (AmdGpu::MtbConflict::g_enabled) [[unlikely]] {
+                AmdGpu::MtbConflict::Touch(it.value().cf, AmdGpu::MtbConflict::Meta);
+            }
+            const s32 old_mask = it.value().clear_mask;
             if (is_clear) {
                 it.value().clear_mask |= 1u << slice;
                 ++meta_clear_epoch;
             } else {
                 it.value().clear_mask &= ~(1u << slice);
+            }
+            if (AmdGpu::MtbConflict::g_enabled && it.value().clear_mask != old_mask) [[unlikely]] {
+                AmdGpu::MtbConflict::Change(it.value().cf);
             }
             return true;
         }
@@ -599,6 +612,8 @@ private:
         };
         Type type;
         s32 clear_mask = -1;
+        /// SHADPS4_MTB_CONFLICT (diagnostic): batch of the last clear-bit change / draw touch.
+        mutable AmdGpu::MtbConflict::Stamp cf{};
     };
     tsl::robin_map<VAddr, MetaDataInfo> surface_metas;
     u64 meta_clear_epoch{}; // SHADPS4_RENDER_STATE_MEMO, see MetaClearEpoch

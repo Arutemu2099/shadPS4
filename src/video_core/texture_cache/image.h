@@ -6,6 +6,7 @@
 #include "common/enum.h"
 #include "common/incremental_id.h"
 #include "common/types.h"
+#include "video_core/amdgpu/mtb_conflict.h"
 #include "video_core/buffer_cache/dirty_epoch.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/texture_cache/image_info.h"
@@ -198,6 +199,8 @@ public:
         /// Bumped by GetBarriers whenever it emits a barrier or changes `state` or the runs
         /// (SHADPS4_TEX_TRANSIT_SKIP: an unchanged serial proves a repeated Transit is a no-op).
         u64 state_serial{1};
+        /// SHADPS4_MTB_CONFLICT (diagnostic): batch of the last state change / draw touch.
+        AmdGpu::MtbConflict::Stamp cf{};
     };
     std::deque<BackingImage> backing_images;
     BackingImage* backing{};

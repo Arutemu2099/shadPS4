@@ -11,6 +11,7 @@
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_draw_packet.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/amdgpu/mtb_conflict.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 #include <thread>
@@ -286,6 +287,7 @@ bool Scheduler::InstallMtbContext(const bool reserve_tick) {
     mtb->rc.dynamic_state.Invalidate();
     mtb->rc.native_heaps_bound = false;
     t_record_ctx = &mtb->rc;
+    AmdGpu::MtbConflict::g_batch = master_semaphore.CurrentTickRaw();
     // P1d: the back translates and reserves; P3: the committer carries the real tick and only a
     // translating worker reserves (at each run).
     if (reserve_tick) {
@@ -329,6 +331,9 @@ void Scheduler::MtbTickAdvanced(const u64 signal_value) {
         master_semaphore.Reserve(master_semaphore.CurrentTickRaw());
     }
     ctx->sink->MarkBoundary(); // the submission was recorded outside the sink
+    if (AmdGpu::MtbConflict::g_enabled) [[unlikely]] {
+        AmdGpu::MtbConflict::EndBatch(master_semaphore.CurrentTickRaw());
+    }
     ++mtb_batches;
     if (++mtb_log_batches >= 16384) {
         LogMtbP1();
