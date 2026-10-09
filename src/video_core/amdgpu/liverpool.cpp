@@ -2314,11 +2314,21 @@ struct FenceCensusState {
     std::unordered_map<u32, u64> where; // key: asc << 24 | in_rest << 23 | body << 22 | type << 8 | opcode
     std::array<u64, 5> dist{};          // dwords from span start to the label: <16, <256, <4K, <64K, more
     u64 syncs = 0, polled_later = 0, not_found = 0;
+    std::array<u64, 8> rel{}; // label - fence packet, dwords: <-4096 <-16 <0 0..1 <16 <256 <4096 more
+    std::array<u64, 4> at_type{}; // PM4 type bits of the dword at the label
+    u64 span_dw = 0;
 } g_fence_census_state;
 
-void FenceCensusNote(std::span<const u32> span, VAddr label, bool asc, bool in_rest) {
+void FenceCensusNote(std::span<const u32> span, VAddr label, bool asc, bool in_rest,
+                     const PM4Header* fence) {
     auto& st = g_fence_census_state;
     ++st.syncs;
+    st.span_dw += span.size();
+    {
+        const s64 r = (s64(label) - s64(reinterpret_cast<VAddr>(fence))) / 4;
+        st.rel[r < -4096 ? 0 : r < -16 ? 1 : r < 0 ? 2 : r < 2 ? 3 : r < 16 ? 4 : r < 256 ? 5 : r < 4096 ? 6 : 7] += 1;
+        st.at_type[(*reinterpret_cast<const u32*>(label) >> 30) & 3] += 1;
+    }
     const u32* p = span.data();
     const u32* end = p + span.size();
     const VAddr base = reinterpret_cast<VAddr>(p);
@@ -2365,9 +2375,12 @@ void FenceCensusNote(std::span<const u32> span, VAddr label, bool asc, bool in_r
         }
         LOG_INFO(Render,
                  "FenceCensus: syncs={} not_found={} polled_by_later_wait={} dist(dw <16/<256/<4K/<64K/more)="
-                 "{}/{}/{}/{}/{} |{}",
+                 "{}/{}/{}/{}/{} | label-fence dw <-4096/<-16/<0/0-1/<16/<256/<4096/more={}/{}/{}/{}/{}/{}/{}/{} "
+                 "| dword at label type0/1/2/3={}/{}/{}/{} span_dw_mean={:.0f} |{}",
                  st.syncs, st.not_found, st.polled_later, st.dist[0], st.dist[1], st.dist[2],
-                 st.dist[3], st.dist[4], line);
+                 st.dist[3], st.dist[4], st.rel[0], st.rel[1], st.rel[2], st.rel[3], st.rel[4],
+                 st.rel[5], st.rel[6], st.rel[7], st.at_type[0], st.at_type[1], st.at_type[2],
+                 st.at_type[3], double(st.span_dw) / double(st.syncs), line);
     }
 }
 } // namespace
@@ -2393,7 +2406,7 @@ void Liverpool::RunFence(const PM4Header* header, std::span<const u32> rest, VAd
         if (g_fence_census) [[unlikely]] {
             const bool asc = (flags & CpSplit::AscReleaseMem) != 0;
             if (label < hi && lo < label + LabelBytes) {
-                FenceCensusNote(rest, label, asc, true);
+                FenceCensusNote(rest, label, asc, true, header);
             } else {
                 for (u32 i = 0; i < split_span_hwm; ++i) {
                     const auto* span = split_spans[i];
@@ -2402,7 +2415,7 @@ void Liverpool::RunFence(const PM4Header* header, std::span<const u32> rest, VAd
                     }
                     const auto s_lo = reinterpret_cast<VAddr>(span->data());
                     if (label < s_lo + span->size_bytes() && s_lo < label + LabelBytes) {
-                        FenceCensusNote(*span, label, asc, false);
+                        FenceCensusNote(*span, label, asc, false, header);
                         break;
                     }
                 }
