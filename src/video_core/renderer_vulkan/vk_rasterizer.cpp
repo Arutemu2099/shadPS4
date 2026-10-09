@@ -255,6 +255,64 @@ constexpr std::array<const char*, P5Count> kP5Names{"buf_find", "buf_special", "
                                                     "tex_key",  "tex_valid",   "tex_emit",
                                                     "tex_miss", "tex_empty"};
 thread_local std::array<u64, P5Count> g_p5{};
+
+// SHADPS4_BIND_REGION_CENSUS=1 (2026-10-09, native resource model, dcb-parallel note sec. 8): which
+// guest memory regions (16 MB granules) the graphics bindings read, what each costs on the back and
+// how often its data had to be uploaded (CPU-written since the last upload). Back thread only.
+const bool g_bind_region_census = [] {
+    const char* v = std::getenv("SHADPS4_BIND_REGION_CENSUS");
+    return v && v[0] == '1';
+}();
+struct RegionStats {
+    u64 n = 0, cyc = 0, uploaded = 0, formatted = 0, written = 0, bytes = 0, img = 0;
+};
+struct RegionCensus {
+    std::unordered_map<u32, RegionStats> by;
+    u64 bindings = 0, images = 0, draws = 0;
+    u64 tsc0 = 0;
+    std::chrono::steady_clock::time_point t0{};
+};
+RegionCensus& GetRegionCensus() {
+    static RegionCensus c;
+    return c;
+}
+void RegionCensusLog(RegionCensus& c) {
+    const u64 now_tsc = __rdtsc();
+    const double wall_ns = double(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - c.t0)
+                                      .count());
+    const double ns_per_cyc = wall_ns / double(std::max<u64>(now_tsc - c.tsc0, 1));
+    std::vector<std::pair<u32, RegionStats>> v(c.by.begin(), c.by.end());
+    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) {
+        return a.second.cyc + a.second.img > b.second.cyc + b.second.img;
+    });
+    u64 all_cyc = 0;
+    for (const auto& [k, r] : v) {
+        all_cyc += r.cyc;
+    }
+    std::string line;
+    for (size_t i = 0; i < std::min<size_t>(v.size(), 24); ++i) {
+        const auto& [k, r] = v[i];
+        line += fmt::format(" | {:#011x}: buf n={} {:.0f}ns {:.1f}%cyc up={:.1f}% fmt={:.0f}% wr={:.0f}% "
+                            "avgKB={:.0f} img={}",
+                            u64(k) << 24, r.n, r.n ? double(r.cyc) * ns_per_cyc / double(r.n) : 0.0,
+                            all_cyc ? 100.0 * double(r.cyc) / double(all_cyc) : 0.0,
+                            r.n ? 100.0 * double(r.uploaded) / double(r.n) : 0.0,
+                            r.n ? 100.0 * double(r.formatted) / double(r.n) : 0.0,
+                            r.n ? 100.0 * double(r.written) / double(r.n) : 0.0,
+                            r.n ? double(r.bytes) / 1024.0 / double(r.n) : 0.0, r.img);
+    }
+    LOG_INFO(Render_Vulkan,
+             "BindRegionCensus: window {:.0f} ms, {} graphics buffer bindings ({:.0f} ns total each), "
+             "{} image bindings, {} regions:{}",
+             wall_ns / 1e6, c.bindings,
+             c.bindings ? double(all_cyc) * ns_per_cyc / double(c.bindings) : 0.0, c.images,
+             v.size(), line);
+    c.by.clear();
+    c.bindings = c.images = 0;
+    c.tsc0 = __rdtsc();
+    c.t0 = std::chrono::steady_clock::now();
+}
 // The per-binding repeat census below allocates in a hash map inside the timed buffer phase;
 // SHADPS4_DRAW_COST_REPEAT=1 keeps it, off by default so the phases are not inflated.
 const bool g_dc_repeat_census = [] {
@@ -5817,6 +5875,13 @@ void Rasterizer::BindTexturesMemo(const Pipeline* pipeline, const Shader::BoundS
         st.ssharps.push_back(ssharp);
     }
     const u64 border = liverpool->BackRegs().ta_bc_base.base_addr;
+    if (g_bind_region_census && !pipeline->IsCompute()) [[unlikely]] {
+        auto& c = GetRegionCensus();
+        for (const auto& t : st.tsharps) {
+            ++c.by[static_cast<u32>(t.Address() >> 24)].img;
+            ++c.images;
+        }
+    }
 
     // The way whose key matches, else the least recently used (or an empty) way, which then
     // misses on the key below and is re-recorded by the full path.
@@ -6860,6 +6925,9 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
         const auto& [buffer_id, vsharp, size] = buffer_bindings[i];
         const auto& desc = stage.buffers[i];
         const u64 p5_t0 = g_draw_cost ? __rdtsc() : 0;
+        const bool rc_on = g_bind_region_census && !binding_compute && buffer_id;
+        const u64 rc_t0 = rc_on ? __rdtsc() : 0;
+        const u64 rc_up0 = rc_on ? buffer_cache.SyncUploadBytesTotal() : 0;
         // SHADPS4_BIND_MEMO_STATS: bindings a memo hit would still run in full are timed.
         const bool memo_fixed = bind_memo_timing && (desc.IsSpecial() || desc.is_written);
         const u64 memo_t0 = memo_fixed ? Common::FencedRDTSC() : 0;
@@ -7025,6 +7093,23 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
         }
         if (g_draw_cost) {
             g_p5[buffer_id ? P5Cache : P5Special] += __rdtsc() - p5_t0;
+        }
+        if (rc_on) {
+            auto& c = GetRegionCensus();
+            if (c.tsc0 == 0) {
+                c.tsc0 = __rdtsc();
+                c.t0 = std::chrono::steady_clock::now();
+            }
+            auto& r = c.by[static_cast<u32>(vsharp.base_address >> 24)];
+            ++r.n;
+            r.cyc += __rdtsc() - rc_t0;
+            r.uploaded += buffer_cache.SyncUploadBytesTotal() != rc_up0;
+            r.formatted += desc.is_formatted;
+            r.written += desc.is_written;
+            r.bytes += size;
+            if ((++c.bindings & 0x3fffff) == 0) {
+                RegionCensusLog(c);
+            }
         }
     }
     Common::FaultMonitor::CountBindBufferPass(find_ns, obtain_ns);
