@@ -263,6 +263,8 @@ const bool g_repeat_heap = [] {
 }();
 constexpr VAddr RepeatHeapLo = 0x248000000ULL;
 constexpr VAddr RepeatHeapHi = 0x24c000000ULL;
+// DRAW_REPEAT=2 diagnostic: which binding of the full path recorded commands (a skip omits them).
+thread_local std::string g_rp_seq_who;
 
 // SHADPS4_BIND_REGION_CENSUS=1 (2026-10-09, native resource model, dcb-parallel note sec. 8): which
 // guest memory regions (16 MB granules) the graphics bindings read, what each costs on the back and
@@ -4506,11 +4508,12 @@ void Rasterizer::DrawRepeatVerify(const GraphicsPipeline* pipeline) {
         }
         push_data = full;
     }
-    if (what && ++st.mismatches <= 16) {
+    if (what && ++st.mismatches <= 64) {
         LOG_ERROR(Render_Vulkan,
-                  "DrawRepeat: MISMATCH {} (pipeline {:#x}, {} buffer infos, {} image infos)",
-                  what, reinterpret_cast<u64>(pipeline), buffer_infos.size(),
-                  image_infos.size());
+                  "DrawRepeat: MISMATCH {} (pipeline {:#x}, {} buffer infos, {} image infos, {} "
+                  "heap slots) recorded by:{}",
+                  what, reinterpret_cast<u64>(pipeline), buffer_infos.size(), image_infos.size(),
+                  st.heap_new.size(), g_rp_seq_who.empty() ? " (outside the bindings)" : g_rp_seq_who);
     }
 }
 
@@ -5118,6 +5121,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     image_infos.clear();
     draw_repeat.tex_nonhit_stages = 0;
     draw_repeat.heap_pending.clear();
+    if (g_draw_repeat == 2) {
+        g_rp_seq_who.clear();
+    }
     g_dc_bind_buf = 0;
     g_dc_bind_tex = 0;
     g_dc_tex_sub = {};
@@ -5288,10 +5294,14 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             BindBuffers(bound, binding, push_data);
             const u64 dc1 = g_draw_cost ? __rdtsc() : 0;
             const auto t_tex = Common::FaultMonitor::Now();
+            const u64 rp_tseq0 = g_draw_repeat == 2 ? scheduler.RecordSeq() : 0;
             if (tex_bind_memo) {
                 BindTexturesMemo(pipeline, bound, binding);
             } else {
                 BindTextures(bound, binding);
+            }
+            if (g_draw_repeat == 2 && scheduler.RecordSeq() != rp_tseq0) [[unlikely]] {
+                g_rp_seq_who += fmt::format(" tex(stage {})", static_cast<u32>(stage->l_stage));
             }
             if (g_draw_cost) {
                 g_dc_bind_buf += dc1 - dc0;
@@ -7199,6 +7209,7 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
         const auto& [buffer_id, vsharp, size] = buffer_bindings[i];
         const auto& desc = stage.buffers[i];
         const u64 p5_t0 = g_draw_cost ? __rdtsc() : 0;
+        const u64 rp_seq0 = g_draw_repeat == 2 ? scheduler.RecordSeq() : 0;
         const bool rc_on = g_bind_region_census && !binding_compute && buffer_id;
         const u64 rc_t0 = rc_on ? __rdtsc() : 0;
         const u64 rc_up0 = rc_on ? buffer_cache.SyncUploadBytesTotal() : 0;
@@ -7372,6 +7383,14 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
         }
         if (g_draw_cost) {
             g_p5[buffer_id ? P5Cache : P5Special] += __rdtsc() - p5_t0;
+        }
+        if (g_draw_repeat == 2 && scheduler.RecordSeq() != rp_seq0) [[unlikely]] {
+            const VAddr a = vsharp.base_address;
+            g_rp_seq_who += fmt::format(" b{}:{}{}{}{}@{:#x}+{:#x}", i,
+                                        a >= RepeatHeapLo && a < RepeatHeapHi ? "heap" : "static",
+                                        desc.is_formatted ? ",fmt" : "",
+                                        desc.is_written ? ",wr" : "", desc.IsSpecial() ? ",sp" : "",
+                                        a, size);
         }
         if (rc_on) {
             auto& c = GetRegionCensus();
