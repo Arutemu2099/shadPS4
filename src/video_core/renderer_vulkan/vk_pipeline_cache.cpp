@@ -29,6 +29,7 @@
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
+#include "video_core/native_census.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_compile_pool.h"
@@ -406,6 +407,96 @@ private:
     bool busy{};
     std::atomic<u32> num_finished{};
     std::jthread thread; // last: joined before anything above is destroyed
+};
+
+// SHADPS4_NATIVE_COLOUR (notes/colour-pass-2026-10-09.md sec. 3): one colour variant's driver
+// compile, built on the front and run on the native compiler thread. Like AsyncJob: the thread
+// reads only copies plus Infos / modules the cache never destroys while it runs.
+struct PipelineCache::NativeColourJob {
+    const GraphicsPipeline* base{};
+    u32 slot{};
+    GraphicsPipelineKey key{};
+    std::array<const Shader::Info*, MaxShaderStages> infos{};
+    std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
+    std::array<vk::ShaderModule, MaxShaderStages> modules{};
+    std::shared_ptr<const Shader::Gcn::FetchShaderData> fetch_shader;
+    GraphicsPipeline::SerializationSupport sdata{};
+    GraphicsPipeline::DescSetBindings bindings;
+    u32 records_binding{};
+    u32 vertex_binding{};
+};
+
+struct PipelineCache::NativeColourCompiler {
+    NativeColourCompiler(const Instance& instance_, Scheduler& scheduler_,
+                         DescriptorHeap& desc_heap_, const Shader::Profile& profile_,
+                         vk::PipelineCache pipeline_cache_)
+        : instance{instance_}, scheduler{scheduler_}, desc_heap{desc_heap_}, profile{profile_},
+          pipeline_cache{pipeline_cache_},
+          thread{std::bind_front(&NativeColourCompiler::Run, this)} {}
+
+    ~NativeColourCompiler() {
+        thread.request_stop();
+        thread.join();
+    }
+
+    void Push(std::unique_ptr<NativeColourJob> job) {
+        {
+            std::scoped_lock lk{mutex};
+            queue.push_back(std::move(job));
+        }
+        cv.notify_one();
+    }
+
+private:
+    void Run(std::stop_token stoken) {
+        Common::SetCurrentThreadName("shadPS4:NativeColourCompiler");
+        while (true) {
+            std::unique_ptr<NativeColourJob> job;
+            {
+                std::unique_lock lk{mutex};
+                Common::CondvarWait(cv, lk, stoken, [&] { return !queue.empty(); });
+                if (stoken.stop_requested()) {
+                    return;
+                }
+                job = std::move(queue.front());
+                queue.pop_front();
+            }
+            const auto t0 = CompileClock::now();
+            auto variant = std::make_unique<GraphicsPipeline>(
+                instance, scheduler, desc_heap, profile, job->key, pipeline_cache, job->infos,
+                job->runtime_infos, job->fetch_shader, job->modules, job->sdata, false,
+                &job->bindings, job->records_binding);
+            const double ms = MsSince(t0);
+            auto& slot = job->base->native_colour[job->slot];
+            if (!variant->UsesPushDescriptors()) {
+                // Too many descriptors for push descriptors (NVIDIA: 32): the slot stays claimed
+                // with no variant, so the back keeps the generic path for this description.
+                LOG_INFO(Render_Vulkan, "NativeColour: variant of {:#x} has no push descriptors",
+                         std::hash<GraphicsPipelineKey>{}(job->key));
+            } else {
+                variant->native_vertex_binding = job->vertex_binding;
+                slot.variant.store(variant.get(), std::memory_order_release);
+            }
+            if (++built <= 64 || (built & 63) == 0) {
+                LOG_INFO(Render_Vulkan, "NativeColour: variant #{} of {:#x} slot {} built in {:.1f} ms",
+                         built, std::hash<GraphicsPipelineKey>{}(job->key), job->slot, ms);
+            }
+            std::scoped_lock lk{mutex};
+            owned.push_back(std::move(variant));
+        }
+    }
+
+    const Instance& instance;
+    Scheduler& scheduler;
+    DescriptorHeap& desc_heap;
+    const Shader::Profile& profile;
+    vk::PipelineCache pipeline_cache;
+    std::mutex mutex;
+    std::condition_variable_any cv;
+    std::deque<std::unique_ptr<NativeColourJob>> queue;
+    std::vector<std::unique_ptr<GraphicsPipeline>> owned;
+    u32 built{};
+    std::jthread thread; // last: started after every member above exists
 };
 
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
@@ -1117,6 +1208,426 @@ void PipelineCache::PrepareNativeVariant(const GraphicsPipeline* base) {
                  std::hash<GraphicsPipelineKey>{}(graphics_key), records_binding);
     }
     native_variants.push_back(std::move(variant));
+}
+
+namespace {
+/// SHADPS4_NATIVE_COLOUR: how the native VS decodes a vertex input format (Vulkan's own
+/// conversion); kind None = not pullable.
+Shader::NativeVtxAttr NativeVtxFromFormat(vk::Format f, u32 stride) {
+    using K = Shader::NativeVtxKind;
+    const auto a = [&](K kind, u8 bits, u8 count) {
+        return Shader::NativeVtxAttr{kind, bits, count, 1, stride};
+    };
+    switch (f) {
+    case vk::Format::eR32Sfloat: return a(K::Float, 32, 1);
+    case vk::Format::eR32G32Sfloat: return a(K::Float, 32, 2);
+    case vk::Format::eR32G32B32Sfloat: return a(K::Float, 32, 3);
+    case vk::Format::eR32G32B32A32Sfloat: return a(K::Float, 32, 4);
+    case vk::Format::eR32Uint: return a(K::Uint, 32, 1);
+    case vk::Format::eR32G32Uint: return a(K::Uint, 32, 2);
+    case vk::Format::eR32G32B32Uint: return a(K::Uint, 32, 3);
+    case vk::Format::eR32G32B32A32Uint: return a(K::Uint, 32, 4);
+    case vk::Format::eR32Sint: return a(K::Sint, 32, 1);
+    case vk::Format::eR32G32Sint: return a(K::Sint, 32, 2);
+    case vk::Format::eR32G32B32Sint: return a(K::Sint, 32, 3);
+    case vk::Format::eR32G32B32A32Sint: return a(K::Sint, 32, 4);
+    case vk::Format::eA2B10G10R10UnormPack32: return a(K::Unorm, 0, 4);
+    case vk::Format::eA2B10G10R10SnormPack32: return a(K::Snorm, 0, 4);
+    case vk::Format::eA2B10G10R10UintPack32: return a(K::Uint16, 0, 4);
+    case vk::Format::eA2B10G10R10SintPack32: return a(K::Sint16, 0, 4);
+    case vk::Format::eA2B10G10R10UscaledPack32: return a(K::Uscaled, 0, 4);
+    case vk::Format::eA2B10G10R10SscaledPack32: return a(K::Sscaled, 0, 4);
+    case vk::Format::eR16Sfloat: return a(K::Half, 16, 1);
+    case vk::Format::eR16Unorm: return a(K::Unorm, 16, 1);
+    case vk::Format::eR16Snorm: return a(K::Snorm, 16, 1);
+    case vk::Format::eR16Uint: return a(K::Uint16, 16, 1);
+    case vk::Format::eR16Sint: return a(K::Sint16, 16, 1);
+    case vk::Format::eR16G16B16Sfloat: return a(K::Half, 16, 3);
+    case vk::Format::eR16G16B16Unorm: return a(K::Unorm, 16, 3);
+    case vk::Format::eR16G16B16Snorm: return a(K::Snorm, 16, 3);
+    case vk::Format::eR8Unorm: return a(K::Unorm, 8, 1);
+    case vk::Format::eR8Snorm: return a(K::Snorm, 8, 1);
+    case vk::Format::eR8Uint: return a(K::Uint16, 8, 1);
+    case vk::Format::eR8Sint: return a(K::Sint16, 8, 1);
+    case vk::Format::eR8G8Unorm: return a(K::Unorm, 8, 2);
+    case vk::Format::eR8G8Snorm: return a(K::Snorm, 8, 2);
+    case vk::Format::eR8G8Uint: return a(K::Uint16, 8, 2);
+    case vk::Format::eR8G8Sint: return a(K::Sint16, 8, 2);
+    case vk::Format::eR16G16Sfloat: return a(K::Half, 16, 2);
+    case vk::Format::eR16G16B16A16Sfloat: return a(K::Half, 16, 4);
+    case vk::Format::eR16G16Unorm: return a(K::Unorm, 16, 2);
+    case vk::Format::eR16G16B16A16Unorm: return a(K::Unorm, 16, 4);
+    case vk::Format::eR16G16Snorm: return a(K::Snorm, 16, 2);
+    case vk::Format::eR16G16B16A16Snorm: return a(K::Snorm, 16, 4);
+    case vk::Format::eR16G16Uint: return a(K::Uint16, 16, 2);
+    case vk::Format::eR16G16B16A16Uint: return a(K::Uint16, 16, 4);
+    case vk::Format::eR16G16Sint: return a(K::Sint16, 16, 2);
+    case vk::Format::eR16G16B16A16Sint: return a(K::Sint16, 16, 4);
+    case vk::Format::eR16G16Uscaled: return a(K::Uscaled, 16, 2);
+    case vk::Format::eR16G16B16A16Uscaled: return a(K::Uscaled, 16, 4);
+    case vk::Format::eR16G16Sscaled: return a(K::Sscaled, 16, 2);
+    case vk::Format::eR16G16B16A16Sscaled: return a(K::Sscaled, 16, 4);
+    case vk::Format::eR8G8B8A8Unorm: return a(K::Unorm, 8, 4);
+    case vk::Format::eR8G8B8A8Snorm: return a(K::Snorm, 8, 4);
+    case vk::Format::eR8G8B8A8Uint: return a(K::Uint16, 8, 4);
+    case vk::Format::eR8G8B8A8Sint: return a(K::Sint16, 8, 4);
+    case vk::Format::eR8G8B8A8Uscaled: return a(K::Uscaled, 8, 4);
+    case vk::Format::eR8G8B8A8Sscaled: return a(K::Sscaled, 8, 4);
+    default: return {};
+    }
+}
+
+/// The number class the native VS will hand out for a kind (must match the input variable's
+/// class, which comes from the V# number format).
+AmdGpu::NumberClass NativeVtxClass(Shader::NativeVtxKind k) {
+    using K = Shader::NativeVtxKind;
+    switch (k) {
+    case K::Uint:
+    case K::Uint16:
+        return AmdGpu::NumberClass::Uint;
+    case K::Sint:
+    case K::Sint16:
+        return AmdGpu::NumberClass::Sint;
+    default:
+        return AmdGpu::NumberClass::Float;
+    }
+}
+
+const char* NativeBufferWhyNot(const Shader::Info& info, u32 narrow_diag_bit = 4) {
+    if (info.uses_dma) {
+        return "dma";
+    }
+    if (info.buffers.size() >= Shader::NUM_BUFFERS) {
+        return "buffer count";
+    }
+    for (const auto& desc : info.buffers) {
+        if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
+            continue;
+        }
+        if (desc.buffer_type != Shader::BufferType::Guest) {
+            return "buffer type";
+        }
+        if (desc.is_written) {
+            return "buffer written";
+        }
+        if (desc.is_formatted && (VideoCore::g_native_colour_diag & 8)) {
+            return "buffer formatted (diag)";
+        }
+        if (True(desc.used_types & (Shader::IR::Type::U8 | Shader::IR::Type::U16)) &&
+            (VideoCore::g_native_colour_diag & (4 | narrow_diag_bit))) {
+            return "buffer narrow loads (diag)";
+        }
+        // Formatted (typed) reads are lowered to raw loads in the shader; the join passes
+        // is_texel to ObtainBuffer like BindBuffers (an image->buffer sync records a copy,
+        // which refuses the join).
+        if (!desc.IsStorage(desc.GetSharp(info))) {
+            return "buffer not storage";
+        }
+        // 8 / 16 / 32-bit loads apply the guest bound (EmitLoadBufferU8 / U16 / B32xN).
+        if (True(desc.used_types & Shader::IR::Type::U64)) {
+            return "buffer load width";
+        }
+    }
+    for (const auto& desc : info.images) {
+        if (desc.is_written) {
+            return "image written";
+        }
+    }
+    return nullptr;
+}
+} // namespace
+
+void PipelineCache::PrepareNativeColour(const GraphicsPipeline* base,
+                                        const AmdGpu::CpSplit::VertexInputsDerived& vi) {
+    // Front thread, right after FRONT_DERIVE: registers and `vi` = the draw that looked `base`
+    // up. Static eligibility once per pipeline, then one variant per vertex description.
+    if (base->native_colour_static == 2) {
+        return;
+    }
+    const auto& regs = liverpool->regs;
+    const auto stages = base->GetStages();
+    const auto* vs = stages[u32(LogicalStage::Vertex)];
+    const auto* fs = stages[u32(LogicalStage::Fragment)];
+    const auto log_not = [&](const char* why) {
+        if (native_colour_logged++ < 2000) {
+            LOG_INFO(Render_Vulkan, "NativeColour: pipeline {:#x} not eligible ({})",
+                     std::hash<GraphicsPipelineKey>{}(base->GetGraphicsKey()), why);
+        }
+    };
+    if (base->native_colour_static == 0) {
+        const char* why = [&]() -> const char* {
+            if (regs.stage_enable.raw != AmdGpu::ShaderStageEnable::VgtStages::Vs) {
+                return "stages";
+            }
+            if (!vs || !fs) {
+                return "no vs / ps";
+            }
+            for (u32 i = 0; i < stages.size(); ++i) {
+                if (stages[i] && i != u32(LogicalStage::Vertex) &&
+                    i != u32(LogicalStage::Fragment)) {
+                    return "extra stage";
+                }
+            }
+            if (fs->images.empty()) {
+                return "untextured"; // the shadow kind (SHADPS4_NATIVE_PASS) or nothing
+            }
+            // Diag 32 / 64: narrow loads ineligible in the VS / PS only.
+            if (const char* w = NativeBufferWhyNot(*vs, 32)) {
+                return w;
+            }
+            if (const char* w = NativeBufferWhyNot(*fs, 64)) {
+                return w;
+            }
+            // + the records and vertex SSBOs in buffer_infos (static_vector of NUM_BUFFERS).
+            if (vs->buffers.size() + fs->buffers.size() + 2 > Shader::NUM_BUFFERS) {
+                return "buffer count";
+            }
+            for (u32 p = 30; p < Shader::IR::NumParams; ++p) {
+                if (vs->stores.GetAny(Shader::IR::Attribute::Param0 + p)) {
+                    return "vs output 30-31";
+                }
+            }
+            return nullptr;
+        }();
+        // SHADPS4_NATIVE_COLOUR_BISECT=<mask>:<value> (diagnostic): pipelines whose VS has 8 /
+        // 16-bit loads are eligible only if (key hash & mask) == value; every other pipeline
+        // stays ineligible. Logs the eligible ones.
+        static const auto bisect = []() -> std::pair<u64, u64> {
+            const char* e = std::getenv("SHADPS4_NATIVE_COLOUR_BISECT");
+            if (!e) {
+                return {0, ~0ull};
+            }
+            char* end = nullptr;
+            const u64 mask = std::strtoull(e, &end, 0);
+            const u64 value = end && *end == ':' ? std::strtoull(end + 1, nullptr, 0) : 0;
+            return {mask, value};
+        }();
+        if (!why && bisect.second != ~0ull) {
+            bool vs_narrow = false;
+            for (const auto& desc : vs->buffers) {
+                vs_narrow |= True(desc.used_types & (Shader::IR::Type::U8 | Shader::IR::Type::U16));
+            }
+            const u64 h = std::hash<GraphicsPipelineKey>{}(base->GetGraphicsKey());
+            if (!vs_narrow || (h & bisect.first) != bisect.second) {
+                why = "bisect";
+            } else {
+                LOG_INFO(Render_Vulkan, "NativeColour: bisect keeps pipeline {:#x} (vs {:#x} ps {:#x})",
+                         h, vs->pgm_hash, fs->pgm_hash);
+            }
+        }
+        base->native_colour_static = why ? 2 : 1;
+        if (why) {
+            if (std::strcmp(why, "bisect") != 0) {
+                log_not(why);
+            }
+            return;
+        }
+    }
+    const u64 key = VideoCore::NativeVertexKey(vi.attribs.data(), vi.header.count);
+    u32 free_slot = GraphicsPipeline::NativeColourSlots;
+    for (u32 i = 0; i < GraphicsPipeline::NativeColourSlots; ++i) {
+        const u64 k = base->native_colour[i].key.load(std::memory_order_relaxed);
+        if (k == key) {
+            return; // claimed: built, building or failed
+        }
+        if (k == 0 && free_slot == GraphicsPipeline::NativeColourSlots) {
+            free_slot = i;
+        }
+    }
+    if (free_slot == GraphicsPipeline::NativeColourSlots) {
+        return;
+    }
+    // Translating two stages costs the front ~1 ms (guess); at most one per 2 ms.
+    const auto now = std::chrono::steady_clock::now();
+    if (now - native_colour_last < std::chrono::milliseconds(2)) {
+        return;
+    }
+    native_colour_last = now;
+    // From here on the slot is claimed for this key whatever happens (a failure is final).
+    base->native_colour[free_slot].key.store(key, std::memory_order_release);
+    // Per-description eligibility: per-vertex attributes of pullable formats, locations < 16,
+    // number class matching the shader's input type.
+    Shader::NativeEmit emit{};
+    for (u32 k = 0; k < vi.header.count; ++k) {
+        const auto& d = vi.attribs[k].desc;
+        if (d.instanced || d.location >= Shader::NativeMaxPulledLocations) {
+            log_not("instanced / location");
+            return;
+        }
+        auto attr = NativeVtxFromFormat(static_cast<vk::Format>(d.vk_format), d.stride);
+        if (attr.bits == 0 && (VideoCore::g_native_colour_diag & 2)) {
+            attr.valid = 0;
+        }
+        if (!attr.valid) {
+            if (native_colour_logged++ < 96) {
+                LOG_INFO(Render_Vulkan, "NativeColour: pipeline {:#x} vertex format {} not pulled",
+                         std::hash<GraphicsPipelineKey>{}(base->GetGraphicsKey()),
+                         vk::to_string(static_cast<vk::Format>(d.vk_format)));
+            }
+            return;
+        }
+        emit.attrs[d.location] = attr;
+        const u32 dg = VideoCore::g_native_colour_diag;
+        if ((dg & 4096) || (attr.bits == 0 && (dg & 128)) || (dg & 256) ||
+            (attr.bits == 8 && (dg & 512)) ||
+            (attr.bits == 16 && (dg & 1024)) || (attr.bits == 32 && (dg & 2048))) {
+            emit.keep_inputs |= 1u << d.location;
+        }
+    }
+    if (const auto* fetch = base->GetFetchShader()) {
+        for (const auto& attrib : fetch->attributes) {
+            if (attrib.semantic >= emit.attrs.size() || !emit.attrs[attrib.semantic].valid ||
+                AmdGpu::GetNumberClass(attrib.GetSharp(*vs).GetNumberFmt()) !=
+                    NativeVtxClass(emit.attrs[attrib.semantic].kind)) {
+                log_not("fetch attribute vs description");
+                return;
+            }
+        }
+    }
+    if (!RefreshGraphicsKey() || !(graphics_key == base->GetGraphicsKey())) {
+        log_not("key did not rebuild");
+        return;
+    }
+    {
+        const auto& fsi = runtime_infos[u32(LogicalStage::Fragment)].fs_info;
+        for (u32 i = 0; i < fsi.num_inputs; ++i) {
+            if (fsi.inputs[i].param_index >= 30) {
+                log_not("ps input 30-31");
+                return;
+            }
+        }
+    }
+    Shader::Backend::Bindings total{};
+    std::array<Shader::Backend::Bindings, MaxShaderStages> starts{};
+    const std::array<LogicalStage, 2> order{LogicalStage::Fragment, LogicalStage::Vertex};
+    for (const auto l : order) {
+        starts[u32(l)] = total;
+        if (infos[u32(l)]) {
+            infos[u32(l)]->AddBindings(total);
+        }
+    }
+    emit.active = true;
+    emit.records_binding = total.unified;
+    emit.colour = true;
+    emit.pull = true;
+    emit.vertex_binding = total.unified + 1;
+    emit.compare = (VideoCore::g_native_colour_diag & 4096) != 0;
+    emit.debug_binding = total.unified + 2;
+    emit.vs_hash = vs ? static_cast<u32>(vs->pgm_hash) : 0u;
+    auto native_modules = modules;
+    struct NativeEmitScope {
+        NativeEmitScope(const Shader::NativeEmit& e) {
+            Shader::t_native_emit = e;
+        }
+        ~NativeEmitScope() {
+            Shader::t_native_emit = {};
+        }
+    };
+    for (const auto l : order) {
+        const u32 idx = u32(l);
+        const auto hw = l == LogicalStage::Vertex ? Shader::Stage::Vertex : Shader::Stage::Fragment;
+        const auto* pgm = regs.ProgramForStage(u32(hw));
+        if (!pgm || !pgm->Address<u32*>() || !infos[idx]) {
+            log_not("program");
+            return;
+        }
+        const auto params = AmdGpu::GetParams(*pgm);
+        auto new_info = Shader::Info(hw, l, params);
+        new_info.pinned_uses_dma = infos[idx]->uses_dma;
+        auto runtime_info = runtime_infos[idx];
+        auto binding = starts[idx];
+        std::vector<u32> spv;
+        {
+            NativeEmitScope scope{emit};
+            const auto ir_program =
+                Shader::TranslateProgram(params.code, pools, new_info, runtime_info, profile);
+            spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
+        }
+        if (!SameBindingLayout(new_info, *infos[idx])) {
+            log_not("native layout differs");
+            return;
+        }
+        // SHADPS4_NATIVE_COLOUR_DUMP=<dir> (diagnostic): the native and the plain SPIR-V of the
+        // first 12 stages whose shader has 8 / 16-bit buffer loads, side by side.
+        static const char* dump_dir = std::getenv("SHADPS4_NATIVE_COLOUR_DUMP");
+        static u32 dumped = 0;
+        bool narrow = false;
+        for (const auto& desc : new_info.buffers) {
+            narrow |= True(desc.used_types & (Shader::IR::Type::U8 | Shader::IR::Type::U16));
+        }
+        const bool pulls = l == LogicalStage::Vertex && base->GetFetchShader() &&
+                           !base->GetFetchShader()->attributes.empty();
+        if (dump_dir && narrow && pulls && dumped < 12) {
+            ++dumped;
+            auto plain_info = Shader::Info(hw, l, params);
+            plain_info.pinned_uses_dma = infos[idx]->uses_dma;
+            auto plain_rt = runtime_infos[idx];
+            auto plain_binding = starts[idx];
+            const auto plain_ir =
+                Shader::TranslateProgram(params.code, pools, plain_info, plain_rt, profile);
+            const auto plain =
+                Shader::Backend::SPIRV::EmitSPIRV(profile, plain_rt, plain_ir, plain_binding);
+            const auto write = [&](const std::vector<u32>& code, const char* kind) {
+                const auto path = fmt::format("{}/ncol_{:016x}_{}_{}.spv", dump_dir, params.hash,
+                                              l == LogicalStage::Vertex ? "vs" : "ps", kind);
+                Common::FS::IOFile file{path, Common::FS::FileAccessMode::Create};
+                file.WriteSpan(std::span<const u32>{code});
+            };
+            write(spv, "native");
+            write(plain, "plain");
+        }
+        DumpShader(spv, params.hash, hw, 0x4e43, "native.spv");
+        native_modules[idx] = CompileSPV(spv, instance.GetDevice());
+        Vulkan::SetObjectName(instance.GetDevice(), native_modules[idx], "{}_{:#x}_native_colour",
+                              l == LogicalStage::Vertex ? "vs" : "ps", params.hash);
+    }
+    auto job = std::make_unique<NativeColourJob>();
+    job->base = base;
+    job->slot = free_slot;
+    job->key = graphics_key;
+    job->infos = infos;
+    job->runtime_infos = runtime_infos;
+    job->modules = native_modules;
+    job->fetch_shader = fetch_shader;
+    job->bindings = GraphicsPipeline::DeriveStageInputs(instance, infos, runtime_infos,
+                                                        fetch_shader.get(), job->sdata);
+    const u32 next = job->bindings.empty()
+                         ? 0u
+                         : job->bindings.back().binding + job->bindings.back().descriptorCount;
+    if (next != emit.records_binding) {
+        if (native_colour_logged++ < 96) {
+            LOG_WARNING(Render_Vulkan, "NativeColour: records binding {} vs {}", next,
+                        emit.records_binding);
+        }
+        return;
+    }
+    job->bindings.push_back({
+        .binding = emit.records_binding,
+        .descriptorType = vk::DescriptorType::eStorageBuffer,
+        .descriptorCount = 1,
+        .stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
+    });
+    job->bindings.push_back({
+        .binding = emit.vertex_binding,
+        .descriptorType = vk::DescriptorType::eStorageBuffer,
+        .descriptorCount = 1,
+        .stageFlags = vk::ShaderStageFlagBits::eVertex,
+    });
+    if (emit.compare) {
+        job->bindings.push_back({
+            .binding = emit.debug_binding,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eVertex,
+        });
+    }
+    job->records_binding = emit.records_binding;
+    job->vertex_binding = emit.vertex_binding;
+    if (!native_colour_compiler) {
+        native_colour_compiler = std::make_unique<NativeColourCompiler>(
+            instance, scheduler, desc_heap, profile, *pipeline_cache);
+    }
+    native_colour_compiler->Push(std::move(job));
 }
 
 void PipelineCache::QueueAsyncPipeline(u64 pipeline_hash) {

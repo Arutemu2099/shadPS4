@@ -94,6 +94,12 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
     if (IR::IsParam(attr)) {
         const u32 param_index{u32(attr) - u32(IR::Attribute::Param0)};
         const auto& param{ctx.input_params.at(param_index)};
+        if (ctx.native_pull && Sirit::ValidId(ctx.native_attr_value[param_index])) {
+            // SHADPS4_NATIVE_COLOUR: the attribute was pulled in the prologue.
+            const Id v = ctx.OpCompositeExtract(param.component_type,
+                                                ctx.native_attr_value[param_index], comp);
+            return param.is_integer ? ctx.OpBitcast(ctx.F32[1], v) : v;
+        }
         const Id value = [&] {
             if (param.is_array) {
                 ASSERT(param.num_components > 1);
@@ -364,25 +370,49 @@ static Id EmitLoadBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id a
     return result;
 }
 
+// SHADPS4_NATIVE_COLOUR: whole-buffer descriptors; the guest V# bound for 8 / 16-bit loads
+// (`shift` = log2 of the load size in bytes), as EmitLoadBufferB32xN does for 32-bit loads; in
+// bytes, so the last 1-3 bytes of a binding (and bindings under 4 bytes) stay readable
+// (s306-s309: a dword-rounded bound zeroed them - speckles on the hero's jeans).
+static Id NativeNarrowInBounds(EmitContext& ctx, u32 handle, Id rel_address, u32 shift) {
+    if (!ctx.native || handle >= ctx.native_size_bytes.size() ||
+        !Sirit::ValidId(ctx.native_size_bytes[handle])) {
+        return Id{};
+    }
+    const Id size_units = shift == 0 ? ctx.native_size_bytes[handle]
+                                     : ctx.OpShiftRightLogical(ctx.U32[1],
+                                                               ctx.native_size_bytes[handle],
+                                                               ctx.ConstU32(shift));
+    return ctx.OpULessThan(ctx.U1[1], rel_address, size_units);
+}
+
 Id EmitLoadBufferU8(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
     const auto& spv_buffer = ctx.buffers[handle];
+    const Id in_bounds = NativeNarrowInBounds(ctx, handle, address, 0);
     if (const Id offset = spv_buffer.Offset(PointerSize::B8); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
     const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U8);
     const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address)};
-    const Id result{ctx.OpLoad(ctx.U8, ptr)};
+    Id result{ctx.OpLoad(ctx.U8, ptr)};
+    if (Sirit::ValidId(in_bounds)) {
+        result = ctx.OpSelect(ctx.U8, in_bounds, result, ctx.Constant(ctx.U8, 0U));
+    }
     return result;
 }
 
 Id EmitLoadBufferU16(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
     const auto& spv_buffer = ctx.buffers[handle];
+    const Id in_bounds = NativeNarrowInBounds(ctx, handle, address, 1);
     if (const Id offset = spv_buffer.Offset(PointerSize::B16); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
     const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U16);
     const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address)};
-    const Id result{ctx.OpLoad(ctx.U16, ptr)};
+    Id result{ctx.OpLoad(ctx.U16, ptr)};
+    if (Sirit::ValidId(in_bounds)) {
+        result = ctx.OpSelect(ctx.U16, in_bounds, result, ctx.Constant(ctx.U16, 0U));
+    }
     return result;
 }
 

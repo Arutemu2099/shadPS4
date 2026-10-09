@@ -71,7 +71,11 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
                          Bindings& binding_)
     : Sirit::Module(profile_.supported_spirv), info{info_}, runtime_info{runtime_info_},
       profile{profile_}, stage{info.stage}, l_stage{info.l_stage}, binding{binding_} {
-    native = Shader::t_native_emit.active && info.l_stage == LogicalStage::Vertex;
+    native = Shader::t_native_emit.active &&
+             (info.l_stage == LogicalStage::Vertex ||
+              (Shader::t_native_emit.colour && info.l_stage == LogicalStage::Fragment));
+    native_colour = native && Shader::t_native_emit.colour;
+    native_pull = native && Shader::t_native_emit.pull && info.l_stage == LogicalStage::Vertex;
     if (info.uses_dma) {
         SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
     } else {
@@ -234,9 +238,33 @@ Id EmitContext::GetBufferSize(const u32 sharp_idx) {
 
 void EmitContext::DefineBufferProperties() {
     if (native) {
-        native_rec_base = OpIMul(U32[1], OpLoad(U32[1], draw_index),
-                                 ConstU32(Shader::NativeRecordDwords));
+        Id draw;
+        if (l_stage == LogicalStage::Fragment) {
+            draw = OpLoad(U32[1], native_draw_in);
+        } else {
+            draw = OpLoad(U32[1], draw_index);
+            if (native_colour) {
+                OpStore(native_draw_out, draw);
+            }
+        }
+        native_rec_base = OpIMul(U32[1], draw, ConstU32(Shader::NativeRecordDwords));
         Name(native_rec_base, "native_rec_base");
+        if (native_pull && Shader::t_native_emit.compare) {
+            const Id vindex{OpLoad(U32[1], vertex_index)};
+            for (u32 loc = 0; loc < IR::NumParams; ++loc) {
+                if (Shader::t_native_emit.attrs[loc].valid) {
+                    NativeCompareAttribute(loc, vindex, draw);
+                }
+            }
+        } else if (native_pull) {
+            const Id vindex{OpLoad(U32[1], vertex_index)};
+            for (u32 loc = 0; loc < IR::NumParams; ++loc) {
+                if (Shader::t_native_emit.attrs[loc].valid &&
+                    !((Shader::t_native_emit.keep_inputs >> loc) & 1)) {
+                    native_attr_value[loc] = NativePullAttribute(loc, vindex);
+                }
+            }
+        }
     }
     if (!profile.needs_buffer_offsets && !native) {
         return;
@@ -253,8 +281,8 @@ void EmitContext::DefineBufferProperties() {
         if (native) {
             // The full byte offset of this draw's binding inside the bound VkBuffer.
             buf_offset = NativeRecordLoad(Shader::NativeRecordOffOffset + binding);
-            native_size_dw[i] = OpShiftRightLogical(
-                U32[1], NativeRecordLoad(Shader::NativeRecordSizeOffset + binding), ConstU32(2U));
+            native_size_bytes[i] = NativeRecordLoad(Shader::NativeRecordSizeOffset + binding);
+            native_size_dw[i] = OpShiftRightLogical(U32[1], native_size_bytes[i], ConstU32(2U));
         } else {
             const u32 half = PushData::BufOffsetIndex + (binding >> 4);
             const u32 comp = (binding & 0xf) >> 2;
@@ -342,6 +370,14 @@ void EmitContext::DefineInputs() {
         for (const auto& attrib : fetch_shader->attributes) {
             ASSERT(attrib.semantic < IR::NumParams);
             const auto sharp = attrib.GetSharp(info);
+            if (native_pull && !((Shader::t_native_emit.keep_inputs >> attrib.semantic) & 1)) {
+                // SHADPS4_NATIVE_COLOUR: no vertex input; NativePullAttribute loads it.
+                ASSERT_MSG(Shader::t_native_emit.attrs[attrib.semantic].valid,
+                           "native pull: attribute {} has no format", attrib.semantic);
+                input_params[attrib.semantic] =
+                    GetAttributeInfo(sharp.GetNumberFmt(), Id{}, 4, false);
+                continue;
+            }
             const Id type{GetAttributeType(*this, sharp.GetNumberFmt())[4]};
             Id id{DefineInput(type, attrib.semantic)};
             if (attrib.GetStepRate() != Gcn::VertexAttribute::InstanceIdType::None) {
@@ -354,6 +390,11 @@ void EmitContext::DefineInputs() {
         break;
     }
     case LogicalStage::Fragment: {
+        if (native_colour) {
+            native_draw_in = DefineInput(U32[1], Shader::NativeDrawIndexLocation);
+            Decorate(native_draw_in, spv::Decoration::Flat);
+            Name(native_draw_in, "native_draw_in");
+        }
         if (info.loads.GetAny(IR::Attribute::FragCoord)) {
             frag_coord = DefineVariable(F32[4], spv::BuiltIn::FragCoord, spv::StorageClass::Input);
         }
@@ -622,6 +663,11 @@ void EmitContext::DefineOutputs() {
                 ++num_attrs;
             }
 
+            if (native_colour) {
+                native_draw_out = DefineOutput(U32[1], Shader::NativeDrawIndexLocation);
+                Decorate(native_draw_out, spv::Decoration::Flat);
+                Name(native_draw_out, "native_draw_out");
+            }
             if (needs_clip_distance_emulation) {
                 clip_distances = Id{DefineOutput(F32[MaxEmulatedClipDistances], 0)};
                 output_params[num_attrs] = GetAttributeInfo(
@@ -896,7 +942,214 @@ void EmitContext::DefineBuffers() {
         Decorate(native_records, spv::Decoration::NonWritable);
         Name(native_records, "native_records");
         interfaces.push_back(native_records);
+        if (native_pull) {
+            native_vbuf = AddGlobalVariable(struct_pointer_type, spv::StorageClass::StorageBuffer);
+            Decorate(native_vbuf, spv::Decoration::Binding, Shader::t_native_emit.vertex_binding);
+            Decorate(native_vbuf, spv::Decoration::DescriptorSet, 0U);
+            Decorate(native_vbuf, spv::Decoration::NonWritable);
+            Name(native_vbuf, "native_vbuf");
+            interfaces.push_back(native_vbuf);
+        }
+        if (native_pull && Shader::t_native_emit.compare) {
+            native_dbg = AddGlobalVariable(struct_pointer_type, spv::StorageClass::StorageBuffer);
+            Decorate(native_dbg, spv::Decoration::Binding, Shader::t_native_emit.debug_binding);
+            Decorate(native_dbg, spv::Decoration::DescriptorSet, 0U);
+            Name(native_dbg, "native_dbg");
+            interfaces.push_back(native_dbg);
+        }
     }
+}
+
+Id EmitContext::NativeVbufLoad(Id dword_index) {
+    return OpLoad(U32[1],
+                  OpAccessChain(native_records_ptr, native_vbuf, u32_zero_value, dword_index));
+}
+
+void EmitContext::NativeCompareAttribute(u32 loc, Id vindex, Id draw) {
+    // Diagnostic: the pulled value vs the real vertex input (both exist in compare mode).
+    const auto& a = Shader::t_native_emit.attrs[loc];
+    const auto& param = input_params[loc];
+    const Id pulled = NativePullAttribute(loc, vindex);
+    const Id vec_type = !param.is_integer ? F32[4]
+                        : param.component_type.value == U32[1].value ? U32[4]
+                                                                      : S32[4];
+    const Id real = OpLoad(vec_type, param.id);
+    Id bad = false_value;
+    std::array<Id, 4> pb{}, rb{};
+    for (u32 i = 0; i < 4; ++i) {
+        const Id p = OpCompositeExtract(param.component_type, pulled, i);
+        const Id r = OpCompositeExtract(param.component_type, real, i);
+        Id diff;
+        if (param.is_integer) {
+            diff = OpINotEqual(U1[1], p, r);
+            pb[i] = param.component_type.value == U32[1].value ? p : OpBitcast(U32[1], p);
+            rb[i] = param.component_type.value == U32[1].value ? r : OpBitcast(U32[1], r);
+        } else {
+            // Bit-exact: a depth-equal pass after a generic depth prepass needs identical
+            // positions, so 1-ulp differences matter.
+            pb[i] = OpBitcast(U32[1], p);
+            rb[i] = OpBitcast(U32[1], r);
+            diff = OpINotEqual(U1[1], pb[i], rb[i]);
+        }
+        bad = OpLogicalOr(U1[1], bad, diff);
+    }
+    const Id ptr0 = OpAccessChain(native_records_ptr, native_dbg, u32_zero_value, u32_zero_value);
+    const Id old = OpAtomicIAdd(U32[1], ptr0, ConstU32(1u), u32_zero_value,
+                                OpSelect(U32[1], bad, ConstU32(1u), u32_zero_value));
+    const Id slot = OpSelect(U32[1], OpLogicalAnd(U1[1], bad, OpULessThan(U1[1], old, ConstU32(64u))),
+                             old, ConstU32(64u));
+    const Id base = OpIAdd(U32[1], ConstU32(16u), OpIMul(U32[1], slot, ConstU32(16u)));
+    const std::array<Id, 16> words{ConstU32(loc), vindex, draw,
+                                   NativeRecordLoad(Shader::NativeRecordVoffOffset + loc),
+                                   pb[0], pb[1], pb[2], pb[3], rb[0], rb[1], rb[2], rb[3],
+                                   ConstU32(Shader::t_native_emit.vs_hash), ConstU32(u32(a.kind)),
+                                   ConstU32(u32(a.bits)), ConstU32(u32(a.count))};
+    for (u32 i = 0; i < 16; ++i) {
+        OpStore(OpAccessChain(native_records_ptr, native_dbg, u32_zero_value,
+                              OpIAdd(U32[1], base, ConstU32(i))),
+                words[i]);
+    }
+}
+
+Id EmitContext::NativePullAttribute(u32 loc, Id vindex) {
+    // What the Vulkan vertex input would fetch for location `loc` (binding = location, offset 0,
+    // per-vertex rate): `stride` bytes per vertex from the draw's stream offset, decoded by the
+    // format into the input variable's type, missing components (0, 0, 0, 1). Reads past the
+    // stream's bound size give (0, 0, 0, 1). Stream offsets / strides need not be 4-byte aligned
+    // (s301: 43% of textured draws are not): two dwords per dword, funnel-shifted.
+    using Shader::NativeVtxKind;
+    const auto& a = Shader::t_native_emit.attrs[loc];
+    const auto& param = input_params[loc];
+    const bool packed = a.bits == 0; // A2B10G10R10: R 0-9, G 10-19, B 20-29, A 30-31
+    const u32 bytes = packed ? 4u : u32(a.bits) / 8 * a.count;
+    const u32 ndw = (bytes + 3) / 4;
+    const Id voff{NativeRecordLoad(Shader::NativeRecordVoffOffset + loc)};
+    const Id vsize{NativeRecordLoad(Shader::NativeRecordVsizeOffset + loc)};
+    const Id rel{OpIMul(U32[1], vindex, ConstU32(a.stride))};
+    const Id end{OpIAdd(U32[1], rel, ConstU32(bytes))};
+    const Id in_bounds{OpLogicalAnd(U1[1], OpULessThanEqual(U1[1], end, vsize),
+                                    OpUGreaterThanEqual(U1[1], end, rel))};
+    // Out of bounds: read the stream's first bytes (a valid address) and discard them.
+    const Id addr{OpSelect(U32[1], in_bounds, OpIAdd(U32[1], voff, rel), voff)};
+    const Id dw0{OpShiftRightLogical(U32[1], addr, ConstU32(2u))};
+    const Id sh{
+        OpShiftLeftLogical(U32[1], OpBitwiseAnd(U32[1], addr, ConstU32(3u)), ConstU32(3u))};
+    const Id aligned{OpIEqual(U1[1], sh, u32_zero_value)};
+    const Id inv{OpISub(U32[1], ConstU32(32u), sh)};
+    std::array<Id, 4> d{};
+    Id lo{NativeVbufLoad(dw0)};
+    for (u32 i = 0; i < ndw; ++i) {
+        const Id hi{NativeVbufLoad(OpIAdd(U32[1], dw0, ConstU32(i + 1)))};
+        const Id funnel{OpBitwiseOr(U32[1], OpShiftRightLogical(U32[1], lo, sh),
+                                    OpShiftLeftLogical(U32[1], hi, inv))};
+        d[i] = OpSelect(U32[1], aligned, lo, funnel);
+        lo = hi;
+    }
+    const bool is_int = param.is_integer;
+    const Id comp_type = param.component_type;
+    const bool is_sint = is_int && comp_type.value == S32[1].value;
+    const bool is_uint = is_int && comp_type.value == U32[1].value;
+    const Id one = is_int ? (is_sint ? ConstS32(1) : ConstU32(1u)) : ConstF32(1.f);
+    const Id zero = is_int ? (is_sint ? ConstS32(0) : u32_zero_value) : f32_zero_value;
+    const auto from_float = [&](Id v) -> Id { return is_int ? OpBitcast(comp_type, v) : v; };
+    const auto from_bits = [&](Id v) -> Id {
+        return is_uint ? v : OpBitcast(comp_type, v);
+    };
+    // Vulkan's fixed-function conversion is the correctly rounded c / (2^b - 1) (s320: the
+    // GLSL unpack's c * (1 / 255) was 1 ulp off; a depth-equal colour pass after a generic depth
+    // prepass then failed on scattered pixels - speckles). Markstein: q0 = c * r, remainder by
+    // fma, one fma correction; checked against every 8 / 10 / 16-bit input (0 mismatches).
+    const auto exact_div = [&](Id cf, u32 d) -> Id {
+        const Id r = ConstF32(1.f / float(d));
+        const Id q0 = OpFMul(F32[1], cf, r);
+        Decorate(q0, spv::Decoration::NoContraction);
+        const Id e = OpFma(F32[1], OpFNegate(F32[1], q0), ConstF32(float(d)), cf);
+        return OpFma(F32[1], e, r, q0);
+    };
+    const auto unorm = [&](Id u, u32 w) {
+        return exact_div(OpConvertUToF(F32[1], u), (1u << w) - 1);
+    };
+    const auto snorm = [&](Id s_u32, u32 w) {
+        const Id sf = OpConvertSToF(F32[1], OpBitcast(S32[1], s_u32));
+        return OpFMax(F32[1], exact_div(sf, (1u << (w - 1)) - 1), ConstF32(-1.f));
+    };
+    std::array<Id, 4> c{zero, zero, zero, one};
+    for (u32 i = 0; packed && i < a.count; ++i) {
+        const u32 w = i < 3 ? 10u : 2u;
+        const Id pos = ConstU32(i * 10u);
+        const Id width = ConstU32(w);
+        const Id u = OpBitFieldUExtract(U32[1], d[0], pos, width);
+        const Id s = OpBitcast(S32[1], OpBitFieldSExtract(U32[1], d[0], pos, width));
+        switch (a.kind) {
+        case NativeVtxKind::Unorm:
+            c[i] = from_float(unorm(u, w));
+            break;
+        case NativeVtxKind::Snorm:
+            c[i] = from_float(snorm(OpBitcast(U32[1], s), w));
+            break;
+        case NativeVtxKind::Uint16:
+            c[i] = from_bits(u);
+            break;
+        case NativeVtxKind::Sint16:
+            c[i] = from_bits(OpBitcast(U32[1], s));
+            break;
+        case NativeVtxKind::Uscaled:
+            c[i] = from_float(OpConvertUToF(F32[1], u));
+            break;
+        case NativeVtxKind::Sscaled:
+            c[i] = from_float(OpConvertSToF(F32[1], s));
+            break;
+        default:
+            UNREACHABLE_MSG("native pull: packed kind {}", u32(a.kind));
+        }
+    }
+    for (u32 i = 0; !packed && i < a.count; ++i) {
+        const u32 bit = i * a.bits;
+        const Id word = d[bit / 32];
+        const Id pos = ConstU32(bit % 32);
+        const Id width = ConstU32(u32(a.bits));
+        switch (a.kind) {
+        case NativeVtxKind::Float:
+            c[i] = from_float(OpBitcast(F32[1], word));
+            break;
+        case NativeVtxKind::Uint:
+        case NativeVtxKind::Sint:
+            c[i] = from_bits(word);
+            break;
+        case NativeVtxKind::Half:
+            c[i] = from_float(
+                OpCompositeExtract(F32[1], OpUnpackHalf2x16(F32[2], word), (bit % 32) / 16));
+            break;
+        case NativeVtxKind::Unorm:
+            c[i] = from_float(unorm(OpBitFieldUExtract(U32[1], word, pos, width), a.bits));
+            break;
+        case NativeVtxKind::Snorm:
+            c[i] = from_float(snorm(OpBitFieldSExtract(U32[1], word, pos, width), a.bits));
+            break;
+        case NativeVtxKind::Uint16:
+            c[i] = from_bits(OpBitFieldUExtract(U32[1], word, pos, width));
+            break;
+        case NativeVtxKind::Sint16:
+            c[i] = from_bits(OpBitFieldSExtract(U32[1], word, pos, width));
+            break;
+        case NativeVtxKind::Uscaled:
+            c[i] = from_float(OpConvertUToF(F32[1], OpBitFieldUExtract(U32[1], word, pos, width)));
+            break;
+        case NativeVtxKind::Sscaled:
+            c[i] = from_float(OpConvertSToF(
+                F32[1], OpBitcast(S32[1], OpBitFieldSExtract(U32[1], word, pos, width))));
+            break;
+        default:
+            UNREACHABLE_MSG("native pull: kind {}", u32(a.kind));
+        }
+    }
+    for (u32 i = 0; i < 4; ++i) {
+        c[i] = OpSelect(comp_type, in_bounds, c[i], i == 3 ? one : zero);
+    }
+    const Id vec_type = !is_int ? F32[4] : is_uint ? U32[4] : S32[4];
+    const Id value{OpCompositeConstruct(vec_type, c[0], c[1], c[2], c[3])};
+    Name(value, fmt::format("native_attr{}", loc));
+    return value;
 }
 
 Id EmitContext::NativeRecordLoad(u32 dword) {

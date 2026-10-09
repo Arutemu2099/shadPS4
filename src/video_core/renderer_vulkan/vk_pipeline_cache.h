@@ -128,6 +128,13 @@ public:
     /// layout + one records SSBO) and publishes it in base->native_variant.
     void PrepareNativeVariant(const GraphicsPipeline* base);
 
+    /// SHADPS4_NATIVE_COLOUR (front / lookup thread, right after the front derived the draw's
+    /// vertex inputs): decides once whether `base` (a textured pipeline) can draw native batches
+    /// and, for each new vertex description, translates its native VS + PS here and queues the
+    /// driver compile on the native compiler thread, which publishes it in base->native_colour.
+    void PrepareNativeColour(const GraphicsPipeline* base,
+                             const AmdGpu::CpSplit::VertexInputsDerived& vi);
+
     const ComputePipeline* GetComputePipeline();
 
     using Result = std::tuple<const Shader::Info*, vk::ShaderModule,
@@ -248,6 +255,10 @@ private:
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
 
     std::unique_ptr<AsyncCompiler> async_compiler; // started by the first async job
+    struct NativeColourJob;
+    struct NativeColourCompiler;
+    std::chrono::steady_clock::time_point native_colour_last{};
+    u32 native_colour_logged{};
     u32 async_pending{};         // queued, not yet published; lookup thread only
     double lookup_translate_ms{}; // GetProgram's module creation time within this lookup
     // PipelineCompile / PipelineCompileSummary log lines (both modes). skipped_draws counts
@@ -276,6 +287,10 @@ private:
     tsl::robin_map<vk::ShaderModule,
                    std::vector<std::variant<GraphicsPipelineKey, ComputePipelineKey>>>
         module_related_pipelines;
+
+    // SHADPS4_NATIVE_COLOUR: last member, so it stops (and destroys the variants it owns)
+    // before anything else of the cache goes.
+    std::unique_ptr<NativeColourCompiler> native_colour_compiler;
 };
 
 } // namespace Vulkan

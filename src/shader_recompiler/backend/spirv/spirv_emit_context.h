@@ -258,6 +258,19 @@ public:
     Id native_rec_base{};     // records index of this draw's first dword
     bool native{};
     std::array<Id, NUM_BUFFERS> native_size_dw{}; // per buffer handle (native variant)
+    std::array<Id, NUM_BUFFERS> native_size_bytes{}; // the same bound in bytes (8 / 16-bit loads)
+    // SHADPS4_NATIVE_COLOUR (notes/colour-pass-2026-10-09.md sec. 3)
+    bool native_colour{};      // the PS is native too: draw index through a flat varying
+    bool native_pull{};        // the VS pulls its fetch attributes from native_vbuf
+    Id native_draw_out{};      // VS: flat uint output at NativeDrawIndexLocation
+    Id native_draw_in{};       // PS: the matching flat input
+    Id native_vbuf{};          // VS: the whole vertex storage buffer (uint data[])
+    Id native_dbg{};           // VS, compare diagnostic: writable uint data[]
+    Id native_dbg_ptr{};
+    void NativeCompareAttribute(u32 location, Id vertex_index_value, Id draw);
+    std::array<Id, IR::NumParams> native_attr_value{}; // VS: pulled vec4 per fetch semantic
+    Id NativeVbufLoad(Id dword_index);
+    Id NativePullAttribute(u32 location, Id vertex_index_value);
     Id instance_id{};
     Id push_data_block{};
     Id base_vertex{};

@@ -28,6 +28,7 @@
 #include "core/libraries/videoout/driver.h"
 #include "core/memory.h"
 #include "core/platform.h"
+#include "video_core/native_census.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "common/readback_offload.h"
@@ -2445,6 +2446,10 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
             }
         }
         vi.header.desc_id = front_vi_desc_id;
+        if (VideoCore::g_native_colour) [[unlikely]] {
+            // SHADPS4_NATIVE_COLOUR: a variant per (pipeline, vertex description), front-side.
+            rasterizer->PrepareNativeColourFront(draw.pipeline, vi);
+        }
     }
     if (verify == DrawVerifySnapshot) {
         bytes += VerifySnapshotBytes;

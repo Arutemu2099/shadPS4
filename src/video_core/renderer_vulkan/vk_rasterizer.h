@@ -16,6 +16,7 @@
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_native_bindings.h"
 #include "video_core/renderer_vulkan/vk_occlusion.h"
+#include "shader_recompiler/native_emit.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -101,6 +102,13 @@ public:
     /// Front thread: classification, hazard note, empty-draw skip and pipeline lookup, reading
     /// the front's registers. Touches no cache, the scheduler or any per-draw member.
     void PrepareDrawFront(SplitDraw& draw);
+    /// SHADPS4_NATIVE_COLOUR: front thread, after FRONT_DERIVE (notes/colour-pass-2026-10-09.md).
+    void PrepareNativeColourFront(const GraphicsPipeline* pipeline,
+                                  const AmdGpu::CpSplit::VertexInputsDerived& vi) {
+        if (pipeline) {
+            pipeline_cache.PrepareNativeColour(pipeline, vi);
+        }
+    }
     /// Front thread: compute pipeline lookup against the current queue's cs registers.
     const ComputePipeline* PrepareDispatchFront();
     /// CP split run-ahead VERIFY, back thread, only while the front is parked on a synchronous
@@ -424,7 +432,7 @@ private:
     /// one recorded drawIndexedIndirectCount whose commands, per-draw records and count live in
     /// a stream-buffer reservation the back keeps appending to while nothing else records.
     static constexpr u32 NativeMaxDraws = 64;
-    static constexpr u32 NativeRecBytes = Shader::NUM_USER_DATA_REGS * 4 + Shader::NUM_BUFFERS * 8;
+    static constexpr u32 NativeRecBytes = Shader::NativeRecordDwords * 4;
     static constexpr u32 NativeCmdBytes = 20; // VkDrawIndexedIndirectCommand
     struct NativeBatch {
         bool open{};
@@ -446,6 +454,13 @@ private:
         std::array<u32, 16> vb_stride{};
         bool vb_rebased{};
         u32 vb_q0{};
+        // SHADPS4_NATIVE_COLOUR: a textured batch (vertex pulling, image key).
+        bool colour{};
+        u64 vbuf{};   ///< the one vertex VkBuffer every stream of the batch sits in (0: none)
+        u32 vmask{};  ///< locations with a non-null stream
+        u64 smp_gen{};
+        u64 border{};
+        u32 img_n{};  ///< words of native_img_key
         std::array<u64, Shader::NUM_BUFFERS> buf{};
         u64 guest_mask{};
         u64 stream_off{};
@@ -465,12 +480,26 @@ private:
         u32 cand_instance_offset{};
     } native_batch;
     boost::container::small_vector<vk::BufferMemoryBarrier2, 16> native_carry;
+    /// SHADPS4_NATIVE_COLOUR: the opener's raw T# / S# words (the draw-repeat image key) and,
+    /// in verify mode, its resolved image infos.
+    std::array<u32, 512> native_img_key{};
+    std::unique_ptr<VideoCore::Buffer> native_dbg; ///< SHADPS4_NATIVE_COLOUR_DIAG 4096
+    u32 native_dbg_logged{};
+    boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> native_open_images;
+    bool NativeImageKey(const GraphicsPipeline* base, std::array<u32, 512>& out, u32& n) const;
+    bool NativeColourGates() const {
+        return tex_bind_memo == 1 && !bind_memo_stats && pending_stencil_writebacks.empty();
+    }
     /// The context register block at the batch open (compared when the epoch moved).
     std::array<u32, 0x400> native_ctx{};
     struct NativeStats {
         u64 opens{}, joins{}, open_fail{}, verify_draws{}, verify_mismatch{}, epoch_same{};
         std::array<u64, 16> close{};
         u64 tick_moved{};
+        // SHADPS4_NATIVE_COLOUR: colour batches; textured indexed draws (any image binding) and
+        // how many of them had a published colour variant at the open point.
+        u64 col_opens{}, col_joins{}, col_open_fail{}, col_verify{}, col_tex_draws{},
+            col_tex_variant{};
         // SHADPS4_NATIVE_TIMING=1: TSC cycles (join ok / join refused / DrawTail of a draw whose
         // pipeline has a native variant / DrawTail of any other draw) and the join's phases.
         u64 c_join_ok{}, n_join_ok{}, c_join_fail{}, n_join_fail{}, c_tail_nat{}, n_tail_nat{},
@@ -479,7 +508,8 @@ private:
     } native_stats;
     bool NativeJoin(const SplitDraw& draw, const AmdGpu::CpSplit::VertexInputsPayload* front_vi);
     bool NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline* native, bool is_indexed,
-                    u32 index_offset, const AmdGpu::CpSplit::VertexInputsPayload* front_vi);
+                    u32 index_offset, const AmdGpu::CpSplit::VertexInputsPayload* front_vi,
+                    bool colour = false);
     void NativeClose(u32 why);
     void NativeVerifyCompare(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset);
     void NativeLog();

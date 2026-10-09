@@ -46,6 +46,31 @@ const int g_native_pass = [] {
     const char* e = std::getenv("SHADPS4_NATIVE_PASS");
     return e ? e[0] - '0' : 0;
 }();
+const u32 g_native_colour_diag = [] {
+    const char* e = std::getenv("SHADPS4_NATIVE_COLOUR_DIAG");
+    return e ? static_cast<u32>(std::strtoul(e, nullptr, 0)) : 0u;
+}();
+const bool g_native_colour = [] {
+    const char* e = std::getenv("SHADPS4_NATIVE_COLOUR");
+    return g_native_pass != 0 && e && e[0] == '1';
+}();
+
+namespace {
+// SHADPS4_NATIVE_COLOUR: a colour variant's VS reads vertex data as storage in the vertex shader
+// stage, not through vertex input. A barrier for GPU-written vertex data (compute skinning) must
+// make it visible to both; the barrier tracker keeps only the last access kind per buffer, so a
+// vertex-input-only barrier left the storage reads racing the writes (s305-s315: speckles on
+// the hero's jeans; clean with every attribute on real vertex input).
+vk::AccessFlags2 VertexReadAccess() {
+    return g_native_colour
+               ? vk::AccessFlagBits2::eVertexAttributeRead | vk::AccessFlagBits2::eShaderStorageRead
+               : vk::AccessFlags2{vk::AccessFlagBits2::eVertexAttributeRead};
+}
+vk::PipelineStageFlagBits2 VertexReadStage() {
+    return g_native_colour ? vk::PipelineStageFlagBits2::eAllGraphics
+                           : vk::PipelineStageFlagBits2::eVertexAttributeInput;
+}
+} // namespace
 
 namespace {
 // SHADPS4_DRAW_COST=1 (diagnostic): ObtainBufferForImage path and cycle split for calls over
@@ -3542,8 +3567,7 @@ void BufferCache::BindVertexBuffers(
         range.offset = offset;
         if (IsRegionGpuModified(range.base_address, size)) {
             if (auto barrier =
-                    buffer->GetBarrier(vk::AccessFlagBits2::eVertexAttributeRead,
-                                       vk::PipelineStageFlagBits2::eVertexAttributeInput)) {
+                    buffer->GetBarrier(VertexReadAccess(), VertexReadStage())) {
                 barriers.emplace_back(*barrier);
             }
         }
@@ -3654,8 +3678,7 @@ void BufferCache::BindVertexBuffersDerived(
                 ++t_pb_vi.gpu_mod;
             }
             if (auto barrier =
-                    buffer->GetBarrier(vk::AccessFlagBits2::eVertexAttributeRead,
-                                       vk::PipelineStageFlagBits2::eVertexAttributeInput)) {
+                    buffer->GetBarrier(VertexReadAccess(), VertexReadStage())) {
                 barriers.emplace_back(*barrier);
             }
         }
@@ -3731,8 +3754,7 @@ void BufferCache::NativeJoinVertexIndex(
         mapped[i] = {buffer->buffer, offset};
         if (barriers && IsRegionGpuModified(range.base_address, size)) {
             if (auto barrier =
-                    buffer->GetBarrier(vk::AccessFlagBits2::eVertexAttributeRead,
-                                       vk::PipelineStageFlagBits2::eVertexAttributeInput)) {
+                    buffer->GetBarrier(VertexReadAccess(), VertexReadStage())) {
                 barriers->emplace_back(*barrier);
             }
         }

@@ -165,6 +165,25 @@ public:
     mutable std::atomic<const GraphicsPipeline*> native_variant{nullptr};
     mutable bool native_checked = false;
     u32 native_records_binding = NoNativeRecords;
+    /// SHADPS4_NATIVE_COLOUR (notes/colour-pass-2026-10-09.md sec. 3): textured native variants
+    /// by vertex description. The front claims a slot by storing its key (front-only writer);
+    /// the compiler thread publishes the variant; the back reads key then variant (acquire).
+    struct NativeColourSlot {
+        std::atomic<u64> key{0};
+        std::atomic<const GraphicsPipeline*> variant{nullptr};
+    };
+    static constexpr u32 NativeColourSlots = 4;
+    mutable std::array<NativeColourSlot, NativeColourSlots> native_colour{};
+    mutable u8 native_colour_static = 0; ///< front: 0 undecided, 1 eligible, 2 not
+    u32 native_vertex_binding = NoNativeRecords; ///< a colour variant: its vertex SSBO binding
+    const GraphicsPipeline* NativeColourVariant(u64 key) const noexcept {
+        for (const auto& slot : native_colour) {
+            if (slot.key.load(std::memory_order_acquire) == key) {
+                return slot.variant.load(std::memory_order_acquire);
+            }
+        }
+        return nullptr;
+    }
 
 private:
     /// One binding per buffer and sampler, one per image with its descriptor count (recorded

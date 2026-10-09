@@ -834,6 +834,11 @@ struct NativeCensus2Group {
     std::array<NativeCensus2Level, kNbLevels> lv{};
     u64 pipe_vs_same{};  // pipeline break with the same VS
     u64 pipe_abab{};     // pipeline break back to the pipeline two draws ago
+    std::array<u64, 4> vk_per_draw{}; // draws whose vertex streams use 0 / 1 / 2 / 3+ VkBuffers
+    u64 valigned{};      // every stream offset and stride 4-byte aligned
+    u64 hint{};          // same pipeline + render state + no dyn change + nothing between as the
+                         // previous draw (what a front-side "next draw may join" hint can see)
+    u64 hint_join{};     // ... and the draw joins at L1
 };
 thread_local std::array<NativeCensus2Group, 2> t_nc2;
 thread_local const void* t_nc2_prev2_pipeline = nullptr;
@@ -854,8 +859,8 @@ u32 NativeCensusBits(const NativeCensusPrev& prev, const GraphicsPipeline* pipel
     if (prev.pipeline != pipeline) {
         m |= NbbPipeline;
     }
-    if (prev.group != group || !(prev.state == state)) {
-        m |= NbbRendering;
+    if (!(prev.state == state)) {
+        m |= NbbRendering; // the group change is added by the caller (v2 groups)
     }
     if (dyn_change) {
         m |= NbbDyn;
@@ -950,6 +955,23 @@ void NativeCensus2Note(const NativeCensusPrev& prev, const GraphicsPipeline* pip
     }
     auto& g = t_nc2[group];
     ++g.draws;
+    {
+        const auto& vi = VideoCore::t_native_vi;
+        std::array<u64, 16> seen{};
+        u32 nvk = 0;
+        bool aligned = true;
+        for (u32 k = 0; k < vi.n; ++k) {
+            if (vi.buf[k] == 0) {
+                continue;
+            }
+            aligned = aligned && (vi.off[k] & 3) == 0 && (vi.stride[k] & 3) == 0;
+            if (std::find(seen.begin(), seen.begin() + nvk, vi.buf[k]) == seen.begin() + nvk) {
+                seen[nvk++] = vi.buf[k];
+            }
+        }
+        ++g.vk_per_draw[std::min<u32>(nvk, 3)];
+        g.valigned += aligned;
+    }
     if (prev.pipeline != nullptr) {
         u32 m = NativeCensusBits(prev, pipeline, state, entry_seq, dyn_change, barriers, images,
                                  buffers, push, occlusion, group);
@@ -958,6 +980,10 @@ void NativeCensus2Note(const NativeCensusPrev& prev, const GraphicsPipeline* pip
         }
         for (u32 b = 0; b < NbbBits; ++b) {
             g.any[b] += (m >> b) & 1u;
+        }
+        if ((m & (NbbPipeline | NbbRendering | NbbDyn | NbbBetween)) == 0) {
+            ++g.hint;
+            g.hint_join += (m & ~kNbLevelFree[1]) == 0;
         }
         if (m & NbbPipeline) {
             g.pipe_vs_same += vs == t_nc2_prev_vs;
@@ -1006,6 +1032,15 @@ void NativeCensus2Note(const NativeCensusPrev& prev, const GraphicsPipeline* pip
                  gi == 0 ? "untextured" : "textured", gg.draws, any,
                  100.0 * double(gg.pipe_vs_same) / double(std::max<u64>(gg.any[1], 1)),
                  100.0 * double(gg.pipe_abab) / double(std::max<u64>(gg.any[1], 1)));
+        LOG_INFO(Render_Vulkan,
+                 "NativeCensus2: {} vertex VkBuffers per draw [0,1,2,3+]={:.1f}%,{:.1f}%,{:.1f}%,"
+                 "{:.1f}% aligned={:.1f}% | front hint (same pipeline/state/dyn, nothing between) "
+                 "{:.1f}% of draws, of which L1-joinable {:.1f}%",
+                 gi == 0 ? "untextured" : "textured", 100.0 * double(gg.vk_per_draw[0]) / n,
+                 100.0 * double(gg.vk_per_draw[1]) / n, 100.0 * double(gg.vk_per_draw[2]) / n,
+                 100.0 * double(gg.vk_per_draw[3]) / n, 100.0 * double(gg.valigned) / n,
+                 100.0 * double(gg.hint) / n,
+                 100.0 * double(gg.hint_join) / double(std::max<u64>(gg.hint, 1)));
         for (u32 li = 0; li < kNbLevels; ++li) {
             auto& l = gg.lv[li];
             std::string first;
@@ -2006,15 +2041,49 @@ static std::vector<u32> g_native_diag_ctx;
 static std::unordered_map<u32, u64> g_native_diag_regs;
 static u64 g_native_diag_n = 0;
 
+bool Rasterizer::NativeImageKey(const GraphicsPipeline* base, std::array<u32, 512>& out,
+                                u32& n) const {
+    // SHADPS4_NATIVE_COLOUR: the raw T# / S# of every image and sampler of every stage, as the
+    // draw-repeat key reads them (DrawRepeatMatch). False on overflow.
+    n = 0;
+    const auto add = [&](const auto& sharp) {
+        constexpr u32 words = static_cast<u32>(sizeof(sharp) / sizeof(u32));
+        if (n + words > out.size()) {
+            return false;
+        }
+        std::memcpy(&out[n], &sharp, sizeof(sharp));
+        n += words;
+        return true;
+    };
+    for (const auto& bound : BoundStages(base)) {
+        if (!bound.info) {
+            continue;
+        }
+        for (const auto& desc : bound.info->images) {
+            if (!add(desc.GetSharp(bound))) {
+                return false;
+            }
+        }
+        for (const auto& desc : bound.info->samplers) {
+            if (!add(desc.GetSharp(bound))) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline* native,
                             bool is_indexed, u32 index_offset,
-                            const AmdGpu::CpSplit::VertexInputsPayload* front_vi) {
+                            const AmdGpu::CpSplit::VertexInputsPayload* front_vi, bool colour) {
     // Back thread, inside DrawTail after BindResources and the vertex / index binds of `base`.
     // native == nullptr: verify mode (only the batch keys are captured; nothing changes).
     auto& b = native_batch;
     b = NativeBatch{.verify = native == nullptr};
+    b.colour = colour;
     const auto fail = [&] {
         ++native_stats.open_fail;
+        native_stats.col_open_fail += colour;
         b.open = false;
         return false;
     };
@@ -2064,11 +2133,45 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         b.vb_off[k] = vi.off[k];
         b.vb_stride[k] = vi.stride[k];
     }
+    // SHADPS4_NATIVE_COLOUR: the opener's image key + the draw-repeat config gates; every
+    // non-null vertex stream in ONE VkBuffer (s301: 92.6% of textured draws), per-vertex only;
+    // the record carries each location's offset (any alignment), so no rebase.
+    std::array<u32, Shader::NativeMaxPulledLocations> col_voff{};
+    std::array<u32, Shader::NativeMaxPulledLocations> col_vsize{};
+    if (colour) {
+        if (!NativeColourGates() || !NativeImageKey(base, native_img_key, b.img_n)) {
+            return fail();
+        }
+        b.smp_gen = texture_cache.SamplerGeneration();
+        b.border = regs.ta_bc_base.base_addr;
+        const auto* attribs = AmdGpu::CpSplit::VertexInputAttribs(*front_vi);
+        for (u32 k = 0; k < vi.n; ++k) {
+            const u32 loc = attribs[k].desc.location;
+            if (attribs[k].desc.instanced || loc >= Shader::NativeMaxPulledLocations) {
+                return fail();
+            }
+            if (vi.buf[k] == 0) {
+                continue; // null stream: vsize 0 -> the shader reads (0, 0, 0, 1)
+            }
+            if ((b.vbuf != 0 && vi.buf[k] != b.vbuf) || vi.off[k] > 0xffffffffull) {
+                return fail();
+            }
+            b.vbuf = vi.buf[k];
+            b.vmask |= 1u << loc;
+            col_voff[loc] = static_cast<u32>(vi.off[k]);
+            col_vsize[loc] = 0xffffffffu; // bound to the VkBuffer's end, as bindVertexBuffers
+        }
+        if (b.verify) {
+            native_open_images.assign(image_infos.begin(), image_infos.end());
+        }
+        // GPU-written vertex data: the vertex binds requested storage-read visibility too
+        // (buffer_cache.cpp VertexReadAccess while SHADPS4_NATIVE_COLOUR is on).
+    }
     // Rebase the per-vertex bindings to the lowest offset of the same stride residue, so a
     // later draw's vertex data below draw 0's still has a non-negative vertexOffset (s287: 3.1 M
     // refusals). Needs one common quotient over the per-vertex bindings; instance-rate bindings
     // keep draw 0's offset (they may not move).
-    {
+    if (!colour) {
         const auto* attribs = AmdGpu::CpSplit::VertexInputAttribs(*front_vi);
         bool ok = true;
         bool any = false;
@@ -2157,6 +2260,10 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
     std::memcpy(rec + Shader::NUM_USER_DATA_REGS, rec_off.data(), sizeof(u32) * Shader::NUM_BUFFERS);
     std::memcpy(rec + Shader::NUM_USER_DATA_REGS + Shader::NUM_BUFFERS, rec_size.data(),
                 sizeof(u32) * Shader::NUM_BUFFERS);
+    if (colour) {
+        std::memcpy(rec + Shader::NativeRecordVoffOffset, col_voff.data(), sizeof(col_voff));
+        std::memcpy(rec + Shader::NativeRecordVsizeOffset, col_vsize.data(), sizeof(col_vsize));
+    }
     b.open_tick = tick_before_map;
     const auto& vs_info = GetBoundStage(Shader::LogicalStage::Vertex);
     const auto [vertex_offset, instance_offset] =
@@ -2189,6 +2296,37 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
     w.descriptorType = vk::DescriptorType::eStorageBuffer;
     w.pBufferInfo = &buffer_infos.back();
     ++set_write_index;
+    if (colour) {
+        // The whole vertex VkBuffer (a stream-buffer stand-in when every stream is null).
+        const vk::Buffer vb = b.vbuf != 0 ? vk::Buffer{std::bit_cast<VkBuffer>(b.vbuf)}
+                                          : stream.Handle();
+        buffer_infos.emplace_back(vb, 0, VK_WHOLE_SIZE);
+        auto& wv = set_writes.emplace_back();
+        wv.dstSet = VK_NULL_HANDLE;
+        wv.dstBinding = native->native_vertex_binding;
+        wv.dstArrayElement = 0;
+        wv.descriptorCount = 1;
+        wv.descriptorType = vk::DescriptorType::eStorageBuffer;
+        wv.pBufferInfo = &buffer_infos.back();
+        ++set_write_index;
+        if (VideoCore::g_native_colour_diag & 4096) {
+            if (!native_dbg) {
+                native_dbg = std::make_unique<VideoCore::Buffer>(
+                    instance, scheduler, VideoCore::MemoryUsage::Download, 0,
+                    vk::BufferUsageFlagBits::eStorageBuffer, 64 * 1024);
+                std::memset(native_dbg->mapped_data.data(), 0, native_dbg->mapped_data.size());
+            }
+            buffer_infos.emplace_back(native_dbg->Handle(), 0, VK_WHOLE_SIZE);
+            auto& wd = set_writes.emplace_back();
+            wd.dstSet = VK_NULL_HANDLE;
+            wd.dstBinding = native->native_vertex_binding + 1;
+            wd.dstArrayElement = 0;
+            wd.descriptorCount = 1;
+            wd.descriptorType = vk::DescriptorType::eStorageBuffer;
+            wd.pBufferInfo = &buffer_infos.back();
+            ++set_write_index;
+        }
+    }
     return true;
 }
 
@@ -2275,6 +2413,23 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
         NativeClose(7);
         return false;
     }
+    if (b.colour && (VideoCore::g_native_colour_diag & 1)) {
+        NativeClose(12);
+        return false;
+    }
+    if (b.colour) {
+        // SHADPS4_NATIVE_COLOUR: the draw-repeat conditions for "the same images": identical
+        // raw T# / S#, no sampler / border / structure / image epoch change since the opener.
+        std::array<u32, 512> key;
+        u32 n = 0;
+        if (texture_cache.SamplerGeneration() != b.smp_gen ||
+            regs.ta_bc_base.base_addr != b.border || !NativeColourGates() ||
+            !NativeImageKey(b.base, key, n) || n != b.img_n ||
+            std::memcmp(key.data(), native_img_key.data(), n * sizeof(u32)) != 0) {
+            NativeClose(12);
+            return false;
+        }
+    }
     static const bool join_timing = [] {
         const char* e = std::getenv("SHADPS4_NATIVE_TIMING");
         return e && e[0] == '1';
@@ -2317,7 +2472,7 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
                 const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
                 const auto [vk_buffer, offset] =
                     buffer_cache.ObtainBuffer(vsharp.base_address, static_cast<u32>(size), false,
-                                              false, VideoCore::BufferId{},
+                                              desc.is_formatted, VideoCore::BufferId{},
                                               Common::BufferSampleCaller::Storage);
                 const u64 handle = std::bit_cast<u64>(static_cast<VkBuffer>(vk_buffer->Handle()));
                 if (barriers) {
@@ -2354,7 +2509,25 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
         ok = false;
     }
     const auto* join_attribs = AmdGpu::CpSplit::VertexInputAttribs(*front_vi);
-    for (u32 k = 0; ok && k < jvi.n; ++k) {
+    std::array<u32, Shader::NativeMaxPulledLocations> col_voff{};
+    std::array<u32, Shader::NativeMaxPulledLocations> col_vsize{};
+    for (u32 k = 0; ok && b.colour && k < jvi.n; ++k) {
+        // SHADPS4_NATIVE_COLOUR: the same VkBuffer per stream (null where the opener's was
+        // null), any offset.
+        const u32 loc = join_attribs[k].desc.location;
+        const bool had = loc < Shader::NativeMaxPulledLocations && (b.vmask & (1u << loc)) != 0;
+        if (jvi.buf[k] == 0) {
+            ok = !had && loc < Shader::NativeMaxPulledLocations;
+            continue;
+        }
+        if (!had || jvi.buf[k] != b.vbuf || jvi.off[k] > 0xffffffffull) {
+            ok = false;
+            break;
+        }
+        col_voff[loc] = static_cast<u32>(jvi.off[k]);
+        col_vsize[loc] = 0xffffffffu;
+    }
+    for (u32 k = 0; ok && !b.colour && k < jvi.n; ++k) {
         if (jvi.buf[k] != b.vb[k] || jvi.stride[k] != b.vb_stride[k]) {
             ok = false;
             break;
@@ -2422,6 +2595,10 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
     std::memcpy(rec + Shader::NUM_USER_DATA_REGS, rec_off.data(), sizeof(u32) * Shader::NUM_BUFFERS);
     std::memcpy(rec + Shader::NUM_USER_DATA_REGS + Shader::NUM_BUFFERS, rec_size.data(),
                 sizeof(u32) * Shader::NUM_BUFFERS);
+    if (b.colour) {
+        std::memcpy(rec + Shader::NativeRecordVoffOffset, col_voff.data(), sizeof(col_voff));
+        std::memcpy(rec + Shader::NativeRecordVsizeOffset, col_vsize.data(), sizeof(col_vsize));
+    }
     const u32 cmd[5] = {regs.num_indices, regs.num_instances.NumInstances(),
                         static_cast<u32>(jvi.ib_off / b.index_size), static_cast<u32>(s32(vo)),
                         instance_offset};
@@ -2430,6 +2607,7 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
     *b.count = b.n;
     lap(2); // compare + record write
     ++native_stats.joins;
+    native_stats.col_joins += b.colour;
     DebugState.IncDrawCall();
     scheduler.NoteDraw();
     MaybeFlushEveryOps(scheduler);
@@ -2445,6 +2623,7 @@ void Rasterizer::NativeVerifyCompare(const GraphicsPipeline* pipeline, bool is_i
     auto& b = native_batch;
     b.cand_valid = false;
     ++native_stats.verify_draws;
+    native_stats.col_verify += b.colour;
     std::string why;
     if (std::memcmp(b.cand_ud.data(), push_data.ud_regs.data(),
                     sizeof(u32) * Shader::NUM_USER_DATA_REGS) != 0) {
@@ -2474,6 +2653,12 @@ void Rasterizer::NativeVerifyCompare(const GraphicsPipeline* pipeline, bool is_i
             vi.stride[k] != b.cand_vi.stride[k]) {
             why = fmt::format("vertex {}", k);
         }
+    }
+    if (why.empty() && b.colour &&
+        (image_infos.size() != native_open_images.size() ||
+         !std::equal(image_infos.begin(), image_infos.end(), native_open_images.begin()))) {
+        // SHADPS4_NATIVE_COLOUR: equal image keys must resolve to the opener's images.
+        why = fmt::format("images ({} vs {})", image_infos.size(), native_open_images.size());
     }
     const auto& vs_info = GetBoundStage(Shader::LogicalStage::Vertex);
     const auto [vertex_offset, instance_offset] =
@@ -2505,6 +2690,29 @@ void Rasterizer::NativeLog() {
              "epoch_same={} tick_moved={} closes:{}",
              st.opens, st.joins, st.open_fail, st.verify_draws, st.verify_mismatch,
              st.epoch_same, st.tick_moved, closes);
+    if (native_dbg && native_dbg_logged < 8) {
+        const auto* d = reinterpret_cast<const u32*>(native_dbg->mapped_data.data());
+        if (d[0] != 0) {
+            ++native_dbg_logged;
+            LOG_WARNING(Render_Vulkan, "NativeCompare: {} mismatching attribute fetches", d[0]);
+            for (u32 e = 0; e < 64 && e < d[0]; ++e) {
+                const u32* w = d + 16 + e * 16;
+                LOG_WARNING(Render_Vulkan,
+                            "NativeCompare: vs {:08x} loc {} kind {} bits {} count {} vertex {} "
+                            "draw {} voff {:#x} pulled {:08x} {:08x} {:08x} {:08x} real {:08x} "
+                            "{:08x} {:08x} {:08x}",
+                            w[12], w[0], w[13], w[14], w[15], w[1], w[2], w[3], w[4], w[5], w[6],
+                            w[7], w[8], w[9], w[10], w[11]);
+            }
+        }
+    }
+    if (VideoCore::g_native_colour) {
+        LOG_INFO(Render_Vulkan,
+                 "NativeColour: opens={} joins={} open_fail={} verify={} | textured draws={} "
+                 "with a variant {:.1f}%",
+                 st.col_opens, st.col_joins, st.col_open_fail, st.col_verify, st.col_tex_draws,
+                 100.0 * double(st.col_tex_variant) / double(std::max<u64>(st.col_tex_draws, 1)));
+    }
     if (st.n_join_ok + st.n_tail_other != 0) {
         const auto per = [](u64 c, u64 n) { return n ? double(c) / double(n) : 0.0; };
         LOG_INFO(Render_Vulkan,
@@ -2966,9 +3174,19 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
             NativeClose(1);
         }
         const auto* native = pipeline->native_variant.load(std::memory_order_acquire);
+        bool colour = false;
+        if (!native && VideoCore::g_native_colour && front_vi) [[unlikely]] {
+            native = pipeline->NativeColourVariant(VideoCore::NativeVertexKey(
+                AmdGpu::CpSplit::VertexInputAttribs(*front_vi), front_vi->count));
+            colour = native != nullptr;
+            if (!image_infos.empty()) {
+                ++native_stats.col_tex_draws;
+                native_stats.col_tex_variant += colour;
+            }
+        }
         if (native && !(repeat && repeat_mode == 1) && !(occlusion && occlusion->Open()) &&
             build_set_writes && !native_bindings &&
-            NativeOpen(pipeline, native, is_indexed, index_offset, front_vi)) {
+            NativeOpen(pipeline, native, is_indexed, index_offset, front_vi, colour)) {
             native_open = true;
             pipeline = native;
         }
@@ -3086,6 +3304,10 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
         }
         native_batch.open = true;
         ++native_stats.opens;
+        native_stats.col_opens += native_batch.colour;
+        if ((native_stats.opens & 0xffff) == 0) {
+            NativeLog();
+        }
     } else if (packet) {
         // Nothing was recorded since the descriptors: the draw rides in the packet.
         DrawPacketHeader tail{};
@@ -3127,9 +3349,14 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     if (VideoCore::g_native_pass == 2 && is_indexed) [[unlikely]] {
         // Verify: key the next draw's candidate on this one.
         native_batch.open = false;
-        if (pipeline->native_variant.load(std::memory_order_acquire) &&
+        const bool colour_cand =
+            VideoCore::g_native_colour && front_vi &&
+            pipeline->NativeColourVariant(VideoCore::NativeVertexKey(
+                AmdGpu::CpSplit::VertexInputAttribs(*front_vi), front_vi->count)) != nullptr;
+        if ((pipeline->native_variant.load(std::memory_order_acquire) || colour_cand) &&
             occlusion_slot == OcclusionQueries::NoSlot) {
-            NativeOpen(pipeline, nullptr, is_indexed, index_offset, front_vi);
+            NativeOpen(pipeline, nullptr, is_indexed, index_offset, front_vi,
+                       colour_cand && !pipeline->native_variant.load(std::memory_order_acquire));
         }
     }
     if (VideoCore::g_native_census) [[unlikely]] {
