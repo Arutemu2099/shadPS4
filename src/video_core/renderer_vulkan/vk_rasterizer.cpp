@@ -4317,6 +4317,11 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
             }
             for (const auto& desc : stage->buffers) {
                 auto v = desc.GetSharp(bound);
+                if (g_repeat_heap && desc.is_formatted && v.GetSize() > (u64{64} << 20)) {
+                    // s359: the 2.4 GB formatted view over texture memory (0x271xxxxxx) records
+                    // image -> buffer syncs on its full path; a repeat must not skip them.
+                    heap_formatted = true;
+                }
                 if (g_repeat_heap && !desc.IsSpecial() && v.base_address >= RepeatHeapLo &&
                     v.base_address < RepeatHeapHi && v.GetSize() > 0) {
                     // The address is re-pointed at the repeat; size / stride / format stay keyed.
