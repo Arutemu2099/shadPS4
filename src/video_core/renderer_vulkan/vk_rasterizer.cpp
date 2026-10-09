@@ -242,10 +242,30 @@ struct SlowImage {
     u32 layout_before{};
 };
 thread_local SlowImage g_dc_slow_img{};
+// Program 5 gate (2026-10-09 evening, dcb-parallel note sec. 6): which part of a draw's binding
+// work is a pure function of guest data (could run on the game's job thread) and which needs the
+// back's state. Per draw, reset in BindResources: 0 buffer pass 1 (V# decode + FindBuffer),
+// 1 special bindings (flat-buffer copy, null clip planes, ...), 2 cache bindings (Obtain, barrier,
+// descriptor info), 3 texture memo key (T# / S# decode, hash, way search), 4 texture memo
+// validation (memo section, per-image checks, LRU / sampler touches), 5 texture memo hit emit,
+// 6 texture memo miss (full BindTextures), 7 stages without images or samplers.
+enum P5Part : u32 { P5Find, P5Special, P5Cache, P5TexKey, P5TexValid, P5TexEmit, P5TexMiss,
+                    P5TexEmpty, P5Count };
+constexpr std::array<const char*, P5Count> kP5Names{"buf_find", "buf_special", "buf_cache",
+                                                    "tex_key",  "tex_valid",   "tex_emit",
+                                                    "tex_miss", "tex_empty"};
+thread_local std::array<u64, P5Count> g_p5{};
+// The per-binding repeat census below allocates in a hash map inside the timed buffer phase;
+// SHADPS4_DRAW_COST_REPEAT=1 keeps it, off by default so the phases are not inflated.
+const bool g_dc_repeat_census = [] {
+    const char* v = std::getenv("SHADPS4_DRAW_COST_REPEAT");
+    return v && v[0] == '1';
+}();
 
 struct DrawCostStats {
     u64 n = 0;
     std::array<u64, DcCount> cyc{};
+    std::array<u64, P5Count> p5{};
 };
 
 bool IsDepthOnlyNoImage(const GraphicsPipeline* pipeline) {
@@ -276,6 +296,11 @@ void NoteDrawCost(const GraphicsPipeline* pipeline, const std::array<u64, DcCoun
         ++c.n;
         for (u32 i = 0; i < DcCount; ++i) {
             c.cyc[i] += cyc[i];
+        }
+        if (!repeat) {
+            for (u32 i = 0; i < P5Count; ++i) {
+                c.p5[i] += g_p5[i];
+            }
         }
     }
     thread_local std::unordered_map<const GraphicsPipeline*, DrawCostStats> stats;
@@ -357,6 +382,17 @@ void NoteDrawCost(const GraphicsPipeline* pipeline, const std::array<u64, DcCoun
                                 phases(c.cyc, c.n));
         }
         LOG_INFO(Render_Vulkan, "DrawCostClass:{}", line);
+        // Program 5 gate: binding parts of the full (non-repeat) draws, ns per draw.
+        std::string p5line;
+        for (const u32 k : {0u, 2u}) {
+            const auto& c = by_class[k];
+            p5line += fmt::format(" | {} n={}:", kClass[k], c.n);
+            for (u32 i = 0; i < P5Count; ++i) {
+                p5line += fmt::format(" {}={:.0f}", kP5Names[i],
+                                      c.n ? double(c.p5[i]) * ns_per_cyc / double(c.n) : 0.0);
+            }
+        }
+        LOG_INFO(Render_Vulkan, "DrawCostP5:{}", p5line);
     }
     LOG_INFO(Render_Vulkan,
              "DrawCost: back idle (WaitForWork) {:.1f}% of wall; dispatches {} = {:.1f}% of wall, "
@@ -4724,6 +4760,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     g_dc_bind_tex = 0;
     g_dc_tex_sub = {};
     g_dc_slow_img = {};
+    g_p5 = {};
 
     bool uses_dma = false;
     binding_compute = pipeline->IsCompute();
@@ -5554,6 +5591,25 @@ void LogTexMemo(TexMemoState& st, u8 mode) {
 void Rasterizer::BindTexturesMemo(const Pipeline* pipeline, const Shader::BoundStage& bound,
                                   Shader::Backend::Bindings& binding) {
     const auto& stage = *bound.info;
+    // Program 5 gate (DRAW_COST): key / validation / hit-emit / miss split, accounted on exit.
+    struct P5Timer {
+        u64 t0 = 0, t1 = 0, t2 = 0;
+        bool hit = false;
+        ~P5Timer() {
+            if (t0 == 0) {
+                return;
+            }
+            const u64 end = __rdtsc();
+            if (t1 == 0) {
+                g_p5[P5TexEmpty] += end - t0;
+                return;
+            }
+            g_p5[P5TexKey] += t1 - t0;
+            g_p5[P5TexValid] += t2 - t1;
+            g_p5[hit ? P5TexEmit : P5TexMiss] += end - t2;
+        }
+    } p5;
+    p5.t0 = g_draw_cost ? __rdtsc() : 0;
     auto& st = GetTexMemoState();
     if (!st.started) {
         st.started = true;
@@ -5647,6 +5703,9 @@ void Rasterizer::BindTexturesMemo(const Pipeline* pipeline, const Shader::BoundS
     }
     auto& rec = found ? *found : *victim;
     rec.last_use = st.total_stages;
+    if (p5.t0 != 0) {
+        p5.t1 = __rdtsc();
+    }
 
     // Validation (design section 3). Image checks and the LRU touches a hit keeps run inside
     // one memo section, so a foreign structural change cannot interleave with them; the
@@ -5724,6 +5783,10 @@ void Rasterizer::BindTexturesMemo(const Pipeline* pipeline, const Shader::BoundS
     st.key_hits += miss != static_cast<s32>(TmKey);
     if (miss >= 0) {
         ++st.miss[static_cast<u32>(miss)];
+    }
+    if (p5.t0 != 0) {
+        p5.t2 = __rdtsc();
+        p5.hit = miss < 0 && tex_bind_memo == 1;
     }
 
     if (miss < 0 && tex_bind_memo == 1) {
@@ -6620,6 +6683,7 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
     }
     u64 obtain_ns = 0;
     const u64 bb_find_cyc = g_draw_cost ? __rdtsc() - bb_find_t0 : 0;
+    g_p5[P5Find] += bb_find_cyc;
     const u64 bb_find_each = buffer_bindings.empty() ? 0 : bb_find_cyc / buffer_bindings.size();
 
     // SHADPS4_LEAN_BIND: plain read bindings take BufferCache::ObtainReadLean.
@@ -6628,6 +6692,7 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
     for (u32 i = 0; i < buffer_bindings.size(); i++) {
         const auto& [buffer_id, vsharp, size] = buffer_bindings[i];
         const auto& desc = stage.buffers[i];
+        const u64 p5_t0 = g_draw_cost ? __rdtsc() : 0;
         // SHADPS4_BIND_MEMO_STATS: bindings a memo hit would still run in full are timed.
         const bool memo_fixed = bind_memo_timing && (desc.IsSpecial() || desc.is_written);
         const u64 memo_t0 = memo_fixed ? Common::FencedRDTSC() : 0;
@@ -6758,7 +6823,7 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
                 g_bb_cyc[w][3] += obtain > walk + rest ? obtain - walk - rest : 0;
                 g_bb_cyc[w][4] += __rdtsc() - bb_t1;
                 ++g_bb_n[w];
-                if (!w) {
+                if (!w && g_dc_repeat_census) {
                     NoteReadBindingRepeat(scheduler.CurrentTick(), buffer_id.index,
                                           vsharp.base_address, size);
                 }
@@ -6790,6 +6855,9 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
         ++binding.buffer;
         if (memo_fixed) {
             bind_memo_fixed_ticks += Common::FencedRDTSC() - memo_t0;
+        }
+        if (g_draw_cost) {
+            g_p5[buffer_id ? P5Cache : P5Special] += __rdtsc() - p5_t0;
         }
     }
     Common::FaultMonitor::CountBindBufferPass(find_ns, obtain_ns);
