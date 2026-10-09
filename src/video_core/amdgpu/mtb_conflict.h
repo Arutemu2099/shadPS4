@@ -41,6 +41,7 @@ struct Window {
     u64 batches{}, any{};
     std::array<u64, Count> touches{}, conf_prev{}, conf_pkt{}, batches_prev{}, batches_pkt{};
     std::array<u64, Count> conf_mid{}, batches_mid{}; ///< v2: packet change after a draw touch
+    std::array<u64, Count> pkt_changes{};             ///< v2 sanity: every packet-made change
 };
 inline Window g_win{};
 inline u32 g_batch_flags = 0;
@@ -65,9 +66,12 @@ inline void Touch(Stamp& s, Class c) {
 inline void Change(Stamp& s, Class c) {
     // v2: a packet / Call changes an object a draw of this batch already touched - a worker that
     // tracks it locally would need a mid-batch join.
-    if (!g_in_draw && s.touch == g_batch) {
-        ++g_win.conf_mid[c];
-        g_batch_flags |= 1u << (c + 16);
+    if (!g_in_draw) {
+        ++g_win.pkt_changes[c];
+        if (s.touch == g_batch) {
+            ++g_win.conf_mid[c];
+            g_batch_flags |= 1u << (c + 16);
+        }
     }
     s.change = g_batch;
     s.change_pkt = !g_in_draw;
@@ -100,10 +104,11 @@ inline void EndBatch(u64 next_batch) {
              w.conf_prev[0] / b, w.conf_prev[1] / b, w.conf_prev[2] / b, w.conf_pkt[0] / b,
              w.conf_pkt[1] / b, w.conf_pkt[2] / b);
     LOG_INFO(Render, "MtbConflict v2: batches with a packet change after a draw touch "
-                     "image/buffer/meta={:.1f}/{:.1f}/{:.1f}% objects per batch {:.2f}/{:.2f}/{:.2f}",
+                     "image/buffer/meta={:.1f}/{:.1f}/{:.1f}% objects per batch {:.2f}/{:.2f}/{:.2f} | "
+                     "all packet-made changes per batch {:.2f}/{:.2f}/{:.2f}",
              100.0 * w.batches_mid[0] / b, 100.0 * w.batches_mid[1] / b,
              100.0 * w.batches_mid[2] / b, w.conf_mid[0] / b, w.conf_mid[1] / b,
-             w.conf_mid[2] / b);
+             w.conf_mid[2] / b, w.pkt_changes[0] / b, w.pkt_changes[1] / b, w.pkt_changes[2] / b);
     w = Window{};
 }
 
