@@ -1240,6 +1240,17 @@ void TextureCache::UpdateImage(ImageId image_id) {
     RefreshImage(image);
 }
 
+bool TextureCache::AnyImageAt(VAddr address) {
+    if (const auto it = page_table.find(address >> Traits::PageBits); it != nullptr) {
+        for (const ImageId image_id : *it) {
+            if (slot_images[image_id].info.guest_address == address) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
     // Only images whose guest_address == address can match here. RegisterImage registers an image
     // on every page it spans, so any such candidate is present on the single page containing

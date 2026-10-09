@@ -114,6 +114,10 @@ public:
     /// Retrieves image whose address matches provided
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
 
+    /// SHADPS4_DRAW_REPEAT_HEAP: any image whose guest address is exactly `address` (the
+    /// candidates FindImageFromRange considers, without its size test or log).
+    [[nodiscard]] bool AnyImageAt(VAddr address);
+
     /// Retrieves an image view with the properties of the specified image id.
     [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc);
 

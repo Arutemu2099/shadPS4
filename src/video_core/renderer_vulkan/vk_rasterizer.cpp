@@ -3273,6 +3273,9 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
                 draw_repeat.v_buffers[idx] = draw_repeat.heap_new[k].info;
             }
         }
+        if (draw_repeat.clip_patch && draw_repeat.clip_base_idx < draw_repeat.v_buffers.size()) {
+            draw_repeat.v_buffers[draw_repeat.clip_base_idx] = draw_repeat.clip_new;
+        }
         draw_repeat.v_images.assign(image_infos.begin(), image_infos.end());
         draw_repeat.v_seq = scheduler.RecordSeq();
         bound = BindResources(pipeline);
@@ -4321,8 +4324,8 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
             for (const auto& desc : stage->buffers) {
                 auto v = desc.GetSharp(bound);
                 if (g_repeat_heap && desc.is_formatted && !desc.IsSpecial() &&
-                    (v.GetSize() > (u64{64} << 20) ||
-                     texture_cache.FindImageFromRange(v.base_address, v.GetSize(), false))) {
+                    v.base_address != 0 &&
+                    (v.GetSize() > (u64{64} << 20) || texture_cache.AnyImageAt(v.base_address))) {
                     // A formatted read over an image: its full path syncs buffer <- image
                     // (SynchronizeBufferFromImage) on every bind; a repeat must not skip that
                     // (s359: the 2.4 GB view; review item 2: any size).
@@ -4359,6 +4362,10 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
                 add(bound.user_data[index]);
             }
         }
+        if (g_repeat_heap) {
+            add(heap_positions);
+            add(buf_pos);
+        }
         if (overflow) {
             eligible = false;
             reason = 0;
@@ -4366,10 +4373,6 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
         if (heap_formatted) {
             eligible = false;
             reason = 3;
-        }
-        if (g_repeat_heap) {
-            add(heap_positions);
-            add(buf_pos);
         }
     }
     st.sizes[st.kidx ^ 1] = n;
@@ -4440,11 +4443,13 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
             st.clip_cur[1 + i * 4 + 2] = plane.data_z;
             st.clip_cur[1 + i * 4 + 3] = plane.data_w;
         }
-        if (st.clip_cur != st.clip_base) {
+        // The planes are copied afresh below (Opus delta review item 1: the base's stream copy
+        // may be overwritten by a ring wrap inside the tick), so only the enable bits must match.
+        if (st.clip_cur[0] != st.clip_base[0] ||
+            (st.clip_cur[0] != 0 && st.clip_base_idx == ~0u)) {
             ++st.f_clip;
             return false;
         }
-        st.clip_repeats += st.clip_cur[0] != 0;
     }
     if (g_repeat_heap) {
         if (st.heap_cand.size() != st.heap_base.size()) {
@@ -4486,6 +4491,32 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
         }
         st.heap_repeats += !st.heap_new.empty();
     }
+    st.clip_patch = false;
+    if (g_repeat_heap && pipeline->repeat_static == 2 && st.clip_cur[0] != 0) {
+        // As BindBuffers' ClipPlanes branch: this draw's planes into the stream buffer. A Map that
+        // waits (ring wrap) submits work, which moves RecordSeq: then take the full path.
+        const u64 seq0 = scheduler.RecordSeq();
+        const auto& regs = liverpool->BackRegs();
+        std::array<float, AmdGpu::NUM_CLIP_PLANES * 4> planes{};
+        for (u32 i = 0; i < AmdGpu::NUM_CLIP_PLANES; ++i) {
+            const auto& plane = regs.clip_user_data[i];
+            planes[i * 4 + 0] = std::bit_cast<float>(plane.data_x);
+            planes[i * 4 + 1] = std::bit_cast<float>(plane.data_y);
+            planes[i * 4 + 2] = std::bit_cast<float>(plane.data_z);
+            planes[i * 4 + 3] = std::bit_cast<float>(plane.data_w);
+        }
+        auto& vk_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
+        const u32 ubo_size = static_cast<u32>(sizeof(planes));
+        const u64 offset = vk_buffer.Copy(planes.data(), ubo_size, instance.StorageMinAlignment());
+        if (scheduler.RecordSeq() != seq0) {
+            ++st.f_clip;
+            st.heap_new.clear();
+            return false;
+        }
+        st.clip_new = vk::DescriptorBufferInfo{vk_buffer.Handle(), offset, ubo_size};
+        st.clip_patch = true;
+        ++st.clip_repeats;
+    }
     ++st.repeats;
     return true;
 }
@@ -4517,6 +4548,10 @@ void Rasterizer::DrawRepeatApply(const GraphicsPipeline* pipeline, bool patch_in
             buffer_infos[slot.info_idx] = st.heap_new[k].info;
         }
     }
+    if (st.clip_patch && patch_infos) {
+        ASSERT(st.clip_base_idx < buffer_infos.size());
+        buffer_infos[st.clip_base_idx] = st.clip_new;
+    }
 }
 
 void Rasterizer::DrawRepeatVerify(const GraphicsPipeline* pipeline) {
@@ -4534,7 +4569,8 @@ void Rasterizer::DrawRepeatVerify(const GraphicsPipeline* pipeline) {
     for (size_t i = 0; !what && i < buffer_infos.size(); ++i) {
         const auto& a = st.v_buffers[i];
         const auto& b = buffer_infos[i];
-        const bool clip_slot = g_repeat_heap && st.clip_cur[0] != 0 && i == st.clip_info_idx;
+        // Both sides made a fresh copy of the same registers at this point: offsets differ.
+        const bool clip_slot = st.clip_patch && i == st.clip_base_idx;
         if (a.buffer != b.buffer || (!clip_slot && a.offset != b.offset) || a.range != b.range) {
             what = clip_slot ? "clip-plane buffer info" : "buffer info";
         }
@@ -5144,6 +5180,7 @@ void Rasterizer::DrawRepeatStore(const GraphicsPipeline* pipeline, bool complete
     st.push_data = push_data;
     st.end_seq = scheduler.RecordSeq();
     st.heap_base = st.heap_pending;
+    st.clip_base_idx = st.clip_info_idx;
     if (g_repeat_heap && pipeline->repeat_static == 2) {
         const auto& regs = liverpool->BackRegs();
         st.clip_base[0] = regs.clipper_control.user_clip_plane_enable;
