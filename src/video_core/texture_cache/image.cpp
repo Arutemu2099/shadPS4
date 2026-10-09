@@ -245,7 +245,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
     BackingImage* const cf_backing = backing;
     SCOPE_EXIT {
         if (cf && cf_backing->state_serial != cf_serial) [[unlikely]] {
-            AmdGpu::MtbConflict::Change(cf_backing->cf);
+            AmdGpu::MtbConflict::Change(cf_backing->cf, AmdGpu::MtbConflict::Image);
         }
     };
     auto& last_state = backing->state;
@@ -1084,7 +1084,7 @@ void Image::SetBackingSamples(u32 num_samples, bool copy_backing) {
         new_backing->state.pl_stage = dst_stage;
         ++new_backing->state_serial; // SHADPS4_TEX_TRANSIT_SKIP: a state write outside GetBarriers
         if (AmdGpu::MtbConflict::g_enabled) [[unlikely]] {
-            AmdGpu::MtbConflict::Change(new_backing->cf);
+            AmdGpu::MtbConflict::Change(new_backing->cf, AmdGpu::MtbConflict::Image);
         }
     }
 

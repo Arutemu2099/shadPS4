@@ -324,7 +324,7 @@ public:
             it.value().clear_mask = u32(-1);
             ++meta_clear_epoch;
             if (AmdGpu::MtbConflict::g_enabled) [[unlikely]] {
-                AmdGpu::MtbConflict::Change(it.value().cf);
+                AmdGpu::MtbConflict::Change(it.value().cf, AmdGpu::MtbConflict::Meta);
             }
             return true;
         }
@@ -360,7 +360,7 @@ public:
                 it.value().clear_mask &= ~(1u << slice);
             }
             if (AmdGpu::MtbConflict::g_enabled && it.value().clear_mask != old_mask) [[unlikely]] {
-                AmdGpu::MtbConflict::Change(it.value().cf);
+                AmdGpu::MtbConflict::Change(it.value().cf, AmdGpu::MtbConflict::Meta);
             }
             return true;
         }

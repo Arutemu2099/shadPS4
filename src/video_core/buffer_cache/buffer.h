@@ -207,7 +207,7 @@ public:
             const auto before = HazardTuple();
             auto result = GetBarrierImpl(dst_acess_mask, dst_stage, offset, run);
             if (HazardTuple() != before) {
-                AmdGpu::MtbConflict::Change(cf);
+                AmdGpu::MtbConflict::Change(cf, AmdGpu::MtbConflict::Buffer);
             }
             return result;
         }
