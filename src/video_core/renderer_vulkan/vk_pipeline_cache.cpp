@@ -1015,8 +1015,8 @@ void PipelineCache::PrepareNativeVariant(const GraphicsPipeline* base) {
             // Opus review #3: a rebased vertexOffset shifts VertexId.
             return "vs reads VertexId";
         }
-        if (vs->buffers.empty()) {
-            return "vs no buffers";
+        if (vs->buffers.empty() || vs->buffers.size() >= Shader::NUM_BUFFERS) {
+            return "vs buffer count";
         }
         for (const auto& desc : vs->buffers) {
             if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
@@ -1025,6 +1025,11 @@ void PipelineCache::PrepareNativeVariant(const GraphicsPipeline* base) {
             if (desc.buffer_type != Shader::BufferType::Guest || desc.is_written ||
                 desc.is_formatted || !desc.IsStorage(desc.GetSharp(*vs))) {
                 return "vs buffer kind";
+            }
+            // Native loads apply the guest bound for 32-bit loads only (Opus review #1).
+            if (True(desc.used_types &
+                     (Shader::IR::Type::U8 | Shader::IR::Type::U16 | Shader::IR::Type::U64))) {
+                return "vs buffer load width";
             }
         }
         return nullptr;

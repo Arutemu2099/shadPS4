@@ -253,6 +253,8 @@ void EmitContext::DefineBufferProperties() {
         if (native) {
             // The full byte offset of this draw's binding inside the bound VkBuffer.
             buf_offset = NativeRecordLoad(Shader::NativeRecordOffOffset + binding);
+            native_size_dw[i] = OpShiftRightLogical(
+                U32[1], NativeRecordLoad(Shader::NativeRecordSizeOffset + binding), ConstU32(2U));
         } else {
             const u32 half = PushData::BufOffsetIndex + (binding >> 4);
             const u32 comp = (binding & 0xf) >> 2;

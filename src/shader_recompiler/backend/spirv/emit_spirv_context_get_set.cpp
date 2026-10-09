@@ -335,17 +335,28 @@ void EmitSetPatch(EmitContext& ctx, IR::Patch patch, Id value) {
 template <u32 N, PointerType alias>
 static Id EmitLoadBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
     const auto& spv_buffer = ctx.buffers[handle];
+    const Id rel_address = address;
     if (const Id offset = spv_buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
     const auto& data_types = alias == PointerType::U32 ? ctx.U32 : ctx.F32;
     const auto [id, pointer_type] = spv_buffer.Alias(alias);
+    // SHADPS4_NATIVE_PASS: whole-buffer descriptors; the guest V# bound is applied here.
+    const Id size_dw = ctx.native && handle < ctx.native_size_dw.size() ? ctx.native_size_dw[handle]
+                                                                        : Id{};
 
     boost::container::static_vector<Id, N> ids;
     for (u32 i = 0; i < N; i++) {
         const Id index_i = i == 0 ? address : ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i));
         const Id ptr_i = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index_i);
-        const Id result_i = ctx.OpLoad(data_types[1], ptr_i);
+        Id result_i = ctx.OpLoad(data_types[1], ptr_i);
+        if (Sirit::ValidId(size_dw)) {
+            const Id rel_i =
+                i == 0 ? rel_address : ctx.OpIAdd(ctx.U32[1], rel_address, ctx.ConstU32(i));
+            const Id in_bounds = ctx.OpULessThan(ctx.U1[1], rel_i, size_dw);
+            const Id zero = alias == PointerType::U32 ? ctx.u32_zero_value : ctx.f32_zero_value;
+            result_i = ctx.OpSelect(data_types[1], in_bounds, result_i, zero);
+        }
         ids.push_back(result_i);
     }
 

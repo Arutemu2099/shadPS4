@@ -257,6 +257,7 @@ public:
     Id native_records_ptr{};  // pointer type to one u32 of it
     Id native_rec_base{};     // records index of this draw's first dword
     bool native{};
+    std::array<Id, NUM_BUFFERS> native_size_dw{}; // per buffer handle (native variant)
     Id instance_id{};
     Id push_data_block{};
     Id base_vertex{};

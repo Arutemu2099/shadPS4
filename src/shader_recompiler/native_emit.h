@@ -22,6 +22,9 @@ inline thread_local NativeEmit t_native_emit{};
 
 constexpr u32 NativeRecordUdOffset = 0;
 constexpr u32 NativeRecordOffOffset = NUM_USER_DATA_REGS;
-constexpr u32 NativeRecordDwords = NUM_USER_DATA_REGS + NUM_BUFFERS; // 56 dwords, 224 bytes
+/// Each Guest binding's V# size in bytes: native loads past it return 0, as the generic path's
+/// descriptor range makes robustBufferAccess do (Opus code review 2026-10-09 #1).
+constexpr u32 NativeRecordSizeOffset = NUM_USER_DATA_REGS + NUM_BUFFERS;
+constexpr u32 NativeRecordDwords = NUM_USER_DATA_REGS + 2 * NUM_BUFFERS; // 96 dwords, 384 bytes
 
 } // namespace Shader

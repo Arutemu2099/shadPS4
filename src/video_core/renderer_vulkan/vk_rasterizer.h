@@ -424,7 +424,7 @@ private:
     /// one recorded drawIndexedIndirectCount whose commands, per-draw records and count live in
     /// a stream-buffer reservation the back keeps appending to while nothing else records.
     static constexpr u32 NativeMaxDraws = 64;
-    static constexpr u32 NativeRecBytes = Shader::NUM_USER_DATA_REGS * 4 + Shader::NUM_BUFFERS * 4;
+    static constexpr u32 NativeRecBytes = Shader::NUM_USER_DATA_REGS * 4 + Shader::NUM_BUFFERS * 8;
     static constexpr u32 NativeCmdBytes = 20; // VkDrawIndexedIndirectCommand
     struct NativeBatch {
         bool open{};
@@ -458,6 +458,8 @@ private:
         std::array<u32, Shader::NUM_USER_DATA_REGS> cand_ud{};
         std::array<u64, Shader::NUM_BUFFERS> cand_buf{};
         std::array<u64, Shader::NUM_BUFFERS> cand_off{};
+        std::array<u64, Shader::NUM_BUFFERS> cand_size{};
+        u64 open_tick{};
         VideoCore::NativeJoinVi cand_vi{};
         u32 cand_vertex_offset{};
         u32 cand_instance_offset{};
@@ -468,6 +470,7 @@ private:
     struct NativeStats {
         u64 opens{}, joins{}, open_fail{}, verify_draws{}, verify_mismatch{}, epoch_same{};
         std::array<u64, 16> close{};
+        u64 tick_moved{};
     } native_stats;
     bool NativeJoin(const SplitDraw& draw, const AmdGpu::CpSplit::VertexInputsPayload* front_vi);
     bool NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline* native, bool is_indexed,

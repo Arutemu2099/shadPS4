@@ -1752,8 +1752,18 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
     // Opus review 2026-10-09: the context epoch only moves with the viewport memo (#2); without
     // dynamic vertex input the bound sizes would clip rebased reads (#3); attributes past 16 are
     // not tracked (#7).
+    // Opus code review #3: RecordSeq only sees records through the recording worker, and the
+    // stream-size / deferred-upload modes upload without a record; MTB translators share the
+    // stream buffer.
+    static const bool native_config_ok = [] {
+        const char* stream = std::getenv("SHADPS4_STREAM_MAX_SIZE");
+        const bool stream_off = !stream || std::strtoull(stream, nullptr, 0) == 0;
+        const char* mtb = std::getenv("SHADPS4_MTB_P1");
+        const bool mtb_off = !mtb || mtb[0] != '1';
+        return stream_off && mtb_off && !VideoCore::g_epoch_defer_upload;
+    }();
     if (!front_vi || !is_indexed || g_viewport_memo < 1 || !instance.IsVertexInputDynamicState() ||
-        front_vi->count > 16) {
+        front_vi->count > 16 || !native_config_ok || !scheduler.IsAsyncRecording()) {
         return fail();
     }
     const auto& vi = VideoCore::t_native_vi;
@@ -1818,6 +1828,7 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
     }
     // Buffer bindings, in BindResources order.
     std::array<u32, Shader::NUM_BUFFERS> rec_off{};
+    std::array<u32, Shader::NUM_BUFFERS> rec_size{};
     u32 bi = 0;
     for (const auto& bound : BoundStages(base)) {
         if (!bound.info) {
@@ -1833,6 +1844,8 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
                     return fail();
                 }
                 rec_off[bi] = static_cast<u32>(full);
+                const u64 bound_size = buffer_infos[bi].range - push_data.buf_offsets[bi];
+                rec_size[bi] = static_cast<u32>(std::min<u64>(bound_size, 0xffffffffull));
                 b.buf[bi] = std::bit_cast<u64>(static_cast<VkBuffer>(buffer_infos[bi].buffer));
                 b.guest_mask |= u64{1} << bi;
             }
@@ -1840,6 +1853,12 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         }
     }
     if (bi != buffer_infos.size()) {
+        return fail();
+    }
+    const auto& vs_bound = GetBoundStage(Shader::LogicalStage::Vertex);
+    if (GetDrawOffsets(regs, vs_bound, base->GetFetchShader()).second != 0) {
+        // Opus code review #2: firstInstance != 0 in an indirect command needs
+        // drawIndirectFirstInstance, which is not enabled.
         return fail();
     }
     if (b.verify) {
@@ -1867,6 +1886,9 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
     auto* rec = reinterpret_cast<u32*>(b.recs);
     std::memcpy(rec, push_data.ud_regs.data(), sizeof(u32) * Shader::NUM_USER_DATA_REGS);
     std::memcpy(rec + Shader::NUM_USER_DATA_REGS, rec_off.data(), sizeof(u32) * Shader::NUM_BUFFERS);
+    std::memcpy(rec + Shader::NUM_USER_DATA_REGS + Shader::NUM_BUFFERS, rec_size.data(),
+                sizeof(u32) * Shader::NUM_BUFFERS);
+    b.open_tick = tick_before_map;
     const auto& vs_info = GetBoundStage(Shader::LogicalStage::Vertex);
     const auto [vertex_offset, instance_offset] =
         GetDrawOffsets(regs, vs_info, base->GetFetchShader());
@@ -1997,6 +2019,7 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
     auto* barriers = b.verify ? nullptr : &native_carry;
     const size_t carry0 = native_carry.size();
     std::array<u32, Shader::NUM_BUFFERS> rec_off{};
+    std::array<u32, Shader::NUM_BUFFERS> rec_size{};
     bool ok = true;
     u32 bi = 0;
     for (const auto& bound : BoundStages(b.base)) {
@@ -2025,6 +2048,8 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
                 }
                 b.cand_buf[bi] = handle;
                 b.cand_off[bi] = offset;
+                b.cand_size[bi] = size;
+                rec_size[bi] = static_cast<u32>(std::min<u64>(size, 0xffffffffull));
                 if (handle != b.buf[bi]) {
                     ok = false;
                 }
@@ -2055,10 +2080,13 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
             continue;
         }
         const s64 d = s64(jvi.off[k]) - s64(b.vb_off[k]);
-        if (join_attribs[k].desc.instanced && d != 0) {
+        if (join_attribs[k].desc.instanced) {
             // Opus #3: vertexOffset cannot rebase an instance-rate binding.
-            ok = false;
-            break;
+            if (d != 0) {
+                ok = false;
+                break;
+            }
+            continue; // Opus code review #6: no quotient from an instance-rate binding.
         }
         if (b.vb_stride[k] == 0 ? d != 0 : d % s64(b.vb_stride[k]) != 0) {
             ok = false;
@@ -2097,6 +2125,10 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
         return false;
     }
     const s64 vo = s64(s32(vertex_offset)) + q;
+    if (instance_offset != 0) {
+        NativeClose(3); // Opus code review #2 (firstInstance)
+        return false;
+    }
     if (vo < 0 || vo > INT32_MAX) {
         // Opus #3: a rebased vertexOffset must stay a valid non-negative vertex index base.
         NativeClose(3);
@@ -2105,6 +2137,8 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
     auto* rec = reinterpret_cast<u32*>(b.recs + u64(b.n) * NativeRecBytes);
     std::memcpy(rec, push.ud_regs.data(), sizeof(u32) * Shader::NUM_USER_DATA_REGS);
     std::memcpy(rec + Shader::NUM_USER_DATA_REGS, rec_off.data(), sizeof(u32) * Shader::NUM_BUFFERS);
+    std::memcpy(rec + Shader::NUM_USER_DATA_REGS + Shader::NUM_BUFFERS, rec_size.data(),
+                sizeof(u32) * Shader::NUM_BUFFERS);
     const u32 cmd[5] = {regs.num_indices, regs.num_instances.NumInstances(),
                         static_cast<u32>(jvi.ib_off / b.index_size), static_cast<u32>(s32(vo)),
                         instance_offset};
@@ -2138,7 +2172,8 @@ void Rasterizer::NativeVerifyCompare(const GraphicsPipeline* pipeline, bool is_i
         }
         const u64 handle = std::bit_cast<u64>(static_cast<VkBuffer>(buffer_infos[i].buffer));
         const u64 full = buffer_infos[i].offset + push_data.buf_offsets[i];
-        if (handle != b.cand_buf[i] || full != b.cand_off[i]) {
+        const u64 size = buffer_infos[i].range - push_data.buf_offsets[i];
+        if (handle != b.cand_buf[i] || full != b.cand_off[i] || size != b.cand_size[i]) {
             why = fmt::format("buffer {} ({:#x}+{:#x} vs {:#x}+{:#x})", i, handle, full,
                               b.cand_buf[i], b.cand_off[i]);
         }
@@ -2183,9 +2218,9 @@ void Rasterizer::NativeLog() {
     }
     LOG_INFO(Render_Vulkan,
              "NativePass: opens={} joins={} open_fail={} verify_draws={} verify_mismatch={} "
-             "epoch_same={} closes:{}",
+             "epoch_same={} tick_moved={} closes:{}",
              st.opens, st.joins, st.open_fail, st.verify_draws, st.verify_mismatch,
-             st.epoch_same, closes);
+             st.epoch_same, st.tick_moved, closes);
 }
 
 void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
@@ -2746,6 +2781,12 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
         scheduler.GetDynamicState().packet_state_unknown = true;
         native_batch.seq = scheduler.RecordSeq();
         native_batch.tick = scheduler.CurrentTick();
+        if (native_batch.tick != native_batch.open_tick) [[unlikely]] {
+            // Opus code review #4: a flush between the reservation and this record; the region's
+            // watch says the earlier tick. No joins into this batch; counted.
+            ++native_stats.tick_moved;
+            native_batch.tick = ~0ULL;
+        }
         native_batch.open = true;
         ++native_stats.opens;
     } else if (packet) {
