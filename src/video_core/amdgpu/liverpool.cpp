@@ -2492,36 +2492,46 @@ struct ForwardStats {
     u64 posted = 0, skipped_waits = 0, not_adjacent = 0, failed_test = 0;
 } g_fwd_stats;
 
-/// The value a fence packet writes to its label, if it is a plain data write.
-std::optional<u32> FenceValue(const PM4Header* fence) {
+/// The low dword a fence packet writes to its label and the write's width in bytes, if it is a
+/// plain data write (Opus review 2026-10-09 #2: the exact width, not 8).
+struct FenceWrite {
+    u32 value;
+    u32 width;
+};
+std::optional<FenceWrite> FenceValue(const PM4Header* fence) {
+    const auto data = [](DataSelect sel, u32 value) -> std::optional<FenceWrite> {
+        if (sel == DataSelect::Data32Low) {
+            return FenceWrite{value, 4};
+        }
+        if (sel == DataSelect::Data64) {
+            return FenceWrite{value, 8};
+        }
+        return std::nullopt;
+    };
     switch (fence->type3.opcode.Value()) {
     case PM4ItOpcode::EventWriteEop: {
         const auto* eop = reinterpret_cast<const PM4CmdEventWriteEop*>(fence);
-        const auto sel = eop->data_sel.Value();
-        if (sel == DataSelect::Data32Low || sel == DataSelect::Data64) {
-            return eop->DataDWord();
-        }
-        return std::nullopt;
+        return data(eop->data_sel.Value(), eop->DataDWord());
     }
     case PM4ItOpcode::EventWriteEos: {
         const auto* eos = reinterpret_cast<const PM4CmdEventWriteEos*>(fence);
         if (eos->command.Value() == PM4CmdEventWriteEos::Command::SignalFence) {
-            return eos->DataDWord();
+            return FenceWrite{eos->DataDWord(), 4};
         }
         return std::nullopt;
     }
     case PM4ItOpcode::ReleaseMem: {
         const auto* rm = reinterpret_cast<const PM4CmdReleaseMem*>(fence);
-        const auto sel = rm->data_sel.Value();
-        if (sel == DataSelect::Data32Low || sel == DataSelect::Data64) {
-            return rm->DataDWord();
-        }
-        return std::nullopt;
+        return data(rm->data_sel.Value(), rm->DataDWord());
     }
     default:
         return std::nullopt;
     }
 }
+
+/// Opus review #6: ASC fences forward only from indirect buffers (a top-level ASC ring's read
+/// pointer moves past the skipped wait before the back writes a label that may sit in the ring).
+thread_local bool t_fwd_asc_allowed = false;
 
 bool WaitPassesWith(const PM4CmdWaitRegMem* w, u32 value) {
     const u32 v = value & w->mask;
@@ -2589,20 +2599,36 @@ void Liverpool::RunFence(const PM4Header* header, std::span<const u32> rest, VAd
     const auto lo = reinterpret_cast<VAddr>(rest.data());
     const VAddr hi = lo + rest.size_bytes();
     if (g_fence_forward) {
-        // A label wholly inside memory the front has already parsed (just behind this packet's
-        // end) cannot change anything the front reads next: post without syncing, and remember
-        // it for the adjacent WAIT_REG_MEM (ForwardedWait).
-        const VAddr parsed_end = reinterpret_cast<VAddr>(header) + dwords * sizeof(u32);
-        const auto value = FenceValue(header);
-        if (value && label + LabelBytes <= parsed_end &&
-            label + 256 >= reinterpret_cast<VAddr>(header)) {
-            const u32 key = (flags & CpSplit::AscReleaseMem) ? 1 + ((flags >> 8) & 0xff) : 0;
-            g_fwd[key] = {reinterpret_cast<const u32*>(parsed_end), label, *value};
-            ++g_fwd_stats.posted;
-            split->NotePostedWrite(label, LabelBytes);
-            split->PostRunAhead(CpSplit::PostKind::Fence);
-            split->MaybeLog();
-            return;
+        // A label wholly behind this packet's header (memory the front has already parsed) and
+        // in no other active span cannot change anything the front reads next; when the very next
+        // packet is a WAIT_REG_MEM on that label which the fence's value passes, post without
+        // syncing and let ForwardedWait skip that wait. Opus review 2026-10-09: GPU-delayed fences
+        // (#1) keep the old path; exact width, strictly before the header (#2); the other spans
+        // still checked (#3); the adjacent wait checked here, so no stale entry survives (#4);
+        // ASC only from indirect buffers (#6).
+        const bool asc = (flags & CpSplit::AscReleaseMem) != 0;
+        const u32 key = asc ? 1 + ((flags >> 8) & 0xff) : 0;
+        g_fwd[key].next_packet = nullptr;
+        const auto write = FenceValue(header);
+        const auto* next = reinterpret_cast<const u32*>(header) + dwords;
+        const VAddr head = reinterpret_cast<VAddr>(header);
+        if (write && FenceAtGpu() == 0 && (!asc || t_fwd_asc_allowed) &&
+            label + write->width <= head && label + 256 >= head &&
+            reinterpret_cast<VAddr>(next) < hi &&
+            !SplitSpansOverlap(label, label + write->width)) {
+            const auto* nh = reinterpret_cast<const PM4Header*>(next);
+            const auto* w = reinterpret_cast<const PM4CmdWaitRegMem*>(next);
+            if (nh->type == 3 && nh->type3.opcode == PM4ItOpcode::WaitRegMem &&
+                w->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory &&
+                reinterpret_cast<VAddr>(w->Address<u32*>()) == label &&
+                WaitPassesWith(w, write->value)) {
+                g_fwd[key] = {next, label, write->value};
+                ++g_fwd_stats.posted;
+                split->NotePostedWrite(label, write->width);
+                split->PostRunAhead(CpSplit::PostKind::Fence);
+                split->MaybeLog();
+                return;
+            }
         }
     }
     if ((label < hi && lo < label + LabelBytes) ||
@@ -4908,6 +4934,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (split_post_fence && release_mem->data_sel != DataSelect::GdsMemStore)
                 [[unlikely]] {
                 ASSERT(queue.pipe_id <= 0xff);
+                t_fwd_asc_allowed = is_indirect;
                 RunFence(header, acb, release_mem->Address<VAddr>(),
                          static_cast<u16>(CpSplit::AscReleaseMem | (queue.pipe_id << 8)),
                          CpSplit::DrainReason::CallAscRelease);
