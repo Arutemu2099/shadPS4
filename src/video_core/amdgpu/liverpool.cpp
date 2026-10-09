@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstddef>
 #include <immintrin.h>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <boost/preprocessor/stringize.hpp>
@@ -2472,6 +2473,103 @@ void FenceWaitNote(const PM4Header* fence, const u32* end, VAddr label) {
                  st.packets_between[2], st.packets_between[3], st.packets_between[4]);
     }
 }
+// SHADPS4_FENCE_FORWARD=1 (2026-10-09, notes/dcb-parallel-2026-10-09.md sec. 4; census s340 / s341:
+// every syncing fence label sits just BEHIND its own packet, and the very next packet is a
+// WAIT_REG_MEM on that label which the fence's own value satisfies). The front posts such a fence
+// without syncing and skips the adjacent wait: in stream order the back writes the label before
+// anything after the wait runs, and the wait's test passes on that value. Front thread only.
+const bool g_fence_forward = [] {
+    const char* v = std::getenv("SHADPS4_FENCE_FORWARD");
+    return v && v[0] == '1';
+}();
+struct ForwardedFence {
+    const u32* next_packet = nullptr; ///< the packet right after the fence (the only one we skip)
+    VAddr label = 0;
+    u32 value = 0;
+};
+std::array<ForwardedFence, 257> g_fwd{}; // 0 = gfx, 1 + pipe_id = ASC
+struct ForwardStats {
+    u64 posted = 0, skipped_waits = 0, not_adjacent = 0, failed_test = 0;
+} g_fwd_stats;
+
+/// The value a fence packet writes to its label, if it is a plain data write.
+std::optional<u32> FenceValue(const PM4Header* fence) {
+    switch (fence->type3.opcode.Value()) {
+    case PM4ItOpcode::EventWriteEop: {
+        const auto* eop = reinterpret_cast<const PM4CmdEventWriteEop*>(fence);
+        const auto sel = eop->data_sel.Value();
+        if (sel == DataSelect::Data32Low || sel == DataSelect::Data64) {
+            return eop->DataDWord();
+        }
+        return std::nullopt;
+    }
+    case PM4ItOpcode::EventWriteEos: {
+        const auto* eos = reinterpret_cast<const PM4CmdEventWriteEos*>(fence);
+        if (eos->command.Value() == PM4CmdEventWriteEos::Command::SignalFence) {
+            return eos->DataDWord();
+        }
+        return std::nullopt;
+    }
+    case PM4ItOpcode::ReleaseMem: {
+        const auto* rm = reinterpret_cast<const PM4CmdReleaseMem*>(fence);
+        const auto sel = rm->data_sel.Value();
+        if (sel == DataSelect::Data32Low || sel == DataSelect::Data64) {
+            return rm->DataDWord();
+        }
+        return std::nullopt;
+    }
+    default:
+        return std::nullopt;
+    }
+}
+
+bool WaitPassesWith(const PM4CmdWaitRegMem* w, u32 value) {
+    const u32 v = value & w->mask;
+    using F = PM4CmdWaitRegMem::Function;
+    switch (w->function.Value()) {
+    case F::Always:
+        return true;
+    case F::LessThan:
+        return v < w->ref;
+    case F::LessThanEqual:
+        return v <= w->ref;
+    case F::Equal:
+        return v == w->ref;
+    case F::NotEqual:
+        return v != w->ref;
+    case F::GreaterThanEqual:
+        return v >= w->ref;
+    case F::GreaterThan:
+        return v > w->ref;
+    default:
+        return false;
+    }
+}
+
+/// True: this WAIT_REG_MEM is the packet right after a forwarded fence on the same queue, polls
+/// its label and passes on its value - the caller skips the drain and the wait.
+bool ForwardedWait(u32 queue_key, const PM4Header* header) {
+    auto& f = g_fwd[queue_key];
+    if (f.next_packet == nullptr) {
+        return false;
+    }
+    const bool adjacent = reinterpret_cast<const u32*>(header) == f.next_packet;
+    const auto* w = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
+    const bool ok = adjacent && w->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory &&
+                    reinterpret_cast<VAddr>(w->Address<u32*>()) == f.label &&
+                    WaitPassesWith(w, f.value);
+    f.next_packet = nullptr;
+    if (!adjacent) {
+        ++g_fwd_stats.not_adjacent;
+    } else if (!ok) {
+        ++g_fwd_stats.failed_test;
+    } else if ((++g_fwd_stats.skipped_waits & 0xffff) == 0) {
+        LOG_INFO(Render, "FenceForward: posted={} skipped_waits={} not_adjacent={} failed_test={}",
+                 g_fwd_stats.posted, g_fwd_stats.skipped_waits, g_fwd_stats.not_adjacent,
+                 g_fwd_stats.failed_test);
+    }
+    return ok;
+}
 } // namespace
 
 void Liverpool::RunFence(const PM4Header* header, std::span<const u32> rest, VAddr label,
@@ -2490,6 +2588,23 @@ void Liverpool::RunFence(const PM4Header* header, std::span<const u32> rest, VAd
     split->Commit();
     const auto lo = reinterpret_cast<VAddr>(rest.data());
     const VAddr hi = lo + rest.size_bytes();
+    if (g_fence_forward) {
+        // A label wholly inside memory the front has already parsed (just behind this packet's
+        // end) cannot change anything the front reads next: post without syncing, and remember
+        // it for the adjacent WAIT_REG_MEM (ForwardedWait).
+        const VAddr parsed_end = reinterpret_cast<VAddr>(header) + dwords * sizeof(u32);
+        const auto value = FenceValue(header);
+        if (value && label + LabelBytes <= parsed_end &&
+            label + 256 >= reinterpret_cast<VAddr>(header)) {
+            const u32 key = (flags & CpSplit::AscReleaseMem) ? 1 + ((flags >> 8) & 0xff) : 0;
+            g_fwd[key] = {reinterpret_cast<const u32*>(parsed_end), label, *value};
+            ++g_fwd_stats.posted;
+            split->NotePostedWrite(label, LabelBytes);
+            split->PostRunAhead(CpSplit::PostKind::Fence);
+            split->MaybeLog();
+            return;
+        }
+    }
     if ((label < hi && lo < label + LabelBytes) ||
         SplitSpansOverlap(label, label + LabelBytes)) {
         if (g_fence_census) [[unlikely]] {
@@ -4234,6 +4349,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // there are no other submits to yield to we can sleep the thread
                 // instead and allow other tasks to run.
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
+                if (g_fence_forward && split_enabled && ForwardedWait(0, header)) {
+                    break; // SHADPS4_FENCE_FORWARD: passes in stream order on the fence's value
+                }
                 // CP split: the back may still owe writes this wait reads (inventory 0.6), so
                 // drain before testing. At depth 0 this only flushes register records.
                 FrontDrain(CpSplit::DrainReason::WaitRegMem);
@@ -4764,6 +4882,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+            if (g_fence_forward && split_enabled && ForwardedWait(1 + (queue.pipe_id & 0xff), header)) {
+                break; // SHADPS4_FENCE_FORWARD (ASC)
+            }
             const auto wrm_start = Common::FaultMonitor::Now();
             const u64 wrm_ns0 = g_cp_wait.enabled ? CpWaitStats::Now() : 0;
             bool wrm_waited = false;
