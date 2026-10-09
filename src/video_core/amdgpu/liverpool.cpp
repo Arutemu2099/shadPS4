@@ -1625,7 +1625,107 @@ void MtbLog() {
 }
 } // namespace
 
+namespace {
+// SHADPS4_BACK_CYCLES=1 (2026-10-09): the back's cycles per record type per second, and inside
+// them the GPU waits / submits / stream-buffer wraps (Vulkan::t_back_cycles). Back thread only.
+struct BackCycleWindow {
+    std::array<u64, 16> cyc{};
+    std::array<u64, 16> n{};
+    u64 start_ns{};
+    u64 start_tsc{};
+    u64 calls{};
+    Vulkan::BackCycleStats base{};
+    u64 thread_cyc{};
+    std::pair<u64, u64> prod{};
+};
+BackCycleWindow g_back_cyc;
+
+u64 ThreadCycles() {
+    return Common::CurrentThreadCycles();
+}
+
+void BackCyclesNote(u32 type, u64 cyc, Vulkan::Scheduler* sched) {
+    auto& w = g_back_cyc;
+    w.cyc[type & 15] += cyc;
+    ++w.n[type & 15];
+    if ((++w.calls & 4095) != 0) {
+        return;
+    }
+    const u64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    const u64 tsc = __rdtsc();
+    if (w.start_ns == 0) {
+        w.start_ns = now;
+        w.start_tsc = tsc;
+        w.cyc = {};
+        w.n = {};
+        w.base = Vulkan::t_back_cycles;
+        w.thread_cyc = ThreadCycles();
+        w.prod = sched ? sched->ProducerWaitNs() : std::pair<u64, u64>{};
+        return;
+    }
+    if (now - w.start_ns < 10'000'000'000ull) {
+        return;
+    }
+    const double secs = double(now - w.start_ns) / 1e9;
+    const double ms_per_cyc = double(now - w.start_ns) / 1e6 / double(tsc - w.start_tsc);
+    const auto ms = [&](u64 c) { return double(c) * ms_per_cyc / secs; }; // ms per second
+    const auto per_s = [&](u64 v) { return double(v) / secs; };
+    u64 all = 0;
+    for (const u64 c : w.cyc) {
+        all += c;
+    }
+    using RT = CpSplit::RecordType;
+    const auto t = [](RT r) { return static_cast<u32>(r); };
+    const auto& now_s = Vulkan::t_back_cycles;
+    const auto& b = w.base;
+    const u64 thread_now = ThreadCycles();
+    const auto prod = sched ? sched->ProducerWaitNs() : std::pair<u64, u64>{};
+    // Thread CPU cycles (QueryThreadCycleTime) as a share of the window's TSC cycles: well below
+    // records + spin = the back is descheduled (blocked) inside its records.
+    const double cpu_pct = 100.0 * double(thread_now - w.thread_cyc) / double(tsc - w.start_tsc);
+    LOG_INFO(Render,
+             "BackCycles2: thread_cpu={:.1f}% of wall | producer waits ms per s: chunk_space={:.1f} "
+             "drain={:.1f}",
+             cpu_pct, double(prod.first - w.prod.first) / 1e6 / secs,
+             double(prod.second - w.prod.second) / 1e6 / secs);
+    w.thread_cyc = thread_now;
+    w.prod = prod;
+    LOG_INFO(Render,
+             "BackCycles: window_s={:.1f} ghz={:.3f} | ms per s: records={:.1f} draw={:.1f} "
+             "dispatch={:.1f} packet={:.1f} call={:.1f} regwrite={:.1f} other={:.1f} | per s: "
+             "draws={:.0f} dispatches={:.0f} packets={:.0f} calls={:.0f} regwrites={:.0f} | "
+             "inside: gpu_wait_ms={:.1f} waits={:.0f} blocked={:.0f} submit_ms={:.1f} "
+             "submits={:.0f} stream_wraps={:.1f} stream_waits={:.1f} stream_wait_ms={:.2f}",
+             secs, 1e-6 / ms_per_cyc, ms(all), ms(w.cyc[t(RT::Draw)]), ms(w.cyc[t(RT::Dispatch)]),
+             ms(w.cyc[t(RT::Packet)]), ms(w.cyc[t(RT::Call)]), ms(w.cyc[t(RT::RegWrite)]),
+             ms(all - w.cyc[t(RT::Draw)] - w.cyc[t(RT::Dispatch)] - w.cyc[t(RT::Packet)] -
+                w.cyc[t(RT::Call)] - w.cyc[t(RT::RegWrite)]),
+             per_s(w.n[t(RT::Draw)]), per_s(w.n[t(RT::Dispatch)]), per_s(w.n[t(RT::Packet)]),
+             per_s(w.n[t(RT::Call)]), per_s(w.n[t(RT::RegWrite)]),
+             ms(now_s.wait_cyc - b.wait_cyc), per_s(now_s.wait_calls - b.wait_calls),
+             per_s(now_s.wait_blocked - b.wait_blocked), ms(now_s.flush_cyc - b.flush_cyc),
+             per_s(now_s.flush_calls - b.flush_calls), per_s(now_s.stream_wraps - b.stream_wraps),
+             per_s(now_s.stream_waits - b.stream_waits),
+             ms(now_s.stream_wait_cyc - b.stream_wait_cyc));
+    w.start_ns = now;
+    w.start_tsc = tsc;
+    w.cyc = {};
+    w.n = {};
+    w.base = now_s;
+}
+} // namespace
+
 void Liverpool::ExecuteRecord(const CpSplit::RecordHeader& record) {
+    static const bool back_cycles = Vulkan::BackCyclesEnabled();
+    if (back_cycles) [[unlikely]] {
+        const u64 t0 = __rdtsc();
+        ExecuteRecordImpl(record);
+        BackCyclesNote(static_cast<u32>(record.type), __rdtsc() - t0,
+                       rasterizer ? &rasterizer->GetScheduler() : nullptr);
+        return;
+    }
     if (!AmdGpu::MtbCensus::g_enabled) [[likely]] {
         ExecuteRecordImpl(record);
         return;

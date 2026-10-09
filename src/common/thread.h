@@ -80,4 +80,7 @@ inline void SampleThreadPlacement(const char* role, unsigned stride_log2 = 6) {
     }
 }
 
+/// CPU cycles the calling thread has run (QueryThreadCycleTime; 0 elsewhere). Diagnostics.
+u64 CurrentThreadCycles();
+
 } // namespace Common

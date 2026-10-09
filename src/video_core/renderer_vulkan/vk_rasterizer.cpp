@@ -262,7 +262,22 @@ bool IsDepthOnlyNoImage(const GraphicsPipeline* pipeline) {
     return true;
 }
 
-void NoteDrawCost(const GraphicsPipeline* pipeline, const std::array<u64, DcCount>& cyc) {
+void NoteDrawCost(const GraphicsPipeline* pipeline, const std::array<u64, DcCount>& cyc,
+                  bool repeat) {
+    // 2026-10-09 afternoon (colour-pass note sec. 6): phases by class, bit 0 = draw-repeat hit,
+    // bit 1 = the pipeline samples images.
+    thread_local std::array<DrawCostStats, 4> by_class{};
+    {
+        bool images = false;
+        for (const auto* stage : pipeline->GetStages()) {
+            images = images || (stage && !stage->images.empty());
+        }
+        auto& c = by_class[(repeat ? 1u : 0u) | (images ? 2u : 0u)];
+        ++c.n;
+        for (u32 i = 0; i < DcCount; ++i) {
+            c.cyc[i] += cyc[i];
+        }
+    }
     thread_local std::unordered_map<const GraphicsPipeline*, DrawCostStats> stats;
     thread_local u64 draws = 0;
     thread_local u64 win_tsc = 0;
@@ -327,6 +342,22 @@ void NoteDrawCost(const GraphicsPipeline* pipeline, const std::array<u64, DcCoun
              "DrawCost: window {:.0f} ms, {} draws, draw time {:.1f}% of wall, {:.0f} ns/draw;{}",
              wall_ns / 1e6, draws, 100.0 * double(all_cyc) * ns_per_cyc / wall_ns,
              double(all_cyc) * ns_per_cyc / double(draws), phases(all_phase, draws));
+    {
+        static constexpr std::array<const char*, 4> kClass{"full_untextured", "repeat_untextured",
+                                                           "full_textured", "repeat_textured"};
+        std::string line;
+        for (u32 k = 0; k < 4; ++k) {
+            const auto& c = by_class[k];
+            u64 t = 0;
+            for (const u64 v : c.cyc) {
+                t += v;
+            }
+            line += fmt::format(" | {} n={} {:.0f} ns/draw:{}", kClass[k], c.n,
+                                c.n ? double(t) * ns_per_cyc / double(c.n) : 0.0,
+                                phases(c.cyc, c.n));
+        }
+        LOG_INFO(Render_Vulkan, "DrawCostClass:{}", line);
+    }
     LOG_INFO(Render_Vulkan,
              "DrawCost: back idle (WaitForWork) {:.1f}% of wall; dispatches {} = {:.1f}% of wall, "
              "{:.0f} ns each",
@@ -390,6 +421,7 @@ void NoteDrawCost(const GraphicsPipeline* pipeline, const std::array<u64, DcCoun
                  all_cyc ? 100.0 * double(total_of(st)) / double(all_cyc) : 0.0,
                  double(total_of(st)) * ns_per_cyc / double(st.n), phases(st.cyc, st.n));
     }
+    by_class = {};
     stats.clear();
     draws = 0;
     win_tsc = __rdtsc();
@@ -2090,9 +2122,16 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
     auto& b = native_batch;
     b = NativeBatch{.verify = native == nullptr};
     b.colour = colour;
-    const auto fail = [&] {
+    const auto fail = [&](u32 line) {
         ++native_stats.open_fail;
         native_stats.col_open_fail += colour;
+        for (auto& [l, n] : native_stats.fail_lines) {
+            if (l == line || l == 0) {
+                l = line;
+                ++n;
+                break;
+            }
+        }
         b.open = false;
         return false;
     };
@@ -2111,11 +2150,11 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
     }();
     if (!front_vi || !is_indexed || g_viewport_memo < 1 || !instance.IsVertexInputDynamicState() ||
         front_vi->count > 16 || !native_config_ok || !scheduler.IsAsyncRecording()) {
-        return fail();
+        return fail(__LINE__);
     }
     const auto& vi = VideoCore::t_native_vi;
     if (vi.ib_type == 0 || vi.ib_off % vi.ib_type != 0 || vi.n > b.vb.size()) {
-        return fail();
+        return fail(__LINE__);
     }
     const auto& regs = liverpool->BackRegs();
     b.base = base;
@@ -2149,18 +2188,18 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
     std::array<u32, Shader::NativeMaxPulledLocations> col_vsize{};
     if (colour) {
         if (!NativeColourGates() || !NativeImageKey(base, native_img_key, b.img_n)) {
-            return fail();
+            return fail(__LINE__);
         }
         // Opus code review 2026-10-09 #1: a draw that samples a bound target (feedback loop)
         // records a Transit barrier per draw on the generic path; a join would skip it.
         if (attachment_feedback_loop) {
-            return fail();
+            return fail(__LINE__);
         }
         for (const auto id : bound_images) {
             const auto& image = texture_cache.PeekImage(id);
             if ((image.binding.is_target && image.binding.is_bound) ||
                 image.binding.force_general) {
-                return fail();
+                return fail(__LINE__);
             }
         }
         b.smp_gen = texture_cache.SamplerGeneration();
@@ -2169,13 +2208,13 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         for (u32 k = 0; k < vi.n; ++k) {
             const u32 loc = attribs[k].desc.location;
             if (attribs[k].desc.instanced || loc >= Shader::NativeMaxPulledLocations) {
-                return fail();
+                return fail(__LINE__);
             }
             if (vi.buf[k] == 0) {
                 continue; // null stream: vsize 0 -> the shader reads (0, 0, 0, 1)
             }
             if ((b.vbuf != 0 && vi.buf[k] != b.vbuf) || vi.off[k] > 0xffffffffull) {
-                return fail();
+                return fail(__LINE__);
             }
             b.vbuf = vi.buf[k];
             b.vmask |= 1u << loc;
@@ -2242,12 +2281,12 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         }
         for (const auto& desc : bound.info->buffers) {
             if (bi >= buffer_infos.size()) {
-                return fail();
+                return fail(__LINE__);
             }
             if (desc.buffer_type == Shader::BufferType::Guest) {
                 const u64 full = buffer_infos[bi].offset + push_data.buf_offsets[bi];
                 if (full > 0xffffffffull || !buffer_infos[bi].buffer) {
-                    return fail();
+                    return fail(__LINE__);
                 }
                 rec_off[bi] = static_cast<u32>(full);
                 const u64 bound_size = buffer_infos[bi].range - push_data.buf_offsets[bi];
@@ -2259,13 +2298,13 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         }
     }
     if (bi != buffer_infos.size()) {
-        return fail();
+        return fail(__LINE__);
     }
     const auto& vs_bound = GetBoundStage(Shader::LogicalStage::Vertex);
     if (GetDrawOffsets(regs, vs_bound, base->GetFetchShader()).second != 0) {
         // Opus code review #2: firstInstance != 0 in an indirect command needs
         // drawIndirectFirstInstance, which is not enabled.
-        return fail();
+        return fail(__LINE__);
     }
     if (b.verify) {
         b.open = true;
@@ -2273,7 +2312,7 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
     }
     auto& stream = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
     if (!stream.IsCoherent()) {
-        return fail();
+        return fail(__LINE__);
     }
     const u64 total = u64(NativeMaxDraws) * (NativeRecBytes + NativeCmdBytes) + 16;
     const u64 seq_before_map = scheduler.RecordSeq();
@@ -2281,7 +2320,7 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
     const auto [ptr, offset] = stream.Map(total, instance.StorageMinAlignment(), false);
     if (!ptr || scheduler.RecordSeq() != seq_before_map ||
         scheduler.CurrentTick() != tick_before_map) {
-        return fail();
+        return fail(__LINE__);
     }
     stream.Commit();
     b.stream_off = offset;
@@ -2304,7 +2343,7 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         GetDrawOffsets(regs, vs_info, base->GetFetchShader());
     const s64 vo0 = s64(s32(vertex_offset)) + (b.vb_rebased ? s64(b.vb_q0) : 0);
     if (vo0 < 0 || vo0 > INT32_MAX) {
-        return fail();
+        return fail(__LINE__);
     }
     const u32 cmd[5] = {regs.num_indices, regs.num_instances.NumInstances(),
                         static_cast<u32>(vi.ib_off / vi.ib_type), static_cast<u32>(vo0),
@@ -2742,6 +2781,15 @@ void Rasterizer::NativeLog() {
                             w[7], w[8], w[9], w[10], w[11]);
             }
         }
+    }
+    if (st.open_fail != 0) {
+        std::string lines;
+        for (const auto& [l, n] : st.fail_lines) {
+            if (l != 0) {
+                lines += fmt::format(" L{}={}", l, n);
+            }
+        }
+        LOG_INFO(Render_Vulkan, "NativeOpenFail (vk_rasterizer.cpp line=count):{}", lines);
     }
     if (VideoCore::g_native_colour) {
         LOG_INFO(Render_Vulkan,
@@ -3444,7 +3492,7 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     sample.Finish();
     if (g_draw_cost) {
         dc_lap(DcRecordTail);
-        NoteDrawCost(pipeline, dc);
+        NoteDrawCost(pipeline, dc, repeat && repeat_mode == 1);
         // ~50 us at ~3.5 GHz TSC: log where a slow texture phase went (first 5 per shader).
         static thread_local std::unordered_map<u64, u32> slow_logged;
         u64 fs = 0;

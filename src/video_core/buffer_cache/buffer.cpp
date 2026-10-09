@@ -3,6 +3,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include <immintrin.h>
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -229,6 +230,9 @@ std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) 
 
     if (offset + size > this->size_bytes) {
         // The buffer would overflow, save the amount of used watches and reset the state.
+        if (Vulkan::BackCyclesEnabled()) [[unlikely]] {
+            ++Vulkan::t_back_cycles.stream_wraps;
+        }
         invalidation_mark = current_watch_cursor;
         current_watch_cursor = 0;
         offset = 0;
@@ -288,7 +292,14 @@ bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_w
         if (!scheduler->IsFree(watch.tick) && !allow_wait) {
             return false;
         }
-        scheduler->Wait(watch.tick);
+        if (Vulkan::BackCyclesEnabled() && !scheduler->IsFree(watch.tick)) [[unlikely]] {
+            const u64 c0 = __rdtsc();
+            scheduler->Wait(watch.tick);
+            ++Vulkan::t_back_cycles.stream_waits;
+            Vulkan::t_back_cycles.stream_wait_cyc += __rdtsc() - c0;
+        } else {
+            scheduler->Wait(watch.tick);
+        }
         wait_bound = watch.upper_bound;
         ++wait_cursor;
     }

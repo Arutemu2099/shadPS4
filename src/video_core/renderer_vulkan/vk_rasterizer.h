@@ -511,6 +511,8 @@ private:
         std::array<u64, 4> c_cphase{};
         bool last_open_colour{};
         u64 peek_yes{}, peek_no{}, peek_unknown{};
+        // Open refusals by source line (SHADPS4_BACK_CYCLES study, 2026-10-09).
+        std::array<std::pair<u32, u64>, 24> fail_lines{};
     } native_stats;
     bool NativeJoin(const SplitDraw& draw, const AmdGpu::CpSplit::VertexInputsPayload* front_vi);
     bool NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline* native, bool is_indexed,

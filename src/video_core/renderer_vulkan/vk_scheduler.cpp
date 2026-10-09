@@ -794,8 +794,25 @@ void Scheduler::EndRendering(std::source_location loc) {
     Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
 }
 
+thread_local BackCycleStats t_back_cycles{};
+
+bool BackCyclesEnabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("SHADPS4_BACK_CYCLES");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
 void Scheduler::Flush(SubmitInfo& info) {
     // When flushing, we only send data to the driver; no waiting is necessary.
+    if (BackCyclesEnabled()) [[unlikely]] {
+        const u64 c0 = __rdtsc();
+        SubmitExecution(info);
+        ++t_back_cycles.flush_calls;
+        t_back_cycles.flush_cyc += __rdtsc() - c0;
+        return;
+    }
     SubmitExecution(info);
 }
 
@@ -878,9 +895,17 @@ void Scheduler::WaitMain(u64 tick) {
         SubmitInfo info{};
         Flush(info);
     }
+    const bool back_cyc = BackCyclesEnabled();
+    const u64 c0 = back_cyc ? __rdtsc() : 0;
+    const bool blocked = back_cyc && !master_semaphore.IsFree(tick);
     const auto start = Common::FaultMonitor::Now();
     master_semaphore.Wait(tick);
     Common::FaultMonitor::CountGpuWait(Common::FaultMonitor::SinceNs(start));
+    if (back_cyc) [[unlikely]] {
+        ++t_back_cycles.wait_calls;
+        t_back_cycles.wait_blocked += blocked;
+        t_back_cycles.wait_cyc += __rdtsc() - c0;
+    }
 }
 
 void Scheduler::PopPendingOperations() {

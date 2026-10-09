@@ -28,6 +28,16 @@ class VkCtxScope;
 
 namespace Vulkan {
 
+/// SHADPS4_BACK_CYCLES=1 (2026-10-09): what the back thread's records spend outside
+/// translation - GPU waits, submits, stream-buffer wraps. Per thread; the back logs its own.
+struct BackCycleStats {
+    u64 wait_calls{}, wait_blocked{}, wait_cyc{};
+    u64 flush_calls{}, flush_cyc{};
+    u64 stream_wraps{}, stream_waits{}, stream_wait_cyc{};
+};
+extern thread_local BackCycleStats t_back_cycles;
+bool BackCyclesEnabled();
+
 class Instance;
 struct DrawPacketDesc;
 struct DrawPacketHeader;
@@ -576,6 +586,15 @@ public:
     /// Diagnostic (SHADPS4_ASC_RING_LATENCY + SHADPS4_ASYNC_RECORDING_TIMING=1): logs the recording
     /// worker's counters since the previous call. Command-processor thread (the producer) only.
     void LogRecordingWindow();
+    /// SHADPS4_BACK_CYCLES: the producer's cumulative waits on the recording worker (ns; needs
+    /// SHADPS4_ASYNC_RECORDING_TIMING=1): {free chunk space, drains}. Producer thread only.
+    std::pair<u64, u64> ProducerWaitNs() const {
+        if (!recording_worker) {
+            return {0, 0};
+        }
+        const auto c = recording_worker->GetCounters();
+        return {c.space_wait_ns, c.drain_ns};
+    }
     void PushDescriptors(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
                          std::span<const vk::WriteDescriptorSet> writes);
 

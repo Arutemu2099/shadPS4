@@ -607,4 +607,14 @@ std::string GetCurrentThreadName() {
 #endif
 }
 
+u64 CurrentThreadCycles() {
+#ifdef _WIN32
+    ULONG64 cycles = 0;
+    QueryThreadCycleTime(GetCurrentThread(), &cycles);
+    return cycles;
+#else
+    return 0;
+#endif
+}
+
 } // namespace Common
