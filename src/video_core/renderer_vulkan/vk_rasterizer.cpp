@@ -272,6 +272,38 @@ struct RegionCensus {
     u64 tsc0 = 0;
     std::chrono::steady_clock::time_point t0{};
 };
+// SHADPS4_STATIC_KEY_CENSUS=1 (2026-10-09, dcb note sec. 8, s355): does the STATIC part of a full
+// draw's bindings repeat? Key = pipeline + every V# outside the per-frame heap (granules
+// 0x248-0x24b; heap V#s contribute only their size / stride / format, not the address) + T#s + S#s.
+// Hit = the key was seen in this frame or the previous one. Back thread only.
+const bool g_static_key_census = [] {
+    const char* v = std::getenv("SHADPS4_STATIC_KEY_CENSUS");
+    return v && v[0] == '1';
+}();
+constexpr VAddr HeapLo = 0x248000000ULL;
+constexpr VAddr HeapHi = 0x24c000000ULL;
+struct StaticKeyCensus {
+    std::unordered_map<u64, u64> seen; // key hash -> frame last seen
+    std::unordered_set<u32> heap_ids;  // heap buffer ids this window
+    u64 frame = 0;
+    u64 draws = 0, textured = 0, hit = 0, hit_textured = 0, hit_same_frame = 0;
+    u64 heap_bindings = 0, static_bindings = 0, frames = 0, distinct_new = 0;
+    u64 keys_this_frame = 0, keys_frames_sum = 0;
+};
+StaticKeyCensus& GetStaticKeyCensus() {
+    static StaticKeyCensus c;
+    return c;
+}
+inline u64 KeyMix(u64 h, const void* data, size_t bytes) {
+    const auto* p = static_cast<const u8*>(data);
+    for (size_t i = 0; i < bytes; ++i) {
+        h = (h ^ p[i]) * 0x100000001b3ULL;
+    }
+    return h;
+}
+void NoteStaticKeyHeapId(u32 id) {
+    GetStaticKeyCensus().heap_ids.insert(id);
+}
 RegionCensus& GetRegionCensus() {
     static RegionCensus c;
     return c;
@@ -5005,6 +5037,81 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 
     bool uses_dma = false;
     binding_compute = pipeline->IsCompute();
+    if (g_static_key_census && !binding_compute) [[unlikely]] {
+        auto& c = GetStaticKeyCensus();
+        const u64 frame = Common::FaultMonitor::presented_frames.load(std::memory_order_relaxed);
+        if (frame != c.frame) {
+            c.frame = frame;
+            ++c.frames;
+            c.keys_frames_sum += c.keys_this_frame;
+            c.keys_this_frame = 0;
+        }
+        u64 h = 0xcbf29ce484222325ULL;
+        h = KeyMix(h, &pipeline, sizeof(pipeline));
+        bool textured = false;
+        for (const auto& bound : BoundStages(pipeline)) {
+            const auto* stage = bound.info;
+            if (!stage) {
+                continue;
+            }
+            for (const auto& desc : stage->buffers) {
+                auto vsharp = desc.GetSharp(bound);
+                if (vsharp.base_address >= HeapLo && vsharp.base_address < HeapHi) {
+                    vsharp.base_address = 1; // heap: a dynamic offset, not part of the key
+                    ++c.heap_bindings;
+                } else if (!desc.IsSpecial()) {
+                    ++c.static_bindings;
+                }
+                h = KeyMix(h, &vsharp, sizeof(vsharp));
+            }
+            for (const auto& desc : stage->images) {
+                const auto t = desc.GetSharp(bound);
+                h = KeyMix(h, &t, sizeof(t));
+                textured = true;
+            }
+            for (const auto& desc : stage->samplers) {
+                const auto smp = desc.GetSharp(bound);
+                h = KeyMix(h, &smp, sizeof(smp));
+            }
+        }
+        ++c.draws;
+        c.textured += textured;
+        const auto [it, inserted] = c.seen.try_emplace(h, frame);
+        if (!inserted) {
+            if (it->second + 1 >= frame) {
+                ++c.hit;
+                c.hit_textured += textured;
+                c.hit_same_frame += it->second == frame;
+            }
+            if (it->second != frame) {
+                ++c.keys_this_frame;
+            }
+            it->second = frame;
+        } else {
+            ++c.distinct_new;
+            ++c.keys_this_frame;
+        }
+        if ((c.draws & 0x1fffff) == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "StaticKeyCensus: full draws={} (textured {}) hit (seen this or last frame)={} "
+                     "({:.1f}%, textured {:.1f}%) same_frame={} | distinct keys per frame={:.0f}, new "
+                     "keys={} | per draw: heap bindings {:.2f} static {:.2f} | distinct heap buffer "
+                     "ids this window={} | keys stored={}",
+                     c.draws, c.textured, c.hit, 100.0 * double(c.hit) / double(c.draws),
+                     100.0 * double(c.hit_textured) / double(std::max<u64>(c.textured, 1)),
+                     c.hit_same_frame,
+                     double(c.keys_frames_sum) / double(std::max<u64>(c.frames, 1)), c.distinct_new,
+                     double(c.heap_bindings) / double(c.draws),
+                     double(c.static_bindings) / double(c.draws), c.heap_ids.size(), c.seen.size());
+            c.draws = c.textured = c.hit = c.hit_textured = c.hit_same_frame = 0;
+            c.heap_bindings = c.static_bindings = c.frames = c.distinct_new = 0;
+            c.keys_frames_sum = 0;
+            c.heap_ids.clear();
+            if (c.seen.size() > (1u << 20)) {
+                c.seen.clear();
+            }
+        }
+    }
 
     // Bind resource buffers and textures.
     Shader::Backend::Bindings binding{};
@@ -6718,6 +6825,10 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
                                               buffer_id);
             }
             buffer_bindings.emplace_back(buffer_id, vsharp, size);
+            if (g_static_key_census && !binding_compute && buffer_id &&
+                vsharp.base_address >= HeapLo && vsharp.base_address < HeapHi) [[unlikely]] {
+                NoteStaticKeyHeapId(buffer_id.index);
+            }
         } else {
             buffer_bindings.emplace_back(VideoCore::BufferId{}, vsharp, 0);
         }
