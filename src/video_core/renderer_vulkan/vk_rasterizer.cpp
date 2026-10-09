@@ -786,12 +786,257 @@ u32 NativeCensusWhy(const NativeCensusPrev& prev, const GraphicsPipeline* pipeli
     return NbCount;
 }
 
+// Census v2 (colour-pass study 2026-10-09): every condition evaluated independently (a bit
+// mask, not the first failure), then joinability per cumulative relaxation level:
+//   L0 strict (= v1), L1 vertex / index OFFSETS free (in-shader fetch, per-draw offsets in the
+//   record, same VkBuffers), L2 + vertex / index VkBuffers free (per-draw addresses / vertex
+//   pulling), L3 + every guest buffer VkBuffer free, L4 + images free (bindless), L5 + viewport
+//   push data free. Groups: untextured (no image bindings: shadow / depth passes) vs textured.
+enum NativeBit : u32 {
+    NbbBetween = 1u << 0,
+    NbbPipeline = 1u << 1,
+    NbbRendering = 1u << 2,
+    NbbDyn = 1u << 3,
+    NbbBarrier = 1u << 4,
+    NbbOcclusion = 1u << 5,
+    NbbImages = 1u << 6,
+    NbbBufCount = 1u << 7,
+    NbbBufVk = 1u << 8,
+    NbbVtxLayout = 1u << 9, // stream count / stride differs
+    NbbVtxBuf = 1u << 10,   // some vertex stream in another VkBuffer
+    NbbVtxOff = 1u << 11,   // same VkBuffers, offsets not one common stride multiple
+    NbbIdxBuf = 1u << 12,   // index VkBuffer or type differs
+    NbbIdxOff = 1u << 13,   // index offset not a multiple of the index size
+    NbbViewport = 1u << 14,
+    NbbBits = 15
+};
+constexpr std::array<const char*, NbbBits> kNativeBitNames{
+    "between", "pipeline", "rendering", "dyn",    "barrier", "occlusion", "images", "bufcount",
+    "bufvk",   "vlayout",  "vbuf",      "voff",   "ibuf",    "ioff",      "viewport"};
+constexpr u32 kNbLevels = 6;
+constexpr std::array<u32, kNbLevels> kNbLevelFree{
+    0u,
+    NbbVtxOff | NbbIdxOff,
+    NbbVtxOff | NbbIdxOff | NbbVtxBuf | NbbIdxBuf,
+    NbbVtxOff | NbbIdxOff | NbbVtxBuf | NbbIdxBuf | NbbBufVk,
+    NbbVtxOff | NbbIdxOff | NbbVtxBuf | NbbIdxBuf | NbbBufVk | NbbImages,
+    NbbVtxOff | NbbIdxOff | NbbVtxBuf | NbbIdxBuf | NbbBufVk | NbbImages | NbbViewport};
+struct NativeCensus2Level {
+    u64 joins{};
+    u64 runs{};
+    u64 cur_run{};
+    u64 run_hist[6]{};
+    std::array<u64, NbbBits> first{}; // first remaining failing bit, per break
+};
+struct NativeCensus2Group {
+    u64 draws{};
+    std::array<u64, NbbBits> any{}; // draws with this bit set (independent)
+    std::array<NativeCensus2Level, kNbLevels> lv{};
+    u64 pipe_vs_same{};  // pipeline break with the same VS
+    u64 pipe_abab{};     // pipeline break back to the pipeline two draws ago
+};
+thread_local std::array<NativeCensus2Group, 2> t_nc2;
+thread_local const void* t_nc2_prev2_pipeline = nullptr;
+thread_local u64 t_nc2_prev_vs = 0;
+thread_local u32 t_nc2_prev_group = 0;
+thread_local u64 t_nc2_draws = 0;
+
+u32 NativeCensusBits(const NativeCensusPrev& prev, const GraphicsPipeline* pipeline,
+                     const RenderState& state, u64 entry_seq, bool dyn_change, bool barriers,
+                     std::span<const vk::DescriptorImageInfo> images,
+                     std::span<const vk::DescriptorBufferInfo> buffers,
+                     const Shader::PushData& push, bool occlusion, u32 group) {
+    const auto& vi = VideoCore::t_native_vi;
+    u32 m = 0;
+    if (entry_seq != prev.end_seq) {
+        m |= NbbBetween;
+    }
+    if (prev.pipeline != pipeline) {
+        m |= NbbPipeline;
+    }
+    if (prev.group != group || !(prev.state == state)) {
+        m |= NbbRendering;
+    }
+    if (dyn_change) {
+        m |= NbbDyn;
+    }
+    if (barriers) {
+        m |= NbbBarrier;
+    }
+    if (occlusion) {
+        m |= NbbOcclusion;
+    }
+    if (images.size() != prev.images.size() ||
+        !std::equal(images.begin(), images.end(), prev.images.begin())) {
+        m |= NbbImages;
+    }
+    if (buffers.size() != prev.buffers.size()) {
+        m |= NbbBufCount;
+    } else {
+        for (size_t i = 0; i < buffers.size(); ++i) {
+            if (static_cast<VkBuffer>(buffers[i].buffer) != prev.buffers[i]) {
+                m |= NbbBufVk;
+                break;
+            }
+        }
+    }
+    if (vi.n != prev.vi.n) {
+        m |= NbbVtxLayout;
+    } else {
+        s64 q = 0;
+        bool q_set = false;
+        for (u32 k = 0; k < vi.n; ++k) {
+            if (vi.stride[k] != prev.vi.stride[k]) {
+                m |= NbbVtxLayout;
+                continue;
+            }
+            if (vi.buf[k] != prev.vi.buf[k]) {
+                m |= NbbVtxBuf;
+                continue;
+            }
+            if (vi.buf[k] == 0 || vi.off[k] == prev.vi.off[k]) {
+                continue;
+            }
+            const s64 d = s64(vi.off[k]) - s64(prev.vi.off[k]);
+            if (vi.stride[k] == 0 || d % s64(vi.stride[k]) != 0) {
+                m |= NbbVtxOff;
+                continue;
+            }
+            const s64 qk = d / s64(vi.stride[k]);
+            if (q_set && qk != q) {
+                m |= NbbVtxOff;
+            }
+            q = qk;
+            q_set = true;
+        }
+    }
+    if (vi.ib_buf != prev.vi.ib_buf || vi.ib_type != prev.vi.ib_type) {
+        m |= NbbIdxBuf;
+    } else if (vi.ib_type != 0 && (s64(vi.ib_off) - s64(prev.vi.ib_off)) % s64(vi.ib_type) != 0) {
+        m |= NbbIdxOff;
+    }
+    if (push.xoffset != prev.vp[0] || push.yoffset != prev.vp[1] || push.xscale != prev.vp[2] ||
+        push.yscale != prev.vp[3]) {
+        m |= NbbViewport;
+    }
+    return m;
+}
+
+void NativeCensus2CloseRuns() {
+    for (auto& g : t_nc2) {
+        for (auto& l : g.lv) {
+            if (l.cur_run == 0) {
+                continue;
+            }
+            ++l.runs;
+            const u64 r = l.cur_run;
+            l.run_hist[r == 1 ? 0 : r < 4 ? 1 : r < 8 ? 2 : r < 16 ? 3 : r < 64 ? 4 : 5]++;
+            l.cur_run = 0;
+        }
+    }
+}
+
+void NativeCensus2Note(const NativeCensusPrev& prev, const GraphicsPipeline* pipeline,
+                       const RenderState& state, u64 entry_seq, bool dyn_change, bool barriers,
+                       std::span<const vk::DescriptorImageInfo> images,
+                       std::span<const vk::DescriptorBufferInfo> buffers,
+                       const Shader::PushData& push, bool occlusion) {
+    const u32 group = images.empty() ? 0 : 1;
+    u64 vs = 0;
+    for (const auto* stage : pipeline->GetStages()) {
+        if (stage && stage->l_stage == Shader::LogicalStage::Vertex) {
+            vs = stage->pgm_hash;
+        }
+    }
+    auto& g = t_nc2[group];
+    ++g.draws;
+    if (prev.pipeline != nullptr) {
+        u32 m = NativeCensusBits(prev, pipeline, state, entry_seq, dyn_change, barriers, images,
+                                 buffers, push, occlusion, group);
+        if (t_nc2_prev_group != group) {
+            m |= NbbRendering;
+        }
+        for (u32 b = 0; b < NbbBits; ++b) {
+            g.any[b] += (m >> b) & 1u;
+        }
+        if (m & NbbPipeline) {
+            g.pipe_vs_same += vs == t_nc2_prev_vs;
+            g.pipe_abab += pipeline == t_nc2_prev2_pipeline;
+        }
+        for (u32 li = 0; li < kNbLevels; ++li) {
+            auto& l = g.lv[li];
+            const u32 rest = m & ~kNbLevelFree[li];
+            if (rest == 0) {
+                ++l.joins;
+                ++l.cur_run;
+                continue;
+            }
+            // A break at this level closes the open run of this level in both groups.
+            for (auto& gg : t_nc2) {
+                auto& ll = gg.lv[li];
+                if (ll.cur_run != 0) {
+                    ++ll.runs;
+                    const u64 r = ll.cur_run;
+                    ll.run_hist[r == 1 ? 0 : r < 4 ? 1 : r < 8 ? 2 : r < 16 ? 3 : r < 64 ? 4 : 5]++;
+                    ll.cur_run = 0;
+                }
+            }
+            ++l.first[std::countr_zero(rest)];
+            l.cur_run = 1;
+        }
+    }
+    t_nc2_prev2_pipeline = prev.pipeline;
+    t_nc2_prev_vs = vs;
+    t_nc2_prev_group = group;
+    if ((++t_nc2_draws & 0xFFFFF) != 0) {
+        return;
+    }
+    for (u32 gi = 0; gi < 2; ++gi) {
+        auto& gg = t_nc2[gi];
+        const double n = double(std::max<u64>(gg.draws, 1));
+        std::string any;
+        for (u32 b = 0; b < NbbBits; ++b) {
+            if (gg.any[b]) {
+                any += fmt::format(" {}={:.1f}%", kNativeBitNames[b], 100.0 * double(gg.any[b]) / n);
+            }
+        }
+        LOG_INFO(Render_Vulkan,
+                 "NativeCensus2: {} draws={} conditions failing (independent):{} | pipeline "
+                 "breaks with same VS={:.1f}% back-to-2-ago={:.1f}%",
+                 gi == 0 ? "untextured" : "textured", gg.draws, any,
+                 100.0 * double(gg.pipe_vs_same) / double(std::max<u64>(gg.any[1], 1)),
+                 100.0 * double(gg.pipe_abab) / double(std::max<u64>(gg.any[1], 1)));
+        for (u32 li = 0; li < kNbLevels; ++li) {
+            auto& l = gg.lv[li];
+            std::string first;
+            for (u32 b = 0; b < NbbBits; ++b) {
+                if (l.first[b]) {
+                    first += fmt::format(" {}={:.1f}%", kNativeBitNames[b],
+                                         100.0 * double(l.first[b]) / n);
+                }
+            }
+            LOG_INFO(Render_Vulkan,
+                     "NativeCensus2: {} L{} joinable={:.1f}% mean_run={:.2f} "
+                     "runs[1,2-3,4-7,8-15,16-63,64+]={},{},{},{},{},{} first-break:{}",
+                     gi == 0 ? "untextured" : "textured", li, 100.0 * double(l.joins) / n,
+                     n / double(std::max<u64>(l.runs, 1)), l.run_hist[0], l.run_hist[1],
+                     l.run_hist[2], l.run_hist[3], l.run_hist[4], l.run_hist[5], first);
+        }
+    }
+    NativeCensus2CloseRuns();
+    for (auto& gg : t_nc2) {
+        gg = NativeCensus2Group{};
+    }
+}
+
 void NativeCensusNote(const GraphicsPipeline* pipeline, const RenderState& state, u64 entry_seq,
                       u64 end_seq, bool dyn_change, bool barriers,
                       std::span<const vk::DescriptorImageInfo> images,
                       std::span<const vk::DescriptorBufferInfo> buffers,
                       const Shader::PushData& push, bool occlusion) {
     auto& prev = t_nc_prev;
+    NativeCensus2Note(prev, pipeline, state, entry_seq, dyn_change, barriers, images, buffers,
+                      push, occlusion);
     const u32 group = state.num_color_attachments == 0 ? 0 : 1;
     const u32 why = NativeCensusWhy(prev, pipeline, state, entry_seq, dyn_change, barriers, images,
                                     buffers, push, occlusion, group);
