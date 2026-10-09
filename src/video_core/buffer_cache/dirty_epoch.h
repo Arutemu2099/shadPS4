@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 
 namespace VideoCore {
 
@@ -23,6 +24,11 @@ inline std::atomic<std::uint64_t> g_image_epoch{1};
 inline constexpr std::uint32_t GranuleBits = 21;
 inline constexpr std::size_t NumGranules = std::size_t{1} << (40 - GranuleBits);
 inline std::atomic<std::uint64_t> g_granule_clock{1};
+/// Only SHADPS4_STATIC_KEY_CENSUS reads the clock (Opus review 2026-10-09 item 6: off = no cost).
+inline const bool g_granule_clock_on = [] {
+    const char* v = std::getenv("SHADPS4_STATIC_KEY_CENSUS");
+    return v && v[0] == '1';
+}();
 inline std::atomic<std::uint64_t> g_granule_gen[NumGranules]{};
 
 inline std::size_t GranuleIndex(std::uint64_t addr) noexcept {
@@ -31,7 +37,7 @@ inline std::size_t GranuleIndex(std::uint64_t addr) noexcept {
 }
 
 inline void BumpGranules(std::uint64_t lo, std::uint64_t hi) noexcept {
-    if (hi <= lo) {
+    if (!g_granule_clock_on || hi <= lo) {
         return;
     }
     const std::uint64_t v = g_granule_clock.fetch_add(1, std::memory_order_relaxed) + 1;

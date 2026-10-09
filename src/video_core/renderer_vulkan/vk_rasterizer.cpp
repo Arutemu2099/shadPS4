@@ -4060,14 +4060,14 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
                  "ineligible={:.1f}% pipeline={:.1f}% key={:.1f}% render_state={:.1f}% "
                  "recorded_between={:.1f}% dirty_epoch={:.1f}% image_epoch={:.1f}% "
                  "cache_gen={:.1f}% other={:.1f}% gated={:.1f}% heap={:.1f}% | verified={} "
-                 "mismatches={} heap_repeats={}",
+                 "mismatches={} heap_repeats={} clip_refused={} clip_repeats={}",
                  g_draw_repeat, st.draws, st.repeats, 100.0 * st.repeats / d,
                  100.0 * st.f_ineligible / d, 100.0 * st.f_pipeline / d, 100.0 * st.f_key / d,
                  100.0 * st.f_rs / d, 100.0 * st.f_seq / d, 100.0 * st.f_epoch / d,
                  100.0 * st.f_image / d, 100.0 * st.f_gen / d, 100.0 * st.f_other / d,
                  100.0 * st.f_gated / d, 100.0 * st.f_heap / d, st.verified, st.mismatches,
-                 st.heap_repeats);
-        st.f_heap = st.heap_repeats = 0;
+                 st.heap_repeats, st.f_clip, st.clip_repeats);
+        st.f_heap = st.heap_repeats = st.f_clip = st.clip_repeats = 0;
         LOG_INFO(Render_Vulkan,
                  "DrawRepeatWhy: ineligible draws by global={} dma={} written={} formatted={} "
                  "special={} image_written={} flatbuf={}",
@@ -4283,7 +4283,8 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
             eligible = false;
             reason = pipeline->repeat_why;
         } else if (pipeline->repeat_static == 2 &&
-                   liverpool->BackRegs().clipper_control.user_clip_plane_enable != 0) {
+                   liverpool->BackRegs().clipper_control.user_clip_plane_enable != 0 &&
+                   !g_repeat_heap) {
             eligible = false;
             reason = 4;
         }
@@ -4310,6 +4311,8 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
     st.heap_cand.clear();
     if (eligible) {
         bool heap_formatted = false;
+        u64 heap_positions = 0; // which buffer positions were heap (review item 5)
+        u32 buf_pos = 0;
         for (const auto& bound : BoundStages(pipeline)) {
             const auto* stage = bound.info;
             if (!stage) {
@@ -4317,9 +4320,12 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
             }
             for (const auto& desc : stage->buffers) {
                 auto v = desc.GetSharp(bound);
-                if (g_repeat_heap && desc.is_formatted && v.GetSize() > (u64{64} << 20)) {
-                    // s359: the 2.4 GB formatted view over texture memory (0x271xxxxxx) records
-                    // image -> buffer syncs on its full path; a repeat must not skip them.
+                if (g_repeat_heap && desc.is_formatted && !desc.IsSpecial() &&
+                    (v.GetSize() > (u64{64} << 20) ||
+                     texture_cache.FindImageFromRange(v.base_address, v.GetSize(), false))) {
+                    // A formatted read over an image: its full path syncs buffer <- image
+                    // (SynchronizeBufferFromImage) on every bind; a repeat must not skip that
+                    // (s359: the 2.4 GB view; review item 2: any size).
                     heap_formatted = true;
                 }
                 if (g_repeat_heap && !desc.IsSpecial() && v.base_address >= RepeatHeapLo &&
@@ -4328,7 +4334,11 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
                     heap_formatted = heap_formatted || desc.is_formatted;
                     st.heap_cand.push_back(v);
                     v.base_address = 1;
+                    if (buf_pos < 64) {
+                        heap_positions |= u64{1} << buf_pos;
+                    }
                 }
+                ++buf_pos;
                 add(v);
             }
             for (const auto& desc : stage->images) {
@@ -4356,6 +4366,10 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
         if (heap_formatted) {
             eligible = false;
             reason = 3;
+        }
+        if (g_repeat_heap) {
+            add(heap_positions);
+            add(buf_pos);
         }
     }
     st.sizes[st.kidx ^ 1] = n;
@@ -4414,13 +4428,36 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
         return false;
     }
     st.heap_new.clear();
+    if (g_repeat_heap && pipeline->repeat_static == 2) {
+        // Clip-plane slot: with planes enabled BindBuffers copies the planes into the stream
+        // buffer; the base's copy stands only for the same enable bits and plane data.
+        const auto& regs = liverpool->BackRegs();
+        st.clip_cur[0] = regs.clipper_control.user_clip_plane_enable;
+        for (u32 i = 0; i < AmdGpu::NUM_CLIP_PLANES; ++i) {
+            const auto& plane = regs.clip_user_data[i];
+            st.clip_cur[1 + i * 4 + 0] = plane.data_x;
+            st.clip_cur[1 + i * 4 + 1] = plane.data_y;
+            st.clip_cur[1 + i * 4 + 2] = plane.data_z;
+            st.clip_cur[1 + i * 4 + 3] = plane.data_w;
+        }
+        if (st.clip_cur != st.clip_base) {
+            ++st.f_clip;
+            return false;
+        }
+        st.clip_repeats += st.clip_cur[0] != 0;
+    }
     if (g_repeat_heap) {
         if (st.heap_cand.size() != st.heap_base.size()) {
             ++st.f_heap;
             return false;
         }
         const bool lean = VideoCore::g_lean_bind != 0;
-        const u32 alignment = instance.StorageMinAlignment();
+        if (!st.heap_cand.empty() && (!lean || !buffer_cache.LeanReadOk())) {
+            // The full path would be ObtainBuffer (range notes, ASC deps, host mirror, other
+            // sync modes): only the lean read path's side effects are reproduced (review item 1).
+            ++st.f_heap;
+            return false;
+        }
         for (size_t k = 0; k < st.heap_cand.size(); ++k) {
             const auto& v = st.heap_cand[k];
             const auto& slot = st.heap_base[k];
@@ -4436,8 +4473,13 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
                 return false;
             }
             const u32 offset = static_cast<u32>(slot.buffer->Offset(addr));
-            const u32 offset_aligned = Common::AlignDown(offset, alignment);
+            const u32 offset_aligned = Common::AlignDown(offset, slot.alignment);
             const u32 adjust = offset - offset_aligned;
+            if (adjust % 4 != 0 || adjust >= 256) {
+                ++st.f_heap;
+                st.heap_new.clear();
+                return false;
+            }
             st.heap_new.push_back(
                 {vk::DescriptorBufferInfo{slot.buffer->Handle(), offset_aligned, size + adjust},
                  adjust});
@@ -4468,6 +4510,8 @@ void Rasterizer::DrawRepeatApply(const GraphicsPipeline* pipeline, bool patch_in
     const auto& st = draw_repeat;
     for (size_t k = 0; k < st.heap_new.size(); ++k) {
         const auto& slot = st.heap_base[k];
+        ASSERT(slot.bind_idx < push_data.buf_offsets.size() &&
+               (!patch_infos || slot.info_idx < buffer_infos.size()));
         push_data.buf_offsets[slot.bind_idx] = st.heap_new[k].adjust;
         if (patch_infos) {
             buffer_infos[slot.info_idx] = st.heap_new[k].info;
@@ -5099,6 +5143,17 @@ void Rasterizer::DrawRepeatStore(const GraphicsPipeline* pipeline, bool complete
     st.push_data = push_data;
     st.end_seq = scheduler.RecordSeq();
     st.heap_base = st.heap_pending;
+    if (g_repeat_heap && pipeline->repeat_static == 2) {
+        const auto& regs = liverpool->BackRegs();
+        st.clip_base[0] = regs.clipper_control.user_clip_plane_enable;
+        for (u32 i = 0; i < AmdGpu::NUM_CLIP_PLANES; ++i) {
+            const auto& plane = regs.clip_user_data[i];
+            st.clip_base[1 + i * 4 + 0] = plane.data_x;
+            st.clip_base[1 + i * 4 + 1] = plane.data_y;
+            st.clip_base[1 + i * 4 + 2] = plane.data_z;
+            st.clip_base[1 + i * 4 + 3] = plane.data_w;
+        }
+    }
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
@@ -7323,7 +7378,7 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
             if (g_repeat_heap && !binding_compute && vsharp.base_address >= RepeatHeapLo &&
                 vsharp.base_address < RepeatHeapHi) {
                 draw_repeat.heap_pending.push_back(
-                    {static_cast<u32>(buffer_infos.size() - 1), binding.buffer, vk_buffer});
+                    {static_cast<u32>(buffer_infos.size() - 1), binding.buffer, vk_buffer, alignment});
             }
             if (auto barrier =
                     vk_buffer->GetBarrier(desc.is_written ? vk::AccessFlagBits2::eShaderWrite

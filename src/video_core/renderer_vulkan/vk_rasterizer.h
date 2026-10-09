@@ -424,6 +424,7 @@ private:
             u32 info_idx;
             u32 bind_idx;
             const VideoCore::Buffer* buffer;
+            u32 alignment; ///< BindBuffers' alignment for this binding (review item 3)
         };
         struct HeapNew {
             vk::DescriptorBufferInfo info;
@@ -433,6 +434,10 @@ private:
         std::vector<AmdGpu::Buffer> heap_cand;
         std::vector<HeapNew> heap_new;
         u64 f_heap{}, heap_repeats{};
+        /// SHADPS4_DRAW_REPEAT_HEAP: user clip planes of the base draw (enable bits + plane data);
+        /// a repeat with planes enabled reuses the base's stream copy when both are equal.
+        std::array<u32, 1 + 4 * AmdGpu::NUM_CLIP_PLANES> clip_base{}, clip_cur{};
+        u64 f_clip{}, clip_repeats{};
         // Verify scratch.
         std::vector<vk::DescriptorBufferInfo> v_buffers;
         std::vector<vk::DescriptorImageInfo> v_images;
