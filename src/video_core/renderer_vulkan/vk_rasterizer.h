@@ -434,6 +434,9 @@ private:
         u64 tick{};
         u64 ctx_epoch{};
         u64 desc_id{};
+        u64 tex_gen{};
+        u64 meta_epoch{};
+        u64 image_epoch{};
         std::array<u32, AmdGpu::NUM_COLOR_BUFFERS + 1> extents{};
         u32 index_size{};
         u64 ib{};
@@ -458,8 +461,10 @@ private:
         u32 cand_instance_offset{};
     } native_batch;
     boost::container::small_vector<vk::BufferMemoryBarrier2, 16> native_carry;
+    /// The context register block at the batch open (compared when the epoch moved).
+    std::array<u32, 0x400> native_ctx{};
     struct NativeStats {
-        u64 opens{}, joins{}, open_fail{}, verify_draws{}, verify_mismatch{};
+        u64 opens{}, joins{}, open_fail{}, verify_draws{}, verify_mismatch{}, epoch_same{};
         std::array<u64, 16> close{};
     } native_stats;
     bool NativeJoin(const SplitDraw& draw, const AmdGpu::CpSplit::VertexInputsPayload* front_vi);

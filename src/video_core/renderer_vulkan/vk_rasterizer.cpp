@@ -1096,6 +1096,9 @@ Rasterizer::DrawClass Rasterizer::ClassifyDraw(const AmdGpu::Regs& regs) {
 }
 
 void Rasterizer::ExecuteFilteredDraw(DrawClass draw_class) {
+    if (native_batch.open) [[unlikely]] {
+        NativeClose(12);
+    }
     if (draw_class != DrawClass::Draw) {
         // RENDER_STATE_MEMO: these touch render-target metadata outside DrawTail.
         rs_memo.valid = false;
@@ -1746,7 +1749,11 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         b.open = false;
         return false;
     };
-    if (!front_vi || !is_indexed) {
+    // Opus review 2026-10-09: the context epoch only moves with the viewport memo (#2); without
+    // dynamic vertex input the bound sizes would clip rebased reads (#3); attributes past 16 are
+    // not tracked (#7).
+    if (!front_vi || !is_indexed || g_viewport_memo < 1 || !instance.IsVertexInputDynamicState() ||
+        front_vi->count > 16) {
         return fail();
     }
     const auto& vi = VideoCore::t_native_vi;
@@ -1756,6 +1763,11 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
     const auto& regs = liverpool->BackRegs();
     b.base = base;
     b.ctx_epoch = liverpool->BackContextEpoch();
+    std::memcpy(native_ctx.data(), &regs.reg_array[AmdGpu::Regs::ContextRegWordOffset],
+                sizeof(u32) * native_ctx.size());
+    b.tex_gen = texture_cache.StructGeneration();
+    b.meta_epoch = texture_cache.MetaClearEpoch();
+    b.image_epoch = VideoCore::g_image_epoch.load(std::memory_order_acquire);
     if (g_native_diag) [[unlikely]] {
         g_native_diag_ctx.assign(regs.reg_array.begin() + AmdGpu::Regs::ContextRegWordOffset,
                                  regs.reg_array.begin() + AmdGpu::Regs::ContextRegWordOffset + 0x400);
@@ -1808,8 +1820,11 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         return fail();
     }
     const u64 total = u64(NativeMaxDraws) * (NativeRecBytes + NativeCmdBytes) + 16;
-    const auto [ptr, offset] = stream.Map(total, instance.StorageMinAlignment());
-    if (!ptr) {
+    const u64 seq_before_map = scheduler.RecordSeq();
+    const u64 tick_before_map = scheduler.CurrentTick();
+    const auto [ptr, offset] = stream.Map(total, instance.StorageMinAlignment(), false);
+    if (!ptr || scheduler.RecordSeq() != seq_before_map ||
+        scheduler.CurrentTick() != tick_before_map) {
         return fail();
     }
     stream.Commit();
@@ -1874,6 +1889,29 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
                       scheduler.CurrentTick() != b.tick)) {
         NativeClose(b.n >= NativeMaxDraws ? 4 : 5);
         return false;
+    }
+    if (texture_cache.StructGeneration() != b.tex_gen ||
+        texture_cache.MetaClearEpoch() != b.meta_epoch ||
+        VideoCore::g_image_epoch.load(std::memory_order_acquire) != b.image_epoch) {
+        NativeClose(11);
+        return false;
+    }
+    if (liverpool->BackContextEpoch() != b.ctx_epoch) {
+        // The epoch moves on any value-changing SET_CONTEXT_REG, also when the game sets a
+        // register and sets it back before this draw (s285: at 97% of such refusals only the
+        // per-draw index DMA slots VGT_DMA_BASE_HI / BASE / MAX_SIZE / INDEX_TYPE differed).
+        // Compare the block itself, without those per-draw slots.
+        const u32* now = &regs.reg_array[AmdGpu::Regs::ContextRegWordOffset];
+        constexpr u32 kDmaBaseHi = 0x1f9, kDmaBase = 0x1fa, kDmaMax = 0x29e, kDmaType = 0x29f;
+        bool same = std::memcmp(now, native_ctx.data(), sizeof(u32) * kDmaBaseHi) == 0 &&
+                    std::memcmp(now + kDmaBase + 1, native_ctx.data() + kDmaBase + 1,
+                                sizeof(u32) * (kDmaMax - kDmaBase - 1)) == 0 &&
+                    std::memcmp(now + kDmaType + 1, native_ctx.data() + kDmaType + 1,
+                                sizeof(u32) * (native_ctx.size() - kDmaType - 1)) == 0;
+        if (same) {
+            b.ctx_epoch = liverpool->BackContextEpoch();
+            ++native_stats.epoch_same;
+        }
     }
     if (liverpool->BackContextEpoch() != b.ctx_epoch) {
         if (g_native_diag && g_native_diag_ctx.size() == 0x400) [[unlikely]] {
@@ -1971,6 +2009,7 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
     if (ok && (jvi.n != b.vb_n || jvi.ib_buf != b.ib || jvi.ib_off % b.index_size != 0)) {
         ok = false;
     }
+    const auto* join_attribs = AmdGpu::CpSplit::VertexInputAttribs(*front_vi);
     for (u32 k = 0; ok && k < jvi.n; ++k) {
         if (jvi.buf[k] != b.vb[k] || jvi.stride[k] != b.vb_stride[k]) {
             ok = false;
@@ -1980,6 +2019,11 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
             continue;
         }
         const s64 d = s64(jvi.off[k]) - s64(b.vb_off[k]);
+        if (join_attribs[k].desc.instanced && d != 0) {
+            // Opus #3: vertexOffset cannot rebase an instance-rate binding.
+            ok = false;
+            break;
+        }
         if (b.vb_stride[k] == 0 ? d != 0 : d % s64(b.vb_stride[k]) != 0) {
             ok = false;
             break;
@@ -2017,8 +2061,9 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
         return false;
     }
     const s64 vo = s64(s32(vertex_offset)) + q;
-    if (vo < INT32_MIN || vo > INT32_MAX) {
-        NativeClose(11);
+    if (vo < 0 || vo > INT32_MAX) {
+        // Opus #3: a rebased vertexOffset must stay a valid non-negative vertex index base.
+        NativeClose(3);
         return false;
     }
     auto* rec = reinterpret_cast<u32*>(b.recs + u64(b.n) * NativeRecBytes);
@@ -2102,13 +2147,17 @@ void Rasterizer::NativeLog() {
     }
     LOG_INFO(Render_Vulkan,
              "NativePass: opens={} joins={} open_fail={} verify_draws={} verify_mismatch={} "
-             "closes:{}",
-             st.opens, st.joins, st.open_fail, st.verify_draws, st.verify_mismatch, closes);
+             "epoch_same={} closes:{}",
+             st.opens, st.joins, st.open_fail, st.verify_draws, st.verify_mismatch,
+             st.epoch_same, closes);
 }
 
 void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
                                  const std::array<Shader::BoundStage, Shader::MaxStageTypes>& stages,
                                  bool is_indirect, VAddr address, u32 offset, u32 size) {
+    if (native_batch.open) [[unlikely]] {
+        NativeClose(13);
+    }
     // CP split, back thread: DispatchDirect/DispatchIndirect after the front's lookup. The caller
     // points Liverpool::BackCsRegs() at the record's ComputeProgram snapshot.
     RENDERER_TRACE;
@@ -2641,12 +2690,13 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
                           type = native_batch.index_size == 2 ? vk::IndexType::eUint16
                                                               : vk::IndexType::eUint32](
                              vk::CommandBuffer cmdbuf) {
-            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+            if (!GraphicsBindTracker::Enabled() || GraphicsBindTracker::NeedBind(cmdbuf, handle)) {
+                cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+            }
             cmdbuf.bindIndexBuffer(ib, 0, type);
             cmdbuf.drawIndexedIndirectCount(sb, cmd_off, sb, count_off, NativeMaxDraws,
                                             NativeCmdBytes);
         });
-        GraphicsBindTracker::Invalidate();
         scheduler.GetDynamicState().packet_state_unknown = true;
         native_batch.seq = scheduler.RecordSeq();
         native_batch.tick = scheduler.CurrentTick();
@@ -2802,6 +2852,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 void Rasterizer::DrawIndirectTail(const GraphicsPipeline* pipeline, bool is_indexed,
                                   VAddr arg_address, u32 offset, u32 stride, u32 max_count,
                                   VAddr count_address) {
+    if (native_batch.open) [[unlikely]] {
+        NativeClose(14);
+    }
     rs_memo.valid = false; // RENDER_STATE_MEMO: this path rewrites cb_descs / db_desc
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
@@ -2914,6 +2967,9 @@ void Rasterizer::DispatchDirect() {
 }
 
 void Rasterizer::DispatchDirectTail(const ComputePipeline* pipeline) {
+    if (native_batch.open) [[unlikely]] {
+        NativeClose(15);
+    }
     const auto& cs_program = liverpool->BackCsRegs();
     const auto& cs = GetBoundStage(Shader::LogicalStage::Compute);
     if (ExecuteShaderHLE(cs, liverpool->BackRegs(), cs_program, *this)) {

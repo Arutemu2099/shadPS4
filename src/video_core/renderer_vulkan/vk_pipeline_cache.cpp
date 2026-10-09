@@ -1011,6 +1011,10 @@ void PipelineCache::PrepareNativeVariant(const GraphicsPipeline* base) {
         if (!vs->images.empty() || !vs->samplers.empty() || vs->uses_dma) {
             return "vs images";
         }
+        if (vs->loads.Get(Shader::IR::Attribute::VertexId)) {
+            // Opus review #3: a rebased vertexOffset shifts VertexId.
+            return "vs reads VertexId";
+        }
         if (vs->buffers.empty()) {
             return "vs no buffers";
         }
@@ -1067,11 +1071,21 @@ void PipelineCache::PrepareNativeVariant(const GraphicsPipeline* base) {
         new_info.pinned_uses_dma = infos[vs_idx]->uses_dma;
         auto runtime_info = runtime_infos[vs_idx];
         auto binding = starts[vs_idx];
-        Shader::t_native_emit = {true, records_binding};
-        const auto ir_program = Shader::TranslateProgram(params.code, pools, new_info, runtime_info,
-                                                         profile);
-        const auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
-        Shader::t_native_emit = {};
+        struct NativeEmitScope {
+            NativeEmitScope(u32 rb) {
+                Shader::t_native_emit = {true, rb};
+            }
+            ~NativeEmitScope() {
+                Shader::t_native_emit = {};
+            }
+        };
+        std::vector<u32> spv;
+        {
+            NativeEmitScope scope{records_binding};
+            const auto ir_program = Shader::TranslateProgram(params.code, pools, new_info,
+                                                             runtime_info, profile);
+            spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
+        }
         if (!SameBindingLayout(new_info, *infos[vs_idx])) {
             LOG_ERROR(Render_Vulkan, "NativePass: vs_{:#x} native layout differs; not used",
                       params.hash);
