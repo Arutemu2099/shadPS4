@@ -1245,6 +1245,7 @@ struct LeanState {
     alignas(64) std::atomic<u32> back_cur{0};                    ///< DCB index the back follows
     std::atomic<u64> l2_taken{}, l2_skipped{}, l2_early{}, head_draws{}, back_records{},
         back_wait_ticks{};
+    std::unique_ptr<Lean::Parser> toucher; ///< front: L2 Pretouch before the exclusive lookup
 };
 LeanState g_lean_s;
 /// The front's DCB being recorded (top level only).
@@ -1744,7 +1745,8 @@ void LeanLog() {
                  "(workers {:.1f}%) | EARLY STOPS {} (gate 0) | back: worker-channel records {:.0f}/s, "
                  "waiting for workers {:.2f} ms/s | worker: fault waits {} ({:.2f} ms/s), faults in lock {} "
                  "(first {:#x}), touches {}, builds {} (refresh failed {}), null builds {}, native preps {}, "
-                 "colour preps {} | head pass {:.2f} ms/s",
+                 "colour preps {} | head pass {:.2f} ms/s | front faults in lock {}, register-only "
+                 "completions {} (draws dropped {}), back lock-service waits {}",
                  sec, c.dcbs.load(), s.l2_taken.load(), s.l2_skipped.load(), s.head_draws.load(),
                  c.front_draws.load(), hd + fd > 0 ? 100.0 * hd / (hd + fd) : 0.0, s.l2_early.load(),
                  double(s.back_records.load()) / std::max(sec, 1e-9),
@@ -1754,7 +1756,9 @@ void LeanLog() {
                  g_lean_l2.faults_in_lock.load(), g_lean_l2.first_in_lock.load(),
                  g_lean_l2.touches.load(), g_lean_l2.builds.load(), g_lean_l2.build_refresh_fail.load(),
                  g_lean_l2.build_null.load(), g_lean_l2.native_preps.load(),
-                 g_lean_l2.colour_preps.load(), double(s.chain_cyc) / 3.5e6 / std::max(sec, 1e-9));
+                 g_lean_l2.colour_preps.load(), double(s.chain_cyc) / 3.5e6 / std::max(sec, 1e-9),
+                 g_lean_l2.front_faults_in_lock.load(), g_lean_l2.regs_only_runs.load(),
+                 g_lean_l2.dropped_draws.load(), g_lean_l2.lock_service_waits.load());
         s.l2_taken = s.l2_skipped = s.head_draws = s.back_records = s.back_wait_ticks = 0;
         g_lean_l2.fault_waits = 0;
         g_lean_l2.wait_ticks = 0;
@@ -2297,6 +2301,12 @@ void Liverpool::FrontProcess(std::stop_token stoken) {
 
 void Liverpool::BackLoop(std::stop_token stoken) {
     std::stop_callback wake_on_stop{stoken, [this] { split->WakeBack(); }};
+    if (g_lean == 2) {
+        // SHADPS4_LEAN=2: while this thread waits for the pipeline cache's lock it runs guest
+        // commands (a lean worker faulting under that lock waits for one).
+        t_lock_service_ctx = this;
+        t_lock_service = [](void* p) { static_cast<Liverpool*>(p)->ProcessCommands(); };
+    }
     bool stop_forwarded = false;
     // SHADPS4_MTB_P1 (P1d, notes/parrec-build-2026-10-08.md sec. 14): the translating context is
     // installed before the first record that can record a command (a rasterizer is bound).
@@ -3554,6 +3564,19 @@ void Liverpool::LeanStart() {
         }
         LOG_INFO(Render, "Lean L2: {} ({} job channels of 1 MB)", s.l2 ? "on" : "OFF (config)",
                  s.l2 ? LeanSlots : 0u);
+        if (s.l2) {
+            Lean::Env fe{};
+            fe.rasterizer = rasterizer;
+            fe.pipeline_cache = &rasterizer->GetPipelineCache();
+            fe.split_enabled = split_enabled;
+            fe.split_run_ahead = split_run_ahead;
+            fe.split_verify = split_verify;
+            fe.split_post_dma = split_post_dma;
+            fe.split_task_guard = split_task_guard;
+            fe.split_front_derive = split_front_derive;
+            fe.l2 = true;
+            s.toucher = std::make_unique<Lean::Parser>(fe);
+        }
     }
     split->canon_fn = &LeanCanonRecord; // the front's records too (canon is set per packet)
     s.regs = std::make_unique<Regs>();
@@ -3662,12 +3685,23 @@ void Liverpool::LeanWorkerLoop(std::stop_token stoken, u32 index) {
             l2w = {&out, idx};
             j.res = parser.Parse(j.dcb, j.cut_dw, st, out);
             if (j.res.end_dw != j.cut_dw) {
-                // An early stop: the packets between it and the cut are nobody's (gate 0).
+                // An early stop (gate 0): finish to the cut in register-only mode so the back's
+                // mirror reaches the front's state at the cut; the draws in between are dropped.
                 if (s.l2_early.fetch_add(1, std::memory_order_relaxed) < 8) {
                     LOG_CRITICAL(Render, "Lean L2 EARLY STOP: DCB {} stop {} at dw {} (opcode {:#x}), "
                                          "cut {} of {} dw",
                                  idx, Lean::StopName(j.res.stop), j.res.end_dw,
                                  j.res.stop_opcode, j.cut_dw, j.dcb.size());
+                }
+                parser.SetRegsOnly(true, j.res.end_dw);
+                const auto rest = parser.Parse(j.dcb, j.cut_dw, st, out);
+                parser.SetRegsOnly(false, 0);
+                g_lean_l2.regs_only_runs.fetch_add(1, std::memory_order_relaxed);
+                g_lean_l2.dropped_draws.fetch_add(rest.dropped, std::memory_order_relaxed);
+                if (rest.end_dw != j.cut_dw) {
+                    LOG_CRITICAL(Render, "Lean L2: register-only completion of DCB {} stopped at {} "
+                                         "({}), cut {}",
+                                 idx, rest.end_dw, Lean::StopName(rest.stop), j.cut_dw);
                 }
             }
             out.Reserve(CpSplit::RecordType::LeanEnd, 0);
@@ -7547,9 +7581,13 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
     auto& s = g_lean_s;
     auto& ch = *s.ch[ref.slot];
     s.back_cur.store(ref.index, std::memory_order_release);
+    split->FlushDone(); // the front's depth waits must see everything before this record
     lean_following = true;
     u64 wait = 0;
     for (u32 spins = 0;;) {
+        if (split->FrontHasExited() || s.stop.load(std::memory_order_relaxed)) [[unlikely]] {
+            break;
+        }
         if (const auto* r = ch.Next()) {
             spins = 0;
             if (r->type == CpSplit::RecordType::LeanEnd) {
@@ -7578,6 +7616,9 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
                          const CpSplit::DrawArgs& args) {
     if (g_lean != 0) [[unlikely]] {
         ++g_lean_s.c.front_draws;
+        if (g_lean_s.toucher) {
+            g_lean_s.toucher->Pretouch(regs); // faults before PrepareDrawFront's exclusive lock
+        }
     }
     if (AmdGpu::NativeRec::g_mode >= 2) [[unlikely]] {
         if (NativeRecMember(header, name, host_marker, args)) {
@@ -8658,6 +8699,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
     if (g_lean != 0 && !is_indirect_gfx && split_enabled && rasterizer) [[unlikely]] {
         if (g_lean == 2) {
+            if (split_task_guard) {
+                // The head pass (and the worker) read [0, cut) before SplitSpanScope guards the
+                // tail: guard the whole buffer first.
+                const auto lo = reinterpret_cast<VAddr>(dcb.data());
+                split->GuardSpan(lo, lo + dcb.size_bytes(), CpSplit::DrainReason::TaskGuard);
+            }
             const auto l2 =
                 LeanFrontBeginL2(dcb, ccb, EmulatorSettings.IsVkGuestMarkersEnabled());
             if (l2.cut != 0) {

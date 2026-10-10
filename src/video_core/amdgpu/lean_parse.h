@@ -132,6 +132,7 @@ struct SpanResult {
     u32 end_dw{};      ///< dword offset of the first packet NOT parsed (the front resumes here)
     Stop stop{};
     u32 stop_opcode{}; ///< PM4ItOpcode of the stop packet (0 for Cut / End)
+    u32 dropped{};     ///< register-only mode: draws not emitted
     u32 run_bumps{};   ///< GUEST_DISPATCH_ORDER: parsed packets that end a dispatch run
                        ///< (not RunNeutral); L2 hand-back: one fresh gfx run if > 0
 };
@@ -154,6 +155,15 @@ public:
     const Env& GetEnv() const noexcept {
         return env;
     }
+    /// L2 early stop: the next Parse starts at `start_dw` and emits register words, extents and
+    /// ClearState only (draws dropped and counted) - the back's mirror reaches the cut state.
+    void SetRegsOnly(bool on, u32 start_dw) {
+        regs_only = on;
+        start = on ? start_dw : 0;
+    }
+    /// L2 front: touch the pages the front's own lookup of this draw reads (shader headers, SRT
+    /// tables, fetch code, fetch V#s), so its faults happen before it takes the cache's lock.
+    void Pretouch(const Regs& regs);
 
 private:
     /// SHADPS4_LEAN: shader headers + checked SRT walks into the scratch, outside the cache's
@@ -178,6 +188,8 @@ private:
     };
     std::unordered_map<const void*, std::vector<WalkOp>> walk_plans; ///< per walker code
     StaticEnv static_env{};
+    bool regs_only{};
+    u32 start{};
     struct DrawPlan;
     Stop DecideDraw(const PM4Header* header, std::span<const u32> dcb, u32 off,
                     const char* name, const CpSplit::DrawArgs& args, const ChainState& st,

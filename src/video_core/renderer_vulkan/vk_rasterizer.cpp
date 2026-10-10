@@ -2097,11 +2097,13 @@ void Rasterizer::PrepareDrawFront(SplitDraw& draw) {
         // Infos' per-draw fields: copy this draw's under the same exclusive hold, then release
         // (never across guest reads: the back's GetComputePipeline takes this lock too).
         auto lk = pipeline_cache.AcquireExclusive();
+        AmdGpu::t_front_in_lock = true;
         draw.pipeline = pipeline_cache.GetGraphicsPipelineLocked();
         if (VideoCore::g_native_pass != 0 && draw.pipeline && !draw.pipeline->native_checked) {
             pipeline_cache.PrepareNativeVariantLocked(draw.pipeline, liverpool->regs);
         }
         pipeline_cache.CaptureFront(front_capture, draw.pipeline);
+        AmdGpu::t_front_in_lock = false;
         front_capture_valid = true;
         return;
     }
@@ -12788,6 +12790,11 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, VideoCore::InvalidateOri
     if (AmdGpu::t_lean_worker) [[unlikely]] {
         AmdGpu::LeanNoteWorkerFault(addr); // counted; completes as a game thread's would
     }
+    if (AmdGpu::t_front_in_lock) [[unlikely]] {
+        if (AmdGpu::g_lean_l2.front_faults_in_lock.fetch_add(1, std::memory_order_relaxed) == 0) {
+            LOG_CRITICAL(Render, "Lean L2: FRONT fault under the pipeline cache lock at {:#x}", addr);
+        }
+    }
     // CP split run-ahead: a fault on the front must not download or invalidate ahead of the
     // draws it has posted. No lock is held here. No-op on every other thread.
     liverpool->DrainForFrontFault();
@@ -12809,6 +12816,11 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size) {
         // the worker holds no cache lock here (its guest reads run outside the shared lock), so
         // completing as a game thread's fault cannot deadlock; its span stops before emitting.
         AmdGpu::LeanNoteWorkerFault(addr);
+    }
+    if (AmdGpu::t_front_in_lock) [[unlikely]] {
+        if (AmdGpu::g_lean_l2.front_faults_in_lock.fetch_add(1, std::memory_order_relaxed) == 0) {
+            LOG_CRITICAL(Render, "Lean L2: FRONT fault under the pipeline cache lock at {:#x}", addr);
+        }
     }
     liverpool->DrainForFrontFault();
     buffer_cache.ReadMemory(addr, size);

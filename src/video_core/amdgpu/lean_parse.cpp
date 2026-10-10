@@ -205,6 +205,9 @@ Stop Parser::DecideDraw(const PM4Header* header, std::span<const u32> dcb, u32 o
     plan.name = name;
     plan.draw.args = args;
 
+    if (regs_only) {
+        return Stop::None; // the caller journals the draw packet's registers and drops the draw
+    }
     // Rasterizer::PrepareDrawFront.
     plan.draw.draw_class = Rasterizer::ClassifyDraw(regs);
     if (plan.draw.draw_class == Rasterizer::DrawClass::Draw) {
@@ -262,7 +265,7 @@ Stop Parser::DecideDraw(const PM4Header* header, std::span<const u32> dcb, u32 o
                     return Stop::NativeUnchecked; // the front would run PrepareNativeVariant
                 }
                 t_lean_in_lock = true;
-                env.pipeline_cache->PrepareNativeVariant(plan.draw.pipeline, regs);
+                env.pipeline_cache->PrepareNativeVariantRefreshed(plan.draw.pipeline, regs);
                 t_lean_in_lock = false;
                 g_lean_l2.native_preps.fetch_add(1, std::memory_order_relaxed);
             }
@@ -335,7 +338,7 @@ Stop Parser::DecideDraw(const PM4Header* header, std::span<const u32> dcb, u32 o
                 }
                 // PrepareNativeColourFront: decides / queues the variant (compiled elsewhere).
                 t_lean_in_lock = true;
-                env.pipeline_cache->PrepareNativeColour(plan.draw.pipeline, *vi, regs);
+                env.pipeline_cache->PrepareNativeColourRefreshed(plan.draw.pipeline, *vi, regs);
                 t_lean_in_lock = false;
                 g_lean_l2.colour_preps.fetch_add(1, std::memory_order_relaxed);
             }
@@ -595,7 +598,7 @@ SpanResult Parser::Parse(std::span<const u32> dcb, u32 cut_dw, ChainState& st,
     const u32 n = static_cast<u32>(dcb.size());
     const u32 limit = std::min(cut_dw, n);
     const u32 num_regs = static_cast<u32>(regs.reg_array.size());
-    u32 off = 0;
+    u32 off = start;
 
     for (;;) {
         if (off >= n) {
@@ -910,8 +913,12 @@ SpanResult Parser::Parse(std::span<const u32> dcb, u32 cut_dw, ChainState& st,
             JournalField(out, regs, regs.num_indices);
             JournalField(out, regs, regs.draw_initiator);
             // DebugState.PushRegsDump (debugger register dumps): not mirrored.
-            EmitDraw(header, plan, st, out);
-            ++r.draws;
+            if (regs_only) {
+                ++r.dropped;
+            } else {
+                EmitDraw(header, plan, st, out);
+                ++r.draws;
+            }
             break;
         }
         case PM4ItOpcode::DrawIndexOffset2: {
@@ -934,8 +941,12 @@ SpanResult Parser::Parse(std::span<const u32> dcb, u32 cut_dw, ChainState& st,
             JournalField(out, regs, regs.max_index_size);
             JournalField(out, regs, regs.num_indices);
             JournalField(out, regs, regs.draw_initiator);
-            EmitDraw(header, plan, st, out);
-            ++r.draws;
+            if (regs_only) {
+                ++r.dropped;
+            } else {
+                EmitDraw(header, plan, st, out);
+                ++r.draws;
+            }
             break;
         }
         case PM4ItOpcode::DrawIndexAuto: {
@@ -953,8 +964,12 @@ SpanResult Parser::Parse(std::span<const u32> dcb, u32 cut_dw, ChainState& st,
             }
             JournalField(out, regs, regs.num_indices);
             JournalField(out, regs, regs.draw_initiator);
-            EmitDraw(header, plan, st, out);
-            ++r.draws;
+            if (regs_only) {
+                ++r.dropped;
+            } else {
+                EmitDraw(header, plan, st, out);
+                ++r.draws;
+            }
             break;
         }
         default:
@@ -1123,6 +1138,11 @@ bool Parser::FetchOk(const Shader::Info& info, std::span<const u32> ud) const {
             }
         }
     }
+}
+
+void Parser::Pretouch(const Regs& regs) {
+    (void)Prewalk(regs);
+    scratch->prewalked = false;
 }
 
 bool Parser::RefreshCaptured(const Regs& regs) {

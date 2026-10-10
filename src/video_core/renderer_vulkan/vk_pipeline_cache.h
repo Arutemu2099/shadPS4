@@ -223,6 +223,15 @@ public:
     const GraphicsPipeline* LookupOrBuildGraphics(const AmdGpu::Regs& regs,
                                                   GraphicsLookupScratch& out);
 
+    /// SHADPS4_LEAN=2 workers: refresh the shared Infos with THIS draw (GraphicsLookupLocked over
+    /// `regs`) and decide the native / colour variant, under one exclusive hold.
+    void PrepareNativeVariantRefreshed(const GraphicsPipeline* base, const AmdGpu::Regs& regs);
+    void PrepareNativeColourRefreshed(const GraphicsPipeline* base,
+                                      const AmdGpu::CpSplit::VertexInputsDerived& vi,
+                                      const AmdGpu::Regs& regs);
+    /// The exclusive lock; on the back thread (t_lock_service set) a try-lock loop that runs
+    /// guest commands while it waits (a worker faulting under the lock needs them).
+    [[nodiscard]] std::unique_lock<std::shared_mutex> LockExclusiveServicing() const;
     /// The exclusive guard; hold it across GetGraphicsPipelineLocked + WriteStage on the front
     /// once workers may take LookupOrBuildGraphics' build path concurrently.
     [[nodiscard]] std::unique_lock<std::shared_mutex> AcquireExclusive() const;

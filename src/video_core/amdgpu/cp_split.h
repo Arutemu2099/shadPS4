@@ -540,6 +540,12 @@ public:
     [[nodiscard]] u64 EmittedSeq() const noexcept {
         return emitted;
     }
+    /// Back: publish batched done seqs now (SHADPS4_LEAN=2, before waiting on a job channel).
+    void FlushDone() {
+        if (done_count != 0) {
+            PublishDone(pending_done);
+        }
+    }
     [[nodiscard]] u64 CommittedSeq() const noexcept {
         return committed_seq;
     }

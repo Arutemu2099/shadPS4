@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "common/logging/log.h"
+
 // The front's own helpers the architecture-A worker parser (lean_parse.*) must call so it behaves
 // exactly as ProcessGraphics (notes/architecture-a-2026-10-10.md sec. 16). Defined in liverpool.cpp
 // as thin wrappers over the file-local functions.
@@ -53,16 +55,25 @@ inline LeanFaultStats g_lean_fault_stats;
 inline thread_local void (*t_lean_l2_wait)(void*) = nullptr;
 inline thread_local void* t_lean_l2_ctx = nullptr;
 inline thread_local bool t_lean_in_lock = false;
+/// The front holds the cache's exclusive lock (L2 PrepareDrawFront): a fault here is counted.
+inline thread_local bool t_front_in_lock = false;
+/// Back thread (L2): what to run while it waits for the cache's lock (ProcessCommands).
+inline thread_local void (*t_lock_service)(void*) = nullptr;
+inline thread_local void* t_lock_service_ctx = nullptr;
 struct LeanL2Stats {
     std::atomic<u64> fault_waits{}, faults_in_lock{}, build_null{}, native_preps{}, colour_preps{},
-        touches{}, wait_ticks{}, builds{}, build_refresh_fail{};
+        touches{}, wait_ticks{}, builds{}, build_refresh_fail{}, front_faults_in_lock{},
+        regs_only_runs{}, dropped_draws{}, lock_service_waits{};
     std::atomic<u64> first_in_lock{};
 };
 inline LeanL2Stats g_lean_l2;
 inline void LeanNoteWorkerFault(u64 addr) {
     if (t_lean_l2_wait) [[likely]] {
         if (t_lean_in_lock) {
-            g_lean_l2.faults_in_lock.fetch_add(1, std::memory_order_relaxed);
+            if (g_lean_l2.faults_in_lock.fetch_add(1, std::memory_order_relaxed) == 0) {
+                LOG_CRITICAL(Render, "Lean L2: worker fault while holding the pipeline cache lock "
+                                     "at {:#x} (completes without the back wait)", addr);
+            }
             u64 none = 0;
             g_lean_l2.first_in_lock.compare_exchange_strong(none, addr);
             return; // no wait: the back may be waiting for the lock this worker holds

@@ -991,8 +991,41 @@ void PipelineCache::VerifyPreparedPipeline(PreparedPipelineEntry& entry,
 }
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
-    std::unique_lock lk{graphics_mutex};
+    auto lk = LockExclusiveServicing();
     return GraphicsLookupLocked(liverpool->regs);
+}
+
+std::unique_lock<std::shared_mutex> PipelineCache::LockExclusiveServicing() const {
+    std::unique_lock lk{graphics_mutex, std::defer_lock};
+    if (!AmdGpu::t_lock_service) [[likely]] {
+        lk.lock();
+        return lk;
+    }
+    bool counted = false;
+    for (u32 spins = 0; !lk.try_lock(); ++spins) {
+        if (!counted) {
+            AmdGpu::g_lean_l2.lock_service_waits.fetch_add(1, std::memory_order_relaxed);
+            counted = true;
+        }
+        AmdGpu::t_lock_service(AmdGpu::t_lock_service_ctx);
+        spins < 64 ? _mm_pause() : std::this_thread::yield();
+    }
+    return lk;
+}
+
+void PipelineCache::PrepareNativeVariantRefreshed(const GraphicsPipeline* base,
+                                                  const AmdGpu::Regs& regs) {
+    std::unique_lock lk{graphics_mutex};
+    (void)GraphicsLookupLocked(regs); // the shared Infos now hold this draw's per-draw fields
+    PrepareNativeVariantLocked(base, regs);
+}
+
+void PipelineCache::PrepareNativeColourRefreshed(const GraphicsPipeline* base,
+                                                 const AmdGpu::CpSplit::VertexInputsDerived& vi,
+                                                 const AmdGpu::Regs& regs) {
+    std::unique_lock lk{graphics_mutex};
+    (void)GraphicsLookupLocked(regs);
+    PrepareNativeColourLocked(base, vi, regs);
 }
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLocked() {
@@ -1854,7 +1887,7 @@ void PipelineCache::NoteCompiledPipeline(u64 hash, double translate_ms, double c
 const ComputePipeline* PipelineCache::GetComputePipeline() {
     // Exclusive: GetProgram may insert into program_cache (a rehash under a concurrent
     // LookupGraphics would be a race) and compute_pipelines is mutated below.
-    std::unique_lock lk{graphics_mutex};
+    auto lk = LockExclusiveServicing();
     if (!RefreshComputeKey()) {
         return nullptr;
     }
