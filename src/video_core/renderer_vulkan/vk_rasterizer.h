@@ -690,6 +690,7 @@ private:
         u64 nd_cand{}, nd_ok{}, nd_vfy_ok{}, nd_vfy_bad{}, c_tail_dopen{}, n_tail_dopen{};
         std::array<u64, 16> nd_fail{};
         std::array<u64, 4> c_nd_ph{}; ///< direct bind: buffers, vertex / index, NativeOpen
+        u64 c_bind_copen{}, n_bind_copen{}, last_bind_cyc{}; ///< generic BindResources of colour openers
         bool last_open_direct{};
         /// Bindless census (sec. 11): colour openers by DrawTail event flags (texmiss 1,
         /// recorded 2, uploaded 4, giant 8, clip 16), [1] = right after an image-key close.

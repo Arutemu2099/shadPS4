@@ -2243,6 +2243,9 @@ void Rasterizer::ExecuteDraw(const SplitDraw& draw,
                 if (native_stats.last_open_direct) {
                     native_stats.c_tail_dopen += dt;
                     ++native_stats.n_tail_dopen;
+                } else {
+                    native_stats.c_bind_copen += native_stats.last_bind_cyc;
+                    ++native_stats.n_bind_copen;
                 }
                 {
                     const u32 a = native_stats.close_key ? 1u : 0u;
@@ -5892,7 +5895,8 @@ void Rasterizer::NativeLog() {
                  "NativeDirect: candidates={} direct openers={} (DrawTail {:.0f} cycles each) | "
                  "fails 1..9: {} {} {} {} {} {} {} {} {} | verify ok={} MISMATCH={} "
                  "(restructured between the binds {}) | cycles per direct bind: buffers {:.0f} "
-                 "vertex+index {:.0f} NativeOpen {:.0f} | NativeOpen fail lines: see NativeOpenFail",
+                 "vertex+index {:.0f} NativeOpen {:.0f} | generic colour openers: BindResources "
+                 "{:.0f} (n={})",
                  st.nd_cand, st.nd_ok,
                  double(st.c_tail_dopen) / double(std::max<u64>(st.n_tail_dopen, 1)),
                  st.nd_fail[1], st.nd_fail[2], st.nd_fail[3], st.nd_fail[4], st.nd_fail[5],
@@ -5900,7 +5904,9 @@ void Rasterizer::NativeLog() {
                  st.nd_vfy_bad, st.nd_fail[15],
                  double(st.c_nd_ph[0]) / double(std::max<u64>(st.nd_cand, 1)),
                  double(st.c_nd_ph[1]) / double(std::max<u64>(st.nd_cand, 1)),
-                 double(st.c_nd_ph[2]) / double(std::max<u64>(st.nd_cand, 1)));
+                 double(st.c_nd_ph[2]) / double(std::max<u64>(st.nd_cand, 1)),
+                 double(st.c_bind_copen) / double(std::max<u64>(st.n_bind_copen, 1)),
+                 st.n_bind_copen);
     }
     if (st.bl_open + st.bl_open_fail != 0) {
         LOG_INFO(Render_Vulkan,
@@ -6380,7 +6386,9 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
         const u64 fc_seq0 = scheduler.RecordSeq();
         const u64 fc_up0 = buffer_cache.SyncUploadBytesTotal();
         native_stats.giant_bound = false;
+        const u64 br0 = __rdtsc();
         bound = BindResources(pipeline);
+        native_stats.last_bind_cyc = __rdtsc() - br0;
         native_stats.last_flags = (draw_repeat.tex_nonhit_stages != 0 ? 1u : 0u) |
                                   (scheduler.RecordSeq() != fc_seq0 ? 2u : 0u) |
                                   (buffer_cache.SyncUploadBytesTotal() != fc_up0 ? 4u : 0u) |
