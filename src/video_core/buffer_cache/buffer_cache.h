@@ -287,6 +287,14 @@ public:
     }
     /// NATIVE_COHERENT=2: runs the per-binding sync the skip replaced and classifies any upload.
     void CoherentVerify(Buffer& buffer, VAddr addr, u32 size);
+    /// SHADPS4_NATIVE_COHERENT: the CP wrote these guest bytes inside a submission with no
+    /// coherence point after it (DMA CPU paths, occlusion dumps): sync them now. CP thread.
+    void CoherentCpWrite(VAddr addr, u64 size) {
+        if (g_native_coherent != 0 && coherent_live && size != 0) {
+            ++coherent_stats.dma_syncs;
+            SynchronizeBuffersInRange(addr, size);
+        }
+    }
     void NoteCoherentSpanSkip() noexcept {
         ++coherent_stats.span_skips;
     }

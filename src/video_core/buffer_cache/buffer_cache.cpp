@@ -3910,12 +3910,9 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + num_bytes / sizeof(u32), value);
             memory_tracker->ClearRecent(address, num_bytes);
-            if (g_native_coherent != 0 && coherent_live) {
-                // SHADPS4_NATIVE_COHERENT: the CP wrote guest memory mid-submission; later reads
-                // in this submission skip validity, so the bytes are due now.
-                ++coherent_stats.dma_syncs;
-                SynchronizeBuffersInRange(address, num_bytes);
-            }
+            // SHADPS4_NATIVE_COHERENT: the CP wrote guest memory mid-submission; later reads in
+            // this submission skip validity, so the bytes are due now.
+            CoherentCpWrite(address, num_bytes);
             return;
         }
     }
@@ -3944,11 +3941,7 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
             // Both buffers were not transferred to GPU yet. Can safely copy in host memory.
             memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
             memory_tracker->ClearRecent(dst, num_bytes);
-            if (g_native_coherent != 0 && coherent_live) {
-                // SHADPS4_NATIVE_COHERENT: as FillBuffer's CPU path.
-                ++coherent_stats.dma_syncs;
-                SynchronizeBuffersInRange(dst, num_bytes);
-            }
+            CoherentCpWrite(dst, num_bytes); // SHADPS4_NATIVE_COHERENT: as FillBuffer's CPU path.
             return;
         }
         // Without a readback there's nothing we can do with this
@@ -5143,7 +5136,8 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
         JoinOverlap(new_buffer_id, overlap_id, !overlap.has_stream_leap);
     }
     Register(new_buffer_id);
-    if (g_native_coherent != 0 && coherent_live && Common::FaultMonitor::t_is_cp_thread) {
+    if (g_native_coherent != 0 && coherent_live &&
+        (Common::FaultMonitor::t_is_cp_thread || Common::FaultMonitor::t_acting_cp)) {
         // SHADPS4_NATIVE_COHERENT: reads of this buffer skip validity from now on, so every page
         // the joined buffers did not carry is uploaded now (the tracker starts them dirty), not
         // at a binding.
@@ -5764,10 +5758,14 @@ void BufferCache::CoherenceSync(bool bounded, u32 bound_lo) {
     if (g_native_coherent == 0) {
         return;
     }
-    if (g_back_clean == 0) {
+    if (g_back_clean == 0 || g_epoch_defer_upload || g_range_notes || g_asc_deps) {
+        // BACK_CLEAN: the dirty log. EPOCH_DEFER_UPLOAD leaves drained pages dirty and unprotected
+        // (never logged again: stale for good; Opus review A). RANGE_NOTES / ASC deps need the
+        // per-binding notes the skip does not make (review E).
         if (!coherent_warned) {
             coherent_warned = true;
-            LOG_CRITICAL(Render, "NativeCoherent: needs SHADPS4_BACK_CLEAN=1 (the dirty log); off");
+            LOG_CRITICAL(Render, "NativeCoherent: needs SHADPS4_BACK_CLEAN=1 and no EPOCH_DEFER_UPLOAD "
+                                 "/ range notes / ASC deps; off");
         }
         return;
     }
@@ -5784,12 +5782,13 @@ void BufferCache::CoherenceSync(bool bounded, u32 bound_lo) {
     const bool ok = DirtyLog::DrainTo(coherent_head, end, [this](u64 first, u64 count, bool) {
         coherent_runs.emplace_back(first, count);
     });
+    bool peek_ok = true;
     if (bounded && ok && end != tail) {
         // The bound is the front's view; the front runs ahead of the back, so the CP's own guest
         // writes (bit 10; before this point in stream order) may sit after it (s451: 75 missed
         // pages at load). Peek past the bound for them; they are drained again later (clean then).
         u64 peek = coherent_head;
-        DirtyLog::DrainTo(peek, tail, [this, &cs](u64 first, u64 count, bool by_cp) {
+        peek_ok = DirtyLog::DrainTo(peek, tail, [this, &cs](u64 first, u64 count, bool by_cp) {
             if (by_cp) {
                 ++cs.cp_peeked;
                 coherent_runs.emplace_back(first, count);
@@ -5797,7 +5796,7 @@ void BufferCache::CoherenceSync(bool bounded, u32 bound_lo) {
         });
     }
     const u64 bytes0 = sync_upload_bytes_total;
-    if (!ok || !coherent_live) {
+    if (!ok || !peek_ok || !coherent_live) {
         // First point, or log entries were lost: every cached buffer, whole (rare: loading).
         ++cs.sweeps;
         ForEachBufferInRange(0, u64{1} << 40, [this](BufferId, Buffer& buffer) {

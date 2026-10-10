@@ -1893,7 +1893,10 @@ void Liverpool::ExecuteRecordImpl(const CpSplit::RecordHeader& record) {
     case CpSplit::RecordType::EpochBump: {
         const auto* epoch = reinterpret_cast<const CpSplit::EpochPayload*>(payload);
         VideoCore::BumpSubmitEpoch(static_cast<PM4ItOpcode>(epoch->opcode));
-        if (VideoCore::g_native_coherent != 0 && rasterizer) {
+        static const bool mtb = Vulkan::MtbP1Requested() || g_mtb_p3 != 0;
+        if (VideoCore::g_native_coherent != 0 && rasterizer && !mtb) {
+            // (Never under MTB P1 / P3: a worker could skip-bind past a point the committer has not
+            // run yet; Opus review F. Without points the skip never goes live.)
             // Milestone 1 (native-path sec. 17): memory coherence once per submission. A
             // submission start (Nop) is bounded by the tail the front read; other points (memory
             // wait satisfied, CP-side guest write) take everything logged so far.
@@ -4146,6 +4149,9 @@ void Liverpool::ExecuteGfxPacket(const PM4Header* header, bool guest_markers_ena
                 // SHADPS4_OCCLUSION_QUERIES=1: real queries (vk_occlusion.h) publish their counts
                 // here; the probe and the fake below are then unused.
                 if (rasterizer && rasterizer->OcclusionDump(results, num_counter_pairs)) {
+                    // EVENT_WRITE keeps the submit epoch: no coherence point follows (review B).
+                    rasterizer->GetBufferCache().CoherentCpWrite(reinterpret_cast<VAddr>(results),
+                                                                 u64{num_counter_pairs} * 16);
                     break;
                 }
                 if (occlusion_log) [[unlikely]] {
@@ -4183,11 +4189,16 @@ void Liverpool::ExecuteGfxPacket(const PM4Header* header, bool guest_markers_ena
                     }
                 }
                 if (occlusion_fake != 2) {
+                    u64* const first = results;
                     for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
                         *results = pixel_counter | OcclusionCounterValidMask;
                     }
                     if (occlusion_fake != 0) {
                         pixel_counter += OcclusionCounterStep;
+                    }
+                    if (rasterizer) {
+                        rasterizer->GetBufferCache().CoherentCpWrite(
+                            reinterpret_cast<VAddr>(first), u64{num_counter_pairs} * 16);
                     }
                 }
             }
