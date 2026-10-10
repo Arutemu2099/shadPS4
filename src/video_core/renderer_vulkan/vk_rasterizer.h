@@ -113,6 +113,18 @@ public:
             pipeline_cache.PrepareNativeColour(pipeline, vi);
         }
     }
+    // ---- Architecture A worker parser (video_core/amdgpu/lean_parse.*): pure, regs-taking
+    // mirrors of the front's per-draw decisions. Any thread; no member, counter or cache touched.
+    /// SkipEmptyDraw's decision for `regs` (SHADPS4_EMPTY_DRAWS=2 and zero indices / instances)
+    /// without the front's EMPTY_DRAWS counters.
+    static bool SkipEmptyDrawRegs(const AmdGpu::Regs& regs);
+    /// Read-only: would PipelineCache::PrepareNativeColour(pipeline, vi) return without changing
+    /// anything? False when the front would decide the pipeline's eligibility or claim a slot for
+    /// this vertex description (the worker stops and leaves the draw to the front). Reads the
+    /// front-written eligibility byte and the slot keys only.
+    static bool NativeColourVariantReady(const GraphicsPipeline* pipeline,
+                                         const AmdGpu::CpSplit::VertexInputsDerived& vi);
+
     /// Front thread: compute pipeline lookup against the current queue's cs registers.
     const ComputePipeline* PrepareDispatchFront();
     /// CP split run-ahead VERIFY, back thread, only while the front is parked on a synchronous

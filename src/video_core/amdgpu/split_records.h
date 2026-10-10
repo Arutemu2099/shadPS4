@@ -52,6 +52,38 @@ inline u32 StageBytes(const Shader::Info& info) {
     return static_cast<u32>((bytes + 7) & ~size_t{7});
 }
 
+/// The same block size from the per-draw word counts alone (architecture A worker parser: the
+/// words live in a GraphicsLookupScratch stage, not in the shared Info).
+inline u32 StageBytes(u32 ud_dw, u32 flat_dw) {
+    const size_t bytes = sizeof(CpSplit::StagePayload) + (size_t{ud_dw} + flat_dw) * sizeof(u32);
+    return static_cast<u32>((bytes + 7) & ~size_t{7});
+}
+
+/// WriteStage from caller-owned per-draw data (Vulkan::GraphicsLookupScratch::Stage after
+/// PipelineCache::LookupGraphics): `info` is the SHARED Shader::Info pointer the back reads the
+/// immutable part of; the words are exactly what the front's lookup would have left in that Info
+/// for the same registers. Same bytes, same layout as WriteStage(out, info, logical_stage).
+inline u8* WriteStage(u8* out, const Shader::Info* info, VAddr pgm_base,
+                      std::span<const u32> user_data, std::span<const u32> flattened_ud_buf,
+                      u32 logical_stage) {
+    auto* stage = reinterpret_cast<CpSplit::StagePayload*>(out);
+    stage->info = info;
+    stage->pgm_base = pgm_base;
+    stage->logical_stage = logical_stage;
+    stage->ud_dw = static_cast<u32>(user_data.size());
+    stage->flat_dw = static_cast<u32>(flattened_ud_buf.size());
+    stage->pad = 0;
+    auto* dwords = reinterpret_cast<u32*>(stage + 1);
+    if (!user_data.empty()) {
+        std::memcpy(dwords, user_data.data(), user_data.size_bytes());
+    }
+    if (!flattened_ud_buf.empty()) {
+        std::memcpy(dwords + stage->ud_dw, flattened_ud_buf.data(),
+                    flattened_ud_buf.size_bytes());
+    }
+    return out + StageBytes(stage->ud_dw, stage->flat_dw);
+}
+
 /// Copies what the back reads of a stage's per-draw data (Shader::BoundStage): user data,
 /// flat buffer and pgm_base, as the lookup just left them in the shared Info.
 inline u8* WriteStage(u8* out, const Shader::Info& info, u32 logical_stage) {

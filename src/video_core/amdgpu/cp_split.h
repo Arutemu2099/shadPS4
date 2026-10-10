@@ -552,6 +552,14 @@ public:
         }
         return r;
     }
+    /// SHADPS4_LEAN shadow: nobody consumes this channel - every commit counts as executed.
+    bool self_consume{false};
+    /// SHADPS4_LEAN: no MaybeLog lines from this channel.
+    bool quiet{false};
+    /// SHADPS4_LEAN shadow compare: when set, every register word written (EmitRegWrite) and
+    /// every other committed record (canon_fn) is appended as canonical u64 events.
+    std::vector<u64>* canon{};
+    void (*canon_fn)(std::vector<u64>&, const RecordHeader&){};
     /// SHADPS4_A2_PARK: A2 workers parked until something they wait for changes (a publish, the
     /// front starting to wait, the back waiting on a stretch). Rung only while one is parked.
     alignas(64) std::atomic<u32> reader_parked{0};

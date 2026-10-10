@@ -41,6 +41,7 @@
 #include "video_core/amdgpu/split_hazard.h"
 #include "video_core/renderdoc.h"
 #include "video_core/amdgpu/lean_front_api.h"
+#include "video_core/amdgpu/lean_parse.h"
 #include "video_core/amdgpu/split_records.h"
 #include "video_core/renderer_vulkan/vk_a2.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -1176,6 +1177,405 @@ void RegScanLog(RegScanStats& st, u64 now) {
              st.asc_sh_max);
     st = RegScanStats{};
     st.win_tsc = now;
+}
+
+/// SHADPS4_LEAN (architecture A piece 2, lean worker parser; notes/architecture-a-2026-10-10.md sec. 16):
+/// 1 = L1 shadow (the front still parses everything; workers parse each DCB's head span into a
+/// scratch channel and the two record streams are compared as canonical events).
+const int g_lean = [] {
+    const char* v = std::getenv("SHADPS4_LEAN");
+    return v ? v[0] - '0' : 0;
+}();
+constexpr u32 LeanSlots = 128;
+struct LeanJob {
+    std::atomic<u32> state{0};     ///< 0 free, 1 queued (worker may take it)
+    std::atomic<u32> done_mask{0}; ///< 1 front finished its events, 2 worker finished
+    std::atomic<u32> index{0};
+    std::span<const u32> dcb;
+    u32 cut_dw{};
+    u32 dcb_pkts{}, dcb_draws{}; ///< whole DCB (chain scan)
+    std::vector<u32> win; ///< the chain's register windows at the DCB start (DcbSnapWindows order)
+    std::array<CbDbExtent, NUM_COLOR_BUFFERS> cb{};
+    CbDbExtent db{};
+    u64 epoch{};
+    ComputeProgram cs{};
+    VAddr iaa{};
+    std::vector<u64> front_canon;
+    std::vector<std::pair<u32, u32>> front_marks; ///< (packet dword offset, events before it)
+    std::vector<u64> worker_canon;
+    Lean::SpanResult res{};
+};
+struct LeanCounters {
+    std::atomic<u64> dcbs{}, eligible{}, skipped{}, cmp{}, bad{}, events{}, pkts{}, pkts_span{},
+        draws{}, draws_span{}, no_mark{}, epoch_bumps{};
+    std::array<std::atomic<u64>, 16> stops{};
+    std::array<std::atomic<u64>, 256> stop_ops{};
+};
+struct LeanState {
+    std::array<LeanJob, LeanSlots> jobs;
+    std::atomic<u32> next_claim{1};
+    alignas(64) std::atomic<u32> queued{0}; ///< newest DCB index handed to the workers
+    std::atomic<bool> stop{false};
+    std::vector<std::jthread> workers;
+    bool started{};
+    // The chain (front-owned in L1).
+    std::unique_ptr<Regs> regs;
+    std::array<CbDbExtent, NUM_COLOR_BUFFERS> cb{};
+    CbDbExtent db{};
+    u64 epoch{};
+    ComputeProgram cs{};
+    VAddr iaa{};
+    bool seeded{};
+    u32 index{};
+    u64 chain_cyc{}, chain_cmp{}, chain_bad_win{}, chain_bad_full{}, chain_bad_extra{}, reseeds{};
+    LeanCounters c;
+    u64 win_tsc{};
+};
+LeanState g_lean_s;
+/// The front's DCB being recorded (top level only).
+struct LeanFront {
+    LeanJob* job{};
+    const u32* base{};
+    bool recording{};
+};
+LeanFront g_lean_front;
+
+/// Canonical events of one committed record (not RegWrite: those are recorded word by word).
+/// Fields, never struct bytes; the vertex-input description id is excluded (worker numbering).
+void LeanCanonRecord(std::vector<u64>& v, const CpSplit::RecordHeader& h) {
+    using RT = CpSplit::RecordType;
+    const auto ev = [&](u64 kind, u64 x) { v.push_back((kind << 56) | (x & 0x00ffffffffffffffull)); };
+    const auto* p = reinterpret_cast<const u8*>(&h + 1);
+    switch (h.type) {
+    case RT::ClearState:
+        ev(2, 0);
+        break;
+    case RT::Extent: {
+        const auto& e = *reinterpret_cast<const CpSplit::ExtentPayload*>(p);
+        ev(3, (u64{e.slot} << 32) | e.raw);
+        break;
+    }
+    case RT::EpochBump:
+        ev(4, reinterpret_cast<const CpSplit::EpochPayload*>(p)->opcode);
+        break;
+    case RT::Draw: {
+        const auto& r = *reinterpret_cast<const SplitDrawRecord*>(p);
+        ev(5, reinterpret_cast<u64>(r.draw.pipeline));
+        ev(6, u64{r.draw.args.is_indexed} | u64{r.draw.args.is_indirect} << 1 |
+                  u64(static_cast<u32>(r.draw.draw_class)) << 2 | u64{r.draw.skip} << 10 |
+                  u64{r.draw.args.index_offset} << 16);
+        ev(7, r.ctx_epoch);
+        ev(8, (u64{r.job_tag} << 32) | r.job_idx);
+        ev(9, reinterpret_cast<u64>(r.cmd_address));
+        ev(10, (u64{r.stage_count} << 32) | (r.marker != nullptr ? 1u : 0u) | (u64{r.verify} << 8));
+        std::array<Shader::BoundStage, Shader::MaxStageTypes> st{};
+        const u8* end = ReadStages(reinterpret_cast<const u8*>(&r + 1), r.stage_count, st);
+        for (u32 s = 0; s < st.size(); ++s) {
+            if (!st[s].info) {
+                continue;
+            }
+            ev(11, (u64{s} << 48) | reinterpret_cast<u64>(st[s].info));
+            ev(12, st[s].pgm_base);
+            ev(13, (u64(st[s].user_data.size()) << 32) | st[s].flattened_ud_buf.size());
+            for (const u32 w : st[s].user_data) {
+                ev(14, w);
+            }
+            for (const u32 w : st[s].flattened_ud_buf) {
+                ev(15, w);
+            }
+        }
+        if (r.vi_bytes != 0) {
+            const auto& vi = *reinterpret_cast<const CpSplit::VertexInputsPayload*>(end);
+            ev(16, (u64{vi.count} << 32) | vi.range_count);
+            const auto* at = CpSplit::VertexInputAttribs(vi);
+            for (u32 k = 0; k < vi.count; ++k) {
+                ev(17, (u64{at[k].desc.vk_format} << 32) | at[k].desc.stride);
+                ev(18, (u64{at[k].desc.divisor} << 16) | (u64{at[k].desc.location} << 8) |
+                           at[k].desc.instanced);
+                ev(19, at[k].base_address);
+                ev(20, (u64{at[k].size} << 16) | at[k].range);
+            }
+            const auto* rg = CpSplit::VertexInputRanges(vi);
+            for (u32 k = 0; k < vi.range_count; ++k) {
+                ev(21, rg[k].base_address);
+                ev(22, rg[k].end_address);
+            }
+        }
+        break;
+    }
+    case RT::Packet: {
+        const auto* w = reinterpret_cast<const u32*>(p);
+        ev(23, (u64{h.size} << 32) | w[0]);
+        break;
+    }
+    default:
+        ev(30, static_cast<u32>(h.type));
+        break;
+    }
+}
+
+/// The lean parser's packet set (the worker stops before the first packet outside it).
+bool LeanSupported(const PM4Header* header, bool guest_markers) {
+    switch (header->type3.opcode) {
+    case PM4ItOpcode::Nop:
+        return !LeanNopHasBackEffect(header, guest_markers);
+    case PM4ItOpcode::ContextControl:
+    case PM4ItOpcode::AcquireMem:
+    case PM4ItOpcode::ClearState:
+    case PM4ItOpcode::SetConfigReg:
+    case PM4ItOpcode::SetContextReg:
+    case PM4ItOpcode::SetShReg:
+    case PM4ItOpcode::SetUconfigReg:
+    case PM4ItOpcode::IndexType:
+    case PM4ItOpcode::IndexBase:
+    case PM4ItOpcode::IndexBufferSize:
+    case PM4ItOpcode::NumInstances:
+    case PM4ItOpcode::SetBase:
+    case PM4ItOpcode::DrawIndex2:
+    case PM4ItOpcode::DrawIndexOffset2:
+    case PM4ItOpcode::DrawIndexAuto:
+        return true;
+    case PM4ItOpcode::DmaData:
+        return reinterpret_cast<const PM4DmaData*>(header)->dst_addr_lo == 0x3022C;
+    default:
+        return false;
+    }
+}
+
+/// The chain's register-only pass over one DCB (+ the non-register items the supported packets
+/// change, mirroring ProcessGraphics), finding the cut and counting packets / draws.
+void LeanChainScan(std::span<const u32> dcb, LeanState& s, bool guest_markers, u32& cut_dw,
+                   u32& pkts, u32& draws) {
+    const u32* base = dcb.data();
+    auto& r = *s.regs;
+    cut_dw = static_cast<u32>(dcb.size());
+    bool cut = false;
+    while (!dcb.empty()) {
+        const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
+        if (header->type == 2) {
+            dcb = dcb.subspan(1);
+            continue;
+        }
+        if (header->type != 3) {
+            break;
+        }
+        const u32 count = header->type3.NumWords();
+        const auto* w = reinterpret_cast<const u32*>(header);
+        const auto op = static_cast<PM4ItOpcode>(header->type3.opcode.Value());
+        ++pkts;
+        if (!cut && !LeanSupported(header, guest_markers)) {
+            cut = true;
+            cut_dw = static_cast<u32>(dcb.data() - base);
+        }
+        switch (op) {
+        case PM4ItOpcode::ClearState:
+            r.SetDefaults();
+            ++s.epoch;
+            break;
+        case PM4ItOpcode::SetConfigReg:
+            std::memcpy(&r.reg_array[Regs::ConfigRegWordOffset + (w[1] & 0xffff)], w + 2,
+                        size_t{count - 1} * 4);
+            break;
+        case PM4ItOpcode::SetContextReg: {
+            const u32 reg_addr = Regs::ContextRegWordOffset + (w[1] & 0xffff);
+            const u32* payload = w + 2;
+            const size_t sz = size_t{count - 1} * 4;
+            if (LeanViewportMemoEnabled() && std::memcmp(&r.reg_array[reg_addr], payload, sz) != 0) {
+                ++s.epoch;
+            }
+            std::memcpy(&r.reg_array[reg_addr], payload, sz);
+            // The CB / DB extent NOP hints (as ProcessGraphics' SET_CONTEXT_REG).
+            const u32 nop_offset = header->type3.count;
+            if (reg_addr >= Liverpool::ContextRegs::CbColor0Base && reg_addr <= Liverpool::ContextRegs::CbColor7Base &&
+                (reg_addr - Liverpool::ContextRegs::CbColor0Base) %
+                        (Liverpool::ContextRegs::CbColor1Base - Liverpool::ContextRegs::CbColor0Base) == 0) {
+                const u32 id = (reg_addr - Liverpool::ContextRegs::CbColor0Base) /
+                               (Liverpool::ContextRegs::CbColor1Base - Liverpool::ContextRegs::CbColor0Base);
+                if (nop_offset == 0x0e || nop_offset == 0x0d || nop_offset == 0x0b) {
+                    s.cb[id].raw = payload[nop_offset + 1];
+                } else {
+                    s.cb[id].raw = 0;
+                }
+            } else if (reg_addr >= Liverpool::ContextRegs::CbColor0Cmask &&
+                       reg_addr <= Liverpool::ContextRegs::CbColor7Cmask &&
+                       (reg_addr - Liverpool::ContextRegs::CbColor0Cmask) %
+                               (Liverpool::ContextRegs::CbColor1Cmask - Liverpool::ContextRegs::CbColor0Cmask) == 0) {
+                const u32 id = (reg_addr - Liverpool::ContextRegs::CbColor0Cmask) /
+                               (Liverpool::ContextRegs::CbColor1Cmask - Liverpool::ContextRegs::CbColor0Cmask);
+                if (nop_offset == 0x04) {
+                    s.cb[id].raw = payload[nop_offset + 1];
+                }
+            } else if (reg_addr == Liverpool::ContextRegs::DbZInfo) {
+                s.db.raw = header->type3.count == 8 ? payload[21] : 0;
+            }
+            break;
+        }
+        case PM4ItOpcode::SetShReg: {
+            const u32 off = w[1] & 0xffff;
+            if (off >= 0x200 && off <= 0x200 + sizeof(ComputeProgram) / 4) {
+                std::memcpy(reinterpret_cast<u32*>(&s.cs) + (off - 0x200), w + 2,
+                            size_t{count - 1} * 4);
+            } else {
+                std::memcpy(&r.reg_array[Regs::ShRegWordOffset + off], w + 2, size_t{count - 1} * 4);
+            }
+            break;
+        }
+        case PM4ItOpcode::SetUconfigReg:
+            std::memcpy(&r.reg_array[Regs::UconfigRegWordOffset + (w[1] & 0xffff)], w + 2,
+                        size_t{count - 1} * 4);
+            break;
+        case PM4ItOpcode::IndexType:
+            r.index_buffer_type.raw = reinterpret_cast<const PM4CmdDrawIndexType*>(header)->raw;
+            break;
+        case PM4ItOpcode::DrawIndex2: {
+            const auto* d = reinterpret_cast<const PM4CmdDrawIndex2*>(header);
+            r.max_index_size = d->max_size;
+            r.index_base_address.base_addr_lo = d->index_base_lo;
+            r.index_base_address.base_addr_hi = d->index_base_hi;
+            r.num_indices = d->index_count;
+            r.draw_initiator = d->draw_initiator;
+            ++draws;
+            break;
+        }
+        case PM4ItOpcode::DrawIndexOffset2: {
+            const auto* d = reinterpret_cast<const PM4CmdDrawIndexOffset2*>(header);
+            r.max_index_size = d->max_size;
+            r.num_indices = d->index_count;
+            r.draw_initiator = d->draw_initiator;
+            ++draws;
+            break;
+        }
+        case PM4ItOpcode::DrawIndexAuto: {
+            const auto* d = reinterpret_cast<const PM4CmdDrawIndexAuto*>(header);
+            r.num_indices = d->index_count;
+            r.draw_initiator = d->draw_initiator;
+            ++draws;
+            break;
+        }
+        case PM4ItOpcode::DrawIndirect:
+        case PM4ItOpcode::DrawIndexIndirect:
+        case PM4ItOpcode::DrawIndirectMulti:
+        case PM4ItOpcode::DrawIndexIndirectMulti:
+        case PM4ItOpcode::DrawIndexIndirectCountMulti:
+            ++draws;
+            break;
+        case PM4ItOpcode::NumInstances:
+            r.num_instances.num_instances =
+                reinterpret_cast<const PM4CmdDrawNumInstances*>(header)->num_instances;
+            break;
+        case PM4ItOpcode::IndexBase: {
+            const auto* b = reinterpret_cast<const PM4CmdDrawIndexBase*>(header);
+            r.index_base_address.base_addr_lo = b->addr_lo;
+            r.index_base_address.base_addr_hi = b->addr_hi;
+            break;
+        }
+        case PM4ItOpcode::IndexBufferSize:
+            r.num_indices = reinterpret_cast<const PM4CmdDrawIndexBufferSize*>(header)->num_indices;
+            break;
+        case PM4ItOpcode::SetBase:
+            s.iaa = reinterpret_cast<const PM4CmdSetBase*>(header)->Address<u64>();
+            break;
+        case PM4ItOpcode::EventWrite:
+            if (reinterpret_cast<const PM4CmdEventWrite*>(header)->event_type.Value() ==
+                EventType::SoVgtStreamoutFlush) {
+                r.cp_strmout_cntl.offset_update_done = 1;
+            }
+            break;
+        default:
+            break;
+        }
+        dcb = dcb.subspan(std::min<size_t>(dcb.size(), size_t{count} + 1));
+    }
+}
+
+/// Compares the front's and the worker's events of one DCB (whoever finishes second).
+void LeanCompare(LeanJob& j) {
+    auto& c = g_lean_s.c;
+    const auto& res = j.res;
+    size_t n_front = j.front_canon.size();
+    if (res.end_dw < j.dcb.size()) {
+        n_front = ~size_t{0};
+        for (const auto& [off, n] : j.front_marks) {
+            if (off == res.end_dw) {
+                n_front = n;
+                break;
+            }
+        }
+    }
+    c.pkts_span += res.packets;
+    c.draws_span += res.draws;
+    for (const u64 e : j.worker_canon) {
+        c.epoch_bumps += (e >> 56) == 4 ? 1 : 0; // EpochBump events inside the worker's span
+    }
+    c.stops[std::min<u32>(static_cast<u32>(res.stop), 15)] += 1;
+    if (res.stop != Lean::Stop::End && res.stop != Lean::Stop::Cut) {
+        c.stop_ops[res.stop_opcode & 255] += 1;
+    }
+    if (n_front == ~size_t{0}) {
+        ++c.no_mark;
+    } else {
+        ++c.cmp;
+        c.events += j.worker_canon.size();
+        size_t i = 0;
+        const size_t n = std::min(n_front, j.worker_canon.size());
+        while (i < n && j.front_canon[i] == j.worker_canon[i]) {
+            ++i;
+        }
+        if (i != n_front || i != j.worker_canon.size()) {
+            if (++c.bad <= 24) {
+                LOG_WARNING(Render,
+                            "Lean verify: DCB {} differs at event {} of front {} / worker {}: front "
+                            "{:#018x} worker {:#018x} (span {} packets {} draws, stop {})",
+                            j.index.load(), i, n_front, j.worker_canon.size(),
+                            i < n_front ? j.front_canon[i] : 0ull,
+                            i < j.worker_canon.size() ? j.worker_canon[i] : 0ull, res.packets,
+                            res.draws, static_cast<u32>(res.stop));
+            }
+        }
+    }
+    j.done_mask.store(0, std::memory_order_relaxed);
+    j.state.store(0, std::memory_order_release);
+}
+
+void LeanLog() {
+    auto& s = g_lean_s;
+    auto& c = s.c;
+    const u64 now = __rdtsc();
+    const double sec = double(now - s.win_tsc) / 3.5e9;
+    std::string stops;
+    for (u32 i = 0; i < 16; ++i) {
+        if (c.stops[i] != 0) {
+            stops += fmt::format(" {}={}", i, c.stops[i].load());
+        }
+    }
+    std::string ops;
+    for (u32 i = 0; i < 256; ++i) {
+        if (c.stop_ops[i] != 0) {
+            ops += fmt::format(" op{:#04x}={}", i, c.stop_ops[i].load());
+        }
+    }
+    const double pk = double(c.pkts.load()), dr = double(c.draws.load());
+    LOG_INFO(Render,
+             "Lean (mode {}): window {:.1f}s | DCBs {} eligible {} skipped (slot busy) {} | chain "
+             "{:.2f} ms/s, verified {} DCBs: windows bad {} whole-file bad {} extras bad {} reseeds "
+             "{} | worker spans compared {} BAD {} (events {}, no mark {}) | coverage: packets "
+             "{:.1f}% draws {:.1f}% | epoch bumps inside worker spans {} | stops (by Lean::Stop "
+             "value):{} | other-stop opcodes:{}",
+             g_lean, sec, c.dcbs.load(), c.eligible.load(), c.skipped.load(),
+             double(s.chain_cyc) / 3.5e6 / std::max(sec, 1e-9), s.chain_cmp, s.chain_bad_win,
+             s.chain_bad_full, s.chain_bad_extra, s.reseeds, c.cmp.load(), c.bad.load(),
+             c.events.load(), c.no_mark.load(), pk > 0 ? 100.0 * double(c.pkts_span) / pk : 0.0,
+             dr > 0 ? 100.0 * double(c.draws_span) / dr : 0.0, c.epoch_bumps.load(), stops, ops);
+    for (auto& x : c.stops) {
+        x = 0;
+    }
+    for (auto& x : c.stop_ops) {
+        x = 0;
+    }
+    c.dcbs = c.eligible = c.skipped = c.cmp = c.bad = c.events = c.pkts = c.pkts_span = c.draws =
+        c.draws_span = c.no_mark = c.epoch_bumps = 0;
+    s.chain_cyc = s.chain_cmp = s.chain_bad_win = s.chain_bad_full = s.chain_bad_extra = s.reseeds = 0;
+    s.win_tsc = now;
 }
 
 const bool g_native_timing_rec = [] {
@@ -2893,7 +3293,102 @@ void Liverpool::A2WorkerLoop(std::stop_token stoken, u32 index) {
     }
 }
 
+void Liverpool::LeanStart() {
+    auto& s = g_lean_s;
+    s.started = true;
+    s.regs = std::make_unique<Regs>();
+    s.win_tsc = __rdtsc();
+    static const u32 n = [] {
+        const char* v = std::getenv("SHADPS4_LEAN_WORKERS");
+        const u32 x = v ? static_cast<u32>(std::strtoul(v, nullptr, 10)) : 4u;
+        return std::clamp<u32>(x, 1, 8);
+    }();
+    for (u32 i = 0; i < n; ++i) {
+        s.workers.emplace_back(std::bind_front(&Liverpool::LeanWorkerLoop, this), i);
+    }
+    LOG_INFO(Render, "Lean: {} shadow parse workers started (mode {})", n, g_lean);
+}
+
+void Liverpool::LeanWorkerLoop(std::stop_token stoken, u32 index) {
+    Common::SetCurrentThreadName(fmt::format("shadPS4:LeanWorker{}", index).c_str());
+    auto& s = g_lean_s;
+    Lean::Env env{};
+    env.rasterizer = rasterizer;
+    env.pipeline_cache = &rasterizer->GetPipelineCache();
+    env.split_enabled = split_enabled;
+    env.split_run_ahead = split_run_ahead;
+    env.split_verify = split_verify;
+    env.split_post_dma = split_post_dma;
+    env.split_task_guard = split_task_guard;
+    env.split_front_derive = split_front_derive;
+    env.host_markers = EmulatorSettings.IsVkHostMarkersEnabled();
+    env.guest_markers = EmulatorSettings.IsVkGuestMarkersEnabled();
+    {
+        const char* v = std::getenv("SHADPS4_DRAW_TAG"); // = g_draw_tag_front (defined later)
+        env.draw_tag_front = v && v[0] == '1';
+    }
+    Lean::Parser parser{env};
+    CpSplit::Channel ch; // scratch: nobody reads it
+    ch.self_consume = true;
+    ch.quiet = true;
+    ch.canon_fn = &LeanCanonRecord;
+    Lean::ChainState st;
+    st.regs = std::make_unique<Regs>();
+    const auto stopping = [&] {
+        return stoken.stop_requested() || s.stop.load(std::memory_order_acquire);
+    };
+    while (!stopping()) {
+        const u32 idx = s.next_claim.fetch_add(1, std::memory_order_acq_rel);
+        for (u32 spins = 0; s.queued.load(std::memory_order_acquire) < idx;) {
+            if (stopping()) {
+                return;
+            }
+            if (++spins < 2048) {
+                _mm_pause();
+            } else {
+                const u32 seen = s.queued.load(std::memory_order_acquire);
+                if (seen < idx) {
+                    s.queued.wait(seen, std::memory_order_acquire);
+                }
+            }
+        }
+        auto& j = s.jobs[idx % LeanSlots];
+        if (j.index.load(std::memory_order_acquire) != idx ||
+            j.state.load(std::memory_order_acquire) != 1) {
+            continue; // not queued (slot busy / not eligible)
+        }
+        const u32* w = j.win.data();
+        for (const auto& [off, n] : CpSplit::DcbSnapWindows) {
+            std::memcpy(&st.regs->reg_array[off], w, size_t{n} * 4);
+            w += n;
+        }
+        st.cb_extent = j.cb;
+        st.db_extent = j.db;
+        st.ctx_epoch = j.epoch;
+        st.cs_state = j.cs;
+        st.indirect_args_addr = j.iaa;
+        st.vi_desc_id = (u64{1} << 63) | (u64{idx} << 20);
+        ch.canon = &j.worker_canon;
+        j.res = parser.Parse(j.dcb, j.cut_dw, st, ch);
+        ch.canon = nullptr;
+        if (j.done_mask.fetch_or(2, std::memory_order_acq_rel) == 1) {
+            LeanCompare(j);
+        }
+    }
+}
+
 void Liverpool::A2Shutdown() {
+    if (g_lean_s.started) {
+        auto& s = g_lean_s;
+        s.stop.store(true, std::memory_order_release);
+        s.queued.fetch_add(0x40000000u, std::memory_order_acq_rel);
+        s.queued.notify_all();
+        for (auto& w : s.workers) {
+            w.request_stop();
+        }
+        s.workers.clear(); // joins
+        s.started = false;
+    }
     auto& g = g_a2s;
     if (!g.started) {
         return;
@@ -6522,6 +7017,113 @@ void Liverpool::NativeRecHead(const PM4Header* header, const void* pipeline_ptr,
     }
 }
 
+void Liverpool::LeanFrontBegin(std::span<const u32> dcb, std::span<const u32> ccb,
+                               bool guest_markers) {
+    auto& s = g_lean_s;
+    auto& c = s.c;
+    if (!s.started) {
+        LeanStart();
+    }
+    ++c.dcbs;
+    if (s.win_tsc == 0) {
+        s.win_tsc = __rdtsc();
+    }
+    const u64 t0 = __rdtsc();
+    auto& gfx_cs = mapped_queues[GfxQueueId].cs_state;
+    // The chain must equal the front's live state here (the front parsed everything before).
+    const auto seed = [&] {
+        *s.regs = regs;
+        s.cb = last_cb_extent;
+        s.db = last_db_extent;
+        s.epoch = context_change_epoch;
+        s.cs = gfx_cs;
+        s.iaa = indirect_args_addr;
+        s.seeded = true;
+    };
+    if (!s.seeded) {
+        seed();
+    } else {
+        ++s.chain_cmp;
+        bool bad_win = false;
+        for (const auto& [off, n] : CpSplit::DcbSnapWindows) {
+            bad_win = bad_win ||
+                      std::memcmp(&s.regs->reg_array[off], &regs.reg_array[off], size_t{n} * 4) != 0;
+        }
+        bool bad_full = false;
+        if ((s.chain_cmp & 15) == 0) {
+            bad_full = std::memcmp(s.regs->reg_array.data(), regs.reg_array.data(),
+                                   sizeof(regs.reg_array)) != 0;
+        }
+        bool bad_extra = s.db.raw != last_db_extent.raw || s.epoch != context_change_epoch ||
+                         std::memcmp(&s.cs, &gfx_cs, sizeof(ComputeProgram)) != 0 ||
+                         s.iaa != indirect_args_addr;
+        for (u32 i = 0; i < NUM_COLOR_BUFFERS; ++i) {
+            bad_extra = bad_extra || s.cb[i].raw != last_cb_extent[i].raw;
+        }
+        s.chain_bad_win += bad_win;
+        s.chain_bad_full += bad_full;
+        s.chain_bad_extra += bad_extra;
+        if (bad_win || bad_full || bad_extra) {
+            if (s.chain_bad_win + s.chain_bad_full + s.chain_bad_extra <= 8) {
+                LOG_WARNING(Render, "Lean chain: state differs from the front at DCB {} (windows {} "
+                                    "whole file {} extras {}: epoch chain {} front {}, iaa {:#x} / {:#x})",
+                            s.index + 1, bad_win, bad_full, bad_extra, s.epoch,
+                            context_change_epoch, s.iaa, indirect_args_addr);
+            }
+            ++s.reseeds;
+            seed();
+        }
+    }
+    const u32 idx = ++s.index;
+    auto& j = s.jobs[idx % LeanSlots];
+    const bool eligible = ccb.empty();
+    bool queued = false;
+    if (eligible && j.state.load(std::memory_order_acquire) == 0 &&
+        j.done_mask.load(std::memory_order_acquire) == 0) {
+        // Entry state E(n) for the worker, then the scan carries the chain to E(n+1).
+        j.index.store(idx, std::memory_order_relaxed);
+        j.dcb = dcb;
+        j.win.resize(CpSplit::DcbSnapWords);
+        u32* out = j.win.data();
+        for (const auto& [off, n] : CpSplit::DcbSnapWindows) {
+            std::memcpy(out, &s.regs->reg_array[off], size_t{n} * 4);
+            out += n;
+        }
+        j.cb = s.cb;
+        j.db = s.db;
+        j.epoch = s.epoch;
+        j.cs = s.cs;
+        j.iaa = s.iaa;
+        j.front_canon.clear();
+        j.front_marks.clear();
+        j.worker_canon.clear();
+        queued = true;
+    }
+    u32 cut = 0, pkts = 0, draws = 0;
+    LeanChainScan(dcb, s, guest_markers, cut, pkts, draws);
+    s.chain_cyc += __rdtsc() - t0;
+    c.pkts += pkts;
+    c.draws += draws;
+    if (queued) {
+        ++c.eligible;
+        j.cut_dw = cut;
+        j.dcb_pkts = pkts;
+        j.dcb_draws = draws;
+        g_lean_front = {&j, dcb.data(), true};
+        j.state.store(1, std::memory_order_release);
+        s.queued.store(idx, std::memory_order_release);
+        s.queued.notify_all();
+    } else {
+        c.skipped += eligible ? 1 : 0;
+        // Not queued: the next index still advances so the workers' claims stay in step.
+        s.queued.store(idx, std::memory_order_release);
+        s.queued.notify_all();
+    }
+    if (c.dcbs >= 65536) {
+        LeanLog();
+    }
+}
+
 void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_marker,
                          const CpSplit::DrawArgs& args) {
     if (AmdGpu::NativeRec::g_mode >= 2) [[unlikely]] {
@@ -7572,6 +8174,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         st.ccbs += ccb.empty() ? 0 : 1;
         t_reg_scan_gfx_open = true;
     }
+    if (g_lean != 0 && !is_indirect_gfx && split_enabled && rasterizer) [[unlikely]] {
+        LeanFrontBegin(dcb, ccb, rasterizer && EmulatorSettings.IsVkGuestMarkersEnabled());
+    }
     SplitSpanScope split_span{*this, &dcb,
                               is_indirect_gfx ? CpSplit::DrainReason::TaskGuardIb
                                               : CpSplit::DrainReason::TaskGuard};
@@ -7593,6 +8198,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
     const bool asc_yield = AscYield();
     while (!dcb.empty()) {
+        if (g_lean_front.job != nullptr) [[unlikely]] {
+            split->canon = nullptr; // nothing between packets (host commands, ASC) is recorded
+        }
         ProcessCommands();
 
         if (asc_yield) {
@@ -7630,6 +8238,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             const PM4ItOpcode opcode = header->type3.opcode;
             if (g_front_cost) [[unlikely]] {
                 FrontCostTick(static_cast<u32>(opcode));
+            }
+            if (g_lean_front.recording &&
+                g_lean_front.base == reinterpret_cast<const u32*>(base_addr)) [[unlikely]] {
+                auto& lj = *g_lean_front.job;
+                const u32 off = static_cast<u32>(dcb.data() - g_lean_front.base);
+                lj.front_marks.emplace_back(off, static_cast<u32>(lj.front_canon.size()));
+                if (off >= lj.cut_dw) {
+                    g_lean_front.recording = false; // the front parses this and the rest
+                } else {
+                    split->canon = &lj.front_canon;
+                }
             }
             g_dispatch_sync.Note(64, opcode, header);
             if (AmdGpu::NativeRec::g_segb != 0) [[unlikely]] {
@@ -8384,6 +9003,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         ce_task.handle.destroy();
     }
 
+    if (g_lean != 0 && !is_indirect_gfx && g_lean_front.job != nullptr) [[unlikely]] {
+        split->canon = nullptr;
+        auto& lj = *g_lean_front.job;
+        g_lean_front = {};
+        if (lj.done_mask.fetch_or(1, std::memory_order_acq_rel) == 2) {
+            LeanCompare(lj);
+        }
+    }
     if (g_reg_scan && !is_indirect_gfx && t_reg_scan_regs) [[unlikely]] {
         auto& st = t_reg_scan;
         t_reg_scan_gfx_open = false;

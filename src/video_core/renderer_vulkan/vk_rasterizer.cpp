@@ -2006,14 +2006,22 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     DrawTail(pipeline, is_indexed, index_offset, sample, t_entry, t_pipeline, pipeline_ns);
 }
 
-bool Rasterizer::SkipEmptyDraw(const AmdGpu::Regs& r) {
-    // SHADPS4_EMPTY_DRAWS=1 counts direct draws with zero indices or zero instances (they render
-    // nothing but still bind every resource); =2 also skips them. Clears and resolves are
-    // handled in FilterDraw before this point. Register reads and statics only (front-safe).
+namespace {
+/// SHADPS4_EMPTY_DRAWS mode, read once (shared by SkipEmptyDraw and SkipEmptyDrawRegs).
+int EmptyDrawsMode() {
     static const int empty_draws = [] {
         const char* value = std::getenv("SHADPS4_EMPTY_DRAWS");
         return value ? value[0] - '0' : 0;
     }();
+    return empty_draws;
+}
+} // namespace
+
+bool Rasterizer::SkipEmptyDraw(const AmdGpu::Regs& r) {
+    // SHADPS4_EMPTY_DRAWS=1 counts direct draws with zero indices or zero instances (they render
+    // nothing but still bind every resource); =2 also skips them. Clears and resolves are
+    // handled in FilterDraw before this point. Register reads and statics only (front-safe).
+    const int empty_draws = EmptyDrawsMode();
     if (empty_draws > 0) {
         static u64 draws = 0, empty = 0;
         const bool is_empty = r.num_indices == 0 || r.num_instances.NumInstances() == 0;
@@ -2028,6 +2036,41 @@ bool Rasterizer::SkipEmptyDraw(const AmdGpu::Regs& r) {
         }
     }
     return false;
+}
+
+bool Rasterizer::SkipEmptyDrawRegs(const AmdGpu::Regs& r) {
+    // SkipEmptyDraw's decision only: mode 2 and a zero index / instance count. The front's
+    // non-atomic EMPTY_DRAWS counters stay the front's.
+    return EmptyDrawsMode() == 2 && (r.num_indices == 0 || r.num_instances.NumInstances() == 0);
+}
+
+bool Rasterizer::NativeColourVariantReady(const GraphicsPipeline* pipeline,
+                                          const AmdGpu::CpSplit::VertexInputsDerived& vi) {
+    // Mirrors the no-change exits of PipelineCache::PrepareNativeColourLocked without its lock:
+    // ineligible pipeline (2) or a slot already claimed for this description -> the front would
+    // return without writing. Undecided (0), or eligible with a free slot for a new description
+    // -> the front would write (decide / claim; its 2 ms throttle is not visible here, so the
+    // free-slot case is conservative). No free slot -> the front returns without a claim.
+    if (!pipeline) {
+        return true; // PrepareNativeColourFront does nothing for a null pipeline
+    }
+    const u8 eligibility = pipeline->native_colour_static; // front-written once, 0 -> 1 or 2
+    if (eligibility == 2) {
+        return true;
+    }
+    if (eligibility == 0) {
+        return false;
+    }
+    const u64 key = VideoCore::NativeVertexKey(vi.attribs.data(), vi.header.count);
+    bool free_slot = false;
+    for (const auto& slot : pipeline->native_colour) {
+        const u64 k = slot.key.load(std::memory_order_acquire);
+        if (k == key) {
+            return true; // claimed: built, building or failed
+        }
+        free_slot |= k == 0;
+    }
+    return !free_slot;
 }
 
 void Rasterizer::PrepareDrawFront(SplitDraw& draw) {

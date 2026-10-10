@@ -379,6 +379,11 @@ private:
                          const CpSplit::DrawArgs& args);
     void NativeRecHead(const PM4Header* header, const void* pipeline, bool plain_draw,
                        u32 vi_bytes, const u8* record_body, u32 stage_count);
+    /// SHADPS4_LEAN (L1 shadow): chain verify + scan + worker hand-off at a top-level DCB start.
+    void LeanFrontBegin(std::span<const u32> dcb, std::span<const u32> ccb, bool guest_markers);
+    /// Starts the lean worker threads (part b).
+    void LeanStart();
+    void LeanWorkerLoop(std::stop_token stoken, u32 index);
     void EmitDraw(const PM4Header* header, const char* name, bool host_marker,
                   const CpSplit::DrawArgs& args);
     /// `queue`: 0 = gfx, vqid + 1 = ASC (the mapped_queues index whose cs_state is copied).

@@ -7,6 +7,8 @@
 // exactly as ProcessGraphics (notes/architecture-a-2026-10-10.md sec. 16). Defined in liverpool.cpp
 // as thin wrappers over the file-local functions.
 
+#include <span>
+
 #include "video_core/amdgpu/pm4_cmds.h"
 
 namespace AmdGpu {

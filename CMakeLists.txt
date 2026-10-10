@@ -1063,6 +1063,8 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
 )
 
 set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
+               src/video_core/amdgpu/lean_parse.cpp
+               src/video_core/amdgpu/lean_parse.h
                src/video_core/amdgpu/cp_split.cpp
                src/video_core/amdgpu/cp_split.h
                src/video_core/amdgpu/liverpool.cpp

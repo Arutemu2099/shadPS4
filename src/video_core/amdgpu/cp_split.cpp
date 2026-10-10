@@ -268,6 +268,17 @@ void Channel::Commit() {
     committed_pos = reserve_pos;
     committed_seq = emitted;
     record_open = false;
+    if (canon && canon_fn) [[unlikely]] {
+        const auto* rh = reinterpret_cast<const RecordHeader*>(storage + (last_record_pos & mask));
+        if (rh->type != RecordType::RegWrite) {
+            canon_fn(*canon, *rh); // register words are recorded word by word in EmitRegWrite
+        }
+    }
+    if (self_consume) [[unlikely]] {
+        cached_read = committed_pos;
+        read_pos.store(committed_pos, std::memory_order_relaxed);
+        done_seq.store(committed_seq, std::memory_order_release);
+    }
 }
 
 void Channel::Sync(DrainReason reason) {
@@ -384,6 +395,11 @@ void Channel::EmitRegWrite(u32 word_offset, const u32* data, u32 count) {
         held.push_back(count);
         held.insert(held.end(), data, data + count);
         return;
+    }
+    if (canon) [[unlikely]] {
+        for (u32 i = 0; i < count; ++i) {
+            canon->push_back((u64{1} << 56) | (u64{word_offset + i} << 32) | data[i]);
+        }
     }
     const u32 seg = u32(sizeof(RegWritePayload)) + count * 4;
     if (reg_batch && !record_open && reg_seq == emitted && reg_seq != 0) {
@@ -705,7 +721,7 @@ void Channel::WakeBack() {
 }
 
 void Channel::MaybeLog() {
-    if ((++log_calls & 1023) != 0) {
+    if ((++log_calls & 1023) != 0 || quiet) {
         return;
     }
     const u64 now = NowNs();
