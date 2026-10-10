@@ -722,8 +722,20 @@ private:
         /// minus shaders and vertex formats), 2 = vertex formats equal, 4 = next pipeline has a
         /// native variant, 8 = context registers moved; native -> non-native draw transitions.
         std::array<u64, 16> seg_c2{};
+        /// Why a draw took the generic path (DrawTail decision; reason literals), with cycles.
+        const char* last_why{};
+        std::unordered_map<const char*, std::pair<u64, u64>> why_other;
         u64 seg_to_other{};
         bool seg_last_native{};
+        /// Segment continuation (sec. 14): at each batch open vs the previous batch - could one
+        /// GPU-driven segment have run across? Break causes: 1 fixed state, 2 dynamic state
+        /// values, 4 render targets, 8 a generic draw in between, 16 index type.
+        u64 seg_opens{}, seg_cont{};
+        std::array<u64, 32> seg_break{};
+        u64 seg_prev_fixed{}, seg_prev_dyn{}, seg_prev_rt{};
+        u32 seg_prev_index{};
+        bool seg_prev_valid{}, seg_generic_since{};
+        u64 seg_native_draws{};
         std::array<u64, 4> rj_fail{};
         std::array<u64, 4> prep_c10{};  ///< verify: close 10 of a prepared member by where
         std::array<u64, 16> prep_stop{};

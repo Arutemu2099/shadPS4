@@ -2262,6 +2262,14 @@ void Rasterizer::ExecuteDraw(const SplitDraw& draw,
                 ++native_stats.n_tail_other;
                 native_stats.seg_to_other += native_stats.seg_last_native;
                 native_stats.seg_last_native = false;
+                native_stats.seg_generic_since = true;
+                {
+                    auto& w = native_stats.why_other[native_stats.last_why
+                                                         ? native_stats.last_why
+                                                         : "unknown"];
+                    ++w.first;
+                    w.second += dt;
+                }
                 bool images = false;
                 for (const auto* stage : draw.pipeline->GetStages()) {
                     images = images || (stage && !stage->images.empty());
@@ -4364,6 +4372,67 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
                         AmdGpu::CpSplit::VertexInputAttribs(*front_vi), cmd, vertex_offset,
                         instance_offset);
     }
+    {
+        // Segment continuation census (sec. 14).
+        auto& st = native_stats;
+        const auto mix = [](u64 h, u64 v) { return (h ^ v) * 0x100000001B3ull; };
+        const auto& key = base->GetGraphicsKey();
+        constexpr size_t fixed0 = offsetof(GraphicsPipelineKey, patch_control_points);
+        u64 hf = 0xcbf29ce484222325ull;
+        for (size_t i = fixed0; i < sizeof(key); ++i) {
+            hf = mix(hf, reinterpret_cast<const u8*>(&key)[i]);
+        }
+        const auto& ds = scheduler.GetDynamicState();
+        u64 hd = 0xcbf29ce484222325ull;
+        const auto add = [&](const void* p, size_t n) {
+            for (size_t i = 0; i < n; ++i) {
+                hd = mix(hd, static_cast<const u8*>(p)[i]);
+            }
+        };
+        add(ds.viewports.data(), ds.viewports.size() * sizeof(ds.viewports[0]));
+        add(ds.scissors.data(), ds.scissors.size() * sizeof(ds.scissors[0]));
+        const u32 flags = u32(ds.depth_test_enabled) | u32(ds.depth_write_enabled) << 1 |
+                          u32(ds.depth_bounds_test_enabled) << 2 | u32(ds.depth_bias_enabled) << 3 |
+                          u32(ds.stencil_test_enabled) << 4 | u32(ds.primitive_restart_enable) << 5 |
+                          u32(ds.rasterizer_discard_enable) << 6 | u32(ds.feedback_loop_enabled) << 7;
+        add(&flags, sizeof(flags));
+        add(&ds.depth_compare_op, sizeof(ds.depth_compare_op));
+        add(&ds.depth_bounds_min, sizeof(float));
+        add(&ds.depth_bounds_max, sizeof(float));
+        add(&ds.depth_bias_constant, sizeof(float));
+        add(&ds.depth_bias_clamp, sizeof(float));
+        add(&ds.depth_bias_slope, sizeof(float));
+        add(&ds.stencil_front_ops, sizeof(ds.stencil_front_ops));
+        add(&ds.stencil_back_ops, sizeof(ds.stencil_back_ops));
+        const std::array<u32, 6> sv{ds.stencil_front_reference, ds.stencil_front_write_mask,
+                                    ds.stencil_front_compare_mask, ds.stencil_back_reference,
+                                    ds.stencil_back_write_mask, ds.stencil_back_compare_mask};
+        add(sv.data(), sizeof(sv));
+        add(&ds.cull_mode, sizeof(ds.cull_mode));
+        add(&ds.front_face, sizeof(ds.front_face));
+        add(ds.blend_constants.data(), sizeof(ds.blend_constants));
+        add(&ds.color_write_masks, sizeof(ds.color_write_masks));
+        add(&ds.line_width, sizeof(float));
+        u64 hr = 0xcbf29ce484222325ull;
+        for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+            hr = mix(hr, regs.color_buffers[cb].Address());
+        }
+        hr = mix(hr, regs.depth_buffer.DepthAddress());
+        if (st.seg_prev_valid) {
+            ++st.seg_opens;
+            const u32 why = (hf != st.seg_prev_fixed ? 1u : 0u) | (hd != st.seg_prev_dyn ? 2u : 0u) |
+                            (hr != st.seg_prev_rt ? 4u : 0u) | (st.seg_generic_since ? 8u : 0u) |
+                            (b.index_size != st.seg_prev_index ? 16u : 0u);
+            st.seg_cont += why == 0;
+            ++st.seg_break[why];
+        }
+        st.seg_prev_valid = true;
+        st.seg_prev_fixed = hf;
+        st.seg_prev_dyn = hd;
+        st.seg_prev_rt = hr;
+        st.seg_prev_index = b.index_size;
+        st.seg_generic_since = false;
+    }
     return true;
 }
 
@@ -5458,11 +5527,37 @@ void Rasterizer::NativeLog() {
                                   (i & 4) ? "N" : "n", (i & 8) ? "C" : "c", st.seg_c2[i]);
             }
         }
+        std::string sb;
+        for (u32 i = 1; i < 32; ++i) {
+            if (st.seg_break[i]) {
+                sb += fmt::format(" {}{}{}{}{}={}", (i & 1) ? "F" : "", (i & 2) ? "D" : "",
+                                  (i & 4) ? "R" : "", (i & 8) ? "G" : "", (i & 16) ? "I" : "",
+                                  st.seg_break[i]);
+            }
+        }
+        LOG_INFO(Render_Vulkan,
+                 "NativeSegCont: batch opens after the first={} could continue one segment={} "
+                 "| breaks by F fixed / D dynamic values / R render targets / G generic draw "
+                 "between / I index type:{}",
+                 st.seg_opens, st.seg_cont, sb);
         LOG_INFO(Render_Vulkan,
                  "NativeSegCensus: pipeline-change closes by F fixed state equal / V vertex "
                  "formats equal / N next native / C context moved (lower case = not):{} | native "
                  "-> other transitions {}",
                  sc, st.seg_to_other);
+        std::vector<std::pair<const char*, std::pair<u64, u64>>> wv(st.why_other.begin(),
+                                                                     st.why_other.end());
+        std::sort(wv.begin(), wv.end(), [](const auto& x, const auto& y) {
+            return x.second.second > y.second.second;
+        });
+        std::string wl;
+        for (const auto& [w, v] : wv) {
+            wl += fmt::format(" | {}: n={} cycles {:.0f}", w, v.first,
+                              double(v.second) / double(std::max<u64>(v.first, 1)));
+        }
+        LOG_INFO(Render_Vulkan, "NativeWhyOther: generic DrawTail draws by reason (most cycles "
+                                "first):{}",
+                 wl);
     }
     if (st.bl_open + st.bl_open_fail != 0) {
         LOG_INFO(Render_Vulkan,
@@ -6025,12 +6120,23 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
 
     // SHADPS4_NATIVE_PASS: this draw opens a native batch (its own records go first).
     bool native_open = false;
+    native_stats.last_why = is_indexed ? "native pass off" : "not indexed";
     if (VideoCore::g_native_pass == 1 && is_indexed) [[unlikely]] {
         if (native_batch.open) {
             NativeClose(1);
         }
         const auto* native = pipeline->native_variant.load(std::memory_order_acquire);
         bool colour = false;
+        if (!native) {
+            const char* cw = pipeline->native_colour_why.load(std::memory_order_relaxed);
+            native_stats.last_why =
+                pipeline->native_colour[0].key.load(std::memory_order_relaxed) != 0
+                    ? "colour: no variant for this vertex description"
+                : cw                       ? cw
+                : !front_vi                ? "no front vertex inputs"
+                : !VideoCore::g_native_colour ? "colour pass off"
+                                           : "no variant yet / undecided";
+        }
         // Opus code review #7: slots fill in order, so slot 0 empty = no variant at all.
         if (!native && VideoCore::g_native_colour && front_vi &&
             pipeline->native_colour[0].key.load(std::memory_order_relaxed) != 0) [[unlikely]] {
@@ -6055,8 +6161,15 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
                 if (next == 0) {
                     native = nullptr;
                     colour = false;
+                    native_stats.last_why = "colour: peek says single draw";
                 }
             }
+        }
+        if (native) {
+            native_stats.last_why = (repeat && repeat_mode == 1) ? "draw repeat"
+                                    : (occlusion && occlusion->Open()) ? "occlusion query open"
+                                    : !build_set_writes || native_bindings ? "no set writes"
+                                                                           : "NativeOpen failed";
         }
         if (native && !(repeat && repeat_mode == 1) && !(occlusion && occlusion->Open()) &&
             build_set_writes && !native_bindings &&

@@ -1368,6 +1368,7 @@ void PipelineCache::PrepareNativeColour(const GraphicsPipeline* base,
     const auto* vs = stages[u32(LogicalStage::Vertex)];
     const auto* fs = stages[u32(LogicalStage::Fragment)];
     const auto log_not = [&](const char* why) {
+        base->native_colour_why.store(why, std::memory_order_relaxed);
         if (native_colour_logged++ < 2000) {
             LOG_INFO(Render_Vulkan, "NativeColour: pipeline {:#x} not eligible ({})",
                      std::hash<GraphicsPipelineKey>{}(base->GetGraphicsKey()), why);
@@ -1432,6 +1433,9 @@ void PipelineCache::PrepareNativeColour(const GraphicsPipeline* base,
             }
         }
         base->native_colour_static = why ? 2 : 1;
+        if (why) {
+            base->native_colour_why.store(why, std::memory_order_relaxed);
+        }
         if (why) {
             if (std::strcmp(why, "bisect") != 0) {
                 log_not(why);

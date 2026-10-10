@@ -181,6 +181,8 @@ public:
     static constexpr u32 NativeColourSlots = 4;
     mutable std::array<NativeColourSlot, NativeColourSlots> native_colour{};
     mutable u8 native_colour_static = 0; ///< front: 0 undecided, 1 eligible, 2 not
+    /// Native census (sec. 14): the last reason the front logged for no colour variant.
+    mutable std::atomic<const char*> native_colour_why{nullptr};
     u32 native_vertex_binding = NoNativeRecords; ///< a colour variant: its vertex SSBO binding
     u32 native_table_binding = NoNativeRecords;  ///< SHADPS4_NATIVE_GPU_DIRECT: the batch table
     const GraphicsPipeline* NativeColourVariant(u64 key) const noexcept {
