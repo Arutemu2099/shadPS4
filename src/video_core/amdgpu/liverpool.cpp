@@ -34,6 +34,7 @@
 #include "core/memory.h"
 #include "core/platform.h"
 #include "video_core/native_census.h"
+#include <xxhash.h>
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/native_rec.h"
 #include "video_core/amdgpu/pm4_cmds.h"
@@ -1204,8 +1205,8 @@ struct LeanJob {
     std::vector<std::pair<u32, u32>> front_marks; ///< (packet dword offset, events before it)
     std::vector<u64> worker_canon;
     Lean::SpanResult res{};
-    u64 begin_seq{};          ///< the front's emitted count at the DCB start (L1 lag check)
-    std::atomic<bool> lag{};  ///< the back had started the DCB before the worker finished
+    u64 dcb_hash{};           ///< XXH3 of the DCB words at queue time (L1 lag check)
+    std::atomic<bool> lag{};  ///< the words changed before the worker's parse ended
 };
 struct LeanCounters {
     std::atomic<u64> dcbs{}, eligible{}, skipped{}, cmp{}, bad{}, events{}, pkts{}, pkts_span{},
@@ -1213,7 +1214,7 @@ struct LeanCounters {
     std::atomic<u32> epoch_bump_op{}; ///< first offending opcode | 0x100 (0: none)
     /// L2 stage b: parity breaks, L1 lag-excluded jobs, BAD spans by first-difference kind, the
     /// front's draws and its NativeRec member-path draws (job_member = 1).
-    std::atomic<u64> parity{}, lag{}, front_draws{}, front_member{};
+    std::atomic<u64> parity{}, parity_changed{}, lag{}, front_draws{}, front_member{};
     std::array<std::atomic<u64>, 32> bad_kind{};
     std::array<std::atomic<u64>, 32> stops{};
     std::array<std::atomic<u64>, 256> stop_ops{};
@@ -1537,7 +1538,15 @@ void LeanCompare(LeanJob& j) {
     }
     c.stops[std::min<u32>(static_cast<u32>(res.stop), 31)] += 1;
     if (Lean::IsStaticStop(res.stop)) {
-        ++c.parity; // the chain should have cut at this packet
+        // The chain should have cut at this packet: a changed buffer (lag) or a real bug.
+        if (j.lag.load(std::memory_order_acquire)) {
+            ++c.parity_changed;
+        } else if (++c.parity <= 8) {
+            LOG_WARNING(Render, "Lean PARITY (buffer unchanged): DCB {} worker stop {} at dw {} "
+                                "(opcode {:#x}), chain cut {} of {} dw",
+                        j.index.load(), Lean::StopName(res.stop), res.end_dw, res.stop_opcode,
+                        j.cut_dw, j.dcb.size());
+        }
     }
     if (res.stop != Lean::Stop::End && res.stop != Lean::Stop::Cut) {
         c.stop_ops[res.stop_opcode & 255] += 1;
@@ -1690,14 +1699,16 @@ void LeanLog() {
         }
     }
     LOG_INFO(Render,
-             "Lean (mode {}) L2 counters: parity breaks {} (gate 0) | lag-excluded jobs {} | BAD by "
+             "Lean (mode {}) L2 counters: parity breaks, buffer UNCHANGED {} (gate 0) / buffer changed {} | "
+             "lag-excluded jobs (buffer changed) {} | BAD (unchanged buffers) by "
              "first-difference kind:{} | pipeline-miss sub-reasons (cumulative; 1 unsupported stages, 2 "
              "no program, 3 precompiled first use, 4 no permutation, 5 no pipeline, 6 pending):{} | "
              "front draws {} NativeRec member-path {} ({:.1f}%)",
-             g_lean, c.parity.load(), c.lag.load(), kinds, misses, c.front_draws.load(),
+             g_lean, c.parity.load(), c.parity_changed.load(), c.lag.load(), kinds, misses,
+             c.front_draws.load(),
              c.front_member.load(),
              c.front_draws ? 100.0 * double(c.front_member) / double(c.front_draws) : 0.0);
-    c.parity = c.lag = c.front_draws = c.front_member = 0;
+    c.parity = c.parity_changed = c.lag = c.front_draws = c.front_member = 0;
     std::string ops;
     for (u32 i = 0; i < 256; ++i) {
         if (c.stop_ops[i] != 0) {
@@ -3540,7 +3551,7 @@ void Liverpool::LeanWorkerLoop(std::stop_token stoken, u32 index) {
         j.res = parser.Parse(j.dcb, j.cut_dw, st, ch);
         ch.canon = nullptr;
         // L1 lag: the back already ran (part of) this DCB, so the game may have rewritten it.
-        j.lag.store(split->DoneSeq() >= j.begin_seq,
+        j.lag.store(XXH3_64bits(j.dcb.data(), j.dcb.size_bytes()) != j.dcb_hash,
                     std::memory_order_release);
         if (j.done_mask.fetch_or(2, std::memory_order_acq_rel) == 1) {
             LeanCompare(j);
@@ -7294,7 +7305,7 @@ void Liverpool::LeanFrontBegin(std::span<const u32> dcb, std::span<const u32> cc
         j.front_canon.clear();
         j.front_marks.clear();
         j.worker_canon.clear();
-        j.begin_seq = split->EmittedSeq();
+        j.dcb_hash = XXH3_64bits(dcb.data(), dcb.size_bytes());
         j.lag.store(false, std::memory_order_relaxed);
         queued = true;
     }
