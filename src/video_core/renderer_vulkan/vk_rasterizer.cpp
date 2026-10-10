@@ -4886,8 +4886,39 @@ bool Rasterizer::NativeDirectBind(const GraphicsPipeline* base, const GraphicsPi
         }
         bound.PushUd(binding, push_data);
         for (const auto& desc : stage->buffers) {
-            if (desc.buffer_type != Shader::BufferType::Guest || desc.is_formatted ||
-                desc.is_written || desc.inline_cbuf) {
+            if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
+                // As BindBuffers: a null descriptor when no user plane is enabled, else a copy.
+                const u32 alignment = instance.UniformMinAlignment();
+                if (regs.clipper_control.user_clip_plane_enable == 0) {
+                    buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+                } else {
+                    auto& sb = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
+                    std::array<float, AmdGpu::NUM_CLIP_PLANES * 4> planes{};
+                    for (u32 i = 0; i < AmdGpu::NUM_CLIP_PLANES; ++i) {
+                        const auto& plane = regs.clip_user_data[i];
+                        planes[i * 4 + 0] = std::bit_cast<float>(plane.data_x);
+                        planes[i * 4 + 1] = std::bit_cast<float>(plane.data_y);
+                        planes[i * 4 + 2] = std::bit_cast<float>(plane.data_z);
+                        planes[i * 4 + 3] = std::bit_cast<float>(plane.data_w);
+                    }
+                    const u32 ubo_size = static_cast<u32>(sizeof(planes));
+                    const u64 off = sb.Copy(planes.data(), ubo_size, alignment);
+                    buffer_infos.emplace_back(sb.Handle(), off, ubo_size);
+                }
+                auto& w = set_writes.emplace_back();
+                w.dstSet = VK_NULL_HANDLE;
+                w.dstBinding = binding.unified++;
+                w.dstArrayElement = 0;
+                w.descriptorCount = 1;
+                w.descriptorType = desc.IsStorage(desc.GetSharp(bound))
+                                       ? vk::DescriptorType::eStorageBuffer
+                                       : vk::DescriptorType::eUniformBuffer;
+                w.pBufferInfo = &buffer_infos.back();
+                ++binding.buffer;
+                continue;
+            }
+            if (desc.buffer_type != Shader::BufferType::Guest || desc.is_written ||
+                desc.inline_cbuf) {
                 return fail(5);
             }
             const auto vsharp = desc.GetSharp(bound);
@@ -4898,8 +4929,25 @@ bool Rasterizer::NativeDirectBind(const GraphicsPipeline* base, const GraphicsPi
             const bool is_storage = desc.IsStorage(vsharp);
             const u32 alignment =
                 is_storage ? instance.StorageMinAlignment() : instance.UniformMinAlignment();
-            const VideoCore::Buffer* buf = NativeSpanSync(
-                vsharp.base_address, vsharp.base_address + size, VideoCore::NativeRunAccess::Storage);
+            const VideoCore::Buffer* buf = nullptr;
+            if (desc.is_formatted) {
+                // Typed reads: the full lookup (an image -> buffer sync of overlapping image
+                // data), as the join does; a recorded copy is caught by NativeOpen's checks.
+                const auto [vb, vo] = buffer_cache.ObtainBuffer(
+                    vsharp.base_address, static_cast<u32>(size), false, true, VideoCore::BufferId{},
+                    Common::BufferSampleCaller::Storage);
+                if (vb && vb->CpuAddr() + vo == vsharp.base_address) {
+                    if (auto barrier = vb->GetBarrier(vk::AccessFlagBits2::eShaderRead,
+                                                      vk::PipelineStageFlagBits2::eAllCommands, 0,
+                                                      cur_dispatch_run)) {
+                        buffer_barriers.emplace_back(*barrier);
+                    }
+                    buf = vb;
+                }
+            } else {
+                buf = NativeSpanSync(vsharp.base_address, vsharp.base_address + size,
+                                     VideoCore::NativeRunAccess::Storage);
+            }
             if (!buf) {
                 return fail(7);
             }
@@ -6244,11 +6292,16 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
                     w.descriptorType != vk::DescriptorType::eUniformBuffer) {
                     continue;
                 }
+                const vk::Buffer stream_h =
+                    buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream).Handle();
                 for (const auto& d : dw) {
                     if (d.binding != w.dstBinding) {
                         continue;
                     }
                     ++found;
+                    if (w.pBufferInfo->buffer == stream_h || !w.pBufferInfo->buffer) {
+                        continue; // clip planes: a fresh stream copy in each bind
+                    }
                     if (d.type != w.descriptorType ||
                         d.buffer != std::bit_cast<u64>(static_cast<VkBuffer>(w.pBufferInfo->buffer)) ||
                         d.offset != w.pBufferInfo->offset || d.range != w.pBufferInfo->range) {
