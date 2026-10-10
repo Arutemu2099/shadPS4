@@ -3213,7 +3213,7 @@ void Rasterizer::NativeGpuVerify(const u32* ud, const std::array<u32, Shader::NU
 namespace {
 Rasterizer* g_ring_owner = nullptr;
 std::mutex g_ring_mutex;
-std::array<VideoCore::Buffer*, AmdGpu::NativeRec::MaxSlots> g_ring_bufs{};
+std::array<VideoCore::StreamBuffer*, AmdGpu::NativeRec::MaxSlots> g_ring_bufs{};
 } // namespace
 
 void Rasterizer::NativeGpuRingInit(Rasterizer* owner) {
@@ -3231,9 +3231,8 @@ u32* Rasterizer::NativeGpuRingAlloc(u32 slot) {
     }
     auto*& buf = g_ring_bufs[slot];
     if (!buf) {
-        buf = new VideoCore::Buffer(r->instance, r->scheduler, VideoCore::MemoryUsage::Stream, 0,
-                                    vk::BufferUsageFlagBits::eStorageBuffer,
-                                    u64(NR::RingSize) * NR::GpuRecDwords * sizeof(u32));
+        buf = new VideoCore::StreamBuffer(r->instance, r->scheduler, VideoCore::MemoryUsage::Stream,
+                                          u64(NR::RingSize) * NR::GpuRecDwords * sizeof(u32));
     }
     if (buf->mapped_data.empty() || !buf->IsCoherent()) {
         LOG_WARNING(Render_Vulkan, "NativeGpu: ring of slot {} is not mapped coherent memory", slot);
