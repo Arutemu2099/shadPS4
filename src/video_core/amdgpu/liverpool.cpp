@@ -1207,7 +1207,8 @@ struct LeanJob {
 };
 struct LeanCounters {
     std::atomic<u64> dcbs{}, eligible{}, skipped{}, cmp{}, bad{}, events{}, pkts{}, pkts_span{},
-        draws{}, draws_span{}, no_mark{}, epoch_bumps{};
+        draws{}, draws_span{}, no_mark{}, epoch_bumps{}, run_bumps{};
+    std::atomic<u32> epoch_bump_op{}; ///< first offending opcode | 0x100 (0: none)
     std::array<std::atomic<u64>, 16> stops{};
     std::array<std::atomic<u64>, 256> stop_ops{};
 };
@@ -1228,6 +1229,7 @@ struct LeanState {
     bool seeded{};
     u32 index{};
     u64 chain_cyc{}, chain_cmp{}, chain_bad_win{}, chain_bad_full{}, chain_bad_extra{}, reseeds{};
+    u64 chain_bad_db{}, chain_bad_cb{}, chain_bad_cs{}, chain_bad_epoch{}, chain_bad_iaa{};
     LeanCounters c;
     u64 win_tsc{};
 };
@@ -1459,6 +1461,15 @@ void LeanChainScan(std::span<const u32> dcb, LeanState& s, bool guest_markers, u
         case PM4ItOpcode::DrawIndexIndirectCountMulti:
             ++draws;
             break;
+        case PM4ItOpcode::DispatchDirect: {
+            // ProcessGraphics writes the dimensions and the initiator into the gfx cs_state.
+            const auto* d = reinterpret_cast<const PM4CmdDispatchDirect*>(header);
+            s.cs.dim_x = d->dim_x;
+            s.cs.dim_y = d->dim_y;
+            s.cs.dim_z = d->dim_z;
+            s.cs.dispatch_initiator = d->dispatch_initiator;
+            break;
+        }
         case PM4ItOpcode::NumInstances:
             r.num_instances.num_instances =
                 reinterpret_cast<const PM4CmdDrawNumInstances*>(header)->num_instances;
@@ -1503,9 +1514,14 @@ void LeanCompare(LeanJob& j) {
         }
     }
     c.pkts_span += res.packets;
+    c.run_bumps += res.run_bumps;
     c.draws_span += res.draws;
     for (const u64 e : j.worker_canon) {
-        c.epoch_bumps += (e >> 56) == 4 ? 1 : 0; // EpochBump events inside the worker's span
+        if ((e >> 56) == 4) { // EpochBump inside the worker's span: a bug (hard check)
+            c.epoch_bumps += 1;
+            u32 none = 0;
+            c.epoch_bump_op.compare_exchange_strong(none, 0x100u | static_cast<u32>(e & 0xff));
+        }
     }
     c.stops[std::min<u32>(static_cast<u32>(res.stop), 15)] += 1;
     if (res.stop != Lean::Stop::End && res.stop != Lean::Stop::Cut) {
@@ -1558,16 +1574,19 @@ void LeanLog() {
     LOG_INFO(Render,
              "Lean (mode {}): window {:.1f}s | DCBs {} eligible {} skipped (slot busy) {} | chain "
              "{:.2f} ms/s, verified {} DCBs: windows bad {} whole-file bad {} extras bad {} reseeds "
-             "{} | worker spans compared {} BAD {} (events {}, no mark {}) | coverage: packets "
-             "{:.1f}% draws {:.1f}% | epoch bumps inside worker spans {} | stops (by Lean::Stop "
+             "{} (extras by kind: db {} cb {} cs {} epoch {} iaa {}) | worker spans compared {} BAD {} "
+             "(events {}, no mark {}) | dispatch-run bumps in spans {} | coverage: packets "
+             "{:.1f}% draws {:.1f}% | epoch bumps inside worker spans {} (first opcode {:#x}) | stops (by Lean::Stop "
              "value):{} | other-stop opcodes:{} | faults: pre-check stops SRT protected {} "
              "unmapped {} V# protected {} unmapped {} walker not understood {} flat overflow {}; "
              "FALLBACK faults (must be 0) {} first {:#x} {:#x} | worker shared-lock takes per draw {:.2f}",
              g_lean, sec, c.dcbs.load(), c.eligible.load(), c.skipped.load(),
              double(s.chain_cyc) / 3.5e6 / std::max(sec, 1e-9), s.chain_cmp, s.chain_bad_win,
-             s.chain_bad_full, s.chain_bad_extra, s.reseeds, c.cmp.load(), c.bad.load(),
-             c.events.load(), c.no_mark.load(), pk > 0 ? 100.0 * double(c.pkts_span) / pk : 0.0,
-             dr > 0 ? 100.0 * double(c.draws_span) / dr : 0.0, c.epoch_bumps.load(), stops, ops,
+             s.chain_bad_full, s.chain_bad_extra, s.reseeds, s.chain_bad_db, s.chain_bad_cb,
+             s.chain_bad_cs, s.chain_bad_epoch, s.chain_bad_iaa, c.cmp.load(), c.bad.load(),
+             c.events.load(), c.no_mark.load(), c.run_bumps.load(), pk > 0 ? 100.0 * double(c.pkts_span) / pk : 0.0,
+             dr > 0 ? 100.0 * double(c.draws_span) / dr : 0.0, c.epoch_bumps.load(),
+             c.epoch_bump_op.load() & 0xff, stops, ops,
              g_lean_fault_stats.precheck[0].load(), g_lean_fault_stats.precheck[1].load(),
              g_lean_fault_stats.precheck[2].load(), g_lean_fault_stats.precheck[3].load(),
              g_lean_fault_stats.precheck[4].load(), g_lean_fault_stats.precheck[5].load(),
@@ -1583,8 +1602,9 @@ void LeanLog() {
         x = 0;
     }
     c.dcbs = c.eligible = c.skipped = c.cmp = c.bad = c.events = c.pkts = c.pkts_span = c.draws =
-        c.draws_span = c.no_mark = c.epoch_bumps = 0;
+        c.draws_span = c.no_mark = c.epoch_bumps = c.run_bumps = 0;
     s.chain_cyc = s.chain_cmp = s.chain_bad_win = s.chain_bad_full = s.chain_bad_extra = s.reseeds = 0;
+    s.chain_bad_db = s.chain_bad_cb = s.chain_bad_cs = s.chain_bad_epoch = s.chain_bad_iaa = 0;
     s.win_tsc = now;
 }
 
@@ -7065,20 +7085,36 @@ void Liverpool::LeanFrontBegin(std::span<const u32> dcb, std::span<const u32> cc
             bad_full = std::memcmp(s.regs->reg_array.data(), regs.reg_array.data(),
                                    sizeof(regs.reg_array)) != 0;
         }
-        bool bad_extra = s.db.raw != last_db_extent.raw || s.epoch != context_change_epoch ||
-                         std::memcmp(&s.cs, &gfx_cs, sizeof(ComputeProgram)) != 0 ||
-                         s.iaa != indirect_args_addr;
-        for (u32 i = 0; i < NUM_COLOR_BUFFERS; ++i) {
-            bad_extra = bad_extra || s.cb[i].raw != last_cb_extent[i].raw;
+        const bool bad_db = s.db.raw != last_db_extent.raw;
+        const bool bad_epoch = s.epoch != context_change_epoch;
+        const bool bad_iaa = s.iaa != indirect_args_addr;
+        s32 cs_dw = -1; // first differing cs_state dword
+        for (u32 i = 0; i < sizeof(ComputeProgram) / 4 && cs_dw < 0; ++i) {
+            if (reinterpret_cast<const u32*>(&s.cs)[i] != reinterpret_cast<const u32*>(&gfx_cs)[i]) {
+                cs_dw = static_cast<s32>(i);
+            }
         }
+        u32 cb_mask = 0;
+        for (u32 i = 0; i < NUM_COLOR_BUFFERS; ++i) {
+            cb_mask |= s.cb[i].raw != last_cb_extent[i].raw ? 1u << i : 0u;
+        }
+        const bool bad_extra = bad_db || bad_epoch || bad_iaa || cs_dw >= 0 || cb_mask != 0;
+        s.chain_bad_db += bad_db;
+        s.chain_bad_cb += cb_mask != 0;
+        s.chain_bad_cs += cs_dw >= 0;
+        s.chain_bad_epoch += bad_epoch;
+        s.chain_bad_iaa += bad_iaa;
         s.chain_bad_win += bad_win;
         s.chain_bad_full += bad_full;
         s.chain_bad_extra += bad_extra;
         if (bad_win || bad_full || bad_extra) {
             if (s.chain_bad_win + s.chain_bad_full + s.chain_bad_extra <= 8) {
                 LOG_WARNING(Render, "Lean chain: state differs from the front at DCB {} (windows {} "
-                                    "whole file {} extras {}: epoch chain {} front {}, iaa {:#x} / {:#x})",
-                            s.index + 1, bad_win, bad_full, bad_extra, s.epoch,
+                                    "whole file {} extras {}: db {} cb mask {:#x} cs first dword {} "
+                                    "(chain {:#x} front {:#x}), epoch chain {} front {}, iaa {:#x} / {:#x})",
+                            s.index + 1, bad_win, bad_full, bad_extra, bad_db, cb_mask, cs_dw,
+                            cs_dw >= 0 ? reinterpret_cast<const u32*>(&s.cs)[cs_dw] : 0u,
+                            cs_dw >= 0 ? reinterpret_cast<const u32*>(&gfx_cs)[cs_dw] : 0u, s.epoch,
                             context_change_epoch, s.iaa, indirect_args_addr);
             }
             ++s.reseeds;

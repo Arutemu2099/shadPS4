@@ -172,14 +172,15 @@ Parser::Parser(const Env& env_) : env{env_} {
     //  - !split_run_ahead (depth 0): every draw record syncs;
     //  - NativeRec::g_segb: SegB::NotePacket on every packet and the segment builder in EmitDraw;
     //  - SHADPS4_DRAW_TAG: g_draw_tag_front writes SplitDrawRecord::pad and front counters;
-    //  - SHADPS4_DISPATCH_SYNC_STATS / SHADPS4_GUEST_DISPATCH_ORDER: g_dispatch_sync.Note mutates
-    //    per-queue run state on draws (the dispatch records' `run` numbers would diverge);
+    //  - SHADPS4_DISPATCH_SYNC_STATS: g_dispatch_sync.Note keeps front statistics per packet.
+    //    (SHADPS4_GUEST_DISPATCH_ORDER is supported: the span counts its run-ending packets in
+    //    SpanResult::run_bumps; runs are only compared for equality, so one fresh run at the
+    //    hand-back is equivalent.)
     //  - SHADPS4_SPLIT_HAZARD_STATS: SplitHazard::NoteDraw keeps front-global page statistics;
     //  - no rasterizer / pipeline cache / split: ProcessGraphics draws inline, no records.
     const bool ok = env.rasterizer && env.pipeline_cache && env.split_enabled &&
                     env.split_run_ahead && !env.split_verify && NativeRec::g_segb == 0 &&
-                    !env.draw_tag_front && !EnvFlag("SHADPS4_DISPATCH_SYNC_STATS") &&
-                    !EnvFlag("SHADPS4_GUEST_DISPATCH_ORDER") && !SplitHazard::Enabled();
+                    !env.draw_tag_front && !EnvFlag("SHADPS4_DISPATCH_SYNC_STATS") && !SplitHazard::Enabled();
     config_stop = ok ? Stop::None : Stop::Config;
     viewport_memo = LeanViewportMemoEnabled();
     // Liverpool::BumpEpoch in split mode emits a record only under these flags.
@@ -759,6 +760,21 @@ SpanResult Parser::Parse(std::span<const u32> dcb, u32 cut_dw, ChainState& st,
         }
         off += dwords;
         ++r.packets;
+        switch (static_cast<PM4ItOpcode>(opcode_u)) { // DispatchSyncStats::RunNeutral
+        case PM4ItOpcode::Nop:
+        case PM4ItOpcode::SetShReg:
+        case PM4ItOpcode::SetContextReg:
+        case PM4ItOpcode::SetUconfigReg:
+        case PM4ItOpcode::SetConfigReg:
+        case PM4ItOpcode::IndirectBuffer:
+        case PM4ItOpcode::IndirectBufferConst:
+        case PM4ItOpcode::DispatchDirect:
+        case PM4ItOpcode::DispatchIndirect:
+            break;
+        default:
+            ++r.run_bumps;
+            break;
+        }
     }
 }
 

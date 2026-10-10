@@ -117,6 +117,8 @@ struct SpanResult {
     u32 end_dw{};      ///< dword offset of the first packet NOT parsed (the front resumes here)
     Stop stop{};
     u32 stop_opcode{}; ///< PM4ItOpcode of the stop packet (0 for Cut / End)
+    u32 run_bumps{};   ///< GUEST_DISPATCH_ORDER: parsed packets that end a dispatch run
+                       ///< (not RunNeutral); L2 hand-back: one fresh gfx run if > 0
 };
 
 /// One per worker thread: owns the pipeline-lookup scratch and the vertex-input scratch.
