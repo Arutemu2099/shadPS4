@@ -3781,6 +3781,431 @@ bool Rasterizer::NativeRingPrepare(const GraphicsPipeline* base,
     return true;
 }
 
+bool Rasterizer::NativeSegPrepare(const GraphicsPipeline* base,
+                                  const AmdGpu::CpSplit::VertexInputAttrib* attribs,
+                                  const std::array<u64, Shader::NUM_BUFFERS>& o_addr,
+                                  const std::array<u32, Shader::NUM_BUFFERS>& o_off,
+                                  const std::array<u32, Shader::NUM_BUFFERS>& o_size,
+                                  const u32* o_ud) {
+    // Back thread, NativeOpen of member 0 of a Segment record (SHADPS4_NATIVE_SEGX=1), in place
+    // of NativeRingPrepare: the batch's bases and spans come from the record's unions (index,
+    // pulled streams, the Guest slots' job-run unions), each found in ONE cached buffer (no
+    // creation, no merge: a buffer made here would invalidate the opener's bindings) and synced
+    // once - no member is read. Reason codes as NativeSegEvaluate (segx_result): 2 lifetime,
+    // 3 index, 4 vertex, 5 vertex buffers, 6 Guest, 8 member 0's record / material / spans.
+    namespace NR = AmdGpu::NativeRec;
+    auto& b = native_batch;
+    auto& st = native_stats;
+    const auto& seg = *segx_pending;
+    const auto fail = [&](u32 why) {
+        segx_result = why;
+        return false;
+    };
+    if (!b.colour || !native_seg_on || !native_pt_on || draw_job_tag == 0 || seg.n == 0 ||
+        seg.n > NativeMaxDraws) {
+        return fail(8);
+    }
+    const u32 slot0 = draw_job_tag >> 28;
+    const NR::Record* ring = NR::g_rings[slot0].load(std::memory_order_acquire);
+    const u64 ring_handle = NR::g_gpu_handles[slot0].load(std::memory_order_acquire);
+    if (!ring || ring_handle == 0) {
+        return fail(8);
+    }
+    constexpr u32 mask = NR::RingSize - 1;
+    const u32 idx = draw_job_idx;
+    const NR::Record& r0 = ring[idx & mask];
+    const u32 gpu_ok0 = r0.gpu_ok;
+    const void* cmd0 = r0.cmd;
+    const u32 img_n0 = r0.img_n;
+    const u64 img_h10 = r0.img_h1, img_h20 = r0.img_h2;
+    const u32 push_inh0 = r0.push_inh;
+    const u64 inh_slots0 = r0.inh_slots;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (r0.stamp.load(std::memory_order_relaxed) != idx + 1 || cmd0 != draw_job_cmd || !gpu_ok0) {
+        return fail(8);
+    }
+    // The one material: member 0's job key is the segment's and agrees with the back's key.
+    if ((img_n0 & ~NR::ImgInhBit) != b.img_n || img_h10 != seg.img_h1 || img_h20 != seg.img_h2) {
+        return fail(8);
+    }
+    if (!(img_n0 & NR::ImgInhBit)) {
+        u64 h1 = 0, h2 = 0;
+        NR::ImageKeyHash(native_img_key.data(), b.img_n, h1, h2);
+        if (h1 != img_h10 || h2 != img_h20) {
+            return fail(8);
+        }
+    }
+    // Every member's job ring is alive and its entry inside the safe window.
+    for (u32 j = 0; j < seg.n; ++j) {
+        const u32 slot = segx_list[j] >> 24;
+        const u32 mi = segx_list[j] & Shader::NativeSegRingMask;
+        if (slot >= NR::MaxSlots || NR::g_gpu_bda[slot].load(std::memory_order_acquire) == 0 ||
+            NR::g_job_next[slot].load(std::memory_order_relaxed) - mi > NR::RingSize / 4) {
+            return fail(2);
+        }
+    }
+    const u64 gen = buffer_cache.StructGeneration();
+    struct USpan {
+        u64 handle;
+        VideoCore::NativeRunAccess access;
+        VAddr lo, hi;
+    };
+    std::array<USpan, Shader::NUM_BUFFERS + 17> us;
+    u32 nus = 0;
+    const auto base_of = [&](VAddr a_lo, VAddr a_hi, u64 want_handle, VAddr& cpu) {
+        if (a_lo == 0 || a_hi <= a_lo || a_hi - a_lo > (u64{64} << 20)) {
+            return false;
+        }
+        const VideoCore::Buffer* buf = buffer_cache.NativeBufferAt(a_lo);
+        if (!buf || !buf->IsInBounds(a_lo, a_hi - a_lo) ||
+            std::bit_cast<u64>(static_cast<VkBuffer>(buf->Handle())) != want_handle) {
+            return false;
+        }
+        cpu = buf->CpuAddr();
+        return true;
+    };
+    const auto add_span = [&](u64 handle, VideoCore::NativeRunAccess access, VAddr a_lo,
+                              VAddr a_hi) {
+        for (u32 i = 0; i < nus; ++i) {
+            if (us[i].handle == handle && us[i].access == access &&
+                std::max(us[i].hi, a_hi) - std::min(us[i].lo, a_lo) <= (u64{64} << 20)) {
+                us[i].lo = std::min(us[i].lo, a_lo);
+                us[i].hi = std::max(us[i].hi, a_hi);
+                return true;
+            }
+        }
+        if (nus == us.size()) {
+            return false;
+        }
+        us[nus++] = {handle, access, a_lo, a_hi};
+        return true;
+    };
+    auto& table = native_ring_table;
+    table.fill(0);
+    table[Shader::NativeTableFirst] = idx & mask;
+    table[Shader::NativeTableMask] = mask;
+    {
+        const u64 fb = buffer_cache.GetBdaPageTableBuffer()->BufferDeviceAddress();
+        table[Shader::NativeTablePtFallback] = static_cast<u32>(fb);
+        table[Shader::NativeTablePtFallback + 1] = static_cast<u32>(fb >> 32);
+    }
+    // Inherited user-data registers: the front admitted only members with the opener's set and
+    // values (SegB v2), so the shaders take them from here.
+    table[Shader::NativeTablePushInh] = push_inh0;
+    for (u32 pm = push_inh0; pm != 0; pm &= pm - 1) {
+        const u32 pi = static_cast<u32>(std::countr_zero(pm));
+        if (pi >= Shader::NUM_USER_DATA_REGS) {
+            return fail(8);
+        }
+        table[Shader::NativeTableUd + pi] = o_ud[pi];
+    }
+    for (u32 bi = 0; bi < Shader::NUM_BUFFERS; ++bi) {
+        const u64 bit = u64{1} << bi;
+        if (!(b.guest_mask & bit)) {
+            continue;
+        }
+        if (inh_slots0 & bit) {
+            // The V# sits in inherited registers: every member binds the opener's range.
+            table[Shader::NativeTableBase + bi] = 0u - o_off[bi];
+            table[Shader::NativeTableSize + bi] = o_size[bi];
+            table[Shader::NativeTableInhSlots + bi / 32] |= 1u << (bi % 32);
+            table[Shader::NativeTablePtLo + bi] = static_cast<u32>(o_addr[bi]);
+            table[Shader::NativeTablePtHi + bi / 4] |=
+                static_cast<u32>((o_addr[bi] >> 32) & 0xffu) << ((bi % 4) * 8);
+            continue;
+        }
+        VAddr cpu = 0;
+        if (!(seg.gmask & bit) ||
+            !base_of(seg.glo[bi], seg.ghi[bi], b.buf[bi], cpu) ||
+            !add_span(b.buf[bi], VideoCore::NativeRunAccess::Storage, seg.glo[bi], seg.ghi[bi])) {
+            return fail(6);
+        }
+        table[Shader::NativeTableBase + bi] = static_cast<u32>(cpu);
+    }
+    for (u32 a = 0; a < b.vb_n; ++a) {
+        const bool in_union = ((seg.vmask >> a) & 1) != 0;
+        if (b.vb[a] == 0) {
+            if (in_union) {
+                return fail(4); // a member has a stream where the opener has none
+            }
+            continue;
+        }
+        VAddr vcpu = 0;
+        const u32 loc = attribs[a].desc.location;
+        if (!in_union || loc >= Shader::NativeMaxPulledLocations ||
+            !base_of(seg.vlo[a], seg.vhi[a], b.vb[a], vcpu) ||
+            !add_span(b.vb[a], VideoCore::NativeRunAccess::Storage, seg.vlo[a], seg.vhi[a])) {
+            return fail(4);
+        }
+        table[Shader::NativeTableVbase + loc] = static_cast<u32>(vcpu);
+    }
+    VAddr icpu = 0;
+    if (!base_of(seg.ilo, seg.ihi, b.ib, icpu) ||
+        !add_span(b.ib, VideoCore::NativeRunAccess::Index, seg.ilo, seg.ihi) ||
+        (seg.ilo - icpu) % b.index_size != 0) {
+        return fail(3);
+    }
+    // The spans, through the validity cache as NativeRingPrepare (one sync walk per buffer).
+    const u64 clock0 = VideoCore::g_granule_clock.load(std::memory_order_acquire);
+    for (u32 i = 0; i < nus; ++i) {
+        NativeSpanEntry* hit = nullptr;
+        for (auto& e : native_span_cache) {
+            if (e.handle == us[i].handle && e.access == static_cast<u32>(us[i].access) &&
+                e.gen == gen && us[i].lo >= e.lo && us[i].hi <= e.hi &&
+                VideoCore::GranulesUnchangedSince(us[i].lo, us[i].hi, e.epoch)) {
+                hit = &e;
+                break;
+            }
+        }
+        bool gpu_mod = false;
+        const VideoCore::Buffer* buf = buffer_cache.NativeRunSpan(
+            us[i].lo, us[i].hi, us[i].access, &buffer_barriers, cur_dispatch_run, hit == nullptr,
+            hit ? (hit->gpu_mod ? 1 : 0) : -1, &gpu_mod);
+        if (!buf || std::bit_cast<u64>(static_cast<VkBuffer>(buf->Handle())) != us[i].handle) {
+            return fail(8);
+        }
+        st.ring_span_bytes += us[i].hi - us[i].lo;
+        if (hit) {
+            ++st.ring_span_hits;
+            continue;
+        }
+        NativeSpanEntry* slot = nullptr;
+        for (auto& e : native_span_cache) {
+            if (e.handle == us[i].handle && e.access == static_cast<u32>(us[i].access)) {
+                slot = &e;
+                break;
+            }
+        }
+        if (slot && slot->gen == gen && us[i].lo <= slot->hi && us[i].hi >= slot->lo &&
+            std::max(slot->hi, us[i].hi) - std::min(slot->lo, us[i].lo) <= (u64{64} << 20) &&
+            VideoCore::GranulesUnchangedSince(slot->lo, slot->hi, slot->epoch)) {
+            slot->lo = std::min(slot->lo, us[i].lo);
+            slot->hi = std::max(slot->hi, us[i].hi);
+            slot->gpu_mod = slot->gpu_mod || gpu_mod;
+        } else {
+            if (!slot) {
+                slot = &native_span_cache[native_span_rr++ % native_span_cache.size()];
+            }
+            *slot = {us[i].handle, static_cast<u32>(us[i].access), us[i].lo, us[i].hi, clock0,
+                     gen, gpu_mod};
+        }
+    }
+    st.ring_spans += nus;
+    t_segx_delta = static_cast<u32>((seg.ilo - icpu) / b.index_size);
+    t_segx_ranges = 0;
+    for (u32 i = 0; i < seg.n_ops; ++i) {
+        t_segx_ranges += segx_ops[i].kind == AmdGpu::CpSplit::SegOpDrawRange;
+    }
+    native_prep.active = false;
+    native_ring_handle = ring_handle;
+    return true;
+}
+
+void Rasterizer::NativeSegWrite(u8* map_ptr, u64 map_off, u64 table_bytes, u64 tables_rel) {
+    // NativeOpen, after member 0's record and command: the segment's members into the batch -
+    // the commands (firstIndex + the index buffer delta) into slots 0..n-1, the list entries,
+    // the one material's bindless slot words into every member's job record (128 bytes each,
+    // write-combined; the remaining per-member cost), the count. One table copy per DRAW_RANGE
+    // after the first (its list address at the range's first member). The batch is sealed.
+    auto& b = native_batch;
+    const auto& seg = *segx_pending;
+    const u32 n = seg.n;
+    for (u32 j = 0; j < n; ++j) {
+        const u32* c = segx_cmds + size_t(j) * 5;
+        const u32 w[5] = {c[0], c[1], c[2] + t_segx_delta, 0u, 0u};
+        std::memcpy(b.cmds + u64(j) * NativeCmdBytes, w, sizeof(w));
+    }
+    if (b.list) {
+        std::memcpy(b.list, segx_list, size_t(n) * sizeof(u32));
+    }
+    if (b.bindless) {
+        for (u32 j = 0; j < n; ++j) {
+            BindlessRingWrite((segx_list[j] >> 24) << 28, segx_list[j] & Shader::NativeSegRingMask,
+                              b.bl_slots.data());
+        }
+    }
+    *b.count = n;
+    b.n = n;
+    b.sealed = true;
+    native_prep.active = false;
+    const u64 list_addr = u64{native_ring_table[Shader::NativeTableSegList]} |
+                          (u64{native_ring_table[Shader::NativeTableSegList + 1]} << 32);
+    u32 k = 0;
+    for (u32 i = 0; i < seg.n_ops; ++i) {
+        if (segx_ops[i].kind != AmdGpu::CpSplit::SegOpDrawRange) {
+            continue;
+        }
+        if (k > 0) {
+            std::array<u32, Shader::NativeTableDwords> t = native_ring_table;
+            const u64 la = list_addr + u64(segx_ops[i].a) * sizeof(u32);
+            t[Shader::NativeTableSegList] = static_cast<u32>(la);
+            t[Shader::NativeTableSegList + 1] = static_cast<u32>(la >> 32);
+            std::memcpy(map_ptr + tables_rel + u64(k - 1) * table_bytes, t.data(), table_bytes);
+            segx_table_off[k] = map_off + tables_rel + u64(k - 1) * table_bytes;
+        }
+        ++k;
+    }
+    segx_result = 1;
+    ++native_stats.segx_opens;
+    native_stats.segx_members += n;
+}
+
+namespace {
+/// SHADPS4_NATIVE_SEGX: the dynamic stencil values UpdateDynamicState derives, for an op's raw
+/// DB_STENCILREFMASK / _BF (everything else from the mirror): front / back reference, write
+/// mask, compare mask.
+void SegxStencilValues(const AmdGpu::Regs& regs, u32 raw_f, u32 raw_b, std::array<u32, 6>& out) {
+    AmdGpu::StencilRefMask front{}, back_raw{};
+    std::memcpy(&front, &raw_f, sizeof(u32));
+    std::memcpy(&back_raw, &raw_b, sizeof(u32));
+    const auto back = regs.depth_control.backface_enable ? back_raw : front;
+    const bool stencil_clear = regs.depth_render_control.stencil_clear_enable;
+    const auto reference = [&](const AmdGpu::StencilRefMask& face, AmdGpu::CompareFunc compare,
+                               AmdGpu::StencilFunc fail, AmdGpu::StencilFunc pass,
+                               AmdGpu::StencilFunc depth_fail) -> u32 {
+        if (g_replace_op_reference && compare == AmdGpu::CompareFunc::Always &&
+            fail == AmdGpu::StencilFunc::Keep && pass == AmdGpu::StencilFunc::ReplaceOp &&
+            depth_fail == AmdGpu::StencilFunc::Keep &&
+            !regs.depth_shader_control.stencil_test_val_export_enable &&
+            !regs.depth_shader_control.stencil_op_val_export_enable) {
+            return face.stencil_op_val;
+        }
+        return face.stencil_test_val;
+    };
+    out[0] = reference(front, regs.depth_control.stencil_ref_func,
+                       regs.stencil_control.stencil_fail_front,
+                       regs.stencil_control.stencil_zpass_front,
+                       regs.stencil_control.stencil_zfail_front);
+    out[1] = regs.depth_control.backface_enable
+                 ? reference(back, regs.depth_control.stencil_bf_func,
+                             regs.stencil_control.stencil_fail_back,
+                             regs.stencil_control.stencil_zpass_back,
+                             regs.stencil_control.stencil_zfail_back)
+                 : out[0];
+    out[2] = !stencil_clear ? front.stencil_write_mask : 0u;
+    out[3] = !stencil_clear ? back.stencil_write_mask : 0u;
+    out[4] = front.stencil_mask;
+    out[5] = back.stencil_mask;
+}
+
+void SegxCullValues(const AmdGpu::Regs& regs, u32 raw_pc, vk::CullModeFlags& cull,
+                    vk::FrontFace& ff) {
+    AmdGpu::PolygonControl pc{};
+    std::memcpy(&pc, &raw_pc, sizeof(u32));
+    cull = LiverpoolToVK::IsPrimitiveCulled(regs.primitive_type)
+               ? LiverpoolToVK::CullMode(pc.CullingMode())
+               : vk::CullModeFlagBits::eNone;
+    ff = LiverpoolToVK::FrontFace(pc.front_face);
+}
+} // namespace
+
+void Rasterizer::NativeSegRecord(const GraphicsPipeline* pipeline, vk::Buffer sb, u64 cmd_off,
+                                 vk::PipelineLayout bl_layout, vk::DescriptorSet bl_set) {
+    // DrawTail, in place of the batch's drawIndexedIndirectCount: the op list - indirect draw
+    // ranges over the members' commands with stencil / cull dynamic state between them. A range
+    // after the first re-pushes the table (its list address at the range's first member:
+    // DrawIndex restarts at 0 for every indirect draw). The dynamic-state tracker is told the
+    // stencil / cull state is unknown afterwards.
+    struct Baked {
+        u32 kind{};
+        u32 first{}, count{};
+        std::array<u32, 6> st{};
+        vk::CullModeFlags cull{};
+        vk::FrontFace ff{};
+        u64 table_off{};
+    };
+    const auto& seg = *segx_pending;
+    const auto& regs = liverpool->BackRegs();
+    std::vector<Baked> baked;
+    baked.reserve(seg.n_ops);
+    u32 k = 0;
+    bool any_state = false;
+    for (u32 i = 0; i < seg.n_ops; ++i) {
+        const auto& op = segx_ops[i];
+        Baked bk{};
+        bk.kind = op.kind;
+        switch (op.kind) {
+        case AmdGpu::CpSplit::SegOpDrawRange:
+            bk.first = op.a;
+            bk.count = op.b;
+            bk.table_off = k > 0 ? segx_table_off[k] : 0;
+            ++k;
+            break;
+        case AmdGpu::CpSplit::SegOpStencil:
+            SegxStencilValues(regs, op.a, op.b, bk.st);
+            any_state = true;
+            break;
+        case AmdGpu::CpSplit::SegOpCull:
+            SegxCullValues(regs, op.a, bk.cull, bk.ff);
+            any_state = true;
+            break;
+        default:
+            continue;
+        }
+        baked.push_back(bk);
+    }
+    const auto& b = native_batch;
+    scheduler.Record([handle = pipeline->Handle(), sb, cmd_off, bl_layout, bl_set,
+                      layout = pipeline->GetLayout(), tbind = pipeline->native_table_binding,
+                      table_bytes = u64(Shader::NativeTableDwords) * sizeof(u32),
+                      ib = vk::Buffer{std::bit_cast<VkBuffer>(b.ib)},
+                      type = b.index_size == 2 ? vk::IndexType::eUint16 : vk::IndexType::eUint32,
+                      baked = std::move(baked)](vk::CommandBuffer cmdbuf) {
+        if (!GraphicsBindTracker::Enabled() || GraphicsBindTracker::NeedBind(cmdbuf, handle)) {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+        }
+        if (bl_set) {
+            cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, bl_layout, 1, bl_set, {});
+        }
+        cmdbuf.bindIndexBuffer(ib, 0, type);
+        for (const auto& op : baked) {
+            switch (op.kind) {
+            case AmdGpu::CpSplit::SegOpDrawRange: {
+                if (op.table_off != 0) {
+                    vk::DescriptorBufferInfo info{sb, op.table_off, table_bytes};
+                    vk::WriteDescriptorSet w{};
+                    w.dstSet = VK_NULL_HANDLE;
+                    w.dstBinding = tbind;
+                    w.dstArrayElement = 0;
+                    w.descriptorCount = 1;
+                    w.descriptorType = vk::DescriptorType::eStorageBuffer;
+                    w.pBufferInfo = &info;
+                    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, layout, 0, w);
+                }
+                cmdbuf.drawIndexedIndirect(sb, cmd_off + u64(op.first) * NativeCmdBytes, op.count,
+                                           NativeCmdBytes);
+                break;
+            }
+            case AmdGpu::CpSplit::SegOpStencil:
+                cmdbuf.setStencilReference(vk::StencilFaceFlagBits::eFront, op.st[0]);
+                cmdbuf.setStencilReference(vk::StencilFaceFlagBits::eBack, op.st[1]);
+                cmdbuf.setStencilWriteMask(vk::StencilFaceFlagBits::eFront, op.st[2]);
+                cmdbuf.setStencilWriteMask(vk::StencilFaceFlagBits::eBack, op.st[3]);
+                cmdbuf.setStencilCompareMask(vk::StencilFaceFlagBits::eFront, op.st[4]);
+                cmdbuf.setStencilCompareMask(vk::StencilFaceFlagBits::eBack, op.st[5]);
+                break;
+            case AmdGpu::CpSplit::SegOpCull:
+                cmdbuf.setCullMode(op.cull);
+                cmdbuf.setFrontFace(op.ff);
+                break;
+            default:
+                break;
+            }
+        }
+    });
+    if (any_state) {
+        auto& ds = scheduler.GetDynamicState();
+        ds.dirty_state.stencil_front_reference = true;
+        ds.dirty_state.stencil_back_reference = true;
+        ds.dirty_state.stencil_front_write_mask = true;
+        ds.dirty_state.stencil_back_write_mask = true;
+        ds.dirty_state.stencil_front_compare_mask = true;
+        ds.dirty_state.stencil_back_compare_mask = true;
+        ds.dirty_state.cull_mode = true;
+        ds.dirty_state.front_face = true;
+    }
+}
+
 void Rasterizer::NativeRingVerifyWrite() {
     // SHADPS4_NATIVE_GPU_DIRECT=3: the batch stays legacy; the ring's predictions (records and
     // commands) go to the prepare-verify side copy that NativeJoin compares with each join.
@@ -4286,11 +4711,18 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
                       rec_off, rec_size);
     }
     bool ring_verify = false;
+    bool segx_prepared = false;
     if (gpu_direct) [[unlikely]] {
+        // SHADPS4_NATIVE_SEGX=1: a Segment record's member 0 takes the segment's unions instead
+        // of the opener's job run (NativeSegPrepare); a refusal leaves a legacy opener.
         const bool prepared =
-            NativeRingPrepare(base, AmdGpu::CpSplit::VertexInputAttribs(*front_vi), open_addr,
-                              rec_off, rec_size, push_data.ud_regs.data());
-        ring_verify = prepared && AmdGpu::NativeRec::g_gpu_mode == 3;
+            segx_pending != nullptr
+                ? NativeSegPrepare(base, AmdGpu::CpSplit::VertexInputAttribs(*front_vi),
+                                   open_addr, rec_off, rec_size, push_data.ud_regs.data())
+                : NativeRingPrepare(base, AmdGpu::CpSplit::VertexInputAttribs(*front_vi),
+                                    open_addr, rec_off, rec_size, push_data.ud_regs.data());
+        segx_prepared = prepared && segx_pending != nullptr;
+        ring_verify = prepared && !segx_prepared && AmdGpu::NativeRec::g_gpu_mode == 3;
         b.ring = prepared && !ring_verify;
         native_stats.ring_opens_legacy += !prepared;
     }
@@ -4298,12 +4730,15 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
     const u64 table_bytes = gpu_direct ? Shader::NativeTableDwords * 4 : 0;
     // SHADPS4_NATIVE_SEG: the batch's record list (a u32 per draw) after the count.
     const u64 seg_bytes = native_seg_on ? u64(NativeMaxDraws) * 4 : 0;
+    // SHADPS4_NATIVE_SEGX: one table copy per DRAW_RANGE after the first (NativeSegWrite).
+    const u64 segx_bytes =
+        segx_prepared && t_segx_ranges > 1 ? u64(t_segx_ranges - 1) * table_bytes : 0;
     auto& stream = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
     if (!stream.IsCoherent()) {
         return fail(__LINE__);
     }
-    const u64 total =
-        u64(NativeMaxDraws) * (NativeRecBytes + NativeCmdBytes) + 16 + table_bytes + seg_bytes;
+    const u64 total = u64(NativeMaxDraws) * (NativeRecBytes + NativeCmdBytes) + 16 + table_bytes +
+                      seg_bytes + segx_bytes;
     const u64 seq_before_map = scheduler.RecordSeq();
     const u64 tick_before_map = scheduler.CurrentTick();
     const auto [map_ptr, map_off] = stream.Map(total, instance.StorageMinAlignment(), false);
@@ -4339,6 +4774,7 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
             NativeSegOpen(stream.BufferDeviceAddress() + offset,
                           stream.BufferDeviceAddress() + offset + list_off,
                           reinterpret_cast<u32*>(ptr + list_off));
+            b.list = reinterpret_cast<u32*>(ptr + list_off);
         }
         std::memcpy(map_ptr, native_ring_table.data(), table_bytes);
     }
@@ -4464,7 +4900,9 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
                 ++set_write_index;
             }
         }
-        if (b.ring) {
+        if (segx_prepared) [[unlikely]] {
+            NativeSegWrite(map_ptr, map_off, table_bytes, total - segx_bytes);
+        } else if (b.ring) {
             NativeRingWrite();
         } else if (ring_verify) {
             NativeRingVerifyWrite();
@@ -4969,7 +5407,7 @@ const GraphicsPipeline* Rasterizer::NativeDirectCandidate(
     // The normal path's single-draw rule (advisor ~01:15: without it, singles became openers
     // at ~13 k instead of generic draws at ~7.9 k): open only if the next queued draw shares the
     // pipeline.
-    if (liverpool->NativePeekNextDraw(pipeline) == 0) {
+    if (segx_pending == nullptr && liverpool->NativePeekNextDraw(pipeline) == 0) {
         ++native_stats.nd_fail[10];
         return nullptr;
     }
@@ -5241,6 +5679,12 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
     auto& b = native_batch;
     const auto& regs = liverpool->BackRegs();
     b.cand_valid = false;
+    if (b.sealed) [[unlikely]] {
+        // SHADPS4_NATIVE_SEGX: an executed segment is complete; the next draw opens its own.
+        ++native_stats.segx_join_refused;
+        NativeClose(15);
+        return false;
+    }
     if (draw.pipeline != b.base) {
         // Segment census (sec. 14): would a GPU-driven segment survive this pipeline change?
         const auto& ka = b.base->GetGraphicsKey();
@@ -7025,6 +7469,10 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
             native_batch.bindless ? pipeline->GetLayout() : vk::PipelineLayout{};
         const vk::DescriptorSet bl_set =
             native_batch.bindless ? Bindless::G().sets[native_batch.bl_set] : vk::DescriptorSet{};
+        if (segx_pending != nullptr && segx_result == 1 && native_batch.sealed) [[unlikely]] {
+            // SHADPS4_NATIVE_SEGX=1: the segment's op list in place of the batch draw.
+            NativeSegRecord(pipeline, stream.Handle(), cmd_off, bl_layout, bl_set);
+        } else {
         scheduler.Record([handle = pipeline->Handle(), sb = stream.Handle(), cmd_off, count_off,
                           bl_layout, bl_set,
                           rebind = native_batch.vb_rebased, vb_n = native_batch.vb_n, vbufs, voffs,
@@ -7046,6 +7494,7 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
             cmdbuf.drawIndexedIndirectCount(sb, cmd_off, sb, count_off, NativeMaxDraws,
                                             NativeCmdBytes);
         });
+        }
         scheduler.GetDynamicState().packet_state_unknown = true;
         native_batch.seq = scheduler.RecordSeq();
         native_batch.tick = scheduler.CurrentTick();

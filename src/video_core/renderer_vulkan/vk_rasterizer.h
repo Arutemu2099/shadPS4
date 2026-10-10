@@ -601,6 +601,10 @@ private:
         VideoCore::NativeJoinVi cand_vi{};
         u32 cand_vertex_offset{};
         u32 cand_instance_offset{};
+        /// SHADPS4_NATIVE_SEGX: the brick-A list of this batch (stream memory) and whether the
+        /// batch is an executed segment (its members are in; no joins).
+        u32* list{};
+        bool sealed{};
     } native_batch;
     boost::container::small_vector<vk::BufferMemoryBarrier2, 16> native_carry;
     /// SHADPS4_NATIVE_COLOUR: the opener's raw T# / S# words (the draw-repeat image key) and,
@@ -802,6 +806,8 @@ private:
         // SHADPS4_NATIVE_TIMING: whole draw records (Liverpool's timer) by rec_outcome x posted by
         // the front's member path.
         std::array<u64, 12> c_rec{}, n_rec{};
+        /// SHADPS4_NATIVE_SEGX=1: executed segments, their members, joins refused by a seal.
+        u64 segx_opens{}, segx_members{}, segx_join_refused{};
     } native_stats;
     void NativePrepare(const GraphicsPipeline* base,
                        const AmdGpu::CpSplit::VertexInputAttrib* attribs,
@@ -820,6 +826,21 @@ private:
                            const std::array<u32, Shader::NUM_BUFFERS>& o_off,
                            const std::array<u32, Shader::NUM_BUFFERS>& o_size, const u32* o_ud);
     void NativeRingWrite();
+    /// SHADPS4_NATIVE_SEGX=1 (sec. 23): NativeOpen of member 0 of a Segment record, in place of
+    /// NativeRingPrepare: the unions, bases and spans from the record (no member is read); then
+    /// the members' commands, list entries and bindless slot words into the batch; then the op
+    /// list in place of the batch draw.
+    bool NativeSegPrepare(const GraphicsPipeline* base,
+                          const AmdGpu::CpSplit::VertexInputAttrib* attribs,
+                          const std::array<u64, Shader::NUM_BUFFERS>& o_addr,
+                          const std::array<u32, Shader::NUM_BUFFERS>& o_off,
+                          const std::array<u32, Shader::NUM_BUFFERS>& o_size, const u32* o_ud);
+    void NativeSegWrite(u8* map_ptr, u64 map_off, u64 table_bytes, u64 tables_rel);
+    void NativeSegRecord(const GraphicsPipeline* pipeline, vk::Buffer sb, u64 cmd_off,
+                         vk::PipelineLayout bl_layout, vk::DescriptorSet bl_set);
+    u32 t_segx_delta{};  ///< (index union lo - the index buffer's CPU base) / index size
+    u32 t_segx_ranges{}; ///< DRAW_RANGE ops of the pending segment (table copies: ranges - 1)
+    std::array<u64, AmdGpu::CpSplit::SegMaxOps + 3> segx_table_off{}; ///< per range > 0
     void NativeRingVerifyWrite();
     std::array<u32, Shader::NativeTableDwords> native_ring_table{};
     struct NativeSpanEntry {
