@@ -163,6 +163,7 @@ enum class RecordType : u16 {
                 ///< retires it for WaitGpuIdle.
     Diag,       ///< DiagPayload: a diagnostic marker in stream order (SHADPS4_ASC_RING_LATENCY).
     Segment,    ///< SHADPS4_NATIVE_SEGX: SplitSegmentRecord, a segment of native colour members.
+    DcbBegin,   ///< SHADPS4_A1: DcbBeginPayload, a top-level guest command buffer starts here.
 };
 
 /// Flags for Packet records.
@@ -253,6 +254,13 @@ struct EpochPayload {
 struct CallPayload {
     void (*invoke)(void*);
     void* context;
+};
+/// SHADPS4_A1 (architecture A, notes/NATIVE-RENDERER.md): the start of one top-level guest
+/// command buffer (one SubmitGfx); every record up to the next DcbBegin belongs to it.
+struct DcbBeginPayload {
+    u64 addr;    ///< guest address of the DCB (identification only, never read)
+    u32 dwords;  ///< DCB size
+    u32 has_ccb; ///< 1: a constant command buffer came with it
 };
 /// Diagnostic marker (never emitted unless a diagnostic flag is on).
 struct DiagPayload {

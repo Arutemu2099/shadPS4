@@ -199,6 +199,17 @@ public:
     /// 5 colour confirm.
     u32 rec_outcome{};
     void NoteRecordCycles(u64 dt);
+    /// SHADPS4_A1 census (Liverpool, back thread): native batch opens so far, whether the last
+    /// open was a colour batch, and the generic-path reason of the last draw (reset per draw).
+    [[nodiscard]] u64 A1NativeOpens() const noexcept {
+        return native_stats.opens;
+    }
+    [[nodiscard]] bool A1LastOpenColour() const noexcept {
+        return native_stats.last_open_colour;
+    }
+    [[nodiscard]] const char* A1TakeWhy() noexcept {
+        return std::exchange(native_stats.last_why, nullptr);
+    }
     /// Back thread: runs a dispatch the front looked up. The caller points
     /// Liverpool::BackCsRegs() at the record's ComputeProgram snapshot.
     void ExecuteDispatch(const ComputePipeline* pipeline,

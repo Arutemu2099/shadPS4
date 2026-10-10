@@ -313,6 +313,8 @@ private:
     void BackLoop(std::stop_token stoken);
     void ExecuteRecord(const CpSplit::RecordHeader& record);
     void ExecuteRecordImpl(const CpSplit::RecordHeader& record);
+    /// SHADPS4_A1 (architecture A step A1): ExecuteRecordImpl plus the per-DCB census.
+    void A1Execute(const CpSplit::RecordHeader& record);
     /// `draw_payload`: the SplitDrawRecord to run (default: the record's own payload; a
     /// Segment record passes its embedded member-0 record).
     void ExecuteDrawRecord(const CpSplit::RecordHeader& record, const void* draw_payload = nullptr);

@@ -185,6 +185,13 @@ static const int g_mtb_p3 = [] {
     return value != nullptr && (value[0] == '1' || value[0] == '2') ? value[0] - '0' : 0;
 }();
 
+/// SHADPS4_A1=1 (architecture A step A1, notes/NATIVE-RENDERER.md): DcbBegin records and the
+/// per-command-buffer census on the back (observation only; every record runs as before).
+static const int g_a1 = [] {
+    const char* value = std::getenv("SHADPS4_A1");
+    return value != nullptr && value[0] == '1' ? 1 : 0;
+}();
+
 void Liverpool::MtbBreakAtPacket(const PM4Header* header) {
     // The DMA_DATA to 0x3022C is skipped by ExecuteGfxPacket: not a sequence point.
     const auto* dma = reinterpret_cast<const PM4DmaData*>(header);
@@ -1745,7 +1752,307 @@ void BackCyclesNote(u32 type, u64 cyc, Vulkan::Scheduler* sched) {
 }
 } // namespace
 
+namespace {
+// SHADPS4_A1 (architecture A step A1, notes/NATIVE-RENDERER.md): per top-level DCB, what a
+// worker translating the whole DCB with today's native pieces would meet. Back thread only.
+// Bits of what a DCB contains besides native draws (a worker cannot take it whole while any is
+// set, except A1Sync, which A handles at the DCB boundary when it sits after the last draw):
+enum A1Bits : u32 {
+    A1Generic = 1u << 0,  ///< a draw took the generic (old per-draw) path
+    A1Indirect = 1u << 1, ///< an indirect draw
+    A1Dispatch = 1u << 2, ///< a dispatch
+    A1Sync = 1u << 3,     ///< a sync packet (EOP / EOS / WRITE_DATA / DMA other than the no-op /
+                          ///< RELEASE_MEM / other) or a Call record
+    A1SyncMid = 1u << 4,  ///< ... with a draw after it inside the same DCB
+};
+struct A1Dcb {
+    bool open{};
+    u32 bits{};
+    u32 draws{}, native{}, shadow{}, colour{}, skipped{};
+    u64 cyc{};      ///< back cycles of the DCB's records (the census' own rdtsc included)
+    const char* why{}; ///< the first generic draw's reason
+    u32 gmask{};       ///< every generic reason seen (A1Reason bits)
+    u32 generic{};     ///< generic draws
+};
+struct A1Census {
+    A1Dcb cur{};
+    u64 dcbs{}, empty{}, draws{}, native{}, records{}, asc_dispatches{};
+    u64 cyc_all{}, cyc_outside{};
+    std::array<u64, 32> by_bits{}, draws_by_bits{}, cyc_by_bits{};
+    u64 elig_shadow_only{}, elig_colour_only{}, elig_mixed{};
+    u64 snap_cyc{}, snap_n{};
+    u64 max_draws{};
+    std::array<u64, 8> draw_hist{}; ///< 0, 1-15, 16-63, 64-127, 128-255, 256-511, 512+
+    std::unordered_map<const char*, u64> why;
+    /// DCBs whose only blockers are generic draws (no I / D / mid sync), by reason set.
+    std::array<u64, 32> g_dcbs{}, g_draws{}, g_cyc{}, g_generic{};
+    u64 start_ns{}, start_tsc{};
+    std::unique_ptr<u32[]> snap; ///< entry snapshot: config + SH, context, uconfig windows
+};
+A1Census g_a1c;
+u64 A1NowNs() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+constexpr u32 A1SnapWords = 0x1000 + 0x400 + 0x400;
+/// Generic-path reasons: 0 peek single draw (policy), 1 not indexed, 2 NativeOpen failed, 3 no
+/// variant for the vertex description, 4 anything else.
+u32 A1Reason(const char* why) {
+    if (why == nullptr) {
+        return 4;
+    }
+    const std::string_view w{why};
+    return w == "colour: peek says single draw"                    ? 0
+           : w == "not indexed"                                    ? 1
+           : w == "NativeOpen failed"                              ? 2
+           : w == "colour: no variant for this vertex description" ? 3
+                                                                   : 4;
+}
+
+void A1Log(A1Census& c) {
+    const u64 now = A1NowNs();
+    const double s = double(now - c.start_ns) * 1e-9;
+    const u64 tsc = __rdtsc();
+    const double tsc_per_ns = c.start_tsc && now > c.start_ns
+                                  ? double(tsc - c.start_tsc) / double(now - c.start_ns)
+                                  : 3.5;
+    const auto ms_s = [&](u64 cyc) { return s > 0 ? double(cyc) / tsc_per_ns * 1e-6 / s : 0.0; };
+    const u64 elig = c.by_bits[0] + c.by_bits[A1Sync];
+    const u64 elig_d = c.draws_by_bits[0] + c.draws_by_bits[A1Sync];
+    const u64 elig_c = c.cyc_by_bits[0] + c.cyc_by_bits[A1Sync];
+    LOG_INFO(Render,
+             "A1: window {:.1f}s dcbs/s={:.0f} draw_recs/s={:.0f} draws/dcb={:.1f} max={} empty={} "
+             "native_draw_share={:.3f} | eligible(no generic/indirect/dispatch, sync only after "
+             "the last draw) dcbs={:.3f} draws={:.3f} back_cyc={:.3f} (shadow-only {} colour-only "
+             "{} mixed {}) | back ms/s: dcb records {:.1f} outside dcbs {:.1f} | entry snapshot "
+             "{} B, {:.0f} cyc each, {:.2f} ms/s | asc dispatches/s {:.0f}",
+             s, s > 0 ? double(c.dcbs) / s : 0.0, s > 0 ? double(c.draws) / s : 0.0,
+             c.dcbs - c.empty ? double(c.draws) / double(c.dcbs - c.empty) : 0.0, c.max_draws,
+             c.empty, c.draws ? double(c.native) / double(c.draws) : 0.0,
+             c.dcbs - c.empty ? double(elig) / double(c.dcbs - c.empty) : 0.0,
+             c.draws ? double(elig_d) / double(c.draws) : 0.0,
+             c.cyc_all ? double(elig_c) / double(c.cyc_all) : 0.0, c.elig_shadow_only,
+             c.elig_colour_only, c.elig_mixed, ms_s(c.cyc_all), ms_s(c.cyc_outside),
+             A1SnapWords * 4, c.snap_n ? double(c.snap_cyc) / double(c.snap_n) : 0.0,
+             ms_s(c.snap_cyc), s > 0 ? double(c.asc_dispatches) / s : 0.0);
+    std::string bits;
+    for (u32 b = 0; b < 32; ++b) {
+        if (c.by_bits[b] != 0) {
+            bits += fmt::format(" [{}{}{}{}{}]={}/{}d/{:.3f}c", (b & A1Generic) ? "G" : "-",
+                                (b & A1Indirect) ? "I" : "-", (b & A1Dispatch) ? "D" : "-",
+                                (b & A1Sync) ? "S" : "-", (b & A1SyncMid) ? "M" : "-",
+                                c.by_bits[b], c.draws_by_bits[b],
+                                c.cyc_all ? double(c.cyc_by_bits[b]) / double(c.cyc_all) : 0.0);
+        }
+    }
+    LOG_INFO(Render, "A1 dcbs by content (G generic I indirect D dispatch S sync M sync before a "
+                     "draw; dcbs/draws/back-cycle share):{} | draws per dcb hist {}",
+             bits, fmt::format("{},{},{},{},{},{},{}", c.draw_hist[0], c.draw_hist[1],
+                               c.draw_hist[2], c.draw_hist[3], c.draw_hist[4], c.draw_hist[5],
+                               c.draw_hist[6]));
+    std::vector<std::pair<u64, const char*>> whys;
+    for (const auto& [k, v] : c.why) {
+        whys.emplace_back(v, k);
+    }
+    std::sort(whys.rbegin(), whys.rend());
+    std::string w;
+    for (size_t i = 0; i < whys.size() && i < 10; ++i) {
+        w += fmt::format(" '{}'={}", whys[i].second ? whys[i].second : "(none: not indexed / "
+                                                                       "no native branch)",
+                         whys[i].first);
+    }
+    LOG_INFO(Render, "A1 first generic draw per dcb, by reason:{}", w);
+    std::string g;
+    for (u32 m = 1; m < 32; ++m) {
+        if (c.g_dcbs[m] != 0) {
+            g += fmt::format(" [{}{}{}{}{}]={}/{}d/{}g/{:.3f}c", (m & 1) ? "P" : "-",
+                             (m & 2) ? "N" : "-", (m & 4) ? "F" : "-", (m & 8) ? "V" : "-",
+                             (m & 16) ? "O" : "-", c.g_dcbs[m], c.g_draws[m], c.g_generic[m],
+                             c.cyc_all ? double(c.g_cyc[m]) / double(c.cyc_all) : 0.0);
+        }
+    }
+    LOG_INFO(Render, "A1 dcbs blocked only by generic draws, by reason set (P peek single, N not "
+                     "indexed, F NativeOpen failed, V no vertex variant, O other; "
+                     "dcbs/draws/generic draws/back-cycle share):{}",
+             g);
+    auto keep = std::move(c.snap);
+    c = A1Census{};
+    c.snap = std::move(keep);
+    c.start_ns = now;
+    c.start_tsc = tsc;
+}
+
+void A1Close(A1Census& c) {
+    auto& d = c.cur;
+    if (!d.open) {
+        return;
+    }
+    ++c.dcbs;
+    c.draws += d.draws;
+    c.native += d.native;
+    c.max_draws = std::max<u64>(c.max_draws, d.draws);
+    const u32 h = d.draws == 0 ? 0 : d.draws < 16 ? 1 : d.draws < 64 ? 2 : d.draws < 128 ? 3
+                : d.draws < 256 ? 4 : d.draws < 512 ? 5 : 6;
+    ++c.draw_hist[h];
+    if (d.draws == 0) {
+        ++c.empty;
+    } else {
+        const u32 b = d.bits & 31;
+        ++c.by_bits[b];
+        c.draws_by_bits[b] += d.draws;
+        c.cyc_by_bits[b] += d.cyc;
+        if (b == 0 || b == A1Sync) {
+            if (d.colour == 0) {
+                ++c.elig_shadow_only;
+            } else if (d.shadow == 0) {
+                ++c.elig_colour_only;
+            } else {
+                ++c.elig_mixed;
+            }
+        }
+        if (d.why != nullptr || (d.bits & A1Generic)) {
+            ++c.why[d.why];
+        }
+        if (b == A1Generic || b == (A1Generic | A1Sync)) {
+            ++c.g_dcbs[d.gmask & 31];
+            c.g_draws[d.gmask & 31] += d.draws;
+            c.g_cyc[d.gmask & 31] += d.cyc;
+            c.g_generic[d.gmask & 31] += d.generic;
+        }
+    }
+    d = A1Dcb{};
+    if (c.dcbs >= 65536) {
+        A1Log(c);
+    }
+}
+} // namespace
+
+void Liverpool::A1Execute(const CpSplit::RecordHeader& record) {
+    using RT = CpSplit::RecordType;
+    auto& c = g_a1c;
+    if (c.start_ns == 0) [[unlikely]] {
+        c.start_ns = A1NowNs();
+        c.start_tsc = __rdtsc();
+    }
+    if (!c.snap) [[unlikely]] {
+        c.snap = std::make_unique<u32[]>(A1SnapWords);
+    }
+    if (record.type == RT::DcbBegin) {
+        A1Close(c);
+        // Entry snapshot (what a worker would start from): config + SH, context, uconfig windows.
+        const u64 t0 = __rdtsc();
+        const auto& r = mirror->regs.reg_array;
+        std::memcpy(c.snap.get(), &r[0x2000], 0x1000 * 4);
+        std::memcpy(c.snap.get() + 0x1000, &r[0xA000], 0x400 * 4);
+        std::memcpy(c.snap.get() + 0x1400, &r[0xC000], 0x400 * 4);
+        c.snap_cyc += __rdtsc() - t0;
+        ++c.snap_n;
+        c.cur.open = true;
+        return;
+    }
+    auto& d = c.cur;
+    u32 bits = 0;
+    const u64 t0 = __rdtsc();
+    switch (record.type) {
+    case RT::Draw: {
+        const auto& r = *reinterpret_cast<const SplitDrawRecord*>(&record + 1);
+        Vulkan::Rasterizer* tr = rasterizer ? &rasterizer->Translating() : nullptr;
+        const u64 opens0 = tr ? tr->A1NativeOpens() : 0;
+        if (tr) {
+            tr->rec_outcome = 0;
+            (void)tr->A1TakeWhy();
+        }
+        ExecuteRecordImpl(record);
+        ++d.draws;
+        if (r.draw.args.is_indirect) {
+            bits |= A1Indirect;
+            break;
+        }
+        if (!tr) {
+            break;
+        }
+        const u32 o = tr->rec_outcome;
+        const bool opened = tr->A1NativeOpens() != opens0;
+        if (o == 1 || o == 4) {
+            ++d.native;
+            ++d.shadow;
+        } else if (o == 2 || o == 5) {
+            ++d.native;
+            ++d.colour;
+        } else if (o == 3 && opened) {
+            ++d.native;
+            ++(tr->A1LastOpenColour() ? d.colour : d.shadow);
+        } else if (o == 0) {
+            ++d.skipped; // filtered / no draw (begin() refused)
+            ++d.native;
+        } else {
+            bits |= A1Generic;
+            const char* why = tr->A1TakeWhy();
+            d.gmask |= 1u << A1Reason(why);
+            ++d.generic;
+            if (!(d.bits & A1Generic)) {
+                d.why = why;
+            }
+        }
+        if (d.bits & A1Sync) {
+            bits |= A1SyncMid;
+        }
+        break;
+    }
+    case RT::Segment:
+        ExecuteRecordImpl(record);
+        ++d.draws;
+        ++d.native;
+        ++d.colour;
+        break;
+    case RT::Dispatch: {
+        ExecuteRecordImpl(record);
+        // ASC dispatches interleave with the gfx DCBs in the stream; only gfx-queue ones count.
+        const auto& r = *reinterpret_cast<const SplitDispatchRecord*>(&record + 1);
+        if (r.queue == 0) {
+            bits |= A1Dispatch;
+        } else {
+            ++c.asc_dispatches;
+        }
+        break;
+    }
+    case RT::Packet: {
+        ExecuteRecordImpl(record);
+        const auto* header = reinterpret_cast<const PM4Header*>(&record + 1);
+        const auto* dma = reinterpret_cast<const PM4DmaData*>(header);
+        const bool noop = !(record.flags & CpSplit::AscReleaseMem) &&
+                          header->type3.opcode == PM4ItOpcode::DmaData &&
+                          dma->dst_addr_lo == 0x3022C;
+        if (!noop) {
+            bits |= A1Sync;
+        }
+        break;
+    }
+    case RT::Call:
+        ExecuteRecordImpl(record);
+        bits |= A1Sync;
+        break;
+    default:
+        ExecuteRecordImpl(record);
+        break;
+    }
+    const u64 dt = __rdtsc() - t0;
+    ++c.records;
+    c.cyc_all += dt;
+    if (d.open) {
+        d.cyc += dt;
+        d.bits |= bits;
+    } else {
+        c.cyc_outside += dt;
+    }
+}
+
 void Liverpool::ExecuteRecord(const CpSplit::RecordHeader& record) {
+    if (g_a1 != 0) [[unlikely]] {
+        A1Execute(record);
+        return;
+    }
     static const bool back_cycles = Vulkan::BackCyclesEnabled();
     if (back_cycles) [[unlikely]] {
         const u64 t0 = __rdtsc();
@@ -1972,6 +2279,8 @@ void Liverpool::ExecuteRecordImpl(const CpSplit::RecordHeader& record) {
         submit_cv.notify_all();
         break;
     }
+    case CpSplit::RecordType::DcbBegin:
+        break; // SHADPS4_A1: bookkeeping in A1Execute
     case CpSplit::RecordType::Diag:
         if (AscRingBack(*reinterpret_cast<const CpSplit::DiagPayload*>(payload)) && rasterizer) {
             rasterizer->GetScheduler().LogRecordingWindow();
@@ -1996,6 +2305,7 @@ int Liverpool::NativePeekNextDraw(const void* pipeline) {
         switch (next->type) {
         case CpSplit::RecordType::RegWrite:
         case CpSplit::RecordType::Diag:
+        case CpSplit::RecordType::DcbBegin:
             pos += next->size;
             continue;
         case CpSplit::RecordType::Draw: {
@@ -5883,6 +6193,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         if (AmdGpu::NativeRec::g_segb != 0) [[unlikely]] {
             SegB::NoteSubmit();
         }
+    }
+    if (!is_indirect_gfx && split_enabled && g_a1 != 0) [[unlikely]] {
+        // Architecture A step A1: the game's top-level command buffer is the unit of work.
+        auto* begin = split->Reserve<CpSplit::DcbBeginPayload>(CpSplit::RecordType::DcbBegin);
+        begin->addr = reinterpret_cast<u64>(dcb.data());
+        begin->dwords = static_cast<u32>(dcb.size());
+        begin->has_ccb = ccb.empty() ? 0u : 1u;
+        split->Commit();
     }
     SplitSpanScope split_span{*this, &dcb,
                               is_indirect_gfx ? CpSplit::DrainReason::TaskGuardIb
