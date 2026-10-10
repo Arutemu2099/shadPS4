@@ -313,7 +313,11 @@ private:
     void BackLoop(std::stop_token stoken);
     void ExecuteRecord(const CpSplit::RecordHeader& record);
     void ExecuteRecordImpl(const CpSplit::RecordHeader& record);
-    void ExecuteDrawRecord(const CpSplit::RecordHeader& record);
+    /// `draw_payload`: the SplitDrawRecord to run (default: the record's own payload; a
+    /// Segment record passes its embedded member-0 record).
+    void ExecuteDrawRecord(const CpSplit::RecordHeader& record, const void* draw_payload = nullptr);
+    /// SHADPS4_NATIVE_SEGX: a Segment record (evaluate, or execute).
+    void ExecuteSegmentRecord(const CpSplit::RecordHeader& record);
     const CpSplit::RecordHeader* back_draw_record{}; ///< SHADPS4_NATIVE_COLOUR peek
     void ExecuteDispatchRecord(const CpSplit::RecordHeader& record);
     /// SHADPS4_MTB_P1_BREAK=1 (P1d pricing): ends an open render pass before a packet record.

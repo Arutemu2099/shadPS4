@@ -161,6 +161,7 @@ enum class RecordType : u16 {
     Retire,     ///< No payload: a guest submission is complete (POST_TASK_DONE); the back
                 ///< retires it for WaitGpuIdle.
     Diag,       ///< DiagPayload: a diagnostic marker in stream order (SHADPS4_ASC_RING_LATENCY).
+    Segment,    ///< SHADPS4_NATIVE_SEGX: SplitSegmentRecord, a segment of native colour members.
 };
 
 /// Flags for Packet records.
@@ -258,6 +259,45 @@ struct DiagPayload {
     u32 queue;
     u64 values[6];
 };
+
+/// SHADPS4_NATIVE_SEGX (notes/native-path-2026-10-09.md sec. 23): one segment of consecutive
+/// native colour members the front's segment builder closed. Payload: this header, then member
+/// 0's whole Draw record (SplitDrawRecord + stage blocks + vertex-input block, `draw_bytes`,
+/// padded to 16), then n_ops SegOp, then n indirect commands (VkDrawIndexedIndirectCommand:
+/// indexCount, instanceCount, firstIndex relative to the index union lo, 0, 0), then n list
+/// entries (slot << 24 | ring index: the member's job record, brick A). Unions: the index
+/// range, each pulled vertex attribute's stream range (by attribute index, `vmask`), each
+/// Guest binding slot's job-run union (`gmask`; a superset of the members' ranges).
+enum SegOpKind : u32 {
+    SegOpDrawRange = 1, ///< a: first member, b: count
+    SegOpStencil = 2,   ///< a: DB_STENCILREFMASK, b: DB_STENCILREFMASK_BF (raw)
+    SegOpCull = 3,      ///< a: PA_SU_SC_MODE_CNTL (raw)
+};
+struct SegOp {
+    u32 kind;
+    u32 a, b, c;
+};
+constexpr u32 SegMaxOps = 192;
+struct SplitSegmentRecord {
+    u32 id;
+    u32 n;
+    u32 n_ops;
+    u32 draw_bytes;
+    u32 index_type; ///< member 0's index_buffer_type.raw
+    u32 index_size;
+    u32 num_indices0;   ///< member 0's draw registers (the mirror holds the next draw's)
+    u32 num_instances0;
+    u64 index_base0;    ///< IndexBufferBase raw
+    u64 ilo, ihi;
+    u64 gmask;
+    u32 vmask;
+    u32 pad;
+    std::array<u64, 16> vlo, vhi;
+    std::array<u64, 40> glo, ghi;
+    u64 img_h1, img_h2; ///< the one material (job record image-key hashes)
+    u64 pad2;
+};
+static_assert(sizeof(SplitSegmentRecord) % 16 == 0);
 
 /// Per-stage user data of one draw/dispatch, copied on the front right after the lookup
 /// (inventory section 4.4). Followed by ud_dw user-data dwords, then flat_dw flat-buffer dwords;

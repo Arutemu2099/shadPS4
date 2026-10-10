@@ -273,5 +273,13 @@ inline const int g_segb = [] {
     const char* v = std::getenv("SHADPS4_NATIVE_SEGB");
     return v ? std::atoi(v) : 0;
 }();
+/// SHADPS4_NATIVE_SEGX (sec. 23, milestone 3 brick C): the front posts closed segments as one
+/// Segment record each (needs SEGB, GPU_DIRECT=1, PT, SEG). 2 = evaluate only (members still
+/// drawn by today's path), 1 = execute (member Draw records withheld). 0 = off.
+inline const int g_segx = [] {
+    const char* v = std::getenv("SHADPS4_NATIVE_SEGX");
+    const int m = v ? std::atoi(v) : 0;
+    return (m == 1 || m == 2) && g_segb != 0 ? m : 0;
+}();
 
 } // namespace AmdGpu::NativeRec

@@ -141,6 +141,20 @@ public:
     /// SHADPS4_NATIVE_SEGB: NativeOpen opened a live batch while this draw record ran (reset by
     /// Liverpool::ExecuteDrawRecord; with rec_outcome it tells an opener from a generic draw).
     bool segb_opened{};
+    /// SHADPS4_NATIVE_SEGX (sec. 23): the read-only checks of a Segment record (variant, job
+    /// ring lifetime, each union inside one cached buffer); `why` = the reason code on false.
+    bool NativeSegEvaluate(const AmdGpu::CpSplit::SplitSegmentRecord& seg,
+                           const GraphicsPipeline* base,
+                           const AmdGpu::CpSplit::VertexInputsPayload* vi, const u32* list,
+                           u32& why);
+    /// SHADPS4_NATIVE_SEGX=1: the Segment record whose member 0 ExecuteDraw runs now (null:
+    /// none), its ops / commands / list, and the outcome (0 open not reached, 1 executed, else
+    /// a reason code), set by Liverpool::ExecuteSegmentRecord.
+    const AmdGpu::CpSplit::SplitSegmentRecord* segx_pending{};
+    const AmdGpu::CpSplit::SegOp* segx_ops{};
+    const u32* segx_cmds{};
+    const u32* segx_list{};
+    u32 segx_result{};
     /// SHADPS4_NATIVE_REC_PREP (notes/native-path-2026-10-09.md sec. 9): the open batch's run
     /// members prepared from the job records (records + indirect commands in the batch slots,
     /// count not advanced); each is confirmed at its own draw record (NativePrepConfirm).

@@ -5939,6 +5939,79 @@ void Rasterizer::NativeSegOpen(u64 recs_addr, u64 list_addr, u32* list) {
     }
 }
 
+bool Rasterizer::NativeSegEvaluate(const AmdGpu::CpSplit::SplitSegmentRecord& seg,
+                                   const GraphicsPipeline* base,
+                                   const AmdGpu::CpSplit::VertexInputsPayload* vi,
+                                   const u32* list, u32& why) {
+    // Back thread, at a Segment record, before anything runs: what the segment open would check
+    // without touching a cache (no sync, no barrier, no creation): the variant is published in
+    // ring + bindless form, every member's job record is still inside its ring's safe window,
+    // and each union (index, pulled streams, Guest job-run unions) lies inside ONE cached buffer
+    // of at most 64 MB. The material's bindless resolve and the opener's bind are not evaluated
+    // here (they have side effects; today's nd_fail / open_fail stats measure them).
+    namespace NR = AmdGpu::NativeRec;
+    if (!base || !vi || base->native_variant.load(std::memory_order_relaxed) != nullptr) {
+        why = 1;
+        return false;
+    }
+    const auto* attribs = AmdGpu::CpSplit::VertexInputAttribs(*vi);
+    const auto* v = base->NativeColourVariant(VideoCore::NativeVertexKey(attribs, vi->count));
+    if (!v || !v->native_bindless || v->native_table_binding == GraphicsPipeline::NoNativeRecords ||
+        !v->UsesPushDescriptors()) {
+        why = 1;
+        return false;
+    }
+    for (u32 j = 0; j < seg.n; ++j) {
+        const u32 slot = list[j] >> 24;
+        const u32 idx = list[j] & Shader::NativeSegRingMask;
+        if (slot >= NR::MaxSlots ||
+            NR::g_job_next[slot].load(std::memory_order_relaxed) - idx > NR::RingSize / 4) {
+            why = 2;
+            return false;
+        }
+    }
+    const auto inside = [&](u64 lo, u64 hi, const VideoCore::Buffer*& buf) {
+        if (lo == 0 || hi <= lo || hi - lo > (u64{64} << 20)) {
+            return false;
+        }
+        buf = buffer_cache.NativeBufferAt(lo);
+        return buf != nullptr && buf->IsInBounds(lo, hi - lo);
+    };
+    const VideoCore::Buffer* buf = nullptr;
+    if (!inside(seg.ilo, seg.ihi, buf)) {
+        why = 3;
+        return false;
+    }
+    const VideoCore::Buffer* vb0 = nullptr;
+    for (u32 a = 0; a < 16; ++a) {
+        if (!((seg.vmask >> a) & 1)) {
+            continue;
+        }
+        if (!inside(seg.vlo[a], seg.vhi[a], buf)) {
+            why = 4;
+            return false;
+        }
+        if (vb0 && buf != vb0) {
+            why = 5; // the colour rule: every stream in one VkBuffer
+            return false;
+        }
+        vb0 = buf;
+    }
+    for (u64 m = seg.gmask; m != 0; m &= m - 1) {
+        const u32 bi = static_cast<u32>(std::countr_zero(m));
+        if (!inside(seg.glo[bi], seg.ghi[bi], buf)) {
+            why = 6;
+            return false;
+        }
+    }
+    if (seg.n_ops > AmdGpu::CpSplit::SegMaxOps + 3 || seg.n == 0 || seg.n > NativeMaxDraws) {
+        why = 7;
+        return false;
+    }
+    why = 0;
+    return true;
+}
+
 void Rasterizer::NativeLog() {
     const auto& st = native_stats;
     std::string closes;
