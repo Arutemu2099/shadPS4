@@ -1743,8 +1743,8 @@ void LeanLog() {
                  "Lean L2: window {:.1f}s | DCBs {} taken {} not taken {} | head draws {} front draws {} "
                  "(workers {:.1f}%) | EARLY STOPS {} (gate 0) | back: worker-channel records {:.0f}/s, "
                  "waiting for workers {:.2f} ms/s | worker: fault waits {} ({:.2f} ms/s), faults in lock {} "
-                 "(first {:#x}), touches {}, null builds {}, native preps {}, colour preps {} | head pass "
-                 "{:.2f} ms/s",
+                 "(first {:#x}), touches {}, builds {} (refresh failed {}), null builds {}, native preps {}, "
+                 "colour preps {} | head pass {:.2f} ms/s",
                  sec, c.dcbs.load(), s.l2_taken.load(), s.l2_skipped.load(), s.head_draws.load(),
                  c.front_draws.load(), hd + fd > 0 ? 100.0 * hd / (hd + fd) : 0.0, s.l2_early.load(),
                  double(s.back_records.load()) / std::max(sec, 1e-9),
@@ -1752,7 +1752,8 @@ void LeanLog() {
                  g_lean_l2.fault_waits.load(),
                  double(g_lean_l2.wait_ticks.load()) / 3.5e6 / std::max(sec, 1e-9),
                  g_lean_l2.faults_in_lock.load(), g_lean_l2.first_in_lock.load(),
-                 g_lean_l2.touches.load(), g_lean_l2.build_null.load(), g_lean_l2.native_preps.load(),
+                 g_lean_l2.touches.load(), g_lean_l2.builds.load(), g_lean_l2.build_refresh_fail.load(),
+                 g_lean_l2.build_null.load(), g_lean_l2.native_preps.load(),
                  g_lean_l2.colour_preps.load(), double(s.chain_cyc) / 3.5e6 / std::max(sec, 1e-9));
         s.l2_taken = s.l2_skipped = s.head_draws = s.back_records = s.back_wait_ticks = 0;
         g_lean_l2.fault_waits = 0;

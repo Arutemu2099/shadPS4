@@ -225,10 +225,21 @@ Stop Parser::DecideDraw(const PM4Header* header, std::span<const u32> dcb, u32 o
             g_lean_fault_stats.lock_takes.fetch_add(1, std::memory_order_relaxed);
             g_lean_fault_stats.lock_draws.fetch_add(1, std::memory_order_relaxed);
             if (env.l2) {
-                // L2: a miss builds here (the front's own lookup over the worker's registers,
-                // exclusive); its guest reads were pre-checked / faulted in by the prewalk.
+                // L2: the read-only lookup first; a miss builds (the front's own lookup over the
+                // worker's registers, exclusive; its guest reads were pre-checked / faulted in by
+                // the prewalk), then the captured per-draw fields are rebuilt from the registers.
                 t_lean_in_lock = true;
-                plan.draw.pipeline = env.pipeline_cache->LookupOrBuildGraphics(regs, *scratch);
+                plan.draw.pipeline = env.pipeline_cache->LookupGraphics(regs, *scratch);
+                if (!plan.draw.pipeline) {
+                    plan.draw.pipeline = env.pipeline_cache->LookupOrBuildGraphics(regs, *scratch);
+                    t_lean_in_lock = false;
+                    g_lean_l2.builds.fetch_add(1, std::memory_order_relaxed);
+                    if (plan.draw.pipeline && !RefreshCaptured(regs)) {
+                        g_lean_l2.build_refresh_fail.fetch_add(1, std::memory_order_relaxed);
+                        scratch->prewalked = false;
+                        return Stop::Fault;
+                    }
+                }
                 t_lean_in_lock = false;
             } else {
                 plan.draw.pipeline = env.pipeline_cache->LookupGraphics(regs, *scratch);
@@ -1112,6 +1123,32 @@ bool Parser::FetchOk(const Shader::Info& info, std::span<const u32> ud) const {
             }
         }
     }
+}
+
+bool Parser::RefreshCaptured(const Regs& regs) {
+    auto& sc = *scratch;
+    const std::array<std::pair<Shader::Stage, Shader::LogicalStage>, 2> stages{{
+        {Shader::Stage::Fragment, Shader::LogicalStage::Fragment},
+        {Shader::Stage::Vertex, Shader::LogicalStage::Vertex},
+    }};
+    for (const auto& [in, out] : stages) {
+        auto& slot = sc.stages[static_cast<u32>(out)];
+        if (!slot.info) {
+            continue;
+        }
+        const auto* pgm = regs.ProgramForStage(static_cast<u32>(in));
+        if (!pgm) {
+            return false;
+        }
+        // = GetProgram's refresh: info.user_data = params.user_data, pgm_base = params.Base().
+        slot.user_data.assign(pgm->user_data.begin(), pgm->user_data.end());
+        const auto& pre = sc.pre_params[static_cast<u32>(out)];
+        slot.pgm_base = pre.has_value() ? pre->Base() : pgm->Address<VAddr>();
+        if (!CheckedWalk(*slot.info, slot.user_data.data(), slot.flattened_ud_buf)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool Parser::Prewalk(const Regs& regs) {

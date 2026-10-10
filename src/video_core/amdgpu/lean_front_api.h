@@ -55,7 +55,7 @@ inline thread_local void* t_lean_l2_ctx = nullptr;
 inline thread_local bool t_lean_in_lock = false;
 struct LeanL2Stats {
     std::atomic<u64> fault_waits{}, faults_in_lock{}, build_null{}, native_preps{}, colour_preps{},
-        touches{}, wait_ticks{};
+        touches{}, wait_ticks{}, builds{}, build_refresh_fail{};
     std::atomic<u64> first_in_lock{};
 };
 inline LeanL2Stats g_lean_l2;
