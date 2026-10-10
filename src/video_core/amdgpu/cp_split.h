@@ -540,6 +540,10 @@ public:
     [[nodiscard]] u64 EmittedSeq() const noexcept {
         return emitted;
     }
+    /// SHADPS4_LEAN=2: the producer's ring-full and depth wait ticks since the last call.
+    std::pair<u64, u64> TakeWaitTicks() {
+        return {std::exchange(counters.full_wait_ticks, 0), std::exchange(counters.depth_wait_ticks, 0)};
+    }
     /// Back: publish batched done seqs now (SHADPS4_LEAN=2, before waiting on a job channel).
     void FlushDone() {
         if (done_count != 0) {

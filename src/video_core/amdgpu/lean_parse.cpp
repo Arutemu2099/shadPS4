@@ -53,12 +53,20 @@
 //    DispatchSync) and the program prefetch hint (PrefetchProgramsOnWrite).
 
 #include <algorithm>
+#include <cstddef>
+#ifdef _MSC_VER
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
 
 #include "common/assert.h"
 #include "common/decoder.h"
+#include "common/scope_exit.h"
+#include "video_core/renderer_vulkan/prepared_graphics_state.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "video_core/amdgpu/lean_front_api.h"
 #include "video_core/amdgpu/lean_parse.h"
@@ -167,7 +175,60 @@ struct Parser::DrawPlan {
     u32 job_idx{};
 };
 
+struct Parser::Caches {
+    // Page state, this draw only (Prewalk clears it).
+    std::array<u64, 64> ok_pages{};
+    u32 n_ok{};
+    struct Hdr {
+        VAddr code{};
+        u32 off{};
+        std::array<u8, sizeof(AmdGpu::BinaryInfo)> copy{};
+    };
+    std::array<Hdr, 256> hdr{};
+    struct Fetch {
+        VAddr code{};
+        std::vector<u32> words;
+        std::vector<std::pair<u32, u32>> attrs; ///< (V# pointer sgpr, dword offset)
+    };
+    std::array<Fetch, 64> fetch{};
+    struct Memo {
+        bool valid{};
+        Vulkan::PreparedGraphicsState state{};
+        u64 epoch{};
+        const Vulkan::GraphicsPipeline* pipeline{};
+        const Shader::Gcn::FetchShaderData* fetch{};
+        Shader::PreparedSpecialization fs_guard, vs_guard;
+        std::unique_ptr<Shader::Info> fs_info, vs_info; ///< private copies (MatchesInputs)
+        const Shader::Info* fs_shared{};
+        const Shader::Info* vs_shared{};
+        vk::ShaderModule fs_module{}, vs_module{};
+    };
+    std::array<Memo, 128> memo{};
+    u64 memo_hits_total{};
+    // Phase ticks / counts since the last FlushPhases.
+    u64 prewalk{}, lookup{}, derive{}, emit{}, draws{};
+    u64 memo_hit{}, memo_miss{}, hdr_hit{}, hdr_miss{}, fetch_hit{}, fetch_miss{}, inelig{};
+};
+
+void Parser::FlushPhases(u32 w) {
+    auto& c = *caches;
+    auto& g = g_lean_phase;
+    g.prewalk += std::exchange(c.prewalk, 0);
+    g.lookup += std::exchange(c.lookup, 0);
+    g.derive += std::exchange(c.derive, 0);
+    g.emit += std::exchange(c.emit, 0);
+    g.draws += std::exchange(c.draws, 0);
+    g.memo_hit[w & 7] += std::exchange(c.memo_hit, 0);
+    g.memo_miss[w & 7] += std::exchange(c.memo_miss, 0);
+    g.memo_ineligible += std::exchange(c.inelig, 0);
+    g.hdr_hit += std::exchange(c.hdr_hit, 0);
+    g.hdr_miss += std::exchange(c.hdr_miss, 0);
+    g.fetch_hit += std::exchange(c.fetch_hit, 0);
+    g.fetch_miss += std::exchange(c.fetch_miss, 0);
+}
+
 Parser::Parser(const Env& env_) : env{env_} {
+    caches = std::make_unique<Caches>();
     // The whole parser is off when the front would take a path this file does not mirror:
     //  - split_verify: EmitDraw's periodic synchronous VERIFY draw and the snapshot block;
     //  - !split_run_ahead (depth 0): every draw record syncs;
@@ -221,10 +282,70 @@ Stop Parser::DecideDraw(const PM4Header* header, std::span<const u32> dcb, u32 o
             // compile / build on: the front must run that draw.
             // Guest reads first, outside the cache's lock, each pre-checked (sec. 16).
             t_lean_fault = false;
+            auto& cc = *caches;
+            const u64 tp0 = __rdtsc();
             if (!Prewalk(regs)) {
                 scratch->prewalked = false;
+                cc.prewalk += __rdtsc() - tp0;
                 return Stop::Fault;
             }
+            const u64 tp1 = __rdtsc();
+            cc.prewalk += tp1 - tp0;
+            // The lookup memo on the front's key (PreparedGraphicsState: render state + shader
+            // hashes + settings, no user data) + the specialization guards of the selection.
+            constexpr u32 fsi = static_cast<u32>(Shader::LogicalStage::Fragment);
+            constexpr u32 vsi = static_cast<u32>(Shader::LogicalStage::Vertex);
+            Vulkan::PreparedGraphicsState pstate;
+            const bool memo_ok = env.rasterizer && scratch->pre_params[fsi].has_value() &&
+                                 scratch->pre_params[vsi].has_value() &&
+                                 !scratch->pre_missing[fsi] && !scratch->pre_missing[vsi] &&
+                                 env.rasterizer->LeanVertexInputDynamic() &&
+                                 pstate.Capture(regs, scratch->pre_params[fsi]->hash,
+                                                scratch->pre_params[vsi]->hash);
+            Caches::Memo* memo = nullptr;
+            bool verify_hit = false;
+            if (memo_ok) {
+                memo = &cc.memo[pstate.Hash() % cc.memo.size()];
+                if (memo->valid && memo->state == pstate &&
+                    memo->epoch == env.pipeline_cache->PreparedEpoch()) {
+                    // Refresh the private Infos with THIS draw, then the guards.
+                    const auto refresh = [&](Shader::Info& info, u32 i, const auto& sh) {
+                        info.user_data = sh.user_data;
+                        info.flattened_ud_buf = scratch->pre_flat[i];
+                        info.pgm_base = scratch->pre_params[i]->Base();
+                    };
+                    refresh(*memo->fs_info, fsi, regs.ps_program);
+                    refresh(*memo->vs_info, vsi, regs.vs_program);
+                    if (memo->fs_guard.MatchesInputs(*memo->fs_info) &&
+                        memo->vs_guard.MatchesInputs(*memo->vs_info)) {
+                        ++cc.memo_hit;
+                        verify_hit = (++cc.memo_hits_total & 63) == 0;
+                        if (!verify_hit) {
+                            plan.draw.pipeline = memo->pipeline;
+                            scratch->Reset();
+                            const auto fill = [&](u32 i, const Shader::Info* shared,
+                                                  const Shader::Info& priv, vk::ShaderModule mod) {
+                                auto& slot = scratch->stages[i];
+                                slot.info = shared;
+                                slot.pgm_base = priv.pgm_base;
+                                slot.user_data.assign(priv.user_data.begin(), priv.user_data.end());
+                                slot.flattened_ud_buf = priv.flattened_ud_buf;
+                                slot.module = mod;
+                            };
+                            fill(fsi, memo->fs_shared, *memo->fs_info, memo->fs_module);
+                            fill(vsi, memo->vs_shared, *memo->vs_info, memo->vs_module);
+                            scratch->fetch_shader = memo->fetch;
+                            scratch->pipeline = memo->pipeline;
+                            scratch->prewalked = false;
+                            goto looked_up;
+                        }
+                    }
+                }
+                ++cc.memo_miss;
+            } else {
+                ++cc.inelig;
+            }
+            scratch->capture_guards = memo_ok;
             g_lean_fault_stats.lock_takes.fetch_add(1, std::memory_order_relaxed);
             g_lean_fault_stats.lock_draws.fetch_add(1, std::memory_order_relaxed);
             if (env.l2) {
@@ -248,6 +369,52 @@ Stop Parser::DecideDraw(const PM4Header* header, std::span<const u32> dcb, u32 o
                 plan.draw.pipeline = env.pipeline_cache->LookupGraphics(regs, *scratch);
             }
             scratch->prewalked = false;
+            scratch->capture_guards = false;
+            if (verify_hit && memo) {
+                // 1 in 64 memo hits: the real lookup above, compared field by field.
+                ++g_lean_phase.memo_verify;
+                bool same = plan.draw.pipeline == memo->pipeline &&
+                            scratch->fetch_shader == memo->fetch;
+                const auto cmp = [&](u32 i, const Shader::Info* shared, const Shader::Info& priv,
+                                     vk::ShaderModule mod) {
+                    const auto& slot = scratch->stages[i];
+                    return slot.info == shared && slot.pgm_base == priv.pgm_base &&
+                           std::equal(slot.user_data.begin(), slot.user_data.end(),
+                                      priv.user_data.begin(), priv.user_data.end()) &&
+                           slot.flattened_ud_buf == priv.flattened_ud_buf && slot.module == mod;
+                };
+                same = same && cmp(fsi, memo->fs_shared, *memo->fs_info, memo->fs_module) &&
+                       cmp(vsi, memo->vs_shared, *memo->vs_info, memo->vs_module);
+                if (!same && g_lean_phase.memo_verify_bad.fetch_add(1) < 8) {
+                    LOG_WARNING(Render, "Lean memo VERIFY mismatch: pipeline memo {} real {} fetch {} / {}",
+                                fmt::ptr(memo->pipeline), fmt::ptr(plan.draw.pipeline),
+                                fmt::ptr(memo->fetch), fmt::ptr(scratch->fetch_shader));
+                }
+            } else if (memo && plan.draw.pipeline && !t_lean_fault &&
+                       scratch->guard_views[fsi] && scratch->guard_views[vsi] &&
+                       scratch->guards[fsi].valid && scratch->guards[vsi].valid &&
+                       scratch->stages[fsi].info && scratch->stages[vsi].info) {
+                // Memoize a successful read-only lookup (a build path captures no guards).
+                memo->valid = true;
+                memo->state = pstate;
+                memo->epoch = env.pipeline_cache->PreparedEpoch();
+                memo->pipeline = plan.draw.pipeline;
+                memo->fetch = scratch->fetch_shader;
+                memo->fs_guard = scratch->guards[fsi];
+                memo->vs_guard = scratch->guards[vsi];
+                memo->fs_info = std::make_unique<Shader::Info>(*scratch->guard_views[fsi]);
+                memo->vs_info = std::make_unique<Shader::Info>(*scratch->guard_views[vsi]);
+                memo->fs_shared = scratch->stages[fsi].info;
+                memo->vs_shared = scratch->stages[vsi].info;
+                memo->fs_module = scratch->stages[fsi].module;
+                memo->vs_module = scratch->stages[vsi].module;
+            }
+            scratch->guard_views = {};
+            for (auto& g : scratch->guards) {
+                g.valid = false;
+            }
+        looked_up:
+            cc.lookup += __rdtsc() - tp1;
             if (t_lean_fault) {
                 t_lean_fault = false;
                 return Stop::FaultFallback;
@@ -290,6 +457,10 @@ Stop Parser::DecideDraw(const PM4Header* header, std::span<const u32> dcb, u32 o
     // FRONT_DERIVE: the derivation from the scratch's vertex stage (the front builds its
     // BoundStage from the shared Info the lookup just refreshed; same words). The V# reads go
     // through the scratch's user data copy. Not for indirect draws (as EmitDraw).
+    const u64 td0 = __rdtsc();
+    SCOPE_EXIT {
+        caches->derive += __rdtsc() - td0;
+    };
     if (env.split_front_derive != 0 && plan.has_stages && !args.is_indirect) {
         const auto& vslot = scratch->stages[static_cast<u32>(Shader::LogicalStage::Vertex)];
         Shader::BoundStage vs{};
@@ -916,7 +1087,10 @@ SpanResult Parser::Parse(std::span<const u32> dcb, u32 cut_dw, ChainState& st,
             if (regs_only) {
                 ++r.dropped;
             } else {
+                const u64 te0 = __rdtsc();
                 EmitDraw(header, plan, st, out);
+                caches->emit += __rdtsc() - te0;
+                ++caches->draws;
                 ++r.draws;
             }
             break;
@@ -944,7 +1118,10 @@ SpanResult Parser::Parse(std::span<const u32> dcb, u32 cut_dw, ChainState& st,
             if (regs_only) {
                 ++r.dropped;
             } else {
+                const u64 te0 = __rdtsc();
                 EmitDraw(header, plan, st, out);
+                caches->emit += __rdtsc() - te0;
+                ++caches->draws;
                 ++r.draws;
             }
             break;
@@ -967,7 +1144,10 @@ SpanResult Parser::Parse(std::span<const u32> dcb, u32 cut_dw, ChainState& st,
             if (regs_only) {
                 ++r.dropped;
             } else {
+                const u64 te0 = __rdtsc();
                 EmitDraw(header, plan, st, out);
+                caches->emit += __rdtsc() - te0;
+                ++caches->draws;
                 ++r.draws;
             }
             break;
@@ -1005,6 +1185,28 @@ SpanResult Parser::Parse(std::span<const u32> dcb, u32 cut_dw, ChainState& st,
 
 bool Parser::ReadOk(VAddr addr, u64 size, u32 kind) const {
     auto& st = g_lean_fault_stats;
+    auto& c = *caches;
+    if (size == 0) {
+        return true;
+    }
+    // Every page of the range already checked in THIS draw: nothing to do (never across draws).
+    const u64 p0 = addr >> 12, p1 = (addr + size - 1) >> 12;
+    bool all = addr >= 0x10000;
+    for (u64 p = p0; all && p <= p1; ++p) {
+        bool hit = false;
+        for (u32 i = 0; i < c.n_ok && !hit; ++i) {
+            hit = c.ok_pages[i] == p;
+        }
+        all = hit;
+    }
+    if (all) {
+        return true;
+    }
+    const auto note_ok = [&] {
+        for (u64 p = p0; p <= p1 && c.n_ok < c.ok_pages.size(); ++p) {
+            c.ok_pages[c.n_ok++] = p;
+        }
+    };
     if (addr < 0x10000 || !env.rasterizer->IsMapped(addr, size)) {
         st.precheck[kind + 1].fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -1017,11 +1219,13 @@ bool Parser::ReadOk(VAddr addr, u64 size, u32 kind) const {
                 const VAddr at = std::max(p, addr);
                 (void)*reinterpret_cast<const volatile u8*>(at);
             }
+            note_ok();
             return true;
         }
         st.precheck[kind].fetch_add(1, std::memory_order_relaxed);
         return false;
     }
+    note_ok();
     return true;
 }
 
@@ -1032,6 +1236,23 @@ bool Parser::HeaderOk(VAddr code, const AmdGpu::BinaryInfo*& found) const {
         g_lean_fault_stats.precheck[7].fetch_add(1, std::memory_order_relaxed);
         return false;
     }
+    auto& hc = caches->hdr[(code >> 8) % caches->hdr.size()];
+    if (hc.code == code) {
+        // Validated hit: the same header bytes (signature, hash, length) at the same place.
+        const VAddr info = code + hc.off;
+        if (ReadOk(info, sizeof(AmdGpu::BinaryInfo), 6) &&
+            std::memcmp(reinterpret_cast<const void*>(info), hc.copy.data(), hc.copy.size()) == 0) {
+            found = reinterpret_cast<const AmdGpu::BinaryInfo*>(info);
+            ++caches->hdr_hit;
+            return true;
+        }
+    }
+    ++caches->hdr_miss;
+    const auto remember = [&](const AmdGpu::BinaryInfo* f) {
+        hc.code = code;
+        hc.off = static_cast<u32>(reinterpret_cast<VAddr>(f) - code);
+        std::memcpy(hc.copy.data(), f, hc.copy.size());
+    };
     if (!ReadOk(code, 8, 6)) {
         return false;
     }
@@ -1045,6 +1266,7 @@ bool Parser::HeaderOk(VAddr code, const AmdGpu::BinaryInfo*& found) const {
         }
         if (reinterpret_cast<const AmdGpu::BinaryInfo*>(info)->Valid()) {
             found = reinterpret_cast<const AmdGpu::BinaryInfo*>(info);
+            remember(found);
             return true;
         }
     }
@@ -1061,6 +1283,7 @@ bool Parser::HeaderOk(VAddr code, const AmdGpu::BinaryInfo*& found) const {
         }
         if (reinterpret_cast<const AmdGpu::BinaryInfo*>(at)->Valid()) {
             found = reinterpret_cast<const AmdGpu::BinaryInfo*>(at);
+            remember(found);
             return true;
         }
     }
@@ -1083,6 +1306,31 @@ bool Parser::FetchOk(const Shader::Info& info, std::span<const u32> ud) const {
     if (code >= (u64{1} << 40)) {
         return bad();
     }
+    auto& cc = *caches;
+    const auto check_vsharp = [&](u32 sgpr, u32 dword_offset) {
+        if (sgpr == Shader::IR::NumScalarRegs) {
+            return true; // ReadUdReg reads the user data itself (host)
+        }
+        if (sgpr + 1u >= ud.size()) {
+            return bad();
+        }
+        const VAddr base = (u64{ud[sgpr]} | (u64{ud[sgpr + 1u]} << 32)) & 0xFFFFFFFFFFFFull;
+        return ReadOk(base + u64{dword_offset} * 4, sizeof(AmdGpu::Buffer), 2);
+    };
+    auto& fc = cc.fetch[(code >> 4) % cc.fetch.size()];
+    if (fc.code == code && !fc.words.empty() && ReadOk(code, fc.words.size() * 4, 6) &&
+        std::memcmp(reinterpret_cast<const void*>(code), fc.words.data(), fc.words.size() * 4) == 0) {
+        // Validated hit: the same instruction words (incl. the terminating S_SETPC_B64).
+        ++cc.fetch_hit;
+        for (const auto& [sgpr, off] : fc.attrs) {
+            if (!check_vsharp(sgpr, off)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    ++cc.fetch_miss;
+    std::vector<std::pair<u32, u32>> attrs;
     struct Load {
         u32 dword_offset;
         u32 base_sgpr;
@@ -1110,6 +1358,9 @@ bool Parser::FetchOk(const Shader::Info& info, std::span<const u32> ud) const {
         }
         pos += inst.length;
         if (inst.opcode == Shader::Gcn::Opcode::S_SETPC_B64) {
+            fc.code = code;
+            fc.words.assign(reinterpret_cast<const u32*>(code), reinterpret_cast<const u32*>(pos));
+            fc.attrs = std::move(attrs);
             return true;
         }
         if (inst.inst_class == Shader::Gcn::InstClass::ScalarMemRd) {
@@ -1126,14 +1377,8 @@ bool Parser::FetchOk(const Shader::Info& info, std::span<const u32> ud) const {
                 return bad();
             }
             const u32 sgpr = loads[b].base_sgpr;
-            if (sgpr == Shader::IR::NumScalarRegs) {
-                continue; // ReadUdReg reads the user data itself (host)
-            }
-            if (sgpr + 1u >= ud.size()) {
-                return bad();
-            }
-            const VAddr base = (u64{ud[sgpr]} | (u64{ud[sgpr + 1u]} << 32)) & 0xFFFFFFFFFFFFull;
-            if (!ReadOk(base + u64{loads[b].dword_offset} * 4, sizeof(AmdGpu::Buffer), 2)) {
+            attrs.emplace_back(sgpr, loads[b].dword_offset);
+            if (!check_vsharp(sgpr, loads[b].dword_offset)) {
                 return false;
             }
         }
@@ -1176,6 +1421,7 @@ bool Parser::Prewalk(const Regs& regs) {
     // lock held: GetParams (the shader header) and RefreshFlatBuf (user data + the SRT walk).
     auto& sc = *scratch;
     sc.prewalked = false;
+    caches->n_ok = 0; // page state: this draw only
     if (regs.stage_enable.raw != AmdGpu::ShaderStageEnable::VgtStages::Vs) {
         return true; // LookupGraphicsShared returns null (UnsupportedStages) before any read
     }

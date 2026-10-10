@@ -123,6 +123,11 @@ public:
     /// SkipEmptyDraw's decision for `regs` (SHADPS4_EMPTY_DRAWS=2 and zero indices / instances)
     /// without the front's EMPTY_DRAWS counters.
     static bool SkipEmptyDrawRegs(const AmdGpu::Regs& regs);
+    /// The lean memo is exact only with dynamic vertex input (else the key specializes on V#
+    /// formats, which the front's prepared path checks separately).
+    bool LeanVertexInputDynamic() const {
+        return instance.IsVertexInputDynamicState();
+    }
     /// Read-only: would PipelineCache::PrepareNativeColour(pipeline, vi) return without changing
     /// anything? False when the front would decide the pipeline's eligibility or claim a slot for
     /// this vertex description (the worker stops and leaves the draw to the front). Reads the

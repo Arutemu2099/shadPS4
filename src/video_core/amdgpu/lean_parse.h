@@ -164,6 +164,8 @@ public:
     /// L2 front: touch the pages the front's own lookup of this draw reads (shader headers, SRT
     /// tables, fetch code, fetch V#s), so its faults happen before it takes the cache's lock.
     void Pretouch(const Regs& regs);
+    /// Adds this parser's phase ticks / cache counts to g_lean_phase (worker slot `w`), clears.
+    void FlushPhases(u32 w);
 
 private:
     /// SHADPS4_LEAN: shader headers + checked SRT walks into the scratch, outside the cache's
@@ -188,6 +190,8 @@ private:
     };
     std::unordered_map<const void*, std::vector<WalkOp>> walk_plans; ///< per walker code
     StaticEnv static_env{};
+    struct Caches;
+    std::unique_ptr<Caches> caches;
     bool regs_only{};
     u32 start{};
     struct DrawPlan;

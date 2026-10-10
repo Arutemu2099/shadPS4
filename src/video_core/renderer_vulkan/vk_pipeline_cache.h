@@ -153,6 +153,11 @@ struct GraphicsLookupScratch {
     u64 view_clock{};
 
     Shader::Info& View(const Shader::Info& shared);
+    /// SHADPS4_LEAN worker memo: when set, ResolveStageReadOnly also captures per bound stage the
+    /// PreparedSpecialization guard of the selected permutation and the private view it used.
+    bool capture_guards{};
+    std::array<Shader::PreparedSpecialization, MaxShaderStages> guards{};
+    std::array<const Shader::Info*, MaxShaderStages> guard_views{};
     void Reset();
 
     /// SHADPS4_LEAN worker (architecture-a sec. 16): the guest reads done OUTSIDE the cache's lock,
@@ -232,6 +237,10 @@ public:
     /// The exclusive lock; on the back thread (t_lock_service set) a try-lock loop that runs
     /// guest commands while it waits (a worker faulting under the lock needs them).
     [[nodiscard]] std::unique_lock<std::shared_mutex> LockExclusiveServicing() const;
+    /// Bumped whenever prepared pipelines may name erased pipelines (read racily by worker memos).
+    [[nodiscard]] u64 PreparedEpoch() const noexcept {
+        return prepared_pipeline_epoch;
+    }
     /// The exclusive guard; hold it across GetGraphicsPipelineLocked + WriteStage on the front
     /// once workers may take LookupOrBuildGraphics' build path concurrently.
     [[nodiscard]] std::unique_lock<std::shared_mutex> AcquireExclusive() const;

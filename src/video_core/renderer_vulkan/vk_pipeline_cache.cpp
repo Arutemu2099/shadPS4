@@ -2720,8 +2720,13 @@ PipelineCache::Resolve PipelineCache::ResolveStageReadOnly(
         out.miss = Miss::NoPermutation; // the front would compile a permutation
         return Resolve::Miss;
     }
-    view.AddBindings(binding); // identical to the shared Info's AddBindings (immutable half)
     const size_t perm_idx = static_cast<size_t>(std::distance(program.modules.begin(), found));
+    if (out.capture_guards) {
+        // The front's prepared-programs guard for this exact selection (incoming bindings).
+        out.guards[out_idx].Capture(view, runtime_info, binding, spec, perm_idx);
+        out.guard_views[out_idx] = &view;
+    }
+    view.AddBindings(binding); // identical to the shared Info's AddBindings (immutable half)
     out.key.stage_hashes[out_idx] = HashCombine(params.hash, perm_idx);
     slot.info = &program.info;
     slot.pgm_base = view.pgm_base;

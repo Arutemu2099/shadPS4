@@ -67,6 +67,14 @@ struct LeanL2Stats {
     std::atomic<u64> first_in_lock{};
 };
 inline LeanL2Stats g_lean_l2;
+/// Lean worker phases (TSC ticks, summed over the workers), cache hits, memo verify.
+struct LeanPhaseStats {
+    std::atomic<u64> claim_wait{}, seed{}, parse{}, prewalk{}, lookup{}, derive{}, emit{}, draws{};
+    std::atomic<u64> hdr_hit{}, hdr_miss{}, fetch_hit{}, fetch_miss{};
+    std::atomic<u64> memo_verify{}, memo_verify_bad{}, memo_ineligible{};
+    std::array<std::atomic<u64>, 8> memo_hit{}, memo_miss{}; ///< per worker
+};
+inline LeanPhaseStats g_lean_phase;
 inline void LeanNoteWorkerFault(u64 addr) {
     if (t_lean_l2_wait) [[likely]] {
         if (t_lean_in_lock) {

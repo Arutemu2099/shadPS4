@@ -1759,6 +1759,54 @@ void LeanLog() {
                  g_lean_l2.colour_preps.load(), double(s.chain_cyc) / 3.5e6 / std::max(sec, 1e-9),
                  g_lean_l2.front_faults_in_lock.load(), g_lean_l2.regs_only_runs.load(),
                  g_lean_l2.dropped_draws.load(), g_lean_l2.lock_service_waits.load());
+        {
+            auto& p = g_lean_phase;
+            const double d = std::max(1.0, double(p.draws.load()));
+            const auto us = [&](const std::atomic<u64>& x) { return double(x.load()) / 3500.0 / d; };
+            u64 full = 0, depth = 0;
+            for (auto& ch : s.ch) {
+                if (ch) {
+                    const auto [fw_, dw_] = ch->TakeWaitTicks();
+                    full += fw_;
+                    depth += dw_;
+                }
+            }
+            const double fw = double(g_lean_l2.wait_ticks.load());
+            const double parse = double(p.parse.load());
+            const double other = parse - double(p.prewalk + p.lookup + p.derive + p.emit) -
+                                 double(full + depth) - fw;
+            const double nw = double(std::max<size_t>(1, s.workers.size()));
+            const double wall = sec * 3.5e9 * nw;
+            std::string per_worker;
+            u64 mh = 0, mm = 0;
+            for (u32 i = 0; i < p.memo_hit.size(); ++i) {
+                const u64 h = p.memo_hit[i].exchange(0), m = p.memo_miss[i].exchange(0);
+                mh += h;
+                mm += m;
+                if (h + m != 0) {
+                    per_worker += fmt::format(" w{} {:.1f}%", i, 100.0 * double(h) / double(h + m));
+                }
+            }
+            LOG_INFO(Render,
+                     "Lean L2 phases: {} worker draws | us per worker draw: prewalk {:.2f} lookup "
+                     "{:.2f} derive {:.2f} emit {:.2f} other-parse {:.2f} | waits per draw: channel "
+                     "full {:.2f} depth {:.2f} fault {:.2f} | seed {:.2f} us per DCB | worker time: "
+                     "claim wait {:.1f}%, busy (parse+seed) {:.1f}% | memo hits {:.1f}% (per worker:{}) "
+                     "ineligible {} verify {} MISMATCH {} | header hits {:.1f}% fetch hits {:.1f}%",
+                     u64(d), us(p.prewalk), us(p.lookup), us(p.derive), us(p.emit),
+                     other / 3500.0 / d, double(full) / 3500.0 / d, double(depth) / 3500.0 / d,
+                     fw / 3500.0 / d,
+                     double(p.seed.load()) / 3500.0 / std::max(1.0, double(s.l2_taken.load())),
+                     100.0 * double(p.claim_wait.load()) / wall,
+                     100.0 * (parse + double(p.seed.load())) / wall,
+                     100.0 * double(mh) / std::max(1.0, double(mh + mm)), per_worker,
+                     p.memo_ineligible.load(), p.memo_verify.load(), p.memo_verify_bad.load(),
+                     100.0 * double(p.hdr_hit) / std::max(1.0, double(p.hdr_hit + p.hdr_miss)),
+                     100.0 * double(p.fetch_hit) / std::max(1.0, double(p.fetch_hit + p.fetch_miss)));
+            p.claim_wait = p.seed = p.parse = p.prewalk = p.lookup = p.derive = p.emit = p.draws = 0;
+            p.hdr_hit = p.hdr_miss = p.fetch_hit = p.fetch_miss = 0;
+            p.memo_ineligible = 0;
+        }
         s.l2_taken = s.l2_skipped = s.head_draws = s.back_records = s.back_wait_ticks = 0;
         g_lean_l2.fault_waits = 0;
         g_lean_l2.wait_ticks = 0;
@@ -3650,6 +3698,7 @@ void Liverpool::LeanWorkerLoop(std::stop_token stoken, u32 index) {
     };
     while (!stopping()) {
         const u32 idx = s.next_claim.fetch_add(1, std::memory_order_acq_rel);
+        const u64 tw0 = __rdtsc(); // claim wait: until the job is queued (or found not taken)
         for (u32 spins = 0; s.queued.load(std::memory_order_acquire) < idx;) {
             if (stopping()) {
                 return;
@@ -3663,6 +3712,8 @@ void Liverpool::LeanWorkerLoop(std::stop_token stoken, u32 index) {
                 }
             }
         }
+        const u64 tw1 = __rdtsc();
+        g_lean_phase.claim_wait += tw1 - tw0;
         auto& j = s.jobs[idx % LeanSlots];
         if (j.index.load(std::memory_order_acquire) != idx ||
             j.state.load(std::memory_order_acquire) != 1) {
@@ -3679,11 +3730,15 @@ void Liverpool::LeanWorkerLoop(std::stop_token stoken, u32 index) {
         st.cs_state = j.cs;
         st.indirect_args_addr = j.iaa;
         st.vi_desc_id = (u64{1} << 63) | (u64{idx} << 20);
+        const u64 ts1 = __rdtsc();
+        g_lean_phase.seed += ts1 - tw1;
         if (env.l2) {
             // L2: the real channel of this slot; the back follows it from the DcbRef.
             auto& out = *s.ch[idx % LeanSlots];
             l2w = {&out, idx};
             j.res = parser.Parse(j.dcb, j.cut_dw, st, out);
+            g_lean_phase.parse += __rdtsc() - ts1;
+            parser.FlushPhases(index);
             if (j.res.end_dw != j.cut_dw) {
                 // An early stop (gate 0): finish to the cut in register-only mode so the back's
                 // mirror reaches the front's state at the cut; the draws in between are dropped.
@@ -7616,9 +7671,6 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
                          const CpSplit::DrawArgs& args) {
     if (g_lean != 0) [[unlikely]] {
         ++g_lean_s.c.front_draws;
-        if (g_lean_s.toucher) {
-            g_lean_s.toucher->Pretouch(regs); // faults before PrepareDrawFront's exclusive lock
-        }
     }
     if (AmdGpu::NativeRec::g_mode >= 2) [[unlikely]] {
         if (NativeRecMember(header, name, host_marker, args)) {
@@ -7660,6 +7712,9 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
     // Keep this lookup before the Sync below, also for the periodic VERIFY draw: the back's
     // re-lookup of that draw (DrawRelookup) is only meaningful because this one ran while
     // earlier posted records could still be outstanding. A drain before this line would blind it.
+    if (g_lean_s.toucher) [[unlikely]] {
+        g_lean_s.toucher->Pretouch(regs); // faults before PrepareDrawFront's exclusive lock
+    }
     rasterizer->PrepareDrawFront(draw);
     const bool has_stages = draw.pipeline && draw.draw_class ==
                                                  Vulkan::Rasterizer::DrawClass::Draw &&
