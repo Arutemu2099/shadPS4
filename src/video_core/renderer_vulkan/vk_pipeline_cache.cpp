@@ -32,6 +32,7 @@
 #include "video_core/native_census.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_bindless.h"
 #include "video_core/renderer_vulkan/vk_pipeline_compile_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -425,6 +426,7 @@ struct PipelineCache::NativeColourJob {
     u32 records_binding{};
     u32 vertex_binding{};
     u32 table_binding{GraphicsPipeline::NoNativeRecords};
+    bool bindless{};
 };
 
 struct PipelineCache::NativeColourCompiler {
@@ -473,7 +475,7 @@ private:
             auto variant = std::make_unique<GraphicsPipeline>(
                 instance, scheduler, desc_heap, profile, job->key, pipeline_cache, job->infos,
                 job->runtime_infos, job->fetch_shader, job->modules, job->sdata, false,
-                &job->bindings, job->records_binding);
+                &job->bindings, job->records_binding, job->bindless);
             const double ms = MsSince(t0);
             auto& slot = job->base->native_colour[job->slot];
             if (!variant->UsesPushDescriptors()) {
@@ -1558,6 +1560,23 @@ void PipelineCache::PrepareNativeColour(const GraphicsPipeline* base,
     emit.vs_hash = vs ? static_cast<u32>(vs->pgm_hash) : 0u;
     emit.ring = Shader::g_native_ring;
     emit.table_binding = total.unified + (emit.compare ? 3u : 2u);
+    // SHADPS4_NATIVE_BINDLESS (sec. 12): the PS samples the global arrays; the VS has no image
+    // or sampler, the PS at most 16 of each, all sampled (no storage, no mip fallback).
+    emit.bindless = [&] {
+        if (!instance.IsBindlessSupported() || !Bindless::Init(instance.GetDevice()) || !vs ||
+            !fs || !vs->images.empty() || !vs->samplers.empty() ||
+            fs->images.size() > Shader::NativeBindlessMax ||
+            fs->samplers.size() > Shader::NativeBindlessMax) {
+            return false;
+        }
+        for (const auto& desc : fs->images) {
+            if (desc.is_written || desc.is_atomic ||
+                desc.mip_fallback_mode != Shader::MipStorageFallbackMode::None) {
+                return false;
+            }
+        }
+        return true;
+    }();
     auto native_modules = modules;
     struct NativeEmitScope {
         NativeEmitScope(const Shader::NativeEmit& e) {
@@ -1676,6 +1695,7 @@ void PipelineCache::PrepareNativeColour(const GraphicsPipeline* base,
     }
     job->records_binding = emit.records_binding;
     job->vertex_binding = emit.vertex_binding;
+    job->bindless = emit.bindless;
     if (!native_colour_compiler) {
         native_colour_compiler = std::make_unique<NativeColourCompiler>(
             instance, scheduler, desc_heap, profile, *pipeline_cache);

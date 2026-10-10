@@ -14,6 +14,7 @@
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/vk_bindless.h"
 #include "video_core/renderer_vulkan/vk_native_bindings.h"
 #include "video_core/renderer_vulkan/vk_occlusion.h"
 #include "shader_recompiler/native_emit.h"
@@ -550,6 +551,11 @@ private:
         u64 smp_gen{};
         u64 border{};
         u32 img_n{};  ///< words of native_img_key
+        /// SHADPS4_NATIVE_BINDLESS (sec. 12): the variant samples the global arrays; the opener's
+        /// slots (16 images, 16 samplers) and the set copy they live in.
+        bool bindless{};
+        u32 bl_set{};
+        std::array<u32, 2 * Shader::NativeBindlessMax> bl_slots{};
         std::array<u64, Shader::NUM_BUFFERS> buf{};
         u64 guest_mask{};
         u64 stream_off{};
@@ -572,6 +578,45 @@ private:
     /// SHADPS4_NATIVE_COLOUR: the opener's raw T# / S# words (the draw-repeat image key) and,
     /// in verify mode, its resolved image infos.
     std::array<u32, 512> native_img_key{};
+    /// SHADPS4_NATIVE_BINDLESS (sec. 12): T# -> slot and S# -> slot caches over the global
+    /// arrays (vk_bindless.h). Image entries are valid while the texture cache's structure
+    /// generation, the image epoch and the meta-clear epoch stay put AND the image's backing and
+    /// state serial are unchanged (no transition due); sampler entries while the sampler
+    /// generation stays put. Slots are never rewritten until their set copy rotates out.
+    struct BindlessImgEntry {
+        const void* desc{};
+        std::array<u32, 8> words{};
+        u64 gen{};
+        u32 slot{};
+        VideoCore::ImageId id{};
+        const void* backing{};
+        u64 serial{};
+        vk::ImageView view{};
+        vk::ImageLayout layout{};
+    };
+    struct BindlessSmpEntry {
+        std::array<u32, 4> words{};
+        u64 gen{};
+        u32 slot{};
+        size_t lru{};
+        vk::Sampler sampler{};
+    };
+    struct BindlessState {
+        u32 cur{};
+        std::array<u64, Bindless::NumSets> last_tick{};
+        u32 img_next{}, smp_next{};
+        std::unordered_map<u64, u32> view_slot, smp_slot;
+        std::vector<BindlessImgEntry> img_cache;
+        std::vector<BindlessSmpEntry> smp_cache;
+        u64 img_gen{1}, smp_gen{1};
+        u64 tex_gen{~0ull}, img_epoch{~0ull}, meta_epoch{~0ull}, sampler_gen{~0ull};
+    } bindless;
+    /// Back thread: the fragment stage's image / sampler slots of the draw `base` describes now
+    /// (32 words: images then samplers). views / samplers (optional): what they hold.
+    bool BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::ImageView* views,
+                         vk::Sampler* samplers, u32& n_img, u32& n_smp, bool retry = true);
+    bool BindlessRotate();
+    void BindlessRingWrite(u32 tag, u32 idx, const u32* slots);
     std::unique_ptr<VideoCore::Buffer> native_dbg; ///< SHADPS4_NATIVE_COLOUR_DIAG 4096
     u32 native_dbg_logged{};
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> native_open_images;
@@ -648,6 +693,14 @@ private:
         /// Ring-join: joins into ring batches, refusals (0 not the next ring entry, 1 job record
         /// gone / no GPU record, 2 another inherited set, 3 inherited values), =2 compare.
         u64 rj_ok{}, rj_cmp_ok{}, rj_cmp_bad{};
+        /// SHADPS4_NATIVE_BINDLESS: batches, joins with another material, failures by reason
+        /// (0 no FS, 1 null / invalid T#, 2 depth redirect / target / rebind, 3 slots full and
+        /// the next copy busy, 4 sampler touch, 5 join: set rotated / recorded / tick), cache
+        /// hits / misses, opener verify against the generic writes, rotations.
+        u64 bl_open{}, bl_open_fail{}, bl_join{}, bl_join_fail{};
+        std::array<u64, 8> bl_fail{};
+        u64 bl_img_hit{}, bl_img_miss{}, bl_smp_hit{}, bl_smp_miss{};
+        u64 bl_vfy_ok{}, bl_vfy_bad{}, bl_vfy_none{}, bl_rot{};
         std::array<u64, 4> rj_fail{};
         std::array<u64, 4> prep_c10{};  ///< verify: close 10 of a prepared member by where
         std::array<u64, 16> prep_stop{};

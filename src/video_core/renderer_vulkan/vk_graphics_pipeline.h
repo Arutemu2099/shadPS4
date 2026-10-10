@@ -109,7 +109,7 @@ public:
                      std::shared_ptr<const Shader::Gcn::FetchShaderData> fetch_shader,
                      std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
                      bool preloading, const DescSetBindings* derived = nullptr,
-                     u32 native_records_binding = NoNativeRecords);
+                     u32 native_records_binding = NoNativeRecords, bool native_bindless = false);
     ~GraphicsPipeline();
 
     static constexpr u32 NoNativeRecords = ~0u;
@@ -169,6 +169,8 @@ public:
     mutable std::atomic<const GraphicsPipeline*> native_variant{nullptr};
     mutable bool native_checked = false;
     u32 native_records_binding = NoNativeRecords;
+    /// SHADPS4_NATIVE_BINDLESS: a colour variant whose PS samples the global arrays (set 1).
+    bool native_bindless = false;
     /// SHADPS4_NATIVE_COLOUR (notes/colour-pass-2026-10-09.md sec. 3): textured native variants
     /// by vertex description. The front claims a slot by storing its key (front-only writer);
     /// the compiler thread publishes the variant; the back reads key then variant (acquire).

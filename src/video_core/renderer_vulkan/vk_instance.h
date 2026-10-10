@@ -484,6 +484,12 @@ public:
         return supports_memory_budget;
     }
 
+    /// SHADPS4_NATIVE_BINDLESS=1 and the device has the descriptor-indexing features the global
+    /// sampled-image / sampler arrays need (enabled at device creation; sec. 12).
+    bool IsBindlessSupported() const {
+        return bindless_supported;
+    }
+
     /// Returns true when the opt-in VK_EXT_descriptor_heap guest binding model is in use.
     /// Fixed before any guest pipeline, buffer, image view or sampler is created.
     bool IsNativeBindingsActive() const {
@@ -547,6 +553,7 @@ private:
     vk::PhysicalDevicePushDescriptorPropertiesKHR push_descriptor_props;
     vk::PhysicalDeviceFeatures features;
     vk::PhysicalDeviceVulkan12Features vk12_features;
+    bool bindless_supported{};
     vk::PhysicalDeviceVulkan13Features vk13_features;
     vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT dynamic_state_3_features;
     vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT shader_atomic_float2_features;

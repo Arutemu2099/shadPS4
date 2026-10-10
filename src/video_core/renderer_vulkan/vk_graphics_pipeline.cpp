@@ -11,6 +11,7 @@
 #include "video_core/amdgpu/cp_split.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_bindless.h"
 #include "shader_recompiler/native_emit.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_compile_pool.h"
@@ -38,10 +39,11 @@ GraphicsPipeline::GraphicsPipeline(
     std::shared_ptr<const Shader::Gcn::FetchShaderData> fetch_shader_,
     std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading,
     const DescSetBindings* derived /*= nullptr*/,
-    u32 native_records_binding_ /*= NoNativeRecords*/)
+    u32 native_records_binding_ /*= NoNativeRecords*/, bool native_bindless_ /*= false*/)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_},
       fetch_shader{std::move(fetch_shader_)} {
     native_records_binding = native_records_binding_;
+    native_bindless = native_bindless_ && Bindless::Init(instance.GetDevice());
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
     // With `derived`, the lookup thread already read everything below that needs an Info's
@@ -88,10 +90,12 @@ GraphicsPipeline::GraphicsPipeline(
 
     // Descriptor heap pipelines have neither a descriptor set layout nor a pipeline layout.
     if (!uses_native_bindings) {
-        const vk::DescriptorSetLayout set_layout = *desc_layout;
+        // SHADPS4_NATIVE_BINDLESS: set 1 = the global image / sampler arrays.
+        const std::array<vk::DescriptorSetLayout, 2> set_layouts{
+            *desc_layout, native_bindless ? *Bindless::G().layout : vk::DescriptorSetLayout{}};
         const vk::PipelineLayoutCreateInfo layout_info = {
-            .setLayoutCount = 1U,
-            .pSetLayouts = &set_layout,
+            .setLayoutCount = native_bindless ? 2U : 1U,
+            .pSetLayouts = set_layouts.data(),
             .pushConstantRangeCount = 1,
             .pPushConstantRanges = &push_constants,
         };

@@ -1381,7 +1381,8 @@ void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
     rec.io_ud = fetch && fetch->instance_offset_sgpr >= 0 && fetch->instance_offset_sgpr < 16
                     ? r.vs[fetch->instance_offset_sgpr]
                     : 0;
-    std::memcpy(r.gpu + size_t(idx & (NR::RingSize - 1)) * NR::GpuRecDwords, g.data(), sizeof(g));
+    std::memcpy(r.gpu + size_t(idx & (NR::RingSize - 1)) * NR::GpuRecDwords, g.data(),
+                sizeof(u32) * NR::GpuRecJobDwords);
     _mm_sfence(); // Opus G2 #5: write-combined ring memory before the union count
     rec.union_idx = r.run_union;
     rec.gpu_ok = 1;

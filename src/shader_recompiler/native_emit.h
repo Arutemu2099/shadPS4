@@ -71,6 +71,10 @@ struct NativeEmit {
     /// each pulled location's are guest addresses (low 32 bits) minus the table's base.
     bool ring{};
     u32 table_binding{};
+    /// SHADPS4_NATIVE_BINDLESS (sec. 12): the PS samples image i / sampler j from the global
+    /// arrays (set 1, binding 0 / 1) at the record's slot words NativeRecordImgOffset + i /
+    /// NativeRecordSmpOffset + j. Set-0 numbering is unchanged.
+    bool bindless{};
 };
 inline thread_local NativeEmit t_native_emit{};
 
@@ -84,8 +88,12 @@ constexpr u32 NativeRecordSizeOffset = NUM_USER_DATA_REGS + NUM_BUFFERS;
 constexpr u32 NativeMaxPulledLocations = 16;
 constexpr u32 NativeRecordVoffOffset = NUM_USER_DATA_REGS + 2 * NUM_BUFFERS;
 constexpr u32 NativeRecordVsizeOffset = NativeRecordVoffOffset + NativeMaxPulledLocations;
-constexpr u32 NativeRecordDwords = NativeRecordVsizeOffset + NativeMaxPulledLocations; // 128
-static_assert(NativeRecordDwords == 128);
+/// SHADPS4_NATIVE_BINDLESS: PS image / sampler slots in the global descriptor arrays.
+constexpr u32 NativeBindlessMax = 16;
+constexpr u32 NativeRecordImgOffset = NativeRecordVsizeOffset + NativeMaxPulledLocations; // 128
+constexpr u32 NativeRecordSmpOffset = NativeRecordImgOffset + NativeBindlessMax;           // 144
+constexpr u32 NativeRecordDwords = NativeRecordSmpOffset + NativeBindlessMax;              // 160
+static_assert(NativeRecordDwords == 160);
 /// SHADPS4_NATIVE_GPU_DIRECT: the per-batch table (ring mode).
 constexpr u32 NativeTableFirst = 0;
 constexpr u32 NativeTableMask = 1;

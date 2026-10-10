@@ -77,6 +77,8 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     native_colour = native && Shader::t_native_emit.colour;
     native_pull = native && Shader::t_native_emit.pull && info.l_stage == LogicalStage::Vertex;
     native_ring = native && Shader::t_native_emit.ring;
+    native_bindless = native_colour && Shader::t_native_emit.bindless &&
+                      info.l_stage == LogicalStage::Fragment;
     if (info.uses_dma) {
         SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
     } else {
@@ -1192,6 +1194,33 @@ Id EmitContext::NativeTableLoad(u32 dword) {
                   OpAccessChain(native_records_ptr, native_table, u32_zero_value, ConstU32(dword)));
 }
 
+Id EmitContext::LoadImage(const TextureDefinition& texture) {
+    if (!texture.bindless) {
+        return OpLoad(texture.image_type, texture.id);
+    }
+    const Id slot{NativeRecordLoad(Shader::NativeRecordImgOffset + texture.bindless_index)};
+    Decorate(slot, spv::Decoration::NonUniform);
+    const Id ptr{OpAccessChain(TypePointer(spv::StorageClass::UniformConstant, texture.image_type),
+                               texture.id, slot)};
+    Decorate(ptr, spv::Decoration::NonUniform);
+    const Id value{OpLoad(texture.image_type, ptr)};
+    Decorate(value, spv::Decoration::NonUniform);
+    return value;
+}
+
+Id EmitContext::LoadSampler(u32 index) {
+    if (!native_bindless) {
+        return OpLoad(sampler_type, samplers[index]);
+    }
+    const Id slot{NativeRecordLoad(Shader::NativeRecordSmpOffset + index)};
+    Decorate(slot, spv::Decoration::NonUniform);
+    const Id ptr{OpAccessChain(sampler_pointer_type, samplers[index], slot)};
+    Decorate(ptr, spv::Decoration::NonUniform);
+    const Id value{OpLoad(sampler_type, ptr)};
+    Decorate(value, spv::Decoration::NonUniform);
+    return value;
+}
+
 Id EmitContext::NativeRecordLoad(u32 dword) {
     const Id index{OpIAdd(U32[1], native_rec_base, ConstU32(dword))};
     return OpLoad(U32[1], OpAccessChain(native_records_ptr, native_records, u32_zero_value, index));
@@ -1299,6 +1328,62 @@ Id ImageType(EmitContext& ctx, const ImageResource& desc, Id sampled_type) {
 }
 
 void EmitContext::DefineImagesAndSamplers() {
+    if (native_bindless) {
+        // SHADPS4_NATIVE_BINDLESS (sec. 12): every image a runtime array of its own image type
+        // aliasing set 1 binding 0 (one sampled-image array), every sampler one of samplers at
+        // binding 1; indexed by the record's slot words (NonUniform: the draw index comes
+        // through a flat varying). binding.unified advances as before (set 0 unchanged).
+        AddCapability(spv::Capability::RuntimeDescriptorArray);
+        AddCapability(spv::Capability::ShaderNonUniform);
+        AddCapability(spv::Capability::SampledImageArrayNonUniformIndexing);
+        if (profile.supported_spirv < 0x00010500) {
+            AddExtension("SPV_EXT_descriptor_indexing");
+        }
+        u32 index = 0;
+        for (const auto& image_desc : info.images) {
+            const auto sharp = image_desc.GetSharp(info);
+            const auto nfmt = sharp.GetNumberFmt();
+            const VectorIds& data_types = GetAttributeType(*this, nfmt);
+            const Id image_type{ImageType(*this, image_desc, data_types[1])};
+            const Id pointer_type{
+                TypePointer(spv::StorageClass::UniformConstant, TypeRuntimeArray(image_type))};
+            const Id id{AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant)};
+            Decorate(id, spv::Decoration::Binding, 0U);
+            Decorate(id, spv::Decoration::DescriptorSet, 1U);
+            binding.unified += image_desc.NumBindings(info);
+            Name(id, fmt::format("{}_bimg{}", stage, index));
+            images.push_back({
+                .data_types = &data_types,
+                .id = id,
+                .sampled_type = TypeSampledImage(image_type),
+                .image_type = image_type,
+                .view_type = sharp.GetHostViewType(image_desc.is_array),
+                .is_integer = AmdGpu::IsInteger(nfmt),
+                .is_storage = false,
+                .mip_fallback_mode = image_desc.mip_fallback_mode,
+                .bindless = true,
+                .bindless_index = index++,
+            });
+            interfaces.push_back(id);
+        }
+        if (info.samplers.empty()) {
+            return;
+        }
+        sampler_type = TypeSampler();
+        sampler_pointer_type = TypePointer(spv::StorageClass::UniformConstant, sampler_type);
+        const Id array_ptr{
+            TypePointer(spv::StorageClass::UniformConstant, TypeRuntimeArray(sampler_type))};
+        for (size_t j = 0; j < info.samplers.size(); ++j) {
+            const Id id{AddGlobalVariable(array_ptr, spv::StorageClass::UniformConstant)};
+            Decorate(id, spv::Decoration::Binding, 1U);
+            Decorate(id, spv::Decoration::DescriptorSet, 1U);
+            ++binding.unified;
+            Name(id, fmt::format("{}_bsamp{}", stage, j));
+            samplers.push_back(id);
+            interfaces.push_back(id);
+        }
+        return;
+    }
     for (const auto& image_desc : info.images) {
         const auto sharp = image_desc.GetSharp(info);
         const auto nfmt = sharp.GetNumberFmt();

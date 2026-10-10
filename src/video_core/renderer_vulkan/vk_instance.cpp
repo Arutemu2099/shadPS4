@@ -449,6 +449,17 @@ bool Instance::CreateDevice() {
 
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
+    {
+        const char* e = std::getenv("SHADPS4_NATIVE_BINDLESS");
+        bindless_supported = e && e[0] == '1' && vk12_features.descriptorIndexing &&
+                             vk12_features.runtimeDescriptorArray &&
+                             vk12_features.shaderSampledImageArrayNonUniformIndexing &&
+                             vk12_features.descriptorBindingSampledImageUpdateAfterBind &&
+                             vk12_features.descriptorBindingUpdateUnusedWhilePending &&
+                             vk12_features.descriptorBindingPartiallyBound;
+        LOG_INFO(Render_Vulkan, "NativeBindless: {}",
+                 bindless_supported ? "descriptor indexing enabled" : "off");
+    }
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
@@ -501,6 +512,12 @@ bool Instance::CreateDevice() {
             .shaderSharedInt64Atomics = vk12_features.shaderSharedInt64Atomics,
             .shaderFloat16 = vk12_features.shaderFloat16,
             .shaderInt8 = vk12_features.shaderInt8,
+            .descriptorIndexing = bindless_supported,
+            .shaderSampledImageArrayNonUniformIndexing = bindless_supported,
+            .descriptorBindingSampledImageUpdateAfterBind = bindless_supported,
+            .descriptorBindingUpdateUnusedWhilePending = bindless_supported,
+            .descriptorBindingPartiallyBound = bindless_supported,
+            .runtimeDescriptorArray = bindless_supported,
             .scalarBlockLayout = vk12_features.scalarBlockLayout,
             .uniformBufferStandardLayout = vk12_features.uniformBufferStandardLayout,
             .separateDepthStencilLayouts = vk12_features.separateDepthStencilLayouts,

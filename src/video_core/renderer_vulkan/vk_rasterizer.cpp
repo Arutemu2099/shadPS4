@@ -3758,6 +3758,11 @@ void Rasterizer::NativeRingWrite() {
         p.inst[j] = m.cmdw[1];
         p.iaddr[j] = m.iaddr;
     }
+    if (b.bindless) {
+        for (u32 j = 0; j <= n; ++j) {
+            BindlessRingWrite(draw_job_tag, p.first_idx - 1 + j, b.bl_slots.data());
+        }
+    }
     p.ring_src = true;
     p.verify = false;
     b.ring_tag = draw_job_tag;
@@ -4027,6 +4032,48 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         }
         b.smp_gen = texture_cache.SamplerGeneration();
         b.border = regs.ta_bc_base.base_addr;
+        if (native && native->native_bindless) {
+            // SHADPS4_NATIVE_BINDLESS: the opener's slots, checked against what BindTextures
+            // just bound for it (the generic writes: views + layouts, samplers, in order).
+            std::array<vk::ImageView, Shader::NativeBindlessMax> views{};
+            std::array<vk::Sampler, Shader::NativeBindlessMax> smps{};
+            u32 ni = 0, ns = 0;
+            const u64 s0 = scheduler.RecordSeq();
+            if (!BindlessResolve(base, b.bl_slots.data(), views.data(), smps.data(), ni, ns) ||
+                scheduler.RecordSeq() != s0) {
+                ++native_stats.bl_open_fail;
+                return fail(__LINE__);
+            }
+            u32 ki = 0, ks = 0;
+            bool bad = false;
+            for (u32 w = 0; w < set_write_index; ++w) {
+                const auto& sw = set_writes[w];
+                if (sw.descriptorType == vk::DescriptorType::eSampledImage && ki < ni) {
+                    bad = bad || sw.pImageInfo[0].imageView != views[ki];
+                    ++ki;
+                } else if (sw.descriptorType == vk::DescriptorType::eSampler && ks < ns) {
+                    bad = bad || sw.pImageInfo[0].sampler != smps[ks];
+                    ++ks;
+                }
+            }
+            if (ki != ni || ks != ns) {
+                ++native_stats.bl_vfy_none;
+            } else if (bad) {
+                if (++native_stats.bl_vfy_bad <= 16) {
+                    LOG_CRITICAL(Render_Vulkan,
+                                 "NativeBindless verify MISMATCH: the opener's resolved views / "
+                                 "samplers differ from BindTextures' ({} images, {} samplers)",
+                                 ni, ns);
+                }
+                return fail(__LINE__);
+            } else {
+                ++native_stats.bl_vfy_ok;
+            }
+            b.bindless = true;
+            b.bl_set = bindless.cur;
+            bindless.last_tick[b.bl_set] = scheduler.CurrentTick();
+            ++native_stats.bl_open;
+        }
         const auto* attribs = AmdGpu::CpSplit::VertexInputAttribs(*front_vi);
         for (u32 k = 0; k < vi.n; ++k) {
             const u32 loc = attribs[k].desc.location;
@@ -4204,6 +4251,9 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         std::memcpy(rec + Shader::NativeRecordVoffOffset, col_voff.data(), sizeof(col_voff));
         std::memcpy(rec + Shader::NativeRecordVsizeOffset, col_vsize.data(), sizeof(col_vsize));
     }
+    if (b.bindless) {
+        std::memcpy(rec + Shader::NativeRecordImgOffset, b.bl_slots.data(), sizeof(b.bl_slots));
+    }
     b.open_tick = tick_before_map;
     const auto& vs_info = GetBoundStage(Shader::LogicalStage::Vertex);
     const auto [vertex_offset, instance_offset] =
@@ -4326,6 +4376,228 @@ void Rasterizer::NativeClose(u32 why) {
         }
         native_prep.active = false;
     }
+}
+
+bool Rasterizer::BindlessRotate() {
+    // The next set copy, once the GPU finished every batch that bound it; caches and slot maps
+    // start over.
+    auto& bl = bindless;
+    const u32 next = (bl.cur + 1) % Bindless::NumSets;
+    if (!scheduler.IsFree(bl.last_tick[next])) {
+        ++native_stats.bl_fail[3];
+        return false;
+    }
+    bl.cur = next;
+    bl.img_next = bl.smp_next = 0;
+    bl.view_slot.clear();
+    bl.smp_slot.clear();
+    ++bl.img_gen;
+    ++bl.smp_gen;
+    ++native_stats.bl_rot;
+    return true;
+}
+
+void Rasterizer::BindlessRingWrite(u32 tag, u32 idx, const u32* slots) {
+    // Ring mode: the GPU reads this draw's record from the job ring; the slot words (128-159)
+    // are the back's (the job thread writes dwords 0-127 only). Write-only (write-combined).
+    namespace NR = AmdGpu::NativeRec;
+    u32* gr = NR::g_gpu_recs[tag >> 28].load(std::memory_order_acquire);
+    if (gr) {
+        std::memcpy(gr + size_t(idx & (NR::RingSize - 1)) * NR::GpuRecDwords +
+                        Shader::NativeRecordImgOffset,
+                    slots, sizeof(u32) * 2 * Shader::NativeBindlessMax);
+    }
+}
+
+bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::ImageView* views,
+                                 vk::Sampler* samplers, u32& n_img, u32& n_smp, bool retry) {
+    // SHADPS4_NATIVE_BINDLESS (sec. 12), back thread. Per fragment image: the cache entry for
+    // (descriptor, raw T#) if every validity condition holds (then only the LRU touch), else
+    // what BindTextures does for one sampled image - FindImage, FindTexture, the sampled-layout
+    // Transit (may record a barrier: callers check RecordSeq) - and a slot for (view, layout).
+    // Per sampler: the S# (with BindTextures' aniso rule) -> GetSampler -> a slot.
+    auto& bl = bindless;
+    auto& st = native_stats;
+    const auto& g = Bindless::G();
+    const u64 tg = texture_cache.StructGeneration();
+    const u64 ie = VideoCore::g_image_epoch.load(std::memory_order_acquire);
+    const u64 me = texture_cache.MetaClearEpoch();
+    const u64 sg = texture_cache.SamplerGeneration();
+    if (tg != bl.tex_gen) {
+        bl.view_slot.clear(); // a view may be gone: its slot is never handed out again
+    }
+    if (tg != bl.tex_gen || ie != bl.img_epoch || me != bl.meta_epoch) {
+        ++bl.img_gen;
+        bl.tex_gen = tg;
+        bl.img_epoch = ie;
+        bl.meta_epoch = me;
+    }
+    if (sg != bl.sampler_gen) {
+        bl.smp_slot.clear();
+        ++bl.smp_gen;
+        bl.sampler_gen = sg;
+    }
+    if (bl.img_cache.empty()) {
+        bl.img_cache.resize(4096);
+        bl.smp_cache.resize(1024);
+    }
+    const Shader::BoundStage* fs = nullptr;
+    for (const auto& bound : BoundStages(base)) {
+        if (bound.info && bound.info->l_stage == Shader::LogicalStage::Fragment) {
+            fs = &bound;
+        }
+    }
+    if (!fs) {
+        ++st.bl_fail[0];
+        return false;
+    }
+    const auto& info = *fs->info;
+    n_img = static_cast<u32>(info.images.size());
+    n_smp = static_cast<u32>(info.samplers.size());
+    if (n_img > Shader::NativeBindlessMax || n_smp > Shader::NativeBindlessMax) {
+        ++st.bl_fail[0];
+        return false;
+    }
+    const auto device = instance.GetDevice();
+    const auto rotate_retry = [&] {
+        return retry && BindlessRotate() &&
+               BindlessResolve(base, slots, views, samplers, n_img, n_smp, false);
+    };
+    for (u32 i = 0; i < n_img; ++i) {
+        const auto& desc = info.images[i];
+        const auto tsharp = desc.GetSharp(*fs);
+        if (tsharp.Address() == 0 || tsharp.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid) {
+            ++st.bl_fail[1];
+            return false;
+        }
+        std::array<u32, 8> words;
+        static_assert(sizeof(tsharp) == sizeof(words));
+        std::memcpy(words.data(), &tsharp, sizeof(words));
+        u64 hsh = std::bit_cast<u64>(&desc) * 0x9E3779B97F4A7C15ull;
+        for (const u32 w : words) {
+            hsh = (hsh ^ w) * 0x100000001B3ull;
+        }
+        auto& e = bl.img_cache[(hsh ^ (hsh >> 29)) & (bl.img_cache.size() - 1)];
+        if (e.gen == bl.img_gen && e.desc == &desc && e.words == words) {
+            auto& image = texture_cache.GetImage(e.id);
+            if (image.backing == e.backing && image.backing->state_serial == e.serial) {
+                texture_cache.TouchImageAccess(image);
+                slots[i] = e.slot;
+                if (views) {
+                    views[i] = e.view;
+                }
+                ++st.bl_img_hit;
+                continue;
+            }
+        }
+        ++st.bl_img_miss;
+        VideoCore::TextureCache::ImageDesc idesc{tsharp, desc};
+        const auto image_id = texture_cache.FindImage(idesc);
+        auto& image = texture_cache.GetImage(image_id);
+        if (texture_cache.GetAssociatedDepth(image) || image.binding.needs_rebind ||
+            image.binding.is_target || image.binding.force_general) {
+            ++st.bl_fail[2];
+            return false;
+        }
+        auto& view = texture_cache.FindTexture(image_id, idesc);
+        image.Transit(image.info.props.is_depth ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+                                                : vk::ImageLayout::eShaderReadOnlyOptimal,
+                      vk::AccessFlagBits2::eShaderRead, idesc.view_info.range);
+        image.usage.texture |= true;
+        const vk::ImageView vh = *view.image_view;
+        const vk::ImageLayout lay = image.backing->state.layout;
+        const u64 vkey = std::bit_cast<u64>(static_cast<VkImageView>(vh)) ^ (u64(lay) << 48);
+        u32 slot;
+        if (const auto it = bl.view_slot.find(vkey); it != bl.view_slot.end()) {
+            slot = it->second;
+        } else {
+            if (bl.img_next >= Bindless::ImageSlots) {
+                return rotate_retry();
+            }
+            slot = bl.img_next++;
+            const vk::DescriptorImageInfo ii{{}, vh, lay};
+            const vk::WriteDescriptorSet w{
+                .dstSet = g.sets[bl.cur],
+                .dstBinding = 0,
+                .dstArrayElement = slot,
+                .descriptorCount = 1,
+                .descriptorType = vk::DescriptorType::eSampledImage,
+                .pImageInfo = &ii,
+            };
+            device.updateDescriptorSets(w, {});
+            bl.view_slot.emplace(vkey, slot);
+        }
+        e = {&desc, words, bl.img_gen, slot, image_id, image.backing, image.backing->state_serial,
+             vh, lay};
+        slots[i] = slot;
+        if (views) {
+            views[i] = vh;
+        }
+    }
+    std::array<size_t, Shader::NativeBindlessMax> lru{};
+    u32 n_lru = 0;
+    for (u32 j = 0; j < n_smp; ++j) {
+        const auto& sdesc = info.samplers[j];
+        auto ssharp = sdesc.GetSharp(*fs);
+        if (sdesc.disable_aniso) {
+            const auto& tsharp = info.images[sdesc.associated_image].GetSharp(*fs);
+            if (tsharp.base_level == 0 && tsharp.last_level == 0) {
+                ssharp.max_aniso.Assign(AmdGpu::AnisoRatio::One);
+            }
+        }
+        std::array<u32, 4> words;
+        static_assert(sizeof(ssharp) == sizeof(words));
+        std::memcpy(words.data(), &ssharp, sizeof(words));
+        u64 hsh = 0xC2B2AE3D27D4EB4Full;
+        for (const u32 w : words) {
+            hsh = (hsh ^ w) * 0x100000001B3ull;
+        }
+        auto& e = bl.smp_cache[(hsh ^ (hsh >> 29)) & (bl.smp_cache.size() - 1)];
+        if (e.gen == bl.smp_gen && e.words == words) {
+            slots[Shader::NativeBindlessMax + j] = e.slot;
+            if (samplers) {
+                samplers[j] = e.sampler;
+            }
+            lru[n_lru++] = e.lru;
+            ++st.bl_smp_hit;
+            continue;
+        }
+        ++st.bl_smp_miss;
+        const vk::Sampler sh =
+            texture_cache.GetSampler(ssharp, liverpool->BackRegs().ta_bc_base, nullptr);
+        const u64 skey = std::bit_cast<u64>(static_cast<VkSampler>(sh));
+        u32 slot;
+        if (const auto it = bl.smp_slot.find(skey); it != bl.smp_slot.end()) {
+            slot = it->second;
+        } else {
+            if (bl.smp_next >= Bindless::SamplerSlots) {
+                return rotate_retry();
+            }
+            slot = bl.smp_next++;
+            const vk::DescriptorImageInfo ii{sh, {}, vk::ImageLayout::eUndefined};
+            const vk::WriteDescriptorSet w{
+                .dstSet = g.sets[bl.cur],
+                .dstBinding = 1,
+                .dstArrayElement = slot,
+                .descriptorCount = 1,
+                .descriptorType = vk::DescriptorType::eSampler,
+                .pImageInfo = &ii,
+            };
+            device.updateDescriptorSets(w, {});
+            bl.smp_slot.emplace(skey, slot);
+        }
+        e = {words, bl.smp_gen, slot, texture_cache.SamplerLruId(ssharp), sh};
+        slots[Shader::NativeBindlessMax + j] = slot;
+        if (samplers) {
+            samplers[j] = sh;
+        }
+    }
+    // Cache hits skipped GetSampler's LRU touch; keep those samplers alive the same way.
+    if (n_lru != 0 && !texture_cache.TouchSamplers(std::span{lru.data(), n_lru}, sg)) {
+        ++st.bl_fail[4];
+        return false;
+    }
+    return true;
 }
 
 bool Rasterizer::NativeRingJoinOk() {
@@ -4452,18 +4724,39 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
         NativeClose(12);
         return false;
     }
+    std::array<u32, 2 * Shader::NativeBindlessMax> jslots{};
+    bool jslots_own = false;
     if (b.colour) {
         // SHADPS4_NATIVE_COLOUR: the draw-repeat conditions for "the same images": identical
         // raw T# / S#, no sampler / border / structure / image epoch change since the opener.
+        // SHADPS4_NATIVE_BINDLESS: other images join through the slot cache (sec. 12).
         std::array<u32, 512> key;
         u32 n = 0;
-        if (texture_cache.SamplerGeneration() != b.smp_gen ||
-            regs.ta_bc_base.base_addr != b.border || !NativeColourGates() ||
-            !NativeImageKey(b.base, key, n) || n != b.img_n ||
-            std::memcmp(key.data(), native_img_key.data(), n * sizeof(u32)) != 0) {
-            NativeClose(12);
-            native_stats.close_key = true; // bindless census: the next opener follows a key change
-            return false;
+        const bool gates = texture_cache.SamplerGeneration() == b.smp_gen &&
+                           regs.ta_bc_base.base_addr == b.border && NativeColourGates() &&
+                           NativeImageKey(b.base, key, n) && n == b.img_n;
+        if (!gates || std::memcmp(key.data(), native_img_key.data(), n * sizeof(u32)) != 0) {
+            bool joined = false;
+            if (gates && b.bindless) {
+                u32 ni = 0, ns = 0;
+                const u64 s0 = scheduler.RecordSeq();
+                joined = BindlessResolve(b.base, jslots.data(), nullptr, nullptr, ni, ns) &&
+                         bindless.cur == b.bl_set && scheduler.RecordSeq() == s0 &&
+                         scheduler.CurrentTick() == b.tick;
+                if (!joined) {
+                    ++native_stats.bl_join_fail;
+                    native_stats.bl_fail[5] += bindless.cur != b.bl_set ||
+                                               scheduler.RecordSeq() != s0 ||
+                                               scheduler.CurrentTick() != b.tick;
+                }
+            }
+            if (!joined) {
+                NativeClose(12);
+                native_stats.close_key = true; // bindless census: the next opener follows a key change
+                return false;
+            }
+            jslots_own = true;
+            ++native_stats.bl_join;
         }
     }
     static const bool join_timing = [] {
@@ -4717,6 +5010,13 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
     if (b.colour) {
         std::memcpy(rec + Shader::NativeRecordVoffOffset, col_voff.data(), sizeof(col_voff));
         std::memcpy(rec + Shader::NativeRecordVsizeOffset, col_vsize.data(), sizeof(col_vsize));
+    }
+    if (b.bindless) {
+        const u32* sl = jslots_own ? jslots.data() : b.bl_slots.data();
+        std::memcpy(rec + Shader::NativeRecordImgOffset, sl, sizeof(u32) * jslots.size());
+        if (b.ring) {
+            BindlessRingWrite(draw_job_tag, draw_job_idx, sl);
+        }
     }
     const u32 cmd[5] = {regs.num_indices, regs.num_instances.NumInstances(),
                         static_cast<u32>(jvi.ib_off / b.index_size), static_cast<u32>(s32(vo)),
@@ -5107,6 +5407,16 @@ void Rasterizer::NativeLog() {
                  st.rj_fail[2], st.rj_fail[3], st.rj_cmp_ok, st.rj_cmp_bad, rf,
                  st.prep_conf, st.prep_conf_col, st.prep_cmp_ok, st.prep_cmp_bad,
                  st.prep_join_refused, st.prep_jref[12], st.prep_jref[10]);
+    }
+    if (st.bl_open + st.bl_open_fail != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "NativeBindless: batches={} open fail={} | joins with other images={} failed={} "
+                 "| fails 0..5: {} {} {} {} {} {} | images hit/miss {}/{} samplers hit/miss {}/{} "
+                 "| opener verify ok={} MISMATCH={} unverified={} | rotations={} slots {}/{}",
+                 st.bl_open, st.bl_open_fail, st.bl_join, st.bl_join_fail, st.bl_fail[0],
+                 st.bl_fail[1], st.bl_fail[2], st.bl_fail[3], st.bl_fail[4], st.bl_fail[5],
+                 st.bl_img_hit, st.bl_img_miss, st.bl_smp_hit, st.bl_smp_miss, st.bl_vfy_ok,
+                 st.bl_vfy_bad, st.bl_vfy_none, st.bl_rot, bindless.img_next, bindless.smp_next);
     }
     if (st.n_rec[0] + st.n_rec[3] + st.n_rec[9] != 0) {
         const auto per = [](u64 c, u64 n) { return n ? double(c) / double(n) : 0.0; };
@@ -5782,7 +6092,12 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
             vbufs[k] = vk::Buffer{std::bit_cast<VkBuffer>(native_batch.vb[k])};
             voffs[k] = native_batch.vb_off[k];
         }
+        const vk::PipelineLayout bl_layout =
+            native_batch.bindless ? pipeline->GetLayout() : vk::PipelineLayout{};
+        const vk::DescriptorSet bl_set =
+            native_batch.bindless ? Bindless::G().sets[native_batch.bl_set] : vk::DescriptorSet{};
         scheduler.Record([handle = pipeline->Handle(), sb = stream.Handle(), cmd_off, count_off,
+                          bl_layout, bl_set,
                           rebind = native_batch.vb_rebased, vb_n = native_batch.vb_n, vbufs, voffs,
                           ib = vk::Buffer{std::bit_cast<VkBuffer>(native_batch.ib)},
                           type = native_batch.index_size == 2 ? vk::IndexType::eUint16
@@ -5790,6 +6105,10 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
                              vk::CommandBuffer cmdbuf) {
             if (!GraphicsBindTracker::Enabled() || GraphicsBindTracker::NeedBind(cmdbuf, handle)) {
                 cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+            }
+            if (bl_set) {
+                cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, bl_layout, 1, bl_set,
+                                          {});
             }
             cmdbuf.bindIndexBuffer(ib, 0, type);
             if (rebind && vb_n != 0) {

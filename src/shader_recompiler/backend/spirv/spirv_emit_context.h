@@ -253,6 +253,11 @@ public:
     Id vertex_index{};
     Id NativeRecordLoad(u32 dword);
     Id NativeTableLoad(u32 dword);
+    /// The image / sampler value to use (SHADPS4_NATIVE_BINDLESS: from the global arrays at
+    /// this draw's slot).
+    Id LoadImage(const TextureDefinition& texture);
+    Id LoadSampler(u32 index);
+    bool native_bindless{};
     Id draw_index{};          // SHADPS4_NATIVE_PASS: DrawIndex built-in (native variant VS)
     Id native_records{};      // SHADPS4_NATIVE_PASS: records SSBO (uint data[])
     Id native_records_ptr{};  // pointer type to one u32 of it
@@ -324,6 +329,8 @@ public:
         bool is_integer = false;
         bool is_storage = false;
         MipStorageFallbackMode mip_fallback_mode{};
+        bool bindless = false; ///< SHADPS4_NATIVE_BINDLESS: `id` is a runtime array (set 1)
+        u32 bindless_index = 0;
     };
 
     enum class PointerType : u32 {
