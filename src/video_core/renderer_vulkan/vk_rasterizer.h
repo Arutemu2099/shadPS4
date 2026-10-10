@@ -131,6 +131,37 @@ public:
     /// Liverpool::ExecuteDrawRecord.
     u32 nr_head_tag{};
     u32 nr_head_idx{};
+    /// SHADPS4_NATIVE_REC >= 2: the job record of the draw ExecuteDraw runs next (tag 0: none),
+    /// its packet and whether the front's member path posted it; set by ExecuteDrawRecord.
+    u32 draw_job_tag{};
+    u32 draw_job_idx{};
+    const void* draw_job_cmd{};
+    bool draw_job_member{};
+    /// SHADPS4_NATIVE_REC_PREP (notes/native-path-2026-10-09.md sec. 9): the open batch's run
+    /// members prepared from the job records (records + indirect commands in the batch slots,
+    /// count not advanced); each is confirmed at its own draw record (NativePrepConfirm).
+    struct NativePrep {
+        bool active{};
+        bool verify{};      ///< =2: prepared into `side`, never confirmed; NativeJoin compares
+        u32 tag{};          ///< job tag of the run
+        u32 first_idx{};    ///< job ring index of the first prepared member
+        u32 next_idx{};     ///< the next member to confirm
+        u32 end_idx{};      ///< one past the last prepared member
+        u32 slot0{};        ///< batch slot of first_idx
+        u64 epoch{}, gen{}; ///< dirty epoch / buffer structure generation at the prepare
+        std::array<const void*, 64> cmd{}; ///< each member's DRAW_INDEX_2 packet
+        std::vector<u32> side;              ///< verify: (record + 5 command words) per member
+        u32 n{};                            ///< members prepared
+    } native_prep;
+    /// Back thread, Liverpool::ExecuteDrawRecord: true = the draw was a prepared member and went
+    /// into the open batch; false = run the record normally (the prepare is dropped on refusal).
+    bool NativePrepConfirm(const SplitDraw& draw, bool plain,
+                           const AmdGpu::CpSplit::VertexInputsPayload* vi);
+    /// SHADPS4_NATIVE_TIMING: what the back did with the draw record it runs (Liverpool's record
+    /// timer): 0 other / filtered, 1 shadow join, 2 colour join, 3 DrawTail, 4 shadow confirm,
+    /// 5 colour confirm.
+    u32 rec_outcome{};
+    void NoteRecordCycles(u64 dt);
     /// Back thread: runs a dispatch the front looked up. The caller points
     /// Liverpool::BackCsRegs() at the record's ComputeProgram snapshot.
     void ExecuteDispatch(const ComputePipeline* pipeline,
@@ -574,7 +605,25 @@ private:
         u64 peek_yes{}, peek_no{}, peek_unknown{};
         // Open refusals by source line (SHADPS4_BACK_CYCLES study, 2026-10-09).
         std::array<std::pair<u32, u64>, 24> fail_lines{};
+        // SHADPS4_NATIVE_REC_PREP: prepares (attempted / with members), members prepared, the
+        // prepare's cycles, stops by reason, confirms ok / refused by reason, verify compares.
+        u64 prep_try{}, prep_runs{}, prep_members{}, c_prep{}, prep_conf{}, prep_conf_col{},
+            prep_cmp_ok{}, prep_cmp_bad{}, prep_join_refused{};
+        std::array<u64, 16> prep_jref{}; ///< verify: the join refused a prepared member (close why)
+        std::array<u64, 16> prep_stop{};
+        std::array<u64, 16> prep_refuse{};
+        // SHADPS4_NATIVE_TIMING: whole draw records (Liverpool's timer) by rec_outcome x posted by
+        // the front's member path.
+        std::array<u64, 12> c_rec{}, n_rec{};
     } native_stats;
+    void NativePrepare(const GraphicsPipeline* base,
+                       const AmdGpu::CpSplit::VertexInputAttrib* attribs,
+                       const std::array<u64, Shader::NUM_BUFFERS>& o_addr,
+                       const std::array<u64, Shader::NUM_BUFFERS>& o_size,
+                       const std::array<u32, Shader::NUM_BUFFERS>& o_off,
+                       const std::array<u32, Shader::NUM_BUFFERS>& o_rsize);
+    bool NativeCtxSame();
+    void NativePrepWrite();
     bool NativeJoin(const SplitDraw& draw, const AmdGpu::CpSplit::VertexInputsPayload* front_vi);
     bool NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline* native, bool is_indexed,
                     u32 index_offset, const AmdGpu::CpSplit::VertexInputsPayload* front_vi,

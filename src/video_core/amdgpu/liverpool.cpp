@@ -795,6 +795,11 @@ CpWaitStats g_cp_wait;
 } // namespace
 
 namespace {
+const bool g_native_timing_rec = [] {
+    const char* e = std::getenv("SHADPS4_NATIVE_TIMING");
+    return e && e[0] == '1';
+}();
+
 // ---- CP front/back split records (cp_split.h). Built on the front, read on the back. ----
 
 /// A draw: the front's classification and lookup plus the per-stage data copied right after the
@@ -812,6 +817,10 @@ struct SplitDrawRecord {
     u32 pad;
     u32 nr_tag;              ///< SHADPS4_NATIVE_REC: the job-thread run this draw heads (0: none)
     u32 nr_idx;
+    u32 job_tag;             ///< SHADPS4_NATIVE_REC >= 2: this draw's OWN job record (0: none),
+    u32 job_idx;             ///< heads, members and refused members alike (REC_PREP, sec. 9)
+    u32 job_member;          ///< 1: posted by the member path (NativeRecMember)
+    u32 job_pad;
 };
 static_assert(sizeof(SplitDrawRecord) % 8 == 0);
 
@@ -1886,7 +1895,17 @@ void Liverpool::ExecuteRecordImpl(const CpSplit::RecordHeader& record) {
     }
     case CpSplit::RecordType::Draw:
         rasterizer->GetScheduler().SwitchStream(0);
-        ExecuteDrawRecord(record);
+        if (g_native_timing_rec) [[unlikely]] {
+            // SHADPS4_NATIVE_TIMING: whole draw records by what the back did with them (sec. 9
+            // gate 0: the per-record path around a join / confirm, measured, not subtracted).
+            auto& tr = rasterizer->Translating();
+            tr.rec_outcome = 0;
+            const u64 t0 = __rdtsc();
+            ExecuteDrawRecord(record);
+            tr.NoteRecordCycles(__rdtsc() - t0);
+        } else {
+            ExecuteDrawRecord(record);
+        }
         break;
     case CpSplit::RecordType::Dispatch:
         ExecuteDispatchRecord(record);
@@ -2011,6 +2030,18 @@ void Liverpool::ExecuteDrawRecord(const CpSplit::RecordHeader& record) {
     translating.draw_tag = rec.pad;
     translating.nr_head_tag = rec.nr_tag;
     translating.nr_head_idx = rec.nr_idx;
+    translating.draw_job_tag = rec.job_tag;
+    translating.draw_job_idx = rec.job_idx;
+    translating.draw_job_cmd = rec.cmd_address;
+    translating.draw_job_member = rec.job_member != 0;
+    // SHADPS4_NATIVE_REC_PREP (notes/native-path-2026-10-09.md sec. 9): a run member the batch
+    // open already prepared from the job records is confirmed here (count + 1) instead of being
+    // joined; any refusal falls through to the normal path below.
+    if (translating.native_prep.active) [[unlikely]] {
+        if (translating.NativePrepConfirm(rec.draw, rec.verify == 0 && !rec.marker, vi_block)) {
+            return;
+        }
+    }
     MtbConflict::g_in_draw = MtbConflict::g_enabled;
     SCOPE_EXIT {
         MtbConflict::g_in_draw = false;
@@ -3361,6 +3392,10 @@ bool Liverpool::NativeRecMember(const PM4Header* header, const char* name, bool 
     rec->pad = 0;
     rec->nr_tag = 0;
     rec->nr_idx = 0;
+    rec->job_tag = tag;
+    rec->job_idx = idx;
+    rec->job_member = 1;
+    rec->job_pad = 0;
     std::memcpy(reinterpret_cast<u8*>(rec + 1), local.data(), body);
     split->Commit();
     if (split_run_ahead) {
@@ -3553,6 +3588,17 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
     rec->pad = tag;
     rec->nr_tag = 0;
     rec->nr_idx = 0;
+    rec->job_tag = 0;
+    rec->job_idx = 0;
+    rec->job_member = 0;
+    rec->job_pad = 0;
+    if (AmdGpu::NativeRec::g_mode >= 2 && header->type3.opcode == PM4ItOpcode::DrawIndex2) {
+        const auto* w = reinterpret_cast<const u32*>(header);
+        if (w[6] == 0xc0021000u && w[7] == AmdGpu::NativeRec::Magic) {
+            rec->job_tag = w[8];
+            rec->job_idx = w[9];
+        }
+    }
     // Copied now: the front's next lookup rewrites these Info fields (inventory 4.4). With
     // run-ahead this is what makes the record self-contained: the back reads user data, flat
     // buffer and pgm_base only from here, and the Info only for its immutable part.
