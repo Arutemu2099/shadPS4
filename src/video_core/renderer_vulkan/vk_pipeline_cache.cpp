@@ -485,6 +485,8 @@ private:
                 // with no variant, so the back keeps the generic path for this description.
                 LOG_INFO(Render_Vulkan, "NativeColour: variant of {:#x} has no push descriptors",
                          std::hash<GraphicsPipelineKey>{}(job->key));
+                job->base->native_colour_why.store("no push descriptors", std::memory_order_relaxed);
+                slot.state.store(2, std::memory_order_release);
             } else {
                 variant->native_vertex_binding = job->vertex_binding;
                 variant->native_table_binding = job->table_binding;
@@ -1380,8 +1382,12 @@ void PipelineCache::PrepareNativeColour(const GraphicsPipeline* base,
     const auto stages = base->GetStages();
     const auto* vs = stages[u32(LogicalStage::Vertex)];
     const auto* fs = stages[u32(LogicalStage::Fragment)];
+    GraphicsPipeline::NativeColourSlot* claimed = nullptr; // SHADPS4_NATIVE_SEGB census
     const auto log_not = [&](const char* why) {
         base->native_colour_why.store(why, std::memory_order_relaxed);
+        if (claimed) {
+            claimed->state.store(2, std::memory_order_release);
+        }
         if (native_colour_logged++ < 2000) {
             LOG_INFO(Render_Vulkan, "NativeColour: pipeline {:#x} not eligible ({})",
                      std::hash<GraphicsPipelineKey>{}(base->GetGraphicsKey()), why);
@@ -1479,6 +1485,7 @@ void PipelineCache::PrepareNativeColour(const GraphicsPipeline* base,
     native_colour_last = now;
     // From here on the slot is claimed for this key whatever happens (a failure is final).
     base->native_colour[free_slot].key.store(key, std::memory_order_release);
+    claimed = &base->native_colour[free_slot];
     // Per-description eligibility: per-vertex attributes of pullable formats, locations < 16,
     // number class matching the shader's input type.
     Shader::NativeEmit emit{};

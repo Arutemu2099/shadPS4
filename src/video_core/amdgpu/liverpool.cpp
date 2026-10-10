@@ -3283,15 +3283,14 @@ bool g_nr_scratch_valid{};
 namespace SegB {
 constexpr u32 MaxMembers = 64;
 constexpr u64 MaxUnion = 64ull << 20;
-/// Why a draw stayed outside (1-9, also closing the open segment) or a segment closed (10-17).
+/// Why a draw stayed outside (1-9, also closing the open segment) or a segment closed (10-18).
 enum Reason : u32 {
     RNone = 0,
     RNoTag,          ///< not a tagged DrawIndex2 (every other draw packet included)
     RStale,          ///< no job ring, or the record was overwritten
     RNoGpuRec,       ///< not derived by the job thread, or no GPU record
-    RNoVariant,      ///< no published colour variant for this vertex description
-    RVariantNoRing,  ///< the variant is not ring (+ pt) + bindless, or a shadow pipeline
-    RInherited,      ///< inherited user data / V# slots (the member path refuses these too)
+    RNoVariant,      ///< no usable colour variant (split by NvReason)
+    RVariantNoRing,  ///< the variant is not ring (+ pt) + bindless
     RInstanceOffset, ///< the fetch shader's instance offset SGPR is not 0
     RNotPlain,       ///< filtered / skipped / no pipeline / no vertex inputs
     RNoUnion,        ///< the job run's union entry is gone (NativeRecGpu killed it)
@@ -3303,13 +3302,14 @@ enum Reason : u32 {
     RVertexUnion,
     RGuestUnion,
     RMisaligned,     ///< the index address is not a whole number of indices from the opener's
+    RInheritedDiff,  ///< v2: the member's inherited set / values differ from the opener's
     NumReasons,
 };
 enum PacketKind : u32 {
     PkNone = 0,
-    PkCtx,      ///< SET_CONTEXT_REG, SET_CONFIG_REG, CONTEXT_CONTROL, CLEAR_STATE
+    PkCtx,      ///< v2: a SET_CONTEXT_REG that changes a value (or CONFIG / CONTEXT_CONTROL / CLEAR_STATE)
     PkSh,       ///< SET_SH_REG outside the VS / PS user-data registers
-    PkUconfig,
+    PkUconfig,  ///< v2: a SET_UCONFIG_REG other than index type / counts, or a changed primitive type
     PkNop,      ///< a NOP with a back effect (flip, guest marker)
     PkDispatch,
     PkEvent,    ///< EVENT_WRITE / EOP / EOS / RELEASE_MEM
@@ -3320,16 +3320,57 @@ enum PacketKind : u32 {
     PkOther,
     NumPacketKinds,
 };
+/// v2: the no-variant split (why the pipeline has no usable colour variant for this draw).
+enum NvReason : u32 {
+    NvShadow = 0,    ///< the pipeline has a shadow / legacy native_variant (out of v1)
+    NvNotEligible,   ///< PrepareNativeColour refused the pipeline (native_colour_why)
+    NvUndecided,     ///< PrepareNativeColour has not run for the pipeline yet
+    NvNotClaimed,    ///< eligible, but no slot holds this vertex description (slots full / rate)
+    NvRefused,       ///< the slot is claimed and its build was refused (no push descriptors,
+                     ///< per-description rule; native_colour_why)
+    NvBuilding,      ///< the slot is claimed, the variant not published yet
+    NumNv,
+};
+/// VGT uconfig registers a member's command / record carries (SET_UCONFIG_REG whitelist).
+constexpr u32 UcPrim = WordOf(offsetof(Regs, primitive_type)) - Regs::UconfigRegWordOffset;
+constexpr u32 UcIndexType = 0x243; // VGT_INDEX_TYPE (the front keeps it in index_buffer_type)
+constexpr u32 UcNumIndices = WordOf(offsetof(Regs, num_indices)) - Regs::UconfigRegWordOffset;
+constexpr u32 UcNumInstances = WordOf(offsetof(Regs, num_instances)) - Regs::UconfigRegWordOffset;
 struct Pred {
     u32 id{}, member{};
     u64 index_addr{};
     u32 index_count{}, instances{};
+};
+/// A small "by key" histogram (register offsets, reason strings), first come first kept.
+template <typename K>
+struct KeyHist {
+    std::array<std::pair<K, u64>, 24> e{};
+    u32 n{};
+    u64 overflow{};
+    void Note(K k) {
+        for (u32 i = 0; i < n; ++i) {
+            if (e[i].first == k) {
+                ++e[i].second;
+                return;
+            }
+        }
+        if (n < e.size()) {
+            e[n++] = {k, 1};
+        } else {
+            ++overflow;
+        }
+    }
+    void Reset() {
+        n = 0;
+        overflow = 0;
+    }
 };
 struct State {
     bool open{};
     u32 next_id{}, id{}, n{};
     const void* pipeline{};
     u32 index_type{}, index_size{};
+    u32 prim{}; ///< v2: the primitive type register at the open
     u64 addr0{}; ///< the opener's index address (the alignment reference: lo may still drop)
     u64 ilo{}, ihi{};
     std::array<u64, 16> vlo{}, vhi{};
@@ -3337,13 +3378,20 @@ struct State {
     std::array<u64, AmdGpu::NativeRec::UnionSlots> glo{}, ghi{};
     u32 nmat{};
     std::array<u64, MaxMembers> mat_h1{}, mat_h2{};
+    // v2: the opener's inherited set and the front's values of those registers.
+    u32 inh_vs{}, inh_ps{}, push_inh{};
+    u64 inh_slots{};
+    std::array<u32, 16> inh_val_vs{}, inh_val_ps{};
     u32 packet{}; ///< first off-whitelist packet kind since the last draw (PkNone: clean)
     // Counters, reset at every log.
-    u64 draws{}, in_seg{}, segments{}, mat_sum{};
+    u64 draws{}, in_seg{}, segments{}, mat_sum{}, inh_members{};
     std::array<u64, 7> hist{}; ///< closed segments by member count 1/2-3/4-7/8-15/16-31/32-63/64
     std::array<u64, 4> mat_hist{};
     std::array<u64, NumReasons> close{}, outside{};
     std::array<u64, NumPacketKinds> pk{};
+    std::array<u64, NumNv> nv{};
+    KeyHist<u32> uc_off{}, ctx_off{};   ///< registers that closed segments (0xffff: CLEAR / CONTROL / CONFIG)
+    KeyHist<const char*> why{};         ///< native_colour_why of not-eligible / refused pipelines
     u32 calls{};
     std::chrono::steady_clock::time_point window{};
 };
@@ -3363,6 +3411,20 @@ void Close(State& s, u32 why) {
         ++s.close[why];
         NoteSegment(s);
     }
+}
+
+template <typename K, typename F>
+std::string TopKeys(KeyHist<K>& h, F&& fmt_key) {
+    std::sort(h.e.begin(), h.e.begin() + h.n,
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::string out;
+    for (u32 i = 0; i < h.n && i < 10; ++i) {
+        out += fmt::format(" {}:{}", fmt_key(h.e[i].first), h.e[i].second);
+    }
+    if (h.overflow != 0) {
+        out += fmt::format(" (+{} in other keys)", h.overflow);
+    }
+    return out.empty() ? std::string{" -"} : out;
 }
 
 void MaybeLog(State& s) {
@@ -3386,31 +3448,51 @@ void MaybeLog(State& s) {
              "segment 1/2-3/4-7/8-15/16-31/32-63/64: {} {} {} {} {} {} {} | close: pipeline={} "
              "index_type={} packet={} (ctx {} sh {} uconfig {} nop {} dispatch {} event {} dma {} "
              "wait {} ib {} submit {} other {}) count={} index_union={} vertex_union={} "
-             "guest_union={} index_misaligned={} outside_draw={} | outside: no_tag={} stale={} "
-             "no_gpu_rec={} no_variant={} variant_not_ring_pt={} inherited={} instance_offset={} "
-             "not_plain={} no_union={} | materials per segment mean {:.2f} 1/2-3/4-7/8+: {} {} {} {}",
+             "guest_union={} index_misaligned={} inherited_differs={} outside_draw={} | outside: "
+             "no_tag={} stale={} no_gpu_rec={} no_variant={} variant_not_ring_pt={} "
+             "instance_offset={} not_plain={} no_union={} | materials per segment mean {:.2f} "
+             "1/2-3/4-7/8+: {} {} {} {}",
              s.draws, s.in_seg, s.draws ? 100.0 * double(s.in_seg) / double(s.draws) : 0.0,
              s.segments, s.hist[0], s.hist[1], s.hist[2], s.hist[3], s.hist[4], s.hist[5],
              s.hist[6], c[RPipeline], c[RIndexType], c[RPacket], p[PkCtx], p[PkSh], p[PkUconfig],
              p[PkNop], p[PkDispatch], p[PkEvent], p[PkDma], p[PkWait], p[PkIb], p[PkSubmit],
-             p[PkOther], c[RCount], c[RIndexUnion], c[RVertexUnion], c[RGuestUnion], c[RMisaligned],
-             c[RNoTag] + c[RStale] + c[RNoGpuRec] + c[RNoVariant] + c[RVariantNoRing] + c[RInherited] +
+             p[PkOther], c[RCount], c[RIndexUnion], c[RVertexUnion], c[RGuestUnion],
+             c[RMisaligned], c[RInheritedDiff],
+             c[RNoTag] + c[RStale] + c[RNoGpuRec] + c[RNoVariant] + c[RVariantNoRing] +
                  c[RInstanceOffset] + c[RNotPlain] + c[RNoUnion],
-             o[RNoTag], o[RStale], o[RNoGpuRec], o[RNoVariant], o[RVariantNoRing], o[RInherited],
+             o[RNoTag], o[RStale], o[RNoGpuRec], o[RNoVariant], o[RVariantNoRing],
              o[RInstanceOffset], o[RNotPlain], o[RNoUnion],
              s.segments ? double(s.mat_sum) / double(s.segments) : 0.0, s.mat_hist[0],
              s.mat_hist[1], s.mat_hist[2], s.mat_hist[3]);
-    s.draws = s.in_seg = s.segments = s.mat_sum = 0;
+    const auto hex = [](u32 k) { return fmt::format("{:#x}", k); };
+    const auto str = [](const char* k) { return std::string{k ? k : "?"}; };
+    LOG_INFO(Render,
+             "NativeSegB front detail: no_variant: shadow={} not_eligible={} undecided={} "
+             "not_claimed={} refused={} building={} | why:{} | inherited members={} | uconfig "
+             "close offsets:{} | ctx close offsets:{}",
+             s.nv[NvShadow], s.nv[NvNotEligible], s.nv[NvUndecided], s.nv[NvNotClaimed],
+             s.nv[NvRefused], s.nv[NvBuilding], TopKeys(s.why, str), s.inh_members,
+             TopKeys(s.uc_off, hex), TopKeys(s.ctx_off, hex));
+    s.draws = s.in_seg = s.segments = s.mat_sum = s.inh_members = 0;
     s.hist.fill(0);
     s.mat_hist.fill(0);
     s.close.fill(0);
     s.outside.fill(0);
     s.pk.fill(0);
+    s.nv.fill(0);
+    s.uc_off.Reset();
+    s.ctx_off.Reset();
+    s.why.Reset();
 }
 
-/// Every gfx type-3 packet the front parses (ProcessGraphics); draws are classified in
-/// NativeSegBDraw. Keeps the first off-whitelist kind since the last draw.
-void NotePacket(PM4ItOpcode opcode, const PM4Header* header, u32 count, bool guest_markers) {
+/// Every gfx type-3 packet the front parses (ProcessGraphics, before the packet is applied, so
+/// `regs` is the shadow BEFORE the write); draws are classified in NativeSegBDraw. Keeps the
+/// first off-whitelist kind since the last draw. v2: a SET_CONTEXT_REG whose every value equals
+/// the shadow's (= the segment's start value, since equal writes leave it unchanged) and a
+/// SET_UCONFIG_REG of the index type / counts (per-member parameters) or an unchanged primitive
+/// type continue the segment.
+void NotePacket(PM4ItOpcode opcode, const PM4Header* header, u32 count, bool guest_markers,
+                const Regs& regs) {
     auto& s = g_state;
     if (s.packet != PkNone) {
         return;
@@ -3442,15 +3524,45 @@ void NotePacket(PM4ItOpcode opcode, const PM4Header* header, u32 count, bool gue
         kind = (vs || ps) ? PkNone : PkSh;
         break;
     }
-    case PM4ItOpcode::SetContextReg:
+    case PM4ItOpcode::SetContextReg: {
+        const u32 off = reinterpret_cast<const PM4CmdSetData*>(header)->reg_offset;
+        const u32* data = reinterpret_cast<const u32*>(header) + 2;
+        for (u32 j = 0; j + 1 < count; ++j) {
+            const u32 reg = off + j;
+            if (reg < 0x400 && data[j] == regs.reg_array[Regs::ContextRegWordOffset + reg]) {
+                continue;
+            }
+            kind = PkCtx;
+            if (s.open) {
+                s.ctx_off.Note(reg);
+            }
+        }
+        break;
+    }
     case PM4ItOpcode::SetConfigReg:
     case PM4ItOpcode::ContextControl:
     case PM4ItOpcode::ClearState:
         kind = PkCtx;
+        if (s.open) {
+            s.ctx_off.Note(0xffffu);
+        }
         break;
-    case PM4ItOpcode::SetUconfigReg:
-        kind = PkUconfig;
+    case PM4ItOpcode::SetUconfigReg: {
+        const u32 off = reinterpret_cast<const PM4CmdSetData*>(header)->reg_offset;
+        const u32* data = reinterpret_cast<const u32*>(header) + 2;
+        for (u32 j = 0; j + 1 < count; ++j) {
+            const u32 reg = off + j;
+            if (reg == UcIndexType || reg == UcNumIndices || reg == UcNumInstances ||
+                (reg == UcPrim && (!s.open || data[j] == s.prim))) {
+                continue;
+            }
+            kind = PkUconfig;
+            if (s.open) {
+                s.uc_off.Note(reg);
+            }
+        }
         break;
+    }
     case PM4ItOpcode::DispatchDirect:
     case PM4ItOpcode::DispatchIndirect:
         kind = PkDispatch;
@@ -3508,6 +3620,10 @@ bool NativeSegBDraw(const PM4Header* header, const Vulkan::GraphicsPipeline* pip
         Close(s, why);
         return false;
     };
+    const auto no_variant = [&](u32 nv) {
+        ++s.nv[nv];
+        return outside(RNoVariant);
+    };
     const auto* w = reinterpret_cast<const u32*>(header);
     if (header->type3.opcode != PM4ItOpcode::DrawIndex2 || w[6] != 0xc0021000u ||
         w[7] != NR::Magic) {
@@ -3527,7 +3643,7 @@ bool NativeSegBDraw(const PM4Header* header, const Vulkan::GraphicsPipeline* pip
     // Seqlock read (Opus review 1): copy, fence, re-check the stamp, then use.
     const bool cmd_ok = src.cmd == w;
     const bool derived = src.derived != 0, gpu_ok = src.gpu_ok != 0;
-    const u32 inh = src.inh_vs | src.inh_ps;
+    const u32 inh_vs = src.inh_vs, inh_ps = src.inh_ps, push_inh = src.push_inh;
     const u64 inh_slots = src.inh_slots;
     const u32 io_ud = src.io_ud;
     const u64 index_addr = src.index_addr;
@@ -3541,9 +3657,6 @@ bool NativeSegBDraw(const PM4Header* header, const Vulkan::GraphicsPipeline* pip
     if (!derived || !gpu_ok) {
         return outside(RNoGpuRec);
     }
-    if (inh != 0 || inh_slots != 0) {
-        return outside(RInherited);
-    }
     if (!plain || !pipeline || !attribs || vi_count == 0) {
         return outside(RNotPlain);
     }
@@ -3552,13 +3665,35 @@ bool NativeSegBDraw(const PM4Header* header, const Vulkan::GraphicsPipeline* pip
     }
     // The variant the back would bind (NativeDirectCandidate's rule): a colour variant of this
     // vertex description, bindless, with the batch table (ring) and, in pt mode, the page table.
-    if (pipeline->native_variant.load(std::memory_order_relaxed) != nullptr ||
-        pipeline->native_colour[0].key.load(std::memory_order_relaxed) == 0) {
-        return outside(RNoVariant);
+    // v2: the no-variant cases apart (NvReason).
+    if (pipeline->native_variant.load(std::memory_order_relaxed) != nullptr) {
+        return no_variant(NvShadow);
     }
-    const auto* v = pipeline->NativeColourVariant(VideoCore::NativeVertexKey(attribs, vi_count));
+    if (pipeline->native_colour_static == 2) {
+        s.why.Note(pipeline->native_colour_why.load(std::memory_order_relaxed));
+        return no_variant(NvNotEligible);
+    }
+    if (pipeline->native_colour_static == 0) {
+        return no_variant(NvUndecided);
+    }
+    const u64 vkey = VideoCore::NativeVertexKey(attribs, vi_count);
+    const Vulkan::GraphicsPipeline::NativeColourSlot* cslot = nullptr;
+    for (const auto& cs : pipeline->native_colour) {
+        if (cs.key.load(std::memory_order_acquire) == vkey) {
+            cslot = &cs;
+            break;
+        }
+    }
+    if (!cslot) {
+        return no_variant(NvNotClaimed);
+    }
+    const auto* v = cslot->variant.load(std::memory_order_acquire);
     if (!v) {
-        return outside(RNoVariant);
+        if (cslot->state.load(std::memory_order_relaxed) == 2) {
+            s.why.Note(pipeline->native_colour_why.load(std::memory_order_relaxed));
+            return no_variant(NvRefused);
+        }
+        return no_variant(NvBuilding);
     }
     if (!v->native_bindless ||
         v->native_table_binding == Vulkan::GraphicsPipeline::NoNativeRecords ||
@@ -3589,6 +3724,22 @@ bool NativeSegBDraw(const PM4Header* header, const Vulkan::GraphicsPipeline* pip
     const u32 isize = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2u : 4u;
     const u64 ilo = index_addr, ihi = index_addr + u64(index_count) * isize;
     const u32 vcount = std::min<u32>(vi_count, 16);
+    // v2: the inherited registers' values as the front has them (the table carries the opener's).
+    const auto inh_same = [&] {
+        if (inh_vs != s.inh_vs || inh_ps != s.inh_ps || push_inh != s.push_inh ||
+            inh_slots != s.inh_slots) {
+            return false;
+        }
+        for (u32 i = 0; i < 16; ++i) {
+            if (((inh_vs >> i) & 1) && regs.vs_program.user_data[i] != s.inh_val_vs[i]) {
+                return false;
+            }
+            if (((inh_ps >> i) & 1) && regs.ps_program.user_data[i] != s.inh_val_ps[i]) {
+                return false;
+            }
+        }
+        return true;
+    };
     if (s.open) {
         u32 why = RNone;
         if (s.pipeline != pipeline) {
@@ -3600,6 +3751,8 @@ bool NativeSegBDraw(const PM4Header* header, const Vulkan::GraphicsPipeline* pip
             ++s.pk[packet];
         } else if (s.n >= MaxMembers) {
             why = RCount;
+        } else if (!inh_same()) {
+            why = RInheritedDiff;
         } else if ((index_addr - s.addr0) % isize != 0) {
             why = RMisaligned;
         } else if (std::max(ihi, s.ihi) - std::min(ilo, s.ilo) > MaxUnion) {
@@ -3635,6 +3788,7 @@ bool NativeSegBDraw(const PM4Header* header, const Vulkan::GraphicsPipeline* pip
         s.pipeline = pipeline;
         s.index_type = regs.index_buffer_type.raw;
         s.index_size = isize;
+        s.prim = regs.reg_array[Regs::UconfigRegWordOffset + UcPrim];
         s.addr0 = index_addr;
         s.ilo = ~u64{0};
         s.ihi = 0;
@@ -3642,6 +3796,14 @@ bool NativeSegBDraw(const PM4Header* header, const Vulkan::GraphicsPipeline* pip
         s.vhi.fill(0);
         s.gmask = 0;
         s.nmat = 0;
+        s.inh_vs = inh_vs;
+        s.inh_ps = inh_ps;
+        s.push_inh = push_inh;
+        s.inh_slots = inh_slots;
+        for (u32 i = 0; i < 16; ++i) {
+            s.inh_val_vs[i] = regs.vs_program.user_data[i];
+            s.inh_val_ps[i] = regs.ps_program.user_data[i];
+        }
     }
     // The member's command against the union lo as it stands (exact division: every member is
     // a whole number of indices from the opener, so from any lo).
@@ -3675,6 +3837,9 @@ bool NativeSegBDraw(const PM4Header* header, const Vulkan::GraphicsPipeline* pip
         s.mat_h1[s.nmat] = h1;
         s.mat_h2[s.nmat] = h2;
         ++s.nmat;
+    }
+    if ((inh_vs | inh_ps) != 0 || inh_slots != 0) {
+        ++s.inh_members;
     }
     ++s.n;
     ++s.in_seg;
@@ -5183,7 +5348,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             const PM4ItOpcode opcode = header->type3.opcode;
             g_dispatch_sync.Note(64, opcode, header);
             if (AmdGpu::NativeRec::g_segb != 0) [[unlikely]] {
-                SegB::NotePacket(opcode, header, count, guest_markers_enabled);
+                SegB::NotePacket(opcode, header, count, guest_markers_enabled, regs);
             }
             switch (opcode) {
             case PM4ItOpcode::Nop: {

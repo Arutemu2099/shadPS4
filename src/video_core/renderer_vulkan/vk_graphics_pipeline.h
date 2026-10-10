@@ -177,6 +177,8 @@ public:
     struct NativeColourSlot {
         std::atomic<u64> key{0};
         std::atomic<const GraphicsPipeline*> variant{nullptr};
+        /// SHADPS4_NATIVE_SEGB census: 2 = the claimed build was refused (no variant will come).
+        std::atomic<u8> state{0};
     };
     static constexpr u32 NativeColourSlots = 4;
     mutable std::array<NativeColourSlot, NativeColourSlots> native_colour{};
