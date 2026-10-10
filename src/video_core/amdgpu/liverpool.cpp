@@ -7775,8 +7775,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         end->pad = 0;
         const u64 end_pos = split->LastRecordPos();
         split->Commit();
-        split->PublishNow();
-        split->dcb_ends_published.fetch_add(1, std::memory_order_release);
+        // The table entry first, then the publish: the back cannot see DcbEnd (and release a
+        // DCB it took itself) before the entry is written.
         if (g_a2 != 0) {
             // The DCB is complete and published: hand it to the workers (A2 table).
             const u32 idx = g_a1_front_index;
@@ -7795,7 +7795,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             e.index.store(idx, std::memory_order_release);
             u32 expect = 0;
             e.state.compare_exchange_strong(expect, 1, std::memory_order_acq_rel);
-            g_a2s.published.store(idx, std::memory_order_release);
+        }
+        split->PublishNow();
+        split->dcb_ends_published.fetch_add(1, std::memory_order_release);
+        if (g_a2 != 0) {
+            g_a2s.published.store(g_a1_front_index, std::memory_order_release);
             g_a2s.published.notify_all();
         }
     }
