@@ -738,6 +738,7 @@ private:
         u64 bl_img_hit{}, bl_img_miss{}, bl_smp_hit{}, bl_smp_miss{};
         u64 bl_vfy_ok{}, bl_vfy_bad{}, bl_vfy_none{}, bl_rot{};
         u64 c_bl_hit{}, c_bl_miss{}; ///< cycles in image hits / misses
+        u64 c_bl_smp{}, c_bl_touch{}, n_bl_res{}; ///< sampler loop / LRU touch cycles, resolves
         /// Segment census (sec. 14): pipeline-change closes by bits 1 = fixed state equal (key
         /// minus shaders and vertex formats), 2 = vertex formats equal, 4 = next pipeline has a
         /// native variant, 8 = context registers moved; native -> non-native draw transitions.

@@ -4722,6 +4722,7 @@ bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::I
     }
     std::array<size_t, Shader::NativeBindlessMax> lru{};
     u32 n_lru = 0;
+    const u64 ts0 = __rdtsc();
     for (u32 j = 0; j < n_smp; ++j) {
         const auto& sdesc = info.samplers[j];
         auto ssharp = sdesc.GetSharp(*fs);
@@ -4779,7 +4780,13 @@ bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::I
         }
     }
     // Cache hits skipped GetSampler's LRU touch; keep those samplers alive the same way.
-    if (n_lru != 0 && !texture_cache.TouchSamplers(std::span{lru.data(), n_lru}, sg)) {
+    const u64 ts1 = __rdtsc();
+    const bool touched =
+        n_lru == 0 || texture_cache.TouchSamplers(std::span{lru.data(), n_lru}, sg);
+    st.c_bl_smp += ts1 - ts0;
+    st.c_bl_touch += __rdtsc() - ts1;
+    ++st.n_bl_res;
+    if (!touched) {
         ++st.bl_fail[4];
         return false;
     }
@@ -4848,11 +4855,32 @@ const GraphicsPipeline* Rasterizer::NativeDirectCandidate(
         pipeline->native_colour[0].key.load(std::memory_order_relaxed) == 0) {
         return nullptr;
     }
-    const auto* v = pipeline->NativeColourVariant(
-        VideoCore::NativeVertexKey(AmdGpu::CpSplit::VertexInputAttribs(*vi), vi->count));
+    const auto* attribs = AmdGpu::CpSplit::VertexInputAttribs(*vi);
+    const auto* v = pipeline->NativeColourVariant(VideoCore::NativeVertexKey(attribs, vi->count));
     if (!v || !v->native_bindless ||
         v->native_table_binding == GraphicsPipeline::NoNativeRecords) {
         return nullptr;
+    }
+    // The normal path's single-draw rule (advisor ~01:15: without it, singles became openers
+    // at ~13 k instead of generic draws at ~7.9 k): open only if the next queued draw shares the
+    // pipeline.
+    if (liverpool->NativePeekNextDraw(pipeline) == 0) {
+        ++native_stats.nd_fail[10];
+        return nullptr;
+    }
+    // NativeOpen's colour rule (every vertex stream in one VkBuffer), checked here so a refusal
+    // costs no bind.
+    const VideoCore::Buffer* vb0 = nullptr;
+    for (u32 k = 0; k < vi->count && k < 16; ++k) {
+        if (attribs[k].base_address == 0 || attribs[k].size == 0) {
+            continue;
+        }
+        const VideoCore::Buffer* vb = buffer_cache.NativeBufferAt(attribs[k].base_address);
+        if (!vb || (vb0 && vb != vb0)) {
+            ++native_stats.nd_fail[11];
+            return nullptr;
+        }
+        vb0 = vb;
     }
     ++native_stats.nd_cand;
     return v;
@@ -5930,14 +5958,15 @@ void Rasterizer::NativeLog() {
     if (st.nd_cand != 0) {
         LOG_INFO(Render_Vulkan,
                  "NativeDirect: candidates={} direct openers={} (DrawTail {:.0f} cycles each) | "
-                 "fails 1..9: {} {} {} {} {} {} {} {} {} | verify ok={} MISMATCH={} "
+                 "fails 1..11: {} {} {} {} {} {} {} {} {} {} {} | verify ok={} MISMATCH={} "
                  "(restructured between the binds {}) | cycles per direct bind: buffers {:.0f} "
                  "vertex+index {:.0f} NativeOpen {:.0f} | generic colour openers: BindResources "
                  "{:.0f} (n={})",
                  st.nd_cand, st.nd_ok,
                  double(st.c_tail_dopen) / double(std::max<u64>(st.n_tail_dopen, 1)),
                  st.nd_fail[1], st.nd_fail[2], st.nd_fail[3], st.nd_fail[4], st.nd_fail[5],
-                 st.nd_fail[6], st.nd_fail[7], st.nd_fail[8], st.nd_fail[9], st.nd_vfy_ok,
+                 st.nd_fail[6], st.nd_fail[7], st.nd_fail[8], st.nd_fail[9], st.nd_fail[10],
+                 st.nd_fail[11], st.nd_vfy_ok,
                  st.nd_vfy_bad, st.nd_fail[15],
                  double(st.c_nd_ph[0]) / double(std::max<u64>(st.nd_cand, 1)),
                  double(st.c_nd_ph[1]) / double(std::max<u64>(st.nd_cand, 1)),
@@ -5950,13 +5979,15 @@ void Rasterizer::NativeLog() {
                  "NativeBindless: batches={} open fail={} | joins with other images={} failed={} "
                  "| fails 0..5: {} {} {} {} {} {} | images hit/miss {}/{} samplers hit/miss {}/{} "
                  "| opener verify ok={} MISMATCH={} unverified={} | rotations={} slots {}/{} | "
-                 "cycles per image hit {:.0f} miss {:.0f}",
+                 "cycles per image hit {:.0f} miss {:.0f} | per resolve: samplers {:.0f} touch {:.0f}",
                  st.bl_open, st.bl_open_fail, st.bl_join, st.bl_join_fail, st.bl_fail[0],
                  st.bl_fail[1], st.bl_fail[2], st.bl_fail[3], st.bl_fail[4], st.bl_fail[5],
                  st.bl_img_hit, st.bl_img_miss, st.bl_smp_hit, st.bl_smp_miss, st.bl_vfy_ok,
                  st.bl_vfy_bad, st.bl_vfy_none, st.bl_rot, bindless.img_next, bindless.smp_next,
                  double(st.c_bl_hit) / double(std::max<u64>(st.bl_img_hit, 1)),
-                 double(st.c_bl_miss) / double(std::max<u64>(st.bl_img_miss, 1)));
+                 double(st.c_bl_miss) / double(std::max<u64>(st.bl_img_miss, 1)),
+                 double(st.c_bl_smp) / double(std::max<u64>(st.n_bl_res, 1)),
+                 double(st.c_bl_touch) / double(std::max<u64>(st.n_bl_res, 1)));
     }
     if (st.n_rec[0] + st.n_rec[3] + st.n_rec[9] != 0) {
         const auto per = [](u64 c, u64 n) { return n ? double(c) / double(n) : 0.0; };
