@@ -247,10 +247,10 @@ struct A2Counters {
 };
 struct A2State {
     std::array<A2Entry, A2Slots> e;
-    std::atomic<u32> next_claim{1};
-    std::atomic<u32> begun{0};     ///< newest index the front began (monotonic)
-    std::atomic<u32> published{0}; ///< newest index the front completed (diagnostics)
-    std::atomic<bool> stop{false};
+    alignas(64) std::atomic<u32> next_claim{1};
+    alignas(64) std::atomic<u32> begun{0};     ///< newest index the front began (monotonic)
+    alignas(64) std::atomic<u32> published{0}; ///< newest index the front completed (diagnostics)
+    alignas(64) std::atomic<bool> stop{false};
     std::atomic<u64> worker_cyc{0}, worker_dcbs{0}, worker_draws{0}; ///< worker-side totals
     std::atomic<u64> take_cyc{0}; ///< inside StretchTranslator::TakeDraw
     std::atomic<u64> publish_wait_cyc{0}; ///< workers waiting for the front's next DCB
@@ -6907,6 +6907,10 @@ void Liverpool::ProcessLoop(std::stop_token stoken) {
             g_asc_ring_front_state.store(FrontGuestIdle, std::memory_order_relaxed);
             std::unique_lock lk{submit_mutex};
             if (!(num_commands || num_submits || submit_done)) {
+                // SHADPS4_CP_SPLIT_PUB_BATCH: nothing may stay unpublished while the front idles.
+                if (split_enabled && CpSplit::t_is_front) {
+                    split->PublishNow();
+                }
                 // Thread-wait column front_idle_ms (always on): only a wait that really blocks.
                 const auto idle_from = std::chrono::steady_clock::now();
                 Common::CondvarWait(submit_cv, lk, stoken, [this] {

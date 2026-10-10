@@ -171,6 +171,15 @@ u32 DoneBatch() {
     return batch;
 }
 
+u32 PubBatch() {
+    static const u32 batch = [] {
+        const char* value = std::getenv("SHADPS4_CP_SPLIT_PUB_BATCH");
+        const unsigned long long v = value ? std::strtoull(value, nullptr, 10) : 1ull;
+        return static_cast<u32>(std::clamp<unsigned long long>(v, 1ull, 256ull));
+    }();
+    return batch;
+}
+
 bool RegBatch() {
     static const bool batch = [] {
         const char* value = std::getenv("SHADPS4_CP_SPLIT_REG_BATCH");
@@ -207,6 +216,7 @@ Channel::Channel(u32 ring_bytes) {
     storage = reinterpret_cast<u8*>((base + 63) & ~std::uintptr_t{63});
     depth = RunAhead() ? Depth() : 1;
     done_batch = DoneBatch();
+    pub_batch = PubBatch();
     reg_batch = RegBatch();
     posted_seqs = std::make_unique<u64[]>(PostSlots);
     posted_writes = std::make_unique<PostedWrite[]>(PostedWriteSlots);
@@ -279,22 +289,29 @@ void Channel::PostRunAhead(PostKind kind) {
     }
     posted_seqs[posts & (PostSlots - 1)] = committed_seq;
     ++posts;
-    Publish();
-    u64 done = done_seq.load(std::memory_order_acquire);
-    while (oldest_post < posts && posted_seqs[oldest_post & (PostSlots - 1)] <= done) {
-        ++oldest_post;
+    if (++unpublished_posts >= pub_batch) {
+        Publish();
     }
+    // oldest_post only moves forward with done_seq: while the stale count is within the depth,
+    // nothing can need a wait, so done_seq (a line the back writes) is not touched.
     if (posts - oldest_post > depth) {
-        // Wait until at most `depth` posted records are outstanding: the one `depth + 1` posts
-        // back (the newest that must be done) is kept because PostSlots > MaxDepth.
-        const u64 target = posted_seqs[(posts - depth - 1) & (PostSlots - 1)];
-        ++counters.depth_waits;
-        counters.depth_wait_ticks += WaitDone(target);
-        oldest_post = posts - depth;
-        done = done_seq.load(std::memory_order_acquire);
+        u64 done = done_seq.load(std::memory_order_acquire);
+        while (oldest_post < posts && posted_seqs[oldest_post & (PostSlots - 1)] <= done) {
+            ++oldest_post;
+        }
+        if (posts - oldest_post > depth) {
+            // Wait until at most `depth` posted records are outstanding: the one `depth + 1`
+            // posts back (the newest that must be done) is kept because PostSlots > MaxDepth.
+            Publish(); // the target may still be unpublished (SHADPS4_CP_SPLIT_PUB_BATCH)
+            const u64 target = posted_seqs[(posts - depth - 1) & (PostSlots - 1)];
+            ++counters.depth_waits;
+            counters.depth_wait_ticks += WaitDone(target);
+            oldest_post = posts - depth;
+            done = done_seq.load(std::memory_order_acquire);
+        }
+        counters.max_lead_seq = std::max(counters.max_lead_seq, committed_seq - done);
     }
     counters.max_lead = std::max(counters.max_lead, posts - oldest_post);
-    counters.max_lead_seq = std::max(counters.max_lead_seq, committed_seq - done);
 }
 
 void Channel::SyncIfPostedPackets(DrainReason reason) {
@@ -486,6 +503,7 @@ void Channel::FrontExited() {
 }
 
 void Channel::Publish() {
+    unpublished_posts = 0;
     if (write_pos.load(std::memory_order_relaxed) == committed_pos) {
         return;
     }
@@ -521,6 +539,7 @@ u64 Channel::WaitDone(u64 seq) {
     if (done_seq.load(std::memory_order_acquire) >= seq) {
         return 0;
     }
+    Publish(); // SHADPS4_CP_SPLIT_PUB_BATCH: never wait on records the back cannot see
     const u64 t0 = Ticks();
     const u64 deadline = NowNs() + SpinNs();
     front_waiting.fetch_add(1, std::memory_order_acq_rel);

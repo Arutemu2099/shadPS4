@@ -554,8 +554,8 @@ public:
     }
     /// SHADPS4_A2_PARK: A2 workers parked until something they wait for changes (a publish, the
     /// front starting to wait, the back waiting on a stretch). Rung only while one is parked.
-    std::atomic<u32> reader_parked{0};
-    std::atomic<u32> reader_bell{0};
+    alignas(64) std::atomic<u32> reader_parked{0};
+    alignas(64) std::atomic<u32> reader_bell{0};
     void RingReaderBell() {
         if (reader_parked.load(std::memory_order_seq_cst) != 0) {
             reader_bell.fetch_add(1, std::memory_order_seq_cst);
@@ -566,9 +566,9 @@ public:
     [[nodiscard]] bool FrontWaitingOnBack() const noexcept {
         return front_waiting.load(std::memory_order_acquire) != 0;
     }
-    std::atomic<u32> front_waiting{0};
+    alignas(64) std::atomic<u32> front_waiting{0};
     /// SHADPS4_A1: complete DCBs the front has published (front writes after the publish).
-    std::atomic<u64> dcb_ends_published{0};
+    alignas(64) std::atomic<u64> dcb_ends_published{0};
 
     /// The front thread is about to return; lets the back leave its loop.
     void FrontExited();
@@ -658,6 +658,8 @@ private:
     u32 depth{1};
     std::unique_ptr<u64[]> posted_seqs;
     u64 posts{0};        ///< Records posted so far.
+    u32 pub_batch{1};    ///< SHADPS4_CP_SPLIT_PUB_BATCH: publish every N posts
+    u32 unpublished_posts{0};
     u64 oldest_post{0};  ///< Index of the oldest post not known to be done.
     u64 last_posted_packet_seq{0};
     // TASK_GUARD write log: destinations of posted packets, oldest first, pruned by done_seq.
