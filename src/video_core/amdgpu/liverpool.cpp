@@ -196,6 +196,11 @@ static u32 g_a1_front_index = 0; ///< front only: DCBs begun
 /// SHADPS4_A2 (architecture A step A2, notes/architecture-a-2026-10-10.md sec. 6): 1 workers
 /// translate native stretches, the back publishes them; 2 verify / count (old path for all).
 static const int g_a2 = Vulkan::A2::Mode();
+/// SHADPS4_A2_PARK=1: caught-up workers park (OS wait) after a short spin.
+static const bool g_a2_park = [] {
+    const char* v = std::getenv("SHADPS4_A2_PARK");
+    return v != nullptr && v[0] == '1';
+}();
 namespace {
 constexpr u32 A2Slots = 256;
 /// Stretches one DCB can hand over (more: the rest of the DCB runs on the old path, counted).
@@ -250,6 +255,7 @@ struct A2State {
     std::atomic<u64> take_cyc{0}; ///< inside StretchTranslator::TakeDraw
     std::atomic<u64> publish_wait_cyc{0}; ///< workers waiting for the front's next DCB
     std::atomic<u64> record_wait_cyc{0};  ///< workers caught up, waiting for the next record
+    std::atomic<u64> park_cyc{0};         ///< of which parked (SHADPS4_A2_PARK)
     std::atomic<u64> cuts_back{0}, cuts_front{0}, cap_hits{0}, seq_breaks{0}, cancels{0};
     /// Per worker: the DCB it holds (0 none) | phase << 28 (1 waits for a DCB, 2 translates,
     /// 3 caught up with the front).
@@ -2303,7 +2309,7 @@ void A2Log() {
              "{:.0f} (released in bulk/s {:.0f}, delta words per stretch {:.1f}) | verify: front "
              "snapshot {} bad {}, render key {} bad {}, would-walk {} | whole: stale {} refused {} "
              "state4 {} | workers {} (since start): translating {:.0f} ms/s, waiting for the next "
-             "DCB {:.0f} ms/s, caught up waiting for records {:.0f} ms/s; cuts: back waited {} "
+             "DCB {:.0f} ms/s, caught up waiting for records {:.0f} ms/s (parked {:.0f}, park {}); cuts: back waited {} "
              "front waited {}; stretch cap {} seq breaks {} cancels {}; translator cyc per draw "
              "{:.0f} | worker refusals (cumulative):{}",
              g_a2, s, ps(c.translated), ps(c.walked),
@@ -2317,7 +2323,8 @@ void A2Log() {
              c.stretches ? double(c.delta_words) / double(c.stretches) : 0.0, c.snap_cmp,
              c.snap_bad, c.rk_cmp, c.rk_bad, c.would, c.whole_stale, c.whole_refused,
              c.whole_st4, Vulkan::A2::NumWorkers(), wms(g.worker_cyc), wms(g.publish_wait_cyc),
-             wms(g.record_wait_cyc), g.cuts_back.load(), g.cuts_front.load(), g.cap_hits.load(),
+             wms(g.record_wait_cyc), wms(g.park_cyc), g_a2_park ? "on" : "off",
+             g.cuts_back.load(), g.cuts_front.load(), g.cap_hits.load(),
              g.seq_breaks.load(), g.cancels.load(),
              g.worker_draws ? double(g.take_cyc) / double(g.worker_draws) : 0.0, rf);
     c = A2Counters{};
@@ -2459,6 +2466,24 @@ void Liverpool::A2WorkerLoop(std::stop_token stoken, u32 index) {
                         publish(last_seq);
                     }
                 }
+                if (g_a2_park && spins >= 256) {
+                    // Park: every waker rings the bell after changing what we re-check here
+                    // (seq_cst both sides, so either we see the change or it sees us parked).
+                    const u64 k0 = __rdtsc();
+                    split->reader_parked.fetch_add(1, std::memory_order_seq_cst);
+                    const u32 bell = split->reader_bell.load(std::memory_order_seq_cst);
+                    const bool need =
+                        open && (e.back_wait.load(std::memory_order_seq_cst) != 0 ||
+                                 split->FrontWaitingOnBack());
+                    if (split->PublishedEnd() <= p && !need && !stopping() &&
+                        e.cancel.load(std::memory_order_seq_cst) == 0) {
+                        split->reader_bell.wait(bell, std::memory_order_acquire);
+                    }
+                    split->reader_parked.fetch_sub(1, std::memory_order_seq_cst);
+                    g.park_cyc.fetch_add(__rdtsc() - k0, std::memory_order_relaxed);
+                    spins = 0;
+                    continue;
+                }
                 spins < 1024 ? _mm_pause() : std::this_thread::yield();
             }
             rec_wait += __rdtsc() - t0;
@@ -2490,6 +2515,7 @@ void Liverpool::A2WorkerLoop(std::stop_token stoken, u32 index) {
                 break; // stop or cancel: the rest runs on the old path
             }
             hold.store(pos, std::memory_order_release); // grows only: stale = lower = safe
+            e.walked.store(pos, std::memory_order_relaxed);
             u64 rpos = pos;
             const auto* h = split->RecordAtPos(rpos);
             if (rpos != pos) {
@@ -2506,12 +2532,6 @@ void Liverpool::A2WorkerLoop(std::stop_token stoken, u32 index) {
                 h->type == CpSplit::RecordType::DcbBegin) {
                 last_seq = h->seq;
                 break;
-            }
-            if (open && e.back_wait.load(std::memory_order_relaxed) != 0) {
-                // The back waits for this stretch's first draw: hand it over now.
-                g.cuts_back.fetch_add(1, std::memory_order_relaxed);
-                end_stretch();
-                publish(last_seq);
             }
             const auto* payload = reinterpret_cast<const u8*>(h + 1);
             switch (h->type) {
@@ -2659,6 +2679,8 @@ void Liverpool::A2Shutdown() {
     g.stop.store(true, std::memory_order_release);
     g.begun.fetch_add(0x40000000u, std::memory_order_acq_rel); // wake every waiter
     g.begun.notify_all();
+    split->reader_bell.fetch_add(1, std::memory_order_seq_cst);
+    split->reader_bell.notify_all();
     for (auto& t : g.workers) {
         t.request_stop();
     }
@@ -2834,7 +2856,8 @@ void Liverpool::A2Execute(const CpSplit::RecordHeader& record) {
                 const u64 t0 = __rdtsc();
                 const bool behind =
                     e.walked.load(std::memory_order_acquire) < split->PublishedEnd();
-                e.back_wait.store(record.seq, std::memory_order_release);
+                e.back_wait.store(record.seq, std::memory_order_seq_cst);
+                split->RingReaderBell(); // a parked worker must hand the stretch over
                 bool netted = false;
                 for (u32 spins = 0;
                      (p = e.progress.load(std::memory_order_acquire)) < record.seq; ++spins) {
@@ -7148,6 +7171,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             if (e.state.load(std::memory_order_acquire) != 0) {
                 // The back still holds idx - A2Slots (it releases at that DcbEnd, published).
                 split->front_waiting.fetch_add(1, std::memory_order_acq_rel);
+                split->RingReaderBell();
                 for (u32 spins = 0; e.state.load(std::memory_order_acquire) != 0; ++spins) {
                     spins < 4096 ? _mm_pause() : std::this_thread::yield();
                 }

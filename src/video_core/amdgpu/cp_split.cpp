@@ -493,6 +493,7 @@ void Channel::Publish() {
     // load of write_pos in WaitForWork, one of the two always sees the other (no lost wake-up).
     write_pos.store(committed_pos, std::memory_order_seq_cst);
     WakeBackIfParked();
+    RingReaderBell();
 }
 
 void Channel::WaitForSpace(u64 end) {
@@ -501,6 +502,7 @@ void Channel::WaitForSpace(u64 end) {
     }
     ++counters.full_waits;
     front_waiting.fetch_add(1, std::memory_order_acq_rel);
+    RingReaderBell();
     for (;;) {
         // The back's read position, held lower by any A2 worker still reading.
         cached_read = ReadFloor();
@@ -522,6 +524,7 @@ u64 Channel::WaitDone(u64 seq) {
     const u64 t0 = Ticks();
     const u64 deadline = NowNs() + SpinNs();
     front_waiting.fetch_add(1, std::memory_order_acq_rel);
+    RingReaderBell();
     struct WaitingScope {
         std::atomic<u32>& w;
         ~WaitingScope() {

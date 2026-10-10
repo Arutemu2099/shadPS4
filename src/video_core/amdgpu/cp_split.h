@@ -552,6 +552,16 @@ public:
         }
         return r;
     }
+    /// SHADPS4_A2_PARK: A2 workers parked until something they wait for changes (a publish, the
+    /// front starting to wait, the back waiting on a stretch). Rung only while one is parked.
+    std::atomic<u32> reader_parked{0};
+    std::atomic<u32> reader_bell{0};
+    void RingReaderBell() {
+        if (reader_parked.load(std::memory_order_seq_cst) != 0) {
+            reader_bell.fetch_add(1, std::memory_order_seq_cst);
+            reader_bell.notify_all();
+        }
+    }
     /// SHADPS4_A2: non-zero while the front waits for the back (WaitDone / WaitForSpace).
     [[nodiscard]] bool FrontWaitingOnBack() const noexcept {
         return front_waiting.load(std::memory_order_acquire) != 0;
