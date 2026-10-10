@@ -40,6 +40,7 @@
 #include "common/readback_offload.h"
 #include "video_core/amdgpu/split_hazard.h"
 #include "video_core/renderdoc.h"
+#include "video_core/amdgpu/lean_front_api.h"
 #include "video_core/amdgpu/split_records.h"
 #include "video_core/renderer_vulkan/vk_a2.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -8983,6 +8984,16 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     ++num_submits;
     asc_submit_seq.fetch_add(1, std::memory_order_release);
     submit_cv.notify_one();
+}
+
+bool LeanViewportMemoEnabled() {
+    return ViewportMemoEnabled();
+}
+bool LeanNopHasBackEffect(const PM4Header* header, bool guest_markers_enabled) {
+    return NopHasBackEffect(header, guest_markers_enabled);
+}
+bool LeanKeepsSubmitEpoch(PM4ItOpcode opcode) {
+    return KeepsSubmitEpoch(opcode);
 }
 
 } // namespace AmdGpu
