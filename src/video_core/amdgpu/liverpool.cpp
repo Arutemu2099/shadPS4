@@ -210,6 +210,7 @@ struct A2Entry {
         u64 end_pos{};
         u64 ctx_epoch{};
         std::vector<std::pair<u32, u32>> delta;
+        u64 render_key{}; ///< full A2RenderKey at the stretch's first draw (A2=2 verify)
     };
     std::vector<Side> side;
     u32 refused{}; ///< 1: no snapshot (whole DCB to the back)
@@ -219,6 +220,9 @@ struct A2Counters {
     u64 dcbs{}, back_dcbs{}, worker_dcbs{}, waits{}, wait_cyc{};
     u64 translated{}, walked{}, would{}, stretches{}, barriers{}, occl_rejects{};
     u64 delta_words{}, back_records{}, skipped_records{}, gen_rejects{};
+    u64 steal_incomplete{}, steal_unclaimed{};
+    u64 wait_complete{}, wait_complete_cyc{}, steal_front_waits{}, steal_timeout{};
+    u64 rk_cmp{}, rk_bad{}, whole_stale{}, whole_refused{}, whole_st4{};
     u64 snap_cmp{}, snap_bad{};
     u64 start_ns{}, start_tsc{};
 };
@@ -227,9 +231,15 @@ struct A2State {
     std::atomic<u32> next_claim{1};
     std::atomic<u32> published{0}; ///< newest index the front completed (monotonic)
     std::atomic<bool> stop{false};
+    std::atomic<u64> worker_cyc{0}, worker_dcbs{0}, worker_draws{0}; ///< worker-side totals
+    std::atomic<u64> take_cyc{0}; ///< inside StretchTranslator::TakeDraw
+    std::atomic<u64> publish_wait_cyc{0}; ///< workers waiting for the front's next DCB
+    /// Per worker: the DCB it holds (0 none) | phase << 28 (1 waits for the front, 2 translates).
+    std::array<std::atomic<u32>, 8> worker_at{};
     std::vector<std::jthread> workers;
     std::vector<Vulkan::A2::StretchTranslator*> translators; ///< for the refusal log
     bool started{false};
+    u64 t_start{}; ///< ns, when the workers started
     // back
     A2Entry* cur{};
     bool cur_back{};
@@ -2166,6 +2176,46 @@ namespace {
 constexpr std::array<std::pair<u32, u32>, 4> A2RenderWindows{{
     {0x000, 0x020}, {0x080, 0x0A0}, {0x200, 0x210}, {0x318, 0x390}}};
 
+/// The render-relevant pipeline key fields (compared when the pipeline changes).
+struct A2PipeRender {
+    u32 num_color;
+    std::array<Shader::PsColorBuffer, AmdGpu::NUM_COLOR_BUFFERS> color;
+    u8 samples, depth_samples;
+    std::array<u8, AmdGpu::NUM_COLOR_BUFFERS> color_samples;
+    u32 mrt_mask, z;
+    explicit A2PipeRender(const Vulkan::GraphicsPipeline* p) {
+        std::memset(this, 0, sizeof(*this));
+        const auto& k = p->GetGraphicsKey();
+        num_color = k.num_color_attachments;
+        color = k.color_buffers;
+        samples = k.num_samples;
+        depth_samples = k.depth_samples;
+        color_samples = k.color_samples;
+        mrt_mask = k.mrt_mask;
+        z = static_cast<u32>(k.z_format) | static_cast<u32>(k.stencil_format) << 4;
+    }
+    bool operator==(const A2PipeRender& o) const {
+        return std::memcmp(this, &o, sizeof(*this)) == 0;
+    }
+};
+/// Copies the render windows (compared with memcmp on a later change).
+void A2CopyRenderWindows(const Regs& regs, std::array<u32, 0x20 + 0x20 + 0x10 + 0x78>& out) {
+    u32 o = 0;
+    for (const auto& [lo, hi] : A2RenderWindows) {
+        std::memcpy(&out[o], &regs.reg_array[Regs::ContextRegWordOffset + lo], (hi - lo) * 4);
+        o += hi - lo;
+    }
+}
+bool A2TouchesRenderWindows(u32 off, u32 count) {
+    for (const auto& [lo, hi] : A2RenderWindows) {
+        const u32 a = Regs::ContextRegWordOffset + lo, b = Regs::ContextRegWordOffset + hi;
+        if (off < b && off + count > a) {
+            return true;
+        }
+    }
+    return false;
+}
+
 u64 A2RenderKey(const Regs& regs, const Vulkan::GraphicsPipeline* pipeline) {
     u64 h = 0xcbf29ce484222325ull;
     const auto mix = [&](const void* p, size_t n) {
@@ -2225,7 +2275,12 @@ void A2Log() {
              "waits on workers {} ({:.2f} ms/s) | global barriers/s={:.0f} occlusion rejects={} | "
              "front snapshot verify {} bad {} | verify-mode would-walk {} | back records/s {:.0f} "
              "(records released in bulk/s {:.0f}, delta words per stretch {:.1f}) | buffer-structure "
-             "rejects {} | worker "
+             "rejects {} | workers {}: translating {:.0f} ms/s waiting for the front {:.0f} ms/s (sum over "
+             "workers, since start) | render-key verify {} bad {} | whole: stale {} refused {} state4 {} | back waited for front/worker {} ({:.2f} ms/s), "
+             "took whole after: front "
+             "waiting {} time-out {} | back took whole: incomplete {} unclaimed {} | worker "
+             "kcyc per dcb {:.1f} translator cyc per draw {:.0f} "
+             "per draw {:.0f} | worker "
              "refusals "
              "(cumulative):{}",
              g_a2, s, s > 0 ? double(c.translated) / s : 0.0, s > 0 ? double(c.walked) / s : 0.0,
@@ -2235,7 +2290,17 @@ void A2Log() {
              s > 0 ? double(c.wait_cyc) / tpn * 1e-6 / s : 0.0,
              s > 0 ? double(c.barriers) / s : 0.0, c.occl_rejects, c.snap_cmp, c.snap_bad, c.would,
              s > 0 ? double(c.back_records) / s : 0.0, s > 0 ? double(c.skipped_records) / s : 0.0,
-             c.stretches ? double(c.delta_words) / double(c.stretches) : 0.0, c.gen_rejects, rf);
+             c.stretches ? double(c.delta_words) / double(c.stretches) : 0.0, c.gen_rejects,
+             Vulkan::A2::NumWorkers(),
+             double(g.worker_cyc) / tpn * 1e-6 / std::max(1e-9, double(now - g.t_start) * 1e-9),
+             double(g.publish_wait_cyc) / tpn * 1e-6 /
+                 std::max(1e-9, double(now - g.t_start) * 1e-9),
+             c.rk_cmp, c.rk_bad, c.whole_stale, c.whole_refused, c.whole_st4,
+             c.wait_complete, s > 0 ? double(c.wait_complete_cyc) / tpn * 1e-6 / s : 0.0,
+             c.steal_front_waits, c.steal_timeout, c.steal_incomplete, c.steal_unclaimed,
+             g.worker_draws ? double(g.take_cyc) / double(g.worker_draws) : 0.0,
+             g.worker_dcbs ? double(g.worker_cyc) / double(g.worker_dcbs) * 1e-3 : 0.0,
+             g.worker_draws ? double(g.worker_cyc) / double(g.worker_draws) : 0.0, rf);
     c = A2Counters{};
     c.start_ns = now;
     c.start_tsc = tsc;
@@ -2262,7 +2327,17 @@ void Liverpool::A2WorkerLoop(std::stop_token stoken, u32 index) {
     std::array<Shader::BoundStage, Shader::MaxStageTypes> stages{};
     while (!stoken.stop_requested() && !g.stop.load(std::memory_order_acquire)) {
         const u32 idx = g.next_claim.fetch_add(1, std::memory_order_acq_rel);
+        g.worker_at[index & 7].store(idx | (1u << 28), std::memory_order_relaxed);
         // Wait until the front completed `idx` (published counts DCB ends in order).
+        {
+        const u64 pw0 = __rdtsc();
+        struct PublishWait {
+            std::atomic<u64>& sum;
+            u64 t0;
+            ~PublishWait() {
+                sum.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
+            }
+        } publish_wait{g.publish_wait_cyc, pw0};
         for (u32 spins = 0; g.published.load(std::memory_order_acquire) < idx;) {
             if (stoken.stop_requested() || g.stop.load(std::memory_order_acquire)) {
                 return;
@@ -2276,12 +2351,16 @@ void Liverpool::A2WorkerLoop(std::stop_token stoken, u32 index) {
                 }
             }
         }
+        }
         auto& e = g.e[idx % A2Slots];
         u32 expect = 1;
         if (e.index.load(std::memory_order_acquire) != idx ||
             !e.state.compare_exchange_strong(expect, 2, std::memory_order_acq_rel)) {
             continue; // the back took it
         }
+        g.worker_at[index & 7].store(idx | (2u << 28), std::memory_order_relaxed);
+        const u64 w_t0 = __rdtsc();
+        u64 w_draws = 0;
         e.stretches.clear();
         e.side.clear();
         e.refused = 0;
@@ -2303,17 +2382,20 @@ void Liverpool::A2WorkerLoop(std::stop_token stoken, u32 index) {
             }
         }
         pos += h->size;
-        u64 key = 0;
         bool open = false;
         bool occlusion = false;
+        bool rt_dirty = false;                       // render windows written since saved
+        const Vulkan::GraphicsPipeline* rt_pipe = nullptr; // pipeline the stretch's key holds
+        std::optional<A2PipeRender> rt_pkey;
+        std::array<u32, 0x20 + 0x20 + 0x10 + 0x78> rt_win{};
         std::vector<u32> pending;               // words written since the last taken draw
         std::vector<std::pair<u32, u32>> delta; // committed through the last taken draw
-        u64 last_end = 0, last_epoch = 0;
+        u64 last_end = 0, last_epoch = 0, open_key = 0;
         const auto end_stretch = [&] {
             if (open) {
                 if (auto s = tr.EndStretch()) {
                     e.stretches.push_back(std::move(s));
-                    e.side.push_back({last_end, last_epoch, std::move(delta)});
+                    e.side.push_back({last_end, last_epoch, std::move(delta), open_key});
                 }
                 open = false;
             }
@@ -2341,6 +2423,7 @@ void Liverpool::A2WorkerLoop(std::stop_token stoken, u32 index) {
                         for (u32 i = 0; i < w->count; ++i) {
                             pending.push_back(w->word_offset + i);
                         }
+                        rt_dirty = rt_dirty || A2TouchesRenderWindows(w->word_offset, w->count);
                     }
                     p += sizeof(CpSplit::RegWritePayload) + size_t{w->count} * sizeof(u32);
                 }
@@ -2368,18 +2451,42 @@ void Liverpool::A2WorkerLoop(std::stop_token stoken, u32 index) {
                 in.job_idx = rec.job_idx;
                 in.job_cmd = rec.cmd_address;
                 in.seq = h->seq;
+                ++w_draws;
                 if (occlusion || !in.pipeline || rec.marker || rec.verify != 0) {
                     end_stretch();
                     break;
                 }
-                const u64 k = A2RenderKey(*regs, in.pipeline);
-                if (open && k != key) {
-                    end_stretch();
+                if (open && (rt_dirty || in.pipeline != rt_pipe)) {
+                    // Same pass only if the render windows and the pipeline's attachment
+                    // setup are unchanged since the stretch's first draw.
+                    bool same = true;
+                    if (rt_dirty) {
+                        std::array<u32, 0x20 + 0x20 + 0x10 + 0x78> now{};
+                        A2CopyRenderWindows(*regs, now);
+                        same = now == rt_win;
+                        rt_dirty = false;
+                    }
+                    if (same && in.pipeline != rt_pipe) {
+                        same = A2PipeRender{in.pipeline} == *rt_pkey;
+                        rt_pipe = in.pipeline;
+                    }
+                    if (!same) {
+                        end_stretch();
+                    }
                 }
-                if (tr.TakeDraw(*regs, in)) {
+                const u64 tk0 = __rdtsc();
+                const bool took = tr.TakeDraw(*regs, in);
+                g.take_cyc.fetch_add(__rdtsc() - tk0, std::memory_order_relaxed);
+                if (took) {
                     if (!open) {
                         open = true;
-                        key = k;
+                        rt_dirty = false;
+                        rt_pipe = in.pipeline;
+                        rt_pkey.emplace(in.pipeline);
+                        A2CopyRenderWindows(*regs, rt_win);
+                        if (g_a2 == 2) {
+                            open_key = A2RenderKey(*regs, in.pipeline);
+                        }
                         pending.clear();
                         delta.clear();
                     }
@@ -2414,6 +2521,10 @@ void Liverpool::A2WorkerLoop(std::stop_token stoken, u32 index) {
             pos += h->size;
         }
         end_stretch();
+        g.worker_cyc.fetch_add(__rdtsc() - w_t0, std::memory_order_relaxed);
+        g.worker_dcbs.fetch_add(1, std::memory_order_relaxed);
+        g.worker_at[index & 7].store(0, std::memory_order_relaxed);
+        g.worker_draws.fetch_add(w_draws, std::memory_order_relaxed);
         e.state.store(3, std::memory_order_release);
         e.state.notify_all();
     }
@@ -2441,6 +2552,7 @@ void Liverpool::A2Execute(const CpSplit::RecordHeader& record) {
         g.started = true;
         c.start_ns = A2NowNs();
         c.start_tsc = __rdtsc();
+        g.t_start = c.start_ns;
         const u32 n = Vulkan::A2::NumWorkers();
         for (u32 i = 0; i < n; ++i) {
             g.workers.emplace_back(std::bind_front(&Liverpool::A2WorkerLoop, this), i);
@@ -2476,6 +2588,52 @@ void Liverpool::A2Execute(const CpSplit::RecordHeader& record) {
             c.snap_bad += bad;
         }
         auto& e = g.e[idx % A2Slots];
+        {
+            // Incomplete (the front is still parsing it) or complete but not yet claimed: wait
+            // for the front / a worker unless the front is waiting on the back (it would never
+            // finish the DCB) or a time-out passes; then the back takes it below.
+            const u64 t0 = __rdtsc();
+            // Safety net only (counted): the policy is "wait unless the front waits on us".
+            constexpr u64 IncompleteTicks = 175'000'000; // ~50 ms
+            constexpr u64 UnclaimedTicks = 175'000'000;
+            bool waited = false;
+            for (u32 spins = 0;; ++spins) {
+                const u32 st = e.state.load(std::memory_order_acquire);
+                const bool mine = e.index.load(std::memory_order_acquire) == idx;
+                const bool incomplete = st == 0;
+                const bool unclaimed = st == 1 && mine;
+                if (!incomplete && !unclaimed) {
+                    break;
+                }
+                if (split->FrontWaitingOnBack()) {
+                    ++c.steal_front_waits;
+                    break;
+                }
+                if (__rdtsc() - t0 > (incomplete ? IncompleteTicks : UnclaimedTicks)) {
+                    ++c.steal_timeout;
+                    std::string ws;
+                    for (u32 w = 0; w < Vulkan::A2::NumWorkers() && w < 8; ++w) {
+                        const u32 at = g.worker_at[w].load(std::memory_order_relaxed);
+                        ws += fmt::format(" w{}={}/{}", w, at & 0x0fffffffu, at >> 28);
+                    }
+                    LOG_WARNING(Render,
+                                "A2 safety net (50 ms): dcb {} state {} (entry index {}) - "
+                                "published {} next_claim {} front waiting {}; workers "
+                                "(dcb/phase 1 wait-front 2 translate):{}",
+                                idx, st, e.index.load(std::memory_order_relaxed),
+                                g.published.load(std::memory_order_relaxed),
+                                g.next_claim.load(std::memory_order_relaxed),
+                                split->FrontWaitingOnBack(), ws);
+                    break;
+                }
+                waited = true;
+                spins < 4096 ? _mm_pause() : std::this_thread::yield();
+            }
+            if (waited) {
+                ++c.wait_complete;
+                c.wait_complete_cyc += __rdtsc() - t0;
+            }
+        }
         for (u32 spins = 0;;) {
             u32 st = e.state.load(std::memory_order_acquire);
             if (st == 0) {
@@ -2483,6 +2641,7 @@ void Liverpool::A2Execute(const CpSplit::RecordHeader& record) {
                 e.index.store(idx, std::memory_order_release);
                 if (e.state.compare_exchange_strong(st, 4, std::memory_order_acq_rel)) {
                     g.cur_back = true;
+                    ++c.steal_incomplete;
                     break;
                 }
                 continue;
@@ -2491,17 +2650,21 @@ void Liverpool::A2Execute(const CpSplit::RecordHeader& record) {
                 // A stale entry of index idx - A2Slots (cannot happen: the back releases at
                 // DcbEnd). Take the DCB on the old path.
                 g.cur_back = true;
+                ++c.whole_stale;
                 break;
             }
             if (st == 1) {
                 if (e.state.compare_exchange_strong(st, 4, std::memory_order_acq_rel)) {
                     g.cur_back = true;
+                    ++c.steal_unclaimed;
                     break;
                 }
                 continue;
             }
             if (st == 3 || st == 4) {
                 g.cur_back = st == 4 || e.refused != 0;
+                c.whole_refused += st == 3 && e.refused != 0;
+                c.whole_st4 += st == 4;
                 break;
             }
             // st == 2: a worker is translating it.
@@ -2575,6 +2738,19 @@ void Liverpool::A2Execute(const CpSplit::RecordHeader& record) {
                         c.skipped_records += s.last_seq - record.seq;
                         ++g.stretch_i;
                         return;
+                    }
+                }
+                if (g_a2 == 2) {
+                    // The shortcut check: the full key from the BACK's mirror at this draw.
+                    const u64 bk = A2RenderKey(mirror->regs, rec.draw.pipeline);
+                    ++c.rk_cmp;
+                    if (bk != g.cur->side[g.stretch_i].render_key) {
+                        if (++c.rk_bad <= 16) {
+                            LOG_WARNING(Render,
+                                        "A2 verify: render key mismatch at draw seq {} "
+                                        "(stretch {}..{})",
+                                        record.seq, s.first_seq, s.last_seq);
+                        }
                     }
                 }
                 if (record.seq == s.last_seq) {
@@ -7605,6 +7781,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             // The DCB is complete and published: hand it to the workers (A2 table).
             const u32 idx = g_a1_front_index;
             auto& e = g_a2s.e[idx % A2Slots];
+            split->front_waiting.fetch_add(1, std::memory_order_acq_rel);
             for (u32 spins = 0;; ++spins) {
                 const u32 st = e.state.load(std::memory_order_acquire);
                 if (st == 0 || (st == 4 && e.index.load(std::memory_order_acquire) == idx)) {
@@ -7612,6 +7789,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 spins < 4096 ? _mm_pause() : std::this_thread::yield();
             }
+            split->front_waiting.fetch_sub(1, std::memory_order_acq_rel);
             e.begin_pos = g_a2s.front_begin_pos;
             e.end_pos = end_pos;
             e.index.store(idx, std::memory_order_release);

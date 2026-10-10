@@ -530,6 +530,11 @@ public:
     void PublishNow() {
         Publish();
     }
+    /// SHADPS4_A2: non-zero while the front waits for the back (WaitDone / WaitForSpace).
+    [[nodiscard]] bool FrontWaitingOnBack() const noexcept {
+        return front_waiting.load(std::memory_order_acquire) != 0;
+    }
+    std::atomic<u32> front_waiting{0};
     /// SHADPS4_A1: complete DCBs the front has published (front writes after the publish).
     std::atomic<u64> dcb_ends_published{0};
 

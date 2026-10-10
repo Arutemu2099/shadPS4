@@ -500,9 +500,11 @@ void Channel::WaitForSpace(u64 end) {
         return;
     }
     ++counters.full_waits;
+    front_waiting.fetch_add(1, std::memory_order_acq_rel);
     for (;;) {
         cached_read = read_pos.load(std::memory_order_acquire);
         if (end - cached_read <= capacity) {
+            front_waiting.fetch_sub(1, std::memory_order_acq_rel);
             return;
         }
         // The back frees space only by consuming what has been published.
@@ -518,6 +520,13 @@ u64 Channel::WaitDone(u64 seq) {
     }
     const u64 t0 = Ticks();
     const u64 deadline = NowNs() + SpinNs();
+    front_waiting.fetch_add(1, std::memory_order_acq_rel);
+    struct WaitingScope {
+        std::atomic<u32>& w;
+        ~WaitingScope() {
+            w.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    } waiting_scope{front_waiting};
     for (u32 spins = 1;; ++spins) {
         if (done_seq.load(std::memory_order_acquire) >= seq) {
             const u64 waited = Ticks() - t0;
@@ -596,6 +605,12 @@ void Channel::Done(const RecordHeader* record) {
 }
 
 void Channel::DoneThrough(u64 end_pos, u64 last_seq) {
+    // Every released record was published, so write_pos >= end_pos; Next() needs
+    // cached_write >= read to see "nothing more" as read == cached_write.
+    if (cached_write < end_pos) {
+        cached_write = write_pos.load(std::memory_order_acquire);
+    }
+    ASSERT_MSG(cached_write >= end_pos, "CpSplit: DoneThrough past the published end");
     read = end_pos;
     read_pos.store(read, std::memory_order_release);
     pending_done = last_seq;
