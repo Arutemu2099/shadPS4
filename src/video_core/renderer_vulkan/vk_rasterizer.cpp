@@ -3296,9 +3296,21 @@ bool Rasterizer::NativeRingPrepare(const GraphicsPipeline* base,
     if (u.stamp.load(std::memory_order_relaxed) != head + 1 || un <= run_k0 + 1) {
         return fail(4); // no member covered by the union yet
     }
+    // Only the batch's Guest slots and streams are copied (s408: the whole union, ~1.2 KB of
+    // another core's cache lines, cost ~670 cycles per batch).
     const u64 guest_mask = u.guest_mask, eq_mask = u.eq_mask;
-    const auto lo = u.lo, hi = u.hi, first_addr = u.first_addr;
-    const auto vlo = u.vlo, vhi = u.vhi;
+    std::array<u64, Shader::NUM_BUFFERS> lo, hi, first_addr;
+    for (u64 m = b.guest_mask; m != 0; m &= m - 1) {
+        const u32 bi = static_cast<u32>(std::countr_zero(m));
+        lo[bi] = u.lo[bi];
+        hi[bi] = u.hi[bi];
+        first_addr[bi] = u.first_addr[bi];
+    }
+    std::array<u64, 16> vlo, vhi;
+    for (u32 a = 0; a < b.vb_n; ++a) {
+        vlo[a] = u.vlo[a];
+        vhi[a] = u.vhi[a];
+    }
     const u64 ilo = u.ilo, ihi = u.ihi;
     std::atomic_thread_fence(std::memory_order_acquire);
     if (u.stamp.load(std::memory_order_relaxed) != head + 1) {
@@ -3327,9 +3339,22 @@ bool Rasterizer::NativeRingPrepare(const GraphicsPipeline* base,
     };
     std::array<USpan, Shader::NUM_BUFFERS + 17> us;
     u32 nus = 0;
+    const u64 bgen = buffer_cache.StructGeneration();
+    if (native_bcache_gen != bgen) {
+        native_bcache_gen = bgen;
+        native_bcache_n = 0;
+    }
     const auto base_of = [&](VAddr a_lo, VAddr a_hi, u64 want_handle, VAddr& cpu) {
         if (a_lo == 0 || a_hi <= a_lo || a_hi - a_lo > (u64{64} << 20)) {
             return false;
+        }
+        // Bounds by VkBuffer, valid while the buffer structure generation stays put.
+        for (u32 i = 0; i < native_bcache_n; ++i) {
+            const auto& e = native_bcache[i];
+            if (e.handle == want_handle && a_lo >= e.lo && a_hi <= e.hi) {
+                cpu = e.lo;
+                return true;
+            }
         }
         const VideoCore::Buffer* buf = buffer_cache.NativeBufferAt(a_lo);
         if (!buf || !buf->IsInBounds(a_lo, a_hi - a_lo) ||
@@ -3337,6 +3362,10 @@ bool Rasterizer::NativeRingPrepare(const GraphicsPipeline* base,
             return false;
         }
         cpu = buf->CpuAddr();
+        auto& e = native_bcache[native_bcache_n < native_bcache.size()
+                                    ? native_bcache_n++
+                                    : (native_bcache_rr++ % native_bcache.size())];
+        e = {want_handle, cpu, cpu + buf->SizeBytes()};
         return true;
     };
     const auto add_span = [&](u64 handle, VideoCore::NativeRunAccess access, VAddr a_lo,
@@ -3410,12 +3439,46 @@ bool Rasterizer::NativeRingPrepare(const GraphicsPipeline* base,
     }
     lap(1); // bases, span list
     for (u32 i = 0; i < nus; ++i) {
-        const VideoCore::Buffer* buf = buffer_cache.NativeRunSpan(
-            us[i].lo, us[i].hi, us[i].access, &buffer_barriers, cur_dispatch_run);
+        // Validity cache: a superset of this range in the same buffer was synced since the last
+        // CPU write (dirty epoch) and buffer-structure change -> only the access barrier.
+        auto* hit = static_cast<NativeSpanEntry*>(nullptr);
+        for (auto& e : native_span_cache) {
+            if (e.handle == us[i].handle && e.access == static_cast<u32>(us[i].access) &&
+                e.epoch == epoch && e.gen == gen && us[i].lo >= e.lo && us[i].hi <= e.hi) {
+                hit = &e;
+                break;
+            }
+        }
+        const VideoCore::Buffer* buf =
+            buffer_cache.NativeRunSpan(us[i].lo, us[i].hi, us[i].access, &buffer_barriers,
+                                       cur_dispatch_run, hit == nullptr);
         if (!buf || std::bit_cast<u64>(static_cast<VkBuffer>(buf->Handle())) != us[i].handle) {
             return fail(9);
         }
         st.ring_span_bytes += us[i].hi - us[i].lo;
+        if (hit) {
+            ++st.ring_span_hits;
+        } else {
+            // Grow the entry of this buffer if it is still current, else replace the oldest.
+            NativeSpanEntry* slot = nullptr;
+            for (auto& e : native_span_cache) {
+                if (e.handle == us[i].handle && e.access == static_cast<u32>(us[i].access)) {
+                    slot = &e;
+                    break;
+                }
+            }
+            if (slot && slot->epoch == epoch && slot->gen == gen &&
+                std::max(slot->hi, us[i].hi) - std::min(slot->lo, us[i].lo) <= (u64{64} << 20)) {
+                slot->lo = std::min(slot->lo, us[i].lo);
+                slot->hi = std::max(slot->hi, us[i].hi);
+            } else {
+                if (!slot) {
+                    slot = &native_span_cache[native_span_rr++ % native_span_cache.size()];
+                }
+                *slot = {us[i].handle, static_cast<u32>(us[i].access), us[i].lo, us[i].hi, epoch,
+                         gen};
+            }
+        }
     }
     st.ring_spans += nus;
     lap(2); // span syncs
@@ -4694,7 +4757,8 @@ void Rasterizer::NativeLog() {
         LOG_INFO(Render_Vulkan,
                  "NativeGpu ring: batches={} members={} ({:.2f} per batch) legacy opens={} | ring "
                  "cycles per member {:.0f} spans per batch {:.2f} (phases per batch: records {:.0f} "
-                 "bases {:.0f} span syncs {:.0f} commands {:.0f}; KB per span {:.0f}) | refusals:{} "
+                 "bases {:.0f} span syncs {:.0f} commands {:.0f}; KB per span {:.0f}; span cache "
+                 "hits {:.1f}%) | refusals:{} "
                  "| confirmed={} (colour {})",
                  st.ring_runs, st.ring_members,
                  st.ring_runs ? double(st.ring_members) / double(st.ring_runs) : 0.0,
@@ -4705,7 +4769,8 @@ void Rasterizer::NativeLog() {
                  double(st.c_ring_ph[1]) / double(std::max<u64>(st.ring_runs, 1)),
                  double(st.c_ring_ph[2]) / double(std::max<u64>(st.ring_runs, 1)),
                  double(st.c_ring_ph[3]) / double(std::max<u64>(st.ring_runs, 1)),
-                 double(st.ring_span_bytes) / 1024.0 / double(std::max<u64>(st.ring_spans, 1)), rf,
+                 double(st.ring_span_bytes) / 1024.0 / double(std::max<u64>(st.ring_spans, 1)),
+                 100.0 * double(st.ring_span_hits) / double(std::max<u64>(st.ring_spans, 1)), rf,
                  st.prep_conf, st.prep_conf_col);
     }
     if (st.n_rec[0] + st.n_rec[3] + st.n_rec[9] != 0) {

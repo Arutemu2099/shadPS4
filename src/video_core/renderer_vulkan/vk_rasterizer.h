@@ -623,6 +623,7 @@ private:
         u64 ring_runs{}, ring_members{}, c_ring{}, ring_spans{}, ring_opens_legacy{};
         std::array<u64, 16> ring_fail{};
         std::array<u64, 4> c_ring_ph{};
+        u64 ring_span_hits{};
         u64 ring_span_bytes{};
         std::array<u64, 4> prep_c10{};  ///< verify: close 10 of a prepared member by where
         std::array<u64, 16> prep_stop{};
@@ -646,6 +647,14 @@ private:
                            const std::array<u64, Shader::NUM_BUFFERS>& o_addr);
     void NativeRingWrite();
     std::array<u32, Shader::NativeTableDwords> native_ring_table{};
+    struct NativeSpanEntry {
+        u64 handle;
+        u32 access;
+        VAddr lo, hi;
+        u64 epoch, gen;
+    };
+    std::array<NativeSpanEntry, 16> native_span_cache{};
+    u32 native_span_rr{};
     u64 native_ring_handle{};
     void NativeGpuVerify(const u32* ud, const std::array<u32, Shader::NUM_BUFFERS>& off,
                          const std::array<u32, Shader::NUM_BUFFERS>& size,

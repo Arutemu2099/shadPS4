@@ -3736,7 +3736,8 @@ const Buffer* BufferCache::NativeBufferAt(VAddr addr) {
 
 const Buffer* BufferCache::NativeRunSpan(
     VAddr lo, VAddr hi, NativeRunAccess access,
-    boost::container::small_vector<vk::BufferMemoryBarrier2, 16>* barriers, u64 dispatch_run) {
+    boost::container::small_vector<vk::BufferMemoryBarrier2, 16>* barriers, u64 dispatch_run,
+    bool sync) {
     if (lo == 0 || hi <= lo || hi - lo > (u64{64} << 20)) {
         return nullptr;
     }
@@ -3753,7 +3754,13 @@ const Buffer* BufferCache::NativeRunSpan(
     // first (memo probe + READ_SYNC_FAST's clean check, no upload due); the full ObtainBuffer
     // only when it says no.
     Buffer* buffer = nullptr;
-    if (LeanReadOk()) {
+    if (!sync) {
+        // SHADPS4_NATIVE_GPU_DIRECT: the caller knows the range is already synced (a superset
+        // validated since the last CPU write); only the access barrier below.
+        buffer = &slot_buffers[id];
+        buffer->NoteMainAccess(scheduler.CurrentTick(), false); // as ObtainBuffer / the lean path
+    }
+    if (!buffer && LeanReadOk()) {
         buffer = ObtainReadLean(lo, static_cast<u32>(size), id).first;
     }
     if (!buffer) {

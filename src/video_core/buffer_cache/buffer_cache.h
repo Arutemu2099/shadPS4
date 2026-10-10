@@ -193,7 +193,7 @@ public:
     const Buffer* NativeBufferAt(VAddr addr);
     const Buffer* NativeRunSpan(VAddr lo, VAddr hi, NativeRunAccess access,
                                 boost::container::small_vector<vk::BufferMemoryBarrier2, 16>* barriers,
-                                u64 dispatch_run);
+                                u64 dispatch_run, bool sync = true);
     void NativeJoinVertexIndex(const AmdGpu::CpSplit::VertexInputsPayload& vi, u32 index_offset,
                                NativeJoinVi& out,
                                boost::container::small_vector<vk::BufferMemoryBarrier2, 16>* barriers);
