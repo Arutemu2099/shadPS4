@@ -1269,6 +1269,8 @@ struct LeanXlStats {
     std::atomic<u64> taken{}, stretches{}, cap{}, cut_pub{}, walked{};
     std::atomic<u64> published{}, pub_draws{}, rej_occl{}, rej_gen{}, rej_mat{}, rej_rt{},
         would{}, back_draws{}, seq_skips{};
+    /// SHADPS4_A2=2 field compares (gate 0 bad): render key per draw, delta words per stretch.
+    std::atomic<u64> rk_cmp{}, rk_bad{}, delta_cmp{}, delta_bad{}, expect_filed{};
     std::atomic<u64> front_p{}, front_e{}, lean_p{}, lean_e{};
     std::array<std::atomic<Vulkan::A2::StretchTranslator*>, 8> tr{};
 };
@@ -1872,14 +1874,17 @@ void LeanLog() {
                      "Lean L3: worker draws walked {:.0f}/s taken {:.0f}/s ({:.1f}%) in {:.0f} "
                      "stretches/s ({:.1f} draws each; cut by publish {:.0f}/s, cap hits {}) | back: "
                      "published {:.0f}/s ({:.0f} draws/s), rejected occlusion {} buffer-gen {} "
-                     "material {} target {} | A2=2 would {:.0f}/s | back old-path draw records in job "
+                     "material {} target {} | A2=2 would {:.0f}/s, render key {} BAD {}, delta words {} "
+                     "BAD {}, slot words filed {} | back old-path draw records in job "
                      "channels {:.0f}/s, seq skips {} | refusals (cumulative, of {}):{}",
                      double(wk) * ps, double(tk) * ps,
                      100.0 * double(tk) / double(std::max<u64>(wk, 1)), double(st_) * ps, double(tk) / double(std::max<u64>(st_, 1)),
                      double(x.cut_pub.exchange(0)) * ps, x.cap.exchange(0),
                      double(x.published.exchange(0)) * ps, double(x.pub_draws.exchange(0)) * ps,
                      x.rej_occl.exchange(0), x.rej_gen.exchange(0), x.rej_mat.exchange(0),
-                     x.rej_rt.exchange(0), double(x.would.exchange(0)) * ps,
+                     x.rej_rt.exchange(0), double(x.would.exchange(0)) * ps, x.rk_cmp.exchange(0),
+                     x.rk_bad.load(), x.delta_cmp.exchange(0), x.delta_bad.load(),
+                     x.expect_filed.exchange(0),
                      double(x.back_draws.exchange(0)) * ps, x.seq_skips.exchange(0), rtot, top);
         }
         s.l2_taken = s.l2_skipped = s.head_draws = s.back_records = s.back_wait_ticks = 0;
@@ -3691,6 +3696,7 @@ struct LeanXl {
     std::vector<std::pair<u32, u32>> delta; // committed through the last taken draw
     std::array<Shader::BoundStage, Shader::MaxStageTypes> stages{};
     u32 since_pub{};
+    u64 open_key{}; ///< SHADPS4_A2=2: A2RenderKey at the open stretch's first draw
     u64 taken{}, stretches{}, cap{}, cut_pub{}, walked{};
 };
 
@@ -3698,7 +3704,7 @@ void LeanXlEnd(LeanXl& x) {
     if (x.open) {
         if (auto s = x.tr->EndStretch()) {
             x.job->xl[x.n] = std::move(s);
-            x.job->xl_side[x.n] = {x.last_end, x.last_epoch, std::move(x.delta), 0};
+            x.job->xl_side[x.n] = {x.last_end, x.last_epoch, std::move(x.delta), x.open_key};
             x.job->xl_ready.store(++x.n, std::memory_order_release);
             ++x.stretches;
         }
@@ -3760,6 +3766,7 @@ void LeanXlDraw(LeanXl& x, const CpSplit::RecordHeader& h, u64 pos) {
             x.rt_pipe = in.pipeline;
             x.rt_pkey.emplace(in.pipeline);
             A2CopyRenderWindows(regs, x.rt_win);
+            x.open_key = g_a2 == 2 ? A2RenderKey(regs, in.pipeline) : 0;
             x.pending.clear();
             x.delta.clear();
         }
@@ -7943,9 +7950,9 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
     // true; false = the old path runs the stretch's records (rejected, or A2=2 verify).
     const auto publish = [&](Vulkan::A2::Stretch& st, const A2Entry::Side& sd,
                              const CpSplit::RecordHeader& first) {
-        if (g_a2 == 2) {
+        const bool verify = g_a2 == 2;
+        if (verify) {
             x.would.fetch_add(st.draws, std::memory_order_relaxed);
-            return false;
         }
         auto& g = g_a2s;
         const auto& rec = *reinterpret_cast<const SplitDrawRecord*>(&first + 1);
@@ -7959,7 +7966,10 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
             x.rej_gen.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
-        rasterizer->GetScheduler().SwitchStream(0);
+        if (!verify) {
+            rasterizer->GetScheduler().SwitchStream(0);
+        }
+        std::array<std::pair<u32, u32>, Vulkan::A2::MaxMaterials> mat_n{};
         static thread_local std::vector<VideoCore::ImageId> mat_ids;
         mat_ids.clear();
         const bool colour = !st.materials.empty();
@@ -7990,7 +8000,7 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                 const auto& mrec = *reinterpret_cast<const SplitDrawRecord*>(mh + 1);
                 std::array<Shader::BoundStage, Shader::MaxStageTypes> mst{};
                 ReadStages(reinterpret_cast<const u8*>(&mrec + 1), mrec.stage_count, mst);
-                u32 ni = 0, ns = 0;
+                auto& [ni, ns] = mat_n[m];
                 ok = rasterizer->A2ResolveMaterial(mr.base, mst[u32(Shader::LogicalStage::Fragment)],
                                                    st.cmds->mat_slots[m].data(), ni, ns, mat_ids);
             }
@@ -8000,7 +8010,27 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                 x.rej_mat.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
+            if (verify) {
+                // The old path's ring write of each colour draw compares its slot words with these.
+                auto& ex = rasterizer->a2_expect;
+                if (ex.size() > 200000) {
+                    ex.clear(); // never written: stale
+                }
+                for (const auto& sw : st.cmds->slot_writes) {
+                    if (sw.mat < st.materials.size()) {
+                        auto& e2 = ex[u64{sw.tag} << 32 | sw.idx];
+                        e2.slots = st.cmds->mat_slots[sw.mat];
+                        e2.n_img = mat_n[sw.mat].first;
+                        e2.n_smp = mat_n[sw.mat].second;
+                        x.expect_filed.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                return false;
+            }
             st.cmds->bindless_set = rasterizer->A2BindlessCommit();
+        }
+        if (verify) {
+            return false;
         }
         if (g.gpu_write) {
             rasterizer->A2GlobalBarrier();
@@ -8053,6 +8083,9 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
         }
     }
     u32 si = 0; // next stretch of this job
+    // SHADPS4_A2=2: the stretch whose draws run on the old path and are compared.
+    const Vulkan::A2::Stretch* vs = nullptr;
+    const A2Entry::Side* vsd = nullptr;
     u64 wait = 0;
     for (u32 spins = 0;;) {
         if (split->FrontHasExited() || s.stop.load(std::memory_order_relaxed)) [[unlikely]] {
@@ -8079,6 +8112,24 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                         ++s.back_records;
                         continue;
                     }
+                    if (g_a2 == 2) {
+                        vs = &st;
+                        vsd = &sd;
+                    }
+                }
+                if (vs && r->seq >= vs->first_seq && r->seq <= vs->last_seq) {
+                    // The full key from the BACK's mirror at this draw (its registers before it).
+                    const auto& rec = *reinterpret_cast<const SplitDrawRecord*>(r + 1);
+                    if (rec.draw.pipeline) {
+                        const u64 bk = A2RenderKey(mirror->regs, rec.draw.pipeline);
+                        x.rk_cmp.fetch_add(1, std::memory_order_relaxed);
+                        if (bk != vsd->render_key &&
+                            x.rk_bad.fetch_add(1, std::memory_order_relaxed) < 16) {
+                            LOG_WARNING(Render, "Lean L3 verify: render key mismatch at job draw seq "
+                                                "{} (stretch {}..{})",
+                                        r->seq, vs->first_seq, vs->last_seq);
+                        }
+                    }
                 }
             }
             switch (r->type) {
@@ -8096,6 +8147,26 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                 break;
             }
             ExecuteRecordImpl(*r); // the plain path for everything not in a published stretch
+            if (vs && r->type == RT::Draw && r->seq == vs->last_seq) {
+                // The delta the back would have applied = its mirror after the stretch's last draw
+                // (the last value per offset).
+                static thread_local std::unordered_set<u32> seen;
+                seen.clear();
+                u32 bad = 0;
+                for (auto it = vsd->delta.rbegin(); it != vsd->delta.rend(); ++it) {
+                    if (seen.insert(it->first).second) {
+                        bad += mirror->regs.reg_array[it->first] != it->second ? 1 : 0;
+                    }
+                }
+                x.delta_cmp.fetch_add(seen.size(), std::memory_order_relaxed);
+                if (bad != 0 && x.delta_bad.fetch_add(bad, std::memory_order_relaxed) < 16) {
+                    LOG_WARNING(Render, "Lean L3 verify: {} delta words differ after job draw seq {} "
+                                        "(stretch {}..{})",
+                                bad, r->seq, vs->first_seq, vs->last_seq);
+                }
+                vs = nullptr;
+                vsd = nullptr;
+            }
             ch.Done(r);
             ++s.back_records;
             if (num_commands.load(std::memory_order_relaxed) != 0) {
