@@ -2951,7 +2951,7 @@ void NativeRecFront(const PM4Header* header, const Vulkan::Rasterizer::SplitDraw
     const u32 index_count = src.index_count, instances = src.instances;
     const bool inst_known = src.inst_known != 0;
     const u32 gap = src.gap_dwords;
-    const u32 count = run_k == 0 ? src.count : 0;
+    const u32 count = run_k == 0 ? src.count.load(std::memory_order_acquire) : 0;
     const bool derived = src.derived != 0;
     const void* d_pipeline = src.pipeline;
     const u32 d_nvs = src.flat_vs_dw, d_nps = src.flat_ps_dw, d_vi_bytes = src.vi_bytes;
@@ -3163,6 +3163,7 @@ struct NativeRecRun {
     const Shader::Info* psi{};
     u64 desc_id{};
     u32 desc_count{};
+    u32 prim{}, index_type{}, vs_nuser{}, ps_nuser{}; ///< front registers at the head (review 4)
     std::array<CpSplit::VertexInputDesc, CpSplit::MaxVertexInputs> descs{};
 };
 NativeRecRun g_nr_run;
@@ -3245,33 +3246,47 @@ bool Liverpool::NativeRecMember(const PM4Header* header, const char* name, bool 
         return refuse(1);
     }
     const NR::Record& src = ring[idx & (NR::RingSize - 1)];
-    if (src.stamp.load(std::memory_order_acquire) != idx + 1 || src.cmd != w) {
+    if (src.stamp.load(std::memory_order_acquire) != idx + 1) {
         return refuse(1);
     }
-    if (src.run_k != run.next_k || src.head_idx != run.head_idx || src.tag != run.tag ||
-        !src.derived) {
+    // Opus review 1: copy every field first, then fence + re-check the stamp, then bounds, and
+    // only then dereference or copy through them.
+    const bool cmd_ok = src.cmd == w;
+    const u32 run_k = src.run_k, head_idx = src.head_idx, src_tag = src.tag;
+    const bool derived = src.derived != 0;
+    const void* src_pipeline = src.pipeline;
+    const u32 nvs = src.flat_vs_dw, nps = src.flat_ps_dw, vi_bytes = src.vi_bytes;
+    const u64 pos = src.payload_pos;
+    const auto ud_vs = src.ud_vs;
+    const auto ud_ps = src.ud_ps;
+    const VAddr vs_pgm = VAddr{src.vs_pgm} << 8, ps_pgm = VAddr{src.ps_pgm} << 8;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (src.stamp.load(std::memory_order_relaxed) != idx + 1 || !cmd_ok) {
+        return refuse(1);
+    }
+    if (run_k != run.next_k || head_idx != run.head_idx || src_tag != run.tag || !derived) {
         return refuse(2);
     }
-    if (context_change_epoch != run.ctx_epoch) {
+    // Opus review 4: the context epoch does not cover the uconfig primitive type, the index
+    // type or the stages' user-SGPR counts.
+    if (context_change_epoch != run.ctx_epoch ||
+        static_cast<u32>(regs.primitive_type) != run.prim ||
+        regs.index_buffer_type.raw != run.index_type ||
+        regs.vs_program.settings.num_user_regs != run.vs_nuser ||
+        regs.ps_program.settings.num_user_regs != run.ps_nuser) {
         return refuse(3);
     }
-    const auto* gp = static_cast<const Vulkan::GraphicsPipeline*>(src.pipeline);
+    const auto* gp = static_cast<const Vulkan::GraphicsPipeline*>(src_pipeline);
+    if (!gp || nvs > 1024 || nps > 1024 || vi_bytes < sizeof(CpSplit::VertexInputsPayload) ||
+        vi_bytes > sizeof(CpSplit::VertexInputsDerived)) {
+        return refuse(1);
+    }
     const auto gstages = gp->GetStages();
     if (gstages[static_cast<u32>(Shader::LogicalStage::Vertex)] != run.vsi ||
         gstages[static_cast<u32>(Shader::LogicalStage::Fragment)] != run.psi) {
         return refuse(4);
     }
     const u64 t0 = __rdtsc();
-    Vulkan::Rasterizer::SplitDraw draw{.args = args};
-    if (!rasterizer->PrepareMemberFront(draw, run.pipeline)) {
-        return refuse(5);
-    }
-    // Copy the job thread's data out first, then re-check the stamp (seqlock).
-    const u32 nvs = src.flat_vs_dw, nps = src.flat_ps_dw, vi_bytes = src.vi_bytes;
-    const u64 pos = src.payload_pos;
-    const auto ud_vs = src.ud_vs;
-    const auto ud_ps = src.ud_ps;
-    const VAddr vs_pgm = VAddr{src.vs_pgm} << 8, ps_pgm = VAddr{src.ps_pgm} << 8;
     const u8* pl = payload + (pos & (NR::PayloadSize - 1));
     const u32 vs_block = StageBlockBytes(16, nvs);
     const u32 ps_block = run.psi ? StageBlockBytes(16, nps) : 0u;
@@ -3299,10 +3314,17 @@ bool Liverpool::NativeRecMember(const PM4Header* header, const char* name, bool 
     }
     const u8* vi_src = pl + (u64(nvs + nps) * 4 + 7) / 8 * 8;
     std::memcpy(out, vi_src, vi_bytes);
+    // Opus review 2: the payload is intact only if the job thread has not claimed past it.
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (NR::g_payload_claim[tag >> 28].load(std::memory_order_relaxed) - pos > NR::PayloadSize ||
+        src.stamp.load(std::memory_order_relaxed) != idx + 1) {
+        return refuse(7);
+    }
     {
         auto* hdr = reinterpret_cast<CpSplit::VertexInputsPayload*>(out);
         auto* att = reinterpret_cast<CpSplit::VertexInputAttrib*>(hdr + 1);
-        if (hdr->count != run.desc_count) {
+        if (hdr->count != run.desc_count ||
+            CpSplit::VertexInputsBytes(hdr->count, hdr->range_count) != vi_bytes) {
             return refuse(6);
         }
         hdr->desc_id = run.desc_id;
@@ -3310,8 +3332,10 @@ bool Liverpool::NativeRecMember(const PM4Header* header, const char* name, bool 
             att[a].desc = run.descs[a]; // the head's (divisors come from context registers)
         }
     }
-    if (src.stamp.load(std::memory_order_acquire) != idx + 1) {
-        return refuse(1);
+    // Last (Opus review 9): the hazard note and empty-draw counter run once per taken member.
+    Vulkan::Rasterizer::SplitDraw draw{.args = args};
+    if (!rasterizer->PrepareMemberFront(draw, run.pipeline) || draw.skip) {
+        return refuse(5);
     }
     const u32 stage_count = run.psi ? 2u : 1u;
     if (NR::g_mode == 3) {
@@ -3379,7 +3403,7 @@ void Liverpool::NativeRecHead(const PM4Header* header, const void* pipeline_ptr,
     }
     const NR::Record& src = ring[idx & (NR::RingSize - 1)];
     if (src.stamp.load(std::memory_order_acquire) != idx + 1 || src.cmd != w ||
-        src.run_k != 0 || src.count < 2 || !src.derived) {
+        src.run_k != 0 || src.count.load(std::memory_order_acquire) < 2 || !src.derived) {
         return;
     }
     const auto stages = draw_pipeline->GetStages();
@@ -3401,6 +3425,10 @@ void Liverpool::NativeRecHead(const PM4Header* header, const void* pipeline_ptr,
     run.pipeline = draw_pipeline;
     run.vsi = vsi;
     run.psi = stages[static_cast<u32>(Shader::LogicalStage::Fragment)];
+    run.prim = static_cast<u32>(regs.primitive_type);
+    run.index_type = regs.index_buffer_type.raw;
+    run.vs_nuser = regs.vs_program.settings.num_user_regs;
+    run.ps_nuser = regs.ps_program.settings.num_user_regs;
     run.desc_id = front_vi->header.desc_id;
     run.desc_count = front_vi->header.count;
     for (u32 a = 0; a < run.desc_count; ++a) {
@@ -3546,11 +3574,11 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
         if ((++st.n_normal & 0x3ffff) == 0) {
             LOG_INFO(Render,
                      "NativeRec members: taken={} refused={} (why 0 tag/mode 1 ring/stale 2 "
-                     "run order 3 epoch 4 infos 5 class 6 vi count: {} {} {} {} {} {} {}) | "
+                     "run order 3 epoch/regs 4 infos 5 class/skip 6 vi count 7 payload: {} {} {} {} {} {} {} {}) | "
                      "mode-3 compare ok={} MISMATCH={} | front cycles per draw: member {:.0f} "
                      "normal EmitDraw {:.0f} (n={})",
                      st.members, st.refused, st.why[0], st.why[1], st.why[2], st.why[3],
-                     st.why[4], st.why[5], st.why[6], st.cmp_ok, st.cmp_bad,
+                     st.why[4], st.why[5], st.why[6], st.why[7], st.cmp_ok, st.cmp_bad,
                      st.members ? double(st.c_member) / double(st.members) : 0.0,
                      double(st.c_normal) / double(st.n_normal), st.n_normal);
         }

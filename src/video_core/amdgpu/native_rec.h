@@ -39,8 +39,9 @@ struct Record {
     std::array<u32, 16> ud_ps;
     // Head only, updated by every draw the run takes (final once the command buffer is
     // submitted: the game submits after its jobs finished).
-    u32 count;
-    const u32* end; ///< dword after the run's last trailing NOP
+    // Opus review 7: written by later draws after the head's stamp was published.
+    std::atomic<u32> count;
+    std::atomic<const u32*> end; ///< dword after the run's last trailing NOP
     // Stage a2: what the job thread derived itself through the program table (0: not derived).
     u32 derived;
     u32 flat_vs_dw;
@@ -56,6 +57,11 @@ struct Record {
 constexpr u32 PayloadBits = 23; // 8 MB per thread
 constexpr u64 PayloadSize = u64{1} << PayloadBits;
 inline std::array<std::atomic<u8*>, MaxSlots> g_payloads{};
+/// Opus review 2: per slot, the payload position the job thread has claimed up to (published
+/// before it writes there). A reader's bytes at [pos, ...) are intact iff claim - pos <= size.
+inline std::array<std::atomic<u64>, MaxSlots> g_payload_claim{};
+/// Slot 15 is shared by every thread past the 14th: no records there (review 6).
+constexpr u32 MaxRecordSlot = 14;
 
 /// Program table: (VS hash, PS hash, fetch shader address) -> the pipeline the front looked up
 /// for such a draw. Written by the front only, read lock-free by the job threads.
