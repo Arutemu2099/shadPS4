@@ -736,6 +736,11 @@ private:
         u32 seg_prev_index{};
         bool seg_prev_valid{}, seg_generic_since{};
         u64 seg_native_draws{};
+        /// D breaks by group: 0 viewport, 1 scissor, 2 depth test/write/compare/bounds, 3 depth
+        /// bias, 4 stencil ops, 5 stencil reference, 6 stencil masks, 7 cull / front face,
+        /// 8 blend constants, 9 colour write masks, 10 other (restart / discard / feedback / line).
+        std::array<u64, 11> seg_dgroup{};
+        std::array<u64, 11> seg_prev_g{};
         std::array<u64, 4> rj_fail{};
         std::array<u64, 4> prep_c10{};  ///< verify: close 10 of a prepared member by where
         std::array<u64, 16> prep_stop{};

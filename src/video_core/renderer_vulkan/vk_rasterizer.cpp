@@ -4413,6 +4413,47 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         add(ds.blend_constants.data(), sizeof(ds.blend_constants));
         add(&ds.color_write_masks, sizeof(ds.color_write_masks));
         add(&ds.line_width, sizeof(float));
+        std::array<u64, 11> g{};
+        {
+            const auto gh = [&](u32 gi, const void* p, size_t n) {
+                u64 h = g[gi] ? g[gi] : 0xcbf29ce484222325ull;
+                for (size_t i = 0; i < n; ++i) {
+                    h = mix(h, static_cast<const u8*>(p)[i]);
+                }
+                g[gi] = h;
+            };
+            gh(0, ds.viewports.data(), ds.viewports.size() * sizeof(ds.viewports[0]));
+            gh(1, ds.scissors.data(), ds.scissors.size() * sizeof(ds.scissors[0]));
+            const u32 zf = u32(ds.depth_test_enabled) | u32(ds.depth_write_enabled) << 1 |
+                           u32(ds.depth_bounds_test_enabled) << 2;
+            gh(2, &zf, 4);
+            gh(2, &ds.depth_compare_op, sizeof(ds.depth_compare_op));
+            gh(2, &ds.depth_bounds_min, 4);
+            gh(2, &ds.depth_bounds_max, 4);
+            const u32 bf = ds.depth_bias_enabled;
+            gh(3, &bf, 4);
+            gh(3, &ds.depth_bias_constant, 4);
+            gh(3, &ds.depth_bias_clamp, 4);
+            gh(3, &ds.depth_bias_slope, 4);
+            const u32 sf = ds.stencil_test_enabled;
+            gh(4, &sf, 4);
+            gh(4, &ds.stencil_front_ops, sizeof(ds.stencil_front_ops));
+            gh(4, &ds.stencil_back_ops, sizeof(ds.stencil_back_ops));
+            gh(5, &ds.stencil_front_reference, 4);
+            gh(5, &ds.stencil_back_reference, 4);
+            gh(6, &ds.stencil_front_write_mask, 4);
+            gh(6, &ds.stencil_front_compare_mask, 4);
+            gh(6, &ds.stencil_back_write_mask, 4);
+            gh(6, &ds.stencil_back_compare_mask, 4);
+            gh(7, &ds.cull_mode, sizeof(ds.cull_mode));
+            gh(7, &ds.front_face, sizeof(ds.front_face));
+            gh(8, ds.blend_constants.data(), sizeof(ds.blend_constants));
+            gh(9, &ds.color_write_masks, sizeof(ds.color_write_masks));
+            const u32 of = u32(ds.primitive_restart_enable) | u32(ds.rasterizer_discard_enable) << 1 |
+                           u32(ds.feedback_loop_enabled) << 2;
+            gh(10, &of, 4);
+            gh(10, &ds.line_width, 4);
+        }
         u64 hr = 0xcbf29ce484222325ull;
         for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
             hr = mix(hr, regs.color_buffers[cb].Address());
@@ -4425,7 +4466,13 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
                             (b.index_size != st.seg_prev_index ? 16u : 0u);
             st.seg_cont += why == 0;
             ++st.seg_break[why];
+            if (why & 2) {
+                for (u32 gi = 0; gi < 11; ++gi) {
+                    st.seg_dgroup[gi] += g[gi] != st.seg_prev_g[gi];
+                }
+            }
         }
+        st.seg_prev_g = g;
         st.seg_prev_valid = true;
         st.seg_prev_fixed = hf;
         st.seg_prev_dyn = hd;
@@ -5540,6 +5587,13 @@ void Rasterizer::NativeLog() {
                  "| breaks by F fixed / D dynamic values / R render targets / G generic draw "
                  "between / I index type:{}",
                  st.seg_opens, st.seg_cont, sb);
+        LOG_INFO(Render_Vulkan,
+                 "NativeSegDyn: dynamic-value breaks by group: viewport {} scissor {} depth {} "
+                 "bias {} stencil ops {} stencil ref {} stencil masks {} cull/face {} blend const "
+                 "{} write masks {} other {}",
+                 st.seg_dgroup[0], st.seg_dgroup[1], st.seg_dgroup[2], st.seg_dgroup[3],
+                 st.seg_dgroup[4], st.seg_dgroup[5], st.seg_dgroup[6], st.seg_dgroup[7],
+                 st.seg_dgroup[8], st.seg_dgroup[9], st.seg_dgroup[10]);
         LOG_INFO(Render_Vulkan,
                  "NativeSegCensus: pipeline-change closes by F fixed state equal / V vertex "
                  "formats equal / N next native / C context moved (lower case = not):{} | native "
