@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <utility>
 #include <atomic>
 #include <cstring>
 #include <memory>
@@ -164,6 +165,7 @@ enum class RecordType : u16 {
     Diag,       ///< DiagPayload: a diagnostic marker in stream order (SHADPS4_ASC_RING_LATENCY).
     Segment,    ///< SHADPS4_NATIVE_SEGX: SplitSegmentRecord, a segment of native colour members.
     DcbBegin,   ///< SHADPS4_A1: DcbBeginPayload, a top-level guest command buffer starts here.
+    DcbEnd,     ///< SHADPS4_A1: DcbEndPayload, the command buffer's last record came before.
 };
 
 /// Flags for Packet records.
@@ -261,6 +263,19 @@ struct DcbBeginPayload {
     u64 addr;    ///< guest address of the DCB (identification only, never read)
     u32 dwords;  ///< DCB size
     u32 has_ccb; ///< 1: a constant command buffer came with it
+    u32 snap_words; ///< A1=2: the front's register windows follow (DcbSnapWindows), else 0
+    u32 index;      ///< 1-based DCB number (front count)
+};
+/// A1=2 entry snapshot windows (word offset, count), in payload order.
+constexpr std::array<std::pair<u32, u32>, 3> DcbSnapWindows{{
+    {0x2000, 0x1000}, // config + SH
+    {0xA000, 0x400},  // context
+    {0xC000, 0x400},  // uconfig
+}};
+constexpr u32 DcbSnapWords = 0x1000 + 0x400 + 0x400;
+struct DcbEndPayload {
+    u32 index; ///< the DcbBegin's index
+    u32 pad;
 };
 /// Diagnostic marker (never emitted unless a diagnostic flag is on).
 struct DiagPayload {
@@ -496,6 +511,28 @@ public:
         Sync(reason);
     }
 
+    /// SHADPS4_A2 (front): unmasked ring position of the record reserved last.
+    [[nodiscard]] u64 LastRecordPos() const noexcept {
+        return last_record_pos;
+    }
+    /// SHADPS4_A2 (any thread): the published record at `pos` (Wrap records skipped, `pos`
+    /// moved past them). The caller guarantees `pos` lies in published, not yet done records.
+    const RecordHeader* RecordAtPos(u64& pos) const {
+        for (;;) {
+            const auto* header = reinterpret_cast<const RecordHeader*>(storage + (pos & mask));
+            if (header->type != RecordType::Wrap) {
+                return header;
+            }
+            pos += header->size;
+        }
+    }
+    /// SHADPS4_A1: publishes everything committed without counting a post or waiting.
+    void PublishNow() {
+        Publish();
+    }
+    /// SHADPS4_A1: complete DCBs the front has published (front writes after the publish).
+    std::atomic<u64> dcb_ends_published{0};
+
     /// The front thread is about to return; lets the back leave its loop.
     void FrontExited();
     /// Posts a Retire record and publishes it (run-ahead POST_TASK_DONE).
@@ -515,6 +552,9 @@ public:
     const RecordHeader* PeekAt(u64& pos);
     /// Releases the record returned by Next() and reports it executed.
     void Done(const RecordHeader* record);
+    /// SHADPS4_A2: releases every record from the one Next() returned up to `end_pos`
+    /// (unmasked, one past the last) and reports them executed through `last_seq`.
+    void DoneThrough(u64 end_pos, u64 last_seq);
     /// Returns when a record is published, `num_commands` is non-zero, `stoken` is stopped or the
     /// front has exited (or spuriously).
     void WaitForWork(const std::atomic<u32>& num_commands, const std::stop_token& stoken);
@@ -563,6 +603,7 @@ private:
     // Producer side (front). Written only by the front.
     alignas(64) std::atomic<u64> write_pos{0}; ///< Published end, seq_cst store.
     u64 reserve_pos{0};
+    u64 last_record_pos{0}; ///< SHADPS4_A2
     u64 committed_pos{0};
     u64 committed_seq{0};
     bool reg_batch{false};

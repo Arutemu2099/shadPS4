@@ -5133,6 +5133,51 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
     return true;
 }
 
+void Rasterizer::A2BeginStretch(const GraphicsPipeline* pipeline) {
+    if (native_batch.open) {
+        NativeClose(15);
+    }
+    draw_repeat.valid = false;
+    rs_memo.valid = false;
+    PrepareRenderState(pipeline);
+    const RenderState state = BeginRendering(pipeline);
+    scheduler.BeginRendering(state);
+}
+
+void Rasterizer::A2EndStretch() {
+    ResetBindings();
+    auto& ds = scheduler.GetDynamicState();
+    ds.Invalidate();
+    ds.vertex_input_unknown = true;
+    ds.packet_state_unknown = true;
+    GraphicsBindTracker::Invalidate();
+    scheduler.InvalidateNativeHeaps();
+    viewport_epoch = 0;
+    if (native_pt_on) {
+        fault_process_pending = true; // the pt shaders may have flagged pages
+    }
+}
+
+void Rasterizer::A2GlobalBarrier() {
+    scheduler.EndRendering();
+    scheduler.Record([](vk::CommandBuffer cmdbuf) {
+        const vk::MemoryBarrier2 barrier{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &barrier,
+        });
+    });
+}
+
+bool Rasterizer::A2OcclusionOpen() const {
+    return occlusion && occlusion->Open();
+}
+
 void Rasterizer::NativeClose(u32 why) {
     native_batch.open = false;
     native_batch.cand_valid = false;

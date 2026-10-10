@@ -40,6 +40,7 @@
 #include "common/readback_offload.h"
 #include "video_core/amdgpu/split_hazard.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/vk_a2.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/amdgpu/mtb_census.h"
@@ -189,8 +190,64 @@ static const int g_mtb_p3 = [] {
 /// per-command-buffer census on the back (observation only; every record runs as before).
 static const int g_a1 = [] {
     const char* value = std::getenv("SHADPS4_A1");
-    return value != nullptr && value[0] == '1' ? 1 : 0;
+    return value != nullptr && (value[0] == '1' || value[0] == '2') ? value[0] - '0' : 0;
 }();
+static u32 g_a1_front_index = 0; ///< front only: DCBs begun
+/// SHADPS4_A2 (architecture A step A2, notes/architecture-a-2026-10-10.md sec. 6): 1 workers
+/// translate native stretches, the back publishes them; 2 verify / count (old path for all).
+static const int g_a2 = Vulkan::A2::Mode();
+namespace {
+/// One DCB of the A2 table. state: 0 free, 1 complete (front), 2 a worker translates it,
+/// 3 translated, 4 the back took it (old path, whole DCB).
+struct A2Entry {
+    std::atomic<u32> state{0};
+    std::atomic<u32> index{0};
+    u64 begin_pos{}, end_pos{};
+    std::vector<std::unique_ptr<Vulkan::A2::Stretch>> stretches;
+    /// Per stretch (same order): one past its last draw record, that draw's ctx epoch, and the
+    /// register words written between its first and last draw (final values, in order).
+    struct Side {
+        u64 end_pos{};
+        u64 ctx_epoch{};
+        std::vector<std::pair<u32, u32>> delta;
+    };
+    std::vector<Side> side;
+    u32 refused{}; ///< 1: no snapshot (whole DCB to the back)
+};
+constexpr u32 A2Slots = 256;
+struct A2Counters {
+    u64 dcbs{}, back_dcbs{}, worker_dcbs{}, waits{}, wait_cyc{};
+    u64 translated{}, walked{}, would{}, stretches{}, barriers{}, occl_rejects{};
+    u64 delta_words{}, back_records{}, skipped_records{}, gen_rejects{};
+    u64 snap_cmp{}, snap_bad{};
+    u64 start_ns{}, start_tsc{};
+};
+struct A2State {
+    std::array<A2Entry, A2Slots> e;
+    std::atomic<u32> next_claim{1};
+    std::atomic<u32> published{0}; ///< newest index the front completed (monotonic)
+    std::atomic<bool> stop{false};
+    std::vector<std::jthread> workers;
+    std::vector<Vulkan::A2::StretchTranslator*> translators; ///< for the refusal log
+    bool started{false};
+    // back
+    A2Entry* cur{};
+    bool cur_back{};
+    size_t stretch_i{};
+    bool reject_cur{}; ///< the current stretch runs on the old path (occlusion open)
+    bool gpu_write{true}; ///< a GPU write was recorded since the last global barrier
+    u64 skip_pos{}, skip_seq{}; ///< set by A2Execute: BackLoop releases through here
+    A2Counters c{};
+    // front
+    u64 front_begin_pos{};
+};
+A2State g_a2s;
+u64 A2NowNs() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+} // namespace
 
 void Liverpool::MtbBreakAtPacket(const PM4Header* header) {
     // The DMA_DATA to 0x3022C is skipped by ExecuteGfxPacket: not a sequence point.
@@ -1384,7 +1441,12 @@ void Liverpool::BackLoop(std::stop_token stoken) {
             }
             Common::SampleThreadPlacement("back", 8);
             ExecuteRecord(*record);
-            split->Done(record);
+            if (g_a2s.skip_pos != 0) [[unlikely]] {
+                // SHADPS4_A2: a worker stretch - every record through its last draw at once.
+                split->DoneThrough(std::exchange(g_a2s.skip_pos, 0), g_a2s.skip_seq);
+            } else {
+                split->Done(record);
+            }
             // Guest commands run at record boundaries, as they ran at packet boundaries before.
             if (num_commands.load(std::memory_order_relaxed) != 0 && AscRingLatency())
                 [[unlikely]] {
@@ -1436,6 +1498,7 @@ void Liverpool::BackLoop(std::stop_token stoken) {
         mtb_thread.request_stop();
         mtb_thread.join();
     }
+    A2Shutdown();
     if (rasterizer) {
         rasterizer->GetScheduler().MtbBackExit();
     }
@@ -1788,6 +1851,12 @@ struct A1Census {
     std::array<u64, 32> g_dcbs{}, g_draws{}, g_cyc{}, g_generic{};
     u64 start_ns{}, start_tsc{};
     std::unique_ptr<u32[]> snap; ///< entry snapshot: config + SH, context, uconfig windows
+    u64 begun{}; ///< DCBs begun on the back (whole run, never reset)
+    /// complete DCBs published ahead at each DcbBegin: <0 (this one incomplete), 0, 1, 2, 3-4,
+    /// 5-8, 9-16, 17+
+    std::array<u64, 8> lead{};
+    u64 snap_cmp{}, snap_bad{}, snap_bad_words{};
+    u32 snap_logged{};
 };
 A1Census g_a1c;
 u64 A1NowNs() {
@@ -1863,6 +1932,12 @@ void A1Log(A1Census& c) {
                          whys[i].first);
     }
     LOG_INFO(Render, "A1 first generic draw per dcb, by reason:{}", w);
+    LOG_INFO(Render,
+             "A1 lead (complete dcbs published ahead at each dcb start; <0 = this one "
+             "incomplete): <0={} 0={} 1={} 2={} 3-4={} 5-8={} 9-16={} 17+={} | front snapshot "
+             "verify: compared={} bad={} bad_words={}",
+             c.lead[0], c.lead[1], c.lead[2], c.lead[3], c.lead[4], c.lead[5], c.lead[6],
+             c.lead[7], c.snap_cmp, c.snap_bad, c.snap_bad_words);
     std::string g;
     for (u32 m = 1; m < 32; ++m) {
         if (c.g_dcbs[m] != 0) {
@@ -1877,8 +1952,12 @@ void A1Log(A1Census& c) {
                      "dcbs/draws/generic draws/back-cycle share):{}",
              g);
     auto keep = std::move(c.snap);
+    const u64 begun = c.begun;
+    const u32 logged = c.snap_logged;
     c = A1Census{};
     c.snap = std::move(keep);
+    c.begun = begun;
+    c.snap_logged = logged;
     c.start_ns = now;
     c.start_tsc = tsc;
 }
@@ -1949,6 +2028,39 @@ void Liverpool::A1Execute(const CpSplit::RecordHeader& record) {
         c.snap_cyc += __rdtsc() - t0;
         ++c.snap_n;
         c.cur.open = true;
+        ++c.begun;
+        if (split) {
+            const s64 ahead =
+                s64(split->dcb_ends_published.load(std::memory_order_acquire)) - s64(c.begun);
+            const u32 li = ahead < 0 ? 0 : ahead == 0 ? 1 : ahead == 1 ? 2 : ahead == 2 ? 3
+                         : ahead <= 4 ? 4 : ahead <= 8 ? 5 : ahead <= 16 ? 6 : 7;
+            ++c.lead[li];
+        }
+        const auto& bp = *reinterpret_cast<const CpSplit::DcbBeginPayload*>(&record + 1);
+        if (bp.snap_words == CpSplit::DcbSnapWords) {
+            const u32* fs = reinterpret_cast<const u32*>(&bp + 1);
+            ++c.snap_cmp;
+            u32 bad = 0;
+            for (const auto& [off, n] : CpSplit::DcbSnapWindows) {
+                for (u32 i = 0; i < n; ++i) {
+                    if (fs[i] != r[off + i]) [[unlikely]] {
+                        ++bad;
+                        if (c.snap_logged < 40) {
+                            ++c.snap_logged;
+                            LOG_WARNING(Render,
+                                        "A1 snapshot mismatch dcb {} reg {:#x}: front {:#x} "
+                                        "back {:#x}",
+                                        bp.index, off + i, fs[i], r[off + i]);
+                        }
+                    }
+                }
+                fs += n;
+            }
+            if (bad != 0) {
+                ++c.snap_bad;
+                c.snap_bad_words += bad;
+            }
+        }
         return;
     }
     auto& d = c.cur;
@@ -2048,7 +2160,460 @@ void Liverpool::A1Execute(const CpSplit::RecordHeader& record) {
     }
 }
 
+namespace {
+/// Context-register windows a render pass depends on (DB, window / generic scissors, colour
+/// control, CB): a change ends a worker stretch (the back begins rendering once per stretch).
+constexpr std::array<std::pair<u32, u32>, 4> A2RenderWindows{{
+    {0x000, 0x020}, {0x080, 0x0A0}, {0x200, 0x210}, {0x318, 0x390}}};
+
+u64 A2RenderKey(const Regs& regs, const Vulkan::GraphicsPipeline* pipeline) {
+    u64 h = 0xcbf29ce484222325ull;
+    const auto mix = [&](const void* p, size_t n) {
+        const auto* b = static_cast<const u8*>(p);
+        for (size_t i = 0; i < n; ++i) {
+            h = (h ^ b[i]) * 0x100000001B3ull;
+        }
+    };
+    for (const auto& [lo, hi] : A2RenderWindows) {
+        mix(&regs.reg_array[Regs::ContextRegWordOffset + lo], (hi - lo) * sizeof(u32));
+    }
+    const auto& k = pipeline->GetGraphicsKey();
+    mix(&k.num_color_attachments, sizeof(k.num_color_attachments));
+    mix(k.color_buffers.data(), sizeof(k.color_buffers));
+    mix(&k.num_samples, sizeof(k.num_samples));
+    mix(&k.depth_samples, sizeof(k.depth_samples));
+    mix(k.color_samples.data(), sizeof(k.color_samples));
+    mix(&k.mrt_mask, sizeof(k.mrt_mask));
+    const u32 z = static_cast<u32>(k.z_format) | static_cast<u32>(k.stencil_format) << 4;
+    mix(&z, sizeof(z));
+    return h;
+}
+
+bool A2NoopDma(const CpSplit::RecordHeader& record) {
+    if (record.flags & CpSplit::AscReleaseMem) {
+        return false;
+    }
+    const auto* header = reinterpret_cast<const PM4Header*>(&record + 1);
+    const auto* dma = reinterpret_cast<const PM4DmaData*>(header);
+    return header->type3.opcode == PM4ItOpcode::DmaData && dma->dst_addr_lo == 0x3022C;
+}
+
+void A2Log() {
+    auto& g = g_a2s;
+    auto& c = g.c;
+    const u64 now = A2NowNs();
+    const u64 tsc = __rdtsc();
+    const double s = double(now - c.start_ns) * 1e-9;
+    const double tpn = now > c.start_ns ? double(tsc - c.start_tsc) / double(now - c.start_ns) : 3.5;
+    const u64 all = c.translated + c.walked;
+    std::array<u64, 32> refusals{};
+    for (const auto* t : g.translators) {
+        for (u32 i = 0; i < 32; ++i) {
+            refusals[i] += t->refusals[i];
+        }
+    }
+    std::string rf;
+    for (u32 i = 0; i < 32; ++i) {
+        if (refusals[i] != 0) {
+            rf += fmt::format(" '{}'={}", Vulkan::A2::RefusalName(i), refusals[i]);
+        }
+    }
+    LOG_INFO(Render,
+             "A2 (mode {}): window {:.1f}s | back-TRANSLATED draw records/s={:.0f} back-walked "
+             "(worker) draw records/s={:.0f} fallback share={:.3f} | stretches/s={:.0f} "
+             "draws/stretch={:.1f} | dcbs/s={:.0f} taken whole by the back={} by workers={} | back "
+             "waits on workers {} ({:.2f} ms/s) | global barriers/s={:.0f} occlusion rejects={} | "
+             "front snapshot verify {} bad {} | verify-mode would-walk {} | back records/s {:.0f} "
+             "(records released in bulk/s {:.0f}, delta words per stretch {:.1f}) | buffer-structure "
+             "rejects {} | worker "
+             "refusals "
+             "(cumulative):{}",
+             g_a2, s, s > 0 ? double(c.translated) / s : 0.0, s > 0 ? double(c.walked) / s : 0.0,
+             all ? double(c.translated) / double(all) : 0.0, s > 0 ? double(c.stretches) / s : 0.0,
+             c.stretches ? double(c.walked) / double(c.stretches) : 0.0,
+             s > 0 ? double(c.dcbs) / s : 0.0, c.back_dcbs, c.worker_dcbs, c.waits,
+             s > 0 ? double(c.wait_cyc) / tpn * 1e-6 / s : 0.0,
+             s > 0 ? double(c.barriers) / s : 0.0, c.occl_rejects, c.snap_cmp, c.snap_bad, c.would,
+             s > 0 ? double(c.back_records) / s : 0.0, s > 0 ? double(c.skipped_records) / s : 0.0,
+             c.stretches ? double(c.delta_words) / double(c.stretches) : 0.0, c.gen_rejects, rf);
+    c = A2Counters{};
+    c.start_ns = now;
+    c.start_tsc = tsc;
+}
+} // namespace
+
+void Liverpool::A2WorkerLoop(std::stop_token stoken, u32 index) {
+    Common::SetCurrentThreadName(fmt::format("shadPS4:A2Worker{}", index).c_str());
+    auto& g = g_a2s;
+    auto arena = std::make_unique<Vulkan::A2::Arena>();
+    Vulkan::A2::WorkerContext ctx{};
+    ctx.instance = &rasterizer->A2Instance();
+    ctx.scheduler = &rasterizer->GetScheduler();
+    ctx.buffer_cache = &rasterizer->A2BufferCache();
+    ctx.arena = arena.get();
+    ctx.worker_index = index;
+    Vulkan::A2::StretchTranslator tr{ctx};
+    {
+        static std::mutex reg_mutex;
+        std::scoped_lock lock{reg_mutex};
+        g.translators.push_back(&tr);
+    }
+    auto regs = std::make_unique<Regs>();
+    std::array<Shader::BoundStage, Shader::MaxStageTypes> stages{};
+    while (!stoken.stop_requested() && !g.stop.load(std::memory_order_acquire)) {
+        const u32 idx = g.next_claim.fetch_add(1, std::memory_order_acq_rel);
+        // Wait until the front completed `idx` (published counts DCB ends in order).
+        for (u32 spins = 0; g.published.load(std::memory_order_acquire) < idx;) {
+            if (stoken.stop_requested() || g.stop.load(std::memory_order_acquire)) {
+                return;
+            }
+            if (++spins < 2048) {
+                _mm_pause();
+            } else {
+                const u32 seen = g.published.load(std::memory_order_acquire);
+                if (seen < idx) {
+                    g.published.wait(seen, std::memory_order_acquire);
+                }
+            }
+        }
+        auto& e = g.e[idx % A2Slots];
+        u32 expect = 1;
+        if (e.index.load(std::memory_order_acquire) != idx ||
+            !e.state.compare_exchange_strong(expect, 2, std::memory_order_acq_rel)) {
+            continue; // the back took it
+        }
+        e.stretches.clear();
+        e.side.clear();
+        e.refused = 0;
+        u64 pos = e.begin_pos;
+        const auto* h = split->RecordAtPos(pos);
+        const auto& bp = *reinterpret_cast<const CpSplit::DcbBeginPayload*>(h + 1);
+        if (h->type != CpSplit::RecordType::DcbBegin || bp.index != idx ||
+            bp.snap_words != CpSplit::DcbSnapWords) {
+            e.refused = 1;
+            e.state.store(3, std::memory_order_release);
+            e.state.notify_all();
+            continue;
+        }
+        {
+            const u32* fs = reinterpret_cast<const u32*>(&bp + 1);
+            for (const auto& [off, n] : CpSplit::DcbSnapWindows) {
+                std::memcpy(&regs->reg_array[off], fs, size_t{n} * sizeof(u32));
+                fs += n;
+            }
+        }
+        pos += h->size;
+        u64 key = 0;
+        bool open = false;
+        bool occlusion = false;
+        std::vector<u32> pending;               // words written since the last taken draw
+        std::vector<std::pair<u32, u32>> delta; // committed through the last taken draw
+        u64 last_end = 0, last_epoch = 0;
+        const auto end_stretch = [&] {
+            if (open) {
+                if (auto s = tr.EndStretch()) {
+                    e.stretches.push_back(std::move(s));
+                    e.side.push_back({last_end, last_epoch, std::move(delta)});
+                }
+                open = false;
+            }
+            pending.clear();
+            delta.clear();
+        };
+        for (;;) {
+            h = split->RecordAtPos(pos);
+            if (pos == e.end_pos || h->type == CpSplit::RecordType::DcbEnd) {
+                break;
+            }
+            const auto* payload = reinterpret_cast<const u8*>(h + 1);
+            switch (h->type) {
+            case CpSplit::RecordType::RegWrite: {
+                const u8* end = reinterpret_cast<const u8*>(h) + h->size;
+                const u8* p = payload;
+                while (p + sizeof(CpSplit::RegWritePayload) <= end) {
+                    const auto* w = reinterpret_cast<const CpSplit::RegWritePayload*>(p);
+                    if (w->count == 0) {
+                        break;
+                    }
+                    std::memcpy(&regs->reg_array[w->word_offset], w + 1,
+                                size_t{w->count} * sizeof(u32));
+                    if (open) {
+                        for (u32 i = 0; i < w->count; ++i) {
+                            pending.push_back(w->word_offset + i);
+                        }
+                    }
+                    p += sizeof(CpSplit::RegWritePayload) + size_t{w->count} * sizeof(u32);
+                }
+                break;
+            }
+            case CpSplit::RecordType::ClearState:
+                end_stretch(); // the back must see it (a whole-mirror reset)
+                regs->SetDefaults();
+                break;
+            case CpSplit::RecordType::Draw: {
+                const auto& rec = *reinterpret_cast<const SplitDrawRecord*>(payload);
+                stages = {};
+                const u8* stages_end =
+                    ReadStages(reinterpret_cast<const u8*>(&rec + 1), rec.stage_count, stages);
+                Vulkan::A2::DrawIn in{};
+                in.pipeline = rec.draw.pipeline;
+                in.is_indexed = rec.draw.args.is_indexed;
+                in.is_indirect = rec.draw.args.is_indirect;
+                in.index_offset = rec.draw.args.index_offset;
+                in.stages = &stages;
+                in.vi = rec.vi_bytes != 0
+                            ? reinterpret_cast<const CpSplit::VertexInputsPayload*>(stages_end)
+                            : nullptr;
+                in.job_tag = rec.job_tag;
+                in.job_idx = rec.job_idx;
+                in.job_cmd = rec.cmd_address;
+                in.seq = h->seq;
+                if (occlusion || !in.pipeline || rec.marker || rec.verify != 0) {
+                    end_stretch();
+                    break;
+                }
+                const u64 k = A2RenderKey(*regs, in.pipeline);
+                if (open && k != key) {
+                    end_stretch();
+                }
+                if (tr.TakeDraw(*regs, in)) {
+                    if (!open) {
+                        open = true;
+                        key = k;
+                        pending.clear();
+                        delta.clear();
+                    }
+                    // The words written before this draw inside the stretch are the back's
+                    // to apply (it skips their records); later ones stay pending.
+                    for (const u32 off : pending) {
+                        delta.emplace_back(off, regs->reg_array[off]);
+                    }
+                    pending.clear();
+                    last_end = pos + h->size;
+                    last_epoch = rec.ctx_epoch;
+                } else {
+                    end_stretch();
+                }
+                break;
+            }
+            case CpSplit::RecordType::Packet:
+                if (!A2NoopDma(*h)) {
+                    // A ZPASS_DONE counter dump opens / closes occlusion wrapping: the rest of
+                    // this DCB stays on the old path (the back decides per draw).
+                    const auto* ph = reinterpret_cast<const PM4Header*>(payload);
+                    if (ph->type3.opcode == PM4ItOpcode::EventWrite) {
+                        occlusion = true;
+                    }
+                    end_stretch();
+                }
+                break;
+            default: // Extent, EpochBump, Call, Dispatch, Segment, Retire, Diag: a boundary
+                end_stretch();
+                break;
+            }
+            pos += h->size;
+        }
+        end_stretch();
+        e.state.store(3, std::memory_order_release);
+        e.state.notify_all();
+    }
+}
+
+void Liverpool::A2Shutdown() {
+    auto& g = g_a2s;
+    if (!g.started) {
+        return;
+    }
+    g.stop.store(true, std::memory_order_release);
+    g.published.fetch_add(0x40000000u, std::memory_order_acq_rel); // wake every waiter
+    g.published.notify_all();
+    for (auto& t : g.workers) {
+        t.request_stop();
+    }
+    g.workers.clear(); // joins
+}
+
+void Liverpool::A2Execute(const CpSplit::RecordHeader& record) {
+    using RT = CpSplit::RecordType;
+    auto& g = g_a2s;
+    auto& c = g.c;
+    if (!g.started && rasterizer) [[unlikely]] {
+        g.started = true;
+        c.start_ns = A2NowNs();
+        c.start_tsc = __rdtsc();
+        const u32 n = Vulkan::A2::NumWorkers();
+        for (u32 i = 0; i < n; ++i) {
+            g.workers.emplace_back(std::bind_front(&Liverpool::A2WorkerLoop, this), i);
+        }
+        LOG_INFO(Render, "A2: {} stretch workers started (mode {})", n, g_a2);
+    }
+    const auto release_cur = [&] {
+        if (g.cur) {
+            for (auto& s : g.cur->stretches) {
+                if (s && s->tick && s->tick->load(std::memory_order_relaxed) == 0) {
+                    s->tick->store(1, std::memory_order_release); // never published: free
+                }
+            }
+            g.cur->stretches.clear();
+            g.cur->state.store(0, std::memory_order_release);
+            g.cur = nullptr;
+        }
+    };
+    switch (record.type) {
+    case RT::DcbBegin: {
+        release_cur();
+        const auto& bp = *reinterpret_cast<const CpSplit::DcbBeginPayload*>(&record + 1);
+        const u32 idx = bp.index;
+        if (g_a2 == 2 && bp.snap_words == CpSplit::DcbSnapWords) {
+            // The entry-state verify: the front's windows = the back's mirror here.
+            const u32* fs = reinterpret_cast<const u32*>(&bp + 1);
+            bool bad = false;
+            for (const auto& [off, n] : CpSplit::DcbSnapWindows) {
+                bad = bad || std::memcmp(fs, &mirror->regs.reg_array[off], size_t{n} * 4) != 0;
+                fs += n;
+            }
+            ++c.snap_cmp;
+            c.snap_bad += bad;
+        }
+        auto& e = g.e[idx % A2Slots];
+        for (u32 spins = 0;;) {
+            u32 st = e.state.load(std::memory_order_acquire);
+            if (st == 0) {
+                // Not complete yet (the front is still parsing it): the back takes it.
+                e.index.store(idx, std::memory_order_release);
+                if (e.state.compare_exchange_strong(st, 4, std::memory_order_acq_rel)) {
+                    g.cur_back = true;
+                    break;
+                }
+                continue;
+            }
+            if (e.index.load(std::memory_order_acquire) != idx) {
+                // A stale entry of index idx - A2Slots (cannot happen: the back releases at
+                // DcbEnd). Take the DCB on the old path.
+                g.cur_back = true;
+                break;
+            }
+            if (st == 1) {
+                if (e.state.compare_exchange_strong(st, 4, std::memory_order_acq_rel)) {
+                    g.cur_back = true;
+                    break;
+                }
+                continue;
+            }
+            if (st == 3 || st == 4) {
+                g.cur_back = st == 4 || e.refused != 0;
+                break;
+            }
+            // st == 2: a worker is translating it.
+            if (spins == 0) {
+                ++c.waits;
+            }
+            const u64 t0 = __rdtsc();
+            if (++spins < 4096) {
+                _mm_pause();
+            } else {
+                e.state.wait(2, std::memory_order_acquire);
+            }
+            c.wait_cyc += __rdtsc() - t0;
+        }
+        g.cur = &e;
+        g.stretch_i = 0;
+        g.reject_cur = false;
+        ++c.dcbs;
+        ++(g.cur_back ? c.back_dcbs : c.worker_dcbs);
+        if (c.dcbs >= 65536) {
+            A2Log();
+        }
+        return;
+    }
+    case RT::DcbEnd:
+        release_cur();
+        return;
+    case RT::Draw: {
+        if (g.cur && !g.cur_back && g.stretch_i < g.cur->stretches.size()) {
+            auto& s = *g.cur->stretches[g.stretch_i];
+            if (record.seq >= s.first_seq && record.seq <= s.last_seq) {
+                const auto& rec = *reinterpret_cast<const SplitDrawRecord*>(&record + 1);
+                if (record.seq == s.first_seq) {
+                    const bool occl = rasterizer->A2OcclusionOpen();
+                    // A buffer created / deleted / joined since the worker's lookups: its VkBuffer
+                    // handles may be stale (A2LookupBuffer reads slots without a lock).
+                    const bool gen_moved =
+                        rasterizer->A2BufferCache().StructGeneration() != s.buf_gen;
+                    g.reject_cur = g_a2 == 2 || occl || gen_moved;
+                    c.occl_rejects += g_a2 == 1 && occl;
+                    c.gen_rejects += g_a2 == 1 && gen_moved && !occl;
+                    if (!g.reject_cur) {
+                        rasterizer->GetScheduler().SwitchStream(0);
+                        if (g.gpu_write) {
+                            rasterizer->A2GlobalBarrier();
+                            g.gpu_write = false;
+                            ++c.barriers;
+                        }
+                        mirror->ctx_epoch = rec.ctx_epoch;
+                        rasterizer->A2BeginStretch(rec.draw.pipeline);
+                        auto& sched = rasterizer->GetScheduler();
+                        sched.Record([cmds = s.cmds, inst = &rasterizer->A2Instance()](
+                                         vk::CommandBuffer cmdbuf) {
+                            Vulkan::A2::Replay(*cmds, cmdbuf, *inst);
+                        });
+                        s.tick->store(sched.CurrentTick(), std::memory_order_release);
+                        rasterizer->A2EndStretch();
+                        // The stretch's register writes (its records are never visited), after the
+                        // pass was resolved from the mirror at its first draw.
+                        const auto& sd = g.cur->side[g.stretch_i];
+                        for (const auto& [off, val] : sd.delta) {
+                            mirror->regs.reg_array[off] = val;
+                        }
+                        mirror->ctx_epoch = sd.ctx_epoch;
+                        c.delta_words += sd.delta.size();
+                        ++c.stretches;
+                        c.walked += s.draws;
+                        ++c.back_records;
+                        g.skip_pos = sd.end_pos;
+                        g.skip_seq = s.last_seq;
+                        c.skipped_records += s.last_seq - record.seq;
+                        ++g.stretch_i;
+                        return;
+                    }
+                }
+                if (record.seq == s.last_seq) {
+                    ++g.stretch_i;
+                }
+                // Rejected / verify: the old path runs the draw.
+                c.would += g_a2 == 2 ? 1 : 0;
+            }
+        }
+        ++c.translated;
+        ++c.back_records;
+        ExecuteRecordImpl(record);
+        return;
+    }
+    case RT::Dispatch:
+    case RT::Call:
+        g.gpu_write = true;
+        ++c.back_records;
+        ExecuteRecordImpl(record);
+        return;
+    case RT::Packet:
+        if (!A2NoopDma(record)) {
+            g.gpu_write = true;
+        }
+        ++c.back_records;
+        ExecuteRecordImpl(record);
+        return;
+    default:
+        ++c.back_records;
+        ExecuteRecordImpl(record);
+        return;
+    }
+}
+
 void Liverpool::ExecuteRecord(const CpSplit::RecordHeader& record) {
+    if (g_a2 != 0) [[unlikely]] {
+        A2Execute(record);
+        return;
+    }
     if (g_a1 != 0) [[unlikely]] {
         A1Execute(record);
         return;
@@ -2280,6 +2845,7 @@ void Liverpool::ExecuteRecordImpl(const CpSplit::RecordHeader& record) {
         break;
     }
     case CpSplit::RecordType::DcbBegin:
+    case CpSplit::RecordType::DcbEnd:
         break; // SHADPS4_A1: bookkeeping in A1Execute
     case CpSplit::RecordType::Diag:
         if (AscRingBack(*reinterpret_cast<const CpSplit::DiagPayload*>(payload)) && rasterizer) {
@@ -2306,6 +2872,7 @@ int Liverpool::NativePeekNextDraw(const void* pipeline) {
         case CpSplit::RecordType::RegWrite:
         case CpSplit::RecordType::Diag:
         case CpSplit::RecordType::DcbBegin:
+        case CpSplit::RecordType::DcbEnd:
             pos += next->size;
             continue;
         case CpSplit::RecordType::Draw: {
@@ -6194,12 +6761,27 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             SegB::NoteSubmit();
         }
     }
-    if (!is_indirect_gfx && split_enabled && g_a1 != 0) [[unlikely]] {
+    if (!is_indirect_gfx && split_enabled && (g_a1 != 0 || g_a2 != 0)) [[unlikely]] {
         // Architecture A step A1: the game's top-level command buffer is the unit of work.
-        auto* begin = split->Reserve<CpSplit::DcbBeginPayload>(CpSplit::RecordType::DcbBegin);
+        const u32 snap_words = (g_a1 == 2 || g_a2 != 0) ? CpSplit::DcbSnapWords : 0u;
+        auto* begin = split->Reserve<CpSplit::DcbBeginPayload>(
+            CpSplit::RecordType::DcbBegin,
+            static_cast<u32>(sizeof(CpSplit::DcbBeginPayload) + snap_words * sizeof(u32)));
         begin->addr = reinterpret_cast<u64>(dcb.data());
         begin->dwords = static_cast<u32>(dcb.size());
         begin->has_ccb = ccb.empty() ? 0u : 1u;
+        begin->snap_words = snap_words;
+        begin->index = ++g_a1_front_index;
+        g_a2s.front_begin_pos = split->LastRecordPos();
+        if (snap_words != 0) {
+            // The front's live register file at the DCB start = the back's mirror once it has
+            // applied every record before this one (verified on the back).
+            u32* out = reinterpret_cast<u32*>(begin + 1);
+            for (const auto& [off, n] : CpSplit::DcbSnapWindows) {
+                std::memcpy(out, &regs.reg_array[off], size_t{n} * sizeof(u32));
+                out += n;
+            }
+        }
         split->Commit();
     }
     SplitSpanScope split_span{*this, &dcb,
@@ -7011,6 +7593,34 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         ce_task.handle.destroy();
     }
 
+    if (!is_indirect_gfx && split_enabled && (g_a1 != 0 || g_a2 != 0)) [[unlikely]] {
+        auto* end = split->Reserve<CpSplit::DcbEndPayload>(CpSplit::RecordType::DcbEnd);
+        end->index = g_a1_front_index;
+        end->pad = 0;
+        const u64 end_pos = split->LastRecordPos();
+        split->Commit();
+        split->PublishNow();
+        split->dcb_ends_published.fetch_add(1, std::memory_order_release);
+        if (g_a2 != 0) {
+            // The DCB is complete and published: hand it to the workers (A2 table).
+            const u32 idx = g_a1_front_index;
+            auto& e = g_a2s.e[idx % A2Slots];
+            for (u32 spins = 0;; ++spins) {
+                const u32 st = e.state.load(std::memory_order_acquire);
+                if (st == 0 || (st == 4 && e.index.load(std::memory_order_acquire) == idx)) {
+                    break;
+                }
+                spins < 4096 ? _mm_pause() : std::this_thread::yield();
+            }
+            e.begin_pos = g_a2s.front_begin_pos;
+            e.end_pos = end_pos;
+            e.index.store(idx, std::memory_order_release);
+            u32 expect = 0;
+            e.state.compare_exchange_strong(expect, 1, std::memory_order_acq_rel);
+            g_a2s.published.store(idx, std::memory_order_release);
+            g_a2s.published.notify_all();
+        }
+    }
     FIBER_EXIT;
 }
 

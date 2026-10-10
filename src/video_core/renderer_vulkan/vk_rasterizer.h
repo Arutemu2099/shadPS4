@@ -210,6 +210,20 @@ public:
     [[nodiscard]] const char* A1TakeWhy() noexcept {
         return std::exchange(native_stats.last_why, nullptr);
     }
+    /// SHADPS4_A2 (back thread): a worker stretch starts at this draw - closes any native batch,
+    /// resolves the render targets for `pipeline` from the back's mirror and begins rendering.
+    void A2BeginStretch(const GraphicsPipeline* pipeline);
+    /// After the stretch's commands: every tracked command-buffer state is unknown.
+    void A2EndStretch();
+    /// Ends rendering and records one global memory barrier (writes -> any access).
+    void A2GlobalBarrier();
+    [[nodiscard]] bool A2OcclusionOpen() const;
+    [[nodiscard]] const Instance& A2Instance() const noexcept {
+        return instance;
+    }
+    [[nodiscard]] VideoCore::BufferCache& A2BufferCache() noexcept {
+        return buffer_cache;
+    }
     /// Back thread: runs a dispatch the front looked up. The caller points
     /// Liverpool::BackCsRegs() at the record's ComputeProgram snapshot.
     void ExecuteDispatch(const ComputePipeline* pipeline,

@@ -195,6 +195,32 @@ public:
     /// SHADPS4_NATIVE_REC_PREP: the existing buffer holding `addr` (page table only: no
     /// creation, merge or sync), or nullptr.
     const Buffer* NativeBufferAt(VAddr addr);
+    /// A2: lock-free, read-only lookup for the A2 worker threads (vk_a2.cpp): the cached buffer
+    /// holding `addr`, or null. Reads the page table's second-level page with an acquire load
+    /// (the CP publishes it with release), the entry's id as a plain word (the CP's page-table
+    /// edits are plain stores: a torn or stale id is caught by the bounds check below and by
+    /// the back's StructGeneration check at publish, which refuses a stretch whose lookups
+    /// predate a buffer delete / join), and the Buffer in the stable SlotVector (objects keep
+    /// their address until erased, commit d1ba1774). Mutates nothing; never creates, merges or
+    /// syncs. `is_deleted` is read racily too (same publish-time guard).
+    [[nodiscard]] const Buffer* A2LookupBuffer(VAddr addr) const noexcept {
+        if (addr == 0) {
+            return nullptr;
+        }
+        const PageData* entry = page_table.find_acquire(addr >> CACHING_PAGEBITS);
+        if (!entry) {
+            return nullptr;
+        }
+        const BufferId id = entry->buffer_id;
+        if (!id || id.index >= Common::StableSlotCapacity) {
+            return nullptr;
+        }
+        const Buffer& found = slot_buffers[id];
+        if (found.is_deleted || !found.IsInBounds(addr, 1)) {
+            return nullptr;
+        }
+        return &found;
+    }
     const Buffer* NativeRunSpan(VAddr lo, VAddr hi, NativeRunAccess access,
                                 boost::container::small_vector<vk::BufferMemoryBarrier2, 16>* barriers,
                                 u64 dispatch_run, bool sync = true, int gpu_mod_hint = -1,

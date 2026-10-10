@@ -244,6 +244,7 @@ void* Channel::Reserve(RecordType type, u32 payload_bytes, u16 flags) {
         reserve_pos = pos;
     }
     WaitForSpace(pos + bytes);
+    last_record_pos = pos;
     auto* header = reinterpret_cast<RecordHeader*>(storage + (pos & mask));
     *header = RecordHeader{type, flags, bytes, ++emitted};
     reserve_pos = pos + bytes;
@@ -592,6 +593,13 @@ void Channel::Done(const RecordHeader* record) {
         return;
     }
     PublishDone(seq);
+}
+
+void Channel::DoneThrough(u64 end_pos, u64 last_seq) {
+    read = end_pos;
+    read_pos.store(read, std::memory_order_release);
+    pending_done = last_seq;
+    PublishDone(last_seq);
 }
 
 void Channel::PublishDone(u64 seq) {
