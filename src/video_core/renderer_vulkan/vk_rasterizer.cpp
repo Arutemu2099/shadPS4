@@ -4855,12 +4855,13 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
                           stream.BufferDeviceAddress() + offset + list_off,
                           reinterpret_cast<u32*>(ptr + list_off));
             b.list = reinterpret_cast<u32*>(ptr + list_off);
-            if (segx_prepared) {
-                const u64 ma = stream.BufferDeviceAddress() + map_off + total - mat_bytes;
-                native_ring_table[Shader::NativeTableSegMat] = static_cast<u32>(ma);
-                native_ring_table[Shader::NativeTableSegMat + 1] = static_cast<u32>(ma >> 32);
-            }
         }
+        // Brick C v3 item 4: the segment's slot table address, 0 for every other batch (written
+        // on every open so no earlier segment's address can survive in the persistent table).
+        const u64 ma =
+            segx_prepared ? stream.BufferDeviceAddress() + map_off + total - mat_bytes : 0;
+        native_ring_table[Shader::NativeTableSegMat] = static_cast<u32>(ma);
+        native_ring_table[Shader::NativeTableSegMat + 1] = static_cast<u32>(ma >> 32);
         std::memcpy(map_ptr, native_ring_table.data(), table_bytes);
     }
     stream.Commit();

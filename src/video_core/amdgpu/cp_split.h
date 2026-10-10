@@ -462,8 +462,8 @@ public:
     /// SHADPS4_NATIVE_SEGX (brick C v3 item 3): while a hold is on, EmitRegWrite / EmitExtent
     /// append to a side buffer instead of the ring, so a Segment record posted later can still
     /// precede them in stream order. ReplayHold re-emits them in order. Reserve() of any record
-    /// other than RegWrite / Extent / Packet / Diag while holding calls the interrupt first (the
-    /// segment builder closes its segment, which takes and replays the hold itself).
+    /// other than RegWrite / Extent / Packet / Diag / Retire while holding calls the interrupt
+    /// first (the segment builder closes its segment, which takes and replays the hold itself).
     void BeginHold();
     bool Holding() const {
         return hold;

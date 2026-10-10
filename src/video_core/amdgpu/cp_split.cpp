@@ -219,7 +219,8 @@ Channel::~Channel() = default;
 void* Channel::Reserve(RecordType type, u32 payload_bytes, u16 flags) {
     ASSERT_MSG(!record_open, "CP split: Reserve before the previous record was committed");
     if (hold && type != RecordType::RegWrite && type != RecordType::Extent &&
-        type != RecordType::Packet && type != RecordType::Diag) [[unlikely]] {
+        type != RecordType::Packet && type != RecordType::Diag && type != RecordType::Retire)
+        [[unlikely]] {
         // Brick C v3 item 3: a record the hold may not reorder against - the segment builder
         // closes its segment (posting the Segment record, then the held journal) first.
         if (hold_cb) {
