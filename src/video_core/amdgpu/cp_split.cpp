@@ -502,7 +502,8 @@ void Channel::WaitForSpace(u64 end) {
     ++counters.full_waits;
     front_waiting.fetch_add(1, std::memory_order_acq_rel);
     for (;;) {
-        cached_read = read_pos.load(std::memory_order_acquire);
+        // The back's read position, held lower by any A2 worker still reading.
+        cached_read = ReadFloor();
         if (end - cached_read <= capacity) {
             front_waiting.fetch_sub(1, std::memory_order_acq_rel);
             return;

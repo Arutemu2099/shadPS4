@@ -197,14 +197,29 @@ static u32 g_a1_front_index = 0; ///< front only: DCBs begun
 /// translate native stretches, the back publishes them; 2 verify / count (old path for all).
 static const int g_a2 = Vulkan::A2::Mode();
 namespace {
-/// One DCB of the A2 table. state: 0 free, 1 complete (front), 2 a worker translates it,
-/// 3 translated, 4 the back took it (old path, whole DCB).
+constexpr u32 A2Slots = 256;
+/// Stretches one DCB can hand over (more: the rest of the DCB runs on the old path, counted).
+constexpr u32 A2MaxStretches = 128;
+/// One DCB of the A2 table. state: 0 free, 1 begun (the front wrote its DcbBegin), 2 a worker
+/// follows it, 3 the worker finished it, 4 the back took it (old path, whole DCB).
+/// The worker hands stretches over while the front still parses the DCB: it fills stretches[k]
+/// and side[k], then ready = k + 1 (release), then progress = the newest draw seq it decided
+/// (every draw up to it is either in one of the first `ready` stretches or on the old path).
 struct A2Entry {
     std::atomic<u32> state{0};
     std::atomic<u32> index{0};
-    u64 begin_pos{}, end_pos{};
-    std::vector<std::unique_ptr<Vulkan::A2::Stretch>> stretches;
-    /// Per stretch (same order): one past its last draw record, that draw's ctx epoch, and the
+    std::atomic<u64> begin_pos{0}; ///< atomic: a worker reads it before its claim (ring hold)
+    u32 refused{}; ///< 1: no snapshot (every draw on the old path)
+    // Written by the worker.
+    alignas(64) std::atomic<u32> ready{0};
+    std::atomic<u64> progress{0};
+    std::atomic<u64> walked{0}; ///< ring position the worker last waited at (caught up there)
+    // Written by the back.
+    alignas(64) std::atomic<u64> back_wait{0}; ///< draw seq the back waits for (0 none)
+    std::atomic<u32> cancel{0}; ///< safety net: the worker stops, the rest runs on the old path
+    /// Fixed size A2MaxStretches (sized once at start; never reallocated under the back's reads).
+    alignas(64) std::vector<std::unique_ptr<Vulkan::A2::Stretch>> stretches;
+    /// Per stretch (same index): one past its last draw record, that draw's ctx epoch, and the
     /// register words written between its first and last draw (final values, in order).
     struct Side {
         u64 end_pos{};
@@ -213,28 +228,31 @@ struct A2Entry {
         u64 render_key{}; ///< full A2RenderKey at the stretch's first draw (A2=2 verify)
     };
     std::vector<Side> side;
-    u32 refused{}; ///< 1: no snapshot (whole DCB to the back)
 };
-constexpr u32 A2Slots = 256;
 struct A2Counters {
     u64 dcbs{}, back_dcbs{}, worker_dcbs{}, waits{}, wait_cyc{};
     u64 translated{}, walked{}, would{}, stretches{}, barriers{}, occl_rejects{};
     u64 delta_words{}, back_records{}, skipped_records{}, gen_rejects{};
-    u64 steal_incomplete{}, steal_unclaimed{};
+    u64 steal_unclaimed{};
     u64 wait_complete{}, wait_complete_cyc{}, steal_front_waits{}, steal_timeout{};
     u64 rk_cmp{}, rk_bad{}, whole_stale{}, whole_refused{}, whole_st4{};
     u64 snap_cmp{}, snap_bad{};
+    u64 dwait_behind{}, dwait_behind_cyc{}, end_waits{}, end_wait_cyc{}, net_cancel{};
     u64 start_ns{}, start_tsc{};
 };
 struct A2State {
     std::array<A2Entry, A2Slots> e;
     std::atomic<u32> next_claim{1};
-    std::atomic<u32> published{0}; ///< newest index the front completed (monotonic)
+    std::atomic<u32> begun{0};     ///< newest index the front began (monotonic)
+    std::atomic<u32> published{0}; ///< newest index the front completed (diagnostics)
     std::atomic<bool> stop{false};
     std::atomic<u64> worker_cyc{0}, worker_dcbs{0}, worker_draws{0}; ///< worker-side totals
     std::atomic<u64> take_cyc{0}; ///< inside StretchTranslator::TakeDraw
     std::atomic<u64> publish_wait_cyc{0}; ///< workers waiting for the front's next DCB
-    /// Per worker: the DCB it holds (0 none) | phase << 28 (1 waits for the front, 2 translates).
+    std::atomic<u64> record_wait_cyc{0};  ///< workers caught up, waiting for the next record
+    std::atomic<u64> cuts_back{0}, cuts_front{0}, cap_hits{0}, seq_breaks{0}, cancels{0};
+    /// Per worker: the DCB it holds (0 none) | phase << 28 (1 waits for a DCB, 2 translates,
+    /// 3 caught up with the front).
     std::array<std::atomic<u32>, 8> worker_at{};
     std::vector<std::jthread> workers;
     std::vector<Vulkan::A2::StretchTranslator*> translators; ///< for the refusal log
@@ -244,6 +262,8 @@ struct A2State {
     A2Entry* cur{};
     bool cur_back{};
     size_t stretch_i{};
+    u64 seen_progress{}; ///< the worker's progress as last loaded
+    u32 cur_n{};         ///< ready stretches as loaded with it
     bool reject_cur{}; ///< the current stretch runs on the old path (occlusion open)
     bool gpu_write{true}; ///< a GPU write was recorded since the last global barrier
     u64 skip_pos{}, skip_seq{}; ///< set by A2Execute: BackLoop releases through here
@@ -2255,6 +2275,10 @@ void A2Log() {
     const u64 tsc = __rdtsc();
     const double s = double(now - c.start_ns) * 1e-9;
     const double tpn = now > c.start_ns ? double(tsc - c.start_tsc) / double(now - c.start_ns) : 3.5;
+    const auto ps = [&](u64 n) { return s > 0 ? double(n) / s : 0.0; };
+    const auto ms = [&](u64 cyc) { return s > 0 ? double(cyc) / tpn * 1e-6 / s : 0.0; };
+    const double ws = std::max(1e-9, double(now - g.t_start) * 1e-9);
+    const auto wms = [&](u64 cyc) { return double(cyc) / tpn * 1e-6 / ws; };
     const u64 all = c.translated + c.walked;
     std::array<u64, 32> refusals{};
     for (const auto* t : g.translators) {
@@ -2271,36 +2295,31 @@ void A2Log() {
     LOG_INFO(Render,
              "A2 (mode {}): window {:.1f}s | back-TRANSLATED draw records/s={:.0f} back-walked "
              "(worker) draw records/s={:.0f} fallback share={:.3f} | stretches/s={:.0f} "
-             "draws/stretch={:.1f} | dcbs/s={:.0f} taken whole by the back={} by workers={} | back "
-             "waits on workers {} ({:.2f} ms/s) | global barriers/s={:.0f} occlusion rejects={} | "
-             "front snapshot verify {} bad {} | verify-mode would-walk {} | back records/s {:.0f} "
-             "(records released in bulk/s {:.0f}, delta words per stretch {:.1f}) | buffer-structure "
-             "rejects {} | workers {}: translating {:.0f} ms/s waiting for the front {:.0f} ms/s (sum over "
-             "workers, since start) | render-key verify {} bad {} | whole: stale {} refused {} state4 {} | back waited for front/worker {} ({:.2f} ms/s), "
-             "took whole after: front "
-             "waiting {} time-out {} | back took whole: incomplete {} unclaimed {} | worker "
-             "kcyc per dcb {:.1f} translator cyc per draw {:.0f} "
-             "per draw {:.0f} | worker "
-             "refusals "
-             "(cumulative):{}",
-             g_a2, s, s > 0 ? double(c.translated) / s : 0.0, s > 0 ? double(c.walked) / s : 0.0,
-             all ? double(c.translated) / double(all) : 0.0, s > 0 ? double(c.stretches) / s : 0.0,
-             c.stretches ? double(c.walked) / double(c.stretches) : 0.0,
-             s > 0 ? double(c.dcbs) / s : 0.0, c.back_dcbs, c.worker_dcbs, c.waits,
-             s > 0 ? double(c.wait_cyc) / tpn * 1e-6 / s : 0.0,
-             s > 0 ? double(c.barriers) / s : 0.0, c.occl_rejects, c.snap_cmp, c.snap_bad, c.would,
-             s > 0 ? double(c.back_records) / s : 0.0, s > 0 ? double(c.skipped_records) / s : 0.0,
-             c.stretches ? double(c.delta_words) / double(c.stretches) : 0.0, c.gen_rejects,
-             Vulkan::A2::NumWorkers(),
-             double(g.worker_cyc) / tpn * 1e-6 / std::max(1e-9, double(now - g.t_start) * 1e-9),
-             double(g.publish_wait_cyc) / tpn * 1e-6 /
-                 std::max(1e-9, double(now - g.t_start) * 1e-9),
-             c.rk_cmp, c.rk_bad, c.whole_stale, c.whole_refused, c.whole_st4,
-             c.wait_complete, s > 0 ? double(c.wait_complete_cyc) / tpn * 1e-6 / s : 0.0,
-             c.steal_front_waits, c.steal_timeout, c.steal_incomplete, c.steal_unclaimed,
-             g.worker_draws ? double(g.take_cyc) / double(g.worker_draws) : 0.0,
-             g.worker_dcbs ? double(g.worker_cyc) / double(g.worker_dcbs) * 1e-3 : 0.0,
-             g.worker_draws ? double(g.worker_cyc) / double(g.worker_draws) : 0.0, rf);
+             "draws/stretch={:.1f} | dcbs/s={:.0f} taken whole by the back={} (front waiting {} "
+             "time-out {} unclaimed {}) followed by workers={} | back waits on workers at draws {} "
+             "({:.2f} ms/s), of which worker behind the publish {} ({:.2f} ms/s); at DcbEnd {} "
+             "({:.2f} ms/s); for a claim {} ({:.2f} ms/s); safety cancels {} | global "
+             "barriers/s={:.0f} occlusion rejects={} buffer-structure rejects {} | back records/s "
+             "{:.0f} (released in bulk/s {:.0f}, delta words per stretch {:.1f}) | verify: front "
+             "snapshot {} bad {}, render key {} bad {}, would-walk {} | whole: stale {} refused {} "
+             "state4 {} | workers {} (since start): translating {:.0f} ms/s, waiting for the next "
+             "DCB {:.0f} ms/s, caught up waiting for records {:.0f} ms/s; cuts: back waited {} "
+             "front waited {}; stretch cap {} seq breaks {} cancels {}; translator cyc per draw "
+             "{:.0f} | worker refusals (cumulative):{}",
+             g_a2, s, ps(c.translated), ps(c.walked),
+             all ? double(c.translated) / double(all) : 0.0, ps(c.stretches),
+             c.stretches ? double(c.walked) / double(c.stretches) : 0.0, ps(c.dcbs), c.back_dcbs,
+             c.steal_front_waits, c.steal_timeout, c.steal_unclaimed, c.worker_dcbs, c.waits,
+             ms(c.wait_cyc), c.dwait_behind, ms(c.dwait_behind_cyc), c.end_waits,
+             ms(c.end_wait_cyc), c.wait_complete, ms(c.wait_complete_cyc), c.net_cancel,
+             ps(c.barriers), c.occl_rejects, c.gen_rejects, ps(c.back_records),
+             ps(c.skipped_records),
+             c.stretches ? double(c.delta_words) / double(c.stretches) : 0.0, c.snap_cmp,
+             c.snap_bad, c.rk_cmp, c.rk_bad, c.would, c.whole_stale, c.whole_refused,
+             c.whole_st4, Vulkan::A2::NumWorkers(), wms(g.worker_cyc), wms(g.publish_wait_cyc),
+             wms(g.record_wait_cyc), g.cuts_back.load(), g.cuts_front.load(), g.cap_hits.load(),
+             g.seq_breaks.load(), g.cancels.load(),
+             g.worker_draws ? double(g.take_cyc) / double(g.worker_draws) : 0.0, rf);
     c = A2Counters{};
     c.start_ns = now;
     c.start_tsc = tsc;
@@ -2325,87 +2344,174 @@ void Liverpool::A2WorkerLoop(std::stop_token stoken, u32 index) {
     }
     auto regs = std::make_unique<Regs>();
     std::array<Shader::BoundStage, Shader::MaxStageTypes> stages{};
-    while (!stoken.stop_requested() && !g.stop.load(std::memory_order_acquire)) {
+    std::vector<u32> pending;               // words written since the last taken draw
+    std::vector<std::pair<u32, u32>> delta; // committed through the last taken draw
+    if (index >= CpSplit::Channel::MaxReaderHolds) {
+        LOG_ERROR(Render, "A2: worker {} not started (at most {} workers hold ring space)", index,
+                  CpSplit::Channel::MaxReaderHolds);
+        return;
+    }
+    auto& at = g.worker_at[index & 7];
+    auto& hold = split->reader_holds[index].pos;
+    const auto stopping = [&] {
+        return stoken.stop_requested() || g.stop.load(std::memory_order_acquire);
+    };
+    while (!stopping()) {
         const u32 idx = g.next_claim.fetch_add(1, std::memory_order_acq_rel);
-        g.worker_at[index & 7].store(idx | (1u << 28), std::memory_order_relaxed);
-        // Wait until the front completed `idx` (published counts DCB ends in order).
+        at.store(idx | (1u << 28), std::memory_order_relaxed);
+        // Wait until the front began `idx` (the entry is written before its DcbBegin record can
+        // be published).
         {
-        const u64 pw0 = __rdtsc();
-        struct PublishWait {
-            std::atomic<u64>& sum;
-            u64 t0;
-            ~PublishWait() {
-                sum.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
-            }
-        } publish_wait{g.publish_wait_cyc, pw0};
-        for (u32 spins = 0; g.published.load(std::memory_order_acquire) < idx;) {
-            if (stoken.stop_requested() || g.stop.load(std::memory_order_acquire)) {
-                return;
-            }
-            if (++spins < 2048) {
-                _mm_pause();
-            } else {
-                const u32 seen = g.published.load(std::memory_order_acquire);
-                if (seen < idx) {
-                    g.published.wait(seen, std::memory_order_acquire);
+            const u64 pw0 = __rdtsc();
+            for (u32 spins = 0; g.begun.load(std::memory_order_acquire) < idx;) {
+                if (stopping()) {
+                    return;
+                }
+                if (++spins < 2048) {
+                    _mm_pause();
+                } else {
+                    const u32 seen = g.begun.load(std::memory_order_acquire);
+                    if (seen < idx) {
+                        g.begun.wait(seen, std::memory_order_acquire);
+                    }
                 }
             }
-        }
+            g.publish_wait_cyc.fetch_add(__rdtsc() - pw0, std::memory_order_relaxed);
         }
         auto& e = g.e[idx % A2Slots];
+        if (e.index.load(std::memory_order_acquire) != idx) {
+            continue; // the back took it and released it
+        }
+        // Hold ring space BEFORE the claim: the back proceeds into the DCB (and releases its
+        // records) only after it sees state 2. A begin_pos read here is this DCB's or, if the
+        // slot was reused, a later one - both safe (the floor only has to be low enough).
+        hold.store(e.begin_pos.load(std::memory_order_acquire), std::memory_order_seq_cst);
         u32 expect = 1;
-        if (e.index.load(std::memory_order_acquire) != idx ||
-            !e.state.compare_exchange_strong(expect, 2, std::memory_order_acq_rel)) {
+        if (!e.state.compare_exchange_strong(expect, 2, std::memory_order_seq_cst)) {
+            hold.store(~0ull, std::memory_order_release);
             continue; // the back took it
         }
-        g.worker_at[index & 7].store(idx | (2u << 28), std::memory_order_relaxed);
+        // Stable while we hold it (state 2). If the slot was released and begun again for
+        // idx + A2Slots between the two loads, we simply follow that DCB (its own claimer will
+        // find it taken).
+        const u32 dcb = e.index.load(std::memory_order_acquire);
+        at.store(dcb | (2u << 28), std::memory_order_relaxed);
         const u64 w_t0 = __rdtsc();
-        u64 w_draws = 0;
-        e.stretches.clear();
-        e.side.clear();
-        e.refused = 0;
-        u64 pos = e.begin_pos;
-        const auto* h = split->RecordAtPos(pos);
-        const auto& bp = *reinterpret_cast<const CpSplit::DcbBeginPayload*>(h + 1);
-        if (h->type != CpSplit::RecordType::DcbBegin || bp.index != idx ||
-            bp.snap_words != CpSplit::DcbSnapWords) {
-            e.refused = 1;
-            e.state.store(3, std::memory_order_release);
-            e.state.notify_all();
-            continue;
-        }
-        {
-            const u32* fs = reinterpret_cast<const u32*>(&bp + 1);
-            for (const auto& [off, n] : CpSplit::DcbSnapWindows) {
-                std::memcpy(&regs->reg_array[off], fs, size_t{n} * sizeof(u32));
-                fs += n;
-            }
-        }
-        pos += h->size;
+        u64 w_draws = 0, rec_wait = 0;
+        u32 n = 0;        // stretches handed over
+        u64 decided = 0;  // progress published
+        u64 last_seq = 0; // seq of the newest record walked
         bool open = false;
         bool occlusion = false;
         bool rt_dirty = false;                       // render windows written since saved
         const Vulkan::GraphicsPipeline* rt_pipe = nullptr; // pipeline the stretch's key holds
         std::optional<A2PipeRender> rt_pkey;
         std::array<u32, 0x20 + 0x20 + 0x10 + 0x78> rt_win{};
-        std::vector<u32> pending;               // words written since the last taken draw
-        std::vector<std::pair<u32, u32>> delta; // committed through the last taken draw
-        u64 last_end = 0, last_epoch = 0, open_key = 0;
+        u64 last_end = 0, last_epoch = 0, open_key = 0, open_first = 0;
+        pending.clear();
+        delta.clear();
+        const auto publish = [&](u64 seq) {
+            if (seq > decided) {
+                decided = seq;
+                e.progress.store(seq, std::memory_order_release);
+            }
+        };
         const auto end_stretch = [&] {
             if (open) {
                 if (auto s = tr.EndStretch()) {
-                    e.stretches.push_back(std::move(s));
-                    e.side.push_back({last_end, last_epoch, std::move(delta), open_key});
+                    e.stretches[n] = std::move(s);
+                    e.side[n] = {last_end, last_epoch, std::move(delta), open_key};
+                    e.ready.store(++n, std::memory_order_release);
                 }
                 open = false;
             }
             pending.clear();
             delta.clear();
         };
-        for (;;) {
-            h = split->RecordAtPos(pos);
-            if (pos == e.end_pos || h->type == CpSplit::RecordType::DcbEnd) {
+        // 0: the record at p is published; 1: stop; 2: the back cancelled (safety net).
+        const auto wait_pub = [&](u64 p) -> int {
+            if (split->PublishedEnd() > p) {
+                return 0;
+            }
+            // Caught up with the front: everything before an open stretch is decided.
+            publish(open ? open_first - 1 : last_seq);
+            e.walked.store(p, std::memory_order_release);
+            at.store(dcb | (3u << 28), std::memory_order_relaxed);
+            const u64 t0 = __rdtsc();
+            int r = 0;
+            for (u32 spins = 0; split->PublishedEnd() <= p; ++spins) {
+                if (stopping()) {
+                    r = 1;
+                    break;
+                }
+                if (e.cancel.load(std::memory_order_acquire) != 0) {
+                    r = 2;
+                    break;
+                }
+                if (open) {
+                    // Somebody needs the open stretch now: the back waits for its first draw,
+                    // or the front waits for the back (a drain publishes without a record that
+                    // would close the stretch).
+                    const bool back = e.back_wait.load(std::memory_order_acquire) != 0;
+                    if (back || split->FrontWaitingOnBack()) {
+                        (back ? g.cuts_back : g.cuts_front).fetch_add(1, std::memory_order_relaxed);
+                        end_stretch();
+                        publish(last_seq);
+                    }
+                }
+                spins < 1024 ? _mm_pause() : std::this_thread::yield();
+            }
+            rec_wait += __rdtsc() - t0;
+            at.store(dcb | (2u << 28), std::memory_order_relaxed);
+            return r;
+        };
+        u64 pos = e.begin_pos.load(std::memory_order_acquire);
+        hold.store(pos, std::memory_order_release); // >= the value held before the claim
+        bool ok = wait_pub(pos) == 0;
+        if (ok) {
+            const auto* h = split->RecordAtPos(pos);
+            const auto& bp = *reinterpret_cast<const CpSplit::DcbBeginPayload*>(h + 1);
+            if (h->type != CpSplit::RecordType::DcbBegin || bp.index != dcb ||
+                bp.snap_words != CpSplit::DcbSnapWords) {
+                e.refused = 1;
+                ok = false;
+            } else {
+                const u32* fs = reinterpret_cast<const u32*>(&bp + 1);
+                for (const auto& [off, cnt] : CpSplit::DcbSnapWindows) {
+                    std::memcpy(&regs->reg_array[off], fs, size_t{cnt} * sizeof(u32));
+                    fs += cnt;
+                }
+                last_seq = h->seq;
+                pos += h->size;
+            }
+        }
+        while (ok) {
+            if (wait_pub(pos) != 0) {
+                break; // stop or cancel: the rest runs on the old path
+            }
+            hold.store(pos, std::memory_order_release); // grows only: stale = lower = safe
+            u64 rpos = pos;
+            const auto* h = split->RecordAtPos(rpos);
+            if (rpos != pos) {
+                pos = rpos; // skipped a Wrap: wait for the record after it
+                continue;
+            }
+            if (h->seq != last_seq + 1) {
+                // An alarm only (the ring hold makes an overwrite impossible): stop here, the
+                // rest runs on the old path.
+                g.seq_breaks.fetch_add(1, std::memory_order_relaxed);
                 break;
+            }
+            if (h->type == CpSplit::RecordType::DcbEnd ||
+                h->type == CpSplit::RecordType::DcbBegin) {
+                last_seq = h->seq;
+                break;
+            }
+            if (open && e.back_wait.load(std::memory_order_relaxed) != 0) {
+                // The back waits for this stretch's first draw: hand it over now.
+                g.cuts_back.fetch_add(1, std::memory_order_relaxed);
+                end_stretch();
+                publish(last_seq);
             }
             const auto* payload = reinterpret_cast<const u8*>(h + 1);
             switch (h->type) {
@@ -2474,12 +2580,17 @@ void Liverpool::A2WorkerLoop(std::stop_token stoken, u32 index) {
                         end_stretch();
                     }
                 }
+                if (!open && n >= A2MaxStretches) {
+                    g.cap_hits.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                }
                 const u64 tk0 = __rdtsc();
                 const bool took = tr.TakeDraw(*regs, in);
                 g.take_cyc.fetch_add(__rdtsc() - tk0, std::memory_order_relaxed);
                 if (took) {
                     if (!open) {
                         open = true;
+                        open_first = h->seq;
                         rt_dirty = false;
                         rt_pipe = in.pipeline;
                         rt_pkey.emplace(in.pipeline);
@@ -2518,13 +2629,23 @@ void Liverpool::A2WorkerLoop(std::stop_token stoken, u32 index) {
                 end_stretch();
                 break;
             }
+            last_seq = h->seq;
+            if (!open && h->type == CpSplit::RecordType::Draw) {
+                publish(last_seq);
+            }
             pos += h->size;
         }
         end_stretch();
-        g.worker_cyc.fetch_add(__rdtsc() - w_t0, std::memory_order_relaxed);
+        if (e.cancel.load(std::memory_order_acquire) != 0) {
+            g.cancels.fetch_add(1, std::memory_order_relaxed);
+        }
+        g.worker_cyc.fetch_add(__rdtsc() - w_t0 - rec_wait, std::memory_order_relaxed);
+        g.record_wait_cyc.fetch_add(rec_wait, std::memory_order_relaxed);
         g.worker_dcbs.fetch_add(1, std::memory_order_relaxed);
-        g.worker_at[index & 7].store(0, std::memory_order_relaxed);
         g.worker_draws.fetch_add(w_draws, std::memory_order_relaxed);
+        at.store(0, std::memory_order_relaxed);
+        hold.store(~0ull, std::memory_order_release); // done reading this DCB's records
+        e.progress.store(~0ull, std::memory_order_release);
         e.state.store(3, std::memory_order_release);
         e.state.notify_all();
     }
@@ -2536,8 +2657,8 @@ void Liverpool::A2Shutdown() {
         return;
     }
     g.stop.store(true, std::memory_order_release);
-    g.published.fetch_add(0x40000000u, std::memory_order_acq_rel); // wake every waiter
-    g.published.notify_all();
+    g.begun.fetch_add(0x40000000u, std::memory_order_acq_rel); // wake every waiter
+    g.begun.notify_all();
     for (auto& t : g.workers) {
         t.request_stop();
     }
@@ -2553,6 +2674,10 @@ void Liverpool::A2Execute(const CpSplit::RecordHeader& record) {
         c.start_ns = A2NowNs();
         c.start_tsc = __rdtsc();
         g.t_start = c.start_ns;
+        for (auto& entry : g.e) {
+            entry.stretches.resize(A2MaxStretches);
+            entry.side.resize(A2MaxStretches);
+        }
         const u32 n = Vulkan::A2::NumWorkers();
         for (u32 i = 0; i < n; ++i) {
             g.workers.emplace_back(std::bind_front(&Liverpool::A2WorkerLoop, this), i);
@@ -2561,13 +2686,46 @@ void Liverpool::A2Execute(const CpSplit::RecordHeader& record) {
     }
     const auto release_cur = [&] {
         if (g.cur) {
-            for (auto& s : g.cur->stretches) {
+            auto& e = *g.cur;
+            if (!g.cur_back) {
+                // The worker may still walk the tail records (non-draw records never wait on
+                // it): the slot stays ours until it is done. Bounded: every record through this
+                // DcbEnd is published.
+                const u64 t0 = __rdtsc();
+                bool waited = false;
+                for (u32 spins = 0;; ++spins) {
+                    u32 st = e.state.load(std::memory_order_acquire);
+                    if (st == 1) {
+                        if (e.state.compare_exchange_strong(st, 4, std::memory_order_acq_rel)) {
+                            break;
+                        }
+                        continue;
+                    }
+                    if (st != 2) {
+                        break;
+                    }
+                    waited = true;
+                    if (spins < 4096) {
+                        _mm_pause();
+                    } else {
+                        e.state.wait(2, std::memory_order_acquire);
+                    }
+                }
+                if (waited) {
+                    ++c.end_waits;
+                    c.end_wait_cyc += __rdtsc() - t0;
+                }
+            }
+            const u32 n = e.ready.load(std::memory_order_acquire);
+            for (u32 i = 0; i < n; ++i) {
+                auto& s = e.stretches[i];
                 if (s && s->tick && s->tick->load(std::memory_order_relaxed) == 0) {
                     s->tick->store(1, std::memory_order_release); // never published: free
                 }
+                s.reset();
             }
-            g.cur->stretches.clear();
-            g.cur->state.store(0, std::memory_order_release);
+            e.ready.store(0, std::memory_order_relaxed);
+            e.state.store(0, std::memory_order_release);
             g.cur = nullptr;
         }
     };
@@ -2588,28 +2746,35 @@ void Liverpool::A2Execute(const CpSplit::RecordHeader& record) {
             c.snap_bad += bad;
         }
         auto& e = g.e[idx % A2Slots];
+        g.cur_back = false;
+        g.stretch_i = 0;
+        g.reject_cur = false;
+        g.seen_progress = 0;
+        g.cur_n = 0;
+        ++c.dcbs;
+        if (e.index.load(std::memory_order_acquire) != idx ||
+            e.state.load(std::memory_order_acquire) == 0) {
+            // Cannot happen: the front writes the entry before the DcbBegin record is
+            // published. Old path, and the slot is not ours to release.
+            ++c.whole_stale;
+            g.cur_back = true;
+            g.cur = nullptr;
+            ++c.back_dcbs;
+            return;
+        }
         {
-            // Incomplete (the front is still parsing it) or complete but not yet claimed: wait
-            // for the front / a worker unless the front is waiting on the back (it would never
-            // finish the DCB) or a time-out passes; then the back takes it below.
+            // Begun but not yet claimed by a worker: wait for one unless the front is waiting
+            // on the back (it may never publish more) or the safety net passes; then the back
+            // takes it below.
             const u64 t0 = __rdtsc();
-            // Safety net only (counted): the policy is "wait unless the front waits on us".
-            constexpr u64 IncompleteTicks = 175'000'000; // ~50 ms
-            constexpr u64 UnclaimedTicks = 175'000'000;
+            constexpr u64 UnclaimedTicks = 175'000'000; // ~50 ms
             bool waited = false;
-            for (u32 spins = 0;; ++spins) {
-                const u32 st = e.state.load(std::memory_order_acquire);
-                const bool mine = e.index.load(std::memory_order_acquire) == idx;
-                const bool incomplete = st == 0;
-                const bool unclaimed = st == 1 && mine;
-                if (!incomplete && !unclaimed) {
-                    break;
-                }
+            for (u32 spins = 0; e.state.load(std::memory_order_acquire) == 1; ++spins) {
                 if (split->FrontWaitingOnBack()) {
                     ++c.steal_front_waits;
                     break;
                 }
-                if (__rdtsc() - t0 > (incomplete ? IncompleteTicks : UnclaimedTicks)) {
+                if (__rdtsc() - t0 > UnclaimedTicks) {
                     ++c.steal_timeout;
                     std::string ws;
                     for (u32 w = 0; w < Vulkan::A2::NumWorkers() && w < 8; ++w) {
@@ -2617,11 +2782,10 @@ void Liverpool::A2Execute(const CpSplit::RecordHeader& record) {
                         ws += fmt::format(" w{}={}/{}", w, at & 0x0fffffffu, at >> 28);
                     }
                     LOG_WARNING(Render,
-                                "A2 safety net (50 ms): dcb {} state {} (entry index {}) - "
-                                "published {} next_claim {} front waiting {}; workers "
-                                "(dcb/phase 1 wait-front 2 translate):{}",
-                                idx, st, e.index.load(std::memory_order_relaxed),
-                                g.published.load(std::memory_order_relaxed),
+                                "A2 safety net (50 ms, unclaimed): dcb {} - begun {} next_claim "
+                                "{} front waiting {}; workers (dcb/phase 1 wait-dcb 2 translate "
+                                "3 caught-up):{}",
+                                idx, g.begun.load(std::memory_order_relaxed),
                                 g.next_claim.load(std::memory_order_relaxed),
                                 split->FrontWaitingOnBack(), ws);
                     break;
@@ -2634,25 +2798,8 @@ void Liverpool::A2Execute(const CpSplit::RecordHeader& record) {
                 c.wait_complete_cyc += __rdtsc() - t0;
             }
         }
-        for (u32 spins = 0;;) {
+        for (;;) {
             u32 st = e.state.load(std::memory_order_acquire);
-            if (st == 0) {
-                // Not complete yet (the front is still parsing it): the back takes it.
-                e.index.store(idx, std::memory_order_release);
-                if (e.state.compare_exchange_strong(st, 4, std::memory_order_acq_rel)) {
-                    g.cur_back = true;
-                    ++c.steal_incomplete;
-                    break;
-                }
-                continue;
-            }
-            if (e.index.load(std::memory_order_acquire) != idx) {
-                // A stale entry of index idx - A2Slots (cannot happen: the back releases at
-                // DcbEnd). Take the DCB on the old path.
-                g.cur_back = true;
-                ++c.whole_stale;
-                break;
-            }
             if (st == 1) {
                 if (e.state.compare_exchange_strong(st, 4, std::memory_order_acq_rel)) {
                     g.cur_back = true;
@@ -2661,28 +2808,13 @@ void Liverpool::A2Execute(const CpSplit::RecordHeader& record) {
                 }
                 continue;
             }
-            if (st == 3 || st == 4) {
-                g.cur_back = st == 4 || e.refused != 0;
-                c.whole_refused += st == 3 && e.refused != 0;
-                c.whole_st4 += st == 4;
-                break;
-            }
-            // st == 2: a worker is translating it.
-            if (spins == 0) {
-                ++c.waits;
-            }
-            const u64 t0 = __rdtsc();
-            if (++spins < 4096) {
-                _mm_pause();
-            } else {
-                e.state.wait(2, std::memory_order_acquire);
-            }
-            c.wait_cyc += __rdtsc() - t0;
+            // 2: a worker follows the front through it; 3: the worker finished it.
+            g.cur_back = st == 4;
+            c.whole_refused += st == 3 && e.refused != 0;
+            c.whole_st4 += st == 4;
+            break;
         }
         g.cur = &e;
-        g.stretch_i = 0;
-        g.reject_cur = false;
-        ++c.dcbs;
         ++(g.cur_back ? c.back_dcbs : c.worker_dcbs);
         if (c.dcbs >= 65536) {
             A2Log();
@@ -2693,7 +2825,55 @@ void Liverpool::A2Execute(const CpSplit::RecordHeader& record) {
         release_cur();
         return;
     case RT::Draw: {
-        if (g.cur && !g.cur_back && g.stretch_i < g.cur->stretches.size()) {
+        if (g.cur && !g.cur_back && record.seq > g.seen_progress) {
+            auto& e = *g.cur;
+            u64 p = e.progress.load(std::memory_order_acquire);
+            if (p < record.seq) [[unlikely]] {
+                // The worker following this DCB has not decided this draw yet (it is behind,
+                // or the draw opens its stretch: it hands it over when it sees back_wait).
+                const u64 t0 = __rdtsc();
+                const bool behind =
+                    e.walked.load(std::memory_order_acquire) < split->PublishedEnd();
+                e.back_wait.store(record.seq, std::memory_order_release);
+                bool netted = false;
+                for (u32 spins = 0;
+                     (p = e.progress.load(std::memory_order_acquire)) < record.seq; ++spins) {
+                    if (!netted && __rdtsc() - t0 > 175'000'000) {
+                        // Safety net (~50 ms; a scheduling bug if it fires in normal play): the
+                        // worker stops and the rest of the DCB runs on the old path.
+                        netted = true;
+                        ++c.net_cancel;
+                        std::string ws;
+                        for (u32 w = 0; w < Vulkan::A2::NumWorkers() && w < 8; ++w) {
+                            const u32 at = g.worker_at[w].load(std::memory_order_relaxed);
+                            ws += fmt::format(" w{}={}/{}", w, at & 0x0fffffffu, at >> 28);
+                        }
+                        LOG_WARNING(Render,
+                                    "A2 safety net (50 ms, draw): dcb {} draw seq {} progress {} "
+                                    "ready {} state {} walked {} published end {} front waiting "
+                                    "{}; workers (dcb/phase):{}",
+                                    e.index.load(std::memory_order_relaxed), record.seq, p,
+                                    e.ready.load(std::memory_order_relaxed),
+                                    e.state.load(std::memory_order_relaxed),
+                                    e.walked.load(std::memory_order_relaxed),
+                                    split->PublishedEnd(), split->FrontWaitingOnBack(), ws);
+                        e.cancel.store(1, std::memory_order_release);
+                    }
+                    spins < 4096 ? _mm_pause() : std::this_thread::yield();
+                }
+                e.back_wait.store(0, std::memory_order_release);
+                const u64 dt = __rdtsc() - t0;
+                ++c.waits;
+                c.wait_cyc += dt;
+                if (behind) {
+                    ++c.dwait_behind;
+                    c.dwait_behind_cyc += dt;
+                }
+            }
+            g.seen_progress = p;
+            g.cur_n = e.ready.load(std::memory_order_acquire);
+        }
+        if (g.cur && !g.cur_back && g.stretch_i < g.cur_n) {
             auto& s = *g.cur->stretches[g.stretch_i];
             if (record.seq >= s.first_seq && record.seq <= s.last_seq) {
                 const auto& rec = *reinterpret_cast<const SplitDrawRecord*>(&record + 1);
@@ -6959,6 +7139,32 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
         }
         split->Commit();
+        if (g_a2 != 0) {
+            // Hand the DCB to the workers now - they follow the front record by record. The
+            // entry is written before the DcbBegin record can be published (nothing publishes
+            // between the Commit above and here).
+            const u32 idx = g_a1_front_index;
+            auto& e = g_a2s.e[idx % A2Slots];
+            if (e.state.load(std::memory_order_acquire) != 0) {
+                // The back still holds idx - A2Slots (it releases at that DcbEnd, published).
+                split->front_waiting.fetch_add(1, std::memory_order_acq_rel);
+                for (u32 spins = 0; e.state.load(std::memory_order_acquire) != 0; ++spins) {
+                    spins < 4096 ? _mm_pause() : std::this_thread::yield();
+                }
+                split->front_waiting.fetch_sub(1, std::memory_order_acq_rel);
+            }
+            e.begin_pos.store(g_a2s.front_begin_pos, std::memory_order_relaxed);
+            e.refused = 0;
+            e.ready.store(0, std::memory_order_relaxed);
+            e.progress.store(0, std::memory_order_relaxed);
+            e.walked.store(0, std::memory_order_relaxed);
+            e.back_wait.store(0, std::memory_order_relaxed);
+            e.cancel.store(0, std::memory_order_relaxed);
+            e.index.store(idx, std::memory_order_release);
+            e.state.store(1, std::memory_order_release);
+            g_a2s.begun.store(idx, std::memory_order_release);
+            g_a2s.begun.notify_all();
+        }
     }
     SplitSpanScope split_span{*this, &dcb,
                               is_indirect_gfx ? CpSplit::DrainReason::TaskGuardIb
@@ -7773,34 +7979,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         auto* end = split->Reserve<CpSplit::DcbEndPayload>(CpSplit::RecordType::DcbEnd);
         end->index = g_a1_front_index;
         end->pad = 0;
-        const u64 end_pos = split->LastRecordPos();
         split->Commit();
-        // The table entry first, then the publish: the back cannot see DcbEnd (and release a
-        // DCB it took itself) before the entry is written.
-        if (g_a2 != 0) {
-            // The DCB is complete and published: hand it to the workers (A2 table).
-            const u32 idx = g_a1_front_index;
-            auto& e = g_a2s.e[idx % A2Slots];
-            split->front_waiting.fetch_add(1, std::memory_order_acq_rel);
-            for (u32 spins = 0;; ++spins) {
-                const u32 st = e.state.load(std::memory_order_acquire);
-                if (st == 0 || (st == 4 && e.index.load(std::memory_order_acquire) == idx)) {
-                    break;
-                }
-                spins < 4096 ? _mm_pause() : std::this_thread::yield();
-            }
-            split->front_waiting.fetch_sub(1, std::memory_order_acq_rel);
-            e.begin_pos = g_a2s.front_begin_pos;
-            e.end_pos = end_pos;
-            e.index.store(idx, std::memory_order_release);
-            u32 expect = 0;
-            e.state.compare_exchange_strong(expect, 1, std::memory_order_acq_rel);
-        }
         split->PublishNow();
         split->dcb_ends_published.fetch_add(1, std::memory_order_release);
         if (g_a2 != 0) {
             g_a2s.published.store(g_a1_front_index, std::memory_order_release);
-            g_a2s.published.notify_all();
         }
     }
     FIBER_EXIT;

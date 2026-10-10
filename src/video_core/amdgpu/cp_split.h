@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <utility>
 #include <atomic>
@@ -526,9 +527,30 @@ public:
             pos += header->size;
         }
     }
+    /// SHADPS4_A2 (any thread): the published end (unmasked). A record whose header position is
+    /// below it is complete and immutable until the back releases it.
+    [[nodiscard]] u64 PublishedEnd() const noexcept {
+        return write_pos.load(std::memory_order_acquire);
+    }
     /// SHADPS4_A1: publishes everything committed without counting a post or waiting.
     void PublishNow() {
         Publish();
+    }
+    /// SHADPS4_A2: ring space is free only once the back AND every A2 worker are past it. A
+    /// worker holds the position of the record it reads next (~0 when it holds no DCB; it only
+    /// grows while held, so a stale value is lower = conservative). WaitForSpace frees space up
+    /// to the lowest of read_pos and these.
+    struct alignas(64) ReaderHold {
+        std::atomic<u64> pos{~0ull};
+    };
+    static constexpr u32 MaxReaderHolds = 8;
+    std::array<ReaderHold, MaxReaderHolds> reader_holds{};
+    [[nodiscard]] u64 ReadFloor() const noexcept {
+        u64 r = read_pos.load(std::memory_order_acquire);
+        for (const auto& hold : reader_holds) {
+            r = std::min(r, hold.pos.load(std::memory_order_acquire));
+        }
+        return r;
     }
     /// SHADPS4_A2: non-zero while the front waits for the back (WaitDone / WaitForSpace).
     [[nodiscard]] bool FrontWaitingOnBack() const noexcept {
