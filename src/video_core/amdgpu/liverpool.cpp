@@ -1547,6 +1547,54 @@ void LeanCompare(LeanJob& j) {
                             i < j.worker_canon.size() ? j.worker_canon[i] : 0ull, res.packets,
                             res.draws, static_cast<u32>(res.stop));
             }
+            static std::atomic<u32> ud_logged{0};
+            if (i < n && (j.front_canon[i] >> 56) == 14 && ud_logged.fetch_add(1) < 6) {
+                // The truth: entry windows + register events up to i.
+                auto truth = std::make_unique<Regs>();
+                const u32* w = j.win.data();
+                for (const auto& [off, cnt] : CpSplit::DcbSnapWindows) {
+                    std::memcpy(&truth->reg_array[off], w, size_t{cnt} * 4);
+                    w += cnt;
+                }
+                s64 stage = -1, first_ud = -1;
+                for (size_t k = 0; k < i; ++k) {
+                    const u64 e = j.front_canon[k];
+                    const u64 kind = e >> 56;
+                    if (kind == 1) {
+                        truth->reg_array[(e >> 32) & 0xffffff] = static_cast<u32>(e);
+                    } else if (kind == 2) {
+                        truth->SetDefaults();
+                    } else if (kind == 11) {
+                        stage = static_cast<s64>((e >> 48) & 0xff);
+                        first_ud = -1;
+                    } else if (kind == 14 && first_ud < 0) {
+                        first_ud = static_cast<s64>(k);
+                    }
+                }
+                if (first_ud < 0) {
+                    first_ud = static_cast<s64>(i);
+                }
+                const u64 slot = i - static_cast<u64>(first_ud);
+                const u32 in_stage = stage == static_cast<s64>(Shader::LogicalStage::Fragment)
+                                         ? static_cast<u32>(Shader::Stage::Fragment)
+                                         : static_cast<u32>(Shader::Stage::Vertex);
+                const auto* pgm = truth->ProgramForStage(in_stage);
+                const u32 tv = pgm && slot < pgm->user_data.size() ? pgm->user_data[slot] : 0xdeadbeefu;
+                std::string fr, wk;
+                for (size_t k = i >= 24 ? i - 24 : 0; k < std::min(i + 4, n); ++k) {
+                    fr += fmt::format(" {:x}", j.front_canon[k]);
+                    wk += fmt::format(" {:x}", j.worker_canon[k]);
+                }
+                LOG_WARNING(Render, "Lean verify user data: DCB {} event {}: logical stage {} user-data "
+                                    "slot {}: TRUE (registers) {:#x} front {:#x} worker {:#x} -> {}",
+                            j.index.load(), i, stage, slot, tv, static_cast<u32>(j.front_canon[i]),
+                            static_cast<u32>(j.worker_canon[i]),
+                            tv == static_cast<u32>(j.front_canon[i])
+                                ? "worker wrong"
+                                : (tv == static_cast<u32>(j.worker_canon[i]) ? "FRONT wrong" : "neither"));
+                LOG_WARNING(Render, "Lean verify user data: DCB {} front around:{}", j.index.load(), fr);
+                LOG_WARNING(Render, "Lean verify user data: DCB {} worker around:{}", j.index.load(), wk);
+            }
             if (c.bad <= 3) {
                 const auto dump = [](const std::vector<u64>& v, size_t lim) {
                     std::string s;
