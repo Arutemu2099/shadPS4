@@ -1049,6 +1049,22 @@ void PageManager::ExternalProtect(VAddr address, u64 size, Core::MemoryPermissio
 #endif
 }
 
+bool PageManager::AnyReadProtected(VAddr addr, u64 size) const {
+    if (size == 0) {
+        return false;
+    }
+    const u64 end = addr + size;
+    if (end < addr || end > (u64{1} << Impl::ADDRESS_BITS)) {
+        return true; // outside the tracked space: treat as not safely readable
+    }
+    for (u64 page = addr >> PM_PAGE_BITS, last = (end - 1) >> PM_PAGE_BITS; page <= last; ++page) {
+        if (impl->cached_pages[page].num_read_watchers != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 template <bool track>
 void PageManager::UpdatePageWatchers(VAddr addr, u64 size) const {
     impl->UpdatePageWatchers<track, false>(addr, size);

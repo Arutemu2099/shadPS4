@@ -58,6 +58,7 @@
 #include <iterator>
 
 #include "common/assert.h"
+#include "common/decoder.h"
 #include "video_core/amdgpu/lean_front_api.h"
 #include "video_core/amdgpu/lean_parse.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -142,6 +143,7 @@ constexpr const char* StopNames[] = {
     "none",          "cut",           "end",       "unsupported",    "overrun",
     "hint-missing",  "bad-set-base",  "nop-back",  "dma-sync",       "dma-guard",
     "pipeline-miss", "native-unchecked", "colour-variant-missing", "config",
+    "fault",         "fault-fallback",
 };
 static_assert(std::size(StopNames) == static_cast<size_t>(Stop::Count));
 
@@ -211,7 +213,20 @@ Stop Parser::DecideDraw(const PM4Header* header, std::span<const u32> dcb, u32 o
             // Piece 1: read-only, shared-locked, never compiles. Null for every reason the
             // front's GetGraphicsPipeline would return null for AND for every miss it would
             // compile / build on: the front must run that draw.
+            // Guest reads first, outside the cache's lock, each pre-checked (sec. 16).
+            t_lean_fault = false;
+            if (!Prewalk(regs)) {
+                scratch->prewalked = false;
+                return Stop::Fault;
+            }
+            g_lean_fault_stats.lock_takes.fetch_add(1, std::memory_order_relaxed);
+            g_lean_fault_stats.lock_draws.fetch_add(1, std::memory_order_relaxed);
             plan.draw.pipeline = env.pipeline_cache->LookupGraphics(regs, *scratch);
+            scratch->prewalked = false;
+            if (t_lean_fault) {
+                t_lean_fault = false;
+                return Stop::FaultFallback;
+            }
             if (!plan.draw.pipeline) {
                 return Stop::PipelineMiss;
             }
@@ -246,8 +261,28 @@ Stop Parser::DecideDraw(const PM4Header* header, std::span<const u32> dcb, u32 o
         vs.user_data = vslot.user_data;
         vs.flattened_ud_buf = vslot.flattened_ud_buf;
         vs.pgm_base = vslot.pgm_base;
+        if (const auto* fetch = scratch->fetch_shader) {
+            // One V# per fetch attribute, read through a user-data pointer (Info::ReadUdReg).
+            for (const auto& attrib : fetch->attributes) {
+                if (attrib.sgpr_base == Shader::IR::NumScalarRegs ||
+                    attrib.sgpr_base + 1u >= vslot.user_data.size()) {
+                    continue; // from the user data itself (no guest read) / bound by ReadUdReg
+                }
+                const u64 base = (u64{vslot.user_data[attrib.sgpr_base]} |
+                                  (u64{vslot.user_data[attrib.sgpr_base + 1u]} << 32)) &
+                                 0xFFFFFFFFFFFFull;
+                if (!ReadOk(base + u64{attrib.dword_offset} * 4, sizeof(AmdGpu::Buffer), 2)) {
+                    return Stop::Fault;
+                }
+            }
+        }
+        t_lean_fault = false;
         plan.vi_bytes = plan.draw.pipeline->DeriveVertexInputs(
             *vi, regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1, vs);
+        if (t_lean_fault) {
+            t_lean_fault = false;
+            return Stop::FaultFallback;
+        }
         plan.bytes += plan.vi_bytes;
         // The desc-id rule's comparison (applied in EmitDraw, after the decision).
         bool same = vi->header.count == st.vi_prev_count;
@@ -725,6 +760,222 @@ SpanResult Parser::Parse(std::span<const u32> dcb, u32 cut_dw, ChainState& st,
         off += dwords;
         ++r.packets;
     }
+}
+
+bool Parser::ReadOk(VAddr addr, u64 size, u32 kind) const {
+    auto& st = g_lean_fault_stats;
+    if (addr < 0x10000 || !env.rasterizer->IsMapped(addr, size)) {
+        st.precheck[kind + 1].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (env.rasterizer->LeanPageManager().AnyReadProtected(addr, size)) {
+        st.precheck[kind].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    return true;
+}
+
+bool Parser::Prewalk(const Regs& regs) {
+    // ResolveStageReadOnly's guest reads for the bound Fragment / Vertex stages, done here with no
+    // lock held: GetParams (the shader header) and RefreshFlatBuf (user data + the SRT walk).
+    auto& sc = *scratch;
+    sc.prewalked = false;
+    const std::array<std::pair<Shader::Stage, Shader::LogicalStage>, 2> stages{{
+        {Shader::Stage::Fragment, Shader::LogicalStage::Fragment},
+        {Shader::Stage::Vertex, Shader::LogicalStage::Vertex},
+    }};
+    for (const auto& [in, out] : stages) {
+        const u32 in_idx = static_cast<u32>(in);
+        const u32 out_idx = static_cast<u32>(out);
+        sc.pre_params[out_idx].reset();
+        sc.pre_flat[out_idx].clear();
+        if (!regs.stage_enable.IsStageEnabled(in_idx)) {
+            continue;
+        }
+        const auto* pgm = regs.ProgramForStage(in_idx);
+        if (!pgm || !pgm->Address<u32*>()) {
+            continue;
+        }
+        const auto params = AmdGpu::GetParams(*pgm);
+        sc.pre_params[out_idx] = params;
+        g_lean_fault_stats.lock_takes.fetch_add(1, std::memory_order_relaxed);
+        const Shader::Info* info = env.pipeline_cache->ProgramInfoFor(params.hash);
+        if (!info) {
+            continue; // the lookup misses on it before using the flat buffer
+        }
+        if (!CheckedWalk(*info, params.user_data.data(), sc.pre_flat[out_idx])) {
+            return false;
+        }
+    }
+    sc.prewalked = true;
+    return true;
+}
+
+bool Parser::CheckedWalk(const Shader::Info& info, const u32* user_data, std::vector<u32>& flat) {
+    // RefreshFlatBuf: flat = user data, then the generated walker copies the SRT dwords. The
+    // walker is interpreted (it only uses rdi / r10 / rsi and the stack) so every guest read is
+    // pre-checked first. The fault handler's patches (xor rdi,rdi / xor r10d,r10d + nops) read 0.
+    auto& st = g_lean_fault_stats;
+    flat.assign(info.srt_info.flattened_bufsize_dw, 0u);
+    std::memcpy(flat.data(), user_data,
+                std::min<size_t>(flat.size(), Shader::ShaderParams::NumShaderUserData) * 4);
+    const auto* code = reinterpret_cast<const u8*>(info.srt_info.walker_func);
+    if (!code) {
+        return true;
+    }
+    enum : u8 { PushRdi, PopRdi, LoadRdi, MovR10Imm, AndRdiR10, LoadR10, StoreR10, ZeroRdi, ZeroR10, Ret };
+    auto& plan = walk_plans[code];
+    if (plan.empty()) {
+        const size_t size = info.srt_info.walker_func_size;
+        size_t pos = 0;
+        bool ok = false;
+        while (pos < size) {
+            ZydisDecodedInstruction ins;
+            ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+            if (!ZYAN_SUCCESS(Common::Decoder::Instance()->decodeInstruction(
+                    ins, ops, const_cast<u8*>(code + pos), 15))) {
+                break;
+            }
+            const auto reg0 = ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER ? ops[0].reg.value
+                                                                         : ZYDIS_REGISTER_NONE;
+            const auto reg1 = ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER ? ops[1].reg.value
+                                                                         : ZYDIS_REGISTER_NONE;
+            const bool mem1 = ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                              ops[1].mem.base == ZYDIS_REGISTER_RDI &&
+                              ops[1].mem.index == ZYDIS_REGISTER_NONE;
+            const bool mem0 = ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                              ops[0].mem.base == ZYDIS_REGISTER_RSI &&
+                              ops[0].mem.index == ZYDIS_REGISTER_NONE;
+            const s32 d1 = mem1 ? static_cast<s32>(ops[1].mem.disp.value) : 0;
+            const s32 d0 = mem0 ? static_cast<s32>(ops[0].mem.disp.value) : 0;
+            WalkOp w{0xff, 0, 0};
+            switch (ins.mnemonic) {
+            case ZYDIS_MNEMONIC_PUSH:
+                if (reg0 == ZYDIS_REGISTER_RDI) w = {PushRdi, 0, 0};
+                break;
+            case ZYDIS_MNEMONIC_POP:
+                if (reg0 == ZYDIS_REGISTER_RDI) w = {PopRdi, 0, 0};
+                break;
+            case ZYDIS_MNEMONIC_MOV:
+                if (reg0 == ZYDIS_REGISTER_RDI && mem1) {
+                    w = {LoadRdi, d1, 0};
+                } else if (reg0 == ZYDIS_REGISTER_R10 &&
+                           ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                    w = {MovR10Imm, 0, ops[1].imm.value.u};
+                } else if (reg0 == ZYDIS_REGISTER_R10D && mem1) {
+                    w = {LoadR10, d1, 0};
+                } else if (mem0 && reg1 == ZYDIS_REGISTER_R10D) {
+                    w = {StoreR10, d0, 0};
+                }
+                break;
+            case ZYDIS_MNEMONIC_AND:
+                if (reg0 == ZYDIS_REGISTER_RDI && reg1 == ZYDIS_REGISTER_R10) w = {AndRdiR10, 0, 0};
+                break;
+            case ZYDIS_MNEMONIC_XOR:
+                if (reg0 == ZYDIS_REGISTER_RDI && reg1 == ZYDIS_REGISTER_RDI) w = {ZeroRdi, 0, 0};
+                if (reg0 == ZYDIS_REGISTER_R10D && reg1 == ZYDIS_REGISTER_R10D) w = {ZeroR10, 0, 0};
+                break;
+            case ZYDIS_MNEMONIC_NOP:
+                w = {0xfe, 0, 0}; // skipped
+                break;
+            case ZYDIS_MNEMONIC_RET:
+                w = {Ret, 0, 0};
+                break;
+            default:
+                break;
+            }
+            if (w.op == 0xff) {
+                break; // not understood
+            }
+            if (w.op != 0xfe) {
+                plan.push_back(w);
+            }
+            pos += ins.length;
+            if (w.op == Ret) {
+                ok = true;
+                break;
+            }
+        }
+        if (!ok) {
+            plan.clear();
+            st.precheck[4].fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
+    // Run it: rdi starts at the host user-data array (no check); every load through a loaded
+    // pointer is a guest read.
+    struct Rdi {
+        u64 v;
+        bool guest;
+    };
+    Rdi rdi{reinterpret_cast<u64>(user_data), false};
+    u64 r10 = 0;
+    std::array<Rdi, 64> stack{};
+    u32 sp = 0;
+    for (const auto& w : plan) {
+        switch (w.op) {
+        case PushRdi:
+            if (sp == stack.size()) {
+                st.precheck[4].fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            stack[sp++] = rdi;
+            break;
+        case PopRdi:
+            if (sp == 0) {
+                st.precheck[4].fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            rdi = stack[--sp];
+            break;
+        case LoadRdi: {
+            const u64 a = rdi.v + static_cast<s64>(w.disp);
+            if (rdi.guest && !ReadOk(a, 8, 0)) {
+                return false;
+            }
+            u64 v;
+            std::memcpy(&v, reinterpret_cast<const void*>(a), 8);
+            rdi = {v, true};
+            break;
+        }
+        case MovR10Imm:
+            r10 = w.imm;
+            break;
+        case AndRdiR10:
+            rdi.v &= r10;
+            break;
+        case LoadR10: {
+            const u64 a = rdi.v + static_cast<s64>(w.disp);
+            if (rdi.guest && !ReadOk(a, 4, 0)) {
+                return false;
+            }
+            u32 v;
+            std::memcpy(&v, reinterpret_cast<const void*>(a), 4);
+            r10 = v;
+            break;
+        }
+        case StoreR10: {
+            const u64 i = static_cast<u64>(w.disp) / 4;
+            if (w.disp < 0 || i >= flat.size()) {
+                st.precheck[5].fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            flat[i] = static_cast<u32>(r10);
+            break;
+        }
+        case ZeroRdi:
+            rdi = {0, true};
+            break;
+        case ZeroR10:
+            r10 = 0;
+            break;
+        case Ret:
+            return true;
+        default:
+            break;
+        }
+    }
+    return true;
 }
 
 } // namespace AmdGpu::Lean

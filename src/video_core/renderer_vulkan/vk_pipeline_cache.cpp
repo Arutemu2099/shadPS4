@@ -2607,6 +2607,19 @@ std::unique_lock<std::shared_mutex> PipelineCache::AcquireExclusive() const {
     return std::unique_lock{graphics_mutex};
 }
 
+const Shader::Info* PipelineCache::ProgramInfoFor(u64 hash) const {
+    std::shared_lock lk{graphics_mutex};
+    const auto it = program_cache.find(hash);
+    if (it == program_cache.end()) {
+        return nullptr;
+    }
+    const Program& program = *it->second;
+    if (program.precompiled && !program.precompiled_seen) {
+        return nullptr;
+    }
+    return &program.info;
+}
+
 const GraphicsPipeline* PipelineCache::LookupGraphics(const AmdGpu::Regs& regs,
                                                       GraphicsLookupScratch& out) const {
     out.Reset();
@@ -2636,7 +2649,8 @@ PipelineCache::Resolve PipelineCache::ResolveStageReadOnly(
     if (!pgm || !pgm->Address<u32*>()) {
         return Resolve::Unbound;
     }
-    const auto params = AmdGpu::GetParams(*pgm);
+    const bool pre = out.prewalked && out.pre_params[out_idx].has_value();
+    const auto params = pre ? *out.pre_params[out_idx] : AmdGpu::GetParams(*pgm);
     const auto it = program_cache.find(params.hash);
     if (it == program_cache.end()) {
         out.miss = Miss::NoProgram; // the front would translate and compile it
@@ -2651,7 +2665,11 @@ PipelineCache::Resolve PipelineCache::ResolveStageReadOnly(
     Shader::Info& view = out.View(program.info);
     view.pgm_base = params.Base();
     view.user_data = params.user_data;
-    view.RefreshFlatBuf();
+    if (pre) {
+        view.flattened_ud_buf = out.pre_flat[out_idx]; // the worker's checked walk, outside the lock
+    } else {
+        view.RefreshFlatBuf();
+    }
     auto& runtime_info = out.runtime_infos[out_idx];
     runtime_info.Initialize(stage_in);
     FillStageRuntimeInfo(runtime_info, regs, stage_in, stage_out, nullptr, out.key, false);

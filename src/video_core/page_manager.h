@@ -65,6 +65,11 @@ public:
     static void SetDeferredProtectSink(std::vector<ProtectRange>* sink);
     void ReconcileProtection(std::span<const ProtectRange> ranges) const;
 
+    /// SHADPS4_LEAN worker pre-check: true if any page of [addr, addr + size) is read-protected
+    /// (a read watcher). Lock-free, racy byte reads: a page protected right after this returns
+    /// faults, and the worker's fallback counts that.
+    [[nodiscard]] bool AnyReadProtected(VAddr addr, u64 size) const;
+
     /// Returns page aligned address.
     static constexpr VAddr GetPageAddr(VAddr addr) {
         return Common::AlignDown(addr, PM_PAGE_SIZE);

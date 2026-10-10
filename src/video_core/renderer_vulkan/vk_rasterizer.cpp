@@ -38,6 +38,7 @@
 #include "video_core/amdgpu/mtb_census.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/amdgpu/native_rec.h"
+#include "video_core/amdgpu/lean_front_api.h"
 #include "video_core/renderer_vulkan/vk_a2.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
@@ -12770,6 +12771,9 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, VideoCore::InvalidateOri
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
+    if (AmdGpu::t_lean_worker) [[unlikely]] {
+        AmdGpu::LeanNoteWorkerFault(addr); // counted; completes as a game thread's would
+    }
     // CP split run-ahead: a fault on the front must not download or invalidate ahead of the
     // draws it has posted. No lock is held here. No-op on every other thread.
     liverpool->DrainForFrontFault();
@@ -12786,6 +12790,12 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size) {
     // CP split run-ahead: see InvalidateMemory. SPLIT-TODO: a drain here waits for posted draws
     // the way today's guest faults wait for the CP's current packet (SendCommand<true>), so it
     // should add no new lock cycle - inferred, not checked at run time.
+    if (AmdGpu::t_lean_worker) [[unlikely]] {
+        // SHADPS4_LEAN fallback (the pre-check missed a racing protect): counted (must read 0);
+        // the worker holds no cache lock here (its guest reads run outside the shared lock), so
+        // completing as a game thread's fault cannot deadlock; its span stops before emitting.
+        AmdGpu::LeanNoteWorkerFault(addr);
+    }
     liverpool->DrainForFrontFault();
     buffer_cache.ReadMemory(addr, size);
     return true;

@@ -230,6 +230,10 @@ public:
     /// Ends rendering and records one global memory barrier (writes -> any access).
     void A2GlobalBarrier();
     [[nodiscard]] bool A2OcclusionOpen() const;
+    /// SHADPS4_LEAN worker pre-check (lock-free read-protection test).
+    [[nodiscard]] const VideoCore::PageManager& LeanPageManager() const noexcept {
+        return page_manager;
+    }
     /// SHADPS4_A2 colour stretches (architecture-a sec. 10), back thread, before the stretch's
     /// pass, once per distinct material: its 32 slot words through BindlessResolve with the
     /// representative draw's fragment stage; its images are appended to `ids`. False: the

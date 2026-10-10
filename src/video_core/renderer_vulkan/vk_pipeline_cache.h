@@ -154,6 +154,14 @@ struct GraphicsLookupScratch {
 
     Shader::Info& View(const Shader::Info& shared);
     void Reset();
+
+    /// SHADPS4_LEAN worker (architecture-a sec. 16): the guest reads done OUTSIDE the cache's lock,
+    /// per logical stage - the shader params (GetParams reads the shader header) and the flattened
+    /// user data (the worker's checked SRT walk). When `prewalked`, ResolveStageReadOnly uses them
+    /// and reads no guest memory under the lock. Not touched by Reset (set before each lookup).
+    bool prewalked{};
+    std::array<std::optional<Shader::ShaderParams>, MaxShaderStages> pre_params{};
+    std::array<std::vector<u32>, MaxShaderStages> pre_flat{};
 };
 
 class PipelineCache {
@@ -198,6 +206,9 @@ public:
     /// whenever the front's lookup would return null. Configurations other than
     /// stage_enable == Vs are reported as Miss::UnsupportedStages (LookupOrBuildGraphics handles
     /// them on the exclusive path).
+    /// SHADPS4_LEAN: the program's shared Info for a shader hash (short shared lock); null when
+    /// absent or a precompiled program's first use (the lookup would miss).
+    const Shader::Info* ProgramInfoFor(u64 hash) const;
     const GraphicsPipeline* LookupGraphics(const AmdGpu::Regs& regs,
                                            GraphicsLookupScratch& out) const;
 

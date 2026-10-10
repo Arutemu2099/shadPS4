@@ -1560,12 +1560,22 @@ void LeanLog() {
              "{:.2f} ms/s, verified {} DCBs: windows bad {} whole-file bad {} extras bad {} reseeds "
              "{} | worker spans compared {} BAD {} (events {}, no mark {}) | coverage: packets "
              "{:.1f}% draws {:.1f}% | epoch bumps inside worker spans {} | stops (by Lean::Stop "
-             "value):{} | other-stop opcodes:{}",
+             "value):{} | other-stop opcodes:{} | faults: pre-check stops SRT protected {} "
+             "unmapped {} V# protected {} unmapped {} walker not understood {} flat overflow {}; "
+             "FALLBACK faults (must be 0) {} first {:#x} {:#x} | worker shared-lock takes per draw {:.2f}",
              g_lean, sec, c.dcbs.load(), c.eligible.load(), c.skipped.load(),
              double(s.chain_cyc) / 3.5e6 / std::max(sec, 1e-9), s.chain_cmp, s.chain_bad_win,
              s.chain_bad_full, s.chain_bad_extra, s.reseeds, c.cmp.load(), c.bad.load(),
              c.events.load(), c.no_mark.load(), pk > 0 ? 100.0 * double(c.pkts_span) / pk : 0.0,
-             dr > 0 ? 100.0 * double(c.draws_span) / dr : 0.0, c.epoch_bumps.load(), stops, ops);
+             dr > 0 ? 100.0 * double(c.draws_span) / dr : 0.0, c.epoch_bumps.load(), stops, ops,
+             g_lean_fault_stats.precheck[0].load(), g_lean_fault_stats.precheck[1].load(),
+             g_lean_fault_stats.precheck[2].load(), g_lean_fault_stats.precheck[3].load(),
+             g_lean_fault_stats.precheck[4].load(), g_lean_fault_stats.precheck[5].load(),
+             g_lean_fault_stats.fallback.load(), g_lean_fault_stats.first[0].load(),
+             g_lean_fault_stats.first[1].load(),
+             g_lean_fault_stats.lock_draws.load()
+                 ? double(g_lean_fault_stats.lock_takes.load()) / double(g_lean_fault_stats.lock_draws.load())
+                 : 0.0);
     for (auto& x : c.stops) {
         x = 0;
     }
@@ -3311,6 +3321,7 @@ void Liverpool::LeanStart() {
 
 void Liverpool::LeanWorkerLoop(std::stop_token stoken, u32 index) {
     Common::SetCurrentThreadName(fmt::format("shadPS4:LeanWorker{}", index).c_str());
+    t_lean_worker = true; // its faults are counted, never treated as the front's
     auto& s = g_lean_s;
     Lean::Env env{};
     env.rasterizer = rasterizer;

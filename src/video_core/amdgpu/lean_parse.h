@@ -16,6 +16,8 @@
 #include <array>
 #include <memory>
 #include <span>
+#include <unordered_map>
+#include <vector>
 
 #include "common/types.h"
 #include "video_core/amdgpu/cb_db_extent.h"
@@ -24,6 +26,10 @@
 #include "video_core/amdgpu/regs.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_shader.h"
+
+namespace Shader {
+struct Info;
+}
 
 namespace Vulkan {
 class Rasterizer;
@@ -97,6 +103,9 @@ enum class Stop : u32 {
     Config,               ///< the whole parser is off for this configuration (VERIFY, depth 0,
                           ///< SEGB, DRAW_TAG, dispatch-run diagnostics, hazard stats, no
                           ///< rasterizer / pipeline cache / split)
+    Fault,                ///< a guest read the pre-check found read-protected / unmapped (or a
+                          ///< walker it could not interpret): the front parses from here
+    FaultFallback,        ///< a fault happened anyway (racing protect; counted, must be 0)
     Count,
 };
 
@@ -130,6 +139,19 @@ public:
     }
 
 private:
+    /// SHADPS4_LEAN: shader headers + checked SRT walks into the scratch, outside the cache's
+    /// lock (sec. 16). False: a pre-check stop (Stop::Fault).
+    bool Prewalk(const Regs& regs);
+    /// The checked interpreter of a generated SRT walker (RefreshFlatBuf's walk).
+    bool CheckedWalk(const Shader::Info& info, const u32* user_data, std::vector<u32>& flat);
+    /// IsMapped + AnyReadProtected for one guest read; `kind` 0 SRT, 2 V#.
+    bool ReadOk(VAddr addr, u64 size, u32 kind) const;
+    struct WalkOp {
+        u8 op;
+        s32 disp;
+        u64 imm;
+    };
+    std::unordered_map<const void*, std::vector<WalkOp>> walk_plans; ///< per walker code
     struct DrawPlan;
     Stop DecideDraw(const PM4Header* header, std::span<const u32> dcb, u32 off,
                     const char* name, const CpSplit::DrawArgs& args, const ChainState& st,
