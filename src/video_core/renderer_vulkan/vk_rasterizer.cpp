@@ -2873,7 +2873,11 @@ void Rasterizer::NativePrepare(const GraphicsPipeline* base,
     bool spans_ok = true;
     const auto add_span = [&](u64 handle, VideoCore::NativeRunAccess access, VAddr a, u64 size) {
         for (u32 i = 0; i < nus; ++i) {
-            if (us[i].handle == handle && us[i].access == access) {
+            // Merge only while the union stays within NativeRunSpan's 64 MB (s400: merging every
+            // slot of one buffer failed 1.3 M prepares).
+            if (us[i].handle == handle && us[i].access == access &&
+                std::max<VAddr>(us[i].s.hi, a + size) - std::min(us[i].s.lo, a) <=
+                    (u64{64} << 20)) {
                 us[i].s.Add(a, size);
                 return;
             }
