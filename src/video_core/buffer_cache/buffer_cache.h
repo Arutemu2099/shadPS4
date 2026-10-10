@@ -140,6 +140,9 @@ public:
     [[nodiscard]] Buffer* GetFaultBuffer() noexcept {
         return fault_manager.GetFaultBuffer();
     }
+    [[nodiscard]] u64 FaultPagesProcessed() const noexcept {
+        return fault_manager.PagesProcessed();
+    }
 
     /// Retrieves the buffer with the specified id.
     [[nodiscard]] Buffer& GetBuffer(BufferId id) {

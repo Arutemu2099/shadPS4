@@ -1050,7 +1050,29 @@ void EmitContext::NativePtTranslate(u32 handle, u32 binding, Id record_word, Id 
     const Id entry_addr{OpIAdd(U64, fallback, OpShiftLeftLogical(U64, page, ConstU32(3u)))};
     const Id entry{OpLoad(U64, OpConvertUToPtr(physical_pointer_type_u64, entry_addr),
                           spv::MemoryAccessMask::Aligned, 8u)};
-    const Id miss{OpIEqual(U1[1], entry, u64_zero_value)};
+    // Contiguity (brick C v2): the binding's last byte's page must map to entry + distance (one
+    // cached buffer, contiguous) and be cached; else the binding is a miss (loads read 0) and
+    // its pages are flagged in the fault buffer (count 0 otherwise: the helper's loop runs no
+    // iteration), so ProcessFaultBuffer creates one buffer over the range. One extra
+    // page-table load per binding per invocation.
+    const Id size{OpUMax(U32[1], native_size_bytes[handle], ConstU32(1u))};
+    const Id last_byte{OpIAdd(U64, guest, OpUConvert(U64, OpISub(U32[1], size, ConstU32(1u))))};
+    const Id last_page{OpShiftRightLogical(U64, last_byte,
+                                           ConstU32(VideoCore::BufferCache::CACHING_PAGEBITS))};
+    const Id last_addr{OpIAdd(U64, fallback, OpShiftLeftLogical(U64, last_page, ConstU32(3u)))};
+    const Id entry_last{OpLoad(U64, OpConvertUToPtr(physical_pointer_type_u64, last_addr),
+                               spv::MemoryAccessMask::Aligned, 8u)};
+    const Id distance{OpShiftLeftLogical(U64, OpISub(U64, last_page, page),
+                                         ConstU32(VideoCore::BufferCache::CACHING_PAGEBITS))};
+    const Id contiguous{OpLogicalAnd(U1[1], OpIEqual(U1[1], entry_last, OpIAdd(U64, entry, distance)),
+                                     OpINotEqual(U1[1], entry_last, u64_zero_value))};
+    const Id miss{OpLogicalOr(U1[1], OpIEqual(U1[1], entry, u64_zero_value),
+                              OpLogicalNot(U1[1], contiguous))};
+    const Id npages{OpUConvert(U32[1], OpIAdd(U64, OpISub(U64, last_page, page), Constant(U64, u64{1})))};
+    const Id flag{OpLogicalAnd(U1[1], miss, OpINotEqual(U1[1], guest, u64_zero_value))};
+    OpFunctionCall(void_id, native_pt_fault, NativeTableLoad(Shader::NativeTableFaultAddr),
+                   NativeTableLoad(Shader::NativeTableFaultAddr + 1), OpUConvert(U32[1], page),
+                   OpSelect(U32[1], flag, npages, u32_zero_value));
     const Id in_page{
         OpBitwiseAnd(U64, guest, Constant(U64, VideoCore::BufferCache::CACHING_PAGESIZE - 1))};
     native_dev_base[handle] = OpSelect(U64, miss, fallback, OpIAdd(U64, entry, in_page));
@@ -1105,6 +1127,54 @@ Id EmitContext::DefineNativePtReport(std::string_view name, u32 counter_dword,
     }
     OpBranch(merge_label);
     AddLabel(merge_label);
+    OpReturn();
+    OpFunctionEnd();
+    return func;
+}
+
+Id EmitContext::DefineNativePtFault() {
+    // void(fault_lo, fault_hi, first_page, count): the fault bit of pages first .. first +
+    // min(count, 256) - 1 in the fault buffer at the 64-bit address (bit page % 32 of word
+    // page / 32; a plain read-or-write, as DefineGetBdaPointer's single-page fault).
+    const Id func_type{TypeFunction(void_id, U32[1], U32[1], U32[1], U32[1])};
+    const Id func{OpFunction(void_id, spv::FunctionControlMask::MaskNone, func_type)};
+    const Id lo{OpFunctionParameter(U32[1])};
+    const Id hi{OpFunctionParameter(U32[1])};
+    const Id first{OpFunctionParameter(U32[1])};
+    const Id count{OpFunctionParameter(U32[1])};
+    Name(func, "native_pt_fault");
+    AddLabel();
+    const Id i_var{AddLocalVariable(TypePointer(spv::StorageClass::Function, U32[1]),
+                                    spv::StorageClass::Function)};
+    OpStore(i_var, u32_zero_value);
+    const Id limit{OpUMin(U32[1], count, ConstU32(256u))};
+    const Id base{OpBitwiseOr(U64, OpUConvert(U64, lo),
+                              OpShiftLeftLogical(U64, OpUConvert(U64, hi), ConstU32(32u)))};
+    const Id header{OpLabel()};
+    const Id cond{OpLabel()};
+    const Id body{OpLabel()};
+    const Id cont{OpLabel()};
+    const Id merge{OpLabel()};
+    OpBranch(header);
+    AddLabel(header);
+    OpLoopMerge(merge, cont, spv::LoopControlMask::MaskNone);
+    OpBranch(cond);
+    AddLabel(cond);
+    const Id iv{OpLoad(U32[1], i_var)};
+    OpBranchConditional(OpULessThan(U1[1], iv, limit), body, merge);
+    AddLabel(body);
+    const Id p{OpIAdd(U32[1], first, iv)};
+    const Id word{OpShiftLeftLogical(U32[1], OpShiftRightLogical(U32[1], p, ConstU32(5u)),
+                                     ConstU32(2u))};
+    const Id ptr{OpConvertUToPtr(physical_pointer_type_u32, OpIAdd(U64, base, OpUConvert(U64, word)))};
+    const Id value{OpLoad(U32[1], ptr, spv::MemoryAccessMask::Aligned, 4u)};
+    const Id bit{OpShiftLeftLogical(U32[1], u32_one_value, OpBitwiseAnd(U32[1], p, ConstU32(31u)))};
+    OpStore(ptr, OpBitwiseOr(U32[1], value, bit), spv::MemoryAccessMask::Aligned, 4u);
+    OpBranch(cont);
+    AddLabel(cont);
+    OpStore(i_var, OpIAdd(U32[1], iv, u32_one_value));
+    OpBranch(header);
+    AddLabel(merge);
     OpReturn();
     OpFunctionEnd();
     return func;
@@ -1843,6 +1913,9 @@ Id EmitContext::DefineReadConst(bool dynamic) {
 }
 
 void EmitContext::DefineFunctions() {
+    if (native_pt) {
+        native_pt_fault = DefineNativePtFault(); // called from the prologue (DefineMain)
+    }
     if (info.uses_pack_10_11_11) {
         f32_to_uf11 = DefineFloat32ToUfloatM5(6, "f32_to_uf11");
         f32_to_uf10 = DefineFloat32ToUfloatM5(5, "f32_to_uf10");

@@ -3499,6 +3499,9 @@ bool Rasterizer::NativeRingPrepare(const GraphicsPipeline* base,
         const u64 fb = buffer_cache.GetBdaPageTableBuffer()->BufferDeviceAddress();
         table[Shader::NativeTablePtFallback] = static_cast<u32>(fb);
         table[Shader::NativeTablePtFallback + 1] = static_cast<u32>(fb >> 32);
+        const u64 fa = buffer_cache.GetFaultBuffer()->BufferDeviceAddress();
+        table[Shader::NativeTableFaultAddr] = static_cast<u32>(fa);
+        table[Shader::NativeTableFaultAddr + 1] = static_cast<u32>(fa >> 32);
     }
     // Coverage (sec. 11): inherited user-data registers - every member's equal the opener's
     // (checked at each confirm); the shaders take them from here.
@@ -3889,6 +3892,9 @@ bool Rasterizer::NativeSegPrepare(const GraphicsPipeline* base,
         const u64 fb = buffer_cache.GetBdaPageTableBuffer()->BufferDeviceAddress();
         table[Shader::NativeTablePtFallback] = static_cast<u32>(fb);
         table[Shader::NativeTablePtFallback + 1] = static_cast<u32>(fb >> 32);
+        const u64 fa = buffer_cache.GetFaultBuffer()->BufferDeviceAddress();
+        table[Shader::NativeTableFaultAddr] = static_cast<u32>(fa);
+        table[Shader::NativeTableFaultAddr + 1] = static_cast<u32>(fa >> 32);
     }
     // Inherited user-data registers: the front admitted only members with the opener's set and
     // values (SegB v2), so the shaders take them from here.
@@ -3916,12 +3922,21 @@ bool Rasterizer::NativeSegPrepare(const GraphicsPipeline* base,
             continue;
         }
         VAddr cpu = 0;
-        if (!(seg.gmask & bit) ||
-            !base_of(seg.glo[bi], seg.ghi[bi], b.buf[bi], cpu) ||
-            !add_span(b.buf[bi], VideoCore::NativeRunAccess::Storage, seg.glo[bi], seg.ghi[bi])) {
+        if ((seg.gmask & bit) && base_of(seg.glo[bi], seg.ghi[bi], b.buf[bi], cpu) &&
+            add_span(b.buf[bi], VideoCore::NativeRunAccess::Storage, seg.glo[bi], seg.ghi[bi])) {
+            table[Shader::NativeTableBase + bi] = static_cast<u32>(cpu);
+            continue;
+        }
+        // The union is not inside the opener's buffer (brick C v2): the base stays the opener's
+        // (the descriptor path: scalar reads of this slot by members outside it are a known gap,
+        // sec. 19); the pt loads address each member's range through the page table and flag
+        // uncached / non-contiguous pages for ProcessFaultBuffer.
+        const VideoCore::Buffer* ob = buffer_cache.NativeBufferAt(o_addr[bi]);
+        if (!ob) {
             return fail(6);
         }
-        table[Shader::NativeTableBase + bi] = static_cast<u32>(cpu);
+        table[Shader::NativeTableBase + bi] = static_cast<u32>(ob->CpuAddr());
+        ++st.segx_guest_gpu;
     }
     for (u32 a = 0; a < b.vb_n; ++a) {
         const bool in_union = ((seg.vmask >> a) & 1) != 0;
@@ -4768,6 +4783,9 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
                 const u64 fb = buffer_cache.GetBdaPageTableBuffer()->BufferDeviceAddress();
                 native_ring_table[Shader::NativeTablePtFallback] = static_cast<u32>(fb);
                 native_ring_table[Shader::NativeTablePtFallback + 1] = static_cast<u32>(fb >> 32);
+                const u64 fa = buffer_cache.GetFaultBuffer()->BufferDeviceAddress();
+                native_ring_table[Shader::NativeTableFaultAddr] = static_cast<u32>(fa);
+                native_ring_table[Shader::NativeTableFaultAddr + 1] = static_cast<u32>(fa >> 32);
             }
         }
         if (native_seg_on) [[unlikely]] {
@@ -5041,6 +5059,9 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         ++native_stats.n_no;
     }
     segb_opened = !b.verify;
+    if (native_pt_on && !b.verify) {
+        fault_process_pending = true; // the pt shaders may have flagged pages (brick C v2)
+    }
     return true;
 }
 
@@ -6452,13 +6473,8 @@ bool Rasterizer::NativeSegEvaluate(const AmdGpu::CpSplit::SplitSegmentRecord& se
         }
         vb0 = buf;
     }
-    for (u64 m = seg.gmask; m != 0; m &= m - 1) {
-        const u32 bi = static_cast<u32>(std::countr_zero(m));
-        if (!inside(seg.glo[bi], seg.ghi[bi], buf)) {
-            why = 6;
-            return false;
-        }
-    }
+    // Guest unions: not a refusal any more (brick C v2) - the pt shaders address every member's
+    // range through the page table and flag what is not cached.
     if (seg.n_ops > AmdGpu::CpSplit::SegMaxOps + 3 || seg.n == 0 || seg.n > NativeMaxDraws) {
         why = 7;
         return false;
@@ -7955,6 +7971,18 @@ void Rasterizer::OnSubmit() {
     if (fault_process_pending) {
         fault_process_pending = false;
         buffer_cache.ProcessFaultBuffer();
+        if (native_pt_on) [[unlikely]] {
+            // SHADPS4_NATIVE_PT: pages the pt shaders faulted (brick C v2), every ~10 s.
+            static auto window = std::chrono::steady_clock::now();
+            static u64 last = 0;
+            const auto now = std::chrono::steady_clock::now();
+            if (now - window >= std::chrono::seconds(10)) {
+                const u64 pages = buffer_cache.FaultPagesProcessed();
+                LOG_INFO(Render_Vulkan, "NativePt faults: pages={}", pages - last);
+                last = pages;
+                window = now;
+            }
+        }
     }
     texture_cache.ProcessDownloadImages();
     texture_cache.RunGarbageCollector();

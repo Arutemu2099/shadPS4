@@ -435,6 +435,7 @@ public:
 
     Id get_bda_pointer{};
     Id native_pt_report{}; // SHADPS4_NATIVE_PT=2: void(binding, rel, pt, desc, draw, lo, hi, tag)
+    Id native_pt_fault{};  // SHADPS4_NATIVE_PT: void(fault_lo, fault_hi, first_page, count)
     Id native_seg_report{}; // SHADPS4_NATIVE_SEG=2: void(word, entry, ptr, ssbo, draw, lo, hi, tag)
 
     Id read_const{};
@@ -463,6 +464,7 @@ private:
 
     Id DefineGetBdaPointer();
     Id DefineNativePtReport(std::string_view name, u32 counter_dword, u32 entries_dword);
+    Id DefineNativePtFault();
 
     Id DefineReadConst(bool dynamic);
 

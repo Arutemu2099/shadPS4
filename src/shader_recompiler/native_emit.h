@@ -150,11 +150,14 @@ constexpr u32 NativeSegSlots = NativeSegLegacySlot + 1;
 constexpr u32 NativeSegRingMask = (1u << 14) - 1;
 constexpr u32 NativeTableSlotAddr = 176;                                       // 176..209
 constexpr u32 NativeTableSegList = NativeTableSlotAddr + 2 * NativeSegSlots; // 210, 211
+/// SHADPS4_NATIVE_PT (brick C v2): the fault buffer's u64 device address (a non-contiguous or
+/// uncached Guest range flags its pages there; ProcessFaultBuffer creates the buffer).
+constexpr u32 NativeTableFaultAddr = NativeTableSegList + 2; // 212, 213
 constexpr u32 NativeTableDwords = 256;
 static_assert(NativeTableInhSlots + 2 <= NativeTableUd);
 static_assert(NativeTableSize + NUM_BUFFERS <= NativeTablePtLo);
 static_assert(NativeTablePtFallback + 2 <= NativeTableSlotAddr);
-static_assert(NativeTableSegList + 2 <= NativeTableDwords);
+static_assert(NativeTableFaultAddr + 2 <= NativeTableDwords);
 /// SHADPS4_NATIVE_GPU_DIRECT=1: native variants are compiled in ring mode.
 inline const bool g_native_ring = [] {
     const char* v = std::getenv("SHADPS4_NATIVE_GPU_DIRECT");

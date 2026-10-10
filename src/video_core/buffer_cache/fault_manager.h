@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/range_set.h"
 
@@ -22,8 +23,13 @@ public:
     }
 
     void ProcessFaultBuffer();
+    /// Faulted pages handed to FindBuffer so far (SHADPS4_NATIVE_PT's "NativePt faults" line).
+    [[nodiscard]] u64 PagesProcessed() const noexcept {
+        return pages_processed.load(std::memory_order_relaxed);
+    }
 
 private:
+    std::atomic<u64> pages_processed{};
     Vulkan::Scheduler& scheduler;
     BufferCache& buffer_cache;
     RangeSet fault_ranges;

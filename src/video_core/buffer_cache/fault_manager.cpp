@@ -21,7 +21,9 @@ FaultManager::FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& 
     : scheduler{scheduler_}, buffer_cache{buffer_cache_},
       caching_pagesize{1ULL << caching_pagebits}, caching_num_pages{caching_num_pages_},
       fault_buffer_size{caching_num_pages_ / 8},
-      fault_buffer{instance, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, fault_buffer_size},
+      // eShaderDeviceAddress: SHADPS4_NATIVE_PT flags non-contiguous Guest ranges by pointer.
+      fault_buffer{instance, scheduler, MemoryUsage::DeviceLocal, 0,
+                   AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, fault_buffer_size},
       download_buffer{instance, scheduler, MemoryUsage::Download,
                       0,        AllFlags,  MaxPendingFaults * PageFaultAreaSize} {
     const auto device = instance.GetDevice();
@@ -163,6 +165,7 @@ void FaultManager::ProcessFaultBuffer() {
             fault_ranges.Add(fault_buf[i], caching_pagesize);
             LOG_INFO(Render_Vulkan, "Accessed non-GPU cached memory at {:#x}", fault_buf[i]);
         }
+        pages_processed.fetch_add(fault_count, std::memory_order_relaxed);
         fault_ranges.ForEach([&](VAddr start, VAddr end) {
             ASSERT_MSG((end - start) <= std::numeric_limits<u32>::max(),
                        "Buffer size is too large");

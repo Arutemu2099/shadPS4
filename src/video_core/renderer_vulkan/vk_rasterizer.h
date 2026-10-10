@@ -808,6 +808,7 @@ private:
         std::array<u64, 12> c_rec{}, n_rec{};
         /// SHADPS4_NATIVE_SEGX=1: executed segments, their members, joins refused by a seal.
         u64 segx_opens{}, segx_members{}, segx_join_refused{};
+        u64 segx_guest_gpu{}; ///< Guest slots of segments left to the page table (no span)
     } native_stats;
     void NativePrepare(const GraphicsPipeline* base,
                        const AmdGpu::CpSplit::VertexInputAttrib* attribs,
