@@ -196,6 +196,29 @@ public:
         return slot_images[id];
     }
 
+    /// SHADPS4_NATIVE_BINDLESS (back thread): a T# -> image cache entry still names the image
+    /// FindImage would return - PreparedEntryValid's rule (allocated, same uid, registered, not
+    /// picked; same structure generation, or an exact-range match whose overlap epoch is
+    /// unchanged) - and the image needs no re-validation on a bind (clean, no depth association).
+    [[nodiscard]] bool BindlessEntryValid(ImageId id, u64 uid, u64 generation, bool local,
+                                          u64 overlap_epoch) {
+        if (!id || !uid || !slot_images.is_allocated(id)) {
+            return false;
+        }
+        const Image& image = slot_images[id];
+        const auto flags = std::atomic_ref<ImageFlagBits>{const_cast<ImageFlagBits&>(image.flags)}
+                               .load(std::memory_order_relaxed);
+        if (image.image_uid != uid || False(flags & ImageFlagBits::Registered) ||
+            True(flags & (ImageFlagBits::Picked | ImageFlagBits::Dirty)) || image.depth_id) {
+            return false;
+        }
+        if (struct_generation.load(std::memory_order_acquire) == generation) {
+            return true;
+        }
+        return local && std::atomic_ref<u64>{const_cast<u64&>(image.overlap_epoch)}.load(
+                            std::memory_order_relaxed) == overlap_epoch;
+    }
+
     /// SHADPS4_BIND_MEMO_STATS: the UpdateImageLockFree predicate (registered, clean, tracked
     /// over its whole guest range) with relaxed loads, no LRU touch and no counters. CP thread.
     [[nodiscard]] bool ImageUpToDateRelaxed(ImageId id) noexcept {

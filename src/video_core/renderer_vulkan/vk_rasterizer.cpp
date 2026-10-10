@@ -4423,15 +4423,16 @@ bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::I
     const u64 ie = VideoCore::g_image_epoch.load(std::memory_order_acquire);
     const u64 me = texture_cache.MetaClearEpoch();
     const u64 sg = texture_cache.SamplerGeneration();
-    if (tg != bl.tex_gen) {
-        bl.view_slot.clear(); // a view may be gone: its slot is never handed out again
-    }
-    if (tg != bl.tex_gen || ie != bl.img_epoch || me != bl.meta_epoch) {
+    // Per-image validity (s431: a global texture-cache generation / image epoch wiped every
+    // entry a few times per frame, 30% misses, -7% city): BindlessEntryValid per entry; only a
+    // meta clear invalidates everything. Slot keys carry the image uid and backing, so a dead
+    // view's handle value cannot alias a live one.
+    (void)ie;
+    if (me != bl.meta_epoch) {
         ++bl.img_gen;
-        bl.tex_gen = tg;
-        bl.img_epoch = ie;
         bl.meta_epoch = me;
     }
+    bl.tex_gen = tg;
     if (sg != bl.sampler_gen) {
         bl.smp_slot.clear();
         ++bl.smp_gen;
@@ -4478,8 +4479,10 @@ bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::I
             hsh = (hsh ^ w) * 0x100000001B3ull;
         }
         auto& e = bl.img_cache[(hsh ^ (hsh >> 29)) & (bl.img_cache.size() - 1)];
-        if (e.gen == bl.img_gen && e.desc == &desc && e.words == words) {
-            auto& image = texture_cache.GetImage(e.id);
+        const u64 tc0 = __rdtsc();
+        if (e.gen == bl.img_gen && e.desc == &desc && e.words == words &&
+            texture_cache.BindlessEntryValid(e.id, e.uid, e.tex_gen, e.local, e.overlap)) {
+            auto& image = texture_cache.PeekImage(e.id);
             if (image.backing == e.backing && image.backing->state_serial == e.serial) {
                 texture_cache.TouchImageAccess(image);
                 slots[i] = e.slot;
@@ -4487,6 +4490,7 @@ bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::I
                     views[i] = e.view;
                 }
                 ++st.bl_img_hit;
+                st.c_bl_hit += __rdtsc() - tc0;
                 continue;
             }
         }
@@ -4506,7 +4510,9 @@ bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::I
         image.usage.texture |= true;
         const vk::ImageView vh = *view.image_view;
         const vk::ImageLayout lay = image.backing->state.layout;
-        const u64 vkey = std::bit_cast<u64>(static_cast<VkImageView>(vh)) ^ (u64(lay) << 48);
+        const BindlessState::ViewKey vkey{image.image_uid, image.backing,
+                                          std::bit_cast<u64>(static_cast<VkImageView>(vh)),
+                                          static_cast<u32>(lay)};
         u32 slot;
         if (const auto it = bl.view_slot.find(vkey); it != bl.view_slot.end()) {
             slot = it->second;
@@ -4527,12 +4533,25 @@ bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::I
             device.updateDescriptorSets(w, {});
             bl.view_slot.emplace(vkey, slot);
         }
-        e = {&desc, words, bl.img_gen, slot, image_id, image.backing, image.backing->state_serial,
-             vh, lay};
+        e = {&desc,
+             words,
+             bl.img_gen,
+             slot,
+             image_id,
+             image.image_uid,
+             texture_cache.StructGeneration(),
+             std::atomic_ref<u64>{image.overlap_epoch}.load(std::memory_order_relaxed),
+             image.info.guest_address == idesc.info.guest_address &&
+                 image.info.guest_size == idesc.info.guest_size,
+             image.backing,
+             image.backing->state_serial,
+             vh,
+             lay};
         slots[i] = slot;
         if (views) {
             views[i] = vh;
         }
+        st.c_bl_miss += __rdtsc() - tc0;
     }
     std::array<size_t, Shader::NativeBindlessMax> lru{};
     u32 n_lru = 0;
@@ -5412,11 +5431,14 @@ void Rasterizer::NativeLog() {
         LOG_INFO(Render_Vulkan,
                  "NativeBindless: batches={} open fail={} | joins with other images={} failed={} "
                  "| fails 0..5: {} {} {} {} {} {} | images hit/miss {}/{} samplers hit/miss {}/{} "
-                 "| opener verify ok={} MISMATCH={} unverified={} | rotations={} slots {}/{}",
+                 "| opener verify ok={} MISMATCH={} unverified={} | rotations={} slots {}/{} | "
+                 "cycles per image hit {:.0f} miss {:.0f}",
                  st.bl_open, st.bl_open_fail, st.bl_join, st.bl_join_fail, st.bl_fail[0],
                  st.bl_fail[1], st.bl_fail[2], st.bl_fail[3], st.bl_fail[4], st.bl_fail[5],
                  st.bl_img_hit, st.bl_img_miss, st.bl_smp_hit, st.bl_smp_miss, st.bl_vfy_ok,
-                 st.bl_vfy_bad, st.bl_vfy_none, st.bl_rot, bindless.img_next, bindless.smp_next);
+                 st.bl_vfy_bad, st.bl_vfy_none, st.bl_rot, bindless.img_next, bindless.smp_next,
+                 double(st.c_bl_hit) / double(std::max<u64>(st.bl_img_hit, 1)),
+                 double(st.c_bl_miss) / double(std::max<u64>(st.bl_img_miss, 1)));
     }
     if (st.n_rec[0] + st.n_rec[3] + st.n_rec[9] != 0) {
         const auto per = [](u64 c, u64 n) { return n ? double(c) / double(n) : 0.0; };

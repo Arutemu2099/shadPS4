@@ -589,6 +589,8 @@ private:
         u64 gen{};
         u32 slot{};
         VideoCore::ImageId id{};
+        u64 uid{}, tex_gen{}, overlap{};
+        bool local{};
         const void* backing{};
         u64 serial{};
         vk::ImageView view{};
@@ -605,7 +607,21 @@ private:
         u32 cur{};
         std::array<u64, Bindless::NumSets> last_tick{};
         u32 img_next{}, smp_next{};
-        std::unordered_map<u64, u32> view_slot, smp_slot;
+        struct ViewKey {
+            u64 uid;
+            const void* backing;
+            u64 view;
+            u32 layout;
+            bool operator==(const ViewKey&) const = default;
+        };
+        struct ViewKeyHash {
+            size_t operator()(const ViewKey& k) const noexcept {
+                return std::hash<u64>{}(k.uid * 0x9E3779B97F4A7C15ull ^
+                                        std::bit_cast<u64>(k.backing) ^ (k.view * 31) ^ k.layout);
+            }
+        };
+        std::unordered_map<ViewKey, u32, ViewKeyHash> view_slot;
+        std::unordered_map<u64, u32> smp_slot;
         std::vector<BindlessImgEntry> img_cache;
         std::vector<BindlessSmpEntry> smp_cache;
         u64 img_gen{1}, smp_gen{1};
@@ -701,6 +717,7 @@ private:
         std::array<u64, 8> bl_fail{};
         u64 bl_img_hit{}, bl_img_miss{}, bl_smp_hit{}, bl_smp_miss{};
         u64 bl_vfy_ok{}, bl_vfy_bad{}, bl_vfy_none{}, bl_rot{};
+        u64 c_bl_hit{}, c_bl_miss{}; ///< cycles in image hits / misses
         std::array<u64, 4> rj_fail{};
         std::array<u64, 4> prep_c10{};  ///< verify: close 10 of a prepared member by where
         std::array<u64, 16> prep_stop{};
