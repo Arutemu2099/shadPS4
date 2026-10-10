@@ -1036,6 +1036,9 @@ u64 NativeRecSpecKey(const Shader::BoundStage& bs, const Shader::Gcn::FetchShade
 /// Stage a2: derive what the front's FRONT_DERIVE + stage copy produce (flattened user data of
 /// VS / PS, the vertex inputs) on the job thread, through the program table the front publishes.
 /// Writes into the thread's payload ring; fills the record's derive fields (derived = 0: none).
+std::array<std::atomic<u64>, 4> g_nr_need{};
+std::array<std::atomic<u64>, 32> g_nr_need_reg{};
+
 void NativeRecDerive(NR::Record& rec) {
     auto& r = t_rec;
     rec.derived = 0;
@@ -1073,6 +1076,18 @@ void NativeRecDerive(NR::Record& rec) {
     const u32 need_ps = np == 0xffffffffu ? cnt_ps : (np & cnt_ps);
     if ((r.vs_known & need_vs) != need_vs || (r.ps_known & need_ps) != need_ps) {
         g_nr_d[1].fetch_add(1, std::memory_order_relaxed);
+        // Diagnostic: masks unknown (VS / PS) vs known-but-missing, and which registers.
+        g_nr_need[nv == 0xffffffffu ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+        g_nr_need[np == 0xffffffffu ? 2 : 3].fetch_add(1, std::memory_order_relaxed);
+        const u32 miss_vs = need_vs & ~r.vs_known, miss_ps = need_ps & ~r.ps_known;
+        for (u32 i = 0; i < 16; ++i) {
+            if ((miss_vs >> i) & 1) {
+                g_nr_need_reg[i].fetch_add(1, std::memory_order_relaxed);
+            }
+            if ((miss_ps >> i) & 1) {
+                g_nr_need_reg[16 + i].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         return;
     }
     const auto stages = gp->GetStages();
@@ -1396,6 +1411,19 @@ u32 NativeRecDraw(const u32* cmdbuf, u64 index_addr, u32 index_count, u32 tag) {
                      "no pipeline={} | runs ended by the vertex layout={}",
                      g_nr_d[0].exchange(0), g_nr_d[1].exchange(0), g_nr_d[2].exchange(0),
                      g_nr_d[3].exchange(0), g_nr_d[4].exchange(0));
+            {
+                std::string regs;
+                for (u32 i = 0; i < 32; ++i) {
+                    if (const u64 c = g_nr_need_reg[i].exchange(0)) {
+                        regs += fmt::format(" {}{}={}", i < 16 ? "vs" : "ps", i & 15, c);
+                    }
+                }
+                LOG_INFO(Lib_GnmDriver,
+                         "NativeRec user-data unknown: VS mask unknown={} known={} | PS mask "
+                         "unknown={} known={} | missing needed registers:{}",
+                         g_nr_need[0].exchange(0), g_nr_need[1].exchange(0),
+                         g_nr_need[2].exchange(0), g_nr_need[3].exchange(0), regs);
+            }
             LOG_INFO(Lib_GnmDriver, "NativeRec off-whitelist packets (256 SH 257 NOP 258 uconfig 259 DMA):{} last NOP payload {:#x}",
                      off, g_nr_last_nop.load());
             LOG_INFO(Lib_GnmDriver,
