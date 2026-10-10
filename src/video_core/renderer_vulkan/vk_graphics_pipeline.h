@@ -187,7 +187,6 @@ public:
     mutable std::atomic<const char*> native_colour_why{nullptr};
     u32 native_vertex_binding = NoNativeRecords; ///< a colour variant: its vertex SSBO binding
     u32 native_table_binding = NoNativeRecords;  ///< SHADPS4_NATIVE_GPU_DIRECT: the batch table
-    u32 native_pagetable_binding = NoNativeRecords; ///< SHADPS4_NATIVE_PT: the GPU page table
     u32 native_pt_debug_binding = NoNativeRecords;  ///< SHADPS4_NATIVE_PT=2: the compare SSBO
     const GraphicsPipeline* NativeColourVariant(u64 key) const noexcept {
         for (const auto& slot : native_colour) {

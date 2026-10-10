@@ -186,6 +186,9 @@ void EmitContext::DefineArithmeticTypes() {
     if (info.uses_dma || native_pt) {
         physical_pointer_type_u32 = TypePointer(spv::StorageClass::PhysicalStorageBuffer, U32[1]);
     }
+    if (native_pt) {
+        physical_pointer_type_u64 = TypePointer(spv::StorageClass::PhysicalStorageBuffer, U64);
+    }
 }
 
 void EmitContext::DefineInterfaces() {
@@ -1002,37 +1005,16 @@ void EmitContext::DefineBuffers() {
             Name(native_dbg, "native_dbg");
             interfaces.push_back(native_dbg);
         }
-        if (native_pt) {
-            // SHADPS4_NATIVE_PT: the buffer cache's GPU page table (uint64 data[], read-only).
-            const Id pt_array_type{TypeRuntimeArray(U64)};
-            const Id pt_struct_type{TypeStruct(pt_array_type)};
-            if (std::ranges::find(buf_type_ids, pt_array_type.value, &Id::value) ==
-                buf_type_ids.end()) {
-                Decorate(pt_array_type, spv::Decoration::ArrayStride, 8U);
-                Decorate(pt_struct_type, spv::Decoration::Block);
-                MemberName(pt_struct_type, 0, "data");
-                MemberDecorate(pt_struct_type, 0, spv::Decoration::Offset, 0U);
-                buf_type_ids.push_back(pt_array_type);
-            }
-            native_pagetable_ptr = TypePointer(spv::StorageClass::StorageBuffer, U64);
-            native_pagetable =
-                AddGlobalVariable(TypePointer(spv::StorageClass::StorageBuffer, pt_struct_type),
-                                  spv::StorageClass::StorageBuffer);
-            Decorate(native_pagetable, spv::Decoration::Binding,
-                     Shader::t_native_emit.pagetable_binding);
-            Decorate(native_pagetable, spv::Decoration::DescriptorSet, 0U);
-            Decorate(native_pagetable, spv::Decoration::NonWritable);
-            Name(native_pagetable, "native_pagetable");
-            interfaces.push_back(native_pagetable);
-            if (native_pt_compare) {
-                native_pt_dbg =
-                    AddGlobalVariable(struct_pointer_type, spv::StorageClass::StorageBuffer);
-                Decorate(native_pt_dbg, spv::Decoration::Binding,
-                         Shader::t_native_emit.pt_debug_binding);
-                Decorate(native_pt_dbg, spv::Decoration::DescriptorSet, 0U);
-                Name(native_pt_dbg, "native_pt_dbg");
-                interfaces.push_back(native_pt_dbg);
-            }
+        // SHADPS4_NATIVE_PT: the page table itself is read by pointer (NativePtTranslate), no
+        // binding; =2 the compare SSBO.
+        if (native_pt_compare) {
+            native_pt_dbg =
+                AddGlobalVariable(struct_pointer_type, spv::StorageClass::StorageBuffer);
+            Decorate(native_pt_dbg, spv::Decoration::Binding,
+                     Shader::t_native_emit.pt_debug_binding);
+            Decorate(native_pt_dbg, spv::Decoration::DescriptorSet, 0U);
+            Name(native_pt_dbg, "native_pt_dbg");
+            interfaces.push_back(native_pt_dbg);
         }
     }
 }
@@ -1059,14 +1041,16 @@ void EmitContext::NativePtTranslate(u32 handle, u32 binding, Id record_word, Id 
     };
     const Id guest{u64_of(lo, hi)};
     Name(guest, fmt::format("buf{}_guest", binding));
-    const Id page{OpUConvert(
-        U32[1], OpShiftRightLogical(U64, guest,
-                                    ConstU32(VideoCore::BufferCache::CACHING_PAGEBITS)))};
-    const Id entry{OpLoad(
-        U64, OpAccessChain(native_pagetable_ptr, native_pagetable, u32_zero_value, page))};
-    const Id miss{OpIEqual(U1[1], entry, u64_zero_value)};
+    // The table's fallback pair is the page table buffer's own device address: the entry is
+    // read by pointer at fallback + page * 8 (no set-0 binding for the page table).
     const Id fallback{u64_of(NativeTableLoad(Shader::NativeTablePtFallback),
                              NativeTableLoad(Shader::NativeTablePtFallback + 1))};
+    const Id page{OpShiftRightLogical(U64, guest,
+                                      ConstU32(VideoCore::BufferCache::CACHING_PAGEBITS))};
+    const Id entry_addr{OpIAdd(U64, fallback, OpShiftLeftLogical(U64, page, ConstU32(3u)))};
+    const Id entry{OpLoad(U64, OpConvertUToPtr(physical_pointer_type_u64, entry_addr),
+                          spv::MemoryAccessMask::Aligned, 8u)};
+    const Id miss{OpIEqual(U1[1], entry, u64_zero_value)};
     const Id in_page{
         OpBitwiseAnd(U64, guest, Constant(U64, VideoCore::BufferCache::CACHING_PAGESIZE - 1))};
     native_dev_base[handle] = OpSelect(U64, miss, fallback, OpIAdd(U64, entry, in_page));

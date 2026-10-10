@@ -3696,10 +3696,8 @@ bool NativeSegBDraw(const PM4Header* header, const Vulkan::GraphicsPipeline* pip
         return no_variant(NvBuilding);
     }
     if (!v->native_bindless ||
-        v->native_table_binding == Vulkan::GraphicsPipeline::NoNativeRecords ||
-        (Shader::g_native_pt != 0 &&
-         v->native_pagetable_binding == Vulkan::GraphicsPipeline::NoNativeRecords)) {
-        return outside(RVariantNoRing);
+        v->native_table_binding == Vulkan::GraphicsPipeline::NoNativeRecords) {
+        return outside(RVariantNoRing); // (pt mode needs no binding: the page table is read by pointer)
     }
     // The Guest binding ranges: the job run's union so far (CPU memory; a superset).
     NR::RunUnion* unions = NR::g_unions[slot].load(std::memory_order_acquire);

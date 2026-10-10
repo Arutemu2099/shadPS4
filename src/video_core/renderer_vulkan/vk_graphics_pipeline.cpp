@@ -76,24 +76,16 @@ GraphicsPipeline::GraphicsPipeline(
                     .descriptorCount = 1,
                     .stageFlags = vk::ShaderStageFlagBits::eVertex,
                 });
-                if (Shader::g_native_pt != 0) {
-                    // SHADPS4_NATIVE_PT: the buffer cache's page table (=2: + the compare SSBO).
-                    native_pagetable_binding = native_records_binding + 2;
+                if (Shader::g_native_pt == 2) {
+                    // SHADPS4_NATIVE_PT=2: the compare SSBO (the page table itself is read by
+                    // pointer at the table's fallback address: no binding).
+                    native_pt_debug_binding = native_records_binding + 2;
                     bindings.push_back({
-                        .binding = native_pagetable_binding,
+                        .binding = native_pt_debug_binding,
                         .descriptorType = vk::DescriptorType::eStorageBuffer,
                         .descriptorCount = 1,
                         .stageFlags = vk::ShaderStageFlagBits::eVertex,
                     });
-                    if (Shader::g_native_pt == 2) {
-                        native_pt_debug_binding = native_records_binding + 3;
-                        bindings.push_back({
-                            .binding = native_pt_debug_binding,
-                            .descriptorType = vk::DescriptorType::eStorageBuffer,
-                            .descriptorCount = 1,
-                            .stageFlags = vk::ShaderStageFlagBits::eVertex,
-                        });
-                    }
                 }
             }
         }

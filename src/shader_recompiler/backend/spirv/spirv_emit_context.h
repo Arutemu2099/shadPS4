@@ -277,8 +277,7 @@ public:
     // through the buffer cache's GPU page table and PhysicalStorageBuffer pointers.
     bool native_pt{};
     bool native_pt_compare{};
-    Id native_pagetable{};     // the page table SSBO (uint64 data[]: device address per page)
-    Id native_pagetable_ptr{}; // pointer type to one u64 of it
+    // The page table (uint64 per page) is read by pointer at the table's fallback address.
     Id native_pt_dbg{};        // compare diagnostic: writable uint data[]
     Id native_draw{};          // this draw's index (compare entries)
     std::array<Id, NUM_BUFFERS> native_dev_base{}; // per buffer handle: the binding's device address
@@ -406,6 +405,7 @@ public:
     size_t bda_pagetable_index{};
     size_t fault_buffer_index{};
     Id physical_pointer_type_u32;
+    Id physical_pointer_type_u64; // SHADPS4_NATIVE_PT: page-table entries
 
     Id sampler_type{};
     Id sampler_pointer_type{};

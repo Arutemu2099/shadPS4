@@ -426,8 +426,7 @@ struct PipelineCache::NativeColourJob {
     u32 records_binding{};
     u32 vertex_binding{};
     u32 table_binding{GraphicsPipeline::NoNativeRecords};
-    u32 pagetable_binding{GraphicsPipeline::NoNativeRecords}; // SHADPS4_NATIVE_PT
-    u32 pt_debug_binding{GraphicsPipeline::NoNativeRecords};
+    u32 pt_debug_binding{GraphicsPipeline::NoNativeRecords}; // SHADPS4_NATIVE_PT=2
     bool bindless{};
 };
 
@@ -490,7 +489,6 @@ private:
             } else {
                 variant->native_vertex_binding = job->vertex_binding;
                 variant->native_table_binding = job->table_binding;
-                variant->native_pagetable_binding = job->pagetable_binding;
                 variant->native_pt_debug_binding = job->pt_debug_binding;
                 slot.variant.store(variant.get(), std::memory_order_release);
             }
@@ -1195,12 +1193,11 @@ void PipelineCache::PrepareNativeVariant(const GraphicsPipeline* base) {
                 Shader::t_native_emit = {true, rb};
                 Shader::t_native_emit.ring = Shader::g_native_ring;
                 Shader::t_native_emit.table_binding = rb + 1;
-                // SHADPS4_NATIVE_PT: the page table (and compare SSBO) after the table, as the
-                // GraphicsPipeline constructor appends them.
+                // SHADPS4_NATIVE_PT: the page table is read by pointer (no binding); =2 the
+                // compare SSBO after the table, as the GraphicsPipeline constructor appends it.
                 Shader::t_native_emit.pt = Shader::g_native_pt != 0 && Shader::g_native_ring;
                 Shader::t_native_emit.pt_compare = Shader::g_native_pt == 2 && Shader::g_native_ring;
-                Shader::t_native_emit.pagetable_binding = rb + 2;
-                Shader::t_native_emit.pt_debug_binding = rb + 3;
+                Shader::t_native_emit.pt_debug_binding = rb + 2;
                 Shader::t_native_emit.seg = Shader::g_native_seg != 0 && Shader::t_native_emit.pt;
                 Shader::t_native_emit.seg_compare =
                     Shader::g_native_seg_compare && Shader::t_native_emit.pt;
@@ -1585,11 +1582,11 @@ void PipelineCache::PrepareNativeColour(const GraphicsPipeline* base,
     emit.vs_hash = vs ? static_cast<u32>(vs->pgm_hash) : 0u;
     emit.ring = Shader::g_native_ring;
     emit.table_binding = total.unified + (emit.compare ? 3u : 2u);
-    // SHADPS4_NATIVE_PT (sec. 18): the page table after the table; =2 the compare SSBO after it.
+    // SHADPS4_NATIVE_PT (sec. 18): the page table is read by pointer (no binding); =2 the
+    // compare SSBO after the table.
     emit.pt = Shader::g_native_pt != 0 && emit.ring;
     emit.pt_compare = Shader::g_native_pt == 2 && emit.ring;
-    emit.pagetable_binding = emit.table_binding + 1;
-    emit.pt_debug_binding = emit.table_binding + 2;
+    emit.pt_debug_binding = emit.table_binding + 1;
     // SHADPS4_NATIVE_SEG (sec. 20 brick A): records by pointer through the batch's list.
     emit.seg = Shader::g_native_seg != 0 && emit.pt;
     emit.seg_compare = Shader::g_native_seg_compare && emit.pt;
@@ -1725,24 +1722,14 @@ void PipelineCache::PrepareNativeColour(const GraphicsPipeline* base,
             .stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
         });
         job->table_binding = emit.table_binding;
-        if (emit.pt) {
+        if (emit.pt_compare) {
             job->bindings.push_back({
-                .binding = emit.pagetable_binding,
+                .binding = emit.pt_debug_binding,
                 .descriptorType = vk::DescriptorType::eStorageBuffer,
                 .descriptorCount = 1,
                 .stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
             });
-            job->pagetable_binding = emit.pagetable_binding;
-            if (emit.pt_compare) {
-                job->bindings.push_back({
-                    .binding = emit.pt_debug_binding,
-                    .descriptorType = vk::DescriptorType::eStorageBuffer,
-                    .descriptorCount = 1,
-                    .stageFlags =
-                        vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
-                });
-                job->pt_debug_binding = emit.pt_debug_binding;
-            }
+            job->pt_debug_binding = emit.pt_debug_binding;
         }
     }
     job->records_binding = emit.records_binding;

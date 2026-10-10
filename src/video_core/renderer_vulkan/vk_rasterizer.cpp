@@ -1464,7 +1464,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     }
     native_pt_on = Shader::g_native_pt != 0 &&
                    (AmdGpu::NativeRec::g_gpu_mode == 1 || AmdGpu::NativeRec::g_gpu_mode == 3);
-    native_pt_extra = native_pt_on ? (Shader::g_native_pt == 2 ? 2u : 1u) : 0u;
+    native_pt_extra = native_pt_on && Shader::g_native_pt == 2 ? 1u : 0u; // the compare SSBO
     if (Shader::g_native_pt != 0) {
         LOG_INFO(Render_Vulkan, "NativePt: mode {}{}", Shader::g_native_pt,
                  native_pt_on ? "" : " (needs SHADPS4_NATIVE_GPU_DIRECT=1; off)");
@@ -4047,9 +4047,7 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
     }();
     if ((AmdGpu::NativeRec::g_gpu_mode == 1 || AmdGpu::NativeRec::g_gpu_mode == 3) &&
         (!native || native->native_table_binding == GraphicsPipeline::NoNativeRecords ||
-         buffer_infos.size() + 4 + native_pt_extra > Shader::NUM_BUFFERS ||
-         (native_pt_on &&
-          native->native_pagetable_binding == GraphicsPipeline::NoNativeRecords))) {
+         buffer_infos.size() + 4 + native_pt_extra > Shader::NUM_BUFFERS)) {
         return fail(__LINE__);
     }
     if (!front_vi || !is_indexed || g_viewport_memo < 1 || !instance.IsVertexInputDynamicState() ||
@@ -4443,20 +4441,11 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         wt.descriptorType = vk::DescriptorType::eStorageBuffer;
         wt.pBufferInfo = &buffer_infos.back();
         ++set_write_index;
-        if (native_pt_on) [[unlikely]] {
-            // SHADPS4_NATIVE_PT: the whole page table (its transfer writes carry their own
-            // post-barrier, as for the DMA path's binding); =2 the compare SSBO.
-            const auto* pt = buffer_cache.GetBdaPageTableBuffer();
-            buffer_infos.emplace_back(pt->Handle(), 0, pt->SizeBytes());
-            auto& wp = set_writes.emplace_back();
-            wp.dstSet = VK_NULL_HANDLE;
-            wp.dstBinding = native->native_pagetable_binding;
-            wp.dstArrayElement = 0;
-            wp.descriptorCount = 1;
-            wp.descriptorType = vk::DescriptorType::eStorageBuffer;
-            wp.pBufferInfo = &buffer_infos.back();
-            ++set_write_index;
-            if (native->native_pt_debug_binding != GraphicsPipeline::NoNativeRecords) {
+        if (native_pt_on && native->native_pt_debug_binding != GraphicsPipeline::NoNativeRecords)
+            [[unlikely]] {
+            // SHADPS4_NATIVE_PT: the page table is read by pointer at the table's fallback (its
+            // device address): no binding, no push; =2 the compare SSBO.
+            {
                 if (!native_pt_dbg) {
                     native_pt_dbg = std::make_unique<VideoCore::Buffer>(
                         instance, scheduler, VideoCore::MemoryUsage::Download, 0,

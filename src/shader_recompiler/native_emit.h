@@ -72,8 +72,9 @@ struct NativeEmit {
     bool ring{};
     u32 table_binding{};
     /// SHADPS4_NATIVE_PT (sec. 18, milestone 2a; ring mode only): Guest bindings are read
-    /// through the buffer cache's GPU page table at `pagetable_binding` (u64 device address per
-    /// 16 KB guest page) and a PhysicalStorageBuffer pointer, from the record's full guest
+    /// through the buffer cache's GPU page table (u64 device address per 16 KB guest page, read
+    /// by pointer at the table's NativeTablePtFallback address + page * 8: the page table buffer
+    /// itself, so it costs no set-0 binding) and a PhysicalStorageBuffer pointer, from the record's full guest
     /// address (low 32 bits in the offset word, bits 32..39 in NativeRecordHiOffset; inherited
     /// slots: the table's NativeTablePtLo / PtHi), not through their set-0 descriptors (still
     /// bound, layout unchanged). =2: every such load also reads the descriptor and mismatches go
@@ -81,7 +82,6 @@ struct NativeEmit {
     /// binding, relative index, pt value, descriptor value, draw, guest lo, guest hi, tag).
     bool pt{};
     bool pt_compare{};
-    u32 pagetable_binding{};
     u32 pt_debug_binding{};
     /// SHADPS4_NATIVE_BINDLESS (sec. 12): the PS samples image i / sampler j from the global
     /// arrays (set 1, binding 0 / 1) at the record's slot words NativeRecordImgOffset + i /
