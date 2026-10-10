@@ -2614,10 +2614,11 @@ void Rasterizer::NativePrepare(const GraphicsPipeline* base,
     if (hr.stamp.load(std::memory_order_relaxed) != head + 1) {
         return stop(0);
     }
-    if (count <= run_k0 + 1 || b.n != 1) {
+    if (count <= run_k0 + 1 || b.n != 0) {
         return stop(1); // the opener is the run's last draw
     }
-    const u32 want = std::min<u32>(count - run_k0 - 1, NativeMaxDraws - b.n);
+    // Slot 0 = the opener (written after the stream reservation), members from slot 1.
+    const u32 want = std::min<u32>(count - run_k0 - 1, NativeMaxDraws - 1);
     if (t_prep.size() < NativeMaxDraws) {
         t_prep.resize(NativeMaxDraws);
     }
