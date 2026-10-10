@@ -4845,7 +4845,8 @@ void Rasterizer::NativeLog() {
                  "cycles per member {:.0f} spans per batch {:.2f} (phases per batch: records {:.0f} "
                  "bases {:.0f} span syncs {:.0f} commands {:.0f}; KB per span {:.0f}; span cache "
                  "hits {:.1f}%) | refusals:{} "
-                 "| confirmed={} (colour {})",
+                 "| confirmed={} (colour {}) | ring verify: ok={} MISMATCH={} join refused a "
+                 "predicted member={} (image key c12={}, recorded c10={})",
                  st.ring_runs, st.ring_members,
                  st.ring_runs ? double(st.ring_members) / double(st.ring_runs) : 0.0,
                  st.ring_opens_legacy,
@@ -4857,7 +4858,8 @@ void Rasterizer::NativeLog() {
                  double(st.c_ring_ph[3]) / double(std::max<u64>(st.ring_runs, 1)),
                  double(st.ring_span_bytes) / 1024.0 / double(std::max<u64>(st.ring_spans, 1)),
                  100.0 * double(st.ring_span_hits) / double(std::max<u64>(st.ring_spans, 1)), rf,
-                 st.prep_conf, st.prep_conf_col);
+                 st.prep_conf, st.prep_conf_col, st.prep_cmp_ok, st.prep_cmp_bad,
+                 st.prep_join_refused, st.prep_jref[12], st.prep_jref[10]);
     }
     if (st.n_rec[0] + st.n_rec[3] + st.n_rec[9] != 0) {
         const auto per = [](u64 c, u64 n) { return n ? double(c) / double(n) : 0.0; };
