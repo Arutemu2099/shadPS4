@@ -167,6 +167,13 @@ enum class RecordType : u16 {
     Segment,    ///< SHADPS4_NATIVE_SEGX: SplitSegmentRecord, a segment of native colour members.
     DcbBegin,   ///< SHADPS4_A1: DcbBeginPayload, a top-level guest command buffer starts here.
     DcbEnd,     ///< SHADPS4_A1: DcbEndPayload, the command buffer's last record came before.
+    DcbRef,     ///< SHADPS4_LEAN=2: DcbRefPayload, the DCB's head span is in a lean job channel.
+    LeanEnd,    ///< SHADPS4_LEAN=2: the last record of a lean job channel's span (no payload).
+};
+/// SHADPS4_LEAN=2: the back follows lean job slot `slot` (DCB `index`) to its LeanEnd.
+struct DcbRefPayload {
+    u32 slot;
+    u32 index;
 };
 
 /// Flags for Packet records.
@@ -532,6 +539,9 @@ public:
     /// Records emitted so far (front) / the newest seq the back has published as done.
     [[nodiscard]] u64 EmittedSeq() const noexcept {
         return emitted;
+    }
+    [[nodiscard]] u64 CommittedSeq() const noexcept {
+        return committed_seq;
     }
     [[nodiscard]] u64 DoneSeq() const noexcept {
         return done_seq.load(std::memory_order_acquire);

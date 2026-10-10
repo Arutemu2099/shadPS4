@@ -381,6 +381,16 @@ private:
                        u32 vi_bytes, const u8* record_body, u32 stage_count);
     /// SHADPS4_LEAN (L1 shadow): chain verify + scan + worker hand-off at a top-level DCB start.
     void LeanFrontBegin(std::span<const u32> dcb, std::span<const u32> ccb, bool guest_markers);
+    /// SHADPS4_LEAN=2 (front): queue the head span, apply it to the live state, emit DcbRef.
+    struct LeanL2Begin {
+        u32 cut{};       ///< 0: not taken (the front parses the whole DCB)
+        u32 run_bumps{}; ///< run-ending packets in the head span
+    };
+    LeanL2Begin LeanFrontBeginL2(std::span<const u32> dcb, std::span<const u32> ccb,
+                                 bool guest_markers);
+    /// SHADPS4_LEAN=2 (back): run a DcbRef's job channel to its LeanEnd.
+    void LeanBackFollow(const CpSplit::DcbRefPayload& ref);
+    bool lean_following{}; ///< back: inside LeanBackFollow (NativePeekNextDraw: unknown)
     /// Starts the lean worker threads (part b).
     void LeanStart();
     void LeanWorkerLoop(std::stop_token stoken, u32 index);

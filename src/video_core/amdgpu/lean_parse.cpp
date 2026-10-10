@@ -224,19 +224,36 @@ Stop Parser::DecideDraw(const PM4Header* header, std::span<const u32> dcb, u32 o
             }
             g_lean_fault_stats.lock_takes.fetch_add(1, std::memory_order_relaxed);
             g_lean_fault_stats.lock_draws.fetch_add(1, std::memory_order_relaxed);
-            plan.draw.pipeline = env.pipeline_cache->LookupGraphics(regs, *scratch);
+            if (env.l2) {
+                // L2: a miss builds here (the front's own lookup over the worker's registers,
+                // exclusive); its guest reads were pre-checked / faulted in by the prewalk.
+                t_lean_in_lock = true;
+                plan.draw.pipeline = env.pipeline_cache->LookupOrBuildGraphics(regs, *scratch);
+                t_lean_in_lock = false;
+            } else {
+                plan.draw.pipeline = env.pipeline_cache->LookupGraphics(regs, *scratch);
+            }
             scratch->prewalked = false;
             if (t_lean_fault) {
                 t_lean_fault = false;
                 return Stop::FaultFallback;
             }
             if (!plan.draw.pipeline) {
-                g_lean_fault_stats.miss[static_cast<u32>(scratch->miss) & 7].fetch_add(
-                    1, std::memory_order_relaxed);
-                return Stop::PipelineMiss;
-            }
-            if (VideoCore::g_native_pass != 0 && !plan.draw.pipeline->native_checked) {
-                return Stop::NativeUnchecked; // the front would run PrepareNativeVariant
+                if (!env.l2) {
+                    g_lean_fault_stats.miss[static_cast<u32>(scratch->miss) & 7].fetch_add(
+                        1, std::memory_order_relaxed);
+                    return Stop::PipelineMiss;
+                }
+                // The front's GetGraphicsPipeline returned null too: a draw with no stages.
+                g_lean_l2.build_null.fetch_add(1, std::memory_order_relaxed);
+            } else if (VideoCore::g_native_pass != 0 && !plan.draw.pipeline->native_checked) {
+                if (!env.l2) {
+                    return Stop::NativeUnchecked; // the front would run PrepareNativeVariant
+                }
+                t_lean_in_lock = true;
+                env.pipeline_cache->PrepareNativeVariant(plan.draw.pipeline, regs);
+                t_lean_in_lock = false;
+                g_lean_l2.native_preps.fetch_add(1, std::memory_order_relaxed);
             }
         }
     }
@@ -302,7 +319,14 @@ Stop Parser::DecideDraw(const PM4Header* header, std::span<const u32> dcb, u32 o
         if (VideoCore::g_native_colour) [[unlikely]] {
             // PrepareNativeColourFront: only when it would return without writing anything.
             if (!Rasterizer::NativeColourVariantReady(plan.draw.pipeline, *vi)) {
-                return Stop::ColourVariantMissing;
+                if (!env.l2) {
+                    return Stop::ColourVariantMissing;
+                }
+                // PrepareNativeColourFront: decides / queues the variant (compiled elsewhere).
+                t_lean_in_lock = true;
+                env.pipeline_cache->PrepareNativeColour(plan.draw.pipeline, *vi, regs);
+                t_lean_in_lock = false;
+                g_lean_l2.colour_preps.fetch_add(1, std::memory_order_relaxed);
             }
         }
     }
@@ -960,6 +984,15 @@ bool Parser::ReadOk(VAddr addr, u64 size, u32 kind) const {
         return false;
     }
     if (env.rasterizer->LeanPageManager().AnyReadProtected(addr, size)) {
+        if (env.l2) {
+            // L2: fault it in HERE, outside every lock (the hook waits for the back first).
+            g_lean_l2.touches.fetch_add(1, std::memory_order_relaxed);
+            for (VAddr p = addr & ~VAddr{0xfff}; p < addr + size; p += 0x1000) {
+                const VAddr at = std::max(p, addr);
+                (void)*reinterpret_cast<const volatile u8*>(at);
+            }
+            return true;
+        }
         st.precheck[kind].fetch_add(1, std::memory_order_relaxed);
         return false;
     }
@@ -980,7 +1013,8 @@ bool Parser::HeaderOk(VAddr code, const AmdGpu::BinaryInfo*& found) const {
     constexpr u32 token_mov_vcchi = 0xBEEB03FF;
     if (w[0] == token_mov_vcchi) {
         const VAddr info = code + (u64{w[1]} + 1) * 8;
-        if (!ReadOk(info, sizeof(AmdGpu::BinaryInfo), 6)) {
+        // The code itself too: a worker's build compiles it (reads [code, info)).
+        if (!ReadOk(code, info + sizeof(AmdGpu::BinaryInfo) - code, 6)) {
             return false;
         }
         if (reinterpret_cast<const AmdGpu::BinaryInfo*>(info)->Valid()) {

@@ -48,7 +48,29 @@ struct LeanFaultStats {
     std::array<std::atomic<u64>, 8> miss{};
 };
 inline LeanFaultStats g_lean_fault_stats;
+/// SHADPS4_LEAN=2 (worker threads): the fault hook's wait for the back, the worker's context, and
+/// whether the worker holds the pipeline cache's lock right now (then the hook must not wait).
+inline thread_local void (*t_lean_l2_wait)(void*) = nullptr;
+inline thread_local void* t_lean_l2_ctx = nullptr;
+inline thread_local bool t_lean_in_lock = false;
+struct LeanL2Stats {
+    std::atomic<u64> fault_waits{}, faults_in_lock{}, build_null{}, native_preps{}, colour_preps{},
+        touches{}, wait_ticks{};
+    std::atomic<u64> first_in_lock{};
+};
+inline LeanL2Stats g_lean_l2;
 inline void LeanNoteWorkerFault(u64 addr) {
+    if (t_lean_l2_wait) [[likely]] {
+        if (t_lean_in_lock) {
+            g_lean_l2.faults_in_lock.fetch_add(1, std::memory_order_relaxed);
+            u64 none = 0;
+            g_lean_l2.first_in_lock.compare_exchange_strong(none, addr);
+            return; // no wait: the back may be waiting for the lock this worker holds
+        }
+        g_lean_l2.fault_waits.fetch_add(1, std::memory_order_relaxed);
+        t_lean_l2_wait(t_lean_l2_ctx); // publish, then wait for the back up to this position
+        return;
+    }
     auto& s = g_lean_fault_stats;
     s.fallback.fetch_add(1, std::memory_order_relaxed);
     const u32 i = s.n_first.fetch_add(1, std::memory_order_relaxed);

@@ -1239,6 +1239,12 @@ struct LeanState {
     u64 chain_bad_db{}, chain_bad_cb{}, chain_bad_cs{}, chain_bad_epoch{}, chain_bad_iaa{};
     LeanCounters c;
     u64 win_tsc{};
+    // SHADPS4_LEAN=2
+    bool l2{};                                                   ///< mode 2 and the config allows it
+    std::array<std::unique_ptr<CpSplit::Channel>, LeanSlots> ch; ///< one per job slot
+    alignas(64) std::atomic<u32> back_cur{0};                    ///< DCB index the back follows
+    std::atomic<u64> l2_taken{}, l2_skipped{}, l2_early{}, head_draws{}, back_records{},
+        back_wait_ticks{};
 };
 LeanState g_lean_s;
 /// The front's DCB being recorded (top level only).
@@ -1353,12 +1359,39 @@ bool LeanSupported(const PM4Header* header, bool guest_markers) {
 
 /// The chain's register-only pass over one DCB (+ the non-register items the supported packets
 /// change, mirroring ProcessGraphics), finding the cut and counting packets / draws.
-void LeanChainScan(std::span<const u32> dcb, LeanState& s, bool guest_markers, bool post_dma,
-                   u32& cut_dw, u32& pkts, u32& draws) {
+/// The state a scan updates: the chain's copy (L1) or the front's live members (L2 head pass).
+struct LeanScanRefs {
+    Regs& r;
+    std::array<CbDbExtent, NUM_COLOR_BUFFERS>& cb;
+    CbDbExtent& db;
+    u64& epoch;
+    ComputeProgram& cs;
+    VAddr& iaa;
+};
+/// DispatchSyncStats::RunNeutral (defined later): packets that do not end a dispatch run.
+bool LeanRunNeutral(PM4ItOpcode op) {
+    switch (op) {
+    case PM4ItOpcode::Nop:
+    case PM4ItOpcode::SetShReg:
+    case PM4ItOpcode::SetContextReg:
+    case PM4ItOpcode::SetUconfigReg:
+    case PM4ItOpcode::SetConfigReg:
+    case PM4ItOpcode::IndirectBuffer:
+    case PM4ItOpcode::IndirectBufferConst:
+    case PM4ItOpcode::DispatchDirect:
+    case PM4ItOpcode::DispatchIndirect:
+        return true;
+    default:
+        return false;
+    }
+}
+void LeanChainScan(std::span<const u32> dcb, LeanScanRefs s, bool guest_markers, bool post_dma,
+                   u32& cut_dw, u32& pkts, u32& draws, bool stop_at_cut = false,
+                   u32* run_bumps = nullptr) {
     const u32* base = dcb.data();
     const std::span<const u32> full = dcb;
     const Lean::StaticEnv senv{.guest_markers = guest_markers, .split_post_dma = post_dma};
-    auto& r = *s.regs;
+    auto& r = s.r;
     cut_dw = static_cast<u32>(dcb.size());
     bool cut = false;
     while (!dcb.empty()) {
@@ -1380,6 +1413,9 @@ void LeanChainScan(std::span<const u32> dcb, LeanState& s, bool guest_markers, b
             if (Lean::StaticCheck(full, at, r, senv, sop) != Lean::Stop::None) {
                 cut = true;
                 cut_dw = at;
+                if (stop_at_cut) {
+                    return; // L2 head pass: the cut packet and the rest are the front's
+                }
             }
         }
         switch (op) {
@@ -1507,6 +1543,9 @@ void LeanChainScan(std::span<const u32> dcb, LeanState& s, bool guest_markers, b
             break;
         default:
             break;
+        }
+        if (run_bumps && !LeanRunNeutral(op)) {
+            ++*run_bumps;
         }
         dcb = dcb.subspan(std::min<size_t>(dcb.size(), size_t{count} + 1));
     }
@@ -1697,6 +1736,27 @@ void LeanLog() {
         if (g_lean_fault_stats.miss[i] != 0) {
             misses += fmt::format(" {}={}", i, g_lean_fault_stats.miss[i].load());
         }
+    }
+    if (g_lean == 2) {
+        const double hd = double(s.head_draws.load()), fd = double(c.front_draws.load());
+        LOG_INFO(Render,
+                 "Lean L2: window {:.1f}s | DCBs {} taken {} not taken {} | head draws {} front draws {} "
+                 "(workers {:.1f}%) | EARLY STOPS {} (gate 0) | back: worker-channel records {:.0f}/s, "
+                 "waiting for workers {:.2f} ms/s | worker: fault waits {} ({:.2f} ms/s), faults in lock {} "
+                 "(first {:#x}), touches {}, null builds {}, native preps {}, colour preps {} | head pass "
+                 "{:.2f} ms/s",
+                 sec, c.dcbs.load(), s.l2_taken.load(), s.l2_skipped.load(), s.head_draws.load(),
+                 c.front_draws.load(), hd + fd > 0 ? 100.0 * hd / (hd + fd) : 0.0, s.l2_early.load(),
+                 double(s.back_records.load()) / std::max(sec, 1e-9),
+                 double(s.back_wait_ticks.load()) / 3.5e6 / std::max(sec, 1e-9),
+                 g_lean_l2.fault_waits.load(),
+                 double(g_lean_l2.wait_ticks.load()) / 3.5e6 / std::max(sec, 1e-9),
+                 g_lean_l2.faults_in_lock.load(), g_lean_l2.first_in_lock.load(),
+                 g_lean_l2.touches.load(), g_lean_l2.build_null.load(), g_lean_l2.native_preps.load(),
+                 g_lean_l2.colour_preps.load(), double(s.chain_cyc) / 3.5e6 / std::max(sec, 1e-9));
+        s.l2_taken = s.l2_skipped = s.head_draws = s.back_records = s.back_wait_ticks = 0;
+        g_lean_l2.fault_waits = 0;
+        g_lean_l2.wait_ticks = 0;
     }
     LOG_INFO(Render,
              "Lean (mode {}) L2 counters: parity breaks, buffer UNCHANGED {} (gate 0) / buffer changed {} | "
@@ -3327,7 +3387,10 @@ void Liverpool::A2WorkerLoop(std::stop_token stoken, u32 index) {
                 break;
             }
             if (h->type == CpSplit::RecordType::DcbEnd ||
-                h->type == CpSplit::RecordType::DcbBegin) {
+                h->type == CpSplit::RecordType::DcbBegin ||
+                h->type == CpSplit::RecordType::DcbRef) {
+                // DcbRef (SHADPS4_LEAN=2): the head's register writes are in a job channel this
+                // walk does not see - the rest of the DCB runs on the old path.
                 last_seq = h->seq;
                 break;
             }
@@ -3473,6 +3536,24 @@ void Liverpool::A2WorkerLoop(std::stop_token stoken, u32 index) {
 void Liverpool::LeanStart() {
     auto& s = g_lean_s;
     s.started = true;
+    if (g_lean == 2) {
+        // The parser's own config gates (Lean::Parser's constructor) + a split with run-ahead.
+        const auto flag = [](const char* name) {
+            const char* v = std::getenv(name);
+            return v && v[0] == '1';
+        };
+        s.l2 = split_enabled && split_run_ahead && !split_verify && NativeRec::g_segb == 0 &&
+               !flag("SHADPS4_DRAW_TAG") && !flag("SHADPS4_DISPATCH_SYNC_STATS") &&
+               !SplitHazard::Enabled();
+        if (s.l2) {
+            for (auto& ch : s.ch) {
+                ch = std::make_unique<CpSplit::Channel>(1u << 20);
+                ch->quiet = true;
+            }
+        }
+        LOG_INFO(Render, "Lean L2: {} ({} job channels of 1 MB)", s.l2 ? "on" : "OFF (config)",
+                 s.l2 ? LeanSlots : 0u);
+    }
     split->canon_fn = &LeanCanonRecord; // the front's records too (canon is set per packet)
     s.regs = std::make_unique<Regs>();
     s.win_tsc = __rdtsc();
@@ -3506,7 +3587,34 @@ void Liverpool::LeanWorkerLoop(std::stop_token stoken, u32 index) {
         const char* v = std::getenv("SHADPS4_DRAW_TAG"); // = g_draw_tag_front (defined later)
         env.draw_tag_front = v && v[0] == '1';
     }
+    env.l2 = g_lean == 2 && s.l2;
     Lean::Parser parser{env};
+    // L2 fault hook context: publish this job's channel, wait for the back up to its position.
+    struct L2Wait {
+        CpSplit::Channel* ch{};
+        u32 idx{};
+    } l2w;
+    if (env.l2) {
+        t_lean_l2_ctx = &l2w;
+        t_lean_l2_wait = [](void* p) {
+            auto& w = *static_cast<L2Wait*>(p);
+            if (!w.ch) {
+                return;
+            }
+            w.ch->PublishNow();
+            const u64 want = w.ch->CommittedSeq();
+            const u64 t0 = __rdtsc();
+            for (u32 spins = 0; g_lean_s.back_cur.load(std::memory_order_acquire) != w.idx ||
+                                w.ch->DoneSeq() < want;
+                 ++spins) {
+                spins < 4096 ? _mm_pause() : std::this_thread::yield();
+                if (g_lean_s.stop.load(std::memory_order_relaxed)) {
+                    break;
+                }
+            }
+            g_lean_l2.wait_ticks.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
+        };
+    }
     CpSplit::Channel ch; // scratch: nobody reads it
     ch.self_consume = true;
     ch.quiet = true;
@@ -3547,6 +3655,26 @@ void Liverpool::LeanWorkerLoop(std::stop_token stoken, u32 index) {
         st.cs_state = j.cs;
         st.indirect_args_addr = j.iaa;
         st.vi_desc_id = (u64{1} << 63) | (u64{idx} << 20);
+        if (env.l2) {
+            // L2: the real channel of this slot; the back follows it from the DcbRef.
+            auto& out = *s.ch[idx % LeanSlots];
+            l2w = {&out, idx};
+            j.res = parser.Parse(j.dcb, j.cut_dw, st, out);
+            if (j.res.end_dw != j.cut_dw) {
+                // An early stop: the packets between it and the cut are nobody's (gate 0).
+                if (s.l2_early.fetch_add(1, std::memory_order_relaxed) < 8) {
+                    LOG_CRITICAL(Render, "Lean L2 EARLY STOP: DCB {} stop {} at dw {} (opcode {:#x}), "
+                                         "cut {} of {} dw",
+                                 idx, Lean::StopName(j.res.stop), j.res.end_dw,
+                                 j.res.stop_opcode, j.cut_dw, j.dcb.size());
+                }
+            }
+            out.Reserve(CpSplit::RecordType::LeanEnd, 0);
+            out.Commit();
+            out.PublishNow();
+            l2w = {};
+            continue; // the back frees the slot at the LeanEnd
+        }
         ch.canon = &j.worker_canon;
         j.res = parser.Parse(j.dcb, j.cut_dw, st, ch);
         ch.canon = nullptr;
@@ -4235,6 +4363,11 @@ void Liverpool::ExecuteRecordImpl(const CpSplit::RecordHeader& record) {
     case CpSplit::RecordType::DcbBegin:
     case CpSplit::RecordType::DcbEnd:
         break; // SHADPS4_A1: bookkeeping in A1Execute
+    case CpSplit::RecordType::DcbRef:
+        LeanBackFollow(*reinterpret_cast<const CpSplit::DcbRefPayload*>(payload));
+        break;
+    case CpSplit::RecordType::LeanEnd:
+        break; // only in a job channel (LeanBackFollow consumes it)
     case CpSplit::RecordType::Diag:
         if (AscRingBack(*reinterpret_cast<const CpSplit::DiagPayload*>(payload)) && rasterizer) {
             rasterizer->GetScheduler().LogRecordingWindow();
@@ -4247,7 +4380,7 @@ void Liverpool::ExecuteRecordImpl(const CpSplit::RecordHeader& record) {
 }
 
 int Liverpool::NativePeekNextDraw(const void* pipeline) {
-    if (!split || !back_draw_record) {
+    if (!split || !back_draw_record || lean_following) {
         return -1;
     }
     u64 pos = split->ReadPos() + back_draw_record->size;
@@ -7310,7 +7443,8 @@ void Liverpool::LeanFrontBegin(std::span<const u32> dcb, std::span<const u32> cc
         queued = true;
     }
     u32 cut = 0, pkts = 0, draws = 0;
-    LeanChainScan(dcb, s, guest_markers, split_post_dma, cut, pkts, draws);
+    LeanChainScan(dcb, LeanScanRefs{*s.regs, s.cb, s.db, s.epoch, s.cs, s.iaa}, guest_markers,
+                  split_post_dma, cut, pkts, draws);
     s.chain_cyc += __rdtsc() - t0;
     c.pkts += pkts;
     c.draws += draws;
@@ -7332,6 +7466,111 @@ void Liverpool::LeanFrontBegin(std::span<const u32> dcb, std::span<const u32> cc
     if (c.dcbs >= 65536) {
         LeanLog();
     }
+}
+
+Liverpool::LeanL2Begin Liverpool::LeanFrontBeginL2(std::span<const u32> dcb,
+                                                   std::span<const u32> ccb, bool guest_markers) {
+    auto& s = g_lean_s;
+    auto& c = s.c;
+    if (!s.started) {
+        LeanStart();
+    }
+    ++c.dcbs;
+    if (s.win_tsc == 0) {
+        s.win_tsc = __rdtsc();
+    }
+    LeanL2Begin res{};
+    const u32 idx = ++s.index;
+    auto& j = s.jobs[idx % LeanSlots];
+    const auto not_taken = [&] {
+        ++s.l2_skipped;
+        s.queued.store(idx, std::memory_order_release); // the workers' claims stay in step
+        s.queued.notify_all();
+    };
+    if (!s.l2 || !ccb.empty() || j.state.load(std::memory_order_acquire) != 0) {
+        not_taken();
+        if (c.dcbs >= 65536) {
+            LeanLog();
+        }
+        return res;
+    }
+    const u64 t0 = __rdtsc();
+    // The worker's entry state = the front's live state here (it is caught up at a DCB start).
+    auto& gfx_cs = mapped_queues[GfxQueueId].cs_state;
+    j.index.store(idx, std::memory_order_relaxed);
+    j.dcb = dcb;
+    j.win.resize(CpSplit::DcbSnapWords);
+    u32* out = j.win.data();
+    for (const auto& [off, n] : CpSplit::DcbSnapWindows) {
+        std::memcpy(out, &regs.reg_array[off], size_t{n} * 4);
+        out += n;
+    }
+    j.cb = last_cb_extent;
+    j.db = last_db_extent;
+    j.epoch = context_change_epoch;
+    j.cs = gfx_cs;
+    j.iaa = indirect_args_addr;
+    // The head pass ON the live state, to the StaticCheck cut.
+    u32 cut = 0, pkts = 0, draws = 0, bumps = 0;
+    LeanChainScan(dcb,
+                  LeanScanRefs{regs, last_cb_extent, last_db_extent, context_change_epoch, gfx_cs,
+                               indirect_args_addr},
+                  guest_markers, split_post_dma, cut, pkts, draws, true, &bumps);
+    s.chain_cyc += __rdtsc() - t0;
+    if (cut == 0) {
+        not_taken(); // the first packet is the front's: nothing for a worker
+        return res;
+    }
+    c.pkts_span += pkts;
+    s.head_draws += draws;
+    ++s.l2_taken;
+    j.cut_dw = cut;
+    j.state.store(1, std::memory_order_release);
+    s.queued.store(idx, std::memory_order_release);
+    s.queued.notify_all();
+    // The back runs the head from the job's channel when it reaches this record.
+    auto* ref = split->Reserve<CpSplit::DcbRefPayload>(CpSplit::RecordType::DcbRef);
+    ref->slot = idx % LeanSlots;
+    ref->index = idx;
+    split->Commit();
+    split->PublishNow();
+    res.cut = cut;
+    res.run_bumps = bumps;
+    if (c.dcbs >= 65536) {
+        LeanLog();
+    }
+    return res;
+}
+
+void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
+    auto& s = g_lean_s;
+    auto& ch = *s.ch[ref.slot];
+    s.back_cur.store(ref.index, std::memory_order_release);
+    lean_following = true;
+    u64 wait = 0;
+    for (u32 spins = 0;;) {
+        if (const auto* r = ch.Next()) {
+            spins = 0;
+            if (r->type == CpSplit::RecordType::LeanEnd) {
+                ch.Done(r);
+                break;
+            }
+            ExecuteRecordImpl(*r); // the plain path: A2 never sees a worker's records
+            ch.Done(r);
+            ++s.back_records;
+            if (num_commands.load(std::memory_order_relaxed) != 0) {
+                ProcessCommands();
+            }
+            continue;
+        }
+        ProcessCommands(); // guest commands run while the back waits for the worker
+        const u64 w0 = __rdtsc();
+        ++spins < 4096 ? _mm_pause() : std::this_thread::yield();
+        wait += __rdtsc() - w0;
+    }
+    lean_following = false;
+    s.back_wait_ticks += wait;
+    s.jobs[ref.slot].state.store(0, std::memory_order_release); // the slot is free again
 }
 
 void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_marker,
@@ -8417,7 +8656,22 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         t_reg_scan_gfx_open = true;
     }
     if (g_lean != 0 && !is_indirect_gfx && split_enabled && rasterizer) [[unlikely]] {
-        LeanFrontBegin(dcb, ccb, rasterizer && EmulatorSettings.IsVkGuestMarkersEnabled());
+        if (g_lean == 2) {
+            const auto l2 =
+                LeanFrontBeginL2(dcb, ccb, EmulatorSettings.IsVkGuestMarkersEnabled());
+            if (l2.cut != 0) {
+                // The head span is a worker's: one fresh gfx dispatch run if it had run-ending
+                // packets (runs compare only for equality), and no NativeRec run continues
+                // across it. The front parses the tail from the state the head pass left.
+                if (l2.run_bumps != 0 && g_dispatch_sync.order) {
+                    g_dispatch_sync.run[64] = ++g_dispatch_sync.run_counter;
+                }
+                g_nr_run.active = false;
+                dcb = dcb.subspan(l2.cut);
+            }
+        } else {
+            LeanFrontBegin(dcb, ccb, rasterizer && EmulatorSettings.IsVkGuestMarkersEnabled());
+        }
     }
     SplitSpanScope split_span{*this, &dcb,
                               is_indirect_gfx ? CpSplit::DrainReason::TaskGuardIb

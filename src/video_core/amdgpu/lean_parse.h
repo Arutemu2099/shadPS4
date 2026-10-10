@@ -65,6 +65,7 @@ struct ChainState {
 /// g_native_pass / g_native_colour / g_epoch_defer_upload / g_native_coherent, NativeRec::g_mode /
 /// g_segb, SplitHazard::Enabled) are read directly by the parser.
 struct Env {
+    bool l2{}; ///< SHADPS4_LEAN=2: resolve runtime cases in place (no runtime stops)
     Vulkan::Rasterizer* rasterizer{};
     Vulkan::PipelineCache* pipeline_cache{};
     bool split_enabled{};      ///< Liverpool::split_enabled (must be true)
