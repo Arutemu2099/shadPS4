@@ -521,11 +521,15 @@ void Channel::WaitForSpace(u64 end) {
     ++counters.full_waits;
     front_waiting.fetch_add(1, std::memory_order_acq_rel);
     RingReaderBell();
+    const u64 t0 = Ticks();
     for (;;) {
         // The back's read position, held lower by any A2 worker still reading.
         cached_read = ReadFloor();
         if (end - cached_read <= capacity) {
             front_waiting.fetch_sub(1, std::memory_order_acq_rel);
+            const u64 waited = Ticks() - t0;
+            counters.full_wait_ticks += waited;
+            Common::FaultMonitor::front_wait_ticks.fetch_add(waited, std::memory_order_relaxed);
             return;
         }
         // The back frees space only by consuming what has been published.
@@ -729,13 +733,15 @@ void Channel::MaybeLog() {
              "CpSplit: window_s={:.1f} mode={} depth={} records={} bytes={} posted_draws={} "
              "posted_pkts={} drains={} drain_waits={} front_wait_ms={:.1f} drain_ms={:.1f} "
              "depth_wait_ms={:.1f} depth_waits={} max_lead={} max_lead_records={} "
-             "back_idle_ms={:.1f} full_waits={} front_parks={} reg_appends={} posted_gfx_disp={} "
+             "back_idle_ms={:.1f} full_waits={} full_wait_ms={:.1f} a2_slot_wait_ms={:.1f} "
+             "front_parks={} reg_appends={} posted_gfx_disp={} "
              "posted_asc_disp={} posted_asc_pkts={} posted_fences={}",
              double(now - log_window_start_ns) / 1e9, Mode(), depth, c.records, c.bytes,
              c.posted[static_cast<u32>(PostKind::Draw)],
              c.posted[static_cast<u32>(PostKind::GfxPacket)], drains, drain_waits,
              ms(drain_ticks + c.depth_wait_ticks), ms(drain_ticks), ms(c.depth_wait_ticks),
-             c.depth_waits, c.max_lead, c.max_lead_seq, ms(idle), c.full_waits, c.front_parks,
+             c.depth_waits, c.max_lead, c.max_lead_seq, ms(idle), c.full_waits,
+             ms(c.full_wait_ticks), ms(std::exchange(slot_wait_ticks, 0)), c.front_parks,
              c.reg_appends, c.posted[static_cast<u32>(PostKind::GfxDispatch)],
              c.posted[static_cast<u32>(PostKind::AscDispatch)],
              c.posted[static_cast<u32>(PostKind::AscPacket)],

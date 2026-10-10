@@ -567,6 +567,8 @@ public:
         return front_waiting.load(std::memory_order_acquire) != 0;
     }
     alignas(64) std::atomic<u32> front_waiting{0};
+    /// SHADPS4_A2: front ticks waiting for a DCB table slot (front-written, logged by MaybeLog).
+    u64 slot_wait_ticks{};
     /// SHADPS4_A1: complete DCBs the front has published (front writes after the publish).
     alignas(64) std::atomic<u64> dcb_ends_published{0};
 
@@ -610,6 +612,7 @@ public:
     /// Front-owned counters, logged and reset every ~10 s by MaybeLog. Times are in TSC ticks.
     struct Counters {
         u64 records{}, bytes{}, full_waits{}, front_parks{}, reg_appends{};
+        u64 full_wait_ticks{}; ///< WaitForSpace (ring full), TSC
         std::array<u64, NumPostKinds> posted{};
         u64 depth_waits{}, depth_wait_ticks{};
         u64 max_lead{};       ///< Most posted records outstanding at a post (after the bound).

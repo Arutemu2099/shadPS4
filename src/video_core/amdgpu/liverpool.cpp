@@ -7310,9 +7310,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // The back still holds idx - A2Slots (it releases at that DcbEnd, published).
                 split->front_waiting.fetch_add(1, std::memory_order_acq_rel);
                 split->RingReaderBell();
+                const u64 sw0 = __rdtsc();
                 for (u32 spins = 0; e.state.load(std::memory_order_acquire) != 0; ++spins) {
                     spins < 4096 ? _mm_pause() : std::this_thread::yield();
                 }
+                const u64 swt = __rdtsc() - sw0;
+                split->slot_wait_ticks += swt;
+                Common::FaultMonitor::front_wait_ticks.fetch_add(swt, std::memory_order_relaxed);
                 split->front_waiting.fetch_sub(1, std::memory_order_acq_rel);
             }
             e.begin_pos.store(g_a2s.front_begin_pos, std::memory_order_relaxed);
