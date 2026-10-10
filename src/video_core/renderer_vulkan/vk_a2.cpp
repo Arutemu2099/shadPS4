@@ -767,9 +767,14 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         cmd_warned = true;
         ++owner->refusals[RefuseNoCmd];
     }
-    if (!inst_known || io_ud != 0 || index_count == 0 || (push_inh >> Shader::NUM_USER_DATA_REGS) != 0) {
+    if (io_ud != 0 || index_count == 0 || (push_inh >> Shader::NUM_USER_DATA_REGS) != 0) {
+        ++owner->sub[io_ud != 0 ? 1 : index_count == 0 ? 2 : 3];
         return refuse(RefuseRecordFields);
     }
+    // The record knows the instance count only after a NUM_INSTANCES packet in the same DCB; the
+    // mirror always has it (as the generic draw path reads it).
+    const u32 n_inst = inst_known ? instances : regs.num_instances.NumInstances();
+    owner->sub[0] += inst_known ? 0 : 1; // census: instance count taken from the mirror
     if (inh_slots != 0) {
         // v1 (as NativeDirectBind fail 3): an inherited V#'s table words need the opener's cache
         // offsets; refuse rather than reproduce them.
@@ -782,7 +787,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     const VAddr index_addr =
         regs.index_base_address.Address<VAddr>() + u64(draw.index_offset) * index_size;
     if (index_addr != index_addr_rec || regs.num_indices != index_count ||
-        regs.num_instances.NumInstances() != instances) {
+        regs.num_instances.NumInstances() != n_inst) {
         return refuse(RefuseRecordRegs);
     }
     const auto* attribs = AmdGpu::CpSplit::VertexInputAttribs(*draw.vi);
@@ -825,6 +830,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
             continue;
         }
         if (!colour && (!info->images.empty() || !info->samplers.empty())) {
+            ++owner->sub[4];
             return refuse(RefuseSlotKind);
         }
         if (colour && s != u32(Shader::LogicalStage::Fragment) &&
@@ -841,6 +847,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
             }
             if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
                 if (regs.clipper_control.user_clip_plane_enable != 0) {
+                    ++owner->sub[5];
                     return refuse(RefuseSlotKind); // needs a stream-buffer copy of the planes
                 }
                 writes[num_writes++] = {bnd.unified++, vk::Buffer{}, 0, VK_WHOLE_SIZE};
@@ -850,10 +857,14 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
             }
             if (desc.buffer_type != Shader::BufferType::Guest || desc.is_written ||
                 desc.is_formatted) {
+                ++owner->sub[desc.buffer_type != Shader::BufferType::Guest ? 6
+                             : desc.is_written                             ? 7
+                                                                           : 8];
                 return refuse(RefuseSlotKind);
             }
             const auto vsharp = desc.GetSharp(bound);
             if (colour && (desc.inline_cbuf || vsharp.base_address == 0 || vsharp.GetSize() == 0)) {
+                ++owner->sub[9];
                 return refuse(RefuseSlotKind); // NativeDirectBind fail 5 / 6
             }
             o_addr[bi] = vsharp.base_address;
@@ -1142,6 +1153,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
             }
             if (!buf || o_addr[b] < buf->CpuAddr() ||
                 o_addr[b] - buf->CpuAddr() >= buf->SizeBytes()) {
+                ++owner->sub[!buf ? 10 : 11];
                 return refuse(RefuseGuestLookup);
             }
             base[b] = static_cast<u32>(buf->CpuAddr());
@@ -1284,7 +1296,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     // at ring entry first + n).
     SubBatch& sb = cmds->batches.back();
     const u32 n = sb.n;
-    const u32 cmdw[5] = {index_count, instances, static_cast<u32>(ib_off / index_size),
+    const u32 cmdw[5] = {index_count, n_inst, static_cast<u32>(ib_off / index_size),
                          static_cast<u32>(s32(vo)), 0u};
     std::memcpy(cmd_ptr + u64(n) * CmdBytes, cmdw, CmdBytes);
     sb.n = n + 1;

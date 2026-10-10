@@ -260,6 +260,10 @@ public:
     std::unique_ptr<Stretch> EndStretch();
     /// Refusal counters by reason (logged by the caller).
     std::array<u64, 32> refusals{};
+    /// Sub-reasons (census): 0-3 record fields (inst_known 0, io_ud, index_count 0, push_inh),
+    /// 4-9 slot kind (shadow with images, clip planes, not Guest, written, formatted, colour
+    /// inline / null / empty V#), 10-11 guest lookup (no buffer, address outside it).
+    std::array<u64, 16> sub{};
     /// Draws taken and sub-batches opened so far (logged by the caller).
     u64 taken{}, sub_batches{};
 

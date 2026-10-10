@@ -241,6 +241,14 @@ public:
         u64 n{};
         std::array<u32, 2 * Shader::NativeBindlessMax> slots{};
     } a2_probe;
+    /// SHADPS4_A2=2: what each colour draw of a verified stretch must get (key tag << 32 | idx);
+    /// BindlessRingWrite compares every write against it and erases the entry.
+    struct A2Expect {
+        std::array<u32, 2 * Shader::NativeBindlessMax> slots{};
+        u32 n_img{}, n_smp{};
+    };
+    std::unordered_map<u64, A2Expect> a2_expect;
+    u64 a2_slot_cmp{}, a2_slot_bad{};
     [[nodiscard]] const Instance& A2Instance() const noexcept {
         return instance;
     }

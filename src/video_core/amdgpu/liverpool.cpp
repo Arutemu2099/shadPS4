@@ -2282,7 +2282,7 @@ bool A2NoopDma(const CpSplit::RecordHeader& record) {
     return header->type3.opcode == PM4ItOpcode::DmaData && dma->dst_addr_lo == 0x3022C;
 }
 
-void A2Log() {
+void A2Log(u64 slot_cmp, u64 slot_bad, u64 expect_n) {
     auto& g = g_a2s;
     auto& c = g.c;
     const u64 now = A2NowNs();
@@ -2306,6 +2306,18 @@ void A2Log() {
             rf += fmt::format(" '{}'={}", Vulkan::A2::RefusalName(i), refusals[i]);
         }
     }
+    std::array<u64, 16> subs{};
+    for (const auto* t : g.translators) {
+        for (u32 i = 0; i < 16; ++i) {
+            subs[i] += t->sub[i];
+        }
+    }
+    const std::string sub = fmt::format(
+        " | sub-reasons: record fields inst_known0 {} io_ud {} index_count0 {} push_inh {}; slot "
+        "kind shadow-images {} clip {} not-guest {} written {} formatted {} colour-inline/null {}; "
+        "guest lookup no-buffer {} outside {}",
+        subs[0], subs[1], subs[2], subs[3], subs[4], subs[5], subs[6], subs[7], subs[8], subs[9],
+        subs[10], subs[11]);
     LOG_INFO(Render,
              "A2 (mode {}): window {:.1f}s | back-TRANSLATED draw records/s={:.0f} back-walked "
              "(worker) draw records/s={:.0f} fallback share={:.3f} | stretches/s={:.0f} "
@@ -2336,7 +2348,8 @@ void A2Log() {
              g.seq_breaks.load(), g.cancels.load(),
              g.worker_draws ? double(g.take_cyc) / double(g.worker_draws) : 0.0,
              c.col_stretches, c.materials, ms(c.col_resolve_cyc), c.mat_rejects, c.rt_rejects,
-             c.slot_cmp, c.slot_bad, c.slot_unwritten, rf);
+             slot_cmp, slot_bad,
+             c.slot_unwritten + expect_n, rf + sub);
     c = A2Counters{};
     c.start_ns = now;
     c.start_tsc = tsc;
@@ -2850,7 +2863,7 @@ void Liverpool::A2Execute(const CpSplit::RecordHeader& record) {
         g.cur = &e;
         ++(g.cur_back ? c.back_dcbs : c.worker_dcbs);
         if (c.dcbs >= 65536) {
-            A2Log();
+            A2Log(rasterizer->a2_slot_cmp, rasterizer->a2_slot_bad, rasterizer->a2_expect.size());
         }
         return;
     }
@@ -2974,8 +2987,19 @@ void Liverpool::A2Execute(const CpSplit::RecordHeader& record) {
                             g.reject_cur = true;
                         }
                         if (ok && g_a2 == 2) {
-                            g.v_stretch = &s;
-                            g.v_slot_k = 0;
+                            auto& ex = rasterizer->a2_expect;
+                            if (ex.size() > 200000) {
+                                c.slot_unwritten += ex.size(); // never written: stale
+                                ex.clear();
+                            }
+                            for (const auto& sw : s.cmds->slot_writes) {
+                                if (sw.mat < s.materials.size()) {
+                                    auto& e2 = ex[u64{sw.tag} << 32 | sw.idx];
+                                    e2.slots = s.cmds->mat_slots[sw.mat];
+                                    e2.n_img = g.v_mat_n[sw.mat].first;
+                                    e2.n_smp = g.v_mat_n[sw.mat].second;
+                                }
+                            }
                         }
                     }
                     if (!g.reject_cur) {
@@ -3038,7 +3062,7 @@ void Liverpool::A2Execute(const CpSplit::RecordHeader& record) {
                 }
                 // Rejected / verify: the old path runs the draw.
                 c.would += g_a2 == 2 ? 1 : 0;
-                if (g.v_stretch == &s && g.v_slot_k < s.cmds->slot_writes.size()) {
+                if (false && g.v_stretch == &s && g.v_slot_k < s.cmds->slot_writes.size()) {
                     const auto& sw = s.cmds->slot_writes[g.v_slot_k];
                     if (sw.tag == rec.job_tag && sw.idx == rec.job_idx) {
                         ++g.v_slot_k;

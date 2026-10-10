@@ -5270,6 +5270,22 @@ void Rasterizer::BindlessRingWrite(u32 tag, u32 idx, const u32* slots) {
         a2_probe.idx = idx;
         std::memcpy(a2_probe.slots.data(), slots, sizeof(u32) * 2 * Shader::NativeBindlessMax);
         ++a2_probe.n;
+        if (const auto it = a2_expect.find(u64{tag} << 32 | idx); it != a2_expect.end()) {
+            const auto& ex = it->second;
+            bool bad = false;
+            for (u32 i = 0; !bad && i < ex.n_img; ++i) {
+                bad = slots[i] != ex.slots[i];
+            }
+            for (u32 j = 0; !bad && j < ex.n_smp; ++j) {
+                bad = slots[Shader::NativeBindlessMax + j] != ex.slots[Shader::NativeBindlessMax + j];
+            }
+            ++a2_slot_cmp;
+            if (bad && ++a2_slot_bad <= 16) {
+                LOG_WARNING(Render_Vulkan, "A2 verify: slot words differ (tag {:#x} idx {}, {} images {} samplers)",
+                            tag, idx, ex.n_img, ex.n_smp);
+            }
+            a2_expect.erase(it);
+        }
     }
 }
 
