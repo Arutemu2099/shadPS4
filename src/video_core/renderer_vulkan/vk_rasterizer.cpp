@@ -5880,12 +5880,13 @@ void Rasterizer::NativeLog() {
     if (st.nd_cand != 0) {
         LOG_INFO(Render_Vulkan,
                  "NativeDirect: candidates={} direct openers={} (DrawTail {:.0f} cycles each) | "
-                 "fails 1..9: {} {} {} {} {} {} {} {} {} | verify ok={} MISMATCH={}",
+                 "fails 1..9: {} {} {} {} {} {} {} {} {} | verify ok={} MISMATCH={} "
+                 "(restructured between the binds {})",
                  st.nd_cand, st.nd_ok,
                  double(st.c_tail_dopen) / double(std::max<u64>(st.n_tail_dopen, 1)),
                  st.nd_fail[1], st.nd_fail[2], st.nd_fail[3], st.nd_fail[4], st.nd_fail[5],
                  st.nd_fail[6], st.nd_fail[7], st.nd_fail[8], st.nd_fail[9], st.nd_vfy_ok,
-                 st.nd_vfy_bad);
+                 st.nd_vfy_bad, st.nd_fail[15]);
     }
     if (st.bl_open + st.bl_open_fail != 0) {
         LOG_INFO(Render_Vulkan,
@@ -6283,7 +6284,9 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
             }
             const auto dpush = push_data;
             const auto dvi = VideoCore::t_native_vi;
+            const u64 dgen = buffer_cache.StructGeneration();
             BindResources(pipeline);
+            const bool restructured = buffer_cache.StructGeneration() != dgen;
             std::string why;
             u32 found = 0;
             for (u32 i = 0; i < set_write_index && why.empty(); ++i) {
@@ -6323,6 +6326,8 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
             }
             if (why.empty()) {
                 ++native_stats.nd_vfy_ok;
+            } else if (restructured) {
+                ++native_stats.nd_fail[15]; // the generic bind changed the buffer structure
             } else if (++native_stats.nd_vfy_bad <= 16) {
                 LOG_CRITICAL(Render_Vulkan, "NativeDirect verify MISMATCH: {}", why);
             }
