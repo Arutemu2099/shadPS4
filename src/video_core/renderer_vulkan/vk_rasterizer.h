@@ -159,6 +159,14 @@ public:
     /// current one (member 0 of a segment of n: n - 1; a replayed member j: n - 1 - j). While it
     /// is > 0 the single-draw peek is skipped: the next POSTED record is not a member.
     u32 segx_left{};
+    /// Brick C v3 item 4: the pending segment's distinct materials (0: none) and, per further
+    /// material, its representative member's stages (spans into the Segment record: valid
+    /// while it runs) and the slots the open resolved for it (row 0 = the opener's bl_slots).
+    u32 segx_n_mat{};
+    std::array<std::array<Shader::BoundStage, Shader::MaxStageTypes>, Shader::NativeSegMaxMaterials>
+        segx_mat_stages{};
+    std::array<std::array<u32, Shader::NativeSegMatWords>, Shader::NativeSegMaxMaterials>
+        segx_mat_slots{};
     /// SHADPS4_NATIVE_REC_PREP (notes/native-path-2026-10-09.md sec. 9): the open batch's run
     /// members prepared from the job records (records + indirect commands in the batch slots,
     /// count not advanced); each is confirmed at its own draw record (NativePrepConfirm).
@@ -666,7 +674,8 @@ private:
     /// Back thread: the fragment stage's image / sampler slots of the draw `base` describes now
     /// (32 words: images then samplers). views / samplers (optional): what they hold.
     bool BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::ImageView* views,
-                         vk::Sampler* samplers, u32& n_img, u32& n_smp, bool retry = true);
+                         vk::Sampler* samplers, u32& n_img, u32& n_smp, bool retry = true,
+                         const Shader::BoundStage* fs_override = nullptr);
     bool BindlessRotate();
     void BindlessRingWrite(u32 tag, u32 idx, const u32* slots);
     std::unique_ptr<VideoCore::Buffer> native_dbg; ///< SHADPS4_NATIVE_COLOUR_DIAG 4096
@@ -688,7 +697,9 @@ private:
     /// words and the hi bytes (vertex hi bytes 0: unused by the shaders).
     void NativePtRecord(u32* rec, const std::array<u64, Shader::NUM_BUFFERS>& addr) const;
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> native_open_images;
-    bool NativeImageKey(const GraphicsPipeline* base, std::array<u32, 512>& out, u32& n) const;
+    bool NativeImageKey(const GraphicsPipeline* base, std::array<u32, 512>& out, u32& n,
+                        const std::array<Shader::BoundStage, Shader::MaxStageTypes>* stages =
+                            nullptr) const;
     bool NativeColourGates() const {
         return tex_bind_memo == 1 && !bind_memo_stats && pending_stencil_writebacks.empty();
     }
@@ -840,7 +851,7 @@ private:
                           const std::array<u64, Shader::NUM_BUFFERS>& o_addr,
                           const std::array<u32, Shader::NUM_BUFFERS>& o_off,
                           const std::array<u32, Shader::NUM_BUFFERS>& o_size, const u32* o_ud);
-    void NativeSegWrite(u8* map_ptr, u64 map_off, u64 table_bytes, u64 tables_rel);
+    void NativeSegWrite(u8* map_ptr, u64 map_off, u64 table_bytes, u64 tables_rel, u8* mat_ptr);
     void NativeSegRecord(const GraphicsPipeline* pipeline, vk::Buffer sb, u64 cmd_off,
                          vk::PipelineLayout bl_layout, vk::DescriptorSet bl_set);
     u32 t_segx_delta{};  ///< (index union lo - the index buffer's CPU base) / index size

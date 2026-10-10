@@ -293,6 +293,8 @@ public:
     bool native_seg_compare{};
     Id native_rec_ptr{};   // u64 device address of this draw's record
     Id native_seg_entry{}; // the list entry (compare entries)
+    Id native_seg_slot_ptr{}; // u64 address of this draw's 32 bindless slot words (item 4)
+    Id NativeSegSlotLoad(u32 word);
     void NativeSegRecordPointer(Id draw);
     std::array<Id, IR::NumParams> native_attr_value{}; // VS: pulled vec4 per fetch semantic
     Id NativeVbufLoad(Id dword_index);

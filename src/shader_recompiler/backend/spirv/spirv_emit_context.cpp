@@ -1201,7 +1201,9 @@ void EmitContext::NativeSegRecordPointer(Id draw) {
     const Id entry{load_ptr(OpIAdd(
         U64, list, OpUConvert(U64, OpShiftLeftLogical(U32[1], draw, ConstU32(2u)))))};
     Name(entry, "native_seg_entry");
-    const Id slot{OpUMin(U32[1], OpShiftRightLogical(U32[1], entry, ConstU32(24u)),
+    const Id slot{OpUMin(U32[1],
+                         OpBitwiseAnd(U32[1], OpShiftRightLogical(U32[1], entry, ConstU32(24u)),
+                                      ConstU32(Shader::NativeSegSlotMask)),
                          ConstU32(Shader::NativeSegSlots - 1))};
     const Id word{OpIAdd(U32[1], ConstU32(Shader::NativeTableSlotAddr),
                          OpShiftLeftLogical(U32[1], slot, ConstU32(1u)))};
@@ -1212,6 +1214,25 @@ void EmitContext::NativeSegRecordPointer(Id draw) {
         OpUConvert(U64, OpIMul(U32[1], ridx, ConstU32(Shader::NativeRecordDwords * 4))));
     Name(native_rec_ptr, "native_rec_ptr");
     native_seg_entry = entry;
+    // Brick C v3 item 4: the slot words - the segment's table row of this draw's material
+    // (entry bits 29..31) when the batch has a table, else the record's own slot words.
+    const Id mat_addr{u64_of(NativeTableLoad(Shader::NativeTableSegMat),
+                             NativeTableLoad(Shader::NativeTableSegMat + 1))};
+    const Id mat{OpShiftRightLogical(U32[1], entry, ConstU32(Shader::NativeSegMatShift))};
+    const Id mat_ptr{OpIAdd(
+        U64, mat_addr,
+        OpUConvert(U64, OpIMul(U32[1], mat, ConstU32(Shader::NativeSegMatWords * 4))))};
+    const Id rec_slots{
+        OpIAdd(U64, native_rec_ptr, Constant(U64, u64{Shader::NativeRecordImgOffset} * 4))};
+    native_seg_slot_ptr = OpSelect(U64, OpINotEqual(U1[1], mat_addr, u64_zero_value), mat_ptr,
+                                   rec_slots);
+    Name(native_seg_slot_ptr, "native_seg_slot_ptr");
+}
+
+Id EmitContext::NativeSegSlotLoad(u32 word) {
+    const Id addr{OpIAdd(U64, native_seg_slot_ptr, Constant(U64, u64{word} * 4))};
+    return OpLoad(U32[1], OpConvertUToPtr(physical_pointer_type_u32, addr),
+                  spv::MemoryAccessMask::Aligned, 4u);
 }
 
 Id EmitContext::NativeVbufLoad(Id dword_index) {
@@ -1425,7 +1446,9 @@ Id EmitContext::LoadImage(const TextureDefinition& texture) {
     if (!texture.bindless) {
         return OpLoad(texture.image_type, texture.id);
     }
-    const Id slot{NativeRecordLoad(Shader::NativeRecordImgOffset + texture.bindless_index)};
+    const Id slot{native_seg ? NativeSegSlotLoad(texture.bindless_index)
+                             : NativeRecordLoad(Shader::NativeRecordImgOffset +
+                                                texture.bindless_index)};
     const Id ptr{OpAccessChain(TypePointer(spv::StorageClass::UniformConstant, texture.image_type),
                                texture.id, slot)};
     const Id value{OpLoad(texture.image_type, ptr)};
@@ -1436,7 +1459,8 @@ Id EmitContext::LoadSampler(u32 index) {
     if (!native_bindless) {
         return OpLoad(sampler_type, samplers[index]);
     }
-    const Id slot{NativeRecordLoad(Shader::NativeRecordSmpOffset + index)};
+    const Id slot{native_seg ? NativeSegSlotLoad(Shader::NativeBindlessMax + index)
+                             : NativeRecordLoad(Shader::NativeRecordSmpOffset + index)};
     const Id ptr{OpAccessChain(sampler_pointer_type, samplers[index], slot)};
     const Id value{OpLoad(sampler_type, ptr)};
     return value;

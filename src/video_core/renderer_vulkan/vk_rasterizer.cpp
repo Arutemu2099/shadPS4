@@ -2324,10 +2324,13 @@ static std::vector<u32> g_native_diag_ctx;
 static std::unordered_map<u32, u64> g_native_diag_regs;
 static u64 g_native_diag_n = 0;
 
-bool Rasterizer::NativeImageKey(const GraphicsPipeline* base, std::array<u32, 512>& out,
-                                u32& n) const {
+bool Rasterizer::NativeImageKey(
+    const GraphicsPipeline* base, std::array<u32, 512>& out, u32& n,
+    const std::array<Shader::BoundStage, Shader::MaxStageTypes>* stages) const {
     // SHADPS4_NATIVE_COLOUR: the raw T# / S# of every image and sampler of every stage, as the
-    // draw-repeat key reads them (DrawRepeatMatch). False on overflow.
+    // draw-repeat key reads them (DrawRepeatMatch). False on overflow. `stages` (brick C v3
+    // item 4): another draw's bound stages (a segment material's representative) in place of
+    // the rasterizer's.
     n = 0;
     const auto add = [&](const auto& sharp) {
         constexpr u32 words = static_cast<u32>(sizeof(sharp) / sizeof(u32));
@@ -2338,7 +2341,10 @@ bool Rasterizer::NativeImageKey(const GraphicsPipeline* base, std::array<u32, 51
         n += words;
         return true;
     };
-    for (const auto& bound : BoundStages(base)) {
+    const std::span<const Shader::BoundStage> bound_span =
+        stages ? std::span<const Shader::BoundStage>{*stages}.first(Shader::MaxStageTypes - 1)
+               : BoundStages(base);
+    for (const auto& bound : bound_span) {
         if (!bound.info) {
             continue;
         }
@@ -3823,8 +3829,11 @@ bool Rasterizer::NativeSegPrepare(const GraphicsPipeline* base,
     if (r0.stamp.load(std::memory_order_relaxed) != idx + 1 || cmd0 != draw_job_cmd || !gpu_ok0) {
         return fail(8);
     }
-    // The one material: member 0's job key is the segment's and agrees with the back's key.
-    if ((img_n0 & ~NR::ImgInhBit) != b.img_n || img_h10 != seg.img_h1 || img_h20 != seg.img_h2) {
+    // Material 0: member 0's job key is the segment's first and agrees with the back's key.
+    // v3 item 4: the further materials were resolved from their representatives' records
+    // (NativeOpen, after the opener's resolve); their count must be the record's.
+    if ((img_n0 & ~NR::ImgInhBit) != b.img_n || seg.n_mat == 0 || seg.n_mat != segx_n_mat ||
+        img_h10 != seg.mat_h1[0] || img_h20 != seg.mat_h2[0]) {
         return fail(8);
     }
     if (!(img_n0 & NR::ImgInhBit)) {
@@ -3836,7 +3845,7 @@ bool Rasterizer::NativeSegPrepare(const GraphicsPipeline* base,
     }
     // Every member's job ring is alive and its entry inside the safe window.
     for (u32 j = 0; j < seg.n; ++j) {
-        const u32 slot = segx_list[j] >> 24;
+        const u32 slot = (segx_list[j] >> 24) & Shader::NativeSegSlotMask;
         const u32 mi = segx_list[j] & 0xffffffu;
         if (slot >= NR::MaxSlots || NR::g_gpu_bda[slot].load(std::memory_order_acquire) == 0 ||
             ((NR::g_job_next[slot].load(std::memory_order_relaxed) - mi) & 0xffffffu) >
@@ -4013,12 +4022,14 @@ bool Rasterizer::NativeSegPrepare(const GraphicsPipeline* base,
     return true;
 }
 
-void Rasterizer::NativeSegWrite(u8* map_ptr, u64 map_off, u64 table_bytes, u64 tables_rel) {
+void Rasterizer::NativeSegWrite(u8* map_ptr, u64 map_off, u64 table_bytes, u64 tables_rel,
+                                u8* mat_ptr) {
     // NativeOpen, after member 0's record and command: the segment's members into the batch -
-    // the commands (firstIndex + the index buffer delta) into slots 0..n-1, the list entries,
-    // the one material's bindless slot words into every member's job record (128 bytes each,
-    // write-combined; the remaining per-member cost), the count. One table copy per DRAW_RANGE
-    // after the first (its list address at the range's first member). The batch is sealed.
+    // the commands (firstIndex + the index buffer delta) into slots 0..n-1, the list entries
+    // (slot | ring index | material index), the slot table (one row of 32 words per distinct
+    // material: the opener's, then those resolved from the representatives - no per-member
+    // write, brick C v3 item 4), the count. One table copy per DRAW_RANGE after the first (its
+    // list address at the range's first member). The batch is sealed.
     auto& b = native_batch;
     const auto& seg = *segx_pending;
     const u32 n = seg.n;
@@ -4030,10 +4041,12 @@ void Rasterizer::NativeSegWrite(u8* map_ptr, u64 map_off, u64 table_bytes, u64 t
     if (b.list) {
         std::memcpy(b.list, segx_list, size_t(n) * sizeof(u32));
     }
-    if (b.bindless) {
-        for (u32 j = 0; j < n; ++j) {
-            BindlessRingWrite((segx_list[j] >> 24) << 28, segx_list[j] & 0xffffffu,
-                              b.bl_slots.data());
+    if (b.bindless && mat_ptr) {
+        constexpr size_t row = Shader::NativeSegMatWords * sizeof(u32);
+        static_assert(sizeof(b.bl_slots) == row);
+        std::memcpy(mat_ptr, b.bl_slots.data(), row);
+        for (u32 m = 1; m < segx_n_mat; ++m) {
+            std::memcpy(mat_ptr + size_t(m) * row, segx_mat_slots[m].data(), row);
         }
     }
     *b.count = n;
@@ -4592,6 +4605,55 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
             b.bl_set = bindless.cur;
             bindless.last_tick[b.bl_set] = scheduler.CurrentTick();
             ++native_stats.bl_open;
+            if (segx_pending != nullptr && segx_n_mat > 1) {
+                // Brick C v3 item 4: every further DISTINCT material of the segment, resolved
+                // once from its representative member's stage blocks exactly as the opener's
+                // (image refresh included: a dirty image misses the slot cache and goes through
+                // FindImage), into the segment's slot table; the set copy must not rotate and no
+                // barrier may be recorded meanwhile (the join rule).
+                namespace NR = AmdGpu::NativeRec;
+                const auto& seg = *segx_pending;
+                const u64 s1 = scheduler.RecordSeq();
+                for (u32 m = 1; m < segx_n_mat; ++m) {
+                    std::array<u32, 512> key;
+                    u32 n = 0;
+                    u64 h1 = 0, h2 = 0;
+                    if (!NativeImageKey(base, key, n, &segx_mat_stages[m]) || n != b.img_n) {
+                        return fail(__LINE__);
+                    }
+                    NR::ImageKeyHash(key.data(), n, h1, h2);
+                    if (h1 != seg.mat_h1[m] || h2 != seg.mat_h2[m]) {
+                        // The job's key may hold zeros for inherited T# / S# (ImgInhBit on its
+                        // record); any other disagreement refuses the open (replay).
+                        const u32 e = segx_list[seg.mat_rep[m]];
+                        const u32 slot = (e >> 24) & Shader::NativeSegSlotMask;
+                        const u32 ridx = e & 0xffffffu;
+                        const NR::Record* ring =
+                            slot < NR::MaxSlots ? NR::g_rings[slot].load(std::memory_order_acquire)
+                                                : nullptr;
+                        bool inherited = false;
+                        if (ring) {
+                            const NR::Record& r = ring[ridx & (NR::RingSize - 1)];
+                            const u32 img_n = r.img_n;
+                            std::atomic_thread_fence(std::memory_order_acquire);
+                            inherited = ((r.stamp.load(std::memory_order_relaxed) - 1) & 0xffffffu) ==
+                                            ridx &&
+                                        (img_n & NR::ImgInhBit) != 0;
+                        }
+                        if (!inherited) {
+                            return fail(__LINE__);
+                        }
+                    }
+                    u32 ni = 0, ns = 0;
+                    const auto& fs_m = segx_mat_stages[m][u32(Shader::LogicalStage::Fragment)];
+                    if (!BindlessResolve(base, segx_mat_slots[m].data(), nullptr, nullptr, ni, ns,
+                                         true, &fs_m) ||
+                        bindless.cur != b.bl_set || scheduler.RecordSeq() != s1) {
+                        ++native_stats.bl_open_fail;
+                        return fail(__LINE__);
+                    }
+                }
+            }
         }
         no_lap(2); // bindless resolve
         const auto* attribs = AmdGpu::CpSplit::VertexInputAttribs(*front_vi);
@@ -4745,12 +4807,15 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
     // SHADPS4_NATIVE_SEGX: one table copy per DRAW_RANGE after the first (NativeSegWrite).
     const u64 segx_bytes =
         segx_prepared && t_segx_ranges > 1 ? u64(t_segx_ranges - 1) * table_bytes : 0;
+    // Brick C v3 item 4: the segment's slot table (one row per distinct material) last.
+    const u64 mat_bytes =
+        segx_prepared ? u64(segx_n_mat) * Shader::NativeSegMatWords * sizeof(u32) : 0;
     auto& stream = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
     if (!stream.IsCoherent()) {
         return fail(__LINE__);
     }
     const u64 total = u64(NativeMaxDraws) * (NativeRecBytes + NativeCmdBytes) + 16 + table_bytes +
-                      seg_bytes + segx_bytes;
+                      seg_bytes + segx_bytes + mat_bytes;
     const u64 seq_before_map = scheduler.RecordSeq();
     const u64 tick_before_map = scheduler.CurrentTick();
     const auto [map_ptr, map_off] = stream.Map(total, instance.StorageMinAlignment(), false);
@@ -4790,6 +4855,11 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
                           stream.BufferDeviceAddress() + offset + list_off,
                           reinterpret_cast<u32*>(ptr + list_off));
             b.list = reinterpret_cast<u32*>(ptr + list_off);
+            if (segx_prepared) {
+                const u64 ma = stream.BufferDeviceAddress() + map_off + total - mat_bytes;
+                native_ring_table[Shader::NativeTableSegMat] = static_cast<u32>(ma);
+                native_ring_table[Shader::NativeTableSegMat + 1] = static_cast<u32>(ma >> 32);
+            }
         }
         std::memcpy(map_ptr, native_ring_table.data(), table_bytes);
     }
@@ -4916,7 +4986,8 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
             }
         }
         if (segx_prepared) [[unlikely]] {
-            NativeSegWrite(map_ptr, map_off, table_bytes, total - segx_bytes);
+            NativeSegWrite(map_ptr, map_off, table_bytes, total - segx_bytes - mat_bytes,
+                           map_ptr + total - mat_bytes);
         } else if (b.ring) {
             NativeRingWrite();
         } else if (ring_verify) {
@@ -5115,7 +5186,8 @@ void Rasterizer::BindlessRingWrite(u32 tag, u32 idx, const u32* slots) {
 }
 
 bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::ImageView* views,
-                                 vk::Sampler* samplers, u32& n_img, u32& n_smp, bool retry) {
+                                 vk::Sampler* samplers, u32& n_img, u32& n_smp, bool retry,
+                                 const Shader::BoundStage* fs_override) {
     // SHADPS4_NATIVE_BINDLESS (sec. 12), back thread. Per fragment image: the cache entry for
     // (descriptor, raw T#) if every validity condition holds (then only the LRU touch), else
     // what BindTextures does for one sampled image - FindImage, FindTexture, the sampled-layout
@@ -5147,9 +5219,11 @@ bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::I
         bl.img_cache.resize(16384);
         bl.smp_cache.resize(1024);
     }
-    const Shader::BoundStage* fs = nullptr;
+    // Brick C v3 item 4: a segment material's representative member supplies its own fragment
+    // stage (user data + flat buffer from its record); the Info is the pipeline's.
+    const Shader::BoundStage* fs = fs_override && fs_override->info ? fs_override : nullptr;
     for (const auto& bound : BoundStages(base)) {
-        if (bound.info && bound.info->l_stage == Shader::LogicalStage::Fragment) {
+        if (!fs && bound.info && bound.info->l_stage == Shader::LogicalStage::Fragment) {
             fs = &bound;
         }
     }
@@ -5167,7 +5241,7 @@ bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::I
     const auto device = instance.GetDevice();
     const auto rotate_retry = [&] {
         return retry && BindlessRotate() &&
-               BindlessResolve(base, slots, views, samplers, n_img, n_smp, false);
+               BindlessResolve(base, slots, views, samplers, n_img, n_smp, false, fs_override);
     };
     for (u32 i = 0; i < n_img; ++i) {
         const auto& desc = info.images[i];
@@ -6426,7 +6500,7 @@ bool Rasterizer::NativeSegEvaluate(const AmdGpu::CpSplit::SplitSegmentRecord& se
     for (u32 j = 0; j < seg.n; ++j) {
         // The entry's low 24 bits are the job's ring counter (unmasked); the age against the
         // job's next counter, modulo 2^24, must leave the GPU its safe window (RingSize / 4).
-        const u32 slot = list[j] >> 24;
+        const u32 slot = (list[j] >> 24) & Shader::NativeSegSlotMask;
         const u32 idx = list[j] & 0xffffffu;
         const u32 next = slot < NR::MaxSlots ? NR::g_job_next[slot].load(std::memory_order_relaxed) : 0u;
         const u32 age = (next - idx) & 0xffffffu;

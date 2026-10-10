@@ -295,8 +295,12 @@ struct SplitSegmentRecord {
     u32 pad;
     std::array<u64, 16> vlo, vhi;
     std::array<u64, 40> glo, ghi;
-    u64 img_h1, img_h2; ///< the one material (job record image-key hashes)
-    u64 pad2;
+    /// v3 item 4: the distinct materials (job record image-key hashes) in order of first
+    /// appearance and each one's representative member (material 0: member 0).
+    u32 n_mat;
+    u32 pad2;
+    std::array<u64, 8> mat_h1, mat_h2;
+    std::array<u32, 8> mat_rep;
     u32 n_rec; ///< embedded member Draw records: 1 (member 0, =2) or n (=1, the replay fallback)
     u32 pad3[3];
     std::array<u32, 64> rec_off; ///< each embedded record's byte offset in the record area

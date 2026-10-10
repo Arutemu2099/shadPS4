@@ -153,7 +153,19 @@ constexpr u32 NativeTableSegList = NativeTableSlotAddr + 2 * NativeSegSlots; // 
 /// SHADPS4_NATIVE_PT (brick C v2): the fault buffer's u64 device address (a non-contiguous or
 /// uncached Guest range flags its pages there; ProcessFaultBuffer creates the buffer).
 constexpr u32 NativeTableFaultAddr = NativeTableSegList + 2; // 212, 213
+/// Brick C v3 item 4 (multi-material segments): a list entry's slot is bits 24..28, its
+/// material index bits 29..31 (0..NativeSegMaxMaterials - 1); the table's NativeTableSegMat =
+/// the u64 device address of the segment's slot table (per material NativeSegMatWords words:
+/// NativeBindlessMax image slots, then NativeBindlessMax sampler slots), 0 = no table: the
+/// slots come from the record words (legacy / ring batches).
+constexpr u32 NativeSegSlotMask = 0x1f;
+constexpr u32 NativeSegMatShift = 29;
+constexpr u32 NativeSegMaxMaterials = 8;
+constexpr u32 NativeSegMatWords = 2 * NativeBindlessMax;
+constexpr u32 NativeTableSegMat = NativeTableFaultAddr + 2; // 214, 215
 constexpr u32 NativeTableDwords = 256;
+static_assert(NativeTableSegMat + 2 <= NativeTableDwords);
+static_assert(NativeSegSlots <= NativeSegSlotMask + 1);
 static_assert(NativeTableInhSlots + 2 <= NativeTableUd);
 static_assert(NativeTableSize + NUM_BUFFERS <= NativeTablePtLo);
 static_assert(NativeTablePtFallback + 2 <= NativeTableSlotAddr);

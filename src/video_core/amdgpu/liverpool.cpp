@@ -3392,7 +3392,8 @@ struct State {
     u64 gmask{};
     std::array<u64, AmdGpu::NativeRec::UnionSlots> glo{}, ghi{};
     u32 nmat{};
-    std::array<u64, MaxMembers> mat_h1{}, mat_h2{};
+    std::array<u64, Shader::NativeSegMaxMaterials> mat_h1{}, mat_h2{};
+    std::array<u32, Shader::NativeSegMaxMaterials> mat_rep{}; ///< v3 item 4: first member per material
     // v2: the opener's inherited set and the front's values of those registers.
     u32 inh_vs{}, inh_ps{}, push_inh{};
     u64 inh_slots{};
@@ -3546,8 +3547,12 @@ void PostSegment(State& s) {
     }
     seg->glo = s.glo;
     seg->ghi = s.ghi;
-    seg->img_h1 = s.nmat ? s.mat_h1[0] : 0;
-    seg->img_h2 = s.nmat ? s.mat_h2[0] : 0;
+    seg->n_mat = s.nmat;
+    for (u32 m = 0; m < s.nmat; ++m) {
+        seg->mat_h1[m] = s.mat_h1[m];
+        seg->mat_h2[m] = s.mat_h2[m];
+        seg->mat_rep[m] = s.mat_rep[m];
+    }
     u8* p = reinterpret_cast<u8*>(seg + 1);
     std::memcpy(p, s.recs.data(), s.rec_bytes);
     p += recs_al;
@@ -3585,7 +3590,7 @@ void NoteSegment(State& s) {
     ++s.segments;
     ++s.hist[n <= 1 ? 0 : n <= 3 ? 1 : n <= 7 ? 2 : n <= 15 ? 3 : n <= 31 ? 4 : n <= 63 ? 5 : 6];
     s.mat_sum += s.nmat;
-    ++s.mat_hist[s.nmat <= 1 ? 0 : s.nmat <= 3 ? 1 : s.nmat <= 7 ? 2 : 3];
+    ++s.mat_hist[s.nmat <= 1 ? 0 : s.nmat == 2 ? 1 : s.nmat <= 4 ? 2 : 3];
     s.open = false;
 }
 
@@ -3638,7 +3643,7 @@ void MaybeLog(State& s) {
              "guest_union={} index_misaligned={} inherited_differs={} material={} ops_full={} "
              "record_full={} outside_draw={} | outside: no_tag={} stale={} no_gpu_rec={} no_variant={} "
              "variant_not_ring_pt={} instance_offset={} not_plain={} no_union={} | materials per "
-             "segment mean {:.2f} 1/2-3/4-7/8+: {} {} {} {}",
+             "segment mean {:.2f} 1/2/3-4/5-8: {} {} {} {}",
              s.draws, s.in_seg, s.draws ? 100.0 * double(s.in_seg) / double(s.draws) : 0.0,
              s.segments, s.hist[0], s.hist[1], s.hist[2], s.hist[3], s.hist[4], s.hist[5],
              s.hist[6], c[RPipeline], c[RIndexType], c[RPacket], p[PkCtx], p[PkSh], p[PkUconfig],
@@ -3991,8 +3996,10 @@ bool NativeSegBDraw(const PM4Header* header, const Vulkan::GraphicsPipeline* pip
         return true;
     };
     bool seen = false;
+    u32 mi = 0; // v3 item 4: the member's material index
     for (u32 i = 0; i < s.nmat && !seen; ++i) {
         seen = s.mat_h1[i] == h1 && s.mat_h2[i] == h2;
+        mi = i;
     }
     if (s.open) {
         u32 why = RNone;
@@ -4026,8 +4033,8 @@ bool NativeSegBDraw(const PM4Header* header, const Vulkan::GraphicsPipeline* pip
             why = RMisaligned;
         } else if (std::max(ihi, s.ihi) - std::min(ilo, s.ilo) > MaxUnion) {
             why = RIndexUnion;
-        } else if (s.segx && !seen && s.nmat != 0) {
-            why = RMaterial; // v1: one material per segment
+        } else if (!seen && s.nmat >= Shader::NativeSegMaxMaterials) {
+            why = RMaterial; // v3 item 4: the material table is full (a 9th material)
         } else if (s.segx && s.n_ops + 3 > CpSplit::SegMaxOps) {
             why = ROps;
         } else if (s.exec && s.rec_bytes + 16u + rec_bytes > SegMaxRecordBytes) {
@@ -4095,6 +4102,7 @@ bool NativeSegBDraw(const PM4Header* header, const Vulkan::GraphicsPipeline* pip
         s.rec_bytes = 0;
         s.n_rec = 0;
         seen = false;
+        mi = 0;
     } else if (s.segx && (s.st_dirty || s.cull_dirty)) {
         // State changed since the previous member: close the open draw range, then the ops.
         if (s.range_count != 0) {
@@ -4125,8 +4133,11 @@ bool NativeSegBDraw(const PM4Header* header, const Vulkan::GraphicsPipeline* pip
     s.m_count[s.n] = index_count;
     s.m_inst[s.n] = pred.instances;
     // The low 24 bits of the job's ring counter (unmasked: the back ages it against g_job_next;
-    // the shaders mask it to the ring).
-    s.m_entry[s.n] = (slot << 24) | (idx & 0xffffffu);
+    // the shaders mask it to the ring), the slot, and (v3 item 4) the material index.
+    if (!seen) {
+        mi = s.nmat; // appended below
+    }
+    s.m_entry[s.n] = (slot << 24) | (idx & 0xffffffu) | (mi << Shader::NativeSegMatShift);
     s.m_vo[s.n] = regs.index_offset != 0 ? regs.index_offset : vo_ud;
     if (s.range_count == 0) {
         s.range_first = s.n;
@@ -4147,9 +4158,10 @@ bool NativeSegBDraw(const PM4Header* header, const Vulkan::GraphicsPipeline* pip
         s.ghi[bi] = had ? std::max(s.ghi[bi], ghi[bi]) : ghi[bi];
     }
     s.gmask |= gmask;
-    if (!seen && s.nmat < MaxMembers) {
+    if (!seen && s.nmat < Shader::NativeSegMaxMaterials) {
         s.mat_h1[s.nmat] = h1;
         s.mat_h2[s.nmat] = h2;
+        s.mat_rep[s.nmat] = s.n;
         ++s.nmat;
     }
     if ((inh_vs | inh_ps) != 0 || inh_slots != 0) {
@@ -4427,7 +4439,8 @@ namespace {
 /// 6 Guest union, 7 ops, 8 segment prepare failed, 9 the open was not reached, 10 other.
 struct SegXBack {
     u64 segments{}, members{}, ok{}, refused{}, op_range{}, op_st{}, op_cull{}, cycles{};
-    u64 replayed{}, replayed_members{}, singles{};
+    u64 replayed{}, replayed_members{}, singles{}, mats_extra{};
+    std::array<u64, 4> mat_hist{}; ///< executed segments by materials 1 / 2 / 3-4 / 5-8
     std::array<u64, 12> why{};
     u32 logged{};
     u32 calls{};
@@ -4486,6 +4499,7 @@ void Liverpool::ExecuteSegmentRecord(const CpSplit::RecordHeader& record) {
             mregs.index_buffer_type.raw = seg->index_type;
             tr.segx_pending = nullptr;
             tr.segx_left = 0;
+            tr.segx_n_mat = 0;
             ExecuteDrawRecord(record, drec);
             mregs.index_base_address = save_ib;
             mregs.num_indices = save_ni;
@@ -4500,6 +4514,35 @@ void Liverpool::ExecuteSegmentRecord(const CpSplit::RecordHeader& record) {
     const u64 t0 = __rdtsc();
     u32 why = 0;
     bool ok = tr.NativeSegEvaluate(*seg, drec->draw.pipeline, vi, list, why);
+    // v3 item 4: each further distinct material's representative member - its stage blocks
+    // (raw T# / S# words) from its embedded record, for the open's one resolve per material.
+    tr.segx_n_mat = 0;
+    if (ok && NR::g_segx == 1) {
+        if (seg->n_mat == 0 || seg->n_mat > Shader::NativeSegMaxMaterials ||
+            (seg->n_mat > 1 && seg->n_rec != seg->n)) {
+            ok = false;
+            why = 10;
+        } else {
+            tr.segx_n_mat = seg->n_mat;
+            for (u32 m = 1; m < seg->n_mat && ok; ++m) {
+                const u32 rep = seg->mat_rep[m];
+                if (rep >= seg->n) {
+                    ok = false;
+                    why = 10;
+                    break;
+                }
+                const auto* mrec =
+                    reinterpret_cast<const SplitDrawRecord*>(recs + seg->rec_off[rep]);
+                auto& st = tr.segx_mat_stages[m];
+                st = {};
+                ReadStages(reinterpret_cast<const u8*>(mrec + 1), mrec->stage_count, st);
+                if (!st[static_cast<u32>(Shader::LogicalStage::Fragment)].info) {
+                    ok = false;
+                    why = 10;
+                }
+            }
+        }
+    }
     if (NR::g_segx == 1) {
         // The members' Draw records were withheld: member 0 runs through its embedded record
         // with ITS draw registers in the mirror (the journal already holds the next draw's) and
@@ -4539,6 +4582,7 @@ void Liverpool::ExecuteSegmentRecord(const CpSplit::RecordHeader& record) {
         ExecuteDrawRecord(record, drec);
         tr.segx_pending = nullptr;
         tr.segx_left = 0;
+        tr.segx_n_mat = 0;
         if (ok) {
             ok = tr.segx_result == 1;
             why = ok ? 0 : tr.segx_result == 0 ? 9 : tr.segx_result;
@@ -4586,6 +4630,8 @@ void Liverpool::ExecuteSegmentRecord(const CpSplit::RecordHeader& record) {
     }
     if (ok) {
         ++s.ok;
+        s.mats_extra += seg->n_mat > 0 ? seg->n_mat - 1 : 0;
+        ++s.mat_hist[seg->n_mat <= 1 ? 0 : seg->n_mat == 2 ? 1 : seg->n_mat <= 4 ? 2 : 3];
     } else {
         ++s.refused;
         ++s.why[std::min<u32>(why, 11)];
@@ -4609,15 +4655,19 @@ void Liverpool::ExecuteSegmentRecord(const CpSplit::RecordHeader& record) {
     LOG_INFO(Render,
              "NativeSegX: mode {} segments={} members={} evaluated ok={} refused={} (variant {} "
              "lifetime {} index_union {} vertex_union {} vertex_bufs {} guest_union {} ops {} "
-             "prepare {} open {} other {}) ops: draw ranges={} stencil={} cull={} | cycles per "
-             "segment open {:.0f} | replayed segments={} members={} | singles returned={}",
+             "prepare {} open {} materials {} other {}) ops: draw ranges={} stencil={} cull={} | "
+             "cycles per segment open {:.0f} | replayed segments={} members={} | singles "
+             "returned={} | materials per segment 1/2/3-4/5-8: {} {} {} {} (extra materials "
+             "resolved={})",
              NR::g_segx, s.segments, s.members, s.ok, s.refused, s.why[1], s.why[2], s.why[3],
-             s.why[4], s.why[5], s.why[6], s.why[7], s.why[8], s.why[9], s.why[10] + s.why[11],
+             s.why[4], s.why[5], s.why[6], s.why[7], s.why[8], s.why[9], s.why[10], s.why[11],
              s.op_range, s.op_st, s.op_cull,
              s.segments ? double(s.cycles) / double(s.segments) : 0.0, s.replayed,
-             s.replayed_members, s.singles);
+             s.replayed_members, s.singles, s.mat_hist[0], s.mat_hist[1], s.mat_hist[2],
+             s.mat_hist[3], s.mats_extra);
     s.segments = s.members = s.ok = s.refused = s.op_range = s.op_st = s.op_cull = s.cycles = 0;
-    s.replayed = s.replayed_members = s.singles = 0;
+    s.replayed = s.replayed_members = s.singles = s.mats_extra = 0;
+    s.mat_hist.fill(0);
     s.why.fill(0);
 }
 
