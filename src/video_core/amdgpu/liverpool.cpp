@@ -3347,6 +3347,7 @@ constexpr u32 UcNumInstances = WordOf(offsetof(Regs, num_instances)) - Regs::Uco
 constexpr u32 CtxStencilF = WordOf(offsetof(Regs, stencil_ref_front)) - Regs::ContextRegWordOffset;
 constexpr u32 CtxStencilB = WordOf(offsetof(Regs, stencil_ref_back)) - Regs::ContextRegWordOffset;
 constexpr u32 CtxPolyCtl = WordOf(offsetof(Regs, polygon_control)) - Regs::ContextRegWordOffset;
+static_assert(CtxStencilF == 0x10C && CtxStencilB == 0x10D && CtxPolyCtl == 0x205);
 struct Pred {
     u32 id{}, member{};
     u64 index_addr{};
@@ -3419,6 +3420,8 @@ struct State {
     std::array<u64, NumPacketKinds> pk{};
     std::array<u64, NumNv> nv{};
     KeyHist<u32> uc_off{}, ctx_off{};   ///< registers that closed segments (0xffff: CLEAR / CONTROL / CONFIG)
+    KeyHist<u32> sh_off{};              ///< SET_SH_REG offsets (first register) that closed segments
+    u64 drop_st{}, drop_cull{};         ///< SEGX: state changes pending at a close (no member followed)
     KeyHist<const char*> why{};         ///< native_colour_why of not-eligible / refused pipelines
     u32 calls{};
     std::chrono::steady_clock::time_point window{};
@@ -3454,6 +3457,8 @@ void PostSegment(State& s) {
     if (!s.split || s.n == 0 || s.opener_bytes == 0) {
         return;
     }
+    s.drop_st += s.st_dirty;
+    s.drop_cull += s.cull_dirty;
     std::array<CpSplit::SegOp, CpSplit::SegMaxOps + 3> ops{};
     u32 n_ops = 0;
     if (s.any_st) {
@@ -3601,15 +3606,17 @@ void MaybeLog(State& s) {
     LOG_INFO(Render,
              "NativeSegB front detail: no_variant: shadow={} not_eligible={} undecided={} "
              "not_claimed={} refused={} building={} | why:{} | inherited members={} | uconfig "
-             "close offsets:{} | ctx close offsets:{}",
+             "close offsets:{} | ctx close offsets:{} | sh close offsets:{}",
              s.nv[NvShadow], s.nv[NvNotEligible], s.nv[NvUndecided], s.nv[NvNotClaimed],
              s.nv[NvRefused], s.nv[NvBuilding], TopKeys(s.why, str), s.inh_members,
-             TopKeys(s.uc_off, hex), TopKeys(s.ctx_off, hex));
+             TopKeys(s.uc_off, hex), TopKeys(s.ctx_off, hex), TopKeys(s.sh_off, hex));
     if (s.segx) {
         LOG_INFO(Render,
                  "NativeSegX front: mode {} segment records posted={} members={} ops: draw "
-                 "ranges={} stencil={} cull={}",
-                 s.exec ? 1 : 2, s.posted, s.posted_members, s.op_range, s.op_st, s.op_cull);
+                 "ranges={} stencil={} cull={} | state changes pending at a close (dropped, no "
+                 "member followed): stencil={} cull={}",
+                 s.exec ? 1 : 2, s.posted, s.posted_members, s.op_range, s.op_st, s.op_cull,
+                 s.drop_st, s.drop_cull);
     }
     s.draws = s.in_seg = s.segments = s.mat_sum = s.inh_members = 0;
     s.posted = s.posted_members = s.op_range = s.op_st = s.op_cull = 0;
@@ -3621,7 +3628,9 @@ void MaybeLog(State& s) {
     s.nv.fill(0);
     s.uc_off.Reset();
     s.ctx_off.Reset();
+    s.sh_off.Reset();
     s.why.Reset();
+    s.drop_st = s.drop_cull = 0;
 }
 
 /// Every gfx type-3 packet the front parses (ProcessGraphics, before the packet is applied, so
@@ -3663,6 +3672,9 @@ void NotePacket(PM4ItOpcode opcode, const PM4Header* header, u32 count, bool gue
         const bool vs = off >= 0x4c && off + n <= 0x5c;
         const bool ps = off >= 0x0c && off + n <= 0x1c;
         kind = (vs || ps) ? PkNone : PkSh;
+        if (kind == PkSh && s.open) {
+            s.sh_off.Note(off);
+        }
         break;
     }
     case PM4ItOpcode::SetContextReg: {
@@ -4018,7 +4030,9 @@ bool NativeSegBDraw(const PM4Header* header, const Vulkan::GraphicsPipeline* pip
     s.m_addr[s.n] = index_addr;
     s.m_count[s.n] = index_count;
     s.m_inst[s.n] = pred.instances;
-    s.m_entry[s.n] = (slot << 24) | (idx & Shader::NativeSegRingMask);
+    // The low 24 bits of the job's ring counter (unmasked: the back ages it against g_job_next;
+    // the shaders mask it to the ring).
+    s.m_entry[s.n] = (slot << 24) | (idx & 0xffffffu);
     s.m_vo[s.n] = regs.index_offset != 0 ? regs.index_offset : vo_ud;
     if (s.range_count == 0) {
         s.range_first = s.n;

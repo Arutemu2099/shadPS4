@@ -3838,9 +3838,10 @@ bool Rasterizer::NativeSegPrepare(const GraphicsPipeline* base,
     // Every member's job ring is alive and its entry inside the safe window.
     for (u32 j = 0; j < seg.n; ++j) {
         const u32 slot = segx_list[j] >> 24;
-        const u32 mi = segx_list[j] & Shader::NativeSegRingMask;
+        const u32 mi = segx_list[j] & 0xffffffu;
         if (slot >= NR::MaxSlots || NR::g_gpu_bda[slot].load(std::memory_order_acquire) == 0 ||
-            NR::g_job_next[slot].load(std::memory_order_relaxed) - mi > NR::RingSize / 4) {
+            ((NR::g_job_next[slot].load(std::memory_order_relaxed) - mi) & 0xffffffu) >
+                NR::RingSize / 4) {
             return fail(2);
         }
     }
@@ -4020,7 +4021,7 @@ void Rasterizer::NativeSegWrite(u8* map_ptr, u64 map_off, u64 table_bytes, u64 t
     }
     if (b.bindless) {
         for (u32 j = 0; j < n; ++j) {
-            BindlessRingWrite((segx_list[j] >> 24) << 28, segx_list[j] & Shader::NativeSegRingMask,
+            BindlessRingWrite((segx_list[j] >> 24) << 28, segx_list[j] & 0xffffffu,
                               b.bl_slots.data());
         }
     }
@@ -6406,10 +6407,20 @@ bool Rasterizer::NativeSegEvaluate(const AmdGpu::CpSplit::SplitSegmentRecord& se
         return false;
     }
     for (u32 j = 0; j < seg.n; ++j) {
+        // The entry's low 24 bits are the job's ring counter (unmasked); the age against the
+        // job's next counter, modulo 2^24, must leave the GPU its safe window (RingSize / 4).
         const u32 slot = list[j] >> 24;
-        const u32 idx = list[j] & Shader::NativeSegRingMask;
-        if (slot >= NR::MaxSlots ||
-            NR::g_job_next[slot].load(std::memory_order_relaxed) - idx > NR::RingSize / 4) {
+        const u32 idx = list[j] & 0xffffffu;
+        const u32 next = slot < NR::MaxSlots ? NR::g_job_next[slot].load(std::memory_order_relaxed) : 0u;
+        const u32 age = (next - idx) & 0xffffffu;
+        if (slot >= NR::MaxSlots || age > NR::RingSize / 4) {
+            static u32 logged = 0;
+            if (++logged <= 10) {
+                LOG_INFO(Render_Vulkan,
+                         "NativeSegX lifetime refusal: segment {} member {} slot {} ring index "
+                         "{} job next {} age {}",
+                         seg.id, j, slot, idx, next, age);
+            }
             why = 2;
             return false;
         }
