@@ -218,6 +218,29 @@ public:
     /// Ends rendering and records one global memory barrier (writes -> any access).
     void A2GlobalBarrier();
     [[nodiscard]] bool A2OcclusionOpen() const;
+    /// SHADPS4_A2 colour stretches (architecture-a sec. 10), back thread, before the stretch's
+    /// pass, once per distinct material: its 32 slot words through BindlessResolve with the
+    /// representative draw's fragment stage; its images are appended to `ids`. False: the
+    /// stretch runs on the old path. May record sampled-layout barriers (outside any pass).
+    bool A2ResolveMaterial(const GraphicsPipeline* base, const Shader::BoundStage& fs, u32* slots,
+                           u32& n_img, u32& n_smp, std::vector<VideoCore::ImageId>& ids);
+    /// NativeColourGates (config + no pending stencil write-backs), once per colour stretch.
+    [[nodiscard]] bool A2ColourGates() const {
+        return NativeColourGates();
+    }
+    [[nodiscard]] u32 A2BindlessCur() const noexcept {
+        return bindless.cur;
+    }
+    /// Marks the current bindless set used by the batch being recorded; returns it.
+    vk::DescriptorSet A2BindlessCommit();
+    /// After A2BeginStretch: none of `ids` is a bound render target or forced to general.
+    [[nodiscard]] bool A2ImagesSafe(const std::vector<VideoCore::ImageId>& ids) const;
+    /// SHADPS4_A2=2: the slot words BindlessRingWrite wrote last (the colour verify).
+    struct A2SlotProbe {
+        u32 tag{}, idx{};
+        u64 n{};
+        std::array<u32, 2 * Shader::NativeBindlessMax> slots{};
+    } a2_probe;
     [[nodiscard]] const Instance& A2Instance() const noexcept {
         return instance;
     }
@@ -700,7 +723,8 @@ private:
     /// (32 words: images then samplers). views / samplers (optional): what they hold.
     bool BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::ImageView* views,
                          vk::Sampler* samplers, u32& n_img, u32& n_smp, bool retry = true,
-                         const Shader::BoundStage* fs_override = nullptr);
+                         const Shader::BoundStage* fs_override = nullptr,
+                         VideoCore::ImageId* ids = nullptr);
     bool BindlessRotate();
     void BindlessRingWrite(u32 tag, u32 idx, const u32* slots);
     std::unique_ptr<VideoCore::Buffer> native_dbg; ///< SHADPS4_NATIVE_COLOUR_DIAG 4096

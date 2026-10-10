@@ -38,6 +38,7 @@
 #include "video_core/amdgpu/mtb_census.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/amdgpu/native_rec.h"
+#include "video_core/renderer_vulkan/vk_a2.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/texture_cache/image_view.h"
@@ -5178,6 +5179,40 @@ bool Rasterizer::A2OcclusionOpen() const {
     return occlusion && occlusion->Open();
 }
 
+bool Rasterizer::A2ResolveMaterial(const GraphicsPipeline* base, const Shader::BoundStage& fs,
+                                   u32* slots, u32& n_img, u32& n_smp,
+                                   std::vector<VideoCore::ImageId>& ids) {
+    if (!base || !fs.info) {
+        return false;
+    }
+    if (native_batch.open) {
+        NativeClose(15); // a native batch may hold the current set's slots
+    }
+    std::array<VideoCore::ImageId, Shader::NativeBindlessMax> got{};
+    if (!BindlessResolve(base, slots, nullptr, nullptr, n_img, n_smp, true, &fs, got.data())) {
+        return false;
+    }
+    ids.insert(ids.end(), got.begin(), got.begin() + n_img);
+    return true;
+}
+
+vk::DescriptorSet Rasterizer::A2BindlessCommit() {
+    bindless.last_tick[bindless.cur] = scheduler.CurrentTick();
+    return Bindless::G().sets[bindless.cur];
+}
+
+bool Rasterizer::A2ImagesSafe(const std::vector<VideoCore::ImageId>& ids) const {
+    // NativeOpen's colour rule (Opus review 2026-10-09 #1): a sampled image that is a bound
+    // target (feedback loop) or forced to the general layout needs per-draw barriers.
+    for (const auto id : ids) {
+        const auto& image = texture_cache.PeekImage(id);
+        if ((image.binding.is_target && image.binding.is_bound) || image.binding.force_general) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void Rasterizer::NativeClose(u32 why) {
     native_batch.open = false;
     native_batch.cand_valid = false;
@@ -5229,11 +5264,18 @@ void Rasterizer::BindlessRingWrite(u32 tag, u32 idx, const u32* slots) {
                         Shader::NativeRecordImgOffset,
                     slots, sizeof(u32) * 2 * Shader::NativeBindlessMax);
     }
+    static const bool a2_verify = Vulkan::A2::Mode() == 2;
+    if (a2_verify) [[unlikely]] {
+        a2_probe.tag = tag;
+        a2_probe.idx = idx;
+        std::memcpy(a2_probe.slots.data(), slots, sizeof(u32) * 2 * Shader::NativeBindlessMax);
+        ++a2_probe.n;
+    }
 }
 
 bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::ImageView* views,
                                  vk::Sampler* samplers, u32& n_img, u32& n_smp, bool retry,
-                                 const Shader::BoundStage* fs_override) {
+                                 const Shader::BoundStage* fs_override, VideoCore::ImageId* ids) {
     // SHADPS4_NATIVE_BINDLESS (sec. 12), back thread. Per fragment image: the cache entry for
     // (descriptor, raw T#) if every validity condition holds (then only the LRU touch), else
     // what BindTextures does for one sampled image - FindImage, FindTexture, the sampled-layout
@@ -5287,7 +5329,8 @@ bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::I
     const auto device = instance.GetDevice();
     const auto rotate_retry = [&] {
         return retry && BindlessRotate() &&
-               BindlessResolve(base, slots, views, samplers, n_img, n_smp, false, fs_override);
+               BindlessResolve(base, slots, views, samplers, n_img, n_smp, false, fs_override,
+                               ids);
     };
     for (u32 i = 0; i < n_img; ++i) {
         const auto& desc = info.images[i];
@@ -5318,6 +5361,9 @@ bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::I
                 slots[i] = e.slot;
                 if (views) {
                     views[i] = e.view;
+                }
+                if (ids) {
+                    ids[i] = e.id;
                 }
                 ++st.bl_img_hit;
                 st.c_bl_hit += __rdtsc() - tc0;
@@ -5383,6 +5429,9 @@ bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::I
         slots[i] = slot;
         if (views) {
             views[i] = vh;
+        }
+        if (ids) {
+            ids[i] = image_id;
         }
         st.c_bl_miss += __rdtsc() - tc0;
     }

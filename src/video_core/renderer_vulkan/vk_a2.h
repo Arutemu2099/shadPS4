@@ -10,6 +10,7 @@
 
 #include "common/types.h"
 #include "shader_recompiler/info.h"
+#include "shader_recompiler/native_emit.h"
 #include "video_core/amdgpu/regs.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -27,9 +28,20 @@
  *    it to the open stretch's command list. Runs on a WORKER thread: it must not touch the buffer
  *    cache's mutable state, the texture cache, the scheduler (Record / Rc / ticks / sinks), the
  *    stream buffer or any Rasterizer member. Allowed: immutable pipeline data and atomics
- *    (native_variant), the job-record rings (NativeRec, read-only, stamp-checked), the buffer
- *    cache's lock-free lookup (BufferCache::A2LookupBuffer), the worker's own arena, its own
- *    DynamicState, and the master semaphore's known GPU tick (read-only, for arena reuse).
+ *    (native_variant, native_colour slots), the job-record rings (NativeRec, read-only,
+ *    stamp-checked), the buffer cache's lock-free lookup (BufferCache::A2LookupBuffer), the
+ *    worker's own arena, its own DynamicState, and the master semaphore's known GPU tick
+ *    (read-only, for arena reuse).
+ *  - Colour draws (v2, "deferred material resolve"): the worker takes a native COLOUR draw
+ *    (bindless textures + pulled vertices) with every check that depends only on registers, the
+ *    draw record's stage blocks, the job record and immutable pipeline data; it records the
+ *    draw's raw T# / S# key as a MATERIAL of the stretch (at most MaxMaterials distinct ones) and
+ *    a SlotWrite per draw. The bindless slots need the texture cache, so the BACK resolves each
+ *    material once at publish (ReadStages of the representative Draw record at
+ *    MaterialRef::rec_pos, BindlessResolve with that fragment stage, the feedback-loop / bound
+ *    target / force_general checks), refuses the whole stretch if any fails, fills
+ *    StretchCmds::mat_slots and bindless_set, and only then records the Replay closure, which
+ *    writes every draw's slot words into the GPU ring record before the draws.
  */
 namespace Vulkan {
 class GraphicsPipeline;
@@ -66,6 +78,18 @@ struct DrawIn {
     /// is skipped (stamp + fields only) and counted under RefuseNoCmd once per session.
     const void* job_cmd{};
     u64 seq{};                ///< the Draw record's CpSplit seq
+    u64 rec_pos{}; ///< unmasked ring position of the Draw record (a material's representative)
+};
+
+/// Colour draws: distinct materials (raw T# / S# keys) a stretch may carry; the back resolves
+/// each once at publish.
+constexpr u32 MaxMaterials = 8;
+
+/// One material of a stretch: the draw's base pipeline (DrawIn::pipeline) and the Draw record the
+/// back re-reads (ReadStages -> BindlessResolve with its fragment stage) to get the slots.
+struct MaterialRef {
+    const GraphicsPipeline* base{};
+    u64 rec_pos{};
 };
 
 /// Per-worker memory the GPU reads (tables, indirect commands, counts): a host-visible coherent
@@ -95,6 +119,9 @@ struct Arena {
 struct SubBatch {
     bool emit_pipeline{}, emit_push{}, emit_descriptors{}, emit_vertex_input{}, emit_index{},
         emit_vertex_buffers{};
+    /// A colour sub-batch (bindless variant): Replay binds StretchCmds::bindless_set at set 1
+    /// with `layout` after the set-0 push, as the back's native colour batch does.
+    bool bindless{};
     vk::Pipeline pipeline{};
     vk::PipelineLayout layout{};
     Shader::PushData push{};
@@ -127,6 +154,21 @@ struct SubBatch {
 
 struct StretchCmds {
     std::vector<SubBatch> batches;
+    /// Colour (bindless) sub-batches: the set-1 copy and the per-material slot words
+    /// (NativeBindlessMax image slots, then NativeBindlessMax sampler slots: the record words
+    /// Shader::NativeRecordImgOffset .. +2*NativeBindlessMax). Both set by the back at publish
+    /// (BindlessResolve per material); unused when slot_writes is empty.
+    vk::DescriptorSet bindless_set{}; ///< set by the back at publish
+    std::array<std::array<u32, 2 * Shader::NativeBindlessMax>, MaxMaterials>
+        mat_slots{}; ///< set by the back
+    /// One per colour draw: Replay writes mat_slots[mat] into job record (tag, idx) of the GPU
+    /// ring (as Rasterizer::BindlessRingWrite) before it records the draws.
+    struct SlotWrite {
+        u32 tag{};
+        u32 idx{};
+        u32 mat{};
+    };
+    std::vector<SlotWrite> slot_writes;
 };
 
 /// Records `cmds` into `cmdbuf` exactly as the translator's closures would have, in order. Called
@@ -147,6 +189,8 @@ struct Stretch {
     /// the stretch (old path) if the generation moved before publish (a buffer was deleted or
     /// joined since the worker's lookups).
     u64 buf_gen{};
+    /// Colour draws' materials in first-seen order (index = SlotWrite::mat / mat_slots row).
+    std::vector<MaterialRef> materials; ///< empty: no colour draws
 };
 
 /// Context a translator gets (set up once per worker thread).
@@ -185,8 +229,20 @@ enum Refusal : u32 {
     RefuseStages,        ///< no vertex stage data
     RefuseLayout,        ///< the variant's binding numbering does not match the stages
     RefuseNoCmd,         ///< DrawIn::job_cmd null (counted once; the draw is not refused)
-    NumRefusals
+    // Colour draws (v2).
+    RefuseColourGates,   ///< colour off / diag bits 1 or 4096 / variant not bindless-ring-pt
+    RefuseColourStages,  ///< images or samplers outside the fragment stage, or no fragment stage
+    RefuseColourImages,  ///< > NativeBindlessMax, storage / atomic image, mip fallback DynamicIndex,
+                         ///< null or invalid-format T#, key over 512 words
+    RefuseColourKeyHash, ///< the job record's image count / key hash disagree with the stages
+    RefuseColourVertex,  ///< instanced attribute, location >= 16, streams in more than one buffer,
+                         ///< offset > 32 bits, or no stream at all
+    RefuseColourStream,  ///< a stream's [base, base + size) is not inside its cached buffer
+    RefuseMaterials,     ///< a 9th distinct material in the stretch
+    NumRefusals          ///< 32 = the refusals array (a colour Guest V# with an inline cbuf,
+                         ///< null base or zero size counts under RefuseSlotKind)
 };
+static_assert(NumRefusals <= 32);
 const char* RefusalName(u32 reason);
 
 /// Per-draw translation on a worker. One instance per worker thread.

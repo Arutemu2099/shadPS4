@@ -20,25 +20,40 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 
-// Architecture A step A2, the shadow translator (v1). Everything here runs on a WORKER thread.
-// What it reproduces: NativeOpen (shadow, !colour) + NativeRingPrepare's table and command math
-// for a run of ring-described draws, and the generic draw tail's command-buffer state (pipeline,
-// push constants, push descriptors, vertex input, index / vertex buffers, dynamic state) - as
-// VALUES in a StretchCmds that the back replays in stream order (Replay below).
+// Architecture A step A2, the stretch translator: v1 shadow draws, v2 colour draws (bindless
+// textures + pulled vertices, "deferred material resolve"). Everything here runs on a WORKER
+// thread except Replay (the recording lane).
+// What it reproduces: NativeOpen (shadow and colour) + NativeRingPrepare's table and command
+// math for a run of ring-described draws, and the generic draw tail's command-buffer state
+// (pipeline, push constants, push descriptors, vertex input, index / vertex buffers, dynamic
+// state) - as VALUES in a StretchCmds that the back replays in stream order (Replay below).
+// Colour: the bindless slot words are the back's (BindlessResolve needs the texture cache), so
+// the worker only keys each draw's material (raw T# / S# words as NativeImageKey) and leaves a
+// SlotWrite per draw; the back resolves every material of the stretch once at publish and
+// Replay writes the slot words into the job ring records as Rasterizer::BindlessRingWrite does.
 //
 // Thread-safety review - every non-local object this file reads, and why that is safe here:
 //  - Config: Mode / NumWorkers (own statics), VideoCore::g_native_pass, g_native_coherent,
-//    AmdGpu::NativeRec::g_gpu_mode, Shader::g_native_ring / g_native_pt / g_native_seg: all
-//    `inline const` initialised at load, never written.
-//  - GraphicsPipeline: native_variant (atomic, acquire; the front stores it once), and the
-//    variant's immutable fields (Handle - may wait a deferred compile, GetLayout, GetGraphicsKey,
+//    g_native_colour, g_native_colour_diag, AmdGpu::NativeRec::g_gpu_mode, Shader::g_native_ring /
+//    g_native_pt / g_native_seg: all `const` / `inline const` initialised at load, never written.
+//  - GraphicsPipeline: native_variant (atomic, acquire; the front stores it once), the
+//    native_colour slots (key acquire, then variant acquire: the front claims the key, the
+//    compile thread publishes the variant after setting native_vertex_binding /
+//    native_table_binding; native_bindless is a constructor argument), and the variant's
+//    immutable fields (Handle - may wait a deferred compile, GetLayout, GetGraphicsKey,
 //    GetFetchShader, native_*_binding) plus the base's stage Infos' persistent lists (buffers,
-//    ud_mask), which only the compile thread writes before the pipeline is published.
+//    images, samplers, ud_mask), which only the compile thread writes before the pipeline is
+//    published.
 //  - DrawIn::stages / vi: the Draw record's blocks in the CpSplit ring, valid while the worker
-//    runs on this DCB (the caller's guarantee); read-only.
+//    runs on this DCB (the caller's guarantee); read-only. The image / sampler sharps come from
+//    the stage's flat buffer span inside that block (ReadStages output), as NativeImageKey's.
 //  - NativeRec: g_rings / g_unions / g_gpu_handles (atomics, acquire), g_job_next (relaxed, a
-//    lifetime bound only); Record and RunUnion through their stamp seqlocks exactly as
-//    NativeRingPrepare reads them (fields first, acquire fence, stamp re-check).
+//    lifetime bound only); Record (img_n / img_h1 / img_h2 included) and RunUnion through their
+//    stamp seqlocks exactly as NativeRingPrepare reads them (fields first, acquire fence, stamp
+//    re-check). g_gpu_recs (acquire) is written by Replay ONLY, on the recording lane: the slot
+//    words 128-159 of a record, which the job thread never writes (GpuRecJobDwords) and the back
+//    writes the same way (BindlessRingWrite); the back has published the stretch (slot words
+//    resolved) before it records the Replay closure.
 //  - BufferCache: A2LookupBuffer (page_table find_acquire + stable SlotVector; see its comment),
 //    StructGeneration (atomic), GetBdaPageTableBuffer / GetFaultBuffer handles and device
 //    addresses (set at construction, never change).
@@ -50,7 +65,13 @@
 //  - Nothing here records into the scheduler, touches the stream buffer, the texture cache,
 //    barriers or any Rasterizer member. Memory validity (CPU-dirty pages) is the submission's
 //    coherence point (SHADPS4_NATIVE_COHERENT, required); GPU-written index / vertex data is
-//    covered by the back's conservative per-stretch global barrier rule (architecture-a sec. 6).
+//    covered by the back's conservative per-stretch global barrier rule (architecture-a sec. 6);
+//    a colour variant's VS reads the vertex buffer as STORAGE (the back's open adds a whole-buffer
+//    vertex barrier when the stream is GPU-written), so that rule must cover storage reads too.
+//  - What the worker does NOT check for a colour draw (the back does, per material, at
+//    publish): NativeColourGates (tex_bind_memo / bind_memo_stats / pending stencil writebacks),
+//    attachment_feedback_loop, images that are bound targets or force_general, the texture-cache
+//    side of BindlessResolve (FindImage, layouts, sampler generation / border colour).
 
 namespace Vulkan::A2 {
 
@@ -80,6 +101,15 @@ constexpr std::array<const char*, NumRefusals> RefusalNames = {
     "record fields", "inherited slot",  "union",          "slot kind",       "guest lookup",
     "index lookup",  "vertex lookup",   "record vs regs", "instance offset", "vertex offset",
     "restart index", "arena",           "stages",         "layout",          "no cmd (once)",
+    "colour gates",  "colour stages",   "colour images",  "colour key hash", "colour vertex",
+    "colour stream", "materials",
+};
+static_assert(RefusalNames.size() == NumRefusals && NumRefusals <= 32);
+
+/// The raw T# / S# words of a colour draw (Rasterizer::NativeImageKey, 512 words at most).
+struct ImageKey {
+    u32 n{};
+    std::array<u32, 512> w{};
 };
 
 /// vk_rasterizer.cpp GetDrawOffsets, verbatim.
@@ -412,6 +442,17 @@ const char* RefusalName(u32 reason) {
 }
 
 void Replay(const StretchCmds& cmds, vk::CommandBuffer cmdbuf, const Instance& instance) {
+    // Colour draws: the back resolved every material of the stretch (mat_slots, bindless_set)
+    // before recording this closure; write each draw's slot words into its job ring record
+    // exactly as Rasterizer::BindlessRingWrite does (write-combined ring memory, 128-159).
+    for (const auto& sw : cmds.slot_writes) {
+        u32* gr = NR::g_gpu_recs[sw.tag >> 28].load(std::memory_order_acquire);
+        if (gr && sw.mat < MaxMaterials) {
+            std::memcpy(gr + size_t(sw.idx & (NR::RingSize - 1)) * NR::GpuRecDwords +
+                            Shader::NativeRecordImgOffset,
+                        cmds.mat_slots[sw.mat].data(), sizeof(u32) * 2 * Shader::NativeBindlessMax);
+        }
+    }
     for (const auto& b : cmds.batches) {
         if (b.emit_pipeline) {
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, b.pipeline);
@@ -437,6 +478,12 @@ void Replay(const StretchCmds& cmds, vk::CommandBuffer cmdbuf, const Instance& i
             cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, b.layout, 0,
                                         vk::ArrayProxy<const vk::WriteDescriptorSet>{
                                             b.num_writes, writes.data()});
+        }
+        if (b.bindless && cmds.bindless_set) {
+            // The global image / sampler arrays (set 1) with the variant's layout, as the
+            // back's native colour batch binds them (vk_rasterizer DrawTail, bl_set).
+            cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, b.layout, 1,
+                                      cmds.bindless_set, {});
         }
         if (b.emit_vertex_input) {
             cmdbuf.setVertexInputEXT(
@@ -471,6 +518,7 @@ struct StretchTranslator::Impl {
     WorkerContext ctx;
     std::unique_ptr<VideoCore::Buffer> arena_buffer; ///< the Arena's VkBuffer (owned here)
     bool enabled{};
+    bool colour_on{}; ///< colour draws may be taken (SHADPS4_NATIVE_COLOUR=1, no diag 1 / 4096)
     bool cmd_warned{};
     u64 align{256};
     u64 region_bytes{};
@@ -483,9 +531,17 @@ struct StretchTranslator::Impl {
     u64 stretch_start{};
     u64 last_desc_id{};
     DynamicState dyn{}; ///< tracked state of the stretch (dirty bits cleared per sub-batch)
+    /// The stretch's materials (index = Stretch::materials index): the key the dedup compares
+    /// and the base pipeline it was seen with (another base's FS may decode the same T# with
+    /// other descriptor bits: a different material).
+    std::array<ImageKey, MaxMaterials> mat_keys{};
+    std::array<const GraphicsPipeline*, MaxMaterials> mat_base{};
 
     // The open sub-batch and its keys.
     bool batch_open{};
+    bool b_colour{};
+    u64 b_vbuf{};  ///< colour: the one vertex VkBuffer of the opener
+    u32 b_vmask{}; ///< colour: the opener's non-null pulled locations
     u32* count_ptr{};
     u8* cmd_ptr{};
     const GraphicsPipeline* b_native{};
@@ -551,8 +607,12 @@ StretchTranslator::Impl::Impl(StretchTranslator* owner_, const WorkerContext& ct
         pt_fallback = pt->BufferDeviceAddress();
         fault_addr = ctx.buffer_cache->GetFaultBuffer()->BufferDeviceAddress();
         enabled = true;
-        LOG_INFO(Render_Vulkan, "A2 worker {}: translator on (arena {} MB, region {} B, align {})",
-                 ctx.worker_index, ArenaBytes >> 20, region_bytes, align);
+        // Colour draws: SHADPS4_NATIVE_COLOUR=1; diag bit 1 (the back takes no colour joins) and
+        // bit 4096 (the compare SSBO shifts the variant's table binding) keep them on the back.
+        colour_on = VideoCore::g_native_colour && (VideoCore::g_native_colour_diag & 4097u) == 0;
+        LOG_INFO(Render_Vulkan,
+                 "A2 worker {}: translator on (arena {} MB, region {} B, align {}, colour {})",
+                 ctx.worker_index, ArenaBytes >> 20, region_bytes, align, colour_on ? "on" : "off");
     } else {
         LOG_INFO(Render_Vulkan, "A2 worker {}: translator off ({})", ctx.worker_index, why);
     }
@@ -614,8 +674,27 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     const GraphicsPipeline* base = draw.pipeline;
     const GraphicsPipeline* native =
         base ? base->native_variant.load(std::memory_order_acquire) : nullptr;
+    // Colour (the back's DrawTail rule): a pipeline without a shadow variant may have a colour
+    // variant per vertex description (NativeColourVariant by NativeVertexKey); it must be the
+    // bindless + pulled-vertex kind (NativeDirectCandidate).
+    bool colour = false;
     if (!native) {
-        return refuse(RefuseNoVariant);
+        if (!base || !colour_on) {
+            return refuse(RefuseNoVariant);
+        }
+        if (!draw.vi || draw.vi->count > 16) {
+            return refuse(RefuseNoVi);
+        }
+        native = base->NativeColourVariant(VideoCore::NativeVertexKey(
+            AmdGpu::CpSplit::VertexInputAttribs(*draw.vi), draw.vi->count));
+        if (!native) {
+            return refuse(RefuseNoVariant);
+        }
+        colour = true;
+        if (!native->native_bindless ||
+            native->native_vertex_binding == GraphicsPipeline::NoNativeRecords) {
+            return refuse(RefuseColourGates);
+        }
     }
     if (native->native_records_binding == GraphicsPipeline::NoNativeRecords ||
         native->native_table_binding == GraphicsPipeline::NoNativeRecords ||
@@ -631,6 +710,19 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     const Shader::BoundStage& vs = (*draw.stages)[u32(Shader::LogicalStage::Vertex)];
     if (!vs.info) {
         return refuse(RefuseStages);
+    }
+    if (colour) {
+        // The colour variant numbers its bindings over {Fragment, Vertex} only (pipeline cache),
+        // and BindlessResolve needs the fragment stage: no other stage may be bound.
+        if (!(*draw.stages)[u32(Shader::LogicalStage::Fragment)].info) {
+            return refuse(RefuseColourStages);
+        }
+        for (u32 s = 0; s < Shader::MaxStageTypes - 1; ++s) {
+            if (s != u32(Shader::LogicalStage::Fragment) && s != u32(Shader::LogicalStage::Vertex) &&
+                (*draw.stages)[s].info) {
+                return refuse(RefuseColourStages);
+            }
+        }
     }
     if (draw.job_tag == 0) {
         return refuse(RefuseNoJob);
@@ -661,6 +753,8 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     const void* cmd = r.cmd;
     const u32 push_inh = r.push_inh, inh_vs = r.inh_vs, inh_ps = r.inh_ps;
     const u64 inh_slots = r.inh_slots;
+    const u32 img_n_rec = r.img_n;
+    const u64 img_h1_rec = r.img_h1, img_h2_rec = r.img_h2;
     std::atomic_thread_fence(std::memory_order_acquire);
     if (r.stamp.load(std::memory_order_relaxed) != idx + 1 || !gpu_ok) {
         return refuse(RefuseStamp);
@@ -711,13 +805,18 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
 
     // Set 0 in BindResources order (LogicalStage index order over the stages): every binding
     // must be fillable without the caches - Guest V#s (never read under PT: the dummy buffer),
-    // unused clip planes (a null descriptor); then the records SSBO (the job ring) and the table.
+    // unused clip planes (a null descriptor); then the records SSBO (the job ring), (colour) the
+    // vertex SSBO, and the table. Colour: images and samplers (fragment stage only) take binding
+    // numbers but no set-0 write (the bindless PS samples set 1 at the record's slots); their raw
+    // T# / S# words form the draw's material key exactly as NativeImageKey builds it (stage index
+    // order, images then samplers).
     Shader::Backend::Bindings bnd{};
     Shader::PushData push = MakePushData(regs);
     std::array<SubBatch::Write, Shader::NUM_BUFFERS + 4> writes{};
     u32 num_writes = 0;
     u64 guest_mask = 0;
     std::array<VAddr, Shader::NUM_BUFFERS> o_addr{};
+    ImageKey key{};
     u32 bi = 0;
     for (u32 s = 0; s < Shader::MaxStageTypes - 1; ++s) {
         const Shader::BoundStage& bound = (*draw.stages)[s];
@@ -725,8 +824,12 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         if (!info) {
             continue;
         }
-        if (!info->images.empty() || !info->samplers.empty()) {
+        if (!colour && (!info->images.empty() || !info->samplers.empty())) {
             return refuse(RefuseSlotKind);
+        }
+        if (colour && s != u32(Shader::LogicalStage::Fragment) &&
+            (!info->images.empty() || !info->samplers.empty())) {
+            return refuse(RefuseColourStages); // BindlessResolve resolves the FS only
         }
         if (bnd.user_data + info->ud_mask.NumRegs() > Shader::NUM_USER_DATA_REGS) {
             return refuse(RefuseLayout);
@@ -750,15 +853,72 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
                 return refuse(RefuseSlotKind);
             }
             const auto vsharp = desc.GetSharp(bound);
+            if (colour && (desc.inline_cbuf || vsharp.base_address == 0 || vsharp.GetSize() == 0)) {
+                return refuse(RefuseSlotKind); // NativeDirectBind fail 5 / 6
+            }
             o_addr[bi] = vsharp.base_address;
             guest_mask |= u64{1} << bi;
             writes[num_writes++] = {bnd.unified++, dummy, 0, VK_WHOLE_SIZE};
             ++bnd.buffer;
             ++bi;
         }
+        if (colour) {
+            // BindlessResolve's own pure checks (bl_fail 0 / 1) and the numbering rule: the
+            // variant counts one binding per image (Info::AddBindings), NativeDirectBind one per
+            // mip level under the DynamicIndex fallback - refuse that mode rather than guess.
+            if (info->images.size() > Shader::NativeBindlessMax ||
+                info->samplers.size() > Shader::NativeBindlessMax) {
+                return refuse(RefuseColourImages);
+            }
+            for (const auto& desc : info->images) {
+                if (desc.is_written || desc.is_atomic ||
+                    desc.mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
+                    return refuse(RefuseColourImages);
+                }
+                const auto tsharp = desc.GetSharp(bound);
+                if (tsharp.Address() == 0 ||
+                    tsharp.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid) {
+                    return refuse(RefuseColourImages);
+                }
+                constexpr u32 words = static_cast<u32>(sizeof(tsharp) / sizeof(u32));
+                if (key.n + words > key.w.size()) {
+                    return refuse(RefuseColourImages);
+                }
+                std::memcpy(&key.w[key.n], &tsharp, sizeof(tsharp));
+                key.n += words;
+            }
+            for (const auto& desc : info->samplers) {
+                const auto ssharp = desc.GetSharp(bound);
+                constexpr u32 words = static_cast<u32>(sizeof(ssharp) / sizeof(u32));
+                if (key.n + words > key.w.size()) {
+                    return refuse(RefuseColourImages);
+                }
+                std::memcpy(&key.w[key.n], &ssharp, sizeof(ssharp));
+                key.n += words;
+            }
+            bnd.unified += static_cast<u32>(info->images.size() + info->samplers.size());
+        }
     }
-    if (native->native_records_binding != bnd.unified ||
-        native->native_table_binding != bnd.unified + 1 || guest_mask == 0) {
+    if (colour) {
+        if (native->native_records_binding != bnd.unified ||
+            native->native_vertex_binding != bnd.unified + 1 ||
+            native->native_table_binding != bnd.unified + 2 || guest_mask == 0) {
+            return refuse(RefuseLayout);
+        }
+        // The job record's image count / key hashes must agree with the stages (NativeRingPrepare
+        // fail 13), unless a T# / S# sat in inherited registers (zeros in the job's key).
+        if ((img_n_rec & ~NR::ImgInhBit) != key.n) {
+            return refuse(RefuseColourKeyHash);
+        }
+        if (!(img_n_rec & NR::ImgInhBit)) {
+            u64 h1 = 0, h2 = 0;
+            NR::ImageKeyHash(key.w.data(), key.n, h1, h2);
+            if (h1 != img_h1_rec || h2 != img_h2_rec) {
+                return refuse(RefuseColourKeyHash);
+            }
+        }
+    } else if (native->native_records_binding != bnd.unified ||
+               native->native_table_binding != bnd.unified + 1 || guest_mask == 0) {
         return refuse(RefuseLayout);
     }
     push.buf_offsets = {}; // whole-range bindings: the record carries each draw's offset
@@ -773,9 +933,19 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         return refuse(RefuseRecordRegs); // NativeRingPrepare why 11
     }
     const u64 ib_handle = std::bit_cast<u64>(static_cast<VkBuffer>(ib->Handle()));
-    // Vertex streams: each non-null stream's buffer and its offset in it.
+    // Vertex streams: each non-null stream's buffer and its offset in it. Colour (NativeOpen's
+    // pulled-vertex rule): per-vertex attributes at locations < 16 only, every non-null stream
+    // inside ONE VkBuffer, offsets below 2^32, at least one stream (the back binds a
+    // stream-buffer stand-in when all are null: not reproduced, refused); each stream's whole
+    // [base, base + size) inside the buffer (NativeRingPrepare fail 7 checks the run's span).
     std::array<u64, 16> vb_handle{}, vcpu{}, voff{};
+    u64 vbuf = 0;
+    u32 vmask = 0;
     for (u32 k = 0; k < vb_n; ++k) {
+        const u32 loc = attribs[k].desc.location;
+        if (colour && (attribs[k].desc.instanced || loc >= Shader::NativeMaxPulledLocations)) {
+            return refuse(RefuseColourVertex);
+        }
         if (vaddr_vi[k] == 0) {
             continue;
         }
@@ -786,6 +956,19 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         vb_handle[k] = std::bit_cast<u64>(static_cast<VkBuffer>(vb->Handle()));
         vcpu[k] = vb->CpuAddr();
         voff[k] = vaddr_vi[k] - vcpu[k];
+        if (colour) {
+            if ((vbuf != 0 && vb_handle[k] != vbuf) || voff[k] > 0xffffffffull) {
+                return refuse(RefuseColourVertex);
+            }
+            if (!vb->IsInBounds(vaddr_vi[k], attribs[k].size)) {
+                return refuse(RefuseColourStream); // NativeRingPrepare fail 7 (the run's span)
+            }
+            vbuf = vb_handle[k];
+            vmask |= 1u << loc;
+        }
+    }
+    if (colour && vbuf == 0) {
+        return refuse(RefuseColourVertex);
     }
 
     // Dynamic state of this draw on top of the tracked state (a copy: a refusal below must not
@@ -799,18 +982,38 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         return refuse(RefuseRestartIndex);
     }
 
+    // Colour: the draw's material in the stretch's list (dedup by base pipeline + key words), or
+    // a new one if the list has room. The list itself changes only when the draw is taken.
+    s32 mat = -1;
+    if (colour) {
+        const u32 nm = stretch ? static_cast<u32>(stretch->materials.size()) : 0;
+        for (u32 m = 0; m < nm; ++m) {
+            if (mat_base[m] == base && mat_keys[m].n == key.n &&
+                std::memcmp(mat_keys[m].w.data(), key.w.data(), sizeof(u32) * key.n) == 0) {
+                mat = static_cast<s32>(m);
+                break;
+            }
+        }
+        if (mat < 0 && nm >= MaxMaterials) {
+            return refuse(RefuseMaterials);
+        }
+    }
+
     // Can the draw continue the open sub-batch? Keys: the variant, the next ring entry of the
     // same job slot and run, the inherited set and the inherited registers' values, the same
     // index / vertex VkBuffers and strides, the same push constants, vertex description and
     // dynamic state, every Guest V# inside the buffers the opener's table bases name, the
-    // vertex rebase quotient rule (below), fewer than MaxDraws draws.
+    // vertex rebase quotient rule (below), fewer than MaxDraws draws. Colour: the same vertex
+    // VkBuffer and the same set of non-null locations (NativeJoin's `had` rule); the material
+    // may differ (each draw's record gets its own slot words).
     const u32 head = run_k == 0 ? idx : head_idx;
-    bool cont = batch_open && b_native == native && b_slot == slot && idx == b_next_idx &&
-                cmds->batches.back().n < MaxDraws && union_idx == b_union && head == b_head &&
-                push_inh == b_push_inh && inh_vs == b_inh_vs && inh_ps == b_inh_ps &&
-                ib_handle == b_ib && index_size == b_index_size && vb_n == b_vb_n &&
-                draw.vi->desc_id == last_desc_id && PushKeySame(push, b_push) &&
-                guest_mask == b_guest_mask && !AnyDirty(cand);
+    bool cont = batch_open && b_native == native && b_colour == colour && b_slot == slot &&
+                idx == b_next_idx && cmds->batches.back().n < MaxDraws && union_idx == b_union &&
+                head == b_head && push_inh == b_push_inh && inh_vs == b_inh_vs &&
+                inh_ps == b_inh_ps && ib_handle == b_ib && index_size == b_index_size &&
+                vb_n == b_vb_n && draw.vi->desc_id == last_desc_id && PushKeySame(push, b_push) &&
+                guest_mask == b_guest_mask && !AnyDirty(cand) &&
+                (!colour || (vbuf == b_vbuf && vmask == b_vmask));
     for (u32 m = inh_vs; cont && m != 0; m &= m - 1) {
         const u32 i = static_cast<u32>(std::countr_zero(m));
         cont = i < 16 && regs.vs_program.user_data[i] == b_ud_vs[i];
@@ -829,9 +1032,13 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     }
     // The member's vertexOffset against the opener's rebased bindings (NativeRingPrepare's
     // d / q loop): one common quotient over the per-vertex streams; instance-rate and
-    // stride-0 streams may not move. A failure ends the sub-batch, not the stretch.
+    // stride-0 streams may not move. A failure ends the sub-batch, not the stretch. Colour: no
+    // rebase (the record carries each location's offset), vertexOffset as is.
     s64 vo = 0;
-    if (cont) {
+    if (cont && colour) {
+        vo = s64(s32(vertex_offset));
+        cont = vo >= 0 && vo <= INT32_MAX;
+    } else if (cont) {
         s64 q = 0;
         bool q_set = false;
         bool ok = true;
@@ -865,9 +1072,10 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     if (!cont) {
         // Rebase (NativeOpen's !colour block): the per-vertex strided streams to the lowest
         // offset of their stride residue if they share one quotient, else the full offsets.
+        // Colour: no rebase (NativeOpen binds the opener's offsets as they are).
         std::array<u64, 16> bo = voff;
         u64 q0 = 0;
-        {
+        if (!colour) {
             bool ok = true, any = false;
             u64 qq = 0;
             for (u32 k = 0; k < vb_n; ++k) {
@@ -980,6 +1188,17 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
             const u32 b = static_cast<u32>(std::countr_zero(m));
             table[Shader::NativeTableBase + b] = base[b];
         }
+        if (colour) {
+            // NativeRingPrepare's per-location bases: the vertex VkBuffer's CPU address (the GPU
+            // record holds each stream's guest address; record - base = the offset). SegMat
+            // stays 0: the slots come from the record words.
+            for (u32 k = 0; k < vb_n; ++k) {
+                if (vb_handle[k] != 0) {
+                    table[Shader::NativeTableVbase + attribs[k].desc.location] =
+                        static_cast<u32>(vcpu[k]);
+                }
+            }
+        }
         const u64 cmd_off = region_off + TableBytes;
         const u64 count_off = cmd_off + u64(MaxDraws) * CmdBytes;
         cmd_ptr = region + TableBytes;
@@ -999,11 +1218,17 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         sb.emit_vertex_input = first_batch || draw.vi->desc_id != last_desc_id;
         sb.emit_index = ib_changed;
         sb.emit_vertex_buffers = vb_changed;
+        sb.bindless = colour;
         sb.pipeline = native->Handle();
         sb.layout = native->GetLayout();
         sb.push = push;
         writes[num_writes++] = {native->native_records_binding,
                                 vk::Buffer{std::bit_cast<VkBuffer>(ring_handle)}, 0, VK_WHOLE_SIZE};
+        if (colour) {
+            // The whole vertex VkBuffer (NativeOpen's colour write, before the table).
+            writes[num_writes++] = {native->native_vertex_binding,
+                                    vk::Buffer{std::bit_cast<VkBuffer>(vbuf)}, 0, VK_WHOLE_SIZE};
+        }
         writes[num_writes++] = {native->native_table_binding, ctx.arena->buffer, region_off,
                                 TableBytes};
         sb.num_writes = num_writes;
@@ -1026,6 +1251,9 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         // The keys of the now-open sub-batch.
         batch_open = true;
         b_native = native;
+        b_colour = colour;
+        b_vbuf = vbuf;
+        b_vmask = vmask;
         b_slot = slot;
         b_union = union_idx;
         b_head = head;
@@ -1061,6 +1289,17 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     std::memcpy(cmd_ptr + u64(n) * CmdBytes, cmdw, CmdBytes);
     sb.n = n + 1;
     *count_ptr = n + 1;
+    if (colour) {
+        // The draw's material (a new one is appended now: nothing above can refuse any more)
+        // and its slot write (Replay fills record (tag, idx) from mat_slots[mat]).
+        if (mat < 0) {
+            mat = static_cast<s32>(stretch->materials.size());
+            stretch->materials.push_back({base, draw.rec_pos});
+            mat_keys[mat] = key;
+            mat_base[mat] = base;
+        }
+        cmds->slot_writes.push_back({draw.job_tag, idx, static_cast<u32>(mat)});
+    }
     b_next_idx = idx + 1;
     dyn = cand;
     stretch->last_seq = draw.seq;

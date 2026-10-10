@@ -243,6 +243,8 @@ struct A2Counters {
     u64 rk_cmp{}, rk_bad{}, whole_stale{}, whole_refused{}, whole_st4{};
     u64 snap_cmp{}, snap_bad{};
     u64 dwait_behind{}, dwait_behind_cyc{}, end_waits{}, end_wait_cyc{}, net_cancel{};
+    u64 col_stretches{}, materials{}, mat_rejects{}, rt_rejects{}, col_resolve_cyc{};
+    u64 slot_cmp{}, slot_bad{}, slot_unwritten{};
     u64 start_ns{}, start_tsc{};
 };
 struct A2State {
@@ -269,6 +271,12 @@ struct A2State {
     bool cur_back{};
     size_t stretch_i{};
     u64 seen_progress{}; ///< the worker's progress as last loaded
+    /// Colour verify (A2=2): the stretch being compared, its next SlotWrite, per material the
+    /// resolved image / sampler counts, and whether its materials resolved.
+    const Vulkan::A2::Stretch* v_stretch{};
+    size_t v_slot_k{};
+    std::array<std::pair<u32, u32>, Vulkan::A2::MaxMaterials> v_mat_n{};
+    bool v_resolved{};
     u32 cur_n{};         ///< ready stretches as loaded with it
     bool reject_cur{}; ///< the current stretch runs on the old path (occlusion open)
     bool gpu_write{true}; ///< a GPU write was recorded since the last global barrier
@@ -2311,7 +2319,7 @@ void A2Log() {
              "state4 {} | workers {} (since start): translating {:.0f} ms/s, waiting for the next "
              "DCB {:.0f} ms/s, caught up waiting for records {:.0f} ms/s (parked {:.0f}, park {}); cuts: back waited {} "
              "front waited {}; stretch cap {} seq breaks {} cancels {}; translator cyc per draw "
-             "{:.0f} | worker refusals (cumulative):{}",
+             "{:.0f} | colour: stretches {} materials {} (resolve {:.2f} ms/s) rejected: material {} render target {} | slot verify {} bad {} not written by the old path {} | worker refusals (cumulative):{}",
              g_a2, s, ps(c.translated), ps(c.walked),
              all ? double(c.translated) / double(all) : 0.0, ps(c.stretches),
              c.stretches ? double(c.walked) / double(c.stretches) : 0.0, ps(c.dcbs), c.back_dcbs,
@@ -2326,7 +2334,9 @@ void A2Log() {
              wms(g.record_wait_cyc), wms(g.park_cyc), g_a2_park ? "on" : "off",
              g.cuts_back.load(), g.cuts_front.load(), g.cap_hits.load(),
              g.seq_breaks.load(), g.cancels.load(),
-             g.worker_draws ? double(g.take_cyc) / double(g.worker_draws) : 0.0, rf);
+             g.worker_draws ? double(g.take_cyc) / double(g.worker_draws) : 0.0,
+             c.col_stretches, c.materials, ms(c.col_resolve_cyc), c.mat_rejects, c.rt_rejects,
+             c.slot_cmp, c.slot_bad, c.slot_unwritten, rf);
     c = A2Counters{};
     c.start_ns = now;
     c.start_tsc = tsc;
@@ -2577,6 +2587,7 @@ void Liverpool::A2WorkerLoop(std::stop_token stoken, u32 index) {
                 in.job_idx = rec.job_idx;
                 in.job_cmd = rec.cmd_address;
                 in.seq = h->seq;
+                in.rec_pos = pos;
                 ++w_draws;
                 if (occlusion || !in.pipeline || rec.marker || rec.verify != 0) {
                     end_stretch();
@@ -2909,6 +2920,64 @@ void Liverpool::A2Execute(const CpSplit::RecordHeader& record) {
                     g.reject_cur = g_a2 == 2 || occl || gen_moved;
                     c.occl_rejects += g_a2 == 1 && occl;
                     c.gen_rejects += g_a2 == 1 && gen_moved && !occl;
+                    // Colour: every distinct material once, before the pass (sec. 10).
+                    static thread_local std::vector<VideoCore::ImageId> mat_ids;
+                    mat_ids.clear();
+                    g.v_stretch = nullptr;
+                    const bool colour = !s.materials.empty();
+                    if (colour && (!g.reject_cur || (g_a2 == 2 && !occl && !gen_moved))) {
+                        if (g_a2 == 1) {
+                            rasterizer->GetScheduler().SwitchStream(0);
+                        }
+                        const u64 r0 = __rdtsc();
+                        const u32 set0 = rasterizer->A2BindlessCur();
+                        bool ok = s.materials.size() <= Vulkan::A2::MaxMaterials &&
+                                  rasterizer->A2ColourGates();
+                        {
+                            // Samplers resolve with the mirror's border-colour base at this
+                            // draw: the stretch must not change it.
+                            const u32 bc0 = static_cast<u32>(
+                                reinterpret_cast<const u32*>(&mirror->regs.ta_bc_base) -
+                                mirror->regs.reg_array.data());
+                            const u32 bc1 = bc0 + static_cast<u32>(
+                                (sizeof(mirror->regs.ta_bc_base) + 3) / 4);
+                            for (const auto& [off, val] : g.cur->side[g.stretch_i].delta) {
+                                ok = ok && (off < bc0 || off >= bc1);
+                            }
+                        }
+                        for (size_t m = 0; ok && m < s.materials.size(); ++m) {
+                            const auto& mr = s.materials[m];
+                            u64 mp = mr.rec_pos;
+                            const auto* mh = split->RecordAtPos(mp);
+                            ok = mh->type == CpSplit::RecordType::Draw;
+                            if (!ok) {
+                                break;
+                            }
+                            const auto& mrec = *reinterpret_cast<const SplitDrawRecord*>(mh + 1);
+                            std::array<Shader::BoundStage, Shader::MaxStageTypes> mst{};
+                            ReadStages(reinterpret_cast<const u8*>(&mrec + 1), mrec.stage_count, mst);
+                            auto& [ni, ns] = g.v_mat_n[m];
+                            ni = ns = 0;
+                            ok = rasterizer->A2ResolveMaterial(
+                                mr.base, mst[u32(Shader::LogicalStage::Fragment)],
+                                s.cmds->mat_slots[m].data(), ni, ns, mat_ids);
+                        }
+                        // A rotation mid-loop invalidates the earlier materials' slots.
+                        ok = ok && rasterizer->A2BindlessCur() == set0;
+                        c.col_resolve_cyc += __rdtsc() - r0;
+                        ++c.col_stretches;
+                        c.materials += s.materials.size();
+                        if (ok && g_a2 == 1) {
+                            s.cmds->bindless_set = rasterizer->A2BindlessCommit();
+                        } else if (!ok) {
+                            c.mat_rejects += g_a2 == 1;
+                            g.reject_cur = true;
+                        }
+                        if (ok && g_a2 == 2) {
+                            g.v_stretch = &s;
+                            g.v_slot_k = 0;
+                        }
+                    }
                     if (!g.reject_cur) {
                         rasterizer->GetScheduler().SwitchStream(0);
                         if (g.gpu_write) {
@@ -2918,6 +2987,14 @@ void Liverpool::A2Execute(const CpSplit::RecordHeader& record) {
                         }
                         mirror->ctx_epoch = rec.ctx_epoch;
                         rasterizer->A2BeginStretch(rec.draw.pipeline);
+                    }
+                    if (!g.reject_cur && colour && !rasterizer->A2ImagesSafe(mat_ids)) {
+                        // A sampled image is a target of this pass: the old path (per-draw
+                        // barriers) runs the stretch; the pass it began is reused.
+                        ++c.rt_rejects;
+                        g.reject_cur = true;
+                    }
+                    if (!g.reject_cur) {
                         auto& sched = rasterizer->GetScheduler();
                         sched.Record([cmds = s.cmds, inst = &rasterizer->A2Instance()](
                                          vk::CommandBuffer cmdbuf) {
@@ -2961,6 +3038,39 @@ void Liverpool::A2Execute(const CpSplit::RecordHeader& record) {
                 }
                 // Rejected / verify: the old path runs the draw.
                 c.would += g_a2 == 2 ? 1 : 0;
+                if (g.v_stretch == &s && g.v_slot_k < s.cmds->slot_writes.size()) {
+                    const auto& sw = s.cmds->slot_writes[g.v_slot_k];
+                    if (sw.tag == rec.job_tag && sw.idx == rec.job_idx) {
+                        ++g.v_slot_k;
+                        const u64 n0 = rasterizer->a2_probe.n;
+                        ++c.translated;
+                        ++c.back_records;
+                        ExecuteRecordImpl(record);
+                        const auto& pr = rasterizer->a2_probe;
+                        if (pr.n == n0 || pr.tag != sw.tag || pr.idx != sw.idx) {
+                            ++c.slot_unwritten;
+                        } else {
+                            const auto& want = s.cmds->mat_slots[sw.mat];
+                            const auto [ni, ns] = g.v_mat_n[sw.mat];
+                            bool bad = sw.mat >= s.materials.size();
+                            for (u32 i = 0; !bad && i < ni; ++i) {
+                                bad = pr.slots[i] != want[i];
+                            }
+                            for (u32 j = 0; !bad && j < ns; ++j) {
+                                bad = pr.slots[Shader::NativeBindlessMax + j] !=
+                                      want[Shader::NativeBindlessMax + j];
+                            }
+                            ++c.slot_cmp;
+                            if (bad && ++c.slot_bad <= 16) {
+                                LOG_WARNING(Render,
+                                            "A2 verify: slot words differ at draw seq {} (material "
+                                            "{} of {}, {} images {} samplers)",
+                                            record.seq, sw.mat, s.materials.size(), ni, ns);
+                            }
+                        }
+                        return;
+                    }
+                }
             }
         }
         ++c.translated;
