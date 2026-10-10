@@ -906,6 +906,59 @@ CpWaitStats g_cp_wait;
 } // namespace
 
 namespace {
+/// SHADPS4_FRONT_COST=1 (counter run): front cycles per PM4 opcode, waits excluded.
+const bool g_front_cost = [] {
+    const char* e = std::getenv("SHADPS4_FRONT_COST");
+    return e && e[0] == '1';
+}();
+struct FrontCost {
+    u64 last_tsc{}, last_wait{}, win_tsc{};
+    u32 last_op{};
+    std::array<u64, 256> cyc{}, n{};
+};
+thread_local FrontCost t_front_cost;
+void FrontCostTick(u32 opcode) {
+    auto& f = t_front_cost;
+    const u64 now = __rdtsc();
+    const u64 wait = Common::FaultMonitor::front_wait_ticks.load(std::memory_order_relaxed);
+    if (f.last_tsc != 0) {
+        const u64 dt = now - f.last_tsc;
+        const u64 dw = wait - f.last_wait;
+        f.cyc[f.last_op & 255] += dt > dw ? dt - dw : 0;
+        ++f.n[f.last_op & 255];
+    } else {
+        f.win_tsc = now;
+    }
+    f.last_tsc = now;
+    f.last_wait = wait;
+    f.last_op = opcode;
+    const u64 win = now - f.win_tsc;
+    if (win > 35'000'000'000ull) { // ~10 s
+        const double s = double(win) / 3.5e9;
+        std::array<u32, 256> ord{};
+        for (u32 i = 0; i < 256; ++i) {
+            ord[i] = i;
+        }
+        std::sort(ord.begin(), ord.end(), [&](u32 a, u32 b) { return f.cyc[a] > f.cyc[b]; });
+        u64 total = 0;
+        for (const u64 c : f.cyc) {
+            total += c;
+        }
+        std::string out;
+        for (u32 k = 0; k < 14 && f.cyc[ord[k]] != 0; ++k) {
+            const u32 op = ord[k];
+            out += fmt::format(" op{:#04x}={:.1f}ms/s({:.0f}k/s,{:.0f}cyc)", op,
+                               double(f.cyc[op]) / 3.5e6 / s, double(f.n[op]) / 1e3 / s,
+                               double(f.cyc[op]) / double(std::max<u64>(f.n[op], 1)));
+        }
+        LOG_INFO(Render, "FrontCost: window {:.1f}s (TSC ~3.5 GHz) front busy {:.1f} ms/s, by opcode:{}",
+                 s, double(total) / 3.5e6 / s, out);
+        f.cyc = {};
+        f.n = {};
+        f.win_tsc = now;
+    }
+}
+
 const bool g_native_timing_rec = [] {
     const char* e = std::getenv("SHADPS4_NATIVE_TIMING");
     return e && e[0] == '1';
@@ -7388,6 +7441,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
+            if (g_front_cost) [[unlikely]] {
+                FrontCostTick(static_cast<u32>(opcode));
+            }
             g_dispatch_sync.Note(64, opcode, header);
             if (AmdGpu::NativeRec::g_segb != 0) [[unlikely]] {
                 SegB::NotePacket(opcode, header, count, guest_markers_enabled, regs);
