@@ -40,6 +40,7 @@
 #include "common/readback_offload.h"
 #include "video_core/amdgpu/split_hazard.h"
 #include "video_core/renderdoc.h"
+#include "video_core/amdgpu/split_records.h"
 #include "video_core/renderer_vulkan/vk_a2.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -972,6 +973,12 @@ struct RegScanStats {
     // ASC SET_SH_REG to the shared (non-compute) SH registers: all / while a gfx DCB is open.
     u64 asc_sh{}, asc_sh_dw{}, asc_sh_in_gfx{}, asc_sh_in_gfx_dw{};
     u32 asc_sh_min{~0u}, asc_sh_max{};
+    // Lean-parser census: draws in total / before the first packet outside S / outside S+DMA_DATA,
+    // DCBs fully inside, and the first cutting opcode (S, S+DMA).
+    u64 draws{}, draws_s{}, draws_sd{}, dcb_full_s{}, dcb_full_sd{};
+    std::array<u64, 256> cut_s{}, cut_sd{};
+    // per DCB (reset at each top-level scan)
+    bool cur_cut_s{}, cur_cut_sd{};
     u64 win_tsc{};
 };
 thread_local RegScanStats t_reg_scan;
@@ -992,6 +999,43 @@ void RegScanRun(std::span<const u32> dcb, AmdGpu::Regs& r, RegScanStats& st, u32
         const u32 count = header->type3.NumWords();
         const auto* w = reinterpret_cast<const u32*>(header);
         ++st.pkts;
+        {
+            const PM4ItOpcode op = header->type3.opcode;
+            const bool is_draw = op == PM4ItOpcode::DrawIndex2 || op == PM4ItOpcode::DrawIndexOffset2 ||
+                                 op == PM4ItOpcode::DrawIndexAuto || op == PM4ItOpcode::DrawIndirect ||
+                                 op == PM4ItOpcode::DrawIndexIndirect ||
+                                 op == PM4ItOpcode::DrawIndirectMulti ||
+                                 op == PM4ItOpcode::DrawIndexIndirectMulti ||
+                                 op == PM4ItOpcode::DrawIndexIndirectCountMulti;
+            const bool in_s =
+                op == PM4ItOpcode::SetConfigReg || op == PM4ItOpcode::SetContextReg ||
+                op == PM4ItOpcode::SetShReg || op == PM4ItOpcode::SetUconfigReg ||
+                op == PM4ItOpcode::ClearState || op == PM4ItOpcode::Nop ||
+                op == PM4ItOpcode::IndexType || op == PM4ItOpcode::IndexBase ||
+                op == PM4ItOpcode::IndexBufferSize || op == PM4ItOpcode::NumInstances ||
+                op == PM4ItOpcode::DrawIndex2 || op == PM4ItOpcode::DrawIndexOffset2 ||
+                op == PM4ItOpcode::DrawIndexAuto ||
+                // user ~13:55: the no-op DMA (destination 0x3022C, skipped by the back) is supported
+                (op == PM4ItOpcode::DmaData &&
+                 reinterpret_cast<const PM4DmaData*>(header)->dst_addr_lo == 0x3022C) ||
+                op == PM4ItOpcode::AcquireMem; // the front ignores it (user ~14:00)
+            // Second column: + SET_BASE (indirect_args_addr) and CONTEXT_CONTROL.
+            const bool in_sd =
+                in_s || op == PM4ItOpcode::SetBase || op == PM4ItOpcode::ContextControl;
+            if (!in_s && !st.cur_cut_s) {
+                st.cur_cut_s = true;
+                ++st.cut_s[static_cast<u32>(op) & 255];
+            }
+            if (!in_sd && !st.cur_cut_sd) {
+                st.cur_cut_sd = true;
+                ++st.cut_sd[static_cast<u32>(op) & 255];
+            }
+            if (is_draw) {
+                ++st.draws;
+                st.draws_s += st.cur_cut_s ? 0 : 1;
+                st.draws_sd += st.cur_cut_sd ? 0 : 1;
+            }
+        }
         switch (header->type3.opcode) {
         case PM4ItOpcode::ClearState:
             r.SetDefaults();
@@ -1090,6 +1134,28 @@ void RegScanRun(std::span<const u32> dcb, AmdGpu::Regs& r, RegScanStats& st, u32
 
 void RegScanLog(RegScanStats& st, u64 now) {
     const double s = double(now - st.win_tsc) / 3.5e9;
+    {
+        const auto top = [](const std::array<u64, 256>& h) {
+            std::array<u32, 256> ord{};
+            for (u32 i = 0; i < 256; ++i) {
+                ord[i] = i;
+            }
+            std::sort(ord.begin(), ord.end(), [&](u32 a, u32 b) { return h[a] > h[b]; });
+            std::string out;
+            for (u32 k = 0; k < 6 && h[ord[k]] != 0; ++k) {
+                out += fmt::format(" op{:#04x}={}", ord[k], h[ord[k]]);
+            }
+            return out;
+        };
+        LOG_INFO(Render,
+                 "LeanParse census (S + no-op DMA + ACQUIRE_MEM): draws {} | before the first packet outside S {} ({:.1f}%), DCBs "
+                 "fully in S {} of {} | outside S+SET_BASE+CONTEXT_CONTROL {} ({:.1f}%), DCBs fully in it {} | "
+                 "first cut, S:{} | S+DMA:{}",
+                 st.draws, st.draws_s, st.draws ? 100.0 * double(st.draws_s) / double(st.draws) : 0.0,
+                 st.dcb_full_s, st.dcbs, st.draws_sd,
+                 st.draws ? 100.0 * double(st.draws_sd) / double(st.draws) : 0.0, st.dcb_full_sd,
+                 top(st.cut_s), top(st.cut_sd));
+    }
     LOG_INFO(Render,
              "RegScan: window {:.1f}s (TSC ~3.5 GHz) register-only pass {:.2f} ms/s ({:.0f} cycles "
              "per DCB, {} DCBs, {:.0f} packets/s of which register {:.0f}/s, IBs {}, CondExec {}) | "
@@ -1118,34 +1184,6 @@ const bool g_native_timing_rec = [] {
 
 // ---- CP front/back split records (cp_split.h). Built on the front, read on the back. ----
 
-/// A draw: the front's classification and lookup plus the per-stage data copied right after the
-/// lookup. Followed by stage_count stage blocks (WriteStage).
-struct SplitDrawRecord {
-    Vulkan::Rasterizer::SplitDraw draw;
-    u64 ctx_epoch;           ///< Liverpool::context_change_epoch at the draw (viewport memo).
-    const char* marker;      ///< Host marker packet name (static string), never dereferenced
-                             ///< on the front's behalf; null = no marker.
-    const void* cmd_address; ///< For the host marker text only (formatted, never read).
-    u32 stage_count;
-    u32 verify;              ///< DrawVerifyFull / DrawVerifySnapshot (VERIFY only), else 0.
-    u32 vi_bytes;            ///< FRONT_DERIVE: bytes of the VertexInputsPayload block after the
-                             ///< stage blocks (0: none).
-    u32 pad;
-    u32 nr_tag;              ///< SHADPS4_NATIVE_REC: the job-thread run this draw heads (0: none)
-    u32 nr_idx;
-    u32 job_tag;             ///< SHADPS4_NATIVE_REC >= 2: this draw's OWN job record (0: none),
-    u32 job_idx;             ///< heads, members and refused members alike (REC_PREP, sec. 9)
-    u32 job_member;          ///< 1: posted by the member path (NativeRecMember)
-    u32 job_pad;
-    // SHADPS4_NATIVE_SEGB (brick B): the front segment builder's prediction for this draw
-    // (segb_id 0: outside every segment); the member's (slot, ring index) are job_tag / job_idx.
-    u32 segb_id;          ///< 1-based segment number
-    u32 segb_member;      ///< position in the segment (0 = the opener)
-    u64 segb_index_addr;  ///< predicted index guest address (= index union lo + firstIndex * size)
-    u32 segb_index_count; ///< predicted indexCount
-    u32 segb_instances;   ///< predicted instanceCount
-};
-static_assert(sizeof(SplitDrawRecord) % 8 == 0);
 
 /// SplitDrawRecord::verify. Full: the front is parked on this record (depth 0, or the periodic
 /// synchronous run-ahead draw), so the back compares against the front's live state. Snapshot:
@@ -1202,52 +1240,6 @@ struct SplitDispatchRecord {
 };
 static_assert(sizeof(SplitDispatchRecord) % 8 == 0);
 
-u32 StageBytes(const Shader::Info& info) {
-    const size_t bytes = sizeof(CpSplit::StagePayload) +
-                         (info.user_data.size() + info.flattened_ud_buf.size()) * sizeof(u32);
-    return static_cast<u32>((bytes + 7) & ~size_t{7});
-}
-
-/// Copies what the back reads of a stage's per-draw data (Shader::BoundStage): user data,
-/// flat buffer and pgm_base, as the lookup just left them in the shared Info.
-u8* WriteStage(u8* out, const Shader::Info& info, u32 logical_stage) {
-    auto* stage = reinterpret_cast<CpSplit::StagePayload*>(out);
-    stage->info = &info;
-    stage->pgm_base = info.pgm_base;
-    stage->logical_stage = logical_stage;
-    stage->ud_dw = static_cast<u32>(info.user_data.size());
-    stage->flat_dw = static_cast<u32>(info.flattened_ud_buf.size());
-    stage->pad = 0;
-    auto* dwords = reinterpret_cast<u32*>(stage + 1);
-    if (!info.user_data.empty()) {
-        std::memcpy(dwords, info.user_data.data(), info.user_data.size_bytes());
-    }
-    if (!info.flattened_ud_buf.empty()) {
-        std::memcpy(dwords + stage->ud_dw, info.flattened_ud_buf.data(),
-                    info.flattened_ud_buf.size() * sizeof(u32));
-    }
-    return out + StageBytes(info);
-}
-
-/// The back's BoundStages, pointing into the record (valid until Channel::Done). Returns the
-/// end of the last stage block.
-const u8* ReadStages(const u8* in, u32 count,
-                     std::array<Shader::BoundStage, Shader::MaxStageTypes>& out) {
-    for (u32 i = 0; i < count; ++i) {
-        const auto* stage = reinterpret_cast<const CpSplit::StagePayload*>(in);
-        const auto* dwords = reinterpret_cast<const u32*>(stage + 1);
-        ASSERT(stage->logical_stage < Shader::MaxStageTypes);
-        auto& bound = out[stage->logical_stage];
-        bound.info = static_cast<const Shader::Info*>(stage->info);
-        bound.user_data = std::span<const u32>{dwords, stage->ud_dw};
-        bound.flattened_ud_buf = std::span<const u32>{dwords + stage->ud_dw, stage->flat_dw};
-        bound.pgm_base = stage->pgm_base;
-        const size_t bytes = sizeof(CpSplit::StagePayload) +
-                             (size_t{stage->ud_dw} + stage->flat_dw) * sizeof(u32);
-        in += (bytes + 7) & ~size_t{7};
-    }
-    return in;
-}
 
 /// Run-ahead VERIFY, front: the extents and register windows the back must match (see
 /// VerifyWindows). `out` is 8-aligned (stage blocks end 8-aligned).
@@ -7570,8 +7562,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         if (st.win_tsc == 0) {
             st.win_tsc = t0;
         }
+        st.cur_cut_s = st.cur_cut_sd = false;
         RegScanRun(dcb, *sr, st, 0);
         st.cyc += __rdtsc() - t0;
+        st.dcb_full_s += st.cur_cut_s ? 0 : 1;
+        st.dcb_full_sd += st.cur_cut_sd ? 0 : 1;
         ++st.dcbs;
         st.ccbs += ccb.empty() ? 0 : 1;
         t_reg_scan_gfx_open = true;
