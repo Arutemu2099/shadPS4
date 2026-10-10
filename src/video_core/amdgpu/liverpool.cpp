@@ -1547,6 +1547,47 @@ void LeanCompare(LeanJob& j) {
                             i < j.worker_canon.size() ? j.worker_canon[i] : 0ull, res.packets,
                             res.draws, static_cast<u32>(res.stop));
             }
+            if (c.bad <= 3) {
+                const auto dump = [](const std::vector<u64>& v, size_t lim) {
+                    std::string s;
+                    for (size_t k = 0; k < std::min<size_t>(lim, 96); ++k) {
+                        s += fmt::format(" {:x}", v[k]);
+                    }
+                    return s;
+                };
+                std::string pk;
+                u32 off = 0, pads = 0;
+                const u32 end = std::min<u32>(res.end_dw + 1, static_cast<u32>(j.dcb.size()));
+                while (off < end) {
+                    const auto* h = reinterpret_cast<const PM4Header*>(j.dcb.data() + off);
+                    if (h->type == 2) {
+                        ++pads;
+                        ++off;
+                        continue;
+                    }
+                    if (pads) {
+                        pk += fmt::format(" pad{}", pads);
+                        pads = 0;
+                    }
+                    if (h->type != 3) {
+                        pk += fmt::format(" {}:type{}", off, u32(h->type));
+                        break;
+                    }
+                    pk += fmt::format(" {}:{:#x}", off, u32(h->type3.opcode.Value()));
+                    if (h->type3.opcode == PM4ItOpcode::SetContextReg ||
+                        h->type3.opcode == PM4ItOpcode::SetShReg ||
+                        h->type3.opcode == PM4ItOpcode::SetUconfigReg) {
+                        pk += fmt::format("[{:#x}x{}]", j.dcb[off + 1] & 0xffff, h->type3.NumWords() - 1);
+                    }
+                    off += h->type3.NumWords() + 1;
+                }
+                LOG_WARNING(Render, "Lean verify dump DCB {}: packets (end_dw {}):{}", j.index.load(),
+                            res.end_dw, pk);
+                LOG_WARNING(Render, "Lean verify dump DCB {}: front:{}", j.index.load(),
+                            dump(j.front_canon, n_front));
+                LOG_WARNING(Render, "Lean verify dump DCB {}: worker:{}", j.index.load(),
+                            dump(j.worker_canon, j.worker_canon.size()));
+            }
         }
     }
     j.done_mask.store(0, std::memory_order_relaxed);
@@ -3326,6 +3367,7 @@ void Liverpool::A2WorkerLoop(std::stop_token stoken, u32 index) {
 void Liverpool::LeanStart() {
     auto& s = g_lean_s;
     s.started = true;
+    split->canon_fn = &LeanCanonRecord; // the front's records too (canon is set per packet)
     s.regs = std::make_unique<Regs>();
     s.win_tsc = __rdtsc();
     static const u32 n = [] {
@@ -4472,7 +4514,8 @@ void Liverpool::RunGfxDma(const PM4Header* header, bool guest_markers_enabled,
                                 guest_markers_enabled ? CpSplit::GuestMarkers : 0);
     std::memcpy(copy, header, dwords * sizeof(u32));
     split->Commit();
-    if (split_task_guard) [[unlikely]] {
+    // The no-op DMA (destination 0x3022C) never writes: the back's ExecuteGfxPacket skips it.
+    if (split_task_guard && dma->dst_addr_lo != 0x3022C) [[unlikely]] {
         split->NotePostedWrite(write_dst, write_bytes);
     }
     split->PostRunAhead(CpSplit::PostKind::GfxPacket);

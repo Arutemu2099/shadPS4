@@ -660,14 +660,8 @@ SpanResult Parser::Parse(std::span<const u32> dcb, u32 cut_dw, ChainState& st,
                     break;
                 }
             }
-            if (env.split_task_guard != 0 &&
-                (dma->dst_sel == DmaDataDst::Memory || dma->dst_sel == DmaDataDst::MemoryUsingL2) &&
-                dma->NumBytes() != 0) {
-                // NotePostedWrite logs a memory destination in the front's posted-write log; a
-                // GDS / register destination is 0 bytes there (NotePostedWrite returns at once).
-                stop = Stop::DmaGuard;
-                break;
-            }
+            // TASK_GUARD: the front does not note the no-op DMA in its posted-write log (the
+            // back never runs it; RunGfxDma), so there is nothing to mirror.
             void* copy = out.Reserve(CpSplit::RecordType::Packet, dwords * sizeof(u32),
                                      env.guest_markers ? u16{CpSplit::GuestMarkers} : u16{0});
             std::memcpy(copy, header, dwords * sizeof(u32));
