@@ -82,6 +82,7 @@ namespace {
 constexpr u32 MaxDraws = 64;                              // Rasterizer::NativeMaxDraws
 constexpr u32 CmdBytes = 20;                              // VkDrawIndexedIndirectCommand
 constexpr u32 TableBytes = Shader::NativeTableDwords * 4; // the per-batch table
+constexpr u32 ClipBytes = 96; // AmdGpu::NUM_CLIP_PLANES x 4 words (the back's planes copy)
 constexpr u64 ArenaBytes = u64{8} << 20;                  // per worker
 constexpr u64 MaxSpan = u64{64} << 20;                    // NativeRingPrepare's union bound
 
@@ -522,6 +523,7 @@ struct StretchTranslator::Impl {
     bool cmd_warned{};
     u64 align{256};
     u64 region_bytes{};
+    u64 clip_off_in_region{}; ///< the sub-batch's clip planes (after table, commands, count)
     vk::Buffer dummy{}; ///< the always-valid Guest stand-in (BDA page table buffer)
     u64 pt_fallback{}, fault_addr{};
 
@@ -557,6 +559,13 @@ struct StretchTranslator::Impl {
     u64 b_guest_mask{};
     std::array<VAddr, Shader::NUM_BUFFERS> b_glo{}, b_ghi{};
     Shader::PushData b_push{};
+    // Inherited Guest slots (the opener's V# for every member) and clip planes.
+    u64 b_inh_slots{};
+    std::array<VAddr, Shader::NUM_BUFFERS> b_iaddr{};
+    std::array<u64, Shader::NUM_BUFFERS> b_isize{};
+    std::array<u32, Shader::NUM_BUFFERS> b_ioff{}, b_isz{};
+    bool b_clip{};
+    std::array<u32, 24> b_planes{};
 };
 
 StretchTranslator::Impl::Impl(StretchTranslator* owner_, const WorkerContext& ctx_)
@@ -581,7 +590,8 @@ StretchTranslator::Impl::Impl(StretchTranslator* owner_, const WorkerContext& ct
     }
     if (!why) {
         align = std::max<u64>(ctx.instance->StorageMinAlignment(), 16);
-        region_bytes = AlignUp(TableBytes + u64(MaxDraws) * CmdBytes + 16, align);
+        clip_off_in_region = AlignUp(TableBytes + u64(MaxDraws) * CmdBytes + 16, align);
+        region_bytes = clip_off_in_region + AlignUp(ClipBytes, align);
         if (!ctx.arena->buffer) {
             // Host-visible, coherent (Upload prefers HOST_COHERENT), storage + indirect, with a
             // device address as the Arena interface asks (its own dedicated allocation).
@@ -777,11 +787,9 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     // mirror always has it (as the generic draw path reads it).
     const u32 n_inst = inst_known ? instances : regs.num_instances.NumInstances();
     owner->sub[0] += inst_known ? 0 : 1; // census: instance count taken from the mirror
-    if (inh_slots != 0) {
-        // v1 (as NativeDirectBind fail 3): an inherited V#'s table words need the opener's cache
-        // offsets; refuse rather than reproduce them.
-        return refuse(RefuseInheritedSlot);
-    }
+    // Inherited Guest slots (l3e): every member binds the opener's V# through the table (Base =
+    // 0 - offset, Size, the InhSlots bit, PtLo / PtHi), as NativeRingPrepare does; resolved in the
+    // union loop below.
 
     // The mirror against the record (NativePrepConfirm refuse 12 / 13, Opus G2 #3).
     const bool is_index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
@@ -823,6 +831,10 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     u32 num_writes = 0;
     u64 guest_mask = 0;
     std::array<VAddr, Shader::NUM_BUFFERS> o_addr{};
+    std::array<u64, Shader::NUM_BUFFERS> o_vsize{};
+    bool clip_on = false;
+    u32 clip_wi = 0;
+    std::array<u32, 24> planes{};
     ImageKey key{};
     u32 bi = 0;
     for (u32 s = 0; s < Shader::MaxStageTypes - 1; ++s) {
@@ -849,8 +861,16 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
             }
             if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
                 if (regs.clipper_control.user_clip_plane_enable != 0) {
-                    ++owner->sub[5];
-                    return refuse(RefuseSlotKind); // needs a stream-buffer copy of the planes
+                    // As BindResources: a copy of the planes (the opener's region, below).
+                    clip_on = true;
+                    clip_wi = num_writes;
+                    for (u32 i = 0; i < AmdGpu::NUM_CLIP_PLANES; ++i) {
+                        const auto& plane = regs.clip_user_data[i];
+                        planes[i * 4 + 0] = plane.data_x;
+                        planes[i * 4 + 1] = plane.data_y;
+                        planes[i * 4 + 2] = plane.data_z;
+                        planes[i * 4 + 3] = plane.data_w;
+                    }
                 }
                 writes[num_writes++] = {bnd.unified++, vk::Buffer{}, 0, VK_WHOLE_SIZE};
                 ++bnd.buffer;
@@ -870,6 +890,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
                 return refuse(RefuseSlotKind); // NativeDirectBind fail 5 / 6
             }
             o_addr[bi] = vsharp.base_address;
+            o_vsize[bi] = vsharp.GetSize();
             guest_mask |= u64{1} << bi;
             writes[num_writes++] = {bnd.unified++, dummy, 0, VK_WHOLE_SIZE};
             ++bnd.buffer;
@@ -1026,7 +1047,12 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
                 inh_ps == b_inh_ps && ib_handle == b_ib && index_size == b_index_size &&
                 vb_n == b_vb_n && draw.vi->desc_id == last_desc_id && PushKeySame(push, b_push) &&
                 guest_mask == b_guest_mask && !AnyDirty(cand) &&
-                (!colour || (vbuf == b_vbuf && vmask == b_vmask));
+                (!colour || (vbuf == b_vbuf && vmask == b_vmask)) && inh_slots == b_inh_slots &&
+                clip_on == b_clip && (!clip_on || planes == b_planes);
+    for (u64 m = inh_slots; cont && m != 0; m &= m - 1) {
+        const u32 b = static_cast<u32>(std::countr_zero(m));
+        cont = o_addr[b] == b_iaddr[b] && o_vsize[b] == b_isize[b];
+    }
     for (u32 m = inh_vs; cont && m != 0; m &= m - 1) {
         const u32 i = static_cast<u32>(std::countr_zero(m));
         cont = i < 16 && regs.vs_program.user_data[i] == b_ud_vs[i];
@@ -1139,8 +1165,32 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         }
         std::array<u32, Shader::NUM_BUFFERS> base{};
         std::array<VAddr, Shader::NUM_BUFFERS> glo{}, ghi{};
+        std::array<u32, Shader::NUM_BUFFERS> i_off{}, i_size{};
         for (u64 m = guest_mask; m != 0; m &= m - 1) {
             const u32 b = static_cast<u32>(std::countr_zero(m));
+            if (inh_slots & (u64{1} << b)) {
+                // The opener's own V# (no union): one cached buffer must hold all of it.
+                const u64 vsz = o_vsize[b];
+                if (vsz == 0 || vsz >= (u64{1} << 30)) {
+                    ++owner->sub[16];
+                    return refuse(RefuseInheritedSlot);
+                }
+                const VideoCore::Buffer* ibuf = ctx.buffer_cache->A2LookupBuffer(o_addr[b]);
+                if (!ibuf || !ibuf->IsInBounds(o_addr[b], vsz)) {
+                    ++owner->sub[17];
+                    return refuse(RefuseInheritedSlot);
+                }
+                const u64 ioff = o_addr[b] - ibuf->CpuAddr();
+                if (ioff > 0xffffffffull) {
+                    ++owner->sub[18];
+                    return refuse(RefuseInheritedSlot);
+                }
+                i_off[b] = static_cast<u32>(ioff);
+                i_size[b] = static_cast<u32>(vsz);
+                glo[b] = ibuf->CpuAddr();
+                ghi[b] = ibuf->CpuAddr() + ibuf->SizeBytes();
+                continue;
+            }
             if (!(u_guest & (u64{1} << b))) {
                 return refuse(RefuseUnion);
             }
@@ -1183,8 +1233,8 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
             b_native = nullptr;
             batch_open = false;
         }
-        // The table (NativeRingPrepare + NativeOpen's ring-mode words; SegMat 0, no inherited
-        // slots: InhSlots / Size / PtLo / PtHi stay 0).
+        // The table (NativeRingPrepare + NativeOpen's ring-mode words; SegMat 0; InhSlots / Size /
+        // PtLo / PtHi only for inherited slots, as NativeRingPrepare writes them).
         auto* table = reinterpret_cast<u32*>(region);
         std::memset(table, 0, TableBytes);
         table[Shader::NativeTableFirst] = idx & mask;
@@ -1200,6 +1250,15 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         }
         for (u64 m = guest_mask; m != 0; m &= m - 1) {
             const u32 b = static_cast<u32>(std::countr_zero(m));
+            if (inh_slots & (u64{1} << b)) {
+                table[Shader::NativeTableBase + b] = 0u - i_off[b];
+                table[Shader::NativeTableSize + b] = i_size[b];
+                table[Shader::NativeTableInhSlots + b / 32] |= 1u << (b % 32);
+                table[Shader::NativeTablePtLo + b] = static_cast<u32>(o_addr[b]);
+                table[Shader::NativeTablePtHi + b / 4] |=
+                    static_cast<u32>((o_addr[b] >> 32) & 0xffu) << ((b % 4) * 8);
+                continue;
+            }
             table[Shader::NativeTableBase + b] = base[b];
         }
         if (colour) {
@@ -1245,6 +1304,12 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         }
         writes[num_writes++] = {native->native_table_binding, ctx.arena->buffer, region_off,
                                 TableBytes};
+        if (clip_on) {
+            std::memcpy(region + clip_off_in_region, planes.data(), ClipBytes);
+            writes[clip_wi].buffer = ctx.arena->buffer;
+            writes[clip_wi].offset = region_off + clip_off_in_region;
+            writes[clip_wi].range = ClipBytes;
+        }
         sb.num_writes = num_writes;
         sb.writes = writes;
         BuildVertexInputArrays(*draw.vi, sb);
@@ -1290,6 +1355,13 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         b_glo = glo;
         b_ghi = ghi;
         b_push = push;
+        b_inh_slots = inh_slots;
+        b_iaddr = o_addr;
+        b_isize = o_vsize;
+        b_ioff = i_off;
+        b_isz = i_size;
+        b_clip = clip_on;
+        b_planes = planes;
         last_desc_id = draw.vi->desc_id;
         ++owner->sub_batches;
     }
@@ -1313,6 +1385,22 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
             mat_base[mat] = base;
         }
         cmds->slot_writes.push_back({draw.job_tag, idx, static_cast<u32>(mat)});
+    }
+    if (inh_slots != 0) {
+        ++owner->sub[19];
+        if (Mode() == 2) {
+            for (u64 m = inh_slots; m != 0; m &= m - 1) {
+                const u32 b = static_cast<u32>(std::countr_zero(m));
+                cmds->inh_checks.push_back({draw.seq, b_iaddr[b], b_isize[b], b_ioff[b], b_isz[b]});
+            }
+        }
+    }
+    if (clip_on) {
+        ++owner->sub[20];
+        if (Mode() == 2) {
+            cmds->clip_checks.push_back(
+                {draw.seq, regs.clipper_control.user_clip_plane_enable, b_planes});
+        }
     }
     b_next_idx = idx + 1;
     dyn = cand;

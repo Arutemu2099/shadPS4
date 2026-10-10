@@ -169,6 +169,22 @@ struct StretchCmds {
         u32 mat{};
     };
     std::vector<SlotWrite> slot_writes;
+    /// SHADPS4_A2=2 direct checks, one entry per taken draw (the back compares at that draw):
+    /// an inherited Guest slot's table words, and the clip planes the sub-batch binds.
+    struct InhCheck {
+        u64 seq{};
+        VAddr addr{};
+        u64 vsize{};
+        u32 off{};
+        u32 size{};
+    };
+    std::vector<InhCheck> inh_checks;
+    struct ClipCheck {
+        u64 seq{};
+        u32 enable{};
+        std::array<u32, 24> planes{};
+    };
+    std::vector<ClipCheck> clip_checks;
 };
 
 /// Records `cmds` into `cmdbuf` exactly as the translator's closures would have, in order. Called
@@ -263,8 +279,10 @@ public:
     /// Sub-reasons (census): 0-3 record fields (inst_known 0, io_ud, index_count 0, push_inh),
     /// 4-9 slot kind (shadow with images, clip planes, not Guest, written, formatted, colour
     /// inline / null / empty V#), 10-11 guest lookup (no buffer, address outside it), 12-15 stamp
-    /// (stamp below idx + 1, above it, gpu_ok 0, cmd differs).
-    std::array<u64, 16> sub{};
+    /// (stamp below idx + 1, above it, gpu_ok 0, cmd differs), 16-18 inherited slot refused (size
+    /// 0 or >= 1 GB, no cached buffer holding it, offset over 32 bits), 19 draws taken with an
+    /// inherited slot, 20 draws taken with user clip planes.
+    std::array<u64, 24> sub{};
     /// Draws taken and sub-batches opened so far (logged by the caller).
     u64 taken{}, sub_batches{};
 

@@ -1271,6 +1271,9 @@ struct LeanXlStats {
         would{}, back_draws{}, seq_skips{};
     /// SHADPS4_A2=2 field compares (gate 0 bad): render key per draw, delta words per stretch.
     std::atomic<u64> rk_cmp{}, rk_bad{}, delta_cmp{}, delta_bad{}, expect_filed{};
+    /// l3e direct checks: inherited-slot words (offset + size vs the back's locked lookup and
+    /// clamp), the record's VS / PS user data vs the mirror (inherited-slot draws), clip planes.
+    std::atomic<u64> inh_cmp{}, inh_bad{}, ud_cmp{}, ud_bad{}, clip_cmp{}, clip_bad{};
     std::atomic<u64> front_p{}, front_e{}, lean_p{}, lean_e{};
     std::array<std::atomic<Vulkan::A2::StretchTranslator*>, 8> tr{};
 };
@@ -1847,13 +1850,13 @@ void LeanLog() {
             auto& x = g_lean_xl;
             const double ps = 1.0 / std::max(sec, 1e-9);
             std::array<u64, 32> rf{};
-            std::array<u64, 16> sb{};
+            std::array<u64, 24> sb{};
             for (const auto& t : x.tr) {
                 if (const auto* tr = t.load(std::memory_order_acquire)) {
                     for (u32 i = 0; i < 32; ++i) {
                         rf[i] += tr->refusals[i]; // cumulative (racy reads, as A2Log)
                     }
-                    for (u32 i = 0; i < 16; ++i) {
+                    for (u32 i = 0; i < 24; ++i) {
                         sb[i] += tr->sub[i];
                     }
                 }
@@ -1861,8 +1864,17 @@ void LeanLog() {
             LOG_INFO(Render,
                      "Lean L3 stamp refusals (cumulative): stamp below idx+1 {} above {} gpu_ok 0 {} "
                      "cmd differs {} | record fields: inst_known 0 {} io_ud {} index_count 0 {} "
-                     "push_inh {}",
-                     sb[12], sb[13], sb[14], sb[15], sb[0], sb[1], sb[2], sb[3]);
+                     "push_inh {} | slot kind: shadow+images {} clip {} not Guest {} written {} "
+                     "formatted {} colour inline/null/empty {} | guest lookup: no buffer {} outside "
+                     "{} | inherited refused: size {} no buffer {} offset {} | taken with inherited "
+                     "slots {} with clip planes {}",
+                     sb[12], sb[13], sb[14], sb[15], sb[0], sb[1], sb[2], sb[3], sb[4], sb[5], sb[6],
+                     sb[7], sb[8], sb[9], sb[10], sb[11], sb[16], sb[17], sb[18], sb[19], sb[20]);
+            LOG_INFO(Render,
+                     "Lean L3 direct checks (A2=2): inherited-slot words {} BAD {} | user-data "
+                     "words {} BAD {} | clip planes {} BAD {}",
+                     x.inh_cmp.exchange(0), x.inh_bad.load(), x.ud_cmp.exchange(0), x.ud_bad.load(),
+                     x.clip_cmp.exchange(0), x.clip_bad.load());
             std::array<u32, 32> ord{};
             for (u32 i = 0; i < 32; ++i) {
                 ord[i] = i;
@@ -8139,6 +8151,7 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
     // SHADPS4_A2=2: the stretch whose draws run on the old path and are compared.
     const Vulkan::A2::Stretch* vs = nullptr;
     const A2Entry::Side* vsd = nullptr;
+    size_t vs_inh = 0, vs_clip = 0; // next direct-check entries of `vs`
     u64 wait = 0;
     for (u32 spins = 0;;) {
         if (split->FrontHasExited() || s.stop.load(std::memory_order_relaxed)) [[unlikely]] {
@@ -8171,6 +8184,8 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                     if (g_a2 == 2) {
                         vs = &st;
                         vsd = &sd;
+                        vs_inh = 0;
+                        vs_clip = 0;
                     }
                 }
                 if (vs && r->seq >= vs->first_seq && r->seq <= vs->last_seq) {
@@ -8184,6 +8199,75 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                             LOG_WARNING(Render, "Lean L3 verify: render key mismatch at job draw seq "
                                                 "{} (stretch {}..{})",
                                         r->seq, vs->first_seq, vs->last_seq);
+                        }
+                    }
+                    // l3e direct checks (the mirror = the registers at this draw).
+                    const auto& ic = vs->cmds->inh_checks;
+                    bool ud_done = false;
+                    for (; vs_inh < ic.size() && ic[vs_inh].seq <= r->seq; ++vs_inh) {
+                        const auto& c = ic[vs_inh];
+                        if (c.seq != r->seq) {
+                            continue;
+                        }
+                        const auto* buf = rasterizer->A2BufferCache().NativeBufferAt(c.addr);
+                        const u64 clamp =
+                            Core::Memory::Instance()->ClampRangeSize(c.addr, c.vsize);
+                        const bool ok = buf && c.addr - buf->CpuAddr() == c.off &&
+                                        std::min<u64>(clamp, 0xffffffffull) == c.size;
+                        x.inh_cmp.fetch_add(1, std::memory_order_relaxed);
+                        if (!ok && x.inh_bad.fetch_add(1, std::memory_order_relaxed) < 16) {
+                            LOG_WARNING(Render,
+                                        "Lean L3 verify: inherited slot {:#x} worker off {:#x} size "
+                                        "{:#x}, back off {:#x} clamp {:#x} (job draw seq {})",
+                                        c.addr, c.off, c.size,
+                                        buf ? c.addr - buf->CpuAddr() : ~u64{0}, clamp, r->seq);
+                        }
+                        if (!ud_done) {
+                            ud_done = true;
+                            std::array<Shader::BoundStage, Shader::MaxStageTypes> rst{};
+                            ReadStages(reinterpret_cast<const u8*>(&rec + 1), rec.stage_count, rst);
+                            const auto cmp_ud = [&](const Shader::BoundStage& bs,
+                                                    const std::array<u32, 16>& m) {
+                                const size_t n = std::min<size_t>(bs.user_data.size(), 16);
+                                u32 bad = 0;
+                                for (size_t i = 0; i < n; ++i) {
+                                    bad += bs.user_data[i] != m[i] ? 1 : 0;
+                                }
+                                x.ud_cmp.fetch_add(n, std::memory_order_relaxed);
+                                if (bad != 0 &&
+                                    x.ud_bad.fetch_add(bad, std::memory_order_relaxed) < 16) {
+                                    LOG_WARNING(Render, "Lean L3 verify: {} user-data words differ "
+                                                        "from the mirror (job draw seq {})",
+                                                bad, r->seq);
+                                }
+                            };
+                            const auto& vsb = rst[u32(Shader::LogicalStage::Vertex)];
+                            const auto& psb = rst[u32(Shader::LogicalStage::Fragment)];
+                            if (vsb.info) {
+                                cmp_ud(vsb, mirror->regs.vs_program.user_data);
+                            }
+                            if (psb.info) {
+                                cmp_ud(psb, mirror->regs.ps_program.user_data);
+                            }
+                        }
+                    }
+                    const auto& cc = vs->cmds->clip_checks;
+                    for (; vs_clip < cc.size() && cc[vs_clip].seq <= r->seq; ++vs_clip) {
+                        const auto& c = cc[vs_clip];
+                        if (c.seq != r->seq) {
+                            continue;
+                        }
+                        bool ok = mirror->regs.clipper_control.user_clip_plane_enable == c.enable;
+                        for (u32 i = 0; ok && i < AmdGpu::NUM_CLIP_PLANES; ++i) {
+                            const auto& p = mirror->regs.clip_user_data[i];
+                            ok = p.data_x == c.planes[i * 4] && p.data_y == c.planes[i * 4 + 1] &&
+                                 p.data_z == c.planes[i * 4 + 2] && p.data_w == c.planes[i * 4 + 3];
+                        }
+                        x.clip_cmp.fetch_add(1, std::memory_order_relaxed);
+                        if (!ok && x.clip_bad.fetch_add(1, std::memory_order_relaxed) < 16) {
+                            LOG_WARNING(Render, "Lean L3 verify: clip planes differ from the mirror "
+                                                "(job draw seq {})",
+                                        r->seq);
                         }
                     }
                 }
