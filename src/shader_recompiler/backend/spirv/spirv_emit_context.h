@@ -253,10 +253,6 @@ public:
     Id vertex_index{};
     Id NativeRecordLoad(u32 dword);
     Id NativeTableLoad(u32 dword);
-    /// The image / sampler value to use (SHADPS4_NATIVE_BINDLESS: from the global arrays at
-    /// this draw's slot).
-    Id LoadImage(const TextureDefinition& texture);
-    Id LoadSampler(u32 index);
     bool native_bindless{};
     Id draw_index{};          // SHADPS4_NATIVE_PASS: DrawIndex built-in (native variant VS)
     Id native_records{};      // SHADPS4_NATIVE_PASS: records SSBO (uint data[])
@@ -378,6 +374,10 @@ public:
     boost::container::small_vector<BufferDefinition, 16> buffers;
     boost::container::small_vector<TextureDefinition, 8> images;
     boost::container::small_vector<Id, 4> samplers;
+    /// The image / sampler value to use (SHADPS4_NATIVE_BINDLESS: from the global arrays at
+    /// this draw's slot).
+    Id LoadImage(const TextureDefinition& texture);
+    Id LoadSampler(u32 index);
     std::unordered_map<u32, Id> first_to_last_label_map;
 
     size_t flatbuf_index{};
