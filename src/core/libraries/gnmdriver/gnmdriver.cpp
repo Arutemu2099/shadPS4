@@ -1041,12 +1041,8 @@ void NativeRecDerive(NR::Record& rec) {
     rec.derived = 0;
     rec.pipeline = nullptr;
     rec.fetch_addr = 0;
-    const u32 need_vs = r.vs_nuser >= 16 ? 0xffffu : ((1u << r.vs_nuser) - 1);
-    const u32 need_ps = r.ps_nuser >= 16 ? 0xffffu : ((1u << r.ps_nuser) - 1);
-    if ((r.vs_known & need_vs) != need_vs || (r.ps_known & need_ps) != need_ps) {
-        g_nr_d[1].fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
+    const u32 cnt_vs = r.vs_nuser >= 16 ? 0xffffu : ((1u << r.vs_nuser) - 1);
+    const u32 cnt_ps = r.ps_nuser >= 16 ? 0xffffu : ((1u << r.ps_nuser) - 1);
     const u64 vs_hash = t_draw_tag_hash[0];
     const u64 ps_hash = t_draw_tag_hash[1];
     const u32 fb = NR::VsFetchBase(vs_hash);
@@ -1063,9 +1059,20 @@ void NativeRecDerive(NR::Record& rec) {
         }
         fetch = (u64(r.vs[base + 1]) << 32 | r.vs[base]) & 0xFFFFFFFFFFFFull;
     }
-    const auto* gp = static_cast<const Vulkan::GraphicsPipeline*>(NR::TableFind(vs_hash, ps_hash, fetch));
+    u64 needs = ~u64{0};
+    const auto* gp =
+        static_cast<const Vulkan::GraphicsPipeline*>(NR::TableFind(vs_hash, ps_hash, fetch, &needs));
     if (!gp) {
         g_nr_d[3].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    // Coverage (sec. 11): every register the stages read must be known; with an unknown read mask
+    // every register below the RSRC2 count.
+    const u32 nv = static_cast<u32>(needs), np = static_cast<u32>(needs >> 32);
+    const u32 need_vs = nv == 0xffffffffu ? cnt_vs : (nv & cnt_vs);
+    const u32 need_ps = np == 0xffffffffu ? cnt_ps : (np & cnt_ps);
+    if ((r.vs_known & need_vs) != need_vs || (r.ps_known & need_ps) != need_ps) {
+        g_nr_d[1].fetch_add(1, std::memory_order_relaxed);
         return;
     }
     const auto stages = gp->GetStages();

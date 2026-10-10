@@ -17,6 +17,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/decoder.h"
 #include "common/fault_monitor.h"
 #include "common/fence_watch.h"
 #include "video_core/buffer_cache/protect_queue.h"
@@ -3096,7 +3097,14 @@ void NativeRecFront(const PM4Header* header, const Vulkan::Rasterizer::SplitDraw
                 }
             }
             NR::VsPublish(vsi->pgm_hash, fb);
-            NR::TablePublish(vsi->pgm_hash, psi ? psi->pgm_hash : 0, fetch, draw.pipeline);
+            NR::TablePublish(vsi->pgm_hash, psi ? psi->pgm_hash : 0, fetch, draw.pipeline, [&] {
+                if (!NR::g_needs_on) {
+                    return ~u64{0};
+                }
+                const u64 nv = NativeNeedCached(vsi, draw.pipeline->GetFetchShader());
+                const u64 np = psi ? NativeNeedCached(psi, nullptr) : 0;
+                return nv | (np << 32);
+            });
         } else {
             vsi = nullptr;
         }
@@ -3114,22 +3122,26 @@ void NativeRecFront(const PM4Header* header, const Vulkan::Rasterizer::SplitDraw
             // The flat buffer starts with the 16 user-data registers; only the stage's own
             // (RSRC2 count) are read, the SRT walker's part after them always is.
             const auto same_flat = [](const u32* job, std::span<const u32> front, u32 n,
-                                      u32 n_user) {
+                                      u32 n_user, u32 need) {
                 if (n != front.size()) {
                     return false;
                 }
                 for (u32 i = 0; i < n; ++i) {
-                    if ((i >= 16 || i < n_user) && job[i] != front[i]) {
+                    if ((i >= 16 || (i < n_user && ((need >> i) & 1))) && job[i] != front[i]) {
                         return false;
                     }
                 }
                 return true;
             };
+            const u32 need_vs = NR::g_needs_on
+                                    ? NativeNeedCached(vsi, draw.pipeline->GetFetchShader())
+                                    : 0xffffffffu;
+            const u32 need_ps = NR::g_needs_on && psi ? NativeNeedCached(psi, nullptr) : 0xffffffffu;
             bool flat_ok = same_flat(fvs, vsi->flattened_ud_buf, d_nvs,
-                                     regs.vs_program.settings.num_user_regs);
+                                     regs.vs_program.settings.num_user_regs, need_vs);
             if (psi) {
                 flat_ok = flat_ok && same_flat(fps, psi->flattened_ud_buf, d_nps,
-                                               regs.ps_program.settings.num_user_regs);
+                                               regs.ps_program.settings.num_user_regs, need_ps);
             }
             bool vi_ok = true;
             if (front_vi) {
@@ -3219,8 +3231,144 @@ u32 StageBlockBytes(u32 ud_dw, u32 flat_dw) {
 /// Compares the member path's record bytes (after the SplitDrawRecord header) with the normal
 /// path's: stage blocks (ud only below the stage's user-SGPR count, flat as NativeRecFront) and
 /// the vertex-input block byte for byte.
+
+// SHADPS4_NATIVE_REC coverage (notes/native-path-2026-10-09.md sec. 11): the user-data registers
+// a stage really reads: its pushed user data (ud_mask), descriptors read straight from user-data
+// registers (sharp_idx < 16), the SRT walker's root pointers and, for the VS, the fetch shader's
+// SGPRs. The walker roots are read back from the walker's x86 code (its emitter writes, per
+// pointer, `push rdi; mov rdi, [rdi + 4 * sgpr]`, roots at depth 1; the fault patch only rewrites
+// nested loads); anything unexpected -> 0xffffffff (unknown: the RSRC2-count rule stays).
+u32 NativeWalkerRoots(const Shader::PersistentSrtInfo& srt, bool& ok) {
+    ok = true;
+    u32 m = 0;
+    if (!srt.walker_func || srt.walker_func_size == 0) {
+        return 0;
+    }
+    auto* code = reinterpret_cast<u8*>(srt.walker_func);
+    const size_t n = srt.walker_func_size;
+    size_t pos = 0;
+    int depth = 0;
+    bool after_push = false;
+    while (pos < n) {
+        ZydisDecodedInstruction ins;
+        ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+        if (!ZYAN_SUCCESS(
+                Common::Decoder::Instance()->decodeInstruction(ins, ops, code + pos, n - pos))) {
+            ok = false;
+            return 0;
+        }
+        const bool reg0_rdi = ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                              ops[0].reg.value == ZYDIS_REGISTER_RDI;
+        if (ins.mnemonic == ZYDIS_MNEMONIC_PUSH && reg0_rdi) {
+            ++depth;
+            after_push = true;
+            pos += ins.length;
+            continue;
+        }
+        if (ins.mnemonic == ZYDIS_MNEMONIC_RET) {
+            break;
+        }
+        if (ins.mnemonic == ZYDIS_MNEMONIC_POP && reg0_rdi) {
+            --depth;
+        } else if (after_push && depth == 1) {
+            // The root load: mov rdi, qword ptr [rdi + disp].
+            if (ins.mnemonic != ZYDIS_MNEMONIC_MOV || !reg0_rdi ||
+                ops[1].type != ZYDIS_OPERAND_TYPE_MEMORY || ops[1].mem.base != ZYDIS_REGISTER_RDI ||
+                ops[1].mem.index != ZYDIS_REGISTER_NONE) {
+                ok = false;
+                return 0;
+            }
+            const s64 disp = ops[1].mem.disp.value;
+            if (disp < 0 || disp % 4 != 0 || disp / 4 >= 15) {
+                ok = false;
+                return 0;
+            }
+            m |= 3u << (disp / 4);
+        }
+        after_push = false;
+        pos += ins.length;
+    }
+    return ok ? m : 0;
+}
+
+u32 NativeNeedMask(const Shader::Info* info, const Shader::Gcn::FetchShaderData* fetch) {
+    if (!info) {
+        return 0;
+    }
+    u32 m = info->ud_mask.mask;
+    const auto add = [&m](u32 idx, u32 count) {
+        for (u32 i = 0; i < count; ++i) {
+            if (idx + i < 16) {
+                m |= 1u << (idx + i);
+            }
+        }
+    };
+    for (const auto& d : info->buffers) {
+        if (!d.inline_cbuf && d.sharp_idx < 16) {
+            add(d.sharp_idx, 4);
+        }
+    }
+    for (const auto& d : info->images) {
+        if (d.sharp_idx < 16) {
+            add(d.sharp_idx, 8);
+        }
+    }
+    for (const auto& d : info->samplers) {
+        if (!d.is_inline_sampler && d.sharp_idx < 16) {
+            add(d.sharp_idx, 4);
+        }
+    }
+    for (const auto& d : info->fmasks) {
+        if (d.sharp_idx < 16) {
+            add(d.sharp_idx, 8);
+        }
+    }
+    bool ok = true;
+    m |= NativeWalkerRoots(info->srt_info, ok);
+    if (!ok) {
+        return 0xffffffffu;
+    }
+    if (info->stage == Shader::Stage::Vertex) {
+        if (info->has_fetch_shader) {
+            add(info->fetch_shader_sgpr_base, 2);
+        }
+        if (fetch) {
+            if (fetch->vertex_offset_sgpr >= 0) {
+                add(static_cast<u32>(fetch->vertex_offset_sgpr), 1);
+            }
+            if (fetch->instance_offset_sgpr >= 0) {
+                add(static_cast<u32>(fetch->instance_offset_sgpr), 1);
+            }
+            for (const auto& attrib : fetch->attributes) {
+                if (attrib.sgpr_base != Shader::IR::NumScalarRegs) {
+                    add(attrib.sgpr_base, 2); // a pointer to the V# list
+                } else {
+                    add(attrib.dword_offset, 4);
+                }
+            }
+        }
+    }
+    return m;
+}
+
+/// Front thread: NativeNeedMask per Info, cached (Infos live as long as the pipeline cache).
+u32 NativeNeedCached(const Shader::Info* info, const Shader::Gcn::FetchShaderData* fetch) {
+    static std::unordered_map<const void*, u32> cache;
+    if (!info) {
+        return 0;
+    }
+    const void* key = static_cast<const u8*>(static_cast<const void*>(info)) +
+                      (fetch ? 1 : 0); // a VS with / without its fetch shader
+    if (const auto it = cache.find(key); it != cache.end()) {
+        return it->second;
+    }
+    const u32 m = NativeNeedMask(info, fetch);
+    cache.emplace(key, m);
+    return m;
+}
+
 bool SameMemberRecord(const u8* normal, const u8* member, u32 stage_count, u32 vi_bytes,
-                      const Regs& regs) {
+                      const Regs& regs, const Vulkan::GraphicsPipeline* pipeline) {
     for (u32 s = 0; s < stage_count; ++s) {
         const auto* a = reinterpret_cast<const CpSplit::StagePayload*>(normal);
         const auto* b = reinterpret_cast<const CpSplit::StagePayload*>(member);
@@ -3235,13 +3383,21 @@ bool SameMemberRecord(const u8* normal, const u8* member, u32 stage_count, u32 v
             16u);
         const auto* da = reinterpret_cast<const u32*>(a + 1);
         const auto* db = reinterpret_cast<const u32*>(b + 1);
+        // Coverage (sec. 11): only the registers the stage reads (the job thread may not know
+        // the others).
+        u32 need = 0xffffffffu;
+        if (AmdGpu::NativeRec::g_needs_on && pipeline) {
+            need = NativeNeedCached(static_cast<const Shader::Info*>(a->info),
+                                    vs ? pipeline->GetFetchShader() : nullptr);
+        }
         for (u32 i = 0; i < a->ud_dw; ++i) {
-            if (i < n_user && da[i] != db[i]) {
+            if (i < n_user && ((need >> i) & 1) && da[i] != db[i]) {
                 return false;
             }
         }
         for (u32 i = 0; i < a->flat_dw; ++i) {
-            if ((i >= 16 || i < n_user) && da[a->ud_dw + i] != db[a->ud_dw + i]) {
+            if ((i >= 16 || (i < n_user && ((need >> i) & 1))) &&
+                da[a->ud_dw + i] != db[a->ud_dw + i]) {
                 return false;
             }
         }
@@ -3421,7 +3577,7 @@ void Liverpool::NativeRecHead(const PM4Header* header, const void* pipeline_ptr,
         g_nr_scratch_valid = false;
         const bool same = g_nr_scratch.size() >= vi_bytes &&
                           SameMemberRecord(record_body, g_nr_scratch.data(), stage_count,
-                                           vi_bytes, regs) &&
+                                           vi_bytes, regs, draw_pipeline) &&
                           draw_pipeline == run.pipeline;
         (same ? st.cmp_ok : st.cmp_bad) += 1;
         if (!same && ++st.logged <= 16) {

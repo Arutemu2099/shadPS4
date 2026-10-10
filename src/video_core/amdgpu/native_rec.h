@@ -132,6 +132,10 @@ struct ProgramEntry {
     std::atomic<u64> key{};
     u64 vs_hash{}, ps_hash{}, fetch_addr{};
     std::atomic<const void*> pipeline{};
+    /// Coverage (sec. 11): the user-data registers each stage really reads (VS low 32 bits, PS
+    /// high; a half of 0xffffffff = unknown -> the RSRC2-count rule). Published before the
+    /// pipeline / key.
+    std::atomic<u64> needs{~u64{0}};
 };
 constexpr u32 TableSize = 8192;
 inline std::array<ProgramEntry, TableSize> g_table{};
@@ -148,7 +152,7 @@ inline u64 TableKey(u64 vs, u64 ps, u64 fetch) {
     return k ? k : 1;
 }
 
-inline const void* TableFind(u64 vs, u64 ps, u64 fetch) {
+inline const void* TableFind(u64 vs, u64 ps, u64 fetch, u64* needs = nullptr) {
     const u64 k = TableKey(vs, ps, fetch);
     for (u32 i = 0; i < 16; ++i) {
         const auto& e = g_table[(k + i) & (TableSize - 1)];
@@ -157,20 +161,27 @@ inline const void* TableFind(u64 vs, u64 ps, u64 fetch) {
             return nullptr;
         }
         if (ek == k && e.vs_hash == vs && e.ps_hash == ps && e.fetch_addr == fetch) {
-            return e.pipeline.load(std::memory_order_acquire);
+            const void* p = e.pipeline.load(std::memory_order_acquire);
+            if (needs) {
+                *needs = e.needs.load(std::memory_order_acquire);
+            }
+            return p;
         }
     }
     return nullptr;
 }
 
-/// Front thread only.
-inline void TablePublish(u64 vs, u64 ps, u64 fetch, const void* pipeline) {
+/// Front thread only. `needs_fn()` (the stages' read masks) runs only when an entry is created
+/// or re-pointed.
+template <typename NeedsFn>
+inline void TablePublish(u64 vs, u64 ps, u64 fetch, const void* pipeline, NeedsFn&& needs_fn) {
     const u64 k = TableKey(vs, ps, fetch);
     for (u32 i = 0; i < 16; ++i) {
         auto& e = g_table[(k + i) & (TableSize - 1)];
         const u64 ek = e.key.load(std::memory_order_relaxed);
         if (ek == k && e.vs_hash == vs && e.ps_hash == ps && e.fetch_addr == fetch) {
             if (e.pipeline.load(std::memory_order_relaxed) != pipeline) {
+                e.needs.store(needs_fn(), std::memory_order_relaxed);
                 e.pipeline.store(pipeline, std::memory_order_release);
             }
             return;
@@ -179,12 +190,19 @@ inline void TablePublish(u64 vs, u64 ps, u64 fetch, const void* pipeline) {
             e.vs_hash = vs;
             e.ps_hash = ps;
             e.fetch_addr = fetch;
+            e.needs.store(needs_fn(), std::memory_order_relaxed);
             e.pipeline.store(pipeline, std::memory_order_relaxed);
             e.key.store(k, std::memory_order_release);
             return;
         }
     }
 }
+
+/// SHADPS4_NATIVE_REC_NEEDS=0 turns the read-mask rule off (the RSRC2-count rule everywhere).
+inline const bool g_needs_on = [] {
+    const char* v = std::getenv("SHADPS4_NATIVE_REC_NEEDS");
+    return !v || v[0] != '0';
+}();
 
 inline u32 VsFetchBase(u64 vs) {
     const u64 k = vs ? vs : 1;
