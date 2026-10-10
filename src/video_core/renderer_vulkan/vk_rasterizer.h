@@ -610,7 +610,7 @@ private:
         u64 prep_try{}, prep_runs{}, prep_members{}, c_prep{}, prep_conf{}, prep_conf_col{},
             prep_cmp_ok{}, prep_cmp_bad{}, prep_join_refused{};
         std::array<u64, 16> prep_jref{}; ///< verify: the join refused a prepared member (close why)
-        std::array<u64, 4> c_prep_ph{}; ///< prepare phases: head, member compute, spans, final
+        std::array<u64, 8> c_prep_ph{}; ///< head, member compute, spans, final; 4-6 inside compute
         u64 prep_looked{};              ///< members that passed the compute loop
         u64 prep_spans{};               ///< NativeRunSpan calls of the prepares
         std::array<u64, 4> prep_c10{};  ///< verify: close 10 of a prepared member by where

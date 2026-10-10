@@ -2752,6 +2752,7 @@ void Rasterizer::NativePrepare(const GraphicsPipeline* base,
         if (j == 0) {
             first_pos = pos;
         }
+        lap(4); // the job ring record: copy, fence, re-check (cross-core reads)
         const u8* pl = payload + (pos & (NR::PayloadSize - 1));
         const u32* flat_vs = reinterpret_cast<const u32*>(pl);
         const u32* flat_ps = flat_vs + nvs;
@@ -2833,6 +2834,7 @@ void Rasterizer::NativePrepare(const GraphicsPipeline* base,
         if (!ok) {
             break;
         }
+        lap(5); // stages: user data push, V# reads from the payload flat buffers, image key
         if (b.colour &&
             (kn != b.img_n || std::memcmp(key.data(), native_img_key.data(), kn * 4) != 0)) {
             why = 7; // the material changed: the next batch starts here
@@ -2869,6 +2871,7 @@ void Rasterizer::NativePrepare(const GraphicsPipeline* base,
             why = 6;
             break;
         }
+        lap(6); // vertex block (payload)
         m.iaddr = index_addr;
         m.icount = index_count;
         m.instances = instances;
@@ -2904,6 +2907,7 @@ void Rasterizer::NativePrepare(const GraphicsPipeline* base,
             }
         }
         ib_u.Add(index_addr, ibytes);
+        lap(7); // range checks against the bounds
         n = j + 1;
     }
     st.prep_looked += n;
@@ -4134,7 +4138,9 @@ void Rasterizer::NativeLog() {
         LOG_INFO(Render_Vulkan,
                  "NativePrep: tries={} runs={} members={} ({:.2f} per run) prepare cycles per "
                  "member {:.0f} (phases per member looked at ({}): head {:.0f} compute {:.0f} spans "
-                 "{:.0f} final {:.0f}; spans per batch {:.2f}) | stops:{} | confirmed={} (colour {}) "
+                 "{:.0f} final {:.0f}; spans per batch {:.2f}; inside compute: ring record {:.0f} "
+                 "stages {:.0f} vertex block {:.0f} range checks {:.0f}) | stops:{} | confirmed={} "
+                 "(colour {}) "
                  "refused:{} | verify ok={} MISMATCH={} join refused a prepared member={} (by "
                  "close:{}; close 10 recorded at formatted slot / other slot / vertex-index: {} {} "
                  "{})",
@@ -4146,6 +4152,10 @@ void Rasterizer::NativeLog() {
                  double(st.c_prep_ph[2]) / double(std::max<u64>(st.prep_looked, 1)),
                  double(st.c_prep_ph[3]) / double(std::max<u64>(st.prep_looked, 1)),
                  st.prep_runs ? double(st.prep_spans) / double(st.prep_runs) : 0.0,
+                 double(st.c_prep_ph[4]) / double(std::max<u64>(st.prep_looked, 1)),
+                 double(st.c_prep_ph[5]) / double(std::max<u64>(st.prep_looked, 1)),
+                 double(st.c_prep_ph[6]) / double(std::max<u64>(st.prep_looked, 1)),
+                 double(st.c_prep_ph[7]) / double(std::max<u64>(st.prep_looked, 1)),
                  arr(st.prep_stop), st.prep_conf, st.prep_conf_col, arr(st.prep_refuse),
                  st.prep_cmp_ok, st.prep_cmp_bad, st.prep_join_refused, arr(st.prep_jref),
                  st.prep_c10[1], st.prep_c10[2], st.prep_c10[3]);
