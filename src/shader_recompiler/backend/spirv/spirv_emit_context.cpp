@@ -1074,28 +1074,44 @@ void EmitContext::NativePtMismatch(u32 handle, Id rel_index, Id pt_bits, Id desc
     // SHADPS4_NATIVE_PT=2: the page-table load against the descriptor load of the same element
     // (both as bits, both 0 past the bound); count every mismatch, keep the first 64 (slot 64 =
     // discard), as NativeCompareAttribute does.
-    const Id bad{OpINotEqual(U1[1], pt_bits, desc_bits)};
-    const Id ptr0{OpAccessChain(native_records_ptr, native_pt_dbg, u32_zero_value, u32_zero_value)};
-    const Id old{OpAtomicIAdd(U32[1], ptr0, ConstU32(1u), u32_zero_value,
-                              OpSelect(U32[1], bad, ConstU32(1u), u32_zero_value))};
-    const Id slot{OpSelect(U32[1],
-                           OpLogicalAnd(U1[1], bad, OpULessThan(U1[1], old, ConstU32(64u))), old,
-                           ConstU32(64u))};
-    const Id base{OpIAdd(U32[1], ConstU32(16u), OpIMul(U32[1], slot, ConstU32(16u)))};
+    // The atomic and the stores run only on a mismatch, inside a helper function (an atomic per
+    // load on one counter took the city to ~1 FPS, s459; a branch here would split the IR's block).
     const u32 tag = (l_stage == LogicalStage::Fragment ? 2u : 1u) | (width << 8);
-    const std::array<Id, 8> words{ConstU32(buffers[handle].binding),
-                                  rel_index,
-                                  pt_bits,
-                                  desc_bits,
-                                  native_draw,
-                                  native_guest_lo[handle],
-                                  native_guest_hi[handle],
-                                  ConstU32(tag)};
-    for (u32 i = 0; i < words.size(); ++i) {
+    OpFunctionCall(void_id, native_pt_report, ConstU32(buffers[handle].binding), rel_index, pt_bits,
+                   desc_bits, native_draw, native_guest_lo[handle], native_guest_hi[handle],
+                   ConstU32(tag));
+}
+
+Id EmitContext::DefineNativePtReport() {
+    const Id func_type{TypeFunction(void_id, U32[1], U32[1], U32[1], U32[1], U32[1], U32[1],
+                                    U32[1], U32[1])};
+    const Id func{OpFunction(void_id, spv::FunctionControlMask::MaskNone, func_type)};
+    std::array<Id, 8> p{};
+    for (auto& param : p) {
+        param = OpFunctionParameter(U32[1]);
+    }
+    Name(func, "native_pt_report");
+    AddLabel();
+    const Id report_label{OpLabel()};
+    const Id merge_label{OpLabel()};
+    const Id bad{OpINotEqual(U1[1], p[2], p[3])};
+    OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    OpBranchConditional(bad, report_label, merge_label);
+    AddLabel(report_label);
+    const Id ptr0{OpAccessChain(native_records_ptr, native_pt_dbg, u32_zero_value, u32_zero_value)};
+    const Id old{OpAtomicIAdd(U32[1], ptr0, ConstU32(1u), u32_zero_value, ConstU32(1u))};
+    const Id slot{OpSelect(U32[1], OpULessThan(U1[1], old, ConstU32(64u)), old, ConstU32(64u))};
+    const Id base{OpIAdd(U32[1], ConstU32(16u), OpIMul(U32[1], slot, ConstU32(16u)))};
+    for (u32 i = 0; i < p.size(); ++i) {
         OpStore(OpAccessChain(native_records_ptr, native_pt_dbg, u32_zero_value,
                               OpIAdd(U32[1], base, ConstU32(i))),
-                words[i]);
+                p[i]);
     }
+    OpBranch(merge_label);
+    AddLabel(merge_label);
+    OpReturn();
+    OpFunctionEnd();
+    return func;
 }
 
 Id EmitContext::NativeVbufLoad(Id dword_index) {
@@ -1785,6 +1801,9 @@ void EmitContext::DefineFunctions() {
     }
     if (info.uses_dma) {
         get_bda_pointer = DefineGetBdaPointer();
+    }
+    if (native_pt_compare && Sirit::ValidId(native_pt_dbg)) {
+        native_pt_report = DefineNativePtReport();
     }
 
     if (True(info.readconst_types & Info::ReadConstType::Immediate)) {

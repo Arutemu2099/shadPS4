@@ -426,6 +426,7 @@ public:
     Id f32_to_uf10{};
 
     Id get_bda_pointer{};
+    Id native_pt_report{}; // SHADPS4_NATIVE_PT=2: void(binding, rel, pt, desc, draw, lo, hi, tag)
 
     Id read_const{};
     Id read_const_dynamic{};
@@ -452,6 +453,7 @@ private:
     Id DefineUfloatM5ToFloat32(u32 mantissa_bits, std::string_view name);
 
     Id DefineGetBdaPointer();
+    Id DefineNativePtReport();
 
     Id DefineReadConst(bool dynamic);
 
