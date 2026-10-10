@@ -1140,7 +1140,12 @@ void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
     rec.gpu_ok = 0;
     rec.union_idx = ~0u;
     if (!r.gpu) [[unlikely]] {
-        r.gpu = new u32[size_t(NR::RingSize) * NR::GpuRecDwords]();
+        if (const auto alloc = NR::g_gpu_alloc.load(std::memory_order_acquire)) {
+            r.gpu = alloc(slot); // ring mode: mapped GPU memory
+        }
+        if (!r.gpu) {
+            r.gpu = new u32[size_t(NR::RingSize) * NR::GpuRecDwords]();
+        }
         r.unions = new NR::RunUnion[NR::UnionMask + 1]();
         NR::g_gpu_recs[slot].store(r.gpu, std::memory_order_release);
         NR::g_unions[slot].store(r.unions, std::memory_order_release);
@@ -1302,6 +1307,9 @@ u32 NativeRecDraw(const u32* cmdbuf, u64 index_addr, u32 index_count, u32 tag) {
     r.cursor = cmdbuf + 10;
     const u32 run_id = tag & 0x0fffffffu;
     const u32 idx = r.next++;
+    if (NR::g_gpu_mode != 0) {
+        NR::g_job_next[tag >> 28].store(r.next, std::memory_order_relaxed);
+    }
     NR::Record& rec = r.ring[idx & (NR::RingSize - 1)];
     rec.stamp.store(0, std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_release);

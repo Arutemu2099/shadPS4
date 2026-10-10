@@ -76,6 +76,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
               (Shader::t_native_emit.colour && info.l_stage == LogicalStage::Fragment));
     native_colour = native && Shader::t_native_emit.colour;
     native_pull = native && Shader::t_native_emit.pull && info.l_stage == LogicalStage::Vertex;
+    native_ring = native && Shader::t_native_emit.ring;
     if (info.uses_dma) {
         SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
     } else {
@@ -247,6 +248,12 @@ void EmitContext::DefineBufferProperties() {
                 OpStore(native_draw_out, draw);
             }
         }
+        if (native_ring) {
+            // SHADPS4_NATIVE_GPU_DIRECT: entry (first + draw) & mask of the records buffer.
+            draw = OpBitwiseAnd(U32[1],
+                                OpIAdd(U32[1], NativeTableLoad(Shader::NativeTableFirst), draw),
+                                NativeTableLoad(Shader::NativeTableMask));
+        }
         native_rec_base = OpIMul(U32[1], draw, ConstU32(Shader::NativeRecordDwords));
         Name(native_rec_base, "native_rec_base");
         if (native_pull && Shader::t_native_emit.compare) {
@@ -281,6 +288,11 @@ void EmitContext::DefineBufferProperties() {
         if (native) {
             // The full byte offset of this draw's binding inside the bound VkBuffer.
             buf_offset = NativeRecordLoad(Shader::NativeRecordOffOffset + binding);
+            if (native_ring) {
+                // The record holds the guest address (low 32 bits); the table the buffer's base.
+                buf_offset = OpISub(U32[1], buf_offset,
+                                    NativeTableLoad(Shader::NativeTableBase + binding));
+            }
             native_size_bytes[i] = NativeRecordLoad(Shader::NativeRecordSizeOffset + binding);
             native_size_dw[i] = OpShiftRightLogical(U32[1], native_size_bytes[i], ConstU32(2U));
         } else {
@@ -950,6 +962,14 @@ void EmitContext::DefineBuffers() {
             Name(native_vbuf, "native_vbuf");
             interfaces.push_back(native_vbuf);
         }
+        if (native_ring) {
+            native_table = AddGlobalVariable(struct_pointer_type, spv::StorageClass::StorageBuffer);
+            Decorate(native_table, spv::Decoration::Binding, Shader::t_native_emit.table_binding);
+            Decorate(native_table, spv::Decoration::DescriptorSet, 0U);
+            Decorate(native_table, spv::Decoration::NonWritable);
+            Name(native_table, "native_table");
+            interfaces.push_back(native_table);
+        }
         if (native_pull && Shader::t_native_emit.compare) {
             native_dbg = AddGlobalVariable(struct_pointer_type, spv::StorageClass::StorageBuffer);
             Decorate(native_dbg, spv::Decoration::Binding, Shader::t_native_emit.debug_binding);
@@ -1023,7 +1043,10 @@ Id EmitContext::NativePullAttribute(u32 loc, Id vindex) {
     const bool packed = a.bits == 0; // A2B10G10R10: R 0-9, G 10-19, B 20-29, A 30-31
     const u32 bytes = packed ? 4u : u32(a.bits) / 8 * a.count;
     const u32 ndw = (bytes + 3) / 4;
-    const Id voff{NativeRecordLoad(Shader::NativeRecordVoffOffset + loc)};
+    Id voff{NativeRecordLoad(Shader::NativeRecordVoffOffset + loc)};
+    if (native_ring) {
+        voff = OpISub(U32[1], voff, NativeTableLoad(Shader::NativeTableVbase + loc));
+    }
     const Id vsize{NativeRecordLoad(Shader::NativeRecordVsizeOffset + loc)};
     const Id rel{OpIMul(U32[1], vindex, ConstU32(a.stride))};
     const Id end{OpIAdd(U32[1], rel, ConstU32(bytes))};
@@ -1153,6 +1176,11 @@ Id EmitContext::NativePullAttribute(u32 loc, Id vindex) {
     const Id value{OpCompositeConstruct(vec_type, c[0], c[1], c[2], c[3])};
     Name(value, fmt::format("native_attr{}", loc));
     return value;
+}
+
+Id EmitContext::NativeTableLoad(u32 dword) {
+    return OpLoad(U32[1],
+                  OpAccessChain(native_records_ptr, native_table, u32_zero_value, ConstU32(dword)));
 }
 
 Id EmitContext::NativeRecordLoad(u32 dword) {

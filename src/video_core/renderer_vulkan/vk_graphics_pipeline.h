@@ -180,6 +180,7 @@ public:
     mutable std::array<NativeColourSlot, NativeColourSlots> native_colour{};
     mutable u8 native_colour_static = 0; ///< front: 0 undecided, 1 eligible, 2 not
     u32 native_vertex_binding = NoNativeRecords; ///< a colour variant: its vertex SSBO binding
+    u32 native_table_binding = NoNativeRecords;  ///< SHADPS4_NATIVE_GPU_DIRECT: the batch table
     const GraphicsPipeline* NativeColourVariant(u64 key) const noexcept {
         for (const auto& slot : native_colour) {
             if (slot.key.load(std::memory_order_acquire) == key) {

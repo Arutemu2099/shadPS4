@@ -90,6 +90,13 @@ struct RunUnion {
     u64 ilo, ihi;
 };
 inline std::array<std::atomic<RunUnion*>, MaxSlots> g_unions{};
+/// SHADPS4_NATIVE_GPU_DIRECT=1: the GPU record ring of a job slot lives in a mapped Vulkan buffer
+/// (allocated through this hook, set by the rasterizer; null: CPU memory, ring mode off); its
+/// VkBuffer handle per slot.
+inline std::atomic<u32* (*)(u32 slot)> g_gpu_alloc{nullptr};
+inline std::array<std::atomic<u64>, MaxSlots> g_gpu_handles{};
+/// The job thread's next ring index (relaxed; the back's ring-lifetime check).
+inline std::array<std::atomic<u32>, MaxSlots> g_job_next{};
 
 constexpr u32 PayloadBits = 23; // 8 MB per thread
 constexpr u64 PayloadSize = u64{1} << PayloadBits;

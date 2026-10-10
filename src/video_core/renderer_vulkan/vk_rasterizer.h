@@ -150,6 +150,7 @@ public:
         u32 slot0{};        ///< batch slot of first_idx
         u64 epoch{}, gen{}; ///< dirty epoch / buffer structure generation at the prepare
         std::array<const void*, 64> cmd{}; ///< each member's DRAW_INDEX_2 packet
+        std::array<u32, 64> icount{}, inst{}; ///< ring mode: each member's index / instance count
         std::vector<u32> side;              ///< verify: (record + 5 command words) per member
         u32 n{};                            ///< members prepared
     } native_prep;
@@ -505,6 +506,7 @@ private:
     };
     struct NativeBatch {
         bool open{};
+        bool ring{}; ///< SHADPS4_NATIVE_GPU_DIRECT: records read from the opener's job ring
         // SHADPS4_NATIVE_REC_RUN (stage c1): spans validated once at the open for the job-thread
         // run the opener heads; valid while the dirty epoch and buffer structure stay put.
         bool run_valid{};
@@ -616,6 +618,10 @@ private:
         /// SHADPS4_NATIVE_GPU_DIRECT=2: 0 no ring / stale, 1 no GPU record, 2 union gone, 3 ok,
         /// 4 mismatch.
         std::array<u64, 5> gv{};
+        /// SHADPS4_NATIVE_GPU_DIRECT=1: ring batches / members, refusals by reason, cycles,
+        /// span syncs.
+        u64 ring_runs{}, ring_members{}, c_ring{}, ring_spans{}, ring_opens_legacy{};
+        std::array<u64, 16> ring_fail{};
         std::array<u64, 4> prep_c10{};  ///< verify: close 10 of a prepared member by where
         std::array<u64, 16> prep_stop{};
         std::array<u64, 16> prep_refuse{};
@@ -630,6 +636,15 @@ private:
                        const std::array<u32, Shader::NUM_BUFFERS>& o_off,
                        const std::array<u32, Shader::NUM_BUFFERS>& o_rsize);
     bool NativeCtxSame();
+    /// SHADPS4_NATIVE_GPU_DIRECT=1 (sec. 10): ring mode for the batch being opened.
+    static u32* NativeGpuRingAlloc(u32 slot);
+    static void NativeGpuRingInit(Rasterizer* owner);
+    bool NativeRingPrepare(const GraphicsPipeline* base,
+                           const AmdGpu::CpSplit::VertexInputAttrib* attribs,
+                           const std::array<u64, Shader::NUM_BUFFERS>& o_addr);
+    void NativeRingWrite();
+    std::array<u32, Shader::NativeTableDwords> native_ring_table{};
+    u64 native_ring_handle{};
     void NativeGpuVerify(const u32* ud, const std::array<u32, Shader::NUM_BUFFERS>& off,
                          const std::array<u32, Shader::NUM_BUFFERS>& size,
                          const std::array<u64, Shader::NUM_BUFFERS>& cpu, const u32* voff,

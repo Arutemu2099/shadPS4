@@ -11,6 +11,7 @@
 #include "video_core/amdgpu/cp_split.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "shader_recompiler/native_emit.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_compile_pool.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -64,6 +65,16 @@ GraphicsPipeline::GraphicsPipeline(
                 .descriptorCount = 1,
                 .stageFlags = vk::ShaderStageFlagBits::eVertex,
             });
+            if (Shader::g_native_ring) {
+                // SHADPS4_NATIVE_GPU_DIRECT: the per-batch table (ring index, bases).
+                native_table_binding = native_records_binding + 1;
+                bindings.push_back({
+                    .binding = native_table_binding,
+                    .descriptorType = vk::DescriptorType::eStorageBuffer,
+                    .descriptorCount = 1,
+                    .stageFlags = vk::ShaderStageFlagBits::eVertex,
+                });
+            }
         }
         BuildDescSetLayout(std::span{bindings.data(), bindings.size()});
     }

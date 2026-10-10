@@ -424,6 +424,7 @@ struct PipelineCache::NativeColourJob {
     GraphicsPipeline::DescSetBindings bindings;
     u32 records_binding{};
     u32 vertex_binding{};
+    u32 table_binding{GraphicsPipeline::NoNativeRecords};
 };
 
 struct PipelineCache::NativeColourCompiler {
@@ -482,6 +483,7 @@ private:
                          std::hash<GraphicsPipelineKey>{}(job->key));
             } else {
                 variant->native_vertex_binding = job->vertex_binding;
+                variant->native_table_binding = job->table_binding;
                 slot.variant.store(variant.get(), std::memory_order_release);
             }
             if (++built <= 64 || (built & 63) == 0) {
@@ -1183,6 +1185,8 @@ void PipelineCache::PrepareNativeVariant(const GraphicsPipeline* base) {
         struct NativeEmitScope {
             NativeEmitScope(u32 rb) {
                 Shader::t_native_emit = {true, rb};
+                Shader::t_native_emit.ring = Shader::g_native_ring;
+                Shader::t_native_emit.table_binding = rb + 1;
             }
             ~NativeEmitScope() {
                 Shader::t_native_emit = {};
@@ -1392,7 +1396,8 @@ void PipelineCache::PrepareNativeColour(const GraphicsPipeline* base,
                 return w;
             }
             // + the records and vertex SSBOs in buffer_infos (static_vector of NUM_BUFFERS).
-            const u32 extra = (VideoCore::g_native_colour_diag & 4096) ? 3u : 2u; // review #5
+            const u32 extra = ((VideoCore::g_native_colour_diag & 4096) ? 3u : 2u) +
+                              (Shader::g_native_ring ? 1u : 0u); // review #5; + the table
             if (vs->buffers.size() + fs->buffers.size() + extra > Shader::NUM_BUFFERS) {
                 return "buffer count";
             }
@@ -1551,6 +1556,8 @@ void PipelineCache::PrepareNativeColour(const GraphicsPipeline* base,
     emit.compare = (VideoCore::g_native_colour_diag & 4096) != 0;
     emit.debug_binding = total.unified + 2;
     emit.vs_hash = vs ? static_cast<u32>(vs->pgm_hash) : 0u;
+    emit.ring = Shader::g_native_ring;
+    emit.table_binding = total.unified + (emit.compare ? 3u : 2u);
     auto native_modules = modules;
     struct NativeEmitScope {
         NativeEmitScope(const Shader::NativeEmit& e) {
@@ -1657,6 +1664,15 @@ void PipelineCache::PrepareNativeColour(const GraphicsPipeline* base,
             .descriptorCount = 1,
             .stageFlags = vk::ShaderStageFlagBits::eVertex,
         });
+    }
+    if (emit.ring) {
+        job->bindings.push_back({
+            .binding = emit.table_binding,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
+        });
+        job->table_binding = emit.table_binding;
     }
     job->records_binding = emit.records_binding;
     job->vertex_binding = emit.vertex_binding;

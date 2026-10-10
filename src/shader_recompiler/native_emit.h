@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <cstdlib>
 #include "common/types.h"
 #include "shader_recompiler/resource.h"
 
@@ -64,6 +65,12 @@ struct NativeEmit {
     u32 draw_location{};
     u32 debug_binding{};
     u32 vs_hash{};
+    /// SHADPS4_NATIVE_GPU_DIRECT=1 (notes/native-path-2026-10-09.md sec. 10): the record of draw
+    /// i is entry (table[first] + i) & table[mask] of the records buffer (a game job thread's
+    /// record ring, or the batch's own records with first 0); each Guest binding's record word and
+    /// each pulled location's are guest addresses (low 32 bits) minus the table's base.
+    bool ring{};
+    u32 table_binding{};
 };
 inline thread_local NativeEmit t_native_emit{};
 
@@ -79,6 +86,18 @@ constexpr u32 NativeRecordVoffOffset = NUM_USER_DATA_REGS + 2 * NUM_BUFFERS;
 constexpr u32 NativeRecordVsizeOffset = NativeRecordVoffOffset + NativeMaxPulledLocations;
 constexpr u32 NativeRecordDwords = NativeRecordVsizeOffset + NativeMaxPulledLocations; // 128
 static_assert(NativeRecordDwords == 128);
+/// SHADPS4_NATIVE_GPU_DIRECT: the per-batch table (ring mode).
+constexpr u32 NativeTableFirst = 0;
+constexpr u32 NativeTableMask = 1;
+constexpr u32 NativeTableBase = 2;
+constexpr u32 NativeTableVbase = 2 + NUM_BUFFERS;
+constexpr u32 NativeTableDwords = 64;
+static_assert(NativeTableVbase + NativeMaxPulledLocations <= NativeTableDwords);
+/// SHADPS4_NATIVE_GPU_DIRECT=1: native variants are compiled in ring mode.
+inline const bool g_native_ring = [] {
+    const char* v = std::getenv("SHADPS4_NATIVE_GPU_DIRECT");
+    return v && v[0] == '1' && v[1] == 0;
+}();
 /// The highest location the flat draw-index varying may use (with 4 built-in components the
 /// 128-component output budget allows locations up to 30; one spare).
 constexpr u32 NativeDrawIndexMaxLocation = 29;
