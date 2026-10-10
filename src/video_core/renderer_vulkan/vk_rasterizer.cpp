@@ -1444,6 +1444,8 @@ Rasterizer::Rasterizer(Rasterizer& primary, WorkerTag)
     build_set_writes = primary.build_set_writes;
     bind_memo_stats = primary.bind_memo_stats;
     tex_bind_memo = primary.tex_bind_memo;
+    native_pt_on = primary.native_pt_on;
+    native_pt_extra = primary.native_pt_extra;
 }
 
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
@@ -4627,7 +4629,8 @@ bool Rasterizer::BindlessRotate() {
 
 void Rasterizer::BindlessRingWrite(u32 tag, u32 idx, const u32* slots) {
     // Ring mode: the GPU reads this draw's record from the job ring; the slot words (128-159)
-    // are the back's (the job thread writes dwords 0-127 only). Write-only (write-combined).
+    // are the back's (the job thread writes dwords 0-127 and the guest-address hi bytes
+    // 160-175). Write-only (write-combined).
     namespace NR = AmdGpu::NativeRec;
     u32* gr = NR::g_gpu_recs[tag >> 28].load(std::memory_order_acquire);
     if (gr) {
