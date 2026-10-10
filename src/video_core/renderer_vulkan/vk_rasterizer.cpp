@@ -2631,6 +2631,13 @@ void Rasterizer::NativePrepare(const GraphicsPipeline* base,
     u32 n = 0;
     u32 why = 15;
     std::array<u32, 512> key;
+    u64 tl = __rdtsc();
+    const auto lap = [&](u32 ph) {
+        const u64 now = __rdtsc();
+        st.c_prep_ph[ph] += now - tl;
+        tl = now;
+    };
+    lap(0); // ring, opener and head records
     for (u32 j = 0; j < want; ++j) {
         const u32 k = run_k0 + 1 + j;
         const u32 mi = head + k;
@@ -2787,6 +2794,8 @@ void Rasterizer::NativePrepare(const GraphicsPipeline* base,
         m.cmd = cmd;
         n = j + 1;
     }
+    st.prep_looked += n;
+    lap(1); // per-member compute from the job records
     if (n < want) {
         ++st.prep_stop[why];
     }
@@ -2871,6 +2880,7 @@ void Rasterizer::NativePrepare(const GraphicsPipeline* base,
         ++st.prep_stop[9];
         n /= 2;
     }
+    lap(2); // spans
     if (!spans_ok) {
         st.c_prep += __rdtsc() - t0;
         return;
@@ -2952,6 +2962,7 @@ void Rasterizer::NativePrepare(const GraphicsPipeline* base,
                   static_cast<u32>(s32(vo)), 0u};
         done = j + 1;
     }
+    lap(3); // final records and commands
     t_prep_n = done;
     native_prep.epoch = epoch;
     native_prep.gen = gen;
@@ -4005,11 +4016,16 @@ void Rasterizer::NativeLog() {
         };
         LOG_INFO(Render_Vulkan,
                  "NativePrep: tries={} runs={} members={} ({:.2f} per run) prepare cycles per "
-                 "member {:.0f} | stops:{} | confirmed={} (colour {}) refused:{} | verify ok={} "
-                 "MISMATCH={} join refused a prepared member={} (by close:{})",
+                 "member {:.0f} (phases per member looked at ({}): head {:.0f} compute {:.0f} spans "
+                 "{:.0f} final {:.0f}) | stops:{} | confirmed={} (colour {}) refused:{} | verify "
+                 "ok={} MISMATCH={} join refused a prepared member={} (by close:{})",
                  st.prep_try, st.prep_runs, st.prep_members,
                  st.prep_runs ? double(st.prep_members) / double(st.prep_runs) : 0.0,
                  st.prep_members ? double(st.c_prep) / double(st.prep_members) : 0.0,
+                 st.prep_looked, double(st.c_prep_ph[0]) / double(std::max<u64>(st.prep_looked, 1)),
+                 double(st.c_prep_ph[1]) / double(std::max<u64>(st.prep_looked, 1)),
+                 double(st.c_prep_ph[2]) / double(std::max<u64>(st.prep_looked, 1)),
+                 double(st.c_prep_ph[3]) / double(std::max<u64>(st.prep_looked, 1)),
                  arr(st.prep_stop), st.prep_conf, st.prep_conf_col, arr(st.prep_refuse),
                  st.prep_cmp_ok, st.prep_cmp_bad, st.prep_join_refused, arr(st.prep_jref));
     }
