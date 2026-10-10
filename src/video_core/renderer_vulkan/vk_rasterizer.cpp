@@ -2619,12 +2619,8 @@ bool Rasterizer::NativeCtxSame() {
     }
     const auto& regs = liverpool->BackRegs();
     const u32* now = &regs.reg_array[AmdGpu::Regs::ContextRegWordOffset];
-    constexpr u32 kDmaBaseHi = 0x1f9, kDmaBase = 0x1fa, kDmaMax = 0x29e, kDmaType = 0x29f;
-    const bool same = std::memcmp(now, native_ctx.data(), sizeof(u32) * kDmaBaseHi) == 0 &&
-                      std::memcmp(now + kDmaBase + 1, native_ctx.data() + kDmaBase + 1,
-                                  sizeof(u32) * (kDmaMax - kDmaBase - 1)) == 0 &&
-                      std::memcmp(now + kDmaType + 1, native_ctx.data() + kDmaType + 1,
-                                  sizeof(u32) * (native_ctx.size() - kDmaType - 1)) == 0;
+    static_assert(std::tuple_size_v<decltype(native_ctx)> == AmdGpu::NativeCtxBlockWords);
+    const bool same = AmdGpu::NativeCtxBlockSame(now, native_ctx.data());
     if (same) {
         b.ctx_epoch = liverpool->BackContextEpoch();
         ++native_stats.epoch_same;

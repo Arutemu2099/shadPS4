@@ -218,6 +218,17 @@ Channel::~Channel() = default;
 
 void* Channel::Reserve(RecordType type, u32 payload_bytes, u16 flags) {
     ASSERT_MSG(!record_open, "CP split: Reserve before the previous record was committed");
+    if (hold && type != RecordType::RegWrite && type != RecordType::Extent &&
+        type != RecordType::Packet && type != RecordType::Diag) [[unlikely]] {
+        // Brick C v3 item 3: a record the hold may not reorder against - the segment builder
+        // closes its segment (posting the Segment record, then the held journal) first.
+        if (hold_cb) {
+            hold_cb(hold_ctx);
+        }
+        if (hold) {
+            FlushHold();
+        }
+    }
     const u32 bytes = AlignUp(u32(sizeof(RecordHeader)) + payload_bytes, RecordAlign);
     ASSERT_MSG(bytes <= capacity / 2, "CP split record of {} bytes does not fit the ring", bytes);
     u64 pos = reserve_pos;
@@ -348,6 +359,13 @@ void Channel::EmitRegWrite(u32 word_offset, const u32* data, u32 count) {
     if (count == 0) {
         return; // Nothing to copy; a count-0 segment would also end a batched record early.
     }
+    if (hold) [[unlikely]] {
+        held.push_back(1u);
+        held.push_back(word_offset);
+        held.push_back(count);
+        held.insert(held.end(), data, data + count);
+        return;
+    }
     const u32 seg = u32(sizeof(RegWritePayload)) + count * 4;
     if (reg_batch && !record_open && reg_seq == emitted && reg_seq != 0) {
         // Append to the newest record if it is our RegWrite and still unpublished: the back cannot
@@ -395,10 +413,52 @@ void Channel::EmitClearState() {
 }
 
 void Channel::EmitExtent(u32 slot, u32 raw) {
+    if (hold) [[unlikely]] {
+        held.push_back(2u);
+        held.push_back(slot);
+        held.push_back(raw);
+        return;
+    }
     auto* payload = Reserve<ExtentPayload>(RecordType::Extent);
     payload->slot = slot;
     payload->raw = raw;
     Commit();
+}
+
+void Channel::BeginHold() {
+    if (!hold) {
+        hold = true;
+        held.clear();
+    }
+}
+
+std::vector<u32> Channel::TakeHold() {
+    hold = false;
+    std::vector<u32> out = std::move(held);
+    held.clear();
+    return out;
+}
+
+void Channel::ReplayHold(const std::vector<u32>& h) {
+    size_t i = 0;
+    while (i + 3 <= h.size()) {
+        const u32 kind = h[i], a = h[i + 1], b = h[i + 2];
+        i += 3;
+        if (kind == 1u) {
+            ASSERT(i + b <= h.size());
+            EmitRegWrite(a, h.data() + i, b);
+            i += b;
+        } else {
+            EmitExtent(a, b);
+        }
+    }
+}
+
+void Channel::FlushHold() {
+    if (hold) {
+        const std::vector<u32> h = TakeHold();
+        ReplayHold(h);
+    }
 }
 
 void Channel::EmitEpochBump(u32 opcode) {
@@ -417,6 +477,7 @@ void Channel::PostRetire() {
 }
 
 void Channel::FrontExited() {
+    FlushHold();
     Sync(DrainReason::FrontExit);
     front_exited.store(true, std::memory_order_release);
     WakeBack();

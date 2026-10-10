@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstring>
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_depth.h"
 #include "video_core/amdgpu/regs_primitive.h"
@@ -190,5 +191,32 @@ union Regs {
 #undef DO_CONCAT2
 #undef CONCAT2
 #undef INSERT_PADDING_WORDS
+
+/// The native batch / segment rule for context-register state (notes/native-path-2026-10-09.md
+/// sec. 25 item 3): two context blocks are the same state when every word but the per-draw
+/// index DMA slots VGT_DMA_BASE_HI / BASE / MAX_SIZE / INDEX_TYPE agrees (s285: at 97% of the
+/// back's refusals only those differed). Shared by the back (Rasterizer::NativeCtxSame) and the
+/// front's segment builder (SegB) so the two rules cannot drift.
+constexpr u32 NativeCtxBlockWords = 0x400;
+inline bool NativeCtxBlockSame(const u32* now, const u32* ref) {
+    constexpr u32 kDmaBaseHi = 0x1f9, kDmaBase = 0x1fa, kDmaMax = 0x29e, kDmaType = 0x29f;
+    return std::memcmp(now, ref, sizeof(u32) * kDmaBaseHi) == 0 &&
+           std::memcmp(now + kDmaBase + 1, ref + kDmaBase + 1,
+                       sizeof(u32) * (kDmaMax - kDmaBase - 1)) == 0 &&
+           std::memcmp(now + kDmaType + 1, ref + kDmaType + 1,
+                       sizeof(u32) * (NativeCtxBlockWords - kDmaType - 1)) == 0;
+}
+/// The first context word the rule counts that differs (NativeCtxBlockWords: none).
+inline u32 NativeCtxBlockFirstDiff(const u32* now, const u32* ref) {
+    for (u32 i = 0; i < NativeCtxBlockWords; ++i) {
+        if (i == 0x1f9 || i == 0x1fa || i == 0x29e || i == 0x29f) {
+            continue;
+        }
+        if (now[i] != ref[i]) {
+            return i;
+        }
+    }
+    return NativeCtxBlockWords;
+}
 
 } // namespace AmdGpu

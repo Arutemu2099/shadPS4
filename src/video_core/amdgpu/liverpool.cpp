@@ -3398,6 +3398,10 @@ struct State {
     u64 inh_slots{};
     std::array<u32, 16> inh_val_vs{}, inh_val_ps{};
     u32 packet{}; ///< first off-whitelist packet kind since the last draw (PkNone: clean)
+    /// v3 item 3 (SEGX): the context block at the segment open (stencil / cull ops update it)
+    /// and whether a value-changing context write is pending the next member's block compare.
+    std::array<u32, NativeCtxBlockWords> ctx0{};
+    bool ctx_dirty{};
     // SHADPS4_NATIVE_SEGX (sec. 23): the segment as the Segment record carries it. `segx`: a
     // Segment record is posted at every close; `exec` (=1): member Draw records are withheld.
     bool init{}, segx{}, exec{};
@@ -3426,12 +3430,28 @@ struct State {
     KeyHist<u32> uc_off{}, ctx_off{};   ///< registers that closed segments (0xffff: CLEAR / CONTROL / CONFIG)
     KeyHist<u32> sh_off{};              ///< SET_SH_REG offsets (first register) that closed segments
     u64 drop_st{}, drop_cull{};         ///< SEGX: state changes pending at a close (no member followed)
+    u64 ctx_cont{}, dma_cont{};         ///< v3 item 3: members continued by the block compare / no-op DMAs
     KeyHist<const char*> why{};         ///< native_colour_why of not-eligible / refused pipelines
     u32 calls{};
     std::chrono::steady_clock::time_point window{};
 };
 State g_state;
 thread_local std::vector<u8> g_scratch; ///< SEGX=1: a withheld member's record is built here
+
+void Close(State& s, u32 why);
+void FlushHold(State& s);
+
+/// v3 item 3: a record the journal hold may not reorder against is about to be reserved - the
+/// open segment closes here (its Segment record first, then the held journal).
+void HoldInterrupt(void*) {
+    auto& s = g_state;
+    if (s.open) {
+        ++s.pk[PkOther];
+        Close(s, RPacket);
+    } else {
+        FlushHold(s);
+    }
+}
 
 /// Front thread, once: the channel and the SEGX gates (never under CP-split VERIFY).
 void Init(State& s, CpSplit::Channel* split, bool run_ahead, bool verify) {
@@ -3440,6 +3460,16 @@ void Init(State& s, CpSplit::Channel* split, bool run_ahead, bool verify) {
     s.run_ahead = run_ahead;
     s.segx = AmdGpu::NativeRec::g_segx != 0 && !verify;
     s.exec = AmdGpu::NativeRec::g_segx == 1 && !verify;
+    if (s.segx && split) {
+        split->SetHoldInterrupt(&HoldInterrupt, nullptr);
+    }
+}
+
+void FlushHold(State& s) {
+    s.ctx_dirty = false;
+    if (s.split) {
+        s.split->FlushHold();
+    }
 }
 
 SplitDrawRecord* ScratchRecord(u32 bytes) {
@@ -3468,6 +3498,9 @@ void PostSegment(State& s) {
     if (!s.split || s.n == 0 || s.rec_bytes == 0) {
         return;
     }
+    // v3 item 3: the Segment record precedes any journal the builder held back.
+    const std::vector<u32> held = s.split->TakeHold();
+    s.ctx_dirty = false;
     s.drop_st += s.st_dirty;
     s.drop_cull += s.cull_dirty;
     std::array<CpSplit::SegOp, CpSplit::SegMaxOps + 3> ops{};
@@ -3544,6 +3577,7 @@ void PostSegment(State& s) {
     }
     s.rec_bytes = 0;
     s.n_rec = 0;
+    s.split->ReplayHold(held);
 }
 
 void NoteSegment(State& s) {
@@ -3563,6 +3597,7 @@ void Close(State& s, u32 why) {
         }
         NoteSegment(s);
     }
+    FlushHold(s);
 }
 
 template <typename K, typename F>
@@ -3621,10 +3656,12 @@ void MaybeLog(State& s) {
     LOG_INFO(Render,
              "NativeSegB front detail: no_variant: shadow={} not_eligible={} undecided={} "
              "not_claimed={} refused={} building={} | why:{} | inherited members={} | uconfig "
-             "close offsets:{} | ctx close offsets:{} | sh close offsets:{}",
+             "close offsets:{} | ctx close offsets:{} | sh close offsets:{} | ctx continued by "
+             "block compare={} dma no-op continued={}",
              s.nv[NvShadow], s.nv[NvNotEligible], s.nv[NvUndecided], s.nv[NvNotClaimed],
              s.nv[NvRefused], s.nv[NvBuilding], TopKeys(s.why, str), s.inh_members,
-             TopKeys(s.uc_off, hex), TopKeys(s.ctx_off, hex), TopKeys(s.sh_off, hex));
+             TopKeys(s.uc_off, hex), TopKeys(s.ctx_off, hex), TopKeys(s.sh_off, hex),
+             s.ctx_cont, s.dma_cont);
     if (s.segx) {
         LOG_INFO(Render,
                  "NativeSegX front: mode {} segment records posted={} members={} ops: draw "
@@ -3646,6 +3683,7 @@ void MaybeLog(State& s) {
     s.sh_off.Reset();
     s.why.Reset();
     s.drop_st = s.drop_cull = 0;
+    s.ctx_cont = s.dma_cont = 0;
 }
 
 /// Every gfx type-3 packet the front parses (ProcessGraphics, before the packet is applied, so
@@ -3717,6 +3755,14 @@ void NotePacket(PM4ItOpcode opcode, const PM4Header* header, u32 count, bool gue
                     s.cur_pc = data[j];
                     s.cull_dirty = true;
                 }
+                s.ctx0[reg] = data[j]; // an op: the block compare must not see it as a change
+                continue;
+            }
+            if (s.segx && s.open && reg < NativeCtxBlockWords) {
+                // v3 item 3: the back's rule - the next member's block compare decides; the
+                // journal is held so a close there still posts the Segment record first.
+                s.ctx_dirty = true;
+                s.split->BeginHold();
                 continue;
             }
             kind = PkCtx;
@@ -3761,6 +3807,14 @@ void NotePacket(PM4ItOpcode opcode, const PM4Header* header, u32 count, bool gue
         kind = PkEvent;
         break;
     case PM4ItOpcode::DmaData:
+        // v3 item 3: the DMA_DATA to 0x3022C is skipped by the back's ExecuteGfxPacket (not a
+        // sequence point, MtbBreakAtPacket): it does not close.
+        if (reinterpret_cast<const PM4DmaData*>(header)->dst_addr_lo == 0x3022C) {
+            s.dma_cont += s.open;
+            break;
+        }
+        kind = PkDma;
+        break;
     case PM4ItOpcode::WriteData:
     case PM4ItOpcode::CopyData:
         kind = PkDma;
@@ -3942,6 +3996,18 @@ bool NativeSegBDraw(const PM4Header* header, const Vulkan::GraphicsPipeline* pip
     }
     if (s.open) {
         u32 why = RNone;
+        bool ctx_changed = false;
+        if (s.ctx_dirty) {
+            // v3 item 3: context writes since the previous member - the back's block compare.
+            const u32* now = &regs.reg_array[Regs::ContextRegWordOffset];
+            if (NativeCtxBlockSame(now, s.ctx0.data())) {
+                ++s.ctx_cont;
+                FlushHold(s);
+            } else {
+                s.ctx_off.Note(NativeCtxBlockFirstDiff(now, s.ctx0.data()));
+                ctx_changed = true;
+            }
+        }
         if (s.pipeline != pipeline) {
             why = RPipeline;
         } else if (s.index_type != regs.index_buffer_type.raw) {
@@ -3949,6 +4015,9 @@ bool NativeSegBDraw(const PM4Header* header, const Vulkan::GraphicsPipeline* pip
         } else if (packet != PkNone) {
             why = RPacket;
             ++s.pk[packet];
+        } else if (ctx_changed) {
+            why = RPacket;
+            ++s.pk[PkCtx];
         } else if (s.n >= MaxMembers) {
             why = RCount;
         } else if (!inh_same()) {
@@ -4014,6 +4083,8 @@ bool NativeSegBDraw(const PM4Header* header, const Vulkan::GraphicsPipeline* pip
         s.init_sf = s.cur_sf = regs.reg_array[Regs::ContextRegWordOffset + CtxStencilF];
         s.init_sb = s.cur_sb = regs.reg_array[Regs::ContextRegWordOffset + CtxStencilB];
         s.init_pc = s.cur_pc = regs.reg_array[Regs::ContextRegWordOffset + CtxPolyCtl];
+        std::memcpy(s.ctx0.data(), &regs.reg_array[Regs::ContextRegWordOffset], sizeof(s.ctx0));
+        s.ctx_dirty = false;
         s.st_dirty = s.cull_dirty = s.any_st = s.any_cull = false;
         s.n_ops = 0;
         s.range_first = 0;

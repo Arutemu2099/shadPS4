@@ -8,6 +8,7 @@
 #include <cstring>
 #include <memory>
 #include <stop_token>
+#include <vector>
 
 #include "common/assert.h"
 #include "common/types.h"
@@ -454,6 +455,22 @@ public:
     void EmitRegWrite(u32 word_offset, const u32* data, u32 count);
     void EmitClearState();
     void EmitExtent(u32 slot, u32 raw);
+    /// SHADPS4_NATIVE_SEGX (brick C v3 item 3): while a hold is on, EmitRegWrite / EmitExtent
+    /// append to a side buffer instead of the ring, so a Segment record posted later can still
+    /// precede them in stream order. ReplayHold re-emits them in order. Reserve() of any record
+    /// other than RegWrite / Extent / Packet / Diag while holding calls the interrupt first (the
+    /// segment builder closes its segment, which takes and replays the hold itself).
+    void BeginHold();
+    bool Holding() const {
+        return hold;
+    }
+    std::vector<u32> TakeHold();
+    void ReplayHold(const std::vector<u32>& held);
+    void FlushHold();
+    void SetHoldInterrupt(void (*fn)(void*), void* context) {
+        hold_cb = fn;
+        hold_ctx = context;
+    }
     void EmitEpochBump(u32 opcode);
 
     /// Runs `fn` on the back while the front waits. `fn` lives on the front's stack, which is
@@ -537,6 +554,10 @@ private:
     u64 committed_pos{0};
     u64 committed_seq{0};
     bool reg_batch{false};
+    bool hold{false};
+    std::vector<u32> held; ///< entries: kind (1 reg / 2 extent), a, b, then count data words
+    void (*hold_cb)(void*){nullptr};
+    void* hold_ctx{nullptr};
     u64 reg_pos{~0ull};  ///< Ring position of the newest RegWrite record header.
     u64 reg_seq{0};      ///< Its seq; appending is allowed only while it is the newest record.
     u32 reg_used{0};     ///< Bytes of it in use (header + segments), before alignment padding.
