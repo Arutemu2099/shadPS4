@@ -3146,8 +3146,276 @@ void NativeRecFront(const PM4Header* header, const Vulkan::Rasterizer::SplitDraw
 
 } // namespace
 
+namespace {
+// SHADPS4_NATIVE_REC=2 (stage b, notes/native-path-2026-10-09.md sec. 6): the front hands the
+// members of a job-thread run to the back without its own pipeline lookup and derivation. The
+// head went through EmitDraw normally and opened the run (NativeRecRun); each member's draw
+// record is built from the job thread's record: the head's pipeline, the member's own user data,
+// flattened user data and program bases, the job-derived vertex inputs with the head's
+// descriptions. =3: the member record is built into a scratch buffer and compared with the
+// normal EmitDraw record of the same draw (which still renders).
+struct NativeRecRun {
+    bool active{};
+    u32 tag{}, head_idx{}, next_k{};
+    u64 ctx_epoch{};
+    const Vulkan::GraphicsPipeline* pipeline{};
+    const Shader::Info* vsi{};
+    const Shader::Info* psi{};
+    u64 desc_id{};
+    u32 desc_count{};
+    std::array<CpSplit::VertexInputDesc, CpSplit::MaxVertexInputs> descs{};
+};
+NativeRecRun g_nr_run;
+struct NativeRecMemberStats {
+    u64 members{}, refused{}, c_member{}, c_normal{}, n_normal{};
+    u64 cmp_ok{}, cmp_bad{};
+    std::array<u64, 8> why{};
+    u32 logged{};
+} g_nr_mst;
+std::vector<u8> g_nr_scratch;
+bool g_nr_scratch_valid{};
+
+u32 StageBlockBytes(u32 ud_dw, u32 flat_dw) {
+    return static_cast<u32>((sizeof(CpSplit::StagePayload) + size_t(ud_dw + flat_dw) * 4 + 7) &
+                            ~size_t{7});
+}
+
+/// Compares the member path's record bytes (after the SplitDrawRecord header) with the normal
+/// path's: stage blocks (ud only below the stage's user-SGPR count, flat as NativeRecFront) and
+/// the vertex-input block byte for byte.
+bool SameMemberRecord(const u8* normal, const u8* member, u32 stage_count, u32 vi_bytes,
+                      const Regs& regs) {
+    for (u32 s = 0; s < stage_count; ++s) {
+        const auto* a = reinterpret_cast<const CpSplit::StagePayload*>(normal);
+        const auto* b = reinterpret_cast<const CpSplit::StagePayload*>(member);
+        if (a->info != b->info || a->pgm_base != b->pgm_base ||
+            a->logical_stage != b->logical_stage || a->ud_dw != b->ud_dw ||
+            a->flat_dw != b->flat_dw) {
+            return false;
+        }
+        const bool vs = a->logical_stage == static_cast<u32>(Shader::LogicalStage::Vertex);
+        const u32 n_user = std::min<u32>(
+            vs ? regs.vs_program.settings.num_user_regs : regs.ps_program.settings.num_user_regs,
+            16u);
+        const auto* da = reinterpret_cast<const u32*>(a + 1);
+        const auto* db = reinterpret_cast<const u32*>(b + 1);
+        for (u32 i = 0; i < a->ud_dw; ++i) {
+            if (i < n_user && da[i] != db[i]) {
+                return false;
+            }
+        }
+        for (u32 i = 0; i < a->flat_dw; ++i) {
+            if ((i >= 16 || i < n_user) && da[a->ud_dw + i] != db[a->ud_dw + i]) {
+                return false;
+            }
+        }
+        const u32 step = StageBlockBytes(a->ud_dw, a->flat_dw);
+        normal += step;
+        member += step;
+    }
+    return std::memcmp(normal, member, vi_bytes) == 0;
+}
+} // namespace
+
+bool Liverpool::NativeRecMember(const PM4Header* header, const char* name, bool host_marker,
+                                const CpSplit::DrawArgs& args) {
+    namespace NR = AmdGpu::NativeRec;
+    auto& run = g_nr_run;
+    auto& st = g_nr_mst;
+    g_nr_scratch_valid = false;
+    const auto refuse = [&](u32 why) {
+        ++st.why[std::min<u32>(why, 7)];
+        ++st.refused;
+        run.active = false;
+        return false;
+    };
+    if (!run.active) {
+        return false;
+    }
+    const auto* w = reinterpret_cast<const u32*>(header);
+    if (header->type3.opcode != PM4ItOpcode::DrawIndex2 || w[6] != 0xc0021000u ||
+        w[7] != NR::Magic || split_verify || split_front_derive == 0) {
+        return refuse(0);
+    }
+    const u32 tag = w[8];
+    const u32 idx = w[9];
+    const NR::Record* ring = NR::g_rings[tag >> 28].load(std::memory_order_acquire);
+    const u8* payload = NR::g_payloads[tag >> 28].load(std::memory_order_acquire);
+    if (!ring || !payload) {
+        return refuse(1);
+    }
+    const NR::Record& src = ring[idx & (NR::RingSize - 1)];
+    if (src.stamp.load(std::memory_order_acquire) != idx + 1 || src.cmd != w) {
+        return refuse(1);
+    }
+    if (src.run_k != run.next_k || src.head_idx != run.head_idx || src.tag != run.tag ||
+        !src.derived) {
+        return refuse(2);
+    }
+    if (context_change_epoch != run.ctx_epoch) {
+        return refuse(3);
+    }
+    const auto* gp = static_cast<const Vulkan::GraphicsPipeline*>(src.pipeline);
+    const auto gstages = gp->GetStages();
+    if (gstages[static_cast<u32>(Shader::LogicalStage::Vertex)] != run.vsi ||
+        gstages[static_cast<u32>(Shader::LogicalStage::Fragment)] != run.psi) {
+        return refuse(4);
+    }
+    const u64 t0 = __rdtsc();
+    Vulkan::Rasterizer::SplitDraw draw{.args = args};
+    if (!rasterizer->PrepareMemberFront(draw, run.pipeline)) {
+        return refuse(5);
+    }
+    // Copy the job thread's data out first, then re-check the stamp (seqlock).
+    const u32 nvs = src.flat_vs_dw, nps = src.flat_ps_dw, vi_bytes = src.vi_bytes;
+    const u64 pos = src.payload_pos;
+    const auto ud_vs = src.ud_vs;
+    const auto ud_ps = src.ud_ps;
+    const VAddr vs_pgm = VAddr{src.vs_pgm} << 8, ps_pgm = VAddr{src.ps_pgm} << 8;
+    const u8* pl = payload + (pos & (NR::PayloadSize - 1));
+    const u32 vs_block = StageBlockBytes(16, nvs);
+    const u32 ps_block = run.psi ? StageBlockBytes(16, nps) : 0u;
+    const u32 body = vs_block + ps_block + vi_bytes;
+    thread_local std::vector<u8> local;
+    local.resize(body);
+    u8* out = local.data();
+    for (u32 i = 0; i < gstages.size(); ++i) {
+        const bool is_vs = i == static_cast<u32>(Shader::LogicalStage::Vertex);
+        const bool is_ps = i == static_cast<u32>(Shader::LogicalStage::Fragment);
+        if (!gstages[i] || (!is_vs && !is_ps)) {
+            continue;
+        }
+        auto* sp = reinterpret_cast<CpSplit::StagePayload*>(out);
+        sp->info = gstages[i];
+        sp->pgm_base = is_vs ? vs_pgm : ps_pgm;
+        sp->logical_stage = i;
+        sp->ud_dw = 16;
+        sp->flat_dw = is_vs ? nvs : nps;
+        sp->pad = 0;
+        auto* dw = reinterpret_cast<u32*>(sp + 1);
+        std::memcpy(dw, is_vs ? ud_vs.data() : ud_ps.data(), 16 * 4);
+        std::memcpy(dw + 16, is_vs ? pl : pl + size_t(nvs) * 4, size_t(sp->flat_dw) * 4);
+        out += StageBlockBytes(16, sp->flat_dw);
+    }
+    const u8* vi_src = pl + (u64(nvs + nps) * 4 + 7) / 8 * 8;
+    std::memcpy(out, vi_src, vi_bytes);
+    {
+        auto* hdr = reinterpret_cast<CpSplit::VertexInputsPayload*>(out);
+        auto* att = reinterpret_cast<CpSplit::VertexInputAttrib*>(hdr + 1);
+        if (hdr->count != run.desc_count) {
+            return refuse(6);
+        }
+        hdr->desc_id = run.desc_id;
+        for (u32 a = 0; a < hdr->count; ++a) {
+            att[a].desc = run.descs[a]; // the head's (divisors come from context registers)
+        }
+    }
+    if (src.stamp.load(std::memory_order_acquire) != idx + 1) {
+        return refuse(1);
+    }
+    const u32 stage_count = run.psi ? 2u : 1u;
+    if (NR::g_mode == 3) {
+        // Verify: keep the bytes for EmitDraw's compare; the normal path renders.
+        g_nr_scratch.assign(local.begin(), local.end());
+        g_nr_scratch_valid = true;
+        ++run.next_k;
+        return false;
+    }
+    auto* rec = split->Reserve<SplitDrawRecord>(CpSplit::RecordType::Draw,
+                                                sizeof(SplitDrawRecord) + body);
+    rec->draw = draw;
+    rec->ctx_epoch = context_change_epoch;
+    rec->marker = host_marker ? name : nullptr;
+    rec->cmd_address = header;
+    rec->stage_count = stage_count;
+    rec->verify = 0;
+    rec->vi_bytes = vi_bytes;
+    rec->pad = 0;
+    std::memcpy(reinterpret_cast<u8*>(rec + 1), local.data(), body);
+    split->Commit();
+    if (split_run_ahead) {
+        split->PostRunAhead(CpSplit::PostKind::Draw);
+    } else {
+        split->Sync(CpSplit::DrainReason::DepthZero);
+    }
+    split->MaybeLog();
+    ++run.next_k;
+    ++st.members;
+    st.c_member += __rdtsc() - t0;
+    return true;
+}
+
+void Liverpool::NativeRecHead(const PM4Header* header, const void* pipeline_ptr, bool plain_draw,
+                              u32 vi_bytes, const u8* record_body, u32 stage_count) {
+    namespace NR = AmdGpu::NativeRec;
+    const auto* draw_pipeline = static_cast<const Vulkan::GraphicsPipeline*>(pipeline_ptr);
+    auto& run = g_nr_run;
+    auto& st = g_nr_mst;
+    // Mode 3: compare the member path's bytes with this (normal) record's.
+    if (g_nr_scratch_valid) {
+        g_nr_scratch_valid = false;
+        const bool same = g_nr_scratch.size() >= vi_bytes &&
+                          SameMemberRecord(record_body, g_nr_scratch.data(), stage_count,
+                                           vi_bytes, regs) &&
+                          draw_pipeline == run.pipeline;
+        (same ? st.cmp_ok : st.cmp_bad) += 1;
+        if (!same && ++st.logged <= 16) {
+            LOG_WARNING(Render, "NativeRec member MISMATCH (k {}, pipeline {})", run.next_k - 1,
+                        draw_pipeline == run.pipeline ? "same" : "differs");
+        }
+        return; // a verified member is not a head
+    }
+    run.active = false;
+    const auto* w = reinterpret_cast<const u32*>(header);
+    if (header->type3.opcode != PM4ItOpcode::DrawIndex2 || w[6] != 0xc0021000u ||
+        w[7] != NR::Magic || !draw_pipeline || !plain_draw || vi_bytes == 0) {
+        return;
+    }
+    const u32 tag = w[8];
+    const u32 idx = w[9];
+    const NR::Record* ring = NR::g_rings[tag >> 28].load(std::memory_order_acquire);
+    if (!ring) {
+        return;
+    }
+    const NR::Record& src = ring[idx & (NR::RingSize - 1)];
+    if (src.stamp.load(std::memory_order_acquire) != idx + 1 || src.cmd != w ||
+        src.run_k != 0 || src.count < 2 || !src.derived) {
+        return;
+    }
+    const auto stages = draw_pipeline->GetStages();
+    for (u32 i = 0; i < stages.size(); ++i) {
+        if (stages[i] && i != static_cast<u32>(Shader::LogicalStage::Vertex) &&
+            i != static_cast<u32>(Shader::LogicalStage::Fragment)) {
+            return;
+        }
+    }
+    const Shader::Info* vsi = stages[static_cast<u32>(Shader::LogicalStage::Vertex)];
+    if (!vsi || vsi->stage != Shader::Stage::Vertex) {
+        return;
+    }
+    run.active = true;
+    run.tag = tag;
+    run.head_idx = idx;
+    run.next_k = 1;
+    run.ctx_epoch = context_change_epoch;
+    run.pipeline = draw_pipeline;
+    run.vsi = vsi;
+    run.psi = stages[static_cast<u32>(Shader::LogicalStage::Fragment)];
+    run.desc_id = front_vi->header.desc_id;
+    run.desc_count = front_vi->header.count;
+    for (u32 a = 0; a < run.desc_count; ++a) {
+        run.descs[a] = front_vi->attribs[a].desc;
+    }
+}
+
 void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_marker,
                          const CpSplit::DrawArgs& args) {
+    if (AmdGpu::NativeRec::g_mode >= 2) [[unlikely]] {
+        if (NativeRecMember(header, name, host_marker, args)) {
+            return;
+        }
+    }
+    const u64 t_nr = AmdGpu::NativeRec::g_mode >= 2 ? __rdtsc() : 0;
     u32 tag = 0;
     u64 t_front = 0;
     if (g_draw_tag_front) [[unlikely]] {
@@ -3267,6 +3535,25 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
     }
     if (verify == DrawVerifySnapshot) {
         WriteVerifySnapshot(out, regs, last_cb_extent, last_db_extent);
+    }
+    if (AmdGpu::NativeRec::g_mode >= 2) [[unlikely]] {
+        NativeRecHead(header, draw.pipeline,
+                      draw.draw_class == Vulkan::Rasterizer::DrawClass::Draw && !draw.skip,
+                      vi_bytes, reinterpret_cast<const u8*>(rec + 1),
+                      rec->stage_count);
+        auto& st = g_nr_mst;
+        st.c_normal += __rdtsc() - t_nr;
+        if ((++st.n_normal & 0x3ffff) == 0) {
+            LOG_INFO(Render,
+                     "NativeRec members: taken={} refused={} (why 0 tag/mode 1 ring/stale 2 "
+                     "run order 3 epoch 4 infos 5 class 6 vi count: {} {} {} {} {} {} {}) | "
+                     "mode-3 compare ok={} MISMATCH={} | front cycles per draw: member {:.0f} "
+                     "normal EmitDraw {:.0f} (n={})",
+                     st.members, st.refused, st.why[0], st.why[1], st.why[2], st.why[3],
+                     st.why[4], st.why[5], st.why[6], st.cmp_ok, st.cmp_bad,
+                     st.members ? double(st.c_member) / double(st.members) : 0.0,
+                     double(st.c_normal) / double(st.n_normal), st.n_normal);
+        }
     }
     split->Commit();
     if (sync) {

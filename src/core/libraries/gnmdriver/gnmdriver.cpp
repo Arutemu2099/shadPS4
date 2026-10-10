@@ -1197,6 +1197,8 @@ u32 NativeRecDraw(const u32* cmdbuf, u64 index_addr, u32 index_count, u32 tag) {
     rec.gap_dwords = gap;
     rec.ud_vs = r.vs;
     rec.ud_ps = r.ps;
+    rec.vs_pgm = t_draw_tag_pgm[0];
+    rec.ps_pgm = t_draw_tag_pgm[1];
     if (cont) {
         rec.run_k = r.head->count;
         rec.head_idx = r.head_idx;

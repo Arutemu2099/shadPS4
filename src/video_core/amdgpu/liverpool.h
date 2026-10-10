@@ -365,6 +365,10 @@ private:
     void JournalExtent(u32 reg_addr);
     /// VideoCore::BumpSubmitEpoch, or in split mode an EpochBump record (runs in stream order).
     void BumpEpoch(PM4ItOpcode opcode);
+    bool NativeRecMember(const PM4Header* header, const char* name, bool host_marker,
+                         const CpSplit::DrawArgs& args);
+    void NativeRecHead(const PM4Header* header, const void* pipeline, bool plain_draw,
+                       u32 vi_bytes, const u8* record_body, u32 stage_count);
     void EmitDraw(const PM4Header* header, const char* name, bool host_marker,
                   const CpSplit::DrawArgs& args);
     /// `queue`: 0 = gfx, vqid + 1 = ASC (the mapped_queues index whose cs_state is copied).

@@ -2031,6 +2031,19 @@ void Rasterizer::PrepareDrawFront(SplitDraw& draw) {
     }
 }
 
+bool Rasterizer::PrepareMemberFront(SplitDraw& draw, const GraphicsPipeline* pipeline) {
+    // As PrepareDrawFront for a direct draw, without the lookup: the job thread proved the
+    // shaders, vertex layout, specialization and context equal to the run head's.
+    draw.draw_class = ClassifyDraw(liverpool->regs);
+    if (draw.draw_class != DrawClass::Draw || draw.args.is_indirect) {
+        return false;
+    }
+    AmdGpu::SplitHazard::NoteDraw(liverpool->regs.ps_program, liverpool->regs.vs_program);
+    draw.skip = SkipEmptyDraw(liverpool->regs);
+    draw.pipeline = pipeline;
+    return true;
+}
+
 const ComputePipeline* Rasterizer::PrepareDispatchFront() {
     // CP split, front thread: reads the front's current queue cs registers (GetCsRegs).
     return pipeline_cache.GetComputePipeline();

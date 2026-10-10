@@ -102,6 +102,9 @@ public:
     /// Front thread: classification, hazard note, empty-draw skip and pipeline lookup, reading
     /// the front's registers. Touches no cache, the scheduler or any per-draw member.
     void PrepareDrawFront(SplitDraw& draw);
+    /// SHADPS4_NATIVE_REC=2, front: PrepareDrawFront for a job-thread run member, whose
+    /// pipeline is the run head's (no lookup). False: not a plain draw (take the normal path).
+    bool PrepareMemberFront(SplitDraw& draw, const GraphicsPipeline* pipeline);
     /// SHADPS4_NATIVE_COLOUR: front thread, after FRONT_DERIVE (notes/colour-pass-2026-10-09.md).
     void PrepareNativeColourFront(const GraphicsPipeline* pipeline,
                                   const AmdGpu::CpSplit::VertexInputsDerived& vi) {

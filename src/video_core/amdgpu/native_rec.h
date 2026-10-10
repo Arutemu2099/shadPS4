@@ -49,6 +49,8 @@ struct Record {
     u64 payload_pos;      ///< byte position in the thread's payload ring: flat VS, flat PS, vi
     const void* pipeline; ///< the Vulkan::GraphicsPipeline the derivation used
     u64 fetch_addr;
+    u32 vs_pgm; ///< the bound VS / PS program address >> 8 (the game binds per-object copies)
+    u32 ps_pgm;
 };
 
 constexpr u32 PayloadBits = 23; // 8 MB per thread
