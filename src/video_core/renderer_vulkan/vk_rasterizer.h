@@ -718,6 +718,12 @@ private:
         u64 bl_img_hit{}, bl_img_miss{}, bl_smp_hit{}, bl_smp_miss{};
         u64 bl_vfy_ok{}, bl_vfy_bad{}, bl_vfy_none{}, bl_rot{};
         u64 c_bl_hit{}, c_bl_miss{}; ///< cycles in image hits / misses
+        /// Segment census (sec. 14): pipeline-change closes by bits 1 = fixed state equal (key
+        /// minus shaders and vertex formats), 2 = vertex formats equal, 4 = next pipeline has a
+        /// native variant, 8 = context registers moved; native -> non-native draw transitions.
+        std::array<u64, 16> seg_c2{};
+        u64 seg_to_other{};
+        bool seg_last_native{};
         std::array<u64, 4> rj_fail{};
         std::array<u64, 4> prep_c10{};  ///< verify: close 10 of a prepared member by where
         std::array<u64, 16> prep_stop{};

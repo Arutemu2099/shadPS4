@@ -2237,6 +2237,7 @@ void Rasterizer::ExecuteDraw(const SplitDraw& draw,
         if (native_timing) {
             const u64 dt = __rdtsc() - t1;
             if (native_stats.last_open_colour) {
+                native_stats.seg_last_native = true;
                 native_stats.c_tail_copen += dt;
                 ++native_stats.n_tail_copen;
                 {
@@ -2250,6 +2251,7 @@ void Rasterizer::ExecuteDraw(const SplitDraw& draw,
                     DrawTagNote(draw.pipeline, 3u, dt);
                 }
             } else if (draw.pipeline->native_variant.load(std::memory_order_relaxed)) {
+                native_stats.seg_last_native = true;
                 native_stats.c_tail_nat += dt;
                 ++native_stats.n_tail_nat;
                 if (g_draw_tag_back) [[unlikely]] {
@@ -2258,6 +2260,8 @@ void Rasterizer::ExecuteDraw(const SplitDraw& draw,
             } else {
                 native_stats.c_tail_other += dt;
                 ++native_stats.n_tail_other;
+                native_stats.seg_to_other += native_stats.seg_last_native;
+                native_stats.seg_last_native = false;
                 bool images = false;
                 for (const auto* stage : draw.pipeline->GetStages()) {
                     images = images || (stage && !stage->images.empty());
@@ -4685,6 +4689,19 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
     const auto& regs = liverpool->BackRegs();
     b.cand_valid = false;
     if (draw.pipeline != b.base) {
+        // Segment census (sec. 14): would a GPU-driven segment survive this pipeline change?
+        const auto& ka = b.base->GetGraphicsKey();
+        const auto& kb = draw.pipeline->GetGraphicsKey();
+        constexpr size_t fixed0 = offsetof(GraphicsPipelineKey, patch_control_points);
+        const bool fixed_eq =
+            std::memcmp(reinterpret_cast<const u8*>(&ka) + fixed0,
+                        reinterpret_cast<const u8*>(&kb) + fixed0, sizeof(ka) - fixed0) == 0;
+        const bool vf_eq = ka.vertex_buffer_formats == kb.vertex_buffer_formats;
+        const bool nat = draw.pipeline->native_variant.load(std::memory_order_relaxed) != nullptr ||
+                         draw.pipeline->native_colour[0].key.load(std::memory_order_relaxed) != 0;
+        const bool ctx = liverpool->BackContextEpoch() != b.ctx_epoch;
+        ++native_stats.seg_c2[(fixed_eq ? 1u : 0u) | (vf_eq ? 2u : 0u) | (nat ? 4u : 0u) |
+                              (ctx ? 8u : 0u)];
         NativeClose(2);
         return false;
     }
@@ -5432,6 +5449,20 @@ void Rasterizer::NativeLog() {
                  st.rj_fail[2], st.rj_fail[3], st.rj_cmp_ok, st.rj_cmp_bad, rf,
                  st.prep_conf, st.prep_conf_col, st.prep_cmp_ok, st.prep_cmp_bad,
                  st.prep_join_refused, st.prep_jref[12], st.prep_jref[10]);
+    }
+    {
+        std::string sc;
+        for (u32 i = 0; i < 16; ++i) {
+            if (st.seg_c2[i]) {
+                sc += fmt::format(" {}{}{}{}={}", (i & 1) ? "F" : "f", (i & 2) ? "V" : "v",
+                                  (i & 4) ? "N" : "n", (i & 8) ? "C" : "c", st.seg_c2[i]);
+            }
+        }
+        LOG_INFO(Render_Vulkan,
+                 "NativeSegCensus: pipeline-change closes by F fixed state equal / V vertex "
+                 "formats equal / N next native / C context moved (lower case = not):{} | native "
+                 "-> other transitions {}",
+                 sc, st.seg_to_other);
     }
     if (st.bl_open + st.bl_open_fail != 0) {
         LOG_INFO(Render_Vulkan,
