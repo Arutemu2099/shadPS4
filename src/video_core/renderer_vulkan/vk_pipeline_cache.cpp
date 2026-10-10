@@ -106,9 +106,13 @@ static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsO
     return num_outputs;
 }
 
-const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalStage l_stage) {
-    auto& info = runtime_infos[u32(l_stage)];
-    const auto& regs = liverpool->regs;
+// The graphics stages of BuildRuntimeInfo over an explicit register file: a pure function of
+// `regs`, `key.color_buffers` (first key pass) and, for the LS stage, the hull Info's per-draw
+// state. Shared by the front path (member scratch) and the read-only path (caller's scratch).
+void PipelineCache::FillStageRuntimeInfo(Shader::RuntimeInfo& info, const AmdGpu::Regs& regs,
+                                         Stage stage, LogicalStage l_stage,
+                                         const Shader::Info* hull_info,
+                                         const GraphicsPipelineKey& key, bool dump) const {
     const auto BuildCommon = [&](const auto& program) {
         info.num_user_data = program.settings.num_user_regs;
         info.num_input_vgprs = program.settings.vgpr_comp_cnt;
@@ -118,12 +122,10 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
         info.fp_round_mode32 = program.settings.fp_round_mode32;
         info.fp_round_mode16_64 = program.settings.fp_round_mode64;
     };
-    info.Initialize(stage);
     switch (stage) {
     case Stage::Local: {
         BuildCommon(regs.ls_program);
         Shader::TessellationDataConstantBuffer tess_constants{};
-        const auto* hull_info = infos[u32(Shader::LogicalStage::TessellationControl)];
         hull_info->ReadTessConstantBuffer(tess_constants);
         info.ls_info.ls_stride = tess_constants.ls_stride;
         break;
@@ -202,7 +204,10 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
         const auto params_vc = AmdGpu::GetParams(regs.vs_program);
         gs_info.vs_copy = params_vc.code;
         gs_info.vs_copy_hash = params_vc.hash;
-        DumpShader(gs_info.vs_copy, gs_info.vs_copy_hash, Shader::Stage::Vertex, 0, "copy.bin");
+        if (dump) {
+            DumpShader(gs_info.vs_copy, gs_info.vs_copy_hash, Shader::Stage::Vertex, 0,
+                       "copy.bin");
+        }
         break;
     }
     case Stage::Fragment: {
@@ -240,7 +245,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
             };
         }
         for (u32 i = 0; i < Shader::MaxColorBuffers; i++) {
-            info.fs_info.color_buffers[i] = graphics_key.color_buffers[i];
+            info.fs_info.color_buffers[i] = key.color_buffers[i];
         }
         // Lowered user clip planes ride the same emulation path as guest-exported distances, so
         // the fragment side arms whenever the hardware vertex stage lowers them, keeping its input
@@ -255,7 +260,22 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
             profile.needs_clip_distance_emulation;
         break;
     }
-    case Stage::Compute: {
+    default:
+        break;
+    }
+}
+
+const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(const AmdGpu::Regs& regs, Stage stage,
+                                                           LogicalStage l_stage) {
+    auto& info = runtime_infos[u32(l_stage)];
+    info.Initialize(stage);
+    if (stage != Stage::Compute) {
+        FillStageRuntimeInfo(info, regs, stage, l_stage,
+                             infos[u32(Shader::LogicalStage::TessellationControl)], graphics_key,
+                             true);
+        return info;
+    }
+    {
         const auto& cs_pgm = liverpool->GetCsRegs();
         info.num_user_data = cs_pgm.settings.num_user_regs;
         info.num_allocated_vgprs = cs_pgm.settings.num_vgprs * 4;
@@ -284,10 +304,6 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
                          seen.size());
             }
         }
-        break;
-    }
-    default:
-        break;
     }
     return info;
 }
@@ -705,7 +721,7 @@ size_t PipelineCache::PreparedPipelineWays() {
 }
 
 PipelineCache::PreparedPipelineEntry* PipelineCache::TryPreparedPipeline(
-    PreparedGraphicsState& state, bool& eligible) {
+    const AmdGpu::Regs& regs, PreparedGraphicsState& state, bool& eligible) {
     constexpr auto fs_idx = u32(LogicalStage::Fragment);
     constexpr auto vs_idx = u32(LogicalStage::Vertex);
     auto& stats = prepared_stats;
@@ -720,7 +736,6 @@ PipelineCache::PreparedPipelineEntry* PipelineCache::TryPreparedPipeline(
     }
 
     eligible = false;
-    const auto& regs = liverpool->regs;
     // Same stage/program presence tests as RefreshGraphicsStages for the plain VS+PS case.
     // Shader collection records module/pipeline relations on the original path only.
     if (regs.stage_enable.raw != AmdGpu::ShaderStageEnable::VgtStages::Vs ||
@@ -975,6 +990,15 @@ void PipelineCache::VerifyPreparedPipeline(PreparedPipelineEntry& entry,
 }
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
+    std::unique_lock lk{graphics_mutex};
+    return GraphicsLookupLocked(liverpool->regs);
+}
+
+const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLocked() {
+    return GraphicsLookupLocked(liverpool->regs);
+}
+
+const GraphicsPipeline* PipelineCache::GraphicsLookupLocked(const AmdGpu::Regs& regs) {
     // MEASUREMENT (perf-forest): GetGraphicsPipeline is 0.99 us/draw = 6.3 ms/frame and never
     // split. Before designing a memo, learn (a) how the cost divides between RefreshGraphicsKey
     // (memset + wide reg read + stage resolve) and the robin_map lookup, and (b) how often the
@@ -985,7 +1009,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     PreparedPipelineEntry* prepared_hit = nullptr;
     bool prepared_eligible = false;
     if (PreparedPipelinesEnabled()) {
-        prepared_hit = TryPreparedPipeline(prepared_state, prepared_eligible);
+        prepared_hit = TryPreparedPipeline(regs, prepared_state, prepared_eligible);
         if (prepared_hit && !PreparedPipelinesVerify()) {
             return prepared_hit->pipeline;
         }
@@ -998,7 +1022,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     }
     lookup_translate_ms = 0;
     const auto t_probe0 = Common::FaultMonitor::Now();
-    if (!RefreshGraphicsKey()) {
+    if (!RefreshGraphicsKey(regs)) {
         ASSERT_MSG(!prepared_hit, "PreparedPipelines hit a draw the original path rejects");
         return nullptr;
     }
@@ -1051,7 +1075,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
         // A draw that carries a register-driven depth or stencil clear is not skipped: the clear
         // is that draw's own load op (Rasterizer depth attachment), so skipping it would leave
         // the frame's depth/stencil uncleared (Opus review 2026-10-01). It compiles in line.
-        const auto& drc = liverpool->regs.depth_render_control;
+        const auto& drc = regs.depth_render_control;
         if (AsyncPipelinesEnabled() && !drc.depth_clear_enable && !drc.stencil_clear_enable) {
             // The entry stays null until a later lookup publishes the compiler's result; this
             // draw and every draw of the key until then are skipped. Nothing below (memo seed,
@@ -1098,9 +1122,20 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
 }
 
 void PipelineCache::PrepareNativeVariant(const GraphicsPipeline* base) {
-    // Front thread, registers = the draw that just looked `base` up. Decided once per pipeline.
+    std::unique_lock lk{graphics_mutex};
+    PrepareNativeVariantLocked(base, liverpool->regs);
+}
+
+void PipelineCache::PrepareNativeVariant(const GraphicsPipeline* base, const AmdGpu::Regs& regs) {
+    std::unique_lock lk{graphics_mutex};
+    PrepareNativeVariantLocked(base, regs);
+}
+
+void PipelineCache::PrepareNativeVariantLocked(const GraphicsPipeline* base,
+                                               const AmdGpu::Regs& regs) {
+    // Exclusive lock held; registers = the draw that just looked `base` up. Decided once per
+    // pipeline.
     base->native_checked = true;
-    const auto& regs = liverpool->regs;
     const auto why_not = [&]() -> const char* {
         if (regs.stage_enable.raw != AmdGpu::ShaderStageEnable::VgtStages::Vs) {
             return "stages";
@@ -1156,7 +1191,7 @@ void PipelineCache::PrepareNativeVariant(const GraphicsPipeline* base) {
     }
     // Rebuild the stage selection for the current registers (members infos / modules /
     // runtime_infos / fetch_shader) and make sure it is `base`.
-    if (!RefreshGraphicsKey() || !(graphics_key == base->GetGraphicsKey())) {
+    if (!RefreshGraphicsKey(regs) || !(graphics_key == base->GetGraphicsKey())) {
         if (logged++ < 64) {
             LOG_WARNING(Render_Vulkan, "NativePass: pipeline {:#x} key did not rebuild",
                         std::hash<GraphicsPipelineKey>{}(base->GetGraphicsKey()));
@@ -1370,12 +1405,25 @@ const char* NativeBufferWhyNot(const Shader::Info& info, u32 narrow_diag_bit = 4
 
 void PipelineCache::PrepareNativeColour(const GraphicsPipeline* base,
                                         const AmdGpu::CpSplit::VertexInputsDerived& vi) {
-    // Front thread, right after FRONT_DERIVE: registers and `vi` = the draw that looked `base`
-    // up. Static eligibility once per pipeline, then one variant per vertex description.
+    std::unique_lock lk{graphics_mutex};
+    PrepareNativeColourLocked(base, vi, liverpool->regs);
+}
+
+void PipelineCache::PrepareNativeColour(const GraphicsPipeline* base,
+                                        const AmdGpu::CpSplit::VertexInputsDerived& vi,
+                                        const AmdGpu::Regs& regs) {
+    std::unique_lock lk{graphics_mutex};
+    PrepareNativeColourLocked(base, vi, regs);
+}
+
+void PipelineCache::PrepareNativeColourLocked(const GraphicsPipeline* base,
+                                              const AmdGpu::CpSplit::VertexInputsDerived& vi,
+                                              const AmdGpu::Regs& regs) {
+    // Exclusive lock held; right after FRONT_DERIVE: registers and `vi` = the draw that looked
+    // `base` up. Static eligibility once per pipeline, then one variant per vertex description.
     if (base->native_colour_static == 2) {
         return;
     }
-    const auto& regs = liverpool->regs;
     const auto stages = base->GetStages();
     const auto* vs = stages[u32(LogicalStage::Vertex)];
     const auto* fs = stages[u32(LogicalStage::Fragment)];
@@ -1522,7 +1570,7 @@ void PipelineCache::PrepareNativeColour(const GraphicsPipeline* base,
             }
         }
     }
-    if (!RefreshGraphicsKey() || !(graphics_key == base->GetGraphicsKey())) {
+    if (!RefreshGraphicsKey(regs) || !(graphics_key == base->GetGraphicsKey())) {
         log_not("key did not rebuild");
         return;
     }
@@ -1803,6 +1851,9 @@ void PipelineCache::NoteCompiledPipeline(u64 hash, double translate_ms, double c
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
+    // Exclusive: GetProgram may insert into program_cache (a rehash under a concurrent
+    // LookupGraphics would be a race) and compute_pipelines is mutated below.
+    std::unique_lock lk{graphics_mutex};
     if (!RefreshComputeKey()) {
         return nullptr;
     }
@@ -1829,19 +1880,11 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     return it->second.get();
 }
 
-bool PipelineCache::RefreshGraphicsKey() {
-    // MEASUREMENT (perf-forest): split the 0.955 us into the SKIPPABLE key assembly (pre+post:
-    // memset
-    // + register reads + color-buffer loops) vs the MANDATORY stage resolution
-    // (RefreshGraphicsStages
-    // -> GetProgram, which refreshes per-draw user_data that BindResources consumes and cannot be
-    // skipped). Only pre+post is reclaimable by a memo; this sizes it before any is written.
-    const auto rgk_t0 = Common::FaultMonitor::Now();
-    std::memset(&graphics_key, 0, sizeof(GraphicsPipelineKey));
-    const auto& regs = liverpool->regs;
-    auto& key = graphics_key;
+void PipelineCache::GraphicsKeyFirstPass(const AmdGpu::Regs& regs, GraphicsPipelineKey& key,
+                                         bool& db_enabled, bool& skip_cb_binding) {
+    std::memset(&key, 0, sizeof(GraphicsPipelineKey));
 
-    const bool db_enabled = regs.depth_buffer.DepthValid() || regs.depth_buffer.StencilValid();
+    db_enabled = regs.depth_buffer.DepthValid() || regs.depth_buffer.StencilValid();
 
     key.z_format = regs.depth_buffer.DepthValid() ? regs.depth_buffer.z_info.format
                                                   : AmdGpu::DepthBuffer::ZFormat::Invalid;
@@ -1865,8 +1908,7 @@ bool PipelineCache::RefreshGraphicsKey() {
     key.num_samples = key.depth_samples;
     key.cb_shader_mask = regs.color_shader_mask;
 
-    const bool skip_cb_binding =
-        regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable;
+    skip_cb_binding = regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable;
 
     // First pass to fill render target information needed by shader recompiler
     for (s32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS && !skip_cb_binding; ++cb) {
@@ -1884,14 +1926,52 @@ bool PipelineCache::RefreshGraphicsKey() {
         color_buffer.export_format = regs.color_export_format.GetFormat(cb);
         color_buffer.swizzle = col_buf.Swizzle();
     }
+}
+
+bool PipelineCache::RefreshGraphicsKey(const AmdGpu::Regs& regs) {
+    // MEASUREMENT (perf-forest): split the 0.955 us into the SKIPPABLE key assembly (pre+post:
+    // memset
+    // + register reads + color-buffer loops) vs the MANDATORY stage resolution
+    // (RefreshGraphicsStages
+    // -> GetProgram, which refreshes per-draw user_data that BindResources consumes and cannot be
+    // skipped). Only pre+post is reclaimable by a memo; this sizes it before any is written.
+    const auto rgk_t0 = Common::FaultMonitor::Now();
+    bool db_enabled = false;
+    bool skip_cb_binding = false;
+    GraphicsKeyFirstPass(regs, graphics_key, db_enabled, skip_cb_binding);
 
     // Compile and bind shader stages
     const auto rgk_t1 = Common::FaultMonitor::Now();
-    if (!RefreshGraphicsStages()) {
+    if (!RefreshGraphicsStages(regs)) {
         return false;
     }
     const auto rgk_t2 = Common::FaultMonitor::Now();
 
+    GraphicsKeySecondPass(regs, graphics_key, db_enabled, skip_cb_binding, true);
+
+    if constexpr (Common::FaultMonitor::DetailCountersEnabled || SHADPS4_FAULT_TIMERS) {
+        static u64 rgk_calls = 0, rgk_pre = 0, rgk_stages = 0, rgk_post = 0;
+        const auto rgk_t3 = Common::FaultMonitor::Now();
+        rgk_pre += Common::FaultMonitor::DiffNs(rgk_t0, rgk_t1);
+        rgk_stages += Common::FaultMonitor::DiffNs(rgk_t1, rgk_t2);
+        rgk_post += Common::FaultMonitor::DiffNs(rgk_t2, rgk_t3);
+        if (++rgk_calls >= 200000) {
+            LOG_INFO(
+                Render_Vulkan,
+                "RgkSplit: pre={:.3f}us stages={:.3f}us post={:.3f}us skippable(pre+post)={:.3f}us",
+                static_cast<double>(rgk_pre) / 1e3 / rgk_calls,
+                static_cast<double>(rgk_stages) / 1e3 / rgk_calls,
+                static_cast<double>(rgk_post) / 1e3 / rgk_calls,
+                static_cast<double>(rgk_pre + rgk_post) / 1e3 / rgk_calls);
+            rgk_calls = rgk_pre = rgk_stages = rgk_post = 0;
+        }
+    }
+    return true;
+}
+
+void PipelineCache::GraphicsKeySecondPass(const AmdGpu::Regs& regs, GraphicsPipelineKey& key,
+                                          bool db_enabled, bool skip_cb_binding,
+                                          bool allow_log) const {
     // Second pass to mask out render targets not written by shader and fill remaining info
     u8 color_samples = 0;
     bool all_color_samples_same = true;
@@ -1928,7 +2008,8 @@ bool PipelineCache::RefreshGraphicsKey() {
         // SHADPS4_MIXED_SAMPLES_LOG=1 (diagnostic): each distinct shader pair / sample-count
         // combination that draws with color samples != depth samples, logged once. These are
         // the pipelines VK_NV_framebuffer_mixed_samples keeps mixed (Pro skin edge highlights).
-        const bool log_mixed = g_log_mixed_samples;
+        // Front path only (`allow_log`): the `seen` set below is unsynchronized.
+        const bool log_mixed = g_log_mixed_samples && allow_log;
         if (log_mixed && depth_mismatch && regs.ps_program.Address<u32*>() &&
             regs.vs_program.Address<u32*>()) {
             static std::unordered_set<u64> seen;
@@ -1954,29 +2035,9 @@ bool PipelineCache::RefreshGraphicsKey() {
             key.num_samples = key.depth_samples;
         }
     }
-
-    if constexpr (Common::FaultMonitor::DetailCountersEnabled || SHADPS4_FAULT_TIMERS) {
-        static u64 rgk_calls = 0, rgk_pre = 0, rgk_stages = 0, rgk_post = 0;
-        const auto rgk_t3 = Common::FaultMonitor::Now();
-        rgk_pre += Common::FaultMonitor::DiffNs(rgk_t0, rgk_t1);
-        rgk_stages += Common::FaultMonitor::DiffNs(rgk_t1, rgk_t2);
-        rgk_post += Common::FaultMonitor::DiffNs(rgk_t2, rgk_t3);
-        if (++rgk_calls >= 200000) {
-            LOG_INFO(
-                Render_Vulkan,
-                "RgkSplit: pre={:.3f}us stages={:.3f}us post={:.3f}us skippable(pre+post)={:.3f}us",
-                static_cast<double>(rgk_pre) / 1e3 / rgk_calls,
-                static_cast<double>(rgk_stages) / 1e3 / rgk_calls,
-                static_cast<double>(rgk_post) / 1e3 / rgk_calls,
-                static_cast<double>(rgk_pre + rgk_post) / 1e3 / rgk_calls);
-            rgk_calls = rgk_pre = rgk_stages = rgk_post = 0;
-        }
-    }
-    return true;
 }
 
-bool PipelineCache::RefreshGraphicsStages() {
-    const auto& regs = liverpool->regs;
+bool PipelineCache::RefreshGraphicsStages(const AmdGpu::Regs& regs) {
     auto& key = graphics_key;
     fetch_shader.reset();
 
@@ -2001,7 +2062,7 @@ bool PipelineCache::RefreshGraphicsStages() {
         std::shared_ptr<const Shader::Gcn::FetchShaderData> fetch_shader_;
         std::tie(infos[stage_out_idx], modules[stage_out_idx], fetch_shader_,
                  key.stage_hashes[stage_out_idx]) =
-            GetProgram(stage_in, stage_out, params, binding);
+            GetProgram(regs, stage_in, stage_out, params, binding);
         if (fetch_shader_) {
             fetch_shader = std::move(fetch_shader_);
         }
@@ -2207,7 +2268,14 @@ void PipelineCache::RetirePrecompiled(u64 hash) {
 PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
-    auto runtime_info = BuildRuntimeInfo(stage, l_stage);
+    return GetProgram(liverpool->regs, stage, l_stage, params, binding);
+}
+
+PipelineCache::Result PipelineCache::GetProgram(const AmdGpu::Regs& regs, Stage stage,
+                                                LogicalStage l_stage,
+                                                const Shader::ShaderParams& params,
+                                                Shader::Backend::Bindings& binding) {
+    auto runtime_info = BuildRuntimeInfo(regs, stage, l_stage);
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
     if (new_program) {
         const auto t_translate = CompileClock::now();
@@ -2303,7 +2371,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
             // scratch (the new-program path), exactly as for a program the cache never held.
             RetirePrecompiled(params.hash);
             binding = start;
-            return GetProgram(stage, l_stage, params, binding);
+            return GetProgram(regs, stage, l_stage, params, binding);
         }
     }
     if (compiled) {
@@ -2381,6 +2449,10 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
         }
         // SHADPS4_ASYNC_COMPUTE_PIPELINES: queued compute compiles hold module handles too.
         PipelineCompilePool::WaitIdle();
+        // Architecture A: the mutation below (modules, prepared guards, pipeline erasure) is
+        // exclusive against worker lookups. Taken after the waits above so a worker blocked on
+        // the lock cannot be what those waits are waiting for.
+        std::unique_lock lk{graphics_mutex};
         // Entries hold pipeline pointers and module handles; drop them all before either
         // can be destroyed below. Runs on the command-processor thread like the draws.
         ++prepared_pipeline_epoch;
@@ -2420,7 +2492,7 @@ std::string PipelineCache::GetShaderName(Shader::Stage stage, u64 hash,
 }
 
 void PipelineCache::DumpShader(std::span<const u32> code, u64 hash, Shader::Stage stage,
-                               size_t perm_idx, std::string_view ext) {
+                               size_t perm_idx, std::string_view ext) const {
     if (!EmulatorSettings.IsDumpShaders()) {
         return;
     }
@@ -2454,4 +2526,323 @@ std::optional<std::vector<u32>> PipelineCache::GetShaderPatch(u64 hash, Shader::
     file.Read(code);
     return code;
 }
+
+// ---- Architecture A (notes/NATIVE-RENDERER.md sec. 9): the lookup from any thread -----------
+//
+// THREAD SAFETY. Every non-local object LookupGraphics (shared lock) reads, and why that is safe:
+//  - `regs` (the caller's private register file) and guest memory reached through it (shader
+//    code for AmdGpu::GetParams / SearchBinaryInfo, whose scan memo is thread_local and whose
+//    prefetch hints are atomics; user-data tables through the SRT walker and the fetch shader
+//    code behind user_data[fetch_shader_sgpr_base]): the caller owns `regs`; guest memory is the
+//    same racy input the front reads today.
+//  - program_cache (robin_map) and Program::modules (small_vector): read-only under the shared
+//    lock; every mutation (GetProgram's try_emplace / AddPermut, RetirePrecompiled's erase,
+//    ReplaceShader's module swap) runs under the exclusive lock. Programs are never destroyed
+//    (unique_ptr in the map or parked in retired_programs), so Program / Info pointers stay valid
+//    for the run.
+//  - The IMMUTABLE half of a shared Shader::Info (buffers, images, samplers, fmasks, ud_mask,
+//    srt_info, fetch_shader_sgpr_base, has_fetch_shader, stage, l_stage, pgm_hash, mrt_mask,
+//    uses_dma, loads / stores, ...): written once by CompileModule / Info::Deserialize before the
+//    Program is published into program_cache (later permutations translate into a fresh
+//    `new_info`), never afterwards. The read-only path copies it into the scratch's InfoView and
+//    never reads the Info's per-draw half (pgm_base, user_data, flattened_ud_buf), which the
+//    front path rewrites under the exclusive lock.
+//  - srt_info.walker_func: JIT-generated code called with the scratch's own buffers; assumed
+//    reentrant (it takes its input and output pointers as arguments - inferred from its
+//    signature, not verified against the emitter).
+//  - graphics_pipelines (robin_map): read-only under the shared lock; inserted / erased only
+//    under the exclusive lock (GraphicsLookupLocked, PublishAsyncPipelines, ReplaceShader;
+//    LoadGraphicsPipeline / WarmUp run before the game, single-threaded). A GraphicsPipeline is
+//    never destroyed while the game runs except by ReplaceShader (devtools, after WaitIdle).
+//  - `instance` (const feature queries), `profile` (set in the constructor), the g_* launch
+//    flags (const, read once), Shader::g_synthetic_flat (set only during WarmUp).
+//  - Shader::StageSpecialization's constructor, Gcn::ParseFetchShader and the LiverpoolToVK
+//    helpers: pure over their arguments (function-local `static const` flags only).
+// NOT reproduced read-only (routed to LookupOrBuildGraphics' exclusive path, which runs the
+// front's own code and is therefore bit-identical to it): any stage configuration other than
+// stage_enable == Vs (tessellation / geometry read the hull Info's per-draw state and dump the
+// copy shader); a program hash missing from program_cache; a precompiled program's first live use
+// (writes precompiled_seen, may retire the program); a specialization with no module (compiles);
+// a key with no pipeline (compiles); the SHADPS4_PREPARED_PROGRAMS / _PIPELINES memos (front-only
+// guards whose selections the verify modes assert equal to the plain first match, which this
+// path always makes); the MIXED_SAMPLES diagnostic log; SharedFetchMetadata's verify counters.
+
+static_assert(std::is_copy_assignable_v<Shader::Info>,
+              "GraphicsLookupScratch::InfoView copies the shared Shader::Info");
+
+Shader::Info& GraphicsLookupScratch::View(const Shader::Info& shared) {
+    InfoView* victim = &views[0];
+    for (auto& view : views) {
+        if (view.source == &shared) {
+            view.last_use = ++view_clock;
+            return view.info;
+        }
+        if (view.last_use < victim->last_use) {
+            victim = &view;
+        }
+    }
+    // The copy takes the immutable half (never rewritten after publication) and whatever the
+    // per-draw half holds right now; the latter is overwritten before every use.
+    victim->info = shared;
+    victim->source = &shared;
+    victim->last_use = ++view_clock;
+    return victim->info;
+}
+
+void GraphicsLookupScratch::Reset() {
+    pipeline = nullptr;
+    fetch_shader = nullptr;
+    miss = Miss::None;
+    key = GraphicsPipelineKey{};
+    for (auto& stage : stages) {
+        stage.info = nullptr;
+        stage.pgm_base = 0;
+        stage.user_data.clear();
+        stage.flattened_ud_buf.clear();
+        stage.module = vk::ShaderModule{};
+    }
+}
+
+std::unique_lock<std::shared_mutex> PipelineCache::AcquireExclusive() const {
+    return std::unique_lock{graphics_mutex};
+}
+
+const GraphicsPipeline* PipelineCache::LookupGraphics(const AmdGpu::Regs& regs,
+                                                      GraphicsLookupScratch& out) const {
+    out.Reset();
+    std::shared_lock lk{graphics_mutex};
+    return LookupGraphicsShared(regs, out);
+}
+
+PipelineCache::Resolve PipelineCache::ResolveStageReadOnly(
+    const AmdGpu::Regs& regs, Stage stage_in, LogicalStage stage_out,
+    Shader::Backend::Bindings& binding, GraphicsLookupScratch& out,
+    const Shader::Info*& view_out, const Program::Module*& module_out) const {
+    // RefreshGraphicsStages' bind_stage + GetProgram's cached path, without the writes: the
+    // same presence tests, the same per-draw refresh (into the scratch's copy), the same
+    // RuntimeInfo, the same StageSpecialization and the same first-match permutation search.
+    using Miss = GraphicsLookupScratch::Miss;
+    const auto in_idx = static_cast<u32>(stage_in);
+    const auto out_idx = static_cast<u32>(stage_out);
+    auto& slot = out.stages[out_idx];
+    slot.info = nullptr;
+    out.key.stage_hashes[out_idx] = 0;
+    view_out = nullptr;
+    module_out = nullptr;
+    if (!regs.stage_enable.IsStageEnabled(in_idx)) {
+        return Resolve::Unbound;
+    }
+    const auto* pgm = regs.ProgramForStage(in_idx);
+    if (!pgm || !pgm->Address<u32*>()) {
+        return Resolve::Unbound;
+    }
+    const auto params = AmdGpu::GetParams(*pgm);
+    const auto it = program_cache.find(params.hash);
+    if (it == program_cache.end()) {
+        out.miss = Miss::NoProgram; // the front would translate and compile it
+        return Resolve::Miss;
+    }
+    const Program& program = *it->second;
+    if (program.precompiled && !program.precompiled_seen) [[unlikely]] {
+        out.miss = Miss::PrecompiledFirstUse; // the front records the use, may retire
+        return Resolve::Miss;
+    }
+    // GetProgram's per-draw refresh, on the private copy.
+    Shader::Info& view = out.View(program.info);
+    view.pgm_base = params.Base();
+    view.user_data = params.user_data;
+    view.RefreshFlatBuf();
+    auto& runtime_info = out.runtime_infos[out_idx];
+    runtime_info.Initialize(stage_in);
+    FillStageRuntimeInfo(runtime_info, regs, stage_in, stage_out, nullptr, out.key, false);
+    // The plain first-match selection (the prepared-programs guard, when enabled, is asserted
+    // equal to it by its verify mode and is skipped here).
+    const Shader::StageSpecialization spec(view, runtime_info, profile, binding);
+    const auto found = std::ranges::find(program.modules, spec, &Program::Module::spec);
+    if (found == program.modules.end()) {
+        out.miss = Miss::NoPermutation; // the front would compile a permutation
+        return Resolve::Miss;
+    }
+    view.AddBindings(binding); // identical to the shared Info's AddBindings (immutable half)
+    const size_t perm_idx = static_cast<size_t>(std::distance(program.modules.begin(), found));
+    out.key.stage_hashes[out_idx] = HashCombine(params.hash, perm_idx);
+    slot.info = &program.info;
+    slot.pgm_base = view.pgm_base;
+    slot.user_data.assign(view.user_data.begin(), view.user_data.end());
+    slot.flattened_ud_buf = view.flattened_ud_buf;
+    slot.module = found->module;
+    view_out = &view;
+    module_out = &*found;
+    return Resolve::Bound;
+}
+
+const GraphicsPipeline* PipelineCache::LookupGraphicsShared(const AmdGpu::Regs& regs,
+                                                            GraphicsLookupScratch& out) const {
+    using Miss = GraphicsLookupScratch::Miss;
+    if (regs.stage_enable.raw != AmdGpu::ShaderStageEnable::VgtStages::Vs) {
+        out.miss = Miss::UnsupportedStages;
+        return nullptr;
+    }
+    auto& key = out.key;
+    bool db_enabled = false;
+    bool skip_cb_binding = false;
+    GraphicsKeyFirstPass(regs, key, db_enabled, skip_cb_binding);
+
+    // RefreshGraphicsStages for the Vs case: fragment first, then vertex, one binding chain;
+    // neither stage's absence is an error (bind_stage's results are ignored there).
+    Shader::Backend::Bindings binding{};
+    const Shader::Info* fs_view = nullptr;
+    const Shader::Info* vs_view = nullptr;
+    const Program::Module* fs_module = nullptr;
+    const Program::Module* vs_module = nullptr;
+    if (ResolveStageReadOnly(regs, Stage::Fragment, LogicalStage::Fragment, binding, out,
+                             fs_view, fs_module) == Resolve::Miss) {
+        return nullptr;
+    }
+    const auto* fs_info = out.stages[static_cast<u32>(LogicalStage::Fragment)].info;
+    key.mrt_mask = fs_info ? fs_info->mrt_mask : 0u;
+    key.num_color_attachments = std::bit_width(key.mrt_mask);
+    if (ResolveStageReadOnly(regs, Stage::Vertex, LogicalStage::Vertex, binding, out, vs_view,
+                             vs_module) == Resolve::Miss) {
+        return nullptr;
+    }
+    // RefreshGraphicsStages' member fetch_shader = the selected VS permutation's (the fragment
+    // stage never carries one).
+    const Shader::Gcn::FetchShaderData* fetch =
+        vs_module ? vs_module->fetch_shader.get() : nullptr;
+    if (vs_view && fetch && !instance.IsVertexInputDynamicState()) {
+        // Without vertex input dynamic state, the pipeline needs to specialize on format.
+        u32 vertex_binding = 0;
+        for (const auto& attrib : fetch->attributes) {
+            const auto& buffer = attrib.GetSharp(*vs_view);
+            ASSERT_MSG(vertex_binding < MaxVertexBufferCount,
+                       "Vertex attribute binding count exceeded limit: {} >= {}", vertex_binding,
+                       MaxVertexBufferCount);
+            key.vertex_buffer_formats[vertex_binding++] =
+                Vulkan::LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt());
+        }
+    }
+
+    GraphicsKeySecondPass(regs, key, db_enabled, skip_cb_binding, false);
+
+    const auto it = graphics_pipelines.find(key);
+    if (it == graphics_pipelines.end()) {
+        out.miss = Miss::NoPipeline; // the front would construct it (or queue it, async)
+        return nullptr;
+    }
+    if (!it->second) {
+        out.miss = Miss::PipelinePending; // SHADPS4_ASYNC_PIPELINES: the front returns null too
+        return nullptr;
+    }
+    out.pipeline = it->second.get();
+    out.fetch_shader = out.pipeline->GetFetchShader();
+    return out.pipeline;
+}
+
+const GraphicsPipeline* PipelineCache::LookupOrBuildGraphics(const AmdGpu::Regs& regs,
+                                                             GraphicsLookupScratch& out) {
+    if (const auto* pipeline = LookupGraphics(regs, out)) {
+        return pipeline;
+    }
+    // The front's own lookup over `regs` (re-checks the tables, then compiles exactly as
+    // GetGraphicsPipeline would; a pending async key still yields null). It writes the member
+    // scratch and the bound stages' shared Infos, from which the result is captured.
+    std::unique_lock lk{graphics_mutex};
+    const GraphicsPipeline* pipeline = GraphicsLookupLocked(regs);
+    CaptureFrontLocked(out, pipeline);
+    return pipeline;
+}
+
+void PipelineCache::CaptureFront(GraphicsLookupScratch& out,
+                                 const GraphicsPipeline* pipeline) const {
+    CaptureFrontLocked(out, pipeline);
+}
+
+void PipelineCache::CaptureFrontLocked(GraphicsLookupScratch& out,
+                                       const GraphicsPipeline* pipeline) const {
+    // What liverpool.cpp copies after the front's lookup: pipeline->GetStages() and, per bound
+    // stage, the shared Info's per-draw fields (WriteStage), plus the member selection.
+    out.Reset();
+    out.pipeline = pipeline;
+    out.key = graphics_key;
+    out.runtime_infos = runtime_infos;
+    if (!pipeline) {
+        return;
+    }
+    out.fetch_shader = pipeline->GetFetchShader();
+    const auto stages = pipeline->GetStages();
+    for (u32 i = 0; i < stages.size() && i < out.stages.size(); ++i) {
+        const Shader::Info* info = stages[i];
+        if (!info) {
+            continue;
+        }
+        auto& slot = out.stages[i];
+        slot.info = info;
+        slot.pgm_base = info->pgm_base;
+        slot.user_data.assign(info->user_data.begin(), info->user_data.end());
+        slot.flattened_ud_buf = info->flattened_ud_buf;
+        slot.module = modules[i];
+    }
+}
+
+bool PipelineCache::LookupMatchesFront(const GraphicsLookupScratch& s,
+                                       const GraphicsPipeline* front_result,
+                                       const char** why) const {
+    // Field by field, never struct bytes (rules-appendix: a verify mode compares FIELDS).
+    const auto fail = [&](const char* what) {
+        if (why) {
+            *why = what;
+        }
+        return false;
+    };
+    if (s.pipeline != front_result) {
+        return fail("pipeline");
+    }
+    if (!front_result) {
+        if (why) {
+            *why = nullptr;
+        }
+        return true; // both null: the miss reason may differ by design (see out.miss)
+    }
+    if (!(s.key == graphics_key)) {
+        return fail("key");
+    }
+    if (s.fetch_shader != front_result->GetFetchShader()) {
+        return fail("fetch shader");
+    }
+    const auto stages = front_result->GetStages();
+    for (u32 i = 0; i < s.stages.size(); ++i) {
+        const Shader::Info* info = i < stages.size() ? stages[i] : nullptr;
+        const auto& slot = s.stages[i];
+        if (slot.info != info) {
+            return fail("stage info pointer");
+        }
+        if (!info) {
+            if (!slot.user_data.empty() || !slot.flattened_ud_buf.empty()) {
+                return fail("unbound stage carries data");
+            }
+            continue;
+        }
+        if (slot.pgm_base != info->pgm_base) {
+            return fail("pgm_base");
+        }
+        if (!std::ranges::equal(slot.user_data, info->user_data)) {
+            return fail("user data words");
+        }
+        if (!std::ranges::equal(slot.flattened_ud_buf, info->flattened_ud_buf)) {
+            return fail("flattened words");
+        }
+        if (slot.module != modules[i]) {
+            return fail("module");
+        }
+        if (!SameRuntimeInfo(s.runtime_infos[i], runtime_infos[i])) {
+            return fail("runtime info");
+        }
+    }
+    if (why) {
+        *why = nullptr;
+    }
+    return true;
+}
+
 } // namespace Vulkan

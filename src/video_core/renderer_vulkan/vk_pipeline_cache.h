@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <mutex>
+#include <shared_mutex>
 #include <unordered_set>
 #include <variant>
 #include <tsl/robin_map.h>
@@ -24,6 +26,7 @@ struct std::hash<vk::ShaderModule> {
 
 namespace AmdGpu {
 class Liverpool;
+union Regs;
 }
 
 namespace Serialization {
@@ -97,6 +100,62 @@ struct Program {
     }
 };
 
+/// Architecture A (notes/NATIVE-RENDERER.md sec. 9): caller-owned scratch of one graphics pipeline
+/// lookup over a private register file (PipelineCache::LookupGraphics / LookupOrBuildGraphics /
+/// CaptureFront). One per worker thread, reused across draws (its vectors keep their capacity).
+/// After a successful lookup it holds everything the front copies into a draw record today
+/// (liverpool.cpp WriteStage): per logical stage the SHARED Shader::Info pointer (the back reads
+/// only its immutable part), pgm_base, the user data words and the flattened user-data buffer,
+/// exactly as the front's lookup would have left them in that Info for the same registers; plus
+/// the key, the per-stage runtime infos and modules of the selection and the pipeline's fetch
+/// shader. Valid until the next lookup on the same scratch.
+struct GraphicsLookupScratch {
+    struct Stage {
+        const Shader::Info* info{}; ///< Program::info (shared, immutable part); null = unbound
+        VAddr pgm_base{};
+        std::vector<u32> user_data; ///< Shader::ShaderParams::NumShaderUserData words
+        std::vector<u32> flattened_ud_buf;
+        vk::ShaderModule module{};
+    };
+    /// Why LookupGraphics returned null (the read-only path never compiles).
+    enum class Miss : u8 {
+        None,
+        UnsupportedStages,   ///< not the plain VS(+PS) configuration: exclusive path only
+        NoProgram,           ///< a bound stage's program hash is not in program_cache (would compile)
+        PrecompiledFirstUse, ///< SHADPS4_PRECOMPILE first live use (the front path writes state)
+        NoPermutation,       ///< no module matches the specialization (would compile)
+        NoPipeline,          ///< the key has no pipeline (would compile)
+        PipelinePending,     ///< SHADPS4_ASYNC_PIPELINES: compiling; the front returns null too
+    };
+
+    const GraphicsPipeline* pipeline{};
+    GraphicsPipelineKey key{};
+    std::array<Stage, MaxShaderStages> stages{};
+    std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
+    const Shader::Gcn::FetchShaderData* fetch_shader{}; ///< = pipeline->GetFetchShader()
+    Miss miss{};
+
+    /// Private copies of the shared Infos this scratch has resolved, keyed by the shared Info's
+    /// address (Programs are never destroyed, so an address names one program for the run). The
+    /// immutable half of a shared Info never changes after its program is published (see the
+    /// thread-safety note in vk_pipeline_cache.cpp), so a copy is refreshed only when evicted;
+    /// the per-draw half (pgm_base, user_data, flattened_ud_buf) is rewritten in the copy on every
+    /// lookup, which is what lets the read-only path run the unmodified StageSpecialization /
+    /// fetch-shader / SRT-walker code (all of which take a Shader::Info) without touching the
+    /// shared object.
+    struct InfoView {
+        const Shader::Info* source{};
+        u64 last_use{};
+        Shader::Info info{};
+    };
+    static constexpr size_t NumViews = 16;
+    std::array<InfoView, NumViews> views{};
+    u64 view_clock{};
+
+    Shader::Info& View(const Shader::Info& shared);
+    void Reset();
+};
+
 class PipelineCache {
 public:
     explicit PipelineCache(const Instance& instance, Scheduler& scheduler,
@@ -120,13 +179,67 @@ public:
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
     bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
 
+    /// Front (command-processor) thread: the lookup for liverpool->regs, writing the member scratch
+    /// and each bound stage's per-draw fields in the shared Infos (what WriteStage reads). Takes the
+    /// cache's exclusive lock for its duration (= GetGraphicsPipelineLocked under AcquireExclusive).
     const GraphicsPipeline* GetGraphicsPipeline();
+
+    // ---- Architecture A: lookups from any thread over an explicit register file --------------
+    // Locking (one std::shared_mutex, `graphics_mutex`, non-recursive): LookupGraphics holds it
+    // SHARED for the whole lookup; GetGraphicsPipeline, GetComputePipeline, LookupOrBuildGraphics'
+    // miss path, PrepareNativeVariant / PrepareNativeColour and ReplaceShader's mutation hold it
+    // EXCLUSIVE. Every *Locked member assumes the caller holds the exclusive lock and takes none.
+
+    /// Any thread, concurrently with other LookupGraphics calls: computes the key from `regs`
+    /// (exactly what the front computes from liverpool->regs for a plain VS(+PS) draw, every
+    /// early-out included), looks the pipeline up and fills `out` with each bound stage's per-draw
+    /// data as WriteStage would read it after the front's lookup. Returns null and sets out.miss
+    /// on a miss (never compiles, never writes member state or any shared Shader::Info field) and
+    /// whenever the front's lookup would return null. Configurations other than
+    /// stage_enable == Vs are reported as Miss::UnsupportedStages (LookupOrBuildGraphics handles
+    /// them on the exclusive path).
+    const GraphicsPipeline* LookupGraphics(const AmdGpu::Regs& regs,
+                                           GraphicsLookupScratch& out) const;
+
+    /// Any thread: LookupGraphics, and on a miss the exclusive path: re-runs the front's complete
+    /// lookup over `regs` (prepared memo, async queueing, program / permutation / pipeline
+    /// compiles, all as GetGraphicsPipeline would) and captures its result into `out`. NOTE: the
+    /// exclusive path leaves the shared Infos holding THIS draw's per-draw fields, as the front's
+    /// own lookup would; a front that reads them without holding AcquireExclusive() across its
+    /// lookup + WriteStage can observe them.
+    const GraphicsPipeline* LookupOrBuildGraphics(const AmdGpu::Regs& regs,
+                                                  GraphicsLookupScratch& out);
+
+    /// The exclusive guard; hold it across GetGraphicsPipelineLocked + WriteStage on the front
+    /// once workers may take LookupOrBuildGraphics' build path concurrently.
+    [[nodiscard]] std::unique_lock<std::shared_mutex> AcquireExclusive() const;
+    /// GetGraphicsPipeline without taking the lock: the caller holds AcquireExclusive().
+    const GraphicsPipeline* GetGraphicsPipelineLocked();
+
+    /// Front thread, right after its lookup returned `pipeline` (same exclusive guard, or before
+    /// any other lookup): copies what the lookup left in the member scratch and the shared Infos
+    /// (per stage: pgm_base, user data words, flat buffer words) into `out`.
+    void CaptureFront(GraphicsLookupScratch& out, const GraphicsPipeline* pipeline) const;
+
+    /// Verify mode, front thread, right after GetGraphicsPipeline returned `front_result` for the
+    /// same registers a worker's LookupGraphics used (nothing else may look up in between):
+    /// compares `s` FIELD BY FIELD with what the front's lookup left behind: pipeline pointer,
+    /// key, and per logical stage the Info pointer, pgm_base, every user data word, every
+    /// flattened word, the module and the runtime info fields. `why` (optional) names the first
+    /// difference.
+    bool LookupMatchesFront(const GraphicsLookupScratch& s, const GraphicsPipeline* front_result,
+                            const char** why = nullptr) const;
 
     /// SHADPS4_NATIVE_PASS (front / lookup thread, right after GetGraphicsPipeline returned
     /// `base` for the current registers): decides once whether `base` can draw native batches
     /// and, if so, builds its native variant (vertex shader re-emitted to read per-draw records,
     /// layout + one records SSBO) and publishes it in base->native_variant.
     void PrepareNativeVariant(const GraphicsPipeline* base);
+    /// Any thread: the same over `regs` (the registers `base` was looked up with). Exclusive lock.
+    void PrepareNativeVariant(const GraphicsPipeline* base, const AmdGpu::Regs& regs);
+    /// The same without taking the lock: the caller holds AcquireExclusive() (a front that holds
+    /// the guard across its lookup + WriteStage must call this, not the locking variant).
+    void PrepareNativeVariantLocked(const GraphicsPipeline* base, const AmdGpu::Regs& regs);
 
     /// SHADPS4_NATIVE_COLOUR (front / lookup thread, right after the front derived the draw's
     /// vertex inputs): decides once whether `base` (a textured pipeline) can draw native batches
@@ -134,11 +247,21 @@ public:
     /// driver compile on the native compiler thread, which publishes it in base->native_colour.
     void PrepareNativeColour(const GraphicsPipeline* base,
                              const AmdGpu::CpSplit::VertexInputsDerived& vi);
+    /// Any thread: the same over `regs` (the registers `base` was looked up with). Exclusive lock.
+    void PrepareNativeColour(const GraphicsPipeline* base,
+                             const AmdGpu::CpSplit::VertexInputsDerived& vi,
+                             const AmdGpu::Regs& regs);
+    /// The same without taking the lock: the caller holds AcquireExclusive().
+    void PrepareNativeColourLocked(const GraphicsPipeline* base,
+                                   const AmdGpu::CpSplit::VertexInputsDerived& vi,
+                                   const AmdGpu::Regs& regs);
 
+    /// Front thread (the current queue's cs registers). Exclusive lock.
     const ComputePipeline* GetComputePipeline();
 
     using Result = std::tuple<const Shader::Info*, vk::ShaderModule,
                               std::shared_ptr<const Shader::Gcn::FetchShaderData>, u64>;
+    /// Caller holds the exclusive lock (internal callers do). Registers = liverpool->regs.
     Result GetProgram(Shader::Stage stage, Shader::LogicalStage l_stage,
                       const Shader::ShaderParams& params, Shader::Backend::Bindings& binding);
 
@@ -153,9 +276,36 @@ public:
     }
 
 private:
-    bool RefreshGraphicsKey();
-    bool RefreshGraphicsStages();
+    // The front path over an explicit register file (member scratch + shared Infos; exclusive
+    // lock held by the caller). GetGraphicsPipeline / PrepareNative* pass liverpool->regs.
+    const GraphicsPipeline* GraphicsLookupLocked(const AmdGpu::Regs& regs);
+    bool RefreshGraphicsKey(const AmdGpu::Regs& regs);
+    bool RefreshGraphicsStages(const AmdGpu::Regs& regs);
     bool RefreshComputeKey();
+    Result GetProgram(const AmdGpu::Regs& regs, Shader::Stage stage, Shader::LogicalStage l_stage,
+                      const Shader::ShaderParams& params, Shader::Backend::Bindings& binding);
+    void CaptureFrontLocked(GraphicsLookupScratch& out, const GraphicsPipeline* pipeline) const;
+
+    // Pure pieces of the key / runtime-info computation, shared by the front path and the
+    // read-only path (no member state written; `key` is the caller's).
+    static void GraphicsKeyFirstPass(const AmdGpu::Regs& regs, GraphicsPipelineKey& key,
+                                     bool& db_enabled, bool& skip_cb_binding);
+    void GraphicsKeySecondPass(const AmdGpu::Regs& regs, GraphicsPipelineKey& key,
+                               bool db_enabled, bool skip_cb_binding, bool allow_log) const;
+    void FillStageRuntimeInfo(Shader::RuntimeInfo& info, const AmdGpu::Regs& regs,
+                              Shader::Stage stage, Shader::LogicalStage l_stage,
+                              const Shader::Info* hull_info, const GraphicsPipelineKey& key,
+                              bool dump) const;
+
+    // The read-only path (shared lock held by the caller).
+    enum class Resolve { Unbound, Bound, Miss };
+    const GraphicsPipeline* LookupGraphicsShared(const AmdGpu::Regs& regs,
+                                                 GraphicsLookupScratch& out) const;
+    Resolve ResolveStageReadOnly(const AmdGpu::Regs& regs, Shader::Stage stage_in,
+                                 Shader::LogicalStage stage_out,
+                                 Shader::Backend::Bindings& binding, GraphicsLookupScratch& out,
+                                 const Shader::Info*& view_out,
+                                 const Program::Module*& module_out) const;
 
     // SHADPS4_PREPARED_PIPELINES: one successful original VS+PS selection, reused while its
     // exact register snapshot, both per-stage specialization guards, both program
@@ -187,7 +337,8 @@ private:
     /// SHADPS4_PREPARED_WAYS=<4..32> (default 4): associativity of the prepared-pipeline table.
     static size_t PreparedPipelineWays();
 
-    PreparedPipelineEntry* TryPreparedPipeline(PreparedGraphicsState& state, bool& eligible);
+    PreparedPipelineEntry* TryPreparedPipeline(const AmdGpu::Regs& regs,
+                                               PreparedGraphicsState& state, bool& eligible);
     void SeedPreparedPipeline(const PreparedGraphicsState& state, const GraphicsPipeline* pipeline);
     void VerifyPreparedPipeline(PreparedPipelineEntry& entry,
                                 const GraphicsPipeline* pipeline, bool is_new);
@@ -195,13 +346,14 @@ private:
                             bool compiled);
 
     void DumpShader(std::span<const u32> code, u64 hash, Shader::Stage stage, size_t perm_idx,
-                    std::string_view ext);
+                    std::string_view ext) const;
     std::optional<std::vector<u32>> GetShaderPatch(u64 hash, Shader::Stage stage, size_t perm_idx,
                                                    std::string_view ext);
     vk::ShaderModule CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                    const std::span<const u32>& code, size_t perm_idx,
                                    Shader::Backend::Bindings& binding);
-    const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::Stage stage, Shader::LogicalStage l_stage);
+    const Shader::RuntimeInfo& BuildRuntimeInfo(const AmdGpu::Regs& regs, Shader::Stage stage,
+                                                Shader::LogicalStage l_stage);
 
     [[nodiscard]] bool IsPipelineCacheDirty() const {
         return num_new_pipelines > 0;
@@ -222,6 +374,11 @@ private:
     const Instance& instance;
     Scheduler& scheduler;
     AmdGpu::Liverpool* liverpool;
+    // Architecture A: guards program_cache, Program::modules / prepared, graphics_pipelines,
+    // compute_pipelines, the member lookup scratch (graphics_key, infos, modules, runtime_infos,
+    // fetch_shader, stage_selections, prepared tables, stats) and the per-draw fields of every
+    // shared Shader::Info. See the thread-safety note in vk_pipeline_cache.cpp.
+    mutable std::shared_mutex graphics_mutex;
     DescriptorHeap desc_heap;
     vk::UniquePipelineCache pipeline_cache;
     vk::UniquePipelineLayout pipeline_layout;

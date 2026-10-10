@@ -959,6 +959,158 @@ void FrontCostTick(u32 opcode) {
     }
 }
 
+/// SHADPS4_REG_SCAN=1 (counter run): the register-only pass of a chained worker, timed and verified.
+const bool g_reg_scan = [] {
+    const char* e = std::getenv("SHADPS4_REG_SCAN");
+    return e && e[0] == '1';
+}();
+struct RegScanStats {
+    u64 cyc{}, dcbs{}, pkts{}, reg_pkts{}, ibs{}, cond_exec{}, cmp{}, bad{}, bad_words{};
+    u64 post_cyc{}, posts{}; ///< the front's JournalRegs (posting register records)
+    // Constant engine: packets by kind, dwords written to / dumped from CE RAM.
+    u64 ce_write{}, ce_write_dw{}, ce_dump{}, ce_dump_dw{}, ce_load{}, ce_other{}, ccbs{};
+    // ASC SET_SH_REG to the shared (non-compute) SH registers: all / while a gfx DCB is open.
+    u64 asc_sh{}, asc_sh_dw{}, asc_sh_in_gfx{}, asc_sh_in_gfx_dw{};
+    u32 asc_sh_min{~0u}, asc_sh_max{};
+    u64 win_tsc{};
+};
+thread_local RegScanStats t_reg_scan;
+thread_local bool t_reg_scan_gfx_open = false; ///< a top-level gfx DCB is in progress (front)
+thread_local std::unique_ptr<AmdGpu::Regs> t_reg_scan_regs;
+
+/// The register-only pass (see SHADPS4_REG_SCAN). Only what writes the register file.
+void RegScanRun(std::span<const u32> dcb, AmdGpu::Regs& r, RegScanStats& st, u32 depth) {
+    while (!dcb.empty()) {
+        const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
+        if (header->type == 2) {
+            dcb = dcb.subspan(1);
+            continue;
+        }
+        if (header->type != 3) {
+            return; // the front asserts on these
+        }
+        const u32 count = header->type3.NumWords();
+        const auto* w = reinterpret_cast<const u32*>(header);
+        ++st.pkts;
+        switch (header->type3.opcode) {
+        case PM4ItOpcode::ClearState:
+            r.SetDefaults();
+            ++st.reg_pkts;
+            break;
+        case PM4ItOpcode::SetConfigReg:
+            std::memcpy(&r.reg_array[AmdGpu::Regs::ConfigRegWordOffset + (w[1] & 0xffff)], w + 2,
+                        size_t{count - 1} * 4);
+            ++st.reg_pkts;
+            break;
+        case PM4ItOpcode::SetContextReg:
+            std::memcpy(&r.reg_array[AmdGpu::Regs::ContextRegWordOffset + (w[1] & 0xffff)], w + 2,
+                        size_t{count - 1} * 4);
+            ++st.reg_pkts;
+            break;
+        case PM4ItOpcode::SetShReg: {
+            const u32 off = w[1] & 0xffff;
+            if (!(off >= 0x200 && off <= 0x200 + sizeof(ComputeProgram) / 4)) {
+                std::memcpy(&r.reg_array[AmdGpu::Regs::ShRegWordOffset + off], w + 2,
+                            size_t{count - 1} * 4);
+            }
+            ++st.reg_pkts;
+            break;
+        }
+        case PM4ItOpcode::SetUconfigReg:
+            std::memcpy(&r.reg_array[AmdGpu::Regs::UconfigRegWordOffset + (w[1] & 0xffff)], w + 2,
+                        size_t{count - 1} * 4);
+            ++st.reg_pkts;
+            break;
+        case PM4ItOpcode::IndexType:
+            r.index_buffer_type.raw = reinterpret_cast<const PM4CmdDrawIndexType*>(header)->raw;
+            ++st.reg_pkts;
+            break;
+        case PM4ItOpcode::DrawIndex2: {
+            const auto* d = reinterpret_cast<const PM4CmdDrawIndex2*>(header);
+            r.max_index_size = d->max_size;
+            r.index_base_address.base_addr_lo = d->index_base_lo;
+            r.index_base_address.base_addr_hi = d->index_base_hi;
+            r.num_indices = d->index_count;
+            r.draw_initiator = d->draw_initiator;
+            break;
+        }
+        case PM4ItOpcode::DrawIndexOffset2: {
+            const auto* d = reinterpret_cast<const PM4CmdDrawIndexOffset2*>(header);
+            r.max_index_size = d->max_size;
+            r.num_indices = d->index_count;
+            r.draw_initiator = d->draw_initiator;
+            break;
+        }
+        case PM4ItOpcode::DrawIndexAuto: {
+            const auto* d = reinterpret_cast<const PM4CmdDrawIndexAuto*>(header);
+            r.num_indices = d->index_count;
+            r.draw_initiator = d->draw_initiator;
+            break;
+        }
+        case PM4ItOpcode::NumInstances:
+            r.num_instances.num_instances =
+                reinterpret_cast<const PM4CmdDrawNumInstances*>(header)->num_instances;
+            ++st.reg_pkts;
+            break;
+        case PM4ItOpcode::IndexBase: {
+            const auto* b = reinterpret_cast<const PM4CmdDrawIndexBase*>(header);
+            r.index_base_address.base_addr_lo = b->addr_lo;
+            r.index_base_address.base_addr_hi = b->addr_hi;
+            ++st.reg_pkts;
+            break;
+        }
+        case PM4ItOpcode::IndexBufferSize:
+            r.num_indices = reinterpret_cast<const PM4CmdDrawIndexBufferSize*>(header)->num_indices;
+            ++st.reg_pkts;
+            break;
+        case PM4ItOpcode::EventWrite: {
+            const auto* ev = reinterpret_cast<const PM4CmdEventWrite*>(header);
+            if (ev->event_type.Value() == EventType::SoVgtStreamoutFlush) {
+                r.cp_strmout_cntl.offset_update_done = 1;
+            }
+            break;
+        }
+        case PM4ItOpcode::IndirectBuffer: {
+            const auto* ib = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+            ++st.ibs;
+            if (depth < 8) {
+                RegScanRun({ib->Address<const u32>(), ib->ib_size}, r, st, depth + 1);
+            }
+            break;
+        }
+        case PM4ItOpcode::CondExec:
+            ++st.cond_exec; // reads GPU-written memory: a chained scan cannot evaluate it ahead
+            break;
+        default:
+            break;
+        }
+        dcb = dcb.subspan(std::min<size_t>(dcb.size(), size_t{count} + 1));
+    }
+}
+
+void RegScanLog(RegScanStats& st, u64 now) {
+    const double s = double(now - st.win_tsc) / 3.5e9;
+    LOG_INFO(Render,
+             "RegScan: window {:.1f}s (TSC ~3.5 GHz) register-only pass {:.2f} ms/s ({:.0f} cycles "
+             "per DCB, {} DCBs, {:.0f} packets/s of which register {:.0f}/s, IBs {}, CondExec {}) | "
+             "end-state verify {} DCBs, {} bad ({} words) | front posting (JournalRegs) {:.2f} ms/s "
+             "({:.0f}/s, {:.0f} cycles each) | CE: CCBs {:.0f}/s, WRITE_CONST_RAM {:.0f}/s ({:.0f} dw/s), "
+             "DUMP_CONST_RAM {:.0f}/s ({:.0f} dw/s), LOAD_CONST_RAM {:.0f}/s, other CE {:.0f}/s | ASC "
+             "SET_SH_REG (non-compute) {:.0f}/s ({:.0f} dw/s), while a gfx DCB is open {:.0f}/s ({:.0f} "
+             "dw/s), SH offsets {:#x}..{:#x}",
+             s, double(st.cyc) / 3.5e6 / s, st.dcbs ? double(st.cyc) / double(st.dcbs) : 0.0,
+             st.dcbs, double(st.pkts) / s, double(st.reg_pkts) / s, st.ibs, st.cond_exec, st.cmp,
+             st.bad, st.bad_words, double(st.post_cyc) / 3.5e6 / s, double(st.posts) / s,
+             st.posts ? double(st.post_cyc) / double(st.posts) : 0.0, double(st.ccbs) / s,
+             double(st.ce_write) / s, double(st.ce_write_dw) / s, double(st.ce_dump) / s,
+             double(st.ce_dump_dw) / s, double(st.ce_load) / s, double(st.ce_other) / s,
+             double(st.asc_sh) / s, double(st.asc_sh_dw) / s, double(st.asc_sh_in_gfx) / s,
+             double(st.asc_sh_in_gfx_dw) / s, st.asc_sh_min == ~0u ? 0u : st.asc_sh_min,
+             st.asc_sh_max);
+    st = RegScanStats{};
+    st.win_tsc = now;
+}
+
 const bool g_native_timing_rec = [] {
     const char* e = std::getenv("SHADPS4_NATIVE_TIMING");
     return e && e[0] == '1';
@@ -3686,6 +3838,13 @@ void Liverpool::VerifySnapshot(const u8* snapshot, u64 seq) const {
 }
 
 void Liverpool::JournalRegs(u32 word_offset, u32 count) {
+    const u64 jr0 = g_reg_scan ? __rdtsc() : 0;
+    SCOPE_EXIT {
+        if (g_reg_scan) [[unlikely]] {
+            t_reg_scan.post_cyc += __rdtsc() - jr0;
+            ++t_reg_scan.posts;
+        }
+    };
     if (split_enabled) [[unlikely]] {
         split->EmitRegWrite(word_offset, &regs.reg_array[word_offset], count);
     }
@@ -7260,6 +7419,21 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb, bool is_ind
 
         const PM4ItOpcode opcode = header->type3.opcode;
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
+        if (g_reg_scan) [[unlikely]] {
+            auto& st = t_reg_scan;
+            const u32 nw = header->type3.NumWords();
+            if (opcode == PM4ItOpcode::WriteConstRam) {
+                ++st.ce_write;
+                st.ce_write_dw += nw > 1 ? nw - 1 : 0;
+            } else if (opcode == PM4ItOpcode::DumpConstRam) {
+                ++st.ce_dump;
+                st.ce_dump_dw += reinterpret_cast<const PM4DumpConstRam*>(header)->Size() / 4;
+            } else if (opcode == PM4ItOpcode::LoadConstRam) {
+                ++st.ce_load;
+            } else if (opcode != PM4ItOpcode::Nop) {
+                ++st.ce_other;
+            }
+        }
         switch (opcode) {
         case PM4ItOpcode::Nop: {
             // const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -7384,6 +7558,23 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             g_a2s.begun.store(idx, std::memory_order_release);
             g_a2s.begun.notify_all();
         }
+    }
+    if (g_reg_scan && !is_indirect_gfx) [[unlikely]] {
+        auto& st = t_reg_scan;
+        auto& sr = t_reg_scan_regs;
+        if (!sr) {
+            sr = std::make_unique<AmdGpu::Regs>();
+        }
+        *sr = regs; // untimed: a chained worker gets this from the previous one
+        const u64 t0 = __rdtsc();
+        if (st.win_tsc == 0) {
+            st.win_tsc = t0;
+        }
+        RegScanRun(dcb, *sr, st, 0);
+        st.cyc += __rdtsc() - t0;
+        ++st.dcbs;
+        st.ccbs += ccb.empty() ? 0 : 1;
+        t_reg_scan_gfx_open = true;
     }
     SplitSpanScope split_span{*this, &dcb,
                               is_indirect_gfx ? CpSplit::DrainReason::TaskGuardIb
@@ -8197,6 +8388,29 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         ce_task.handle.destroy();
     }
 
+    if (g_reg_scan && !is_indirect_gfx && t_reg_scan_regs) [[unlikely]] {
+        auto& st = t_reg_scan;
+        t_reg_scan_gfx_open = false;
+        u32 bad = 0;
+        for (const auto& [off, n] : CpSplit::DcbSnapWindows) {
+            for (u32 i = 0; i < n; ++i) {
+                if (t_reg_scan_regs->reg_array[off + i] != regs.reg_array[off + i]) {
+                    if (++bad <= 4 && st.bad < 8) {
+                        LOG_WARNING(Render, "RegScan verify: word {:#x} scan {:#x} front {:#x}",
+                                    off + i, t_reg_scan_regs->reg_array[off + i],
+                                    regs.reg_array[off + i]);
+                    }
+                }
+            }
+        }
+        ++st.cmp;
+        st.bad += bad != 0;
+        st.bad_words += bad;
+        const u64 now = __rdtsc();
+        if (now - st.win_tsc > 35'000'000'000ull) {
+            RegScanLog(st, now);
+        }
+    }
     if (!is_indirect_gfx && split_enabled && (g_a1 != 0 || g_a2 != 0)) [[unlikely]] {
         auto* end = split->Reserve<CpSplit::DcbEndPayload>(CpSplit::RecordType::DcbEnd);
         end->index = g_a1_front_index;
@@ -8467,6 +8681,18 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                              (set_data->reg_offset - 0x200);
                 std::memcpy(addr, header + 2, set_size);
             } else {
+                if (g_reg_scan) [[unlikely]] {
+                    auto& st = t_reg_scan;
+                    const u32 dw = u32(set_size / sizeof(u32));
+                    ++st.asc_sh;
+                    st.asc_sh_dw += dw;
+                    if (t_reg_scan_gfx_open) {
+                        ++st.asc_sh_in_gfx;
+                        st.asc_sh_in_gfx_dw += dw;
+                    }
+                    st.asc_sh_min = std::min<u32>(st.asc_sh_min, set_data->reg_offset);
+                    st.asc_sh_max = std::max<u32>(st.asc_sh_max, set_data->reg_offset + dw);
+                }
                 std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
                             header + 2, set_size);
                 JournalRegs(Regs::ShRegWordOffset + set_data->reg_offset,
