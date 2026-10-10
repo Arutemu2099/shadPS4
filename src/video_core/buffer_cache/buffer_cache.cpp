@@ -3749,7 +3749,16 @@ const Buffer* BufferCache::NativeRunSpan(
         return nullptr;
     }
     const u64 size = memory->ClampRangeSize(lo, hi - lo);
-    const auto [buffer, offset] = ObtainBuffer(lo, static_cast<u32>(size), false);
+    // SHADPS4_NATIVE_REC_PREP (s402: ~430 cycles per span): the lean read path's clean answer
+    // first (memo probe + READ_SYNC_FAST's clean check, no upload due); the full ObtainBuffer
+    // only when it says no.
+    Buffer* buffer = nullptr;
+    if (LeanReadOk()) {
+        buffer = ObtainReadLean(lo, static_cast<u32>(size), id).first;
+    }
+    if (!buffer) {
+        buffer = ObtainBuffer(lo, static_cast<u32>(size), false).first;
+    }
     if (buffer != &found) {
         return nullptr;
     }

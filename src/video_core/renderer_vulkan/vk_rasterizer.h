@@ -627,6 +627,16 @@ private:
                        const std::array<u32, Shader::NUM_BUFFERS>& o_off,
                        const std::array<u32, Shader::NUM_BUFFERS>& o_rsize);
     bool NativeCtxSame();
+    /// SHADPS4_NATIVE_REC_PREP: bounds of the buffers the prepares checked ranges against, by
+    /// VkBuffer, valid while the buffer structure generation stays put.
+    struct NativeBoundsEntry {
+        u64 handle;
+        VAddr lo, hi;
+    };
+    std::array<NativeBoundsEntry, 16> native_bcache{};
+    u32 native_bcache_n{};
+    u32 native_bcache_rr{};
+    u64 native_bcache_gen{~u64{0}};
     void NativePrepWrite();
     bool NativeJoin(const SplitDraw& draw, const AmdGpu::CpSplit::VertexInputsPayload* front_vi);
     bool NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline* native, bool is_indexed,
