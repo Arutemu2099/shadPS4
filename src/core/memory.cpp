@@ -120,6 +120,24 @@ u64 MemoryManager::ClampRangeSize(VAddr virtual_addr, u64 size) {
     return clamped_size;
 }
 
+u64 MemoryManager::TryClampRangeSize(VAddr virtual_addr, u64 size) {
+    if (size < 1_GB) {
+        return size;
+    }
+    std::shared_lock lk{mutex};
+    if (!IsValidMapping(virtual_addr)) {
+        return 0;
+    }
+    auto vma = FindVMA(virtual_addr);
+    u64 clamped_size = vma->second.base + vma->second.size - virtual_addr;
+    ++vma;
+    while (vma != vma_map.end() && vma->second.IsMapped() && clamped_size < size) {
+        clamped_size += vma->second.size;
+        ++vma;
+    }
+    return std::min(clamped_size, size);
+}
+
 void MemoryManager::SetPrtArea(u32 id, VAddr address, u64 size) {
     PrtArea& area = prt_areas[id];
     if (area.mapped) {

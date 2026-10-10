@@ -77,6 +77,9 @@ struct Record {
 };
 
 /// SHADPS4_NATIVE_GPU_DIRECT: two independent 64-bit hashes of an image key (raw T# / S# words).
+/// Record::img_n bit 31: a T# / S# of the draw sits in inherited registers (zeros in the key).
+constexpr u32 ImgInhBit = 0x80000000u;
+
 inline void ImageKeyHash(const u32* w, u32 n, u64& h1, u64& h2) {
     u64 a = 0x9E3779B97F4A7C15ull ^ n, b = 0xC2B2AE3D27D4EB4Full + n;
     for (u32 i = 0; i < n; ++i) {

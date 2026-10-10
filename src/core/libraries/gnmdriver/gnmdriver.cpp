@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <immintrin.h>
 #include <atomic>
 #include <array>
 #include <cstdlib>
@@ -1245,6 +1246,15 @@ void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
     std::array<u32, 512> key;
     u32 kn = 0;
     bool key_ok = true;
+    bool key_inh = false;
+    const auto add_zero = [&](u32 words) {
+        if (kn + words > key.size()) {
+            key_ok = false;
+            return;
+        }
+        std::memset(&key[kn], 0, words * sizeof(u32));
+        kn += words;
+    };
     const auto add_key = [&](const auto& sharp) {
         constexpr u32 words = static_cast<u32>(sizeof(sharp) / sizeof(u32));
         if (kn + words > key.size()) {
@@ -1297,7 +1307,10 @@ void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
                 const u64 addr = vsharp.base_address;
                 const u64 size = (addr == 0 || vsharp.GetSize() == 0)
                                      ? 0
-                                     : memory->ClampRangeSize(addr, vsharp.GetSize());
+                                     : memory->TryClampRangeSize(addr, vsharp.GetSize());
+                if (size == 0 && addr != 0 && vsharp.GetSize() != 0) {
+                    return kill(); // Opus G2 #6: unmapped huge V# (no assert on a game thread)
+                }
                 g[Shader::NativeRecordOffOffset + bi] = static_cast<u32>(addr);
                 g[Shader::NativeRecordSizeOffset + bi] =
                     static_cast<u32>(std::min<u64>(size, 0xffffffffull));
@@ -1319,15 +1332,32 @@ void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
             }
             ++bi;
         }
+        // A T# / S# read straight from inherited registers: zeros of the same width in the key
+        // and ImgInhBit; the back compares members with the opener's job key only (the inherited
+        // registers themselves are compared with the opener's at every confirm, sec. 11).
+        const auto inh_sharp = [&](u32 idx, u32 words) {
+            return idx < 16 && ((u64{inh} >> idx) & ((u64{1} << words) - 1)) != 0;
+        };
         for (const auto& desc : info->images) {
-            add_key(desc.GetSharp(bs));
+            const auto sharp = desc.GetSharp(bs);
+            if (inh_sharp(desc.sharp_idx, desc.is_r128 ? 4u : 8u)) {
+                key_inh = true;
+                add_zero(static_cast<u32>(sizeof(sharp) / sizeof(u32)));
+            } else {
+                add_key(sharp);
+            }
         }
         for (const auto& desc : info->samplers) {
-            add_key(desc.GetSharp(bs));
+            const auto sharp = desc.GetSharp(bs);
+            if (!desc.is_inline_sampler && inh_sharp(desc.sharp_idx, 4u)) {
+                key_inh = true;
+                add_zero(static_cast<u32>(sizeof(sharp) / sizeof(u32)));
+            } else {
+                add_key(sharp);
+            }
         }
     }
-    // An image / sampler in inherited registers: the key is stale -> no image-key match.
-    rec.img_n = key_ok && (rec.inh_vs | rec.inh_ps) == 0 ? kn : ~0u;
+    rec.img_n = key_ok ? (kn | (key_inh ? NR::ImgInhBit : 0u)) : ~0u;
     NR::ImageKeyHash(key.data(), kn, rec.img_h1, rec.img_h2);
     std::memcpy(g.data(), push.ud_regs.data(), sizeof(u32) * Shader::NUM_USER_DATA_REGS);
     const auto& vi = r.vi_scratch;
@@ -1360,6 +1390,7 @@ void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
                     ? r.vs[fetch->instance_offset_sgpr]
                     : 0;
     std::memcpy(r.gpu + size_t(idx & (NR::RingSize - 1)) * NR::GpuRecDwords, g.data(), sizeof(g));
+    _mm_sfence(); // Opus G2 #5: write-combined ring memory before the union count
     rec.union_idx = r.run_union;
     rec.gpu_ok = 1;
     u.n.store(rec.run_k + 1, std::memory_order_release);

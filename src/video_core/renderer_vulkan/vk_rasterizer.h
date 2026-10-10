@@ -153,6 +153,12 @@ public:
         std::array<u32, 64> icount{}, inst{}; ///< ring mode: each member's index / instance count
         std::vector<u32> side;              ///< verify: (record + 5 command words) per member
         u32 n{};                            ///< members prepared
+        /// Ring mode (sec. 10-11): each member's index address; the opener's inherited VS / PS
+        /// user-data registers and their values (every member must see the same).
+        bool ring_src{};
+        std::array<u64, 64> iaddr{};
+        u32 inh_vs{}, inh_ps{};
+        std::array<u32, 16> inh_val_vs{}, inh_val_ps{};
     } native_prep;
     /// Back thread, Liverpool::ExecuteDrawRecord: true = the draw was a prepared member and went
     /// into the open batch; false = run the record normally (the prepare is dropped on refusal).
@@ -625,6 +631,8 @@ private:
         std::array<u64, 4> c_ring_ph{};
         u64 ring_span_hits{};
         u64 ring_span_bytes{};
+        u64 ring_span_stale{}; ///< SHADPS4_NATIVE_SPAN_CHECK: cache hits over CPU-dirty pages
+        u64 ring_inh_runs{};   ///< ring batches with inherited registers
         std::array<u64, 4> prep_c10{};  ///< verify: close 10 of a prepared member by where
         std::array<u64, 16> prep_stop{};
         std::array<u64, 16> prep_refuse{};
@@ -644,7 +652,9 @@ private:
     static void NativeGpuRingInit(Rasterizer* owner);
     bool NativeRingPrepare(const GraphicsPipeline* base,
                            const AmdGpu::CpSplit::VertexInputAttrib* attribs,
-                           const std::array<u64, Shader::NUM_BUFFERS>& o_addr);
+                           const std::array<u64, Shader::NUM_BUFFERS>& o_addr,
+                           const std::array<u32, Shader::NUM_BUFFERS>& o_off,
+                           const std::array<u32, Shader::NUM_BUFFERS>& o_size, const u32* o_ud);
     void NativeRingWrite();
     void NativeRingVerifyWrite();
     std::array<u32, Shader::NativeTableDwords> native_ring_table{};
