@@ -1847,13 +1847,22 @@ void LeanLog() {
             auto& x = g_lean_xl;
             const double ps = 1.0 / std::max(sec, 1e-9);
             std::array<u64, 32> rf{};
+            std::array<u64, 16> sb{};
             for (const auto& t : x.tr) {
                 if (const auto* tr = t.load(std::memory_order_acquire)) {
                     for (u32 i = 0; i < 32; ++i) {
                         rf[i] += tr->refusals[i]; // cumulative (racy reads, as A2Log)
                     }
+                    for (u32 i = 0; i < 16; ++i) {
+                        sb[i] += tr->sub[i];
+                    }
                 }
             }
+            LOG_INFO(Render,
+                     "Lean L3 stamp refusals (cumulative): stamp below idx+1 {} above {} gpu_ok 0 {} "
+                     "cmd differs {} | record fields: inst_known 0 {} io_ud {} index_count 0 {} "
+                     "push_inh {}",
+                     sb[12], sb[13], sb[14], sb[15], sb[0], sb[1], sb[2], sb[3]);
             std::array<u32, 32> ord{};
             for (u32 i = 0; i < 32; ++i) {
                 ord[i] = i;
@@ -1870,6 +1879,14 @@ void LeanLog() {
             }
             const u64 st_ = x.stretches.exchange(0), tk = x.taken.exchange(0),
                       wk = x.walked.exchange(0);
+            // The back's counters are monotonic (the per-second line diffs them too).
+            static u64 prev_pub = 0, prev_pd = 0, prev_bd = 0;
+            const u64 pub_now = x.published.load(), pd_now = x.pub_draws.load(),
+                      bd_now = x.back_draws.load();
+            const u64 d_pub = pub_now - prev_pub, d_pd = pd_now - prev_pd, d_bd = bd_now - prev_bd;
+            prev_pub = pub_now;
+            prev_pd = pd_now;
+            prev_bd = bd_now;
             LOG_INFO(Render,
                      "Lean L3: worker draws walked {:.0f}/s taken {:.0f}/s ({:.1f}%) in {:.0f} "
                      "stretches/s ({:.1f} draws each; cut by publish {:.0f}/s, cap hits {}) | back: "
@@ -1880,12 +1897,12 @@ void LeanLog() {
                      double(wk) * ps, double(tk) * ps,
                      100.0 * double(tk) / double(std::max<u64>(wk, 1)), double(st_) * ps, double(tk) / double(std::max<u64>(st_, 1)),
                      double(x.cut_pub.exchange(0)) * ps, x.cap.exchange(0),
-                     double(x.published.exchange(0)) * ps, double(x.pub_draws.exchange(0)) * ps,
+                     double(d_pub) * ps, double(d_pd) * ps,
                      x.rej_occl.exchange(0), x.rej_gen.exchange(0), x.rej_mat.exchange(0),
                      x.rej_rt.exchange(0), double(x.would.exchange(0)) * ps, x.rk_cmp.exchange(0),
                      x.rk_bad.load(), x.delta_cmp.exchange(0), x.delta_bad.load(),
                      x.expect_filed.exchange(0),
-                     double(x.back_draws.exchange(0)) * ps, x.seq_skips.exchange(0), rtot, top);
+                     double(d_bd) * ps, x.seq_skips.exchange(0), rtot, top);
         }
         s.l2_taken = s.l2_skipped = s.head_draws = s.back_records = s.back_wait_ticks = 0;
         g_lean_l2.fault_waits = 0;
@@ -3784,12 +3801,14 @@ void LeanXlDraw(LeanXl& x, const CpSplit::RecordHeader& h, u64 pos) {
     }
 }
 
-/// Channel::draw_hook: walk the worker's committed records through the Draw record at draw_pos.
-void LeanXlDrawHook(void* p, u64 draw_pos) {
-    auto& x = *static_cast<LeanXl*>(p);
-    while (x.walk_pos <= draw_pos) {
+/// Walks the worker's committed records that start before `end` (unmasked).
+void LeanXlWalk(LeanXl& x, u64 end) {
+    while (x.walk_pos < end) {
         u64 pos = x.walk_pos;
         const auto* h = x.ch->RecordAtPos(pos); // skips a Wrap
+        if (pos >= end) {
+            break; // only a Wrap before `end`
+        }
         const auto* payload = reinterpret_cast<const u8*>(h + 1);
         switch (h->type) {
         case CpSplit::RecordType::RegWrite:
@@ -3827,6 +3846,12 @@ void LeanXlDrawHook(void* p, u64 draw_pos) {
         }
         x.walk_pos = pos + h->size;
     }
+}
+
+/// Channel::draw_hook: walk the worker's committed records through the Draw record at draw_pos.
+void LeanXlDrawHook(void* p, u64 draw_pos) {
+    auto& x = *static_cast<LeanXl*>(p);
+    LeanXlWalk(x, draw_pos + 1);
     // Lean channels publish by count never: when the back already follows this job, hand over
     // every 8 draws (each publish ends the open stretch).
     if (++x.since_pub >= 8 &&
@@ -3838,6 +3863,9 @@ void LeanXlDrawHook(void* p, u64 draw_pos) {
 /// Channel::pre_publish: end the open stretch before anything new becomes visible.
 void LeanXlPrePublish(void* p) {
     auto& x = *static_cast<LeanXl*>(p);
+    // Everything about to be visible is walked first: the back may run and release it (and the
+    // ring space be reused) before the next Draw commit would have walked it (Opus review).
+    LeanXlWalk(x, x.ch->CommittedPos());
     x.cut_pub += x.open ? 1 : 0;
     LeanXlEnd(x);
     x.since_pub = 0;
@@ -3936,6 +3964,11 @@ void Liverpool::LeanWorkerLoop(std::stop_token stoken, u32 index) {
         xl.tr = xl_tr.get();
         g_lean_xl.tr[index & 7].store(xl.tr, std::memory_order_release);
     }
+    SCOPE_EXIT {
+        if (xl.tr) {
+            g_lean_xl.tr[index & 7].store(nullptr, std::memory_order_release); // LeanLog reads it
+        }
+    };
     // L2 fault hook context: publish this job's channel, wait for the back up to its position.
     struct L2Wait {
         CpSplit::Channel* ch{};
@@ -4052,11 +4085,11 @@ void Liverpool::LeanWorkerLoop(std::stop_token stoken, u32 index) {
                                  idx, rest.end_dw, Lean::StopName(rest.stop), j.cut_dw);
                 }
             }
-            out.Reserve(CpSplit::RecordType::LeanEnd, 0);
-            out.Commit();
-            out.PublishNow(); // pre_publish ends the last stretch first
-            l2w = {};
             if (xl.tr) {
+                // End the last stretch and leave the channel BEFORE the LeanEnd publish: the back
+                // may free the slot right after it (Opus review).
+                LeanXlWalk(xl, out.CommittedPos());
+                LeanXlEnd(xl);
                 out.draw_hook = nullptr;
                 out.pre_publish = nullptr;
                 out.hook_ctx = nullptr;
@@ -4068,6 +4101,10 @@ void Liverpool::LeanWorkerLoop(std::stop_token stoken, u32 index) {
                 gx.cut_pub.fetch_add(std::exchange(xl.cut_pub, 0), std::memory_order_relaxed);
                 gx.walked.fetch_add(std::exchange(xl.walked, 0), std::memory_order_relaxed);
             }
+            out.Reserve(CpSplit::RecordType::LeanEnd, 0);
+            out.Commit();
+            out.PublishNow();
+            l2w = {};
             continue; // the back frees the slot at the LeanEnd
         }
         ch.canon = &j.worker_canon;
@@ -5777,6 +5814,51 @@ NativeRecFrontStats g_nrf;
 
 u32 NativeNeedCached(const Shader::Info* info, const Shader::Gcn::FetchShaderData* fetch);
 
+/// Stage a2's publish: (VS hash, PS hash, fetch shader) -> pipeline for the job threads, from the
+/// front (NativeRecFront) or a lean worker (any thread). `vud`: the draw's VS user data (empty:
+/// the shared Info's). Returns the VS Info if the draw qualifies (Vertex + optional Fragment only).
+const Shader::Info* NativeRecPublishProgramImpl(const Vulkan::GraphicsPipeline* pipeline,
+                                                std::span<const u32> vud,
+                                                const Shader::Info** psi_out) {
+    namespace NR = AmdGpu::NativeRec;
+    const auto stages = pipeline->GetStages();
+    const Shader::Info* vsi = stages[static_cast<u32>(Shader::LogicalStage::Vertex)];
+    const Shader::Info* psi = stages[static_cast<u32>(Shader::LogicalStage::Fragment)];
+    if (psi_out) {
+        *psi_out = psi;
+    }
+    bool other = false;
+    for (u32 i = 0; i < stages.size(); ++i) {
+        other = other || (stages[i] && i != static_cast<u32>(Shader::LogicalStage::Vertex) &&
+                          i != static_cast<u32>(Shader::LogicalStage::Fragment));
+    }
+    if (!vsi || vsi->stage != Shader::Stage::Vertex || other) {
+        return nullptr;
+    }
+    u64 fetch = 0;
+    u32 fb = 0xffffffffu;
+    if (vsi->has_fetch_shader) {
+        const u32 b = vsi->fetch_shader_sgpr_base;
+        fb = b + 1;
+        if (vud.empty()) {
+            vud = vsi->user_data;
+        }
+        if (b + 1 < vud.size()) {
+            fetch = (u64(vud[b + 1]) << 32 | vud[b]) & 0xFFFFFFFFFFFFull;
+        }
+    }
+    NR::VsPublish(vsi->pgm_hash, fb);
+    NR::TablePublish(vsi->pgm_hash, psi ? psi->pgm_hash : 0, fetch, pipeline, [&] {
+        if (!NR::g_needs_on) {
+            return ~u64{0};
+        }
+        const u64 nv = NativeNeedCached(vsi, pipeline->GetFetchShader());
+        const u64 np = psi ? NativeNeedCached(psi, nullptr) : 0;
+        return nv | (np << 32);
+    });
+    return vsi;
+}
+
 void NativeRecFront(const PM4Header* header, const Vulkan::Rasterizer::SplitDraw& draw,
                     const Regs& regs, u64 ctx_epoch,
                     const AmdGpu::CpSplit::VertexInputsDerived* front_vi,
@@ -5931,41 +6013,11 @@ void NativeRecFront(const PM4Header* header, const Vulkan::Rasterizer::SplitDraw
     const Shader::Info* vsi = nullptr;
     const Shader::Info* psi = nullptr;
     if (draw.pipeline && draw.draw_class == Vulkan::Rasterizer::DrawClass::Draw && !draw.skip) {
-        const auto stages = draw.pipeline->GetStages();
-        vsi = stages[static_cast<u32>(Shader::LogicalStage::Vertex)];
-        psi = stages[static_cast<u32>(Shader::LogicalStage::Fragment)];
-        bool other = false;
-        for (u32 i = 0; i < stages.size(); ++i) {
-            other = other || (stages[i] && i != static_cast<u32>(Shader::LogicalStage::Vertex) &&
-                              i != static_cast<u32>(Shader::LogicalStage::Fragment));
+        std::span<const u32> vud{};
+        if (cap) {
+            vud = cap->stages[static_cast<u32>(Shader::LogicalStage::Vertex)].user_data;
         }
-        if (vsi && vsi->stage == Shader::Stage::Vertex && !other) {
-            u64 fetch = 0;
-            u32 fb = 0xffffffffu;
-            if (vsi->has_fetch_shader) {
-                const u32 b = vsi->fetch_shader_sgpr_base;
-                fb = b + 1;
-                std::span<const u32> vud = vsi->user_data;
-                if (cap) {
-                    vud = cap->stages[static_cast<u32>(Shader::LogicalStage::Vertex)].user_data;
-                }
-                if (b + 1 < vud.size()) {
-                    fetch = (u64(vud[b + 1]) << 32 | vud[b]) &
-                            0xFFFFFFFFFFFFull;
-                }
-            }
-            NR::VsPublish(vsi->pgm_hash, fb);
-            NR::TablePublish(vsi->pgm_hash, psi ? psi->pgm_hash : 0, fetch, draw.pipeline, [&] {
-                if (!NR::g_needs_on) {
-                    return ~u64{0};
-                }
-                const u64 nv = NativeNeedCached(vsi, draw.pipeline->GetFetchShader());
-                const u64 np = psi ? NativeNeedCached(psi, nullptr) : 0;
-                return nv | (np << 32);
-            });
-        } else {
-            vsi = nullptr;
-        }
+        vsi = NativeRecPublishProgramImpl(draw.pipeline, vud, &psi);
     }
     if (!derived) {
         ++st.not_derived;
@@ -7187,7 +7239,8 @@ u32 NativeNeedMask(const Shader::Info* info, const Shader::Gcn::FetchShaderData*
 
 /// Front thread: NativeNeedMask per Info, cached (Infos live as long as the pipeline cache).
 u32 NativeNeedCached(const Shader::Info* info, const Shader::Gcn::FetchShaderData* fetch) {
-    static std::unordered_map<const void*, u32> cache;
+    // Per thread: the front and the lean workers (NativeRecPublishProgramImpl) call it.
+    static thread_local std::unordered_map<const void*, u32> cache;
     if (!info) {
         return 0;
     }
@@ -8110,6 +8163,9 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                     if (publish(st, sd, *r)) {
                         ch.DoneThrough(sd.end_pos, st.last_seq);
                         ++s.back_records;
+                        if (num_commands.load(std::memory_order_relaxed) != 0) {
+                            ProcessCommands();
+                        }
                         continue;
                     }
                     if (g_a2 == 2) {
@@ -8141,7 +8197,9 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                 g_a2s.gpu_write = g_a2s.gpu_write || !A2NoopDma(*r);
                 break;
             case RT::Draw:
-                x.back_draws.fetch_add(1, std::memory_order_relaxed);
+                // Monotonic, one writer (this thread): no locked RMW per draw.
+                x.back_draws.store(x.back_draws.load(std::memory_order_relaxed) + 1,
+                                   std::memory_order_relaxed);
                 break;
             default:
                 break;
@@ -10754,6 +10812,10 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
 
 bool LeanViewportMemoEnabled() {
     return ViewportMemoEnabled();
+}
+const Shader::Info* NativeRecPublishProgram(const Vulkan::GraphicsPipeline* pipeline,
+                                            std::span<const u32> vs_user_data) {
+    return NativeRecPublishProgramImpl(pipeline, vs_user_data, nullptr);
 }
 bool LeanNopHasBackEffect(const PM4Header* header, bool guest_markers_enabled) {
     return NopHasBackEffect(header, guest_markers_enabled);

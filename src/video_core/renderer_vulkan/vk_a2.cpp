@@ -756,11 +756,13 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     const u32 img_n_rec = r.img_n;
     const u64 img_h1_rec = r.img_h1, img_h2_rec = r.img_h2;
     std::atomic_thread_fence(std::memory_order_acquire);
-    if (r.stamp.load(std::memory_order_relaxed) != idx + 1 || !gpu_ok) {
+    if (const u32 stamp = r.stamp.load(std::memory_order_relaxed); stamp != idx + 1 || !gpu_ok) {
+        ++owner->sub[stamp != idx + 1 ? (s32(stamp - (idx + 1)) < 0 ? 12 : 13) : 14];
         return refuse(RefuseStamp);
     }
     if (draw.job_cmd) {
         if (cmd != draw.job_cmd) {
+            ++owner->sub[15];
             return refuse(RefuseStamp);
         }
     } else if (!cmd_warned) {

@@ -262,7 +262,8 @@ public:
     std::array<u64, 32> refusals{};
     /// Sub-reasons (census): 0-3 record fields (inst_known 0, io_ud, index_count 0, push_inh),
     /// 4-9 slot kind (shadow with images, clip planes, not Guest, written, formatted, colour
-    /// inline / null / empty V#), 10-11 guest lookup (no buffer, address outside it).
+    /// inline / null / empty V#), 10-11 guest lookup (no buffer, address outside it), 12-15 stamp
+    /// (stamp below idx + 1, above it, gpu_ok 0, cmd differs).
     std::array<u64, 16> sub{};
     /// Draws taken and sub-batches opened so far (logged by the caller).
     u64 taken{}, sub_batches{};

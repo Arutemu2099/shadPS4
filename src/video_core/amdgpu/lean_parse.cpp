@@ -636,6 +636,13 @@ void Parser::EmitDraw(const PM4Header* header, const DrawPlan& plan, ChainState&
         p = vi->Write(p);
     }
     out.Commit();
+    // NativeRec stage a2, as the front's NativeRecFront: the job threads derive their records
+    // from this table (in L2 the front sees only the tails).
+    if (NativeRec::g_mode >= 2 && plan.has_stages && plan.job_tag != 0) {
+        (void)NativeRecPublishProgram(
+            plan.draw.pipeline,
+            scratch->stages[static_cast<u32>(Shader::LogicalStage::Vertex)].user_data);
+    }
     out.PostRunAhead(CpSplit::PostKind::Draw);
     out.MaybeLog();
 }

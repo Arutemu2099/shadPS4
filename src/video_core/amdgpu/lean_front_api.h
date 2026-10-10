@@ -15,7 +15,17 @@
 
 #include "video_core/amdgpu/pm4_cmds.h"
 
+namespace Shader {
+struct Info;
+}
+namespace Vulkan {
+class GraphicsPipeline;
+}
 namespace AmdGpu {
+/// NativeRec stage a2: publish (VS hash, PS hash, fetch shader) -> pipeline for the job threads'
+/// derive (any thread; the tables are multi-writer). `vs_user_data` empty: the VS Info's own.
+const Shader::Info* NativeRecPublishProgram(const Vulkan::GraphicsPipeline* pipeline,
+                                            std::span<const u32> vs_user_data);
 /// SetContextReg bumps the context epoch on a real value change only when this is true.
 bool LeanViewportMemoEnabled();
 /// A NOP whose body is back work (flip IRQ, guest markers): ProcessGraphics runs it through RunGfxPacket.

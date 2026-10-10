@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <immintrin.h>
+
 #include <array>
 #include <atomic>
 #include <cstdlib>
@@ -143,8 +145,9 @@ inline std::array<std::atomic<u64>, MaxSlots> g_payload_claim{};
 /// Slot 15 is shared by every thread past the 14th: no records there (review 6).
 constexpr u32 MaxRecordSlot = 14;
 
-/// Program table: (VS hash, PS hash, fetch shader address) -> the pipeline the front looked up
-/// for such a draw. Written by the front only, read lock-free by the job threads.
+/// Program table: (VS hash, PS hash, fetch shader address) -> the pipeline the front (or a lean
+/// worker, SHADPS4_LEAN_PARSE=2) looked up for such a draw. Any number of writers (an empty slot is
+/// claimed by CAS to TableClaiming, filled, then keyed); read lock-free by the job threads.
 struct ProgramEntry {
     std::atomic<u64> key{};
     u64 vs_hash{}, ps_hash{}, fetch_addr{};
@@ -164,10 +167,23 @@ struct VsEntry {
 };
 inline std::array<VsEntry, TableSize> g_vs_table{};
 
+/// A slot being filled by a writer (never a real key; readers skip it).
+constexpr u64 TableClaiming = ~u64{0};
+
 inline u64 TableKey(u64 vs, u64 ps, u64 fetch) {
     const u64 k = vs * 0x9E3779B97F4A7C15ull ^ (ps + 0x632BE59BD9B4E019ull) * 0xC2B2AE3D27D4EB4Full ^
                   (fetch + 1) * 0x165667B19E3779F9ull;
-    return k ? k : 1;
+    return k && k != TableClaiming ? k : 1;
+}
+
+/// Waits while another writer fills the slot (a few stores).
+inline u64 TableSettled(const std::atomic<u64>& word) {
+    u64 v = word.load(std::memory_order_acquire);
+    while (v == TableClaiming) {
+        _mm_pause();
+        v = word.load(std::memory_order_acquire);
+    }
+    return v;
 }
 
 inline const void* TableFind(u64 vs, u64 ps, u64 fetch, u64* needs = nullptr) {
@@ -189,28 +205,32 @@ inline const void* TableFind(u64 vs, u64 ps, u64 fetch, u64* needs = nullptr) {
     return nullptr;
 }
 
-/// Front thread only. `needs_fn()` (the stages' read masks) runs only when an entry is created
-/// or re-pointed.
+/// Any thread. `needs_fn()` (the stages' read masks) runs only when an entry is created or
+/// re-pointed. Concurrent re-points of one entry may pair one writer's needs with another's
+/// pipeline: harmless, the needs depend only on the key's shaders (VS, PS, fetch shader).
 template <typename NeedsFn>
 inline void TablePublish(u64 vs, u64 ps, u64 fetch, const void* pipeline, NeedsFn&& needs_fn) {
     const u64 k = TableKey(vs, ps, fetch);
     for (u32 i = 0; i < 16; ++i) {
         auto& e = g_table[(k + i) & (TableSize - 1)];
-        const u64 ek = e.key.load(std::memory_order_relaxed);
+        u64 ek = TableSettled(e.key);
+        if (ek == 0) {
+            if (e.key.compare_exchange_strong(ek, TableClaiming, std::memory_order_acq_rel)) {
+                e.vs_hash = vs;
+                e.ps_hash = ps;
+                e.fetch_addr = fetch;
+                e.needs.store(needs_fn(), std::memory_order_relaxed);
+                e.pipeline.store(pipeline, std::memory_order_relaxed);
+                e.key.store(k, std::memory_order_release);
+                return;
+            }
+            ek = TableSettled(e.key); // another writer took it: compare with what it wrote
+        }
         if (ek == k && e.vs_hash == vs && e.ps_hash == ps && e.fetch_addr == fetch) {
             if (e.pipeline.load(std::memory_order_relaxed) != pipeline) {
                 e.needs.store(needs_fn(), std::memory_order_relaxed);
                 e.pipeline.store(pipeline, std::memory_order_release);
             }
-            return;
-        }
-        if (ek == 0) {
-            e.vs_hash = vs;
-            e.ps_hash = ps;
-            e.fetch_addr = fetch;
-            e.needs.store(needs_fn(), std::memory_order_relaxed);
-            e.pipeline.store(pipeline, std::memory_order_relaxed);
-            e.key.store(k, std::memory_order_release);
             return;
         }
     }
@@ -235,25 +255,29 @@ inline u32 VsFetchBase(u64 vs) {
         if (h == 0) {
             return 0;
         }
-        if (h == k) {
+        if (h == k) { // (TableClaiming: being filled, never equal to k)
             return e.fetch_base.load(std::memory_order_relaxed);
         }
     }
     return 0;
 }
 
-/// Front thread only. fetch_base: fetch_shader_sgpr_base + 1, or 0xffffffff for none.
+/// Any thread (empty slots claimed by CAS). fetch_base: fetch_shader_sgpr_base + 1, or
+/// 0xffffffff for none.
 inline void VsPublish(u64 vs, u32 fetch_base) {
-    const u64 k = vs ? vs : 1;
+    const u64 k = vs && vs != TableClaiming ? vs : 1;
     for (u32 i = 0; i < 16; ++i) {
         auto& e = g_vs_table[(k * 0x9E3779B97F4A7C15ull + i) & (TableSize - 1)];
-        const u64 h = e.vs_hash.load(std::memory_order_relaxed);
-        if (h == k) {
-            return;
-        }
+        u64 h = TableSettled(e.vs_hash);
         if (h == 0) {
-            e.fetch_base.store(fetch_base, std::memory_order_relaxed);
-            e.vs_hash.store(k, std::memory_order_release);
+            if (e.vs_hash.compare_exchange_strong(h, TableClaiming, std::memory_order_acq_rel)) {
+                e.fetch_base.store(fetch_base, std::memory_order_relaxed);
+                e.vs_hash.store(k, std::memory_order_release);
+                return;
+            }
+            h = TableSettled(e.vs_hash);
+        }
+        if (h == k) {
             return;
         }
     }
