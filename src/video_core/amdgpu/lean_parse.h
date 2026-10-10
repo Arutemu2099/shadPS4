@@ -166,6 +166,8 @@ public:
     void Pretouch(const Regs& regs);
     /// Adds this parser's phase ticks / cache counts to g_lean_phase (worker slot `w`), clears.
     void FlushPhases(u32 w);
+    /// Rasterizer::IsMapped without its lock (per-worker interval cache, map generation).
+    bool MappedFast(VAddr addr, u64 size) const;
 
 private:
     /// SHADPS4_LEAN: shader headers + checked SRT walks into the scratch, outside the cache's

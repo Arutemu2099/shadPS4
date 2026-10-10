@@ -918,8 +918,12 @@ const bool g_front_cost = [] {
 struct FrontCost {
     u64 last_tsc{}, last_wait{}, win_tsc{};
     u32 last_op{};
-    std::array<u64, 256> cyc{}, n{};
+    // 0x00-0xff graphics opcodes, 0x100 | op compute opcodes, FrontCostLeanHead the L2 head pass
+    // (LeanFrontBeginL2), FrontCostBetween from a top-level DCB's end to the next tick.
+    std::array<u64, 512> cyc{}, n{};
 };
+constexpr u32 FrontCostLeanHead = 0x1FE;
+constexpr u32 FrontCostBetween = 0x1FF;
 thread_local FrontCost t_front_cost;
 void FrontCostTick(u32 opcode) {
     auto& f = t_front_cost;
@@ -928,8 +932,8 @@ void FrontCostTick(u32 opcode) {
     if (f.last_tsc != 0) {
         const u64 dt = now - f.last_tsc;
         const u64 dw = wait - f.last_wait;
-        f.cyc[f.last_op & 255] += dt > dw ? dt - dw : 0;
-        ++f.n[f.last_op & 255];
+        f.cyc[f.last_op & 511] += dt > dw ? dt - dw : 0;
+        ++f.n[f.last_op & 511];
     } else {
         f.win_tsc = now;
     }
@@ -939,8 +943,8 @@ void FrontCostTick(u32 opcode) {
     const u64 win = now - f.win_tsc;
     if (win > 35'000'000'000ull) { // ~10 s
         const double s = double(win) / 3.5e9;
-        std::array<u32, 256> ord{};
-        for (u32 i = 0; i < 256; ++i) {
+        std::array<u32, 512> ord{};
+        for (u32 i = 0; i < 512; ++i) {
             ord[i] = i;
         }
         std::sort(ord.begin(), ord.end(), [&](u32 a, u32 b) { return f.cyc[a] > f.cyc[b]; });
@@ -949,9 +953,13 @@ void FrontCostTick(u32 opcode) {
             total += c;
         }
         std::string out;
-        for (u32 k = 0; k < 14 && f.cyc[ord[k]] != 0; ++k) {
+        for (u32 k = 0; k < 18 && f.cyc[ord[k]] != 0; ++k) {
             const u32 op = ord[k];
-            out += fmt::format(" op{:#04x}={:.1f}ms/s({:.0f}k/s,{:.0f}cyc)", op,
+            const std::string name = op == FrontCostLeanHead ? std::string{"L2head"}
+                                     : op == FrontCostBetween ? std::string{"between"}
+                                     : op >= 0x100 ? fmt::format("c{:#04x}", op & 255)
+                                                   : fmt::format("op{:#04x}", op);
+            out += fmt::format(" {}={:.1f}ms/s({:.0f}k/s,{:.0f}cyc)", name,
                                double(f.cyc[op]) / 3.5e6 / s, double(f.n[op]) / 1e3 / s,
                                double(f.cyc[op]) / double(std::max<u64>(f.n[op], 1)));
         }
@@ -1180,11 +1188,12 @@ void RegScanLog(RegScanStats& st, u64 now) {
     st.win_tsc = now;
 }
 
-/// SHADPS4_LEAN (architecture A piece 2, lean worker parser; notes/architecture-a-2026-10-10.md sec. 16):
-/// 1 = L1 shadow (the front still parses everything; workers parse each DCB's head span into a
-/// scratch channel and the two record streams are compared as canonical events).
+/// SHADPS4_LEAN_PARSE (architecture A piece 2, lean worker parser; notes/architecture-a-2026-10-10.md
+/// sec. 16): 1 = L1 shadow (the front still parses everything; workers parse each DCB's head span
+/// into a scratch channel and the two record streams are compared as canonical events), 2 = L2.
+/// (SHADPS4_LEAN is Common::Lean, the diagnostic skip; every arm sets it to 1.)
 const int g_lean = [] {
-    const char* v = std::getenv("SHADPS4_LEAN");
+    const char* v = std::getenv("SHADPS4_LEAN_PARSE");
     return v ? v[0] - '0' : 0;
 }();
 constexpr u32 LeanSlots = 128;
@@ -1788,12 +1797,16 @@ void LeanLog() {
                 }
             }
             LOG_INFO(Render,
-                     "Lean L2 phases: {} worker draws | us per worker draw: prewalk {:.2f} lookup "
+                     "Lean L2 phases: {} worker draws | us per worker draw: prewalk {:.2f} (header "
+                     "{:.2f} info {:.2f} walk {:.2f} fetch {:.2f}; lock takes per draw: map {:.3f} info "
+                     "{:.3f}) lookup "
                      "{:.2f} derive {:.2f} emit {:.2f} other-parse {:.2f} | waits per draw: channel "
                      "full {:.2f} depth {:.2f} fault {:.2f} | seed {:.2f} us per DCB | worker time: "
                      "claim wait {:.1f}%, busy (parse+seed) {:.1f}% | memo hits {:.1f}% (per worker:{}) "
                      "ineligible {} verify {} MISMATCH {} | header hits {:.1f}% fetch hits {:.1f}%",
-                     u64(d), us(p.prewalk), us(p.lookup), us(p.derive), us(p.emit),
+                     u64(d), us(p.prewalk), us(p.pw_header), us(p.pw_info), us(p.pw_walk),
+                     us(p.pw_fetch), double(p.map_lock.load()) / d, double(p.info_lock.load()) / d,
+                     us(p.lookup), us(p.derive), us(p.emit),
                      other / 3500.0 / d, double(full) / 3500.0 / d, double(depth) / 3500.0 / d,
                      fw / 3500.0 / d,
                      double(p.seed.load()) / 3500.0 / std::max(1.0, double(s.l2_taken.load())),
@@ -1805,6 +1818,7 @@ void LeanLog() {
                      100.0 * double(p.fetch_hit) / std::max(1.0, double(p.fetch_hit + p.fetch_miss)));
             p.claim_wait = p.seed = p.parse = p.prewalk = p.lookup = p.derive = p.emit = p.draws = 0;
             p.hdr_hit = p.hdr_miss = p.fetch_hit = p.fetch_miss = 0;
+            p.pw_header = p.pw_info = p.pw_walk = p.pw_fetch = p.map_lock = p.info_lock = 0;
             p.memo_ineligible = 0;
         }
         s.l2_taken = s.l2_skipped = s.head_draws = s.back_records = s.back_wait_ticks = 0;
@@ -8760,6 +8774,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto lo = reinterpret_cast<VAddr>(dcb.data());
                 split->GuardSpan(lo, lo + dcb.size_bytes(), CpSplit::DrainReason::TaskGuard);
             }
+            if (g_front_cost) [[unlikely]] {
+                FrontCostTick(FrontCostLeanHead);
+            }
             const auto l2 =
                 LeanFrontBeginL2(dcb, ccb, EmulatorSettings.IsVkGuestMarkersEnabled());
             if (l2.cut != 0) {
@@ -9644,6 +9661,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             g_a2s.published.store(g_a1_front_index, std::memory_order_release);
         }
     }
+    if (g_front_cost && !is_indirect_gfx) [[unlikely]] {
+        FrontCostTick(FrontCostBetween);
+    }
     FIBER_EXIT;
 }
 
@@ -9748,6 +9768,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+        if (g_front_cost) [[unlikely]] {
+            FrontCostTick(0x100u | static_cast<u32>(opcode));
+        }
         g_dispatch_sync.Note(vqid & 63, opcode, header);
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;

@@ -12846,16 +12846,30 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
     return boost::icl::contains(mapped_ranges, range);
 }
 
+bool Rasterizer::MappedInterval(VAddr addr, VAddr& lo, VAddr& hi) {
+    Common::RecursiveSharedLock lock{mapped_ranges_mutex};
+    const auto it = mapped_ranges.find(addr);
+    if (it == mapped_ranges.end()) {
+        return false;
+    }
+    lo = it->lower();
+    hi = it->upper();
+    return true;
+}
+
 void Rasterizer::MapMemory(VAddr addr, u64 size) {
     {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges += boost::icl::interval_set<VAddr>::interval_type::right_open(addr, addr + size);
     }
+    mapped_gen.fetch_add(1, std::memory_order_acq_rel);
     page_manager.OnGpuMap(addr, size);
     buffer_cache.EndGpuMap(addr, size);
 }
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
+    // Before anything is torn down (a worker's cached interval stops validating), and again after.
+    mapped_gen.fetch_add(1, std::memory_order_acq_rel);
     buffer_cache.BeginGpuUnmap(addr, size);
     buffer_cache.InvalidateMemory(addr, size);
     texture_cache.UnmapMemory(addr, size);
@@ -12864,6 +12878,7 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges -= boost::icl::interval_set<VAddr>::interval_type::right_open(addr, addr + size);
     }
+    mapped_gen.fetch_add(1, std::memory_order_acq_rel);
     // SHADPS4_BIND_MEMO_STATS: BeginGpuUnmap bumped before the unmap; bump again after it, so a
     // record taken while it was in progress cannot validate against the final mapping.
     buffer_cache.BumpStructGeneration();

@@ -334,6 +334,12 @@ public:
     bool ReadMemory(VAddr addr, u64 size);
     void ProcessDownloadImages();
     bool IsMapped(VAddr addr, u64 size);
+    /// SHADPS4_LEAN_PARSE workers: the GPU-mapped interval [lo, hi) containing addr (false if
+    /// unmapped). Cached by the caller together with MappedGen(), bumped on every map / unmap.
+    bool MappedInterval(VAddr addr, VAddr& lo, VAddr& hi);
+    static u64 MappedGen() {
+        return mapped_gen.load(std::memory_order_acquire);
+    }
     void MapMemory(VAddr addr, u64 size);
     void UnmapMemory(VAddr addr, u64 size);
     /// MemoryManager's own protection changes (see PageManager::ExternalProtect).
@@ -561,6 +567,8 @@ private:
     };
     std::unique_ptr<Shared> owned_shared; ///< Primary instance only.
     GraphicsLookupScratch front_capture{}; ///< SHADPS4_LEAN=2 (FrontCapture)
+    /// One GPU address space (mapped_ranges is shared by every instance): see MappedGen.
+    static inline std::atomic<u64> mapped_gen{0};
     bool front_capture_valid{};
     Shared& shared;
     std::unique_ptr<NativeBindings>& native_bindings;

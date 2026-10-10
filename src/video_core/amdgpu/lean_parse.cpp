@@ -179,6 +179,21 @@ struct Parser::Caches {
     // Page state, this draw only (Prewalk clears it).
     std::array<u64, 64> ok_pages{};
     u32 n_ok{};
+    // GPU-mapped intervals, valid while Rasterizer::MappedGen() equals span_gen (any map / unmap
+    // clears them). Mapping only - the read-protection state stays per page per draw (ok_pages).
+    struct Span {
+        VAddr lo{}, hi{};
+    };
+    std::array<Span, 16> spans{};
+    u32 n_spans{}, next_span{};
+    u64 span_gen{~u64{0}};
+    // Program Infos by shader hash (non-null ProgramInfoFor results; graphics programs are never
+    // erased from the program cache and a retired one stays alive in retired_programs).
+    struct InfoEnt {
+        u64 hash{};
+        const Shader::Info* info{};
+    };
+    std::array<InfoEnt, 256> info{};
     struct Hdr {
         VAddr code{};
         u32 off{};
@@ -207,6 +222,7 @@ struct Parser::Caches {
     u64 memo_hits_total{};
     // Phase ticks / counts since the last FlushPhases.
     u64 prewalk{}, lookup{}, derive{}, emit{}, draws{};
+    u64 pw_header{}, pw_info{}, pw_walk{}, pw_fetch{}, map_lock{}, info_lock{};
     u64 memo_hit{}, memo_miss{}, hdr_hit{}, hdr_miss{}, fetch_hit{}, fetch_miss{}, inelig{};
 };
 
@@ -225,6 +241,44 @@ void Parser::FlushPhases(u32 w) {
     g.hdr_miss += std::exchange(c.hdr_miss, 0);
     g.fetch_hit += std::exchange(c.fetch_hit, 0);
     g.fetch_miss += std::exchange(c.fetch_miss, 0);
+    g.pw_header += std::exchange(c.pw_header, 0);
+    g.pw_info += std::exchange(c.pw_info, 0);
+    g.pw_walk += std::exchange(c.pw_walk, 0);
+    g.pw_fetch += std::exchange(c.pw_fetch, 0);
+    g.map_lock += c.map_lock;
+    g.info_lock += c.info_lock;
+    g_lean_fault_stats.lock_takes.fetch_add(std::exchange(c.info_lock, 0), std::memory_order_relaxed);
+    c.map_lock = 0;
+}
+
+bool Parser::MappedFast(VAddr addr, u64 size) const {
+    // = Rasterizer::IsMapped(addr, size) without its lock: the containing interval is cached
+    // per worker and dropped whenever the map generation moves.
+    auto& c = *caches;
+    const u64 gen = Vulkan::Rasterizer::MappedGen();
+    if (gen != c.span_gen) {
+        c.n_spans = 0;
+        c.next_span = 0;
+        c.span_gen = gen;
+    }
+    if (addr > ~u64{0} - size) {
+        return false;
+    }
+    const VAddr end = addr + size;
+    for (u32 i = 0; i < c.n_spans; ++i) {
+        if (addr >= c.spans[i].lo && end <= c.spans[i].hi) {
+            return true;
+        }
+    }
+    ++c.map_lock;
+    VAddr lo = 0, hi = 0;
+    if (!env.rasterizer->MappedInterval(addr, lo, hi) || end > hi) {
+        return false;
+    }
+    c.spans[c.next_span] = {lo, hi};
+    c.next_span = (c.next_span + 1) % c.spans.size();
+    c.n_spans = std::min<u32>(c.n_spans + 1, static_cast<u32>(c.spans.size()));
+    return true;
 }
 
 Parser::Parser(const Env& env_) : env{env_} {
@@ -1207,7 +1261,7 @@ bool Parser::ReadOk(VAddr addr, u64 size, u32 kind) const {
             c.ok_pages[c.n_ok++] = p;
         }
     };
-    if (addr < 0x10000 || !env.rasterizer->IsMapped(addr, size)) {
+    if (addr < 0x10000 || !MappedFast(addr, size)) {
         st.precheck[kind + 1].fetch_add(1, std::memory_order_relaxed);
         return false;
     }
@@ -1442,8 +1496,13 @@ bool Parser::Prewalk(const Regs& regs) {
         if (!pgm || !pgm->Address<u32*>()) {
             continue;
         }
+        auto& cc = *caches;
         const AmdGpu::BinaryInfo* bin = nullptr;
-        if (!HeaderOk(pgm->Address<VAddr>(), bin)) {
+        const u64 t0 = __rdtsc();
+        const bool hdr_ok = HeaderOk(pgm->Address<VAddr>(), bin);
+        const u64 t1 = __rdtsc();
+        cc.pw_header += t1 - t0;
+        if (!hdr_ok) {
             return false;
         }
         // AmdGpu::GetParams from the checked header (no second search, no memo).
@@ -1453,18 +1512,33 @@ bool Parser::Prewalk(const Regs& regs) {
             .hash = bin->shader_hash,
         };
         sc.pre_params[out_idx] = params;
-        g_lean_fault_stats.lock_takes.fetch_add(1, std::memory_order_relaxed);
-        const Shader::Info* info = env.pipeline_cache->ProgramInfoFor(params.hash);
+        auto& ie = cc.info[(params.hash ^ (params.hash >> 23)) % cc.info.size()];
+        const Shader::Info* info = ie.info != nullptr && ie.hash == params.hash ? ie.info : nullptr;
+        if (!info) {
+            ++cc.info_lock;
+            info = env.pipeline_cache->ProgramInfoFor(params.hash);
+            if (info) {
+                ie = {params.hash, info};
+            }
+        }
+        const u64 t2 = __rdtsc();
+        cc.pw_info += t2 - t1;
         if (!info) {
             sc.pre_missing[out_idx] = true; // the lookup misses on it (no flat buffer built)
             continue;
         }
-        if (!CheckedWalk(*info, params.user_data.data(), sc.pre_flat[out_idx])) {
+        const bool walk_ok = CheckedWalk(*info, params.user_data.data(), sc.pre_flat[out_idx]);
+        const u64 t3 = __rdtsc();
+        cc.pw_walk += t3 - t2;
+        if (!walk_ok) {
             return false;
         }
-        if (out == Shader::LogicalStage::Vertex && info->has_fetch_shader &&
-            !FetchOk(*info, params.user_data)) {
-            return false;
+        if (out == Shader::LogicalStage::Vertex && info->has_fetch_shader) {
+            const bool fetch_ok = FetchOk(*info, params.user_data);
+            cc.pw_fetch += __rdtsc() - t3;
+            if (!fetch_ok) {
+                return false;
+            }
         }
     }
     sc.prewalked = true;

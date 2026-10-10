@@ -26,10 +26,11 @@ bool LeanKeepsSubmitEpoch(PM4ItOpcode opcode);
 /// SHADPS4_LEAN: set on the lean worker threads (Rasterizer::ReadMemory / InvalidateMemory count
 /// their faults instead of treating them as the front's).
 inline thread_local bool t_lean_worker = false;
-/// SHADPS4_LEAN: 0 off, 1 L1 shadow compare, 2 L2 (workers parse the head spans for real).
+/// SHADPS4_LEAN_PARSE: 0 off, 1 L1 shadow compare, 2 L2 (workers parse the head spans for real).
+/// (Not SHADPS4_LEAN: that is Common::Lean, the diagnostic skip, =1 in every arm.)
 inline int LeanMode() {
     static const int mode = [] {
-        const char* v = std::getenv("SHADPS4_LEAN");
+        const char* v = std::getenv("SHADPS4_LEAN_PARSE");
         return v ? std::atoi(v) : 0;
     }();
     return mode;
@@ -71,6 +72,9 @@ inline LeanL2Stats g_lean_l2;
 struct LeanPhaseStats {
     std::atomic<u64> claim_wait{}, seed{}, parse{}, prewalk{}, lookup{}, derive{}, emit{}, draws{};
     std::atomic<u64> hdr_hit{}, hdr_miss{}, fetch_hit{}, fetch_miss{};
+    /// The prewalk split (ticks) and its lock takes (counts): mapped-interval lookups and
+    /// ProgramInfoFor calls (both only on a per-worker cache miss).
+    std::atomic<u64> pw_header{}, pw_info{}, pw_walk{}, pw_fetch{}, map_lock{}, info_lock{};
     std::atomic<u64> memo_verify{}, memo_verify_bad{}, memo_ineligible{};
     std::array<std::atomic<u64>, 8> memo_hit{}, memo_miss{}; ///< per worker
 };
