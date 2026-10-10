@@ -513,6 +513,11 @@ private:
     struct NativeBatch {
         bool open{};
         bool ring{}; ///< SHADPS4_NATIVE_GPU_DIRECT: records read from the opener's job ring
+        /// Ring-join (sec. 11): the opener's job tag / ring index and inherited set; a draw joins
+        /// a ring batch when its job record sits at ring_idx0 + n.
+        u32 ring_tag{}, ring_idx0{};
+        u32 ring_push_inh{}, ring_inh_vs{}, ring_inh_ps{};
+        u64 ring_inh_slots{};
         // SHADPS4_NATIVE_REC_RUN (stage c1): spans validated once at the open for the job-thread
         // run the opener heads; valid while the dirty epoch and buffer structure stay put.
         bool run_valid{};
@@ -633,6 +638,10 @@ private:
         u64 ring_span_bytes{};
         u64 ring_span_stale{}; ///< SHADPS4_NATIVE_SPAN_CHECK: cache hits over CPU-dirty pages
         u64 ring_inh_runs{};   ///< ring batches with inherited registers
+        /// Ring-join: joins into ring batches, refusals (0 not the next ring entry, 1 job record
+        /// gone / no GPU record, 2 another inherited set, 3 inherited values), =2 compare.
+        u64 rj_ok{}, rj_cmp_ok{}, rj_cmp_bad{};
+        std::array<u64, 4> rj_fail{};
         std::array<u64, 4> prep_c10{};  ///< verify: close 10 of a prepared member by where
         std::array<u64, 16> prep_stop{};
         std::array<u64, 16> prep_refuse{};
@@ -647,6 +656,7 @@ private:
                        const std::array<u32, Shader::NUM_BUFFERS>& o_off,
                        const std::array<u32, Shader::NUM_BUFFERS>& o_rsize);
     bool NativeCtxSame();
+    bool NativeRingJoinOk();
     /// SHADPS4_NATIVE_GPU_DIRECT=1 (sec. 10): ring mode for the batch being opened.
     static u32* NativeGpuRingAlloc(u32 slot);
     static void NativeGpuRingInit(Rasterizer* owner);

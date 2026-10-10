@@ -2527,6 +2527,13 @@ static const int g_native_prep = [] {
     const char* e = std::getenv("SHADPS4_NATIVE_REC_PREP");
     return e ? std::atoi(e) : 0;
 }();
+// SHADPS4_NATIVE_RING_JOIN (sec. 11): 1 (default) = a draw the join accepts joins a ring batch
+// when its job record is the batch's next ring entry; 2 = also compare the join's record with the
+// job record the GPU reads (slow: reads write-combined memory); 0 = off (close 13).
+static const int g_native_ring_join = [] {
+    const char* e = std::getenv("SHADPS4_NATIVE_RING_JOIN");
+    return e ? std::atoi(e) : 1;
+}();
 // SHADPS4_NATIVE_SPAN_CHECK=1 (Opus G2 #1): count ring span-cache hits over CPU-dirty pages.
 static const bool g_native_span_check = [] {
     const char* e = std::getenv("SHADPS4_NATIVE_SPAN_CHECK");
@@ -3735,6 +3742,13 @@ void Rasterizer::NativeRingWrite() {
     }
     p.ring_src = true;
     p.verify = false;
+    b.ring_tag = draw_job_tag;
+    b.ring_idx0 = p.first_idx - 1;
+    b.ring_push_inh = native_ring_table[Shader::NativeTablePushInh];
+    b.ring_inh_slots = u64{native_ring_table[Shader::NativeTableInhSlots]} |
+                       (u64{native_ring_table[Shader::NativeTableInhSlots + 1]} << 32);
+    b.ring_inh_vs = p.inh_vs;
+    b.ring_inh_ps = p.inh_ps;
     p.tag = draw_job_tag;
     p.next_idx = p.first_idx;
     p.end_idx = p.first_idx + n;
@@ -4295,6 +4309,59 @@ void Rasterizer::NativeClose(u32 why) {
     }
 }
 
+bool Rasterizer::NativeRingJoinOk() {
+    // Back thread, NativeJoin of a ring batch: the draw's job record must be the batch's next
+    // ring entry (the multi-draw reads draw i at first + i) with a GPU record and the opener's
+    // inherited set / values. The join's own checks (same VkBuffers, image key, vertex / index)
+    // follow as for a legacy batch; then the job record's guest addresses minus the table's
+    // per-buffer bases are the join's offsets.
+    namespace NR = AmdGpu::NativeRec;
+    auto& b = native_batch;
+    auto& st = native_stats;
+    if (g_native_ring_join == 0 || draw_job_tag != b.ring_tag ||
+        draw_job_idx != b.ring_idx0 + b.n) {
+        ++st.rj_fail[0];
+        return false;
+    }
+    const NR::Record* ring = NR::g_rings[draw_job_tag >> 28].load(std::memory_order_acquire);
+    if (!ring) {
+        ++st.rj_fail[1];
+        return false;
+    }
+    const NR::Record& r = ring[draw_job_idx & (NR::RingSize - 1)];
+    const u32 gpu_ok = r.gpu_ok, push_inh = r.push_inh, inh_vs = r.inh_vs, inh_ps = r.inh_ps;
+    const u64 inh_slots = r.inh_slots;
+    const void* cmd = r.cmd;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (r.stamp.load(std::memory_order_relaxed) != draw_job_idx + 1 || cmd != draw_job_cmd ||
+        !gpu_ok) {
+        ++st.rj_fail[1];
+        return false;
+    }
+    if (push_inh != b.ring_push_inh || inh_slots != b.ring_inh_slots ||
+        (inh_vs & 0xffffu) != b.ring_inh_vs || (inh_ps & 0xffffu) != b.ring_inh_ps) {
+        ++st.rj_fail[2];
+        return false;
+    }
+    const auto& regs = liverpool->BackRegs();
+    const auto& p = native_prep;
+    for (u32 m = b.ring_inh_vs; m != 0; m &= m - 1) {
+        const u32 i = static_cast<u32>(std::countr_zero(m));
+        if (regs.vs_program.user_data[i] != p.inh_val_vs[i]) {
+            ++st.rj_fail[3];
+            return false;
+        }
+    }
+    for (u32 m = b.ring_inh_ps; m != 0; m &= m - 1) {
+        const u32 i = static_cast<u32>(std::countr_zero(m));
+        if (regs.ps_program.user_data[i] != p.inh_val_ps[i]) {
+            ++st.rj_fail[3];
+            return false;
+        }
+    }
+    return true;
+}
+
 bool Rasterizer::NativeJoin(const SplitDraw& draw,
                             const AmdGpu::CpSplit::VertexInputsPayload* front_vi) {
     // Back thread, ExecuteDraw after the prologue. True: the draw went into the open batch.
@@ -4305,8 +4372,9 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
         NativeClose(2);
         return false;
     }
-    if (b.ring) {
-        // SHADPS4_NATIVE_GPU_DIRECT: a ring batch reads only the job ring's prepared members.
+    if (b.ring && !NativeRingJoinOk()) {
+        // SHADPS4_NATIVE_GPU_DIRECT: a ring batch reads every record from the job ring; only a
+        // draw whose job record is the next ring entry can join (ring-join, sec. 11).
         NativeClose(13);
         return false;
     }
@@ -4634,6 +4702,60 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
                         static_cast<u32>(jvi.ib_off / b.index_size), static_cast<u32>(s32(vo)),
                         instance_offset};
     std::memcpy(b.cmds + u64(b.n) * NativeCmdBytes, cmd, sizeof(cmd));
+    if (b.ring) [[unlikely]] {
+        ++native_stats.rj_ok;
+        if (g_native_ring_join == 2) {
+            // The record the GPU reads for this draw (job words minus the table's bases,
+            // inherited registers / sizes from the table) against the join's own.
+            namespace NR = AmdGpu::NativeRec;
+            const u32* gr = NR::g_gpu_recs[draw_job_tag >> 28].load(std::memory_order_acquire);
+            std::array<u32, NR::GpuRecDwords> g{};
+            if (gr) {
+                std::memcpy(g.data(),
+                            gr + size_t(draw_job_idx & (NR::RingSize - 1)) * NR::GpuRecDwords,
+                            sizeof(g));
+            }
+            const auto& t = native_ring_table;
+            std::string why = gr ? "" : "no ring";
+            for (u32 i = 0; why.empty() && i < Shader::NUM_USER_DATA_REGS; ++i) {
+                const u32 want = ((b.ring_push_inh >> i) & 1) ? t[Shader::NativeTableUd + i] : g[i];
+                if (want != push.ud_regs[i]) {
+                    why = fmt::format("ud {}: ring {:#x} join {:#x}", i, want, push.ud_regs[i]);
+                }
+            }
+            for (u32 i = 0; why.empty() && i < Shader::NUM_BUFFERS; ++i) {
+                const u64 bit = u64{1} << i;
+                if (!(b.guest_mask & bit)) {
+                    continue;
+                }
+                const u32 off = g[Shader::NativeRecordOffOffset + i] - t[Shader::NativeTableBase + i];
+                const u32 sz = (b.ring_inh_slots & bit) ? t[Shader::NativeTableSize + i]
+                                                        : g[Shader::NativeRecordSizeOffset + i];
+                if (off != rec_off[i] || sz != rec_size[i]) {
+                    why = fmt::format("buffer {}: ring {:#x}+{:#x} join {:#x}+{:#x}", i, off, sz,
+                                      rec_off[i], rec_size[i]);
+                }
+            }
+            for (u32 loc = 0; why.empty() && b.colour && loc < Shader::NativeMaxPulledLocations;
+                 ++loc) {
+                if (col_vsize[loc] == 0) {
+                    continue;
+                }
+                const u32 off =
+                    g[Shader::NativeRecordVoffOffset + loc] - t[Shader::NativeTableVbase + loc];
+                if (off != col_voff[loc] || g[Shader::NativeRecordVsizeOffset + loc] != col_vsize[loc]) {
+                    why = fmt::format("vertex location {}: ring {:#x} join {:#x}", loc, off,
+                                      col_voff[loc]);
+                }
+            }
+            if (why.empty()) {
+                ++native_stats.rj_cmp_ok;
+            } else if (++native_stats.rj_cmp_bad <= 16) {
+                LOG_CRITICAL(Render_Vulkan, "NativeRingJoin compare MISMATCH ({}, slot {}): {}",
+                             b.colour ? "colour" : "shadow", b.n, why);
+            }
+        }
+    }
     if (AmdGpu::NativeRec::g_gpu_mode == 2) [[unlikely]] {
         NativeGpuVerify(push.ud_regs.data(), rec_off, rec_size, join_cpu,
                         b.colour ? col_voff.data() : nullptr, join_attribs, cmd, vertex_offset,
@@ -4944,7 +5066,8 @@ void Rasterizer::NativeLog() {
                  "NativeGpu ring: batches={} members={} ({:.2f} per batch) legacy opens={} | ring "
                  "cycles per member {:.0f} spans per batch {:.2f} (phases per batch: records {:.0f} "
                  "bases {:.0f} span syncs {:.0f} commands {:.0f}; KB per span {:.0f}; span cache "
-                 "hits {:.1f}%, stale hits {}, inherited batches {}) | refusals:{} "
+                 "hits {:.1f}%, stale hits {}, inherited batches {}) | ring-join ok={} refused "
+                 "{}/{}/{}/{} compare ok={} MISMATCH={} | refusals:{} "
                  "| confirmed={} (colour {}) | ring verify: ok={} MISMATCH={} join refused a "
                  "predicted member={} (image key c12={}, recorded c10={})",
                  st.ring_runs, st.ring_members,
@@ -4958,7 +5081,8 @@ void Rasterizer::NativeLog() {
                  double(st.c_ring_ph[3]) / double(std::max<u64>(st.ring_runs, 1)),
                  double(st.ring_span_bytes) / 1024.0 / double(std::max<u64>(st.ring_spans, 1)),
                  100.0 * double(st.ring_span_hits) / double(std::max<u64>(st.ring_spans, 1)),
-                 st.ring_span_stale, st.ring_inh_runs, rf,
+                 st.ring_span_stale, st.ring_inh_runs, st.rj_ok, st.rj_fail[0], st.rj_fail[1],
+                 st.rj_fail[2], st.rj_fail[3], st.rj_cmp_ok, st.rj_cmp_bad, rf,
                  st.prep_conf, st.prep_conf_col, st.prep_cmp_ok, st.prep_cmp_bad,
                  st.prep_join_refused, st.prep_jref[12], st.prep_jref[10]);
     }
