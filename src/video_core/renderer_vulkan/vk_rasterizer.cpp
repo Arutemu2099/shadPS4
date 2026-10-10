@@ -3061,6 +3061,7 @@ bool Rasterizer::NativePrepConfirm(const SplitDraw& draw, bool plain,
     }
     if (p.verify) {
         ++st.prep_conf; // would confirm; NativeJoin compares its record with the prepared one
+        st.prep_conf_col += b.colour;
         return false;
     }
     ++b.n;
@@ -3404,7 +3405,13 @@ void Rasterizer::NativeClose(u32 why) {
         if (native_prep.verify && draw_job_tag == native_prep.tag &&
             draw_job_idx == native_prep.next_idx) {
             ++native_stats.prep_join_refused; // the join refused a member the open prepared
-            ++native_stats.prep_jref[std::min<u32>(why, 15)];
+            ++native_stats.prep_jref[std::min<u32>(why, 14)];
+            // 15: of the close-10 refusals (the join recorded), those after a CPU write since the
+            // prepare (a race the confirm check would have seen a moment later, inferred).
+            if (why == 10 &&
+                VideoCore::g_dirty_epoch.load(std::memory_order_acquire) != native_prep.epoch) {
+                ++native_stats.prep_jref[15];
+            }
         }
         native_prep.active = false;
     }
