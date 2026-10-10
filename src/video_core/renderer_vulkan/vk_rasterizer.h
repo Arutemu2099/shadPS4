@@ -103,6 +103,11 @@ public:
     /// Front thread: classification, hazard note, empty-draw skip and pipeline lookup, reading
     /// the front's registers. Touches no cache, the scheduler or any per-draw member.
     void PrepareDrawFront(SplitDraw& draw);
+    /// SHADPS4_LEAN=2: the per-draw stage fields the front's last PrepareDrawFront captured under
+    /// the cache's exclusive lock (null in other modes / for draws without a lookup).
+    const GraphicsLookupScratch* FrontCapture() const {
+        return front_capture_valid ? &front_capture : nullptr;
+    }
     /// SHADPS4_NATIVE_REC=2, front: PrepareDrawFront for a job-thread run member, whose
     /// pipeline is the run head's (no lookup). False: not a plain draw (take the normal path).
     bool PrepareMemberFront(SplitDraw& draw, const GraphicsPipeline* pipeline);
@@ -550,6 +555,8 @@ private:
         bool fault_process_pending{};
     };
     std::unique_ptr<Shared> owned_shared; ///< Primary instance only.
+    GraphicsLookupScratch front_capture{}; ///< SHADPS4_LEAN=2 (FrontCapture)
+    bool front_capture_valid{};
     Shared& shared;
     std::unique_ptr<NativeBindings>& native_bindings;
     VideoCore::PageManager& page_manager;

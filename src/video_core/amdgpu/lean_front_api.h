@@ -24,6 +24,14 @@ bool LeanKeepsSubmitEpoch(PM4ItOpcode opcode);
 /// SHADPS4_LEAN: set on the lean worker threads (Rasterizer::ReadMemory / InvalidateMemory count
 /// their faults instead of treating them as the front's).
 inline thread_local bool t_lean_worker = false;
+/// SHADPS4_LEAN: 0 off, 1 L1 shadow compare, 2 L2 (workers parse the head spans for real).
+inline int LeanMode() {
+    static const int mode = [] {
+        const char* v = std::getenv("SHADPS4_LEAN");
+        return v ? std::atoi(v) : 0;
+    }();
+    return mode;
+}
 /// Set by a fault on this lean worker; the parser stops its span before emitting (FaultFallback).
 inline thread_local bool t_lean_fault = false;
 struct LeanFaultStats {

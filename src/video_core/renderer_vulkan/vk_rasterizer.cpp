@@ -2080,6 +2080,7 @@ void Rasterizer::PrepareDrawFront(SplitDraw& draw) {
     // path. Only order change: the lookup now runs before the back's PopPendingOperations and
     // native_bindings->BeginDraw instead of after them.
     // SPLIT-TODO: confirm the pipeline constructor does not depend on BeginDraw (heap backend).
+    front_capture_valid = false;
     draw.draw_class = ClassifyDraw(liverpool->regs);
     if (draw.draw_class != DrawClass::Draw) {
         return;
@@ -2090,6 +2091,19 @@ void Rasterizer::PrepareDrawFront(SplitDraw& draw) {
         if (draw.skip) {
             return;
         }
+    }
+    if (AmdGpu::LeanMode() == 2) [[unlikely]] {
+        // Lean workers may build pipelines (LookupOrBuildGraphics), which repoints the shared
+        // Infos' per-draw fields: copy this draw's under the same exclusive hold, then release
+        // (never across guest reads: the back's GetComputePipeline takes this lock too).
+        auto lk = pipeline_cache.AcquireExclusive();
+        draw.pipeline = pipeline_cache.GetGraphicsPipelineLocked();
+        if (VideoCore::g_native_pass != 0 && draw.pipeline && !draw.pipeline->native_checked) {
+            pipeline_cache.PrepareNativeVariantLocked(draw.pipeline, liverpool->regs);
+        }
+        pipeline_cache.CaptureFront(front_capture, draw.pipeline);
+        front_capture_valid = true;
+        return;
     }
     draw.pipeline = pipeline_cache.GetGraphicsPipeline();
     if (VideoCore::g_native_pass != 0 && draw.pipeline && !draw.pipeline->native_checked)

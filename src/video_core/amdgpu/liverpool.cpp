@@ -5197,7 +5197,8 @@ u32 NativeNeedCached(const Shader::Info* info, const Shader::Gcn::FetchShaderDat
 
 void NativeRecFront(const PM4Header* header, const Vulkan::Rasterizer::SplitDraw& draw,
                     const Regs& regs, u64 ctx_epoch,
-                    const AmdGpu::CpSplit::VertexInputsDerived* front_vi) {
+                    const AmdGpu::CpSplit::VertexInputsDerived* front_vi,
+                    const Vulkan::GraphicsLookupScratch* cap) {
     namespace NR = AmdGpu::NativeRec;
     auto& st = g_nrf;
     ++st.draws;
@@ -5314,23 +5315,27 @@ void NativeRecFront(const PM4Header* header, const Vulkan::Rasterizer::SplitDraw
             }
             const auto& rec_ud = vs ? ud_vs : ud_ps;
             const u32 known = vs ? vs_known : ps_known;
+            std::span<const u32> info_ud = info->user_data;
+            if (cap) {
+                info_ud = cap->stages[static_cast<u32>(info->l_stage)].user_data;
+            }
             // Every user-data register the stage is given (RSRC2 USER_SGPR): direct reads, the
             // SRT walker's pointers and the fetch shader address all come from these.
             const u32 n_ud = std::min<u32>(
                 vs ? regs.vs_program.settings.num_user_regs : regs.ps_program.settings.num_user_regs,
                 16u);
             for (u32 i = 0; i < n_ud; ++i) {
-                if (i >= info->user_data.size()) {
+                if (i >= info_ud.size()) {
                     continue;
                 }
                 if ((known >> i & 1) == 0) {
                     ++st.ud_unknown;
-                } else if (rec_ud[i] != info->user_data[i]) {
+                } else if (rec_ud[i] != info_ud[i]) {
                     if (++st.ud_bad <= 16) {
                         LOG_WARNING(Render,
                                     "NativeRec MISMATCH ud: stage {} reg {} front {:#x} record "
                                     "{:#x} (run k {}, gap {} dw)",
-                                    vs ? "VS" : "PS", i, info->user_data[i], rec_ud[i], run_k,
+                                    vs ? "VS" : "PS", i, info_ud[i], rec_ud[i], run_k,
                                     gap);
                     }
                 } else {
@@ -5358,8 +5363,12 @@ void NativeRecFront(const PM4Header* header, const Vulkan::Rasterizer::SplitDraw
             if (vsi->has_fetch_shader) {
                 const u32 b = vsi->fetch_shader_sgpr_base;
                 fb = b + 1;
-                if (b + 1 < vsi->user_data.size()) {
-                    fetch = (u64(vsi->user_data[b + 1]) << 32 | vsi->user_data[b]) &
+                std::span<const u32> vud = vsi->user_data;
+                if (cap) {
+                    vud = cap->stages[static_cast<u32>(Shader::LogicalStage::Vertex)].user_data;
+                }
+                if (b + 1 < vud.size()) {
+                    fetch = (u64(vud[b + 1]) << 32 | vud[b]) &
                             0xFFFFFFFFFFFFull;
                 }
             }
@@ -7325,7 +7334,16 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
         }
     }
     u32 bytes = sizeof(SplitDrawRecord);
-    if (has_stages) {
+    // SHADPS4_LEAN=2: the stage fields captured under the cache's lock (FrontCapture).
+    const Vulkan::GraphicsLookupScratch* cap = has_stages ? rasterizer->FrontCapture() : nullptr;
+    if (has_stages && cap) {
+        for (const auto& slot : cap->stages) {
+            if (slot.info) {
+                bytes += StageBytes(static_cast<u32>(slot.user_data.size()),
+                                    static_cast<u32>(slot.flattened_ud_buf.size()));
+            }
+        }
+    } else if (has_stages) {
         for (const Shader::Info* info : draw.pipeline->GetStages()) {
             if (info) {
                 bytes += StageBytes(*info);
@@ -7339,7 +7357,14 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
     u32 vi_bytes = 0;
     if (split_front_derive != 0 && has_stages && !args.is_indirect) {
         const auto stages = draw.pipeline->GetStages();
-        const Shader::BoundStage vs{stages[static_cast<u32>(Shader::LogicalStage::Vertex)]};
+        Shader::BoundStage vs{stages[static_cast<u32>(Shader::LogicalStage::Vertex)]};
+        if (cap) {
+            const auto& slot = cap->stages[static_cast<u32>(Shader::LogicalStage::Vertex)];
+            vs.info = slot.info;
+            vs.user_data = slot.user_data;
+            vs.flattened_ud_buf = slot.flattened_ud_buf;
+            vs.pgm_base = slot.pgm_base;
+        }
         vi_bytes = draw.pipeline->DeriveVertexInputs(*front_vi, regs.vgt_instance_step_rate_0,
                                                      regs.vgt_instance_step_rate_1, vs);
         bytes += vi_bytes;
@@ -7367,7 +7392,8 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
         bytes += VerifySnapshotBytes;
     }
     if (AmdGpu::NativeRec::g_mode != 0) [[unlikely]] {
-        NativeRecFront(header, draw, regs, context_change_epoch, vi_bytes ? &*front_vi : nullptr);
+        NativeRecFront(header, draw, regs, context_change_epoch, vi_bytes ? &*front_vi : nullptr,
+                       rasterizer->FrontCapture());
     }
     SegB::Pred segb{};
     bool segx_hold = false;
@@ -7415,7 +7441,16 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
     // run-ahead this is what makes the record self-contained: the back reads user data, flat
     // buffer and pgm_base only from here, and the Info only for its immutable part.
     auto* out = reinterpret_cast<u8*>(rec + 1);
-    if (has_stages) {
+    if (has_stages && cap) {
+        for (u32 i = 0; i < cap->stages.size(); ++i) {
+            const auto& slot = cap->stages[i];
+            if (slot.info) {
+                out = WriteStage(out, slot.info, slot.pgm_base, slot.user_data,
+                                 slot.flattened_ud_buf, i);
+                ++rec->stage_count;
+            }
+        }
+    } else if (has_stages) {
         const auto stages = draw.pipeline->GetStages();
         for (u32 i = 0; i < stages.size(); ++i) {
             if (stages[i]) {
