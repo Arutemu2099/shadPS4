@@ -622,6 +622,8 @@ private:
         /// span syncs.
         u64 ring_runs{}, ring_members{}, c_ring{}, ring_spans{}, ring_opens_legacy{};
         std::array<u64, 16> ring_fail{};
+        std::array<u64, 4> c_ring_ph{};
+        u64 ring_span_bytes{};
         std::array<u64, 4> prep_c10{};  ///< verify: close 10 of a prepared member by where
         std::array<u64, 16> prep_stop{};
         std::array<u64, 16> prep_refuse{};

@@ -3308,6 +3308,13 @@ bool Rasterizer::NativeRingPrepare(const GraphicsPipeline* base,
     if (t_prep.size() < NativeMaxDraws) {
         t_prep.resize(NativeMaxDraws);
     }
+    u64 tl = __rdtsc();
+    const auto lap = [&](u32 ph) {
+        const u64 now = __rdtsc();
+        st.c_ring_ph[ph] += now - tl;
+        tl = now;
+    };
+    lap(0); // records, union copy
     // Snapshot BEFORE the span syncs (a CPU write after a sync moves the epoch past it).
     const u64 epoch = VideoCore::g_dirty_epoch.load(std::memory_order_acquire);
     const u64 gen = buffer_cache.StructGeneration();
@@ -3401,14 +3408,17 @@ bool Rasterizer::NativeRingPrepare(const GraphicsPipeline* base,
         !add_span(b.ib, VideoCore::NativeRunAccess::Index, ilo, ihi)) {
         return fail(8);
     }
+    lap(1); // bases, span list
     for (u32 i = 0; i < nus; ++i) {
         const VideoCore::Buffer* buf = buffer_cache.NativeRunSpan(
             us[i].lo, us[i].hi, us[i].access, &buffer_barriers, cur_dispatch_run);
         if (!buf || std::bit_cast<u64>(static_cast<VkBuffer>(buf->Handle())) != us[i].handle) {
             return fail(9);
         }
+        st.ring_span_bytes += us[i].hi - us[i].lo;
     }
     st.ring_spans += nus;
+    lap(2); // span syncs
     // The members' indirect commands (their records are the job thread's).
     const auto& regs = liverpool->BackRegs();
     const u32 index_size = b.index_size;
@@ -3475,6 +3485,7 @@ bool Rasterizer::NativeRingPrepare(const GraphicsPipeline* base,
         m.cmd = cmd;
         n = j + 1;
     }
+    lap(3); // member commands
     if (n < want) {
         ++st.ring_fail[why];
     }
@@ -4682,13 +4693,19 @@ void Rasterizer::NativeLog() {
         }
         LOG_INFO(Render_Vulkan,
                  "NativeGpu ring: batches={} members={} ({:.2f} per batch) legacy opens={} | ring "
-                 "cycles per member {:.0f} spans per batch {:.2f} | refusals:{} | confirmed={} "
-                 "(colour {})",
+                 "cycles per member {:.0f} spans per batch {:.2f} (phases per batch: records {:.0f} "
+                 "bases {:.0f} span syncs {:.0f} commands {:.0f}; KB per span {:.0f}) | refusals:{} "
+                 "| confirmed={} (colour {})",
                  st.ring_runs, st.ring_members,
                  st.ring_runs ? double(st.ring_members) / double(st.ring_runs) : 0.0,
                  st.ring_opens_legacy,
                  st.ring_members ? double(st.c_ring) / double(st.ring_members) : 0.0,
-                 st.ring_runs ? double(st.ring_spans) / double(st.ring_runs) : 0.0, rf,
+                 st.ring_runs ? double(st.ring_spans) / double(st.ring_runs) : 0.0,
+                 double(st.c_ring_ph[0]) / double(std::max<u64>(st.ring_runs, 1)),
+                 double(st.c_ring_ph[1]) / double(std::max<u64>(st.ring_runs, 1)),
+                 double(st.c_ring_ph[2]) / double(std::max<u64>(st.ring_runs, 1)),
+                 double(st.c_ring_ph[3]) / double(std::max<u64>(st.ring_runs, 1)),
+                 double(st.ring_span_bytes) / 1024.0 / double(std::max<u64>(st.ring_spans, 1)), rf,
                  st.prep_conf, st.prep_conf_col);
     }
     if (st.n_rec[0] + st.n_rec[3] + st.n_rec[9] != 0) {
