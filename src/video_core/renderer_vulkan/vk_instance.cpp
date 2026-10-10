@@ -451,7 +451,7 @@ bool Instance::CreateDevice() {
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
     {
         const char* e = std::getenv("SHADPS4_NATIVE_BINDLESS");
-        bindless_supported = e && e[0] == '1' && vk12_features.descriptorIndexing &&
+        bindless_supported = e && (e[0] == '1' || e[0] == '2') && vk12_features.descriptorIndexing &&
                              vk12_features.runtimeDescriptorArray &&
                              vk12_features.shaderSampledImageArrayNonUniformIndexing &&
                              vk12_features.descriptorBindingSampledImageUpdateAfterBind &&

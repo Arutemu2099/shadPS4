@@ -1199,12 +1199,9 @@ Id EmitContext::LoadImage(const TextureDefinition& texture) {
         return OpLoad(texture.image_type, texture.id);
     }
     const Id slot{NativeRecordLoad(Shader::NativeRecordImgOffset + texture.bindless_index)};
-    Decorate(slot, spv::Decoration::NonUniform);
     const Id ptr{OpAccessChain(TypePointer(spv::StorageClass::UniformConstant, texture.image_type),
                                texture.id, slot)};
-    Decorate(ptr, spv::Decoration::NonUniform);
     const Id value{OpLoad(texture.image_type, ptr)};
-    Decorate(value, spv::Decoration::NonUniform);
     return value;
 }
 
@@ -1213,11 +1210,8 @@ Id EmitContext::LoadSampler(u32 index) {
         return OpLoad(sampler_type, samplers[index]);
     }
     const Id slot{NativeRecordLoad(Shader::NativeRecordSmpOffset + index)};
-    Decorate(slot, spv::Decoration::NonUniform);
     const Id ptr{OpAccessChain(sampler_pointer_type, samplers[index], slot)};
-    Decorate(ptr, spv::Decoration::NonUniform);
     const Id value{OpLoad(sampler_type, ptr)};
-    Decorate(value, spv::Decoration::NonUniform);
     return value;
 }
 
@@ -1331,11 +1325,10 @@ void EmitContext::DefineImagesAndSamplers() {
     if (native_bindless) {
         // SHADPS4_NATIVE_BINDLESS (sec. 12): every image a runtime array of its own image type
         // aliasing set 1 binding 0 (one sampled-image array), every sampler one of samplers at
-        // binding 1; indexed by the record's slot words (NonUniform: the draw index comes
-        // through a flat varying). binding.unified advances as before (set 0 unchanged).
+        // binding 1; indexed by the record's slot words. binding.unified advances as before (set 0 unchanged).
         AddCapability(spv::Capability::RuntimeDescriptorArray);
-        AddCapability(spv::Capability::ShaderNonUniform);
-        AddCapability(spv::Capability::SampledImageArrayNonUniformIndexing);
+        // No NonUniform (s433: the decoration is a per-fetch loop on NVIDIA): the slot comes
+        // from the record of this draw, and DrawIndex is dynamically uniform within a draw.
         if (profile.supported_spirv < 0x00010500) {
             AddExtension("SPV_EXT_descriptor_indexing");
         }

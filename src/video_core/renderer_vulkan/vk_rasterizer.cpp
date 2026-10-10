@@ -4046,7 +4046,12 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
             }
             u32 ki = 0, ks = 0;
             bool bad = false;
-            for (u32 w = 0; w < set_write_index; ++w) {
+            // SHADPS4_NATIVE_BINDLESS=2: verify every opener (speed arms: =1, no verify).
+            static const bool bl_verify = [] {
+                const char* e = std::getenv("SHADPS4_NATIVE_BINDLESS");
+                return e && e[0] == '2';
+            }();
+            for (u32 w = 0; bl_verify && w < set_write_index; ++w) {
                 const auto& sw = set_writes[w];
                 if (sw.descriptorType == vk::DescriptorType::eSampledImage && ki < ni) {
                     bad = bad || sw.pImageInfo[0].imageView != views[ki];
@@ -4056,7 +4061,8 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
                     ++ks;
                 }
             }
-            if (ki != ni || ks != ns) {
+            if (!bl_verify) {
+            } else if (ki != ni || ks != ns) {
                 ++native_stats.bl_vfy_none;
             } else if (bad) {
                 if (++native_stats.bl_vfy_bad <= 16) {
