@@ -96,7 +96,7 @@ static_assert(NativeTableVbase + NativeMaxPulledLocations <= NativeTableDwords);
 /// SHADPS4_NATIVE_GPU_DIRECT=1: native variants are compiled in ring mode.
 inline const bool g_native_ring = [] {
     const char* v = std::getenv("SHADPS4_NATIVE_GPU_DIRECT");
-    return v && v[0] == '1' && v[1] == 0;
+    return v && (v[0] == '1' || v[0] == '3') && v[1] == 0;
 }();
 /// The highest location the flat draw-index varying may use (with 4 built-in components the
 /// 128-component output budget allows locations up to 30; one spare).

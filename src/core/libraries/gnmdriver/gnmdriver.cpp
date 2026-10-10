@@ -1201,6 +1201,18 @@ void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
     Shader::Backend::Bindings bnd{};
     u32 bi = 0;
     auto* memory = Core::Memory::Instance();
+    std::array<u32, 512> key;
+    u32 kn = 0;
+    bool key_ok = true;
+    const auto add_key = [&](const auto& sharp) {
+        constexpr u32 words = static_cast<u32>(sizeof(sharp) / sizeof(u32));
+        if (kn + words > key.size()) {
+            key_ok = false;
+            return;
+        }
+        std::memcpy(&key[kn], &sharp, sizeof(sharp));
+        kn += words;
+    };
     for (u32 i = 0; i < stages.size(); ++i) {
         const Shader::Info* info = stages[i];
         if (!info) {
@@ -1247,7 +1259,15 @@ void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
             }
             ++bi;
         }
+        for (const auto& desc : info->images) {
+            add_key(desc.GetSharp(bs));
+        }
+        for (const auto& desc : info->samplers) {
+            add_key(desc.GetSharp(bs));
+        }
     }
+    rec.img_n = key_ok ? kn : ~0u;
+    NR::ImageKeyHash(key.data(), kn, rec.img_h1, rec.img_h2);
     std::memcpy(g.data(), push.ud_regs.data(), sizeof(u32) * Shader::NUM_USER_DATA_REGS);
     const auto& vi = r.vi_scratch;
     const u32 vcount = std::min<u32>(vi.header.count, 16);

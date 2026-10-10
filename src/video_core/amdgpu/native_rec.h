@@ -62,13 +62,32 @@ struct Record {
     u32 io_ud;
     u32 vcount;
     std::array<u64, 16> vaddr;
+    /// The raw T# / S# words of every image and sampler of every stage (NativeImageKey's order):
+    /// count and two independent 64-bit hashes (ImageKeyHash).
+    u32 img_n;
+    u64 img_h1, img_h2;
 };
+
+/// SHADPS4_NATIVE_GPU_DIRECT: two independent 64-bit hashes of an image key (raw T# / S# words).
+inline void ImageKeyHash(const u32* w, u32 n, u64& h1, u64& h2) {
+    u64 a = 0x9E3779B97F4A7C15ull ^ n, b = 0xC2B2AE3D27D4EB4Full + n;
+    for (u32 i = 0; i < n; ++i) {
+        a = (a ^ w[i]) * 0x100000001B3ull;
+        a ^= a >> 29;
+        b = (b + w[i]) * 0xFF51AFD7ED558CCDull;
+        b ^= b >> 33;
+    }
+    h1 = a;
+    h2 = b;
+}
 
 // SHADPS4_NATIVE_GPU_DIRECT (notes/native-path-2026-10-09.md sec. 10): the job thread writes,
 // per derived draw, the record the native shaders read (Shader::NativeRecordDwords dwords: user
 // data in push layout, each Guest binding's guest address (low 32 bits) and size, each pulled
 // vertex location's guest address (low 32 bits)); the GPU subtracts a per-batch base. And per
 // run, the union of every binding's range over the run's draws so far (count published last).
+/// 1: ring mode; 2: G1 verify (records vs every open / join); 3: ring verify (ring prepares run,
+/// batches stay legacy, every prepared member's join is compared with the ring's prediction).
 inline const int g_gpu_mode = [] {
     const char* v = std::getenv("SHADPS4_NATIVE_GPU_DIRECT");
     return v ? std::atoi(v) : 0;

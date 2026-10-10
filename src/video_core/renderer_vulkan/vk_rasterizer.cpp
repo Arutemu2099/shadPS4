@@ -3271,7 +3271,9 @@ bool Rasterizer::NativeRingPrepare(const GraphicsPipeline* base,
     const NR::Record* ring = NR::g_rings[slot].load(std::memory_order_acquire);
     const NR::RunUnion* unions = NR::g_unions[slot].load(std::memory_order_acquire);
     const u64 ring_handle = NR::g_gpu_handles[slot].load(std::memory_order_acquire);
-    if (!ring || !unions || ring_handle == 0) {
+    const bool ring_verify = NR::g_gpu_mode == 3;
+    const u32* gpu_cpu = ring_verify ? NR::g_gpu_recs[slot].load(std::memory_order_acquire) : nullptr;
+    if (!ring || !unions || (ring_handle == 0 && !ring_verify) || (ring_verify && !gpu_cpu)) {
         return fail(1);
     }
     constexpr u32 mask = NR::RingSize - 1;
@@ -3286,9 +3288,21 @@ bool Rasterizer::NativeRingPrepare(const GraphicsPipeline* base,
     const u32 run_k0 = r0.run_k, head_idx0 = r0.head_idx, gpu_ok0 = r0.gpu_ok;
     const u32 union0 = r0.union_idx;
     const void* cmd0 = r0.cmd;
+    const u32 img_n0 = r0.img_n;
+    const u64 img_h10 = r0.img_h1, img_h20 = r0.img_h2;
     std::atomic_thread_fence(std::memory_order_acquire);
     if (r0.stamp.load(std::memory_order_relaxed) != idx + 1 || cmd0 != draw_job_cmd || !gpu_ok0) {
         return fail(3);
+    }
+    // Colour: every member must sample the opener's images and samplers (raw T# / S# words, as
+    // the join's NativeImageKey); the job record carries their hashes. The opener's own record
+    // must agree with the back's key.
+    u64 key_h1 = 0, key_h2 = 0;
+    if (b.colour) {
+        AmdGpu::NativeRec::ImageKeyHash(native_img_key.data(), b.img_n, key_h1, key_h2);
+        if (img_n0 != b.img_n || img_h10 != key_h1 || img_h20 != key_h2) {
+            return fail(13);
+        }
     }
     const u32 head = run_k0 == 0 ? idx : head_idx0;
     const NR::RunUnion& u = unions[union0 & NR::UnionMask];
@@ -3508,10 +3522,16 @@ bool Rasterizer::NativeRingPrepare(const GraphicsPipeline* base,
         const u64 index_addr = r.index_addr;
         const auto vaddr = r.vaddr;
         const void* cmd = r.cmd;
+        const u32 img_n = r.img_n;
+        const u64 img_h1 = r.img_h1, img_h2 = r.img_h2;
         std::atomic_thread_fence(std::memory_order_acquire);
         if (r.stamp.load(std::memory_order_relaxed) != mi + 1 || run_k != k || head_idx != head ||
             !gpu_ok || uidx != union0 || !inst_known || io_ud != 0 || index_count == 0) {
             why = 10;
+            break;
+        }
+        if (b.colour && (img_n != b.img_n || img_h1 != key_h1 || img_h2 != key_h2)) {
+            why = 13; // the material changed: the batch ends here
             break;
         }
         const u64 ib_off = index_addr - icpu;
@@ -3557,6 +3577,27 @@ bool Rasterizer::NativeRingPrepare(const GraphicsPipeline* base,
         m.cmdw = {index_count, instances, static_cast<u32>(ib_off / index_size),
                   static_cast<u32>(s32(vo)), 0u};
         m.cmd = cmd;
+        if (ring_verify) {
+            // The record the GPU would compute: job words minus the table's bases.
+            const u32* g = gpu_cpu + size_t(mi & mask) * NR::GpuRecDwords;
+            m.rec.fill(0);
+            std::memcpy(m.rec.data(), g, sizeof(u32) * Shader::NUM_USER_DATA_REGS);
+            for (u32 bi = 0; bi < Shader::NUM_BUFFERS; ++bi) {
+                if (b.guest_mask & (u64{1} << bi)) {
+                    m.rec[Shader::NativeRecordOffOffset + bi] =
+                        g[Shader::NativeRecordOffOffset + bi] - table[Shader::NativeTableBase + bi];
+                    m.rec[Shader::NativeRecordSizeOffset + bi] = g[Shader::NativeRecordSizeOffset + bi];
+                }
+            }
+            for (u32 loc = 0; b.colour && loc < Shader::NativeMaxPulledLocations; ++loc) {
+                if (g[Shader::NativeRecordVsizeOffset + loc] != 0) {
+                    m.rec[Shader::NativeRecordVoffOffset + loc] =
+                        g[Shader::NativeRecordVoffOffset + loc] - table[Shader::NativeTableVbase + loc];
+                    m.rec[Shader::NativeRecordVsizeOffset + loc] =
+                        g[Shader::NativeRecordVsizeOffset + loc];
+                }
+            }
+        }
         n = j + 1;
     }
     lap(3); // member commands
@@ -3574,6 +3615,33 @@ bool Rasterizer::NativeRingPrepare(const GraphicsPipeline* base,
     native_ring_handle = ring_handle;
     st.c_ring += __rdtsc() - t0;
     return true;
+}
+
+void Rasterizer::NativeRingVerifyWrite() {
+    // SHADPS4_NATIVE_GPU_DIRECT=3: the batch stays legacy; the ring's predictions (records and
+    // commands) go to the prepare-verify side copy that NativeJoin compares with each join.
+    auto& p = native_prep;
+    const u32 n = t_prep_n;
+    t_prep_n = 0;
+    p.side.resize(size_t(n) * (Shader::NativeRecordDwords + 5));
+    for (u32 j = 0; j < n; ++j) {
+        const auto& m = t_prep[j];
+        u32* out = p.side.data() + size_t(j) * (Shader::NativeRecordDwords + 5);
+        std::memcpy(out, m.rec.data(), sizeof(m.rec));
+        std::memcpy(out + Shader::NativeRecordDwords, m.cmdw.data(), sizeof(m.cmdw));
+        p.cmd[j] = m.cmd;
+        p.icount[j] = m.cmdw[0];
+        p.inst[j] = m.cmdw[1];
+    }
+    p.verify = true;
+    p.tag = draw_job_tag;
+    p.next_idx = p.first_idx;
+    p.end_idx = p.first_idx + n;
+    p.slot0 = native_batch.n;
+    p.n = n;
+    p.active = n != 0;
+    ++native_stats.ring_runs;
+    native_stats.ring_members += n;
 }
 
 void Rasterizer::NativeRingWrite() {
@@ -3770,7 +3838,7 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         const bool mtb_off = !mtb || mtb[0] != '1';
         return stream_off && mtb_off && !VideoCore::g_epoch_defer_upload;
     }();
-    if (AmdGpu::NativeRec::g_gpu_mode == 1 &&
+    if ((AmdGpu::NativeRec::g_gpu_mode == 1 || AmdGpu::NativeRec::g_gpu_mode == 3) &&
         (!native || native->native_table_binding == GraphicsPipeline::NoNativeRecords ||
          buffer_infos.size() + 4 > Shader::NUM_BUFFERS)) {
         return fail(__LINE__);
@@ -3953,10 +4021,15 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         NativePrepare(base, AmdGpu::CpSplit::VertexInputAttribs(*front_vi), open_addr, open_size,
                       rec_off, rec_size);
     }
-    const bool gpu_direct = AmdGpu::NativeRec::g_gpu_mode == 1;
+    const bool gpu_direct =
+        AmdGpu::NativeRec::g_gpu_mode == 1 || AmdGpu::NativeRec::g_gpu_mode == 3;
+    bool ring_verify = false;
     if (gpu_direct) [[unlikely]] {
-        b.ring = NativeRingPrepare(base, AmdGpu::CpSplit::VertexInputAttribs(*front_vi), open_addr);
-        native_stats.ring_opens_legacy += !b.ring;
+        const bool prepared =
+            NativeRingPrepare(base, AmdGpu::CpSplit::VertexInputAttribs(*front_vi), open_addr);
+        ring_verify = prepared && AmdGpu::NativeRec::g_gpu_mode == 3;
+        b.ring = prepared && !ring_verify;
+        native_stats.ring_opens_legacy += !prepared;
     }
     const u64 table_bytes = gpu_direct ? Shader::NativeTableDwords * 4 : 0;
     auto& stream = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
@@ -4079,6 +4152,8 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         ++set_write_index;
         if (b.ring) {
             NativeRingWrite();
+        } else if (ring_verify) {
+            NativeRingVerifyWrite();
         }
     }
     if (g_native_prep != 0) [[unlikely]] {

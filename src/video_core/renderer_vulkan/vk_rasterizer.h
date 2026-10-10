@@ -646,6 +646,7 @@ private:
                            const AmdGpu::CpSplit::VertexInputAttrib* attribs,
                            const std::array<u64, Shader::NUM_BUFFERS>& o_addr);
     void NativeRingWrite();
+    void NativeRingVerifyWrite();
     std::array<u32, Shader::NativeTableDwords> native_ring_table{};
     struct NativeSpanEntry {
         u64 handle;

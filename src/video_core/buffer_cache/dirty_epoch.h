@@ -29,7 +29,7 @@ inline std::atomic<std::uint64_t> g_granule_clock{1};
 inline const bool g_granule_clock_on = [] {
     const char* v = std::getenv("SHADPS4_STATIC_KEY_CENSUS");
     const char* g = std::getenv("SHADPS4_NATIVE_GPU_DIRECT");
-    return (v && v[0] == '1') || (g && g[0] == '1' && g[1] == 0);
+    return (v && v[0] == '1') || (g && (g[0] == '1' || g[0] == '3') && g[1] == 0);
 }();
 inline std::atomic<std::uint64_t> g_granule_gen[NumGranules]{};
 
