@@ -3402,7 +3402,7 @@ struct State {
     std::vector<u8> opener; ///< member 0's Draw record (SplitDrawRecord + body), kept at its post
     u32 opener_bytes{};
     std::array<u64, MaxMembers> m_addr{};
-    std::array<u32, MaxMembers> m_count{}, m_inst{}, m_entry{};
+    std::array<u32, MaxMembers> m_count{}, m_inst{}, m_entry{}, m_vo{};
     std::array<CpSplit::SegOp, CpSplit::SegMaxOps> ops{};
     u32 n_ops{};
     u32 range_first{}, range_count{}; ///< the open DRAW_RANGE
@@ -3503,8 +3503,9 @@ void PostSegment(State& s) {
     std::memcpy(p, ops.data(), n_ops * sizeof(CpSplit::SegOp));
     p += n_ops * sizeof(CpSplit::SegOp);
     for (u32 j = 0; j < s.n; ++j) {
+        // vertexOffset as today's colour join writes it (the verified convention).
         const u32 cmd[5] = {s.m_count[j], s.m_inst[j],
-                            static_cast<u32>((s.m_addr[j] - s.ilo) / s.index_size), 0u, 0u};
+                            static_cast<u32>((s.m_addr[j] - s.ilo) / s.index_size), s.m_vo[j], 0u};
         std::memcpy(p, cmd, sizeof(cmd));
         p += sizeof(cmd);
     }
@@ -3810,7 +3811,7 @@ bool NativeSegBDraw(const PM4Header* header, const Vulkan::GraphicsPipeline* pip
     const bool derived = src.derived != 0, gpu_ok = src.gpu_ok != 0;
     const u32 inh_vs = src.inh_vs, inh_ps = src.inh_ps, push_inh = src.push_inh;
     const u64 inh_slots = src.inh_slots;
-    const u32 io_ud = src.io_ud;
+    const u32 io_ud = src.io_ud, vo_ud = src.vo_ud;
     const u64 index_addr = src.index_addr;
     const u32 index_count = src.index_count;
     const u32 union_idx = src.union_idx, head_idx = src.head_idx;
@@ -4018,6 +4019,7 @@ bool NativeSegBDraw(const PM4Header* header, const Vulkan::GraphicsPipeline* pip
     s.m_count[s.n] = index_count;
     s.m_inst[s.n] = pred.instances;
     s.m_entry[s.n] = (slot << 24) | (idx & Shader::NativeSegRingMask);
+    s.m_vo[s.n] = regs.index_offset != 0 ? regs.index_offset : vo_ud;
     if (s.range_count == 0) {
         s.range_first = s.n;
     }

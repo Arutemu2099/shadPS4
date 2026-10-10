@@ -4012,7 +4012,7 @@ void Rasterizer::NativeSegWrite(u8* map_ptr, u64 map_off, u64 table_bytes, u64 t
     const u32 n = seg.n;
     for (u32 j = 0; j < n; ++j) {
         const u32* c = segx_cmds + size_t(j) * 5;
-        const u32 w[5] = {c[0], c[1], c[2] + t_segx_delta, 0u, 0u};
+        const u32 w[5] = {c[0], c[1], c[2] + t_segx_delta, c[3], 0u};
         std::memcpy(b.cmds + u64(j) * NativeCmdBytes, w, sizeof(w));
     }
     if (b.list) {
