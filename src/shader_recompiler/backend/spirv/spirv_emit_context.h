@@ -272,6 +272,20 @@ public:
     Id native_dbg{};           // VS, compare diagnostic: writable uint data[]
     Id native_dbg_ptr{};
     void NativeCompareAttribute(u32 location, Id vertex_index_value, Id draw);
+    // SHADPS4_NATIVE_PT (notes/native-path-2026-10-09.md sec. 18): Guest bindings are read
+    // through the buffer cache's GPU page table and PhysicalStorageBuffer pointers.
+    bool native_pt{};
+    bool native_pt_compare{};
+    Id native_pagetable{};     // the page table SSBO (uint64 data[]: device address per page)
+    Id native_pagetable_ptr{}; // pointer type to one u64 of it
+    Id native_pt_dbg{};        // compare diagnostic: writable uint data[]
+    Id native_draw{};          // this draw's index (compare entries)
+    std::array<Id, NUM_BUFFERS> native_dev_base{}; // per buffer handle: the binding's device address
+    std::array<Id, NUM_BUFFERS> native_pt_miss{};  // the binding's page is not cached (loads read 0)
+    std::array<Id, NUM_BUFFERS> native_guest_lo{}; // the guest address (compare entries)
+    std::array<Id, NUM_BUFFERS> native_guest_hi{};
+    void NativePtTranslate(u32 handle, u32 binding, Id record_word, Id inherited);
+    void NativePtMismatch(u32 handle, Id rel_index, Id pt_bits, Id desc_bits, u32 width);
     std::array<Id, IR::NumParams> native_attr_value{}; // VS: pulled vec4 per fetch semantic
     Id NativeVbufLoad(Id dword_index);
     Id NativePullAttribute(u32 location, Id vertex_index_value);

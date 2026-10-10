@@ -79,7 +79,9 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     native_ring = native && Shader::t_native_emit.ring;
     native_bindless = native_colour && Shader::t_native_emit.bindless &&
                       info.l_stage == LogicalStage::Fragment;
-    if (info.uses_dma) {
+    native_pt = native_ring && Shader::t_native_emit.pt;
+    native_pt_compare = native_pt && Shader::t_native_emit.pt_compare;
+    if (info.uses_dma || native_pt) {
         SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
     } else {
         SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
@@ -179,7 +181,7 @@ void EmitContext::DefineArithmeticTypes() {
     if (info.uses_fp64) {
         frexp_result_f64 = Name(TypeStruct(F64[1], S32[1]), "frexp_result_f64");
     }
-    if (info.uses_dma) {
+    if (info.uses_dma || native_pt) {
         physical_pointer_type_u32 = TypePointer(spv::StorageClass::PhysicalStorageBuffer, U32[1]);
     }
 }
@@ -258,6 +260,7 @@ void EmitContext::DefineBufferProperties() {
         }
         native_rec_base = OpIMul(U32[1], draw, ConstU32(Shader::NativeRecordDwords));
         Name(native_rec_base, "native_rec_base");
+        native_draw = draw;
         if (native_pull && Shader::t_native_emit.compare) {
             const Id vindex{OpLoad(U32[1], vertex_index)};
             for (u32 loc = 0; loc < IR::NumParams; ++loc) {
@@ -289,7 +292,8 @@ void EmitContext::DefineBufferProperties() {
         Id buf_offset;
         if (native) {
             // The full byte offset of this draw's binding inside the bound VkBuffer.
-            buf_offset = NativeRecordLoad(Shader::NativeRecordOffOffset + binding);
+            const Id rec_word{NativeRecordLoad(Shader::NativeRecordOffOffset + binding)};
+            buf_offset = rec_word;
             native_size_bytes[i] = NativeRecordLoad(Shader::NativeRecordSizeOffset + binding);
             if (native_ring) {
                 // The record holds the guest address (low 32 bits); the table the buffer's base.
@@ -300,10 +304,14 @@ void EmitContext::DefineBufferProperties() {
                 const Id bit{OpBitwiseAnd(
                     U32[1], OpShiftRightLogical(U32[1], word, ConstU32(binding % 32)),
                     ConstU32(1u))};
+                const Id inherited{OpINotEqual(U1[1], bit, u32_zero_value)};
                 native_size_bytes[i] =
-                    OpSelect(U32[1], OpINotEqual(U1[1], bit, u32_zero_value),
+                    OpSelect(U32[1], inherited,
                              NativeTableLoad(Shader::NativeTableSize + binding),
                              native_size_bytes[i]);
+                if (native_pt) {
+                    NativePtTranslate(i, binding, rec_word, inherited);
+                }
             }
             native_size_dw[i] = OpShiftRightLogical(U32[1], native_size_bytes[i], ConstU32(2U));
         } else {
@@ -988,6 +996,105 @@ void EmitContext::DefineBuffers() {
             Name(native_dbg, "native_dbg");
             interfaces.push_back(native_dbg);
         }
+        if (native_pt) {
+            // SHADPS4_NATIVE_PT: the buffer cache's GPU page table (uint64 data[], read-only).
+            const Id pt_array_type{TypeRuntimeArray(U64)};
+            const Id pt_struct_type{TypeStruct(pt_array_type)};
+            if (std::ranges::find(buf_type_ids, pt_array_type.value, &Id::value) ==
+                buf_type_ids.end()) {
+                Decorate(pt_array_type, spv::Decoration::ArrayStride, 8U);
+                Decorate(pt_struct_type, spv::Decoration::Block);
+                MemberName(pt_struct_type, 0, "data");
+                MemberDecorate(pt_struct_type, 0, spv::Decoration::Offset, 0U);
+                buf_type_ids.push_back(pt_array_type);
+            }
+            native_pagetable_ptr = TypePointer(spv::StorageClass::StorageBuffer, U64);
+            native_pagetable =
+                AddGlobalVariable(TypePointer(spv::StorageClass::StorageBuffer, pt_struct_type),
+                                  spv::StorageClass::StorageBuffer);
+            Decorate(native_pagetable, spv::Decoration::Binding,
+                     Shader::t_native_emit.pagetable_binding);
+            Decorate(native_pagetable, spv::Decoration::DescriptorSet, 0U);
+            Decorate(native_pagetable, spv::Decoration::NonWritable);
+            Name(native_pagetable, "native_pagetable");
+            interfaces.push_back(native_pagetable);
+            if (native_pt_compare) {
+                native_pt_dbg =
+                    AddGlobalVariable(struct_pointer_type, spv::StorageClass::StorageBuffer);
+                Decorate(native_pt_dbg, spv::Decoration::Binding,
+                         Shader::t_native_emit.pt_debug_binding);
+                Decorate(native_pt_dbg, spv::Decoration::DescriptorSet, 0U);
+                Name(native_pt_dbg, "native_pt_dbg");
+                interfaces.push_back(native_pt_dbg);
+            }
+        }
+    }
+}
+
+void EmitContext::NativePtTranslate(u32 handle, u32 binding, Id record_word, Id inherited) {
+    // SHADPS4_NATIVE_PT (sec. 18): this draw's full guest address of the binding - the record's
+    // offset word (ring: the job thread's guest address, low 32 bits) and hi byte, an inherited
+    // slot's from the table - through the buffer cache's page table (a u64 device address per
+    // 16 KB guest page, 0 = not cached) to the device address the binding's loads start at. A
+    // miss maps to the table's fallback (the page table buffer itself: always mapped memory, so
+    // no pointer ever leaves mapped memory) and every load of the binding then reads 0. The hi
+    // byte bounds the address below 2^40, so the page index never leaves the table.
+    const auto hi_byte = [&](Id word) {
+        return OpBitFieldUExtract(U32[1], word, ConstU32((binding % 4) * 8), ConstU32(8u));
+    };
+    const Id lo{OpSelect(U32[1], inherited, NativeTableLoad(Shader::NativeTablePtLo + binding),
+                         record_word)};
+    const Id hi{OpSelect(U32[1], inherited,
+                         hi_byte(NativeTableLoad(Shader::NativeTablePtHi + binding / 4)),
+                         hi_byte(NativeRecordLoad(Shader::NativeRecordHiOffset + binding / 4)))};
+    const auto u64_of = [&](Id lo32, Id hi32) {
+        return OpBitwiseOr(U64, OpUConvert(U64, lo32),
+                           OpShiftLeftLogical(U64, OpUConvert(U64, hi32), ConstU32(32u)));
+    };
+    const Id guest{u64_of(lo, hi)};
+    Name(guest, fmt::format("buf{}_guest", binding));
+    const Id page{OpUConvert(
+        U32[1], OpShiftRightLogical(U64, guest,
+                                    ConstU32(VideoCore::BufferCache::CACHING_PAGEBITS)))};
+    const Id entry{OpLoad(
+        U64, OpAccessChain(native_pagetable_ptr, native_pagetable, u32_zero_value, page))};
+    const Id miss{OpIEqual(U1[1], entry, u64_zero_value)};
+    const Id fallback{u64_of(NativeTableLoad(Shader::NativeTablePtFallback),
+                             NativeTableLoad(Shader::NativeTablePtFallback + 1))};
+    const Id in_page{
+        OpBitwiseAnd(U64, guest, Constant(U64, VideoCore::BufferCache::CACHING_PAGESIZE - 1))};
+    native_dev_base[handle] = OpSelect(U64, miss, fallback, OpIAdd(U64, entry, in_page));
+    Name(native_dev_base[handle], fmt::format("buf{}_dev", binding));
+    native_pt_miss[handle] = miss;
+    native_guest_lo[handle] = lo;
+    native_guest_hi[handle] = hi;
+}
+
+void EmitContext::NativePtMismatch(u32 handle, Id rel_index, Id pt_bits, Id desc_bits, u32 width) {
+    // SHADPS4_NATIVE_PT=2: the page-table load against the descriptor load of the same element
+    // (both as bits, both 0 past the bound); count every mismatch, keep the first 64 (slot 64 =
+    // discard), as NativeCompareAttribute does.
+    const Id bad{OpINotEqual(U1[1], pt_bits, desc_bits)};
+    const Id ptr0{OpAccessChain(native_records_ptr, native_pt_dbg, u32_zero_value, u32_zero_value)};
+    const Id old{OpAtomicIAdd(U32[1], ptr0, ConstU32(1u), u32_zero_value,
+                              OpSelect(U32[1], bad, ConstU32(1u), u32_zero_value))};
+    const Id slot{OpSelect(U32[1],
+                           OpLogicalAnd(U1[1], bad, OpULessThan(U1[1], old, ConstU32(64u))), old,
+                           ConstU32(64u))};
+    const Id base{OpIAdd(U32[1], ConstU32(16u), OpIMul(U32[1], slot, ConstU32(16u)))};
+    const u32 tag = (l_stage == LogicalStage::Fragment ? 2u : 1u) | (width << 8);
+    const std::array<Id, 8> words{ConstU32(buffers[handle].binding),
+                                  rel_index,
+                                  pt_bits,
+                                  desc_bits,
+                                  native_draw,
+                                  native_guest_lo[handle],
+                                  native_guest_hi[handle],
+                                  ConstU32(tag)};
+    for (u32 i = 0; i < words.size(); ++i) {
+        OpStore(OpAccessChain(native_records_ptr, native_pt_dbg, u32_zero_value,
+                              OpIAdd(U32[1], base, ConstU32(i))),
+                words[i]);
     }
 }
 

@@ -357,6 +357,34 @@ void EmitSetPatch(EmitContext& ctx, IR::Patch patch, Id value) {
     ctx.OpStore(pointer, value);
 }
 
+// SHADPS4_NATIVE_PT: a Guest binding of a native variant reads through its device address
+// (DefineBufferProperties translated the draw's guest address once) instead of the descriptor.
+static bool NativePtLoads(EmitContext& ctx, u32 handle) {
+    return ctx.native_pt && handle < ctx.native_dev_base.size() &&
+           Sirit::ValidId(ctx.native_dev_base[handle]);
+}
+
+// The aligned dword holding byte `byte_off` of the binding (0 when out of bounds or the page is
+// missing: the pointer then stays inside mapped memory and the caller zeroes the result), from
+// the binding's device address rounded down to `base_align` bytes - what the descriptor path's
+// element index does to the binding's offset (dword index for 32-bit loads, halfword for
+// 16-bit). `shift` (optional): the bit position of the byte inside the dword.
+static Id NativePtLoadDword(EmitContext& ctx, u32 handle, Id byte_off, u32 base_align,
+                            Id* shift) {
+    const Id base = ctx.OpBitwiseAnd(ctx.U64, ctx.native_dev_base[handle],
+                                     ctx.Constant(ctx.U64, ~u64{base_align - 1}));
+    const Id addr = ctx.OpIAdd(ctx.U64, base, ctx.OpUConvert(ctx.U64, byte_off));
+    const Id dword_addr = ctx.OpBitwiseAnd(ctx.U64, addr, ctx.Constant(ctx.U64, ~u64{3}));
+    if (shift) {
+        *shift = ctx.OpShiftLeftLogical(
+            ctx.U32[1],
+            ctx.OpBitwiseAnd(ctx.U32[1], ctx.OpUConvert(ctx.U32[1], addr), ctx.ConstU32(3u)),
+            ctx.ConstU32(3u));
+    }
+    const Id ptr = ctx.OpConvertUToPtr(ctx.physical_pointer_type_u32, dword_addr);
+    return ctx.OpLoad(ctx.U32[1], ptr, spv::MemoryAccessMask::Aligned, 4u);
+}
+
 template <u32 N, PointerType alias>
 static Id EmitLoadBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
     const auto& spv_buffer = ctx.buffers[handle];
@@ -369,18 +397,42 @@ static Id EmitLoadBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id a
     // SHADPS4_NATIVE_PASS: whole-buffer descriptors; the guest V# bound is applied here.
     const Id size_dw = ctx.native && handle < ctx.native_size_dw.size() ? ctx.native_size_dw[handle]
                                                                         : Id{};
+    const bool pt = NativePtLoads(ctx, handle);
 
     boost::container::static_vector<Id, N> ids;
     for (u32 i = 0; i < N; i++) {
         const Id index_i = i == 0 ? address : ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i));
-        const Id ptr_i = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index_i);
-        Id result_i = ctx.OpLoad(data_types[1], ptr_i);
+        Id result_i{};
+        if (!pt || ctx.native_pt_compare) {
+            const Id ptr_i = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index_i);
+            result_i = ctx.OpLoad(data_types[1], ptr_i);
+        }
         if (Sirit::ValidId(size_dw)) {
             const Id rel_i =
                 i == 0 ? rel_address : ctx.OpIAdd(ctx.U32[1], rel_address, ctx.ConstU32(i));
             const Id in_bounds = ctx.OpULessThan(ctx.U1[1], rel_i, size_dw);
             const Id zero = alias == PointerType::U32 ? ctx.u32_zero_value : ctx.f32_zero_value;
-            result_i = ctx.OpSelect(data_types[1], in_bounds, result_i, zero);
+            if (Sirit::ValidId(result_i)) {
+                result_i = ctx.OpSelect(data_types[1], in_bounds, result_i, zero);
+            }
+            if (pt) {
+                // SHADPS4_NATIVE_PT: the same dword through the page table.
+                const Id ok = ctx.OpLogicalAnd(ctx.U1[1], in_bounds,
+                                               ctx.OpLogicalNot(ctx.U1[1], ctx.native_pt_miss[handle]));
+                const Id byte_off = ctx.OpSelect(
+                    ctx.U32[1], ok, ctx.OpShiftLeftLogical(ctx.U32[1], rel_i, ctx.ConstU32(2u)),
+                    ctx.u32_zero_value);
+                const Id bits = ctx.OpSelect(ctx.U32[1], ok,
+                                             NativePtLoadDword(ctx, handle, byte_off, 4, nullptr),
+                                             ctx.u32_zero_value);
+                if (ctx.native_pt_compare) {
+                    const Id desc_bits = alias == PointerType::U32
+                                             ? result_i
+                                             : ctx.OpBitcast(ctx.U32[1], result_i);
+                    ctx.NativePtMismatch(handle, rel_i, bits, desc_bits, 32);
+                }
+                result_i = alias == PointerType::U32 ? bits : ctx.OpBitcast(ctx.F32[1], bits);
+            }
         }
         ids.push_back(result_i);
     }
@@ -405,17 +457,49 @@ static Id NativeNarrowInBounds(EmitContext& ctx, u32 handle, Id rel_address, u32
     return ctx.OpULessThan(ctx.U1[1], rel_address, size_units);
 }
 
+// SHADPS4_NATIVE_PT: an 8 / 16-bit load (`shift` = log2 of its size) through the page table:
+// the containing aligned dword, the byte / halfword extracted (no 8 / 16-bit physical pointer
+// capability needed). `desc` (compare mode): the descriptor load's value, zero-extended.
+static Id NativePtLoadNarrow(EmitContext& ctx, u32 handle, Id rel_address, Id in_bounds,
+                             u32 shift, Id desc) {
+    const Id ok = ctx.OpLogicalAnd(ctx.U1[1], in_bounds,
+                                   ctx.OpLogicalNot(ctx.U1[1], ctx.native_pt_miss[handle]));
+    const Id rel_bytes =
+        shift == 0 ? rel_address
+                   : ctx.OpShiftLeftLogical(ctx.U32[1], rel_address, ctx.ConstU32(shift));
+    const Id byte_off = ctx.OpSelect(ctx.U32[1], ok, rel_bytes, ctx.u32_zero_value);
+    Id bit_pos{};
+    const Id dword = NativePtLoadDword(ctx, handle, byte_off, 1u << shift, &bit_pos);
+    const Id bits = ctx.OpSelect(
+        ctx.U32[1], ok, ctx.OpBitFieldUExtract(ctx.U32[1], dword, bit_pos, ctx.ConstU32(8u << shift)),
+        ctx.u32_zero_value);
+    if (ctx.native_pt_compare) {
+        ctx.NativePtMismatch(handle, rel_address, bits, desc, 8u << shift);
+    }
+    return bits;
+}
+
 Id EmitLoadBufferU8(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
     const auto& spv_buffer = ctx.buffers[handle];
     const Id in_bounds = NativeNarrowInBounds(ctx, handle, address, 0);
+    const Id rel_address = address;
     if (const Id offset = spv_buffer.Offset(PointerSize::B8); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
-    const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U8);
-    const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address)};
-    Id result{ctx.OpLoad(ctx.U8, ptr)};
-    if (Sirit::ValidId(in_bounds)) {
-        result = ctx.OpSelect(ctx.U8, in_bounds, result, ctx.Constant(ctx.U8, 0U));
+    const bool pt = NativePtLoads(ctx, handle) && Sirit::ValidId(in_bounds);
+    Id result{};
+    if (!pt || ctx.native_pt_compare) {
+        const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U8);
+        const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address)};
+        result = ctx.OpLoad(ctx.U8, ptr);
+        if (Sirit::ValidId(in_bounds)) {
+            result = ctx.OpSelect(ctx.U8, in_bounds, result, ctx.Constant(ctx.U8, 0U));
+        }
+    }
+    if (pt) {
+        const Id desc = Sirit::ValidId(result) ? ctx.OpUConvert(ctx.U32[1], result) : Id{};
+        result = ctx.OpUConvert(ctx.U8,
+                                NativePtLoadNarrow(ctx, handle, rel_address, in_bounds, 0, desc));
     }
     return result;
 }
@@ -423,14 +507,24 @@ Id EmitLoadBufferU8(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
 Id EmitLoadBufferU16(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
     const auto& spv_buffer = ctx.buffers[handle];
     const Id in_bounds = NativeNarrowInBounds(ctx, handle, address, 1);
+    const Id rel_address = address;
     if (const Id offset = spv_buffer.Offset(PointerSize::B16); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
-    const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U16);
-    const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address)};
-    Id result{ctx.OpLoad(ctx.U16, ptr)};
-    if (Sirit::ValidId(in_bounds)) {
-        result = ctx.OpSelect(ctx.U16, in_bounds, result, ctx.Constant(ctx.U16, 0U));
+    const bool pt = NativePtLoads(ctx, handle) && Sirit::ValidId(in_bounds);
+    Id result{};
+    if (!pt || ctx.native_pt_compare) {
+        const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U16);
+        const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address)};
+        result = ctx.OpLoad(ctx.U16, ptr);
+        if (Sirit::ValidId(in_bounds)) {
+            result = ctx.OpSelect(ctx.U16, in_bounds, result, ctx.Constant(ctx.U16, 0U));
+        }
+    }
+    if (pt) {
+        const Id desc = Sirit::ValidId(result) ? ctx.OpUConvert(ctx.U32[1], result) : Id{};
+        result = ctx.OpUConvert(ctx.U16,
+                                NativePtLoadNarrow(ctx, handle, rel_address, in_bounds, 1, desc));
     }
     return result;
 }

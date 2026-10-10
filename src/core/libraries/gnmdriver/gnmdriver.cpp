@@ -1175,6 +1175,9 @@ void NativeRecDerive(NR::Record& rec) {
 /// SHADPS4_NATIVE_GPU_DIRECT (notes/native-path-2026-10-09.md sec. 10): the GPU record of a
 /// derived draw (what NativeOpen / NativeJoin would write, with guest addresses instead of buffer
 /// offsets) and the run's binding ranges. Called after the run decision (rec.run_k / head_idx set).
+static_assert(NR::GpuRecDwords == Shader::NativeRecordDwords);
+static_assert(NR::GpuRecHiOffset == Shader::NativeRecordHiOffset);
+
 void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
     auto& r = t_rec;
     rec.gpu_ok = 0;
@@ -1306,6 +1309,9 @@ void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
                 g[Shader::NativeRecordOffOffset + bi] = static_cast<u32>(addr);
                 g[Shader::NativeRecordSizeOffset + bi] =
                     static_cast<u32>(std::min<u64>(size, 0xffffffffull));
+                // SHADPS4_NATIVE_PT: bits 32..39 of the guest address, one byte per binding.
+                g[Shader::NativeRecordHiOffset + bi / 4] |=
+                    static_cast<u32>((addr >> 32) & 0xffu) << ((bi % 4) * 8);
                 const u64 bit = u64{1} << bi;
                 if (!(u.guest_mask & bit)) {
                     u.lo[bi] = addr;
@@ -1365,6 +1371,8 @@ void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
             if (loc < Shader::NativeMaxPulledLocations) {
                 g[Shader::NativeRecordVoffOffset + loc] = static_cast<u32>(vaddr);
                 g[Shader::NativeRecordVsizeOffset + loc] = 0xffffffffu;
+                g[Shader::NativeRecordVhiOffset + loc / 4] |=
+                    static_cast<u32>((vaddr >> 32) & 0xffu) << ((loc % 4) * 8);
             }
             u.vlo[a] = std::min(u.vlo[a], vaddr);
             u.vhi[a] = std::max<u64>(u.vhi[a], vaddr + at.size);
@@ -1381,8 +1389,11 @@ void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
     rec.io_ud = fetch && fetch->instance_offset_sgpr >= 0 && fetch->instance_offset_sgpr < 16
                     ? r.vs[fetch->instance_offset_sgpr]
                     : 0;
-    std::memcpy(r.gpu + size_t(idx & (NR::RingSize - 1)) * NR::GpuRecDwords, g.data(),
-                sizeof(u32) * NR::GpuRecJobDwords);
+    u32* const gpu_rec = r.gpu + size_t(idx & (NR::RingSize - 1)) * NR::GpuRecDwords;
+    std::memcpy(gpu_rec, g.data(), sizeof(u32) * NR::GpuRecJobDwords);
+    // The guest-address hi bytes (SHADPS4_NATIVE_PT), always; 128-159 stay the back's.
+    std::memcpy(gpu_rec + NR::GpuRecHiOffset, g.data() + NR::GpuRecHiOffset,
+                sizeof(u32) * (NR::GpuRecDwords - NR::GpuRecHiOffset));
     _mm_sfence(); // Opus G2 #5: write-combined ring memory before the union count
     rec.union_idx = r.run_union;
     rec.gpu_ok = 1;

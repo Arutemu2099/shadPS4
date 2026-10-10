@@ -103,8 +103,11 @@ inline const int g_gpu_mode = [] {
     const char* v = std::getenv("SHADPS4_NATIVE_GPU_DIRECT");
     return v ? std::atoi(v) : 0;
 }();
-constexpr u32 GpuRecDwords = 160; // = Shader::NativeRecordDwords (bindless slot words 128-159)
-constexpr u32 GpuRecJobDwords = 128; // the job thread writes these; the back the rest
+constexpr u32 GpuRecDwords = 176; // = Shader::NativeRecordDwords (bindless slot words 128-159)
+/// The job thread writes dwords 0-127 and the guest-address hi bytes 160-175
+/// (SHADPS4_NATIVE_PT); the back the bindless slot words 128-159.
+constexpr u32 GpuRecJobDwords = 128;
+constexpr u32 GpuRecHiOffset = 160;
 inline std::array<std::atomic<u32*>, MaxSlots> g_gpu_recs{};
 constexpr u32 UnionBits = 12;
 constexpr u32 UnionMask = (1u << UnionBits) - 1;

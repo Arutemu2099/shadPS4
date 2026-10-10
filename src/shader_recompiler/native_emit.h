@@ -71,6 +71,18 @@ struct NativeEmit {
     /// each pulled location's are guest addresses (low 32 bits) minus the table's base.
     bool ring{};
     u32 table_binding{};
+    /// SHADPS4_NATIVE_PT (sec. 18, milestone 2a; ring mode only): Guest bindings are read
+    /// through the buffer cache's GPU page table at `pagetable_binding` (u64 device address per
+    /// 16 KB guest page) and a PhysicalStorageBuffer pointer, from the record's full guest
+    /// address (low 32 bits in the offset word, bits 32..39 in NativeRecordHiOffset; inherited
+    /// slots: the table's NativeTablePtLo / PtHi), not through their set-0 descriptors (still
+    /// bound, layout unchanged). =2: every such load also reads the descriptor and mismatches go
+    /// to a debug SSBO at `pt_debug_binding` (dword 0 count, entries of 16 dwords from dword 16:
+    /// binding, relative index, pt value, descriptor value, draw, guest lo, guest hi, tag).
+    bool pt{};
+    bool pt_compare{};
+    u32 pagetable_binding{};
+    u32 pt_debug_binding{};
     /// SHADPS4_NATIVE_BINDLESS (sec. 12): the PS samples image i / sampler j from the global
     /// arrays (set 1, binding 0 / 1) at the record's slot words NativeRecordImgOffset + i /
     /// NativeRecordSmpOffset + j. Set-0 numbering is unchanged.
@@ -92,8 +104,16 @@ constexpr u32 NativeRecordVsizeOffset = NativeRecordVoffOffset + NativeMaxPulled
 constexpr u32 NativeBindlessMax = 16;
 constexpr u32 NativeRecordImgOffset = NativeRecordVsizeOffset + NativeMaxPulledLocations; // 128
 constexpr u32 NativeRecordSmpOffset = NativeRecordImgOffset + NativeBindlessMax;           // 144
-constexpr u32 NativeRecordDwords = NativeRecordSmpOffset + NativeBindlessMax;              // 160
-static_assert(NativeRecordDwords == 160);
+/// SHADPS4_NATIVE_PT: byte b % 4 of dword NativeRecordHiOffset + b / 4 = bits 32..39 of Guest
+/// binding b's guest address; the same for pulled vertex locations at NativeRecordVhiOffset
+/// (written, not read by the shaders yet). 174-175 spare.
+constexpr u32 NativeRecordHiOffset = NativeRecordSmpOffset + NativeBindlessMax;            // 160
+constexpr u32 NativeRecordHiDwords = (NUM_BUFFERS + 3) / 4;                                 // 10
+constexpr u32 NativeRecordVhiOffset = NativeRecordHiOffset + NativeRecordHiDwords;           // 170
+constexpr u32 NativeRecordVhiDwords = NativeMaxPulledLocations / 4;                          // 4
+constexpr u32 NativeRecordDwords = 176;
+static_assert(NativeRecordHiOffset == 160);
+static_assert(NativeRecordVhiOffset + NativeRecordVhiDwords <= NativeRecordDwords);
 /// SHADPS4_NATIVE_GPU_DIRECT: the per-batch table (ring mode).
 constexpr u32 NativeTableFirst = 0;
 constexpr u32 NativeTableMask = 1;
@@ -106,13 +126,26 @@ constexpr u32 NativeTablePushInh = NativeTableVbase + NativeMaxPulledLocations; 
 constexpr u32 NativeTableInhSlots = NativeTablePushInh + 1;                      // 59, 60
 constexpr u32 NativeTableUd = 64;
 constexpr u32 NativeTableSize = NativeTableUd + NUM_USER_DATA_REGS; // 80
-constexpr u32 NativeTableDwords = 128;
+/// SHADPS4_NATIVE_PT: an inherited slot's guest address (low 32 bits per binding, bits 32..39
+/// as bytes) and the 64-bit fallback device address of a page-table miss (two dwords: the
+/// page table buffer itself, always mapped memory).
+constexpr u32 NativeTablePtLo = NativeTableSize + NUM_BUFFERS;             // 120
+constexpr u32 NativeTablePtHi = NativeTablePtLo + NUM_BUFFERS;             // 160
+constexpr u32 NativeTablePtFallback = NativeTablePtHi + NativeRecordHiDwords; // 170, 171
+constexpr u32 NativeTableDwords = 192;
 static_assert(NativeTableInhSlots + 2 <= NativeTableUd);
-static_assert(NativeTableSize + NUM_BUFFERS <= NativeTableDwords);
+static_assert(NativeTableSize + NUM_BUFFERS <= NativeTablePtLo);
+static_assert(NativeTablePtFallback + 2 <= NativeTableDwords);
 /// SHADPS4_NATIVE_GPU_DIRECT=1: native variants are compiled in ring mode.
 inline const bool g_native_ring = [] {
     const char* v = std::getenv("SHADPS4_NATIVE_GPU_DIRECT");
     return v && (v[0] == '1' || v[0] == '3') && v[1] == 0;
+}();
+/// SHADPS4_NATIVE_PT=1 / 2 (meaningful with SHADPS4_NATIVE_GPU_DIRECT=1 only): native variants
+/// read Guest bindings through the GPU page table; 2 = compare against the descriptor loads.
+inline const int g_native_pt = [] {
+    const char* v = std::getenv("SHADPS4_NATIVE_PT");
+    return v && (v[0] == '1' || v[0] == '2') && v[1] == 0 ? v[0] - '0' : 0;
 }();
 /// The highest location the flat draw-index varying may use (with 4 built-in components the
 /// 128-component output budget allows locations up to 30; one spare).

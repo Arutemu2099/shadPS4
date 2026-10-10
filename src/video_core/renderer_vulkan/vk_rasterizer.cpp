@@ -1459,6 +1459,13 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     if (AmdGpu::NativeRec::g_gpu_mode == 1) {
         NativeGpuRingInit(this); // SHADPS4_NATIVE_GPU_DIRECT=1: the job threads' ring hook
     }
+    native_pt_on = Shader::g_native_pt != 0 &&
+                   (AmdGpu::NativeRec::g_gpu_mode == 1 || AmdGpu::NativeRec::g_gpu_mode == 3);
+    native_pt_extra = native_pt_on ? (Shader::g_native_pt == 2 ? 2u : 1u) : 0u;
+    if (Shader::g_native_pt != 0) {
+        LOG_INFO(Render_Vulkan, "NativePt: mode {}{}", Shader::g_native_pt,
+                 native_pt_on ? "" : " (needs SHADPS4_NATIVE_GPU_DIRECT=1; off)");
+    }
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -3466,6 +3473,12 @@ bool Rasterizer::NativeRingPrepare(const GraphicsPipeline* base,
     table.fill(0);
     table[Shader::NativeTableFirst] = idx & mask;
     table[Shader::NativeTableMask] = mask;
+    if (native_pt_on) {
+        // SHADPS4_NATIVE_PT: where a page-table miss points (always mapped memory).
+        const u64 fb = buffer_cache.GetBdaPageTableBuffer()->BufferDeviceAddress();
+        table[Shader::NativeTablePtFallback] = static_cast<u32>(fb);
+        table[Shader::NativeTablePtFallback + 1] = static_cast<u32>(fb >> 32);
+    }
     // Coverage (sec. 11): inherited user-data registers - every member's equal the opener's
     // (checked at each confirm); the shaders take them from here.
     table[Shader::NativeTablePushInh] = push_inh0;
@@ -3488,6 +3501,13 @@ bool Rasterizer::NativeRingPrepare(const GraphicsPipeline* base,
             table[Shader::NativeTableBase + bi] = 0u - o_off[bi];
             table[Shader::NativeTableSize + bi] = o_size[bi];
             table[Shader::NativeTableInhSlots + bi / 32] |= 1u << (bi % 32);
+            if (native_pt_on) {
+                // SHADPS4_NATIVE_PT: the job record's words are stale here; the opener's guest
+                // address comes from the table.
+                table[Shader::NativeTablePtLo + bi] = static_cast<u32>(o_addr[bi]);
+                table[Shader::NativeTablePtHi + bi / 4] |=
+                    static_cast<u32>((o_addr[bi] >> 32) & 0xffu) << ((bi % 4) * 8);
+            }
             continue;
         }
         if (!(guest_mask & bit)) {
@@ -4006,7 +4026,9 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
     }();
     if ((AmdGpu::NativeRec::g_gpu_mode == 1 || AmdGpu::NativeRec::g_gpu_mode == 3) &&
         (!native || native->native_table_binding == GraphicsPipeline::NoNativeRecords ||
-         buffer_infos.size() + 4 > Shader::NUM_BUFFERS)) {
+         buffer_infos.size() + 4 + native_pt_extra > Shader::NUM_BUFFERS ||
+         (native_pt_on &&
+          native->native_pagetable_binding == GraphicsPipeline::NoNativeRecords))) {
         return fail(__LINE__);
     }
     if (!front_vi || !is_indexed || g_viewport_memo < 1 || !instance.IsVertexInputDynamicState() ||
@@ -4277,6 +4299,18 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
             native_ring_table.fill(0);
             native_ring_table[Shader::NativeTableFirst] = 0;
             native_ring_table[Shader::NativeTableMask] = NativeMaxDraws - 1;
+            if (native_pt_on) {
+                // SHADPS4_NATIVE_PT: the records hold guest addresses (NativePtRecord); the
+                // slot's base = its VkBuffer's CPU address (record - base = the offset).
+                for (u64 m = b.guest_mask; m != 0; m &= m - 1) {
+                    const u32 i = static_cast<u32>(std::countr_zero(m));
+                    native_ring_table[Shader::NativeTableBase + i] =
+                        static_cast<u32>(open_addr[i]) - rec_off[i];
+                }
+                const u64 fb = buffer_cache.GetBdaPageTableBuffer()->BufferDeviceAddress();
+                native_ring_table[Shader::NativeTablePtFallback] = static_cast<u32>(fb);
+                native_ring_table[Shader::NativeTablePtFallback + 1] = static_cast<u32>(fb >> 32);
+            }
         }
         std::memcpy(map_ptr, native_ring_table.data(), table_bytes);
     }
@@ -4289,6 +4323,9 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
     auto* rec = reinterpret_cast<u32*>(b.recs);
     std::memcpy(rec, push_data.ud_regs.data(), sizeof(u32) * Shader::NUM_USER_DATA_REGS);
     std::memcpy(rec + Shader::NUM_USER_DATA_REGS, rec_off.data(), sizeof(u32) * Shader::NUM_BUFFERS);
+    if (native_pt_on) [[unlikely]] {
+        NativePtRecord(rec, open_addr);
+    }
     std::memcpy(rec + Shader::NUM_USER_DATA_REGS + Shader::NUM_BUFFERS, rec_size.data(),
                 sizeof(u32) * Shader::NUM_BUFFERS);
     if (colour) {
@@ -4376,6 +4413,38 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         wt.descriptorType = vk::DescriptorType::eStorageBuffer;
         wt.pBufferInfo = &buffer_infos.back();
         ++set_write_index;
+        if (native_pt_on) [[unlikely]] {
+            // SHADPS4_NATIVE_PT: the whole page table (its transfer writes carry their own
+            // post-barrier, as for the DMA path's binding); =2 the compare SSBO.
+            const auto* pt = buffer_cache.GetBdaPageTableBuffer();
+            buffer_infos.emplace_back(pt->Handle(), 0, pt->SizeBytes());
+            auto& wp = set_writes.emplace_back();
+            wp.dstSet = VK_NULL_HANDLE;
+            wp.dstBinding = native->native_pagetable_binding;
+            wp.dstArrayElement = 0;
+            wp.descriptorCount = 1;
+            wp.descriptorType = vk::DescriptorType::eStorageBuffer;
+            wp.pBufferInfo = &buffer_infos.back();
+            ++set_write_index;
+            if (native->native_pt_debug_binding != GraphicsPipeline::NoNativeRecords) {
+                if (!native_pt_dbg) {
+                    native_pt_dbg = std::make_unique<VideoCore::Buffer>(
+                        instance, scheduler, VideoCore::MemoryUsage::Download, 0,
+                        vk::BufferUsageFlagBits::eStorageBuffer, 64 * 1024);
+                    std::memset(native_pt_dbg->mapped_data.data(), 0,
+                                native_pt_dbg->mapped_data.size());
+                }
+                buffer_infos.emplace_back(native_pt_dbg->Handle(), 0, VK_WHOLE_SIZE);
+                auto& wd = set_writes.emplace_back();
+                wd.dstSet = VK_NULL_HANDLE;
+                wd.dstBinding = native->native_pt_debug_binding;
+                wd.dstArrayElement = 0;
+                wd.descriptorCount = 1;
+                wd.descriptorType = vk::DescriptorType::eStorageBuffer;
+                wd.pBufferInfo = &buffer_infos.back();
+                ++set_write_index;
+            }
+        }
         if (b.ring) {
             NativeRingWrite();
         } else if (ring_verify) {
@@ -5295,6 +5364,7 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
     std::array<u32, Shader::NUM_BUFFERS> rec_off{};
     std::array<u32, Shader::NUM_BUFFERS> rec_size{};
     std::array<u64, Shader::NUM_BUFFERS> join_cpu{}; // GPU_DIRECT=2: each slot's buffer base
+    std::array<u64, Shader::NUM_BUFFERS> join_addr{}; // SHADPS4_NATIVE_PT: each slot's V# address
     bool ok = true;
     u32 bi = 0;
     // SHADPS4_NATIVE_REC_RUN: a run head that joins validates its run's spans here; anything
@@ -5319,6 +5389,7 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
                     break;
                 }
                 const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+                join_addr[bi] = vsharp.base_address;
                 if (run_ok && !desc.is_formatted) {
                     const auto& s = b.run_buf[bi];
                     if (s.handle != 0 && vsharp.base_address >= s.lo &&
@@ -5510,6 +5581,9 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
     auto* rec = reinterpret_cast<u32*>(b.recs + u64(b.n) * NativeRecBytes);
     std::memcpy(rec, push.ud_regs.data(), sizeof(u32) * Shader::NUM_USER_DATA_REGS);
     std::memcpy(rec + Shader::NUM_USER_DATA_REGS, rec_off.data(), sizeof(u32) * Shader::NUM_BUFFERS);
+    if (native_pt_on) [[unlikely]] {
+        NativePtRecord(rec, join_addr);
+    }
     std::memcpy(rec + Shader::NUM_USER_DATA_REGS + Shader::NUM_BUFFERS, rec_size.data(),
                 sizeof(u32) * Shader::NUM_BUFFERS);
     if (b.colour) {
@@ -5803,6 +5877,20 @@ void Rasterizer::DrawTagFlush() {
     st.last_pipe = nullptr;
 }
 
+void Rasterizer::NativePtRecord(u32* rec, const std::array<u64, Shader::NUM_BUFFERS>& addr) const {
+    // SHADPS4_NATIVE_PT: a legacy batch's record holds each Guest slot's guest address (low 32
+    // bits in the offset word, bits 32..39 in the hi bytes; the table's base for the slot is the
+    // buffer's CPU address low 32 bits, so record - base is still the VkBuffer offset).
+    const auto& b = native_batch;
+    std::array<u32, Shader::NativeRecordDwords - Shader::NativeRecordHiOffset> hi{};
+    for (u64 m = b.guest_mask; m != 0; m &= m - 1) {
+        const u32 bi = static_cast<u32>(std::countr_zero(m));
+        rec[Shader::NativeRecordOffOffset + bi] = static_cast<u32>(addr[bi]);
+        hi[bi / 4] |= static_cast<u32>((addr[bi] >> 32) & 0xffu) << ((bi % 4) * 8);
+    }
+    std::memcpy(rec + Shader::NativeRecordHiOffset, hi.data(), sizeof(hi));
+}
+
 void Rasterizer::NativeLog() {
     const auto& st = native_stats;
     std::string closes;
@@ -5816,6 +5904,22 @@ void Rasterizer::NativeLog() {
              "epoch_same={} tick_moved={} closes:{}",
              st.opens, st.joins, st.open_fail, st.verify_draws, st.verify_mismatch,
              st.epoch_same, st.tick_moved, closes);
+    if (native_pt_dbg) {
+        // SHADPS4_NATIVE_PT=2: the count every time (a clean run shows 0), the entries once.
+        const auto* d = reinterpret_cast<const u32*>(native_pt_dbg->mapped_data.data());
+        LOG_INFO(Render_Vulkan, "NativePt compare: {} mismatching loads", d[0]);
+        if (d[0] != 0 && native_pt_logged < 4) {
+            ++native_pt_logged;
+            for (u32 e = 0; e < 64 && e < d[0]; ++e) {
+                const u32* w = d + 16 + e * 16;
+                LOG_WARNING(Render_Vulkan,
+                            "NativePt compare: {} binding {} width {} rel {:#x} pt {:08x} desc "
+                            "{:08x} draw {} guest {:02x}_{:08x}",
+                            (w[7] & 0xff) == 2 ? "ps" : "vs", w[0], w[7] >> 8, w[1], w[2], w[3],
+                            w[4], w[6], w[5]);
+            }
+        }
+    }
     if (native_dbg && native_dbg_logged < 8) {
         const auto* d = reinterpret_cast<const u32*>(native_dbg->mapped_data.data());
         if (d[0] != 0) {

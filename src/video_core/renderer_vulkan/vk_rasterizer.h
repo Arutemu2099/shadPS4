@@ -646,6 +646,16 @@ private:
     void BindlessRingWrite(u32 tag, u32 idx, const u32* slots);
     std::unique_ptr<VideoCore::Buffer> native_dbg; ///< SHADPS4_NATIVE_COLOUR_DIAG 4096
     u32 native_dbg_logged{};
+    /// SHADPS4_NATIVE_PT (notes/native-path-2026-10-09.md sec. 18): native variants read Guest
+    /// bindings through the GPU page table; on = the flag with GPU_DIRECT 1 / 3; the extra
+    /// bindings it pushes (page table, =2 the compare SSBO) and that SSBO's readback copy.
+    bool native_pt_on{};
+    u32 native_pt_extra{};
+    std::unique_ptr<VideoCore::Buffer> native_pt_dbg;
+    u32 native_pt_logged{};
+    /// The back's own (legacy) record in pt mode: guest address low 32 bits in the Guest offset
+    /// words and the hi bytes (vertex hi bytes 0: unused by the shaders).
+    void NativePtRecord(u32* rec, const std::array<u64, Shader::NUM_BUFFERS>& addr) const;
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> native_open_images;
     bool NativeImageKey(const GraphicsPipeline* base, std::array<u32, 512>& out, u32& n) const;
     bool NativeColourGates() const {
