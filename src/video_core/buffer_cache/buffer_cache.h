@@ -190,7 +190,7 @@ public:
     /// appended to `barriers`. nullptr when the span is not inside one buffer or over 64 MB.
     /// SHADPS4_NATIVE_REC_PREP: the existing buffer holding `addr` (page table only: no
     /// creation, merge or sync), or nullptr.
-    const Buffer* NativeBufferAt(VAddr addr) const;
+    const Buffer* NativeBufferAt(VAddr addr);
     const Buffer* NativeRunSpan(VAddr lo, VAddr hi, NativeRunAccess access,
                                 boost::container::small_vector<vk::BufferMemoryBarrier2, 16>* barriers,
                                 u64 dispatch_run);

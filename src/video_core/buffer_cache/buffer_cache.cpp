@@ -3722,7 +3722,7 @@ void BufferCache::BindVertexBuffersDerived(
         std::span<const vk::DeviceSize>{host_sizes}, std::span<const vk::DeviceSize>{host_strides});
 }
 
-const Buffer* BufferCache::NativeBufferAt(VAddr addr) const {
+const Buffer* BufferCache::NativeBufferAt(VAddr addr) {
     if (addr == 0) {
         return nullptr;
     }
