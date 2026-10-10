@@ -3288,6 +3288,8 @@ bool g_nr_scratch_valid{};
 namespace SegB {
 constexpr u32 MaxMembers = 64;
 constexpr u64 MaxUnion = 64ull << 20;
+/// SEGX=1: the embedded member records of one Segment record (the channel takes 2 MB records).
+constexpr u32 SegMaxRecordBytes = 768u << 10;
 /// Why a draw stayed outside (1-9, also closing the open segment) or a segment closed (10-20).
 enum Reason : u32 {
     RNone = 0,
@@ -3310,6 +3312,7 @@ enum Reason : u32 {
     RInheritedDiff,  ///< v2: the member's inherited set / values differ from the opener's
     RMaterial,       ///< v3 (SEGX): a second material (image-key hashes)
     ROps,            ///< v3 (SEGX): the op list is full
+    RRecordFull,     ///< v2 (SEGX=1): the members' records would pass the Segment record cap
     NumReasons,
 };
 enum PacketKind : u32 {
@@ -3400,8 +3403,9 @@ struct State {
     bool init{}, segx{}, exec{};
     CpSplit::Channel* split{};
     bool run_ahead{};
-    std::vector<u8> opener; ///< member 0's Draw record (SplitDrawRecord + body), kept at its post
-    u32 opener_bytes{};
+    std::vector<u8> recs; ///< the members' Draw records (member 0 only in =2), kept at their post
+    u32 rec_bytes{}, n_rec{};
+    std::array<u32, MaxMembers> rec_off{};
     std::array<u64, MaxMembers> m_addr{};
     std::array<u32, MaxMembers> m_count{}, m_inst{}, m_entry{}, m_vo{};
     std::array<CpSplit::SegOp, CpSplit::SegMaxOps> ops{};
@@ -3443,18 +3447,25 @@ SplitDrawRecord* ScratchRecord(u32 bytes) {
     return reinterpret_cast<SplitDrawRecord*>(g_scratch.data());
 }
 
-/// Member 0's record bytes, kept until the segment closes (both SEGX modes).
-void KeepOpener(const void* rec, u32 bytes) {
+/// A member's record bytes, kept until the segment closes (member 0 in =2; every member in =1,
+/// for the replay fallback).
+void KeepMember(const void* rec, u32 bytes) {
     auto& s = g_state;
-    s.opener.assign(static_cast<const u8*>(rec), static_cast<const u8*>(rec) + bytes);
-    s.opener_bytes = bytes;
+    if (s.n_rec >= MaxMembers) {
+        return;
+    }
+    const u32 at = (s.rec_bytes + 15u) & ~15u;
+    s.recs.resize(at + bytes);
+    std::memcpy(s.recs.data() + at, rec, bytes);
+    s.rec_off[s.n_rec++] = at;
+    s.rec_bytes = at + bytes;
 }
 
 /// SEGX: one Segment record for the open segment, in stream position (before whatever closes
 /// it). Member commands against the final index union lo; state ops first restore the values
 /// member 0 ran with (the back's mirror holds the LAST member's), then the recorded ops.
 void PostSegment(State& s) {
-    if (!s.split || s.n == 0 || s.opener_bytes == 0) {
+    if (!s.split || s.n == 0 || s.rec_bytes == 0) {
         return;
     }
     s.drop_st += s.st_dirty;
@@ -3473,8 +3484,8 @@ void PostSegment(State& s) {
     if (s.range_count != 0) {
         ops[n_ops++] = {CpSplit::SegOpDrawRange, s.range_first, s.range_count, 0};
     }
-    const u32 opener_al = (s.opener_bytes + 15u) & ~15u;
-    const u32 bytes = static_cast<u32>(sizeof(CpSplit::SplitSegmentRecord)) + opener_al +
+    const u32 recs_al = (s.rec_bytes + 15u) & ~15u;
+    const u32 bytes = static_cast<u32>(sizeof(CpSplit::SplitSegmentRecord)) + recs_al +
                       n_ops * u32(sizeof(CpSplit::SegOp)) + s.n * 20u + s.n * 4u;
     auto* seg = s.split->Reserve<CpSplit::SplitSegmentRecord>(CpSplit::RecordType::Segment,
                                                               (bytes + 15u) & ~15u);
@@ -3482,7 +3493,9 @@ void PostSegment(State& s) {
     seg->id = s.id;
     seg->n = s.n;
     seg->n_ops = n_ops;
-    seg->draw_bytes = s.opener_bytes;
+    seg->draw_bytes = s.rec_bytes;
+    seg->n_rec = s.n_rec;
+    seg->rec_off = s.rec_off;
     seg->index_type = s.index_type;
     seg->index_size = s.index_size;
     seg->num_indices0 = s.nidx0;
@@ -3503,8 +3516,8 @@ void PostSegment(State& s) {
     seg->img_h1 = s.nmat ? s.mat_h1[0] : 0;
     seg->img_h2 = s.nmat ? s.mat_h2[0] : 0;
     u8* p = reinterpret_cast<u8*>(seg + 1);
-    std::memcpy(p, s.opener.data(), s.opener_bytes);
-    p += opener_al;
+    std::memcpy(p, s.recs.data(), s.rec_bytes);
+    p += recs_al;
     std::memcpy(p, ops.data(), n_ops * sizeof(CpSplit::SegOp));
     p += n_ops * sizeof(CpSplit::SegOp);
     for (u32 j = 0; j < s.n; ++j) {
@@ -3528,7 +3541,8 @@ void PostSegment(State& s) {
          : ops[i].kind == CpSplit::SegOpStencil  ? s.op_st
                                                   : s.op_cull) += 1;
     }
-    s.opener_bytes = 0;
+    s.rec_bytes = 0;
+    s.n_rec = 0;
 }
 
 void NoteSegment(State& s) {
@@ -3586,7 +3600,7 @@ void MaybeLog(State& s) {
              "index_type={} packet={} (ctx {} sh {} uconfig {} nop {} dispatch {} event {} dma {} "
              "wait {} ib {} submit {} other {}) count={} index_union={} vertex_union={} "
              "guest_union={} index_misaligned={} inherited_differs={} material={} ops_full={} "
-             "outside_draw={} | outside: no_tag={} stale={} no_gpu_rec={} no_variant={} "
+             "record_full={} outside_draw={} | outside: no_tag={} stale={} no_gpu_rec={} no_variant={} "
              "variant_not_ring_pt={} instance_offset={} not_plain={} no_union={} | materials per "
              "segment mean {:.2f} 1/2-3/4-7/8+: {} {} {} {}",
              s.draws, s.in_seg, s.draws ? 100.0 * double(s.in_seg) / double(s.draws) : 0.0,
@@ -3594,7 +3608,7 @@ void MaybeLog(State& s) {
              s.hist[6], c[RPipeline], c[RIndexType], c[RPacket], p[PkCtx], p[PkSh], p[PkUconfig],
              p[PkNop], p[PkDispatch], p[PkEvent], p[PkDma], p[PkWait], p[PkIb], p[PkSubmit],
              p[PkOther], c[RCount], c[RIndexUnion], c[RVertexUnion], c[RGuestUnion],
-             c[RMisaligned], c[RInheritedDiff], c[RMaterial], c[ROps],
+             c[RMisaligned], c[RInheritedDiff], c[RMaterial], c[ROps], c[RRecordFull],
              c[RNoTag] + c[RStale] + c[RNoGpuRec] + c[RNoVariant] + c[RVariantNoRing] +
                  c[RInstanceOffset] + c[RNotPlain] + c[RNoUnion],
              o[RNoTag], o[RStale], o[RNoGpuRec], o[RNoVariant], o[RVariantNoRing],
@@ -3792,7 +3806,7 @@ void NoteSubmit() {
 /// and `pred` is its prediction.
 bool NativeSegBDraw(const PM4Header* header, const Vulkan::GraphicsPipeline* pipeline, bool plain,
                     const CpSplit::VertexInputAttrib* attribs, u32 vi_count, const Regs& regs,
-                    Pred& pred) {
+                    u32 rec_bytes, Pred& pred) {
     namespace NR = AmdGpu::NativeRec;
     auto& s = g_state;
     ++s.draws;
@@ -3946,6 +3960,8 @@ bool NativeSegBDraw(const PM4Header* header, const Vulkan::GraphicsPipeline* pip
             why = RMaterial; // v1: one material per segment
         } else if (s.segx && s.n_ops + 3 > CpSplit::SegMaxOps) {
             why = ROps;
+        } else if (s.exec && s.rec_bytes + 16u + rec_bytes > SegMaxRecordBytes) {
+            why = RRecordFull;
         }
         for (u32 a = 0; why == RNone && a < vcount; ++a) {
             if (attribs[a].base_address == 0 || attribs[a].size == 0) {
@@ -4004,7 +4020,8 @@ bool NativeSegBDraw(const PM4Header* header, const Vulkan::GraphicsPipeline* pip
         std::memcpy(&s.ibase0, &regs.index_base_address, sizeof(u64));
         s.nidx0 = regs.num_indices;
         s.ninst0 = regs.num_instances.num_instances;
-        s.opener_bytes = 0;
+        s.rec_bytes = 0;
+        s.n_rec = 0;
         seen = false;
     } else if (s.segx && (s.st_dirty || s.cull_dirty)) {
         // State changed since the previous member: close the open draw range, then the ops.
@@ -4338,6 +4355,7 @@ namespace {
 /// 6 Guest union, 7 ops, 8 segment prepare failed, 9 the open was not reached, 10 other.
 struct SegXBack {
     u64 segments{}, members{}, ok{}, refused{}, op_range{}, op_st{}, op_cull{}, cycles{};
+    u64 replayed{}, replayed_members{};
     std::array<u64, 12> why{};
     u32 logged{};
     u32 calls{};
@@ -4350,7 +4368,8 @@ void Liverpool::ExecuteSegmentRecord(const CpSplit::RecordHeader& record) {
     auto& s = g_segx_back;
     const auto* seg = reinterpret_cast<const CpSplit::SplitSegmentRecord*>(&record + 1);
     const u8* p = reinterpret_cast<const u8*>(seg + 1);
-    const auto* drec = reinterpret_cast<const SplitDrawRecord*>(p);
+    const u8* recs = p; // the embedded member records, at seg->rec_off[j]
+    const auto* drec = reinterpret_cast<const SplitDrawRecord*>(recs + seg->rec_off[0]);
     p += (seg->draw_bytes + 15u) & ~15u;
     const auto* ops = reinterpret_cast<const CpSplit::SegOp*>(p);
     p += size_t(seg->n_ops) * sizeof(CpSplit::SegOp);
@@ -4371,12 +4390,30 @@ void Liverpool::ExecuteSegmentRecord(const CpSplit::RecordHeader& record) {
     bool ok = tr.NativeSegEvaluate(*seg, drec->draw.pipeline, vi, list, why);
     if (NR::g_segx == 1) {
         // The members' Draw records were withheld: member 0 runs through its embedded record
-        // with ITS draw registers in the mirror (the journal already holds the next draw's).
+        // with ITS draw registers in the mirror (the journal already holds the next draw's) and
+        // the stencil / cull state it ran with (the leading state ops; the mirror holds the last
+        // member's). A refusal replays every other member through today's path, in op order,
+        // each with its own draw registers (brick C v2: no holes).
         auto& mregs = mirror->regs;
+        constexpr u32 ctx0 = Regs::ContextRegWordOffset;
         const auto save_ib = mregs.index_base_address;
         const u32 save_ni = mregs.num_indices;
         const auto save_inst = mregs.num_instances;
         const auto save_it = mregs.index_buffer_type;
+        const u32 save_sf = mregs.reg_array[ctx0 + 0x10C];
+        const u32 save_sb = mregs.reg_array[ctx0 + 0x10D];
+        const u32 save_pc = mregs.reg_array[ctx0 + 0x205];
+        const auto apply_state = [&](const CpSplit::SegOp& op) {
+            if (op.kind == CpSplit::SegOpStencil) {
+                mregs.reg_array[ctx0 + 0x10C] = op.a;
+                mregs.reg_array[ctx0 + 0x10D] = op.b;
+            } else if (op.kind == CpSplit::SegOpCull) {
+                mregs.reg_array[ctx0 + 0x205] = op.a;
+            }
+        };
+        for (u32 i = 0; i < seg->n_ops && ops[i].kind != CpSplit::SegOpDrawRange; ++i) {
+            apply_state(ops[i]);
+        }
         std::memcpy(&mregs.index_base_address, &seg->index_base0, sizeof(u64));
         mregs.num_indices = seg->num_indices0;
         mregs.num_instances.num_instances = seg->num_instances0;
@@ -4388,14 +4425,40 @@ void Liverpool::ExecuteSegmentRecord(const CpSplit::RecordHeader& record) {
         tr.segx_result = 0;
         ExecuteDrawRecord(record, drec);
         tr.segx_pending = nullptr;
-        mregs.index_base_address = save_ib;
-        mregs.num_indices = save_ni;
-        mregs.num_instances = save_inst;
-        mregs.index_buffer_type = save_it;
         if (ok) {
             ok = tr.segx_result == 1;
             why = ok ? 0 : tr.segx_result == 0 ? 9 : tr.segx_result;
         }
+        if (!ok && seg->n_rec == seg->n && seg->n > 1) {
+            ++s.replayed;
+            for (u32 i = 0; i < seg->n_ops; ++i) {
+                const auto& op = ops[i];
+                if (op.kind != CpSplit::SegOpDrawRange) {
+                    apply_state(op);
+                    continue;
+                }
+                for (u32 j = op.a; j < op.a + op.b && j < seg->n; ++j) {
+                    if (j == 0) {
+                        continue; // drawn above
+                    }
+                    const u32* c = cmds + size_t(j) * 5;
+                    const u64 addr = seg->ilo + u64(c[2]) * seg->index_size;
+                    mregs.index_base_address.base_addr_lo = static_cast<u32>(addr);
+                    mregs.index_base_address.base_addr_hi = static_cast<u32>(addr >> 32);
+                    mregs.num_indices = c[0];
+                    mregs.num_instances.num_instances = c[1];
+                    ExecuteDrawRecord(record, recs + seg->rec_off[j]);
+                    ++s.replayed_members;
+                }
+            }
+        }
+        mregs.index_base_address = save_ib;
+        mregs.num_indices = save_ni;
+        mregs.num_instances = save_inst;
+        mregs.index_buffer_type = save_it;
+        mregs.reg_array[ctx0 + 0x10C] = save_sf;
+        mregs.reg_array[ctx0 + 0x10D] = save_sb;
+        mregs.reg_array[ctx0 + 0x205] = save_pc;
     }
     s.cycles += __rdtsc() - t0;
     ++s.segments;
@@ -4431,12 +4494,14 @@ void Liverpool::ExecuteSegmentRecord(const CpSplit::RecordHeader& record) {
              "NativeSegX: mode {} segments={} members={} evaluated ok={} refused={} (variant {} "
              "lifetime {} index_union {} vertex_union {} vertex_bufs {} guest_union {} ops {} "
              "prepare {} open {} other {}) ops: draw ranges={} stencil={} cull={} | cycles per "
-             "segment open {:.0f}",
+             "segment open {:.0f} | replayed segments={} members={}",
              NR::g_segx, s.segments, s.members, s.ok, s.refused, s.why[1], s.why[2], s.why[3],
              s.why[4], s.why[5], s.why[6], s.why[7], s.why[8], s.why[9], s.why[10] + s.why[11],
              s.op_range, s.op_st, s.op_cull,
-             s.segments ? double(s.cycles) / double(s.segments) : 0.0);
+             s.segments ? double(s.cycles) / double(s.segments) : 0.0, s.replayed,
+             s.replayed_members);
     s.segments = s.members = s.ok = s.refused = s.op_range = s.op_st = s.op_cull = s.cycles = 0;
+    s.replayed = s.replayed_members = 0;
     s.why.fill(0);
 }
 
@@ -4575,6 +4640,7 @@ bool Liverpool::NativeRecMember(const PM4Header* header, const char* name, bool 
     }
     SegB::Pred segb{};
     bool segx_hold = false;
+    const u32 rec_bytes = static_cast<u32>(sizeof(SplitDrawRecord) + body);
     if (NR::g_segb != 0) [[unlikely]] {
         // SHADPS4_NATIVE_SEGB: the vertex block in `local` (the head's descriptions patched in).
         if (!SegB::g_state.init) {
@@ -4583,12 +4649,11 @@ bool Liverpool::NativeRecMember(const PM4Header* header, const char* name, bool 
         const auto* vih = reinterpret_cast<const CpSplit::VertexInputsPayload*>(out);
         const bool member = SegB::NativeSegBDraw(header, run.pipeline, true,
                                                  CpSplit::VertexInputAttribs(*vih), vih->count,
-                                                 regs, segb);
+                                                 regs, rec_bytes, segb);
         segx_hold = member && SegB::g_state.exec;
     }
-    // SHADPS4_NATIVE_SEGX=1: a segment member's record is built but not posted (member 0's
-    // rides in the Segment record at the close).
-    const u32 rec_bytes = static_cast<u32>(sizeof(SplitDrawRecord) + body);
+    // SHADPS4_NATIVE_SEGX=1: a segment member's record is built but not posted (it rides in the
+    // Segment record at the close).
     auto* rec = segx_hold ? SegB::ScratchRecord(rec_bytes)
                           : split->Reserve<SplitDrawRecord>(CpSplit::RecordType::Draw, rec_bytes);
     rec->draw = draw;
@@ -4611,8 +4676,8 @@ bool Liverpool::NativeRecMember(const PM4Header* header, const char* name, bool 
     rec->segb_index_count = segb.index_count;
     rec->segb_instances = segb.instances;
     std::memcpy(reinterpret_cast<u8*>(rec + 1), local.data(), body);
-    if (segb.id != 0 && segb.member == 0 && SegB::g_state.segx) [[unlikely]] {
-        SegB::KeepOpener(rec, rec_bytes);
+    if (segb.id != 0 && (segb.member == 0 || SegB::g_state.exec) && SegB::g_state.segx) [[unlikely]] {
+        SegB::KeepMember(rec, rec_bytes);
     }
     if (!segx_hold) {
         split->Commit();
@@ -4805,7 +4870,7 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
         const bool member = SegB::NativeSegBDraw(header, draw.pipeline, has_stages,
                                                  vi_bytes ? front_vi->attribs.data() : nullptr,
                                                  vi_bytes ? front_vi->header.count : 0u, regs,
-                                                 segb);
+                                                 bytes, segb);
         segx_hold = member && SegB::g_state.exec;
     }
     // SHADPS4_NATIVE_SEGX=1: a segment member's record is built but not posted (member 0's
@@ -4880,8 +4945,8 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
                      double(st.c_normal) / double(st.n_normal), st.n_normal);
         }
     }
-    if (segb.id != 0 && segb.member == 0 && SegB::g_state.segx) [[unlikely]] {
-        SegB::KeepOpener(rec, bytes);
+    if (segb.id != 0 && (segb.member == 0 || SegB::g_state.exec) && SegB::g_state.segx) [[unlikely]] {
+        SegB::KeepMember(rec, bytes);
     }
     if (segx_hold) [[unlikely]] {
         split->MaybeLog();
