@@ -1082,13 +1082,15 @@ void EmitContext::NativePtTranslate(u32 handle, u32 binding, Id record_word, Id 
     native_guest_hi[handle] = hi;
 }
 
-void EmitContext::NativePtMismatch(u32 handle, Id rel_index, Id pt_bits, Id desc_bits, u32 width) {
+void EmitContext::NativePtMismatch(u32 handle, Id rel_index, Id pt_bits, Id desc_bits, u32 width,
+                                   bool scalar) {
     // SHADPS4_NATIVE_PT=2: the page-table load against the descriptor load of the same element
     // (both as bits, both 0 past the bound); count every mismatch, keep the first 64 (slot 64 =
     // discard), as NativeCompareAttribute does.
     // The atomic and the stores run only on a mismatch, inside a helper function (an atomic per
     // load on one counter took the city to ~1 FPS, s459; a branch here would split the IR's block).
-    const u32 tag = (l_stage == LogicalStage::Fragment ? 2u : 1u) | (width << 8);
+    // Tag bits: 1 vs / 2 ps, bit 2 = a scalar (s_buffer_load) load (brick C v3 item 2).
+    const u32 tag = (l_stage == LogicalStage::Fragment ? 2u : 1u) | (scalar ? 4u : 0u) | (width << 8);
     OpFunctionCall(void_id, native_pt_report, ConstU32(buffers[handle].binding), rel_index, pt_bits,
                    desc_bits, native_draw, native_guest_lo[handle], native_guest_hi[handle],
                    ConstU32(tag));

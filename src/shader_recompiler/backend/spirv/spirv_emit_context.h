@@ -285,7 +285,8 @@ public:
     std::array<Id, NUM_BUFFERS> native_guest_lo{}; // the guest address (compare entries)
     std::array<Id, NUM_BUFFERS> native_guest_hi{};
     void NativePtTranslate(u32 handle, u32 binding, Id record_word, Id inherited);
-    void NativePtMismatch(u32 handle, Id rel_index, Id pt_bits, Id desc_bits, u32 width);
+    void NativePtMismatch(u32 handle, Id rel_index, Id pt_bits, Id desc_bits, u32 width,
+                          bool scalar = false);
     // SHADPS4_NATIVE_SEG (sec. 20 brick A): the record is read by pointer (NativeRecordLoad)
     // from the batch's list entry; =2 every word is also read the SSBO way and compared.
     bool native_seg{};

@@ -90,6 +90,11 @@ Id EmitReadConst(EmitContext& ctx, IR::Inst* inst, Id addr, Id offset) {
     }
 }
 
+// SHADPS4_NATIVE_PT: a Guest binding of a native variant reads through its device address
+// (DefineBufferProperties translated the draw's guest address once) instead of the descriptor.
+static bool NativePtLoads(EmitContext& ctx, u32 handle);
+static Id NativePtLoadDword(EmitContext& ctx, u32 handle, Id byte_off, u32 base_align, Id* shift);
+
 Id EmitReadConstBuffer(EmitContext& ctx, u32 handle, Id index) {
     const auto& buffer = ctx.buffers[handle];
     const Id rel_index = index;
@@ -97,14 +102,36 @@ Id EmitReadConstBuffer(EmitContext& ctx, u32 handle, Id index) {
         index = ctx.OpIAdd(ctx.U32[1], index, offset);
     }
     const auto [id, pointer_type] = buffer.Alias(PointerType::U32);
-    const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index)};
-    Id result{ctx.OpLoad(ctx.U32[1], ptr)};
     // SHADPS4_NATIVE_PASS: whole-buffer descriptors; the guest V# bound (Opus code review #3).
-    if (ctx.native && handle < ctx.native_size_dw.size() &&
-        Sirit::ValidId(ctx.native_size_dw[handle])) {
-        result = ctx.OpSelect(ctx.U32[1],
-                              ctx.OpULessThan(ctx.U1[1], rel_index, ctx.native_size_dw[handle]),
-                              result, ctx.u32_zero_value);
+    const bool bounded = ctx.native && handle < ctx.native_size_dw.size() &&
+                         Sirit::ValidId(ctx.native_size_dw[handle]);
+    // SHADPS4_NATIVE_PT (brick C v3 item 2): the scalar load through the page table like the
+    // vector loads (EmitLoadBufferB32xN): a segment's members address their own buffers.
+    const bool pt = bounded && NativePtLoads(ctx, handle);
+    Id result{};
+    if (!pt || ctx.native_pt_compare) {
+        const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index)};
+        result = ctx.OpLoad(ctx.U32[1], ptr);
+    }
+    if (bounded) {
+        const Id in_bounds = ctx.OpULessThan(ctx.U1[1], rel_index, ctx.native_size_dw[handle]);
+        if (Sirit::ValidId(result)) {
+            result = ctx.OpSelect(ctx.U32[1], in_bounds, result, ctx.u32_zero_value);
+        }
+        if (pt) {
+            const Id ok = ctx.OpLogicalAnd(ctx.U1[1], in_bounds,
+                                           ctx.OpLogicalNot(ctx.U1[1], ctx.native_pt_miss[handle]));
+            const Id byte_off = ctx.OpSelect(
+                ctx.U32[1], ok, ctx.OpShiftLeftLogical(ctx.U32[1], rel_index, ctx.ConstU32(2u)),
+                ctx.u32_zero_value);
+            const Id bits = ctx.OpSelect(ctx.U32[1], ok,
+                                         NativePtLoadDword(ctx, handle, byte_off, 4, nullptr),
+                                         ctx.u32_zero_value);
+            if (ctx.native_pt_compare) {
+                ctx.NativePtMismatch(handle, rel_index, bits, result, 32, true);
+            }
+            result = bits;
+        }
     }
     return result;
 }
@@ -357,8 +384,6 @@ void EmitSetPatch(EmitContext& ctx, IR::Patch patch, Id value) {
     ctx.OpStore(pointer, value);
 }
 
-// SHADPS4_NATIVE_PT: a Guest binding of a native variant reads through its device address
-// (DefineBufferProperties translated the draw's guest address once) instead of the descriptor.
 static bool NativePtLoads(EmitContext& ctx, u32 handle) {
     return ctx.native_pt && handle < ctx.native_dev_base.size() &&
            Sirit::ValidId(ctx.native_dev_base[handle]);

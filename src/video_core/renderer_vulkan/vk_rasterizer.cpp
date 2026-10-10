@@ -6505,10 +6505,10 @@ void Rasterizer::NativeLog() {
             for (u32 e = 0; e < 64 && e < d[0]; ++e) {
                 const u32* w = d + 16 + e * 16;
                 LOG_WARNING(Render_Vulkan,
-                            "NativePt compare: {} binding {} width {} rel {:#x} pt {:08x} desc "
+                            "NativePt compare: {}{} binding {} width {} rel {:#x} pt {:08x} desc "
                             "{:08x} draw {} guest {:02x}_{:08x}",
-                            (w[7] & 0xff) == 2 ? "ps" : "vs", w[0], w[7] >> 8, w[1], w[2], w[3],
-                            w[4], w[6], w[5]);
+                            (w[7] & 2) ? "ps" : "vs", (w[7] & 4) ? " scalar" : "", w[0],
+                            w[7] >> 8, w[1], w[2], w[3], w[4], w[6], w[5]);
             }
         }
         if (native_seg_on && Shader::g_native_seg_compare) {
