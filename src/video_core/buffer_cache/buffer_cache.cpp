@@ -3722,6 +3722,18 @@ void BufferCache::BindVertexBuffersDerived(
         std::span<const vk::DeviceSize>{host_sizes}, std::span<const vk::DeviceSize>{host_strides});
 }
 
+const Buffer* BufferCache::NativeBufferAt(VAddr addr) const {
+    if (addr == 0) {
+        return nullptr;
+    }
+    const BufferId id = page_table[addr >> CACHING_PAGEBITS].buffer_id;
+    if (!id) {
+        return nullptr;
+    }
+    const Buffer& found = slot_buffers[id];
+    return found.is_deleted ? nullptr : &found;
+}
+
 const Buffer* BufferCache::NativeRunSpan(
     VAddr lo, VAddr hi, NativeRunAccess access,
     boost::container::small_vector<vk::BufferMemoryBarrier2, 16>* barriers, u64 dispatch_run) {

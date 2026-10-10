@@ -612,6 +612,8 @@ private:
         std::array<u64, 16> prep_jref{}; ///< verify: the join refused a prepared member (close why)
         std::array<u64, 4> c_prep_ph{}; ///< prepare phases: head, member compute, spans, final
         u64 prep_looked{};              ///< members that passed the compute loop
+        u64 prep_spans{};               ///< NativeRunSpan calls of the prepares
+        std::array<u64, 4> prep_c10{};  ///< verify: close 10 of a prepared member by where
         std::array<u64, 16> prep_stop{};
         std::array<u64, 16> prep_refuse{};
         // SHADPS4_NATIVE_TIMING: whole draw records (Liverpool's timer) by rec_outcome x posted by

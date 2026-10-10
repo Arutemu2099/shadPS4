@@ -2631,6 +2631,32 @@ void Rasterizer::NativePrepare(const GraphicsPipeline* base,
     u32 n = 0;
     u32 why = 15;
     std::array<u32, 512> key;
+    // Exact truncation (s398: halving retries discarded 37% of the members looked at): every
+    // member range must lie inside the batch's buffer for its slot, checked by arithmetic against
+    // that buffer's bounds (page-table lookup once per slot, no sync); the stretch ends at the
+    // first member that does not fit.
+    struct Bounds {
+        VAddr lo{}, hi{};
+        u64 handle{};
+    };
+    std::array<Bounds, Shader::NUM_BUFFERS> slot_b{};
+    std::array<Bounds, 16> vb_b{};
+    Bounds ib_b{};
+    const auto inside = [&](Bounds& bd, VAddr a, u64 size, u64 want) {
+        if (a >= bd.lo && a + size <= bd.hi && bd.handle == want) {
+            return true;
+        }
+        const VideoCore::Buffer* buf = buffer_cache.NativeBufferAt(a);
+        if (!buf || !buf->IsInBounds(a, size)) {
+            return false;
+        }
+        const u64 handle = std::bit_cast<u64>(static_cast<VkBuffer>(buf->Handle()));
+        if (handle != want) {
+            return false;
+        }
+        bd = {.lo = buf->CpuAddr(), .hi = buf->CpuAddr() + buf->SizeBytes(), .handle = handle};
+        return true;
+    };
     u64 tl = __rdtsc();
     const auto lap = [&](u32 ph) {
         const u64 now = __rdtsc();
@@ -2792,6 +2818,21 @@ void Rasterizer::NativePrepare(const GraphicsPipeline* base,
         m.icount = index_count;
         m.instances = instances;
         m.cmd = cmd;
+        for (u32 bi = 0; ok && bi < Shader::NUM_BUFFERS; ++bi) {
+            if ((b.guest_mask & (u64{1} << bi)) && m.addr[bi] != 0) {
+                ok = inside(slot_b[bi], m.addr[bi], m.size[bi], b.buf[bi]);
+            }
+        }
+        for (u32 a = 0; ok && a < b.vb_n; ++a) {
+            if (m.vaddr[a] != 0 && m.vsize[a] != 0) {
+                ok = inside(vb_b[a], m.vaddr[a], m.vsize[a], b.vb[a]);
+            }
+        }
+        ok = ok && inside(ib_b, index_addr, u64(index_count) * index_size, b.ib);
+        if (!ok) {
+            why = 9; // a range outside the batch's buffer: the next batch starts here
+            break;
+        }
         n = j + 1;
     }
     st.prep_looked += n;
@@ -2820,66 +2861,57 @@ void Rasterizer::NativePrepare(const GraphicsPipeline* base,
             hi = std::max<VAddr>(hi, a + size);
         }
     };
-    const auto validate = [&](const Span& s, u64 want_handle, VideoCore::NativeRunAccess access,
-                              NativeRunSpan& out) {
-        if (s.hi <= s.lo) {
-            out = {};
-            return true;
-        }
-        const VideoCore::Buffer* buf =
-            buffer_cache.NativeRunSpan(s.lo, s.hi, access, &buffer_barriers, cur_dispatch_run);
-        if (!buf) {
-            return false;
-        }
-        const u64 handle = std::bit_cast<u64>(static_cast<VkBuffer>(buf->Handle()));
-        if (handle != want_handle) {
-            return false;
-        }
-        out = {.lo = s.lo, .hi = s.hi, .cpu = buf->CpuAddr(), .handle = handle};
-        return true;
+    // One span per distinct (buffer, access) over the kept members (heap slots share one buffer),
+    // each synced once through NativeRunSpan; the ranges were checked against the bounds above.
+    struct USpan {
+        u64 handle{};
+        VideoCore::NativeRunAccess access{};
+        Span s{};
     };
-    // Spans over the prepared members; on a refusal retry with the first half (a member's data
-    // in another VkBuffer than the batch's ends the prepared stretch there).
-    bool spans_ok = false;
-    for (u32 attempt = 0; attempt < 3 && n != 0; ++attempt) {
-        std::array<Span, Shader::NUM_BUFFERS> sb{};
-        std::array<Span, 16> sv{};
-        Span si{};
-        for (u32 j = 0; j < n; ++j) {
-            const auto& m = t_prep[j];
-            for (u32 bi = 0; bi < Shader::NUM_BUFFERS; ++bi) {
-                if ((b.guest_mask & (u64{1} << bi)) && m.addr[bi] != 0) {
-                    sb[bi].Add(m.addr[bi], m.size[bi]);
-                }
-            }
-            for (u32 a = 0; a < b.vb_n; ++a) {
-                if (m.vaddr[a] != 0 && m.vsize[a] != 0) {
-                    sv[a].Add(m.vaddr[a], m.vsize[a]);
-                }
-            }
-            si.Add(m.iaddr, u64(m.icount) * index_size);
-        }
-        bool ok = true;
-        for (u32 bi = 0; ok && bi < Shader::NUM_BUFFERS; ++bi) {
-            if (b.guest_mask & (u64{1} << bi)) {
-                ok = validate(sb[bi], b.buf[bi], VideoCore::NativeRunAccess::Storage,
-                              b.run_buf[bi]);
+    std::array<USpan, Shader::NUM_BUFFERS + 17> us{};
+    u32 nus = 0;
+    bool spans_ok = true;
+    const auto add_span = [&](u64 handle, VideoCore::NativeRunAccess access, VAddr a, u64 size) {
+        for (u32 i = 0; i < nus; ++i) {
+            if (us[i].handle == handle && us[i].access == access) {
+                us[i].s.Add(a, size);
+                return;
             }
         }
-        // Colour batches read vertex data as storage (vertex pulling).
-        const auto vaccess = b.colour ? VideoCore::NativeRunAccess::Storage
-                                      : VideoCore::NativeRunAccess::Vertex;
-        for (u32 a = 0; ok && a < b.vb_n; ++a) {
-            ok = validate(sv[a], b.vb[a], vaccess, b.run_vb[a]);
+        if (nus == us.size()) {
+            spans_ok = false;
+            return;
         }
-        ok = ok && validate(si, b.ib, VideoCore::NativeRunAccess::Index, b.run_ib);
-        if (ok) {
-            spans_ok = true;
-            break;
+        us[nus] = {.handle = handle, .access = access};
+        us[nus].s.Add(a, size);
+        ++nus;
+    };
+    // Colour batches read vertex data as storage (vertex pulling).
+    const auto vaccess =
+        b.colour ? VideoCore::NativeRunAccess::Storage : VideoCore::NativeRunAccess::Vertex;
+    for (u32 j = 0; j < n; ++j) {
+        const auto& m = t_prep[j];
+        for (u32 bi = 0; bi < Shader::NUM_BUFFERS; ++bi) {
+            if ((b.guest_mask & (u64{1} << bi)) && m.addr[bi] != 0) {
+                add_span(b.buf[bi], VideoCore::NativeRunAccess::Storage, m.addr[bi], m.size[bi]);
+            }
         }
-        ++st.prep_stop[9];
-        n /= 2;
+        for (u32 a = 0; a < b.vb_n; ++a) {
+            if (m.vaddr[a] != 0 && m.vsize[a] != 0) {
+                add_span(b.vb[a], vaccess, m.vaddr[a], m.vsize[a]);
+            }
+        }
+        add_span(b.ib, VideoCore::NativeRunAccess::Index, m.iaddr, u64(m.icount) * index_size);
     }
+    for (u32 i = 0; spans_ok && i < nus; ++i) {
+        const VideoCore::Buffer* buf = buffer_cache.NativeRunSpan(
+            us[i].s.lo, us[i].s.hi, us[i].access, &buffer_barriers, cur_dispatch_run);
+        spans_ok = buf && std::bit_cast<u64>(static_cast<VkBuffer>(buf->Handle())) == us[i].handle;
+    }
+    if (!spans_ok) {
+        ++st.prep_stop[11];
+    }
+    st.prep_spans += nus;
     lap(2); // spans
     if (!spans_ok) {
         st.c_prep += __rdtsc() - t0;
@@ -2902,7 +2934,7 @@ void Rasterizer::NativePrepare(const GraphicsPipeline* base,
                 off = o_off[bi];
                 size = o_rsize[bi];
             } else {
-                off = m.addr[bi] - b.run_buf[bi].cpu;
+                off = m.addr[bi] - slot_b[bi].lo;
                 size = m.size[bi];
             }
             if (off > 0xffffffffull) {
@@ -2918,7 +2950,7 @@ void Rasterizer::NativePrepare(const GraphicsPipeline* base,
             if (m.vaddr[a] == 0) {
                 continue;
             }
-            const u64 off = m.vaddr[a] - b.run_vb[a].cpu;
+            const u64 off = m.vaddr[a] - vb_b[a].lo;
             if (b.colour) {
                 const u32 loc = attribs[a].desc.location;
                 if (loc >= Shader::NativeMaxPulledLocations || off > 0xffffffffull) {
@@ -2952,7 +2984,7 @@ void Rasterizer::NativePrepare(const GraphicsPipeline* base,
                 q_set = true;
             }
         }
-        const u64 ib_off = m.iaddr - b.run_ib.cpu;
+        const u64 ib_off = m.iaddr - ib_b.lo;
         const s64 vo = s64(s32(m.vertex_offset)) + q;
         if (!ok || ib_off % index_size != 0 || vo < 0 || vo > INT32_MAX) {
             ++st.prep_stop[10];
@@ -3531,6 +3563,7 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
     }
     // Buffers: the same lookups / syncs as BindBuffers.
     const u64 seq0 = scheduler.RecordSeq();
+    u32 rec_where = 0; // SHADPS4_NATIVE_REC_PREP verify: where this join recorded first
     auto* barriers = b.verify ? nullptr : &native_carry;
     const size_t carry0 = native_carry.size();
     std::array<u32, Shader::NUM_BUFFERS> rec_off{};
@@ -3616,6 +3649,9 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
                     ok = false;
                 }
                 rec_off[bi] = offset;
+                if (rec_where == 0 && scheduler.RecordSeq() != seq0) {
+                    rec_where = desc.is_formatted ? 1u : 2u;
+                }
             }
             ++bi;
         }
@@ -3647,6 +3683,9 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
             }
             jvi = ref;
         }
+    }
+    if (rec_where == 0 && scheduler.RecordSeq() != seq0) {
+        rec_where = 3;
     }
     lap(1); // vertex / index
     s64 q = 0;
@@ -3723,6 +3762,10 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
         scheduler.CurrentTick() != b.tick) {
         // A barrier, an upload record or a different VkBuffer: the generic path takes the draw
         // (with the carried barriers) and may open a new batch.
+        if (ok && native_carry.size() == carry0 && native_prep.active && native_prep.verify &&
+            draw_job_tag == native_prep.tag && draw_job_idx == native_prep.next_idx) {
+            ++native_stats.prep_c10[std::min<u32>(rec_where, 3)];
+        }
         NativeClose(!ok ? 8 : native_carry.size() != carry0 ? 9 : 10);
         return false;
     }
@@ -4017,8 +4060,10 @@ void Rasterizer::NativeLog() {
         LOG_INFO(Render_Vulkan,
                  "NativePrep: tries={} runs={} members={} ({:.2f} per run) prepare cycles per "
                  "member {:.0f} (phases per member looked at ({}): head {:.0f} compute {:.0f} spans "
-                 "{:.0f} final {:.0f}) | stops:{} | confirmed={} (colour {}) refused:{} | verify "
-                 "ok={} MISMATCH={} join refused a prepared member={} (by close:{})",
+                 "{:.0f} final {:.0f}; spans per batch {:.2f}) | stops:{} | confirmed={} (colour {}) "
+                 "refused:{} | verify ok={} MISMATCH={} join refused a prepared member={} (by "
+                 "close:{}; close 10 recorded at formatted slot / other slot / vertex-index: {} {} "
+                 "{})",
                  st.prep_try, st.prep_runs, st.prep_members,
                  st.prep_runs ? double(st.prep_members) / double(st.prep_runs) : 0.0,
                  st.prep_members ? double(st.c_prep) / double(st.prep_members) : 0.0,
@@ -4026,8 +4071,10 @@ void Rasterizer::NativeLog() {
                  double(st.c_prep_ph[1]) / double(std::max<u64>(st.prep_looked, 1)),
                  double(st.c_prep_ph[2]) / double(std::max<u64>(st.prep_looked, 1)),
                  double(st.c_prep_ph[3]) / double(std::max<u64>(st.prep_looked, 1)),
+                 st.prep_runs ? double(st.prep_spans) / double(st.prep_runs) : 0.0,
                  arr(st.prep_stop), st.prep_conf, st.prep_conf_col, arr(st.prep_refuse),
-                 st.prep_cmp_ok, st.prep_cmp_bad, st.prep_join_refused, arr(st.prep_jref));
+                 st.prep_cmp_ok, st.prep_cmp_bad, st.prep_join_refused, arr(st.prep_jref),
+                 st.prep_c10[1], st.prep_c10[2], st.prep_c10[3]);
     }
     if (st.n_rec[0] + st.n_rec[3] + st.n_rec[9] != 0) {
         const auto per = [](u64 c, u64 n) { return n ? double(c) / double(n) : 0.0; };
