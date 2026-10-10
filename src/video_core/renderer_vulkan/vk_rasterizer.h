@@ -613,6 +613,10 @@ private:
         // SHADPS4_NATIVE_TIMING, colour split: colour joins (and their phases) and the DrawTail
         // of draws that opened a colour batch.
         u64 c_cjoin_ok{}, n_cjoin_ok{}, c_tail_copen{}, n_tail_copen{};
+        /// Bindless census (sec. 11): colour openers by DrawTail event flags (texmiss 1,
+        /// recorded 2, uploaded 4, giant 8, clip 16), [1] = right after an image-key close.
+        bool close_key{};
+        std::array<std::array<u64, 32>, 2> c_cop_fl{}, n_cop_fl{};
         std::array<u64, 4> c_cphase{};
         bool last_open_colour{};
         u64 peek_yes{}, peek_no{}, peek_unknown{};

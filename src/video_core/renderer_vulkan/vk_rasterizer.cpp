@@ -2239,6 +2239,13 @@ void Rasterizer::ExecuteDraw(const SplitDraw& draw,
             if (native_stats.last_open_colour) {
                 native_stats.c_tail_copen += dt;
                 ++native_stats.n_tail_copen;
+                {
+                    const u32 a = native_stats.close_key ? 1u : 0u;
+                    const u32 fl = native_stats.last_flags & 31;
+                    native_stats.c_cop_fl[a][fl] += dt;
+                    ++native_stats.n_cop_fl[a][fl];
+                    native_stats.close_key = false;
+                }
                 if (g_draw_tag_back) [[unlikely]] {
                     DrawTagNote(draw.pipeline, 3u, dt);
                 }
@@ -3502,79 +3509,6 @@ bool Rasterizer::NativeRingPrepare(const GraphicsPipeline* base,
         return fail(8);
     }
     lap(1); // bases, span list
-    // Validity cache (s410: the global dirty epoch moved between most batches): a superset of
-    // the range in the same buffer was validated at granule clock T, no 2 MB granule of the range
-    // was marked CPU-dirty or GPU-written since T (dirty_epoch.h: every such marking bumps the
-    // clock of its granules; the global epoch moves only together with it) and the buffer
-    // structure is unchanged -> no sync walk, no GPU-modified walk (cached answer), the access
-    // barrier as always.
-    const u64 clock0 = VideoCore::g_granule_clock.load(std::memory_order_acquire);
-    for (u32 i = 0; i < nus; ++i) {
-        auto* hit = static_cast<NativeSpanEntry*>(nullptr);
-        for (auto& e : native_span_cache) {
-            if (e.handle == us[i].handle && e.access == static_cast<u32>(us[i].access) &&
-                e.gen == gen && us[i].lo >= e.lo && us[i].hi <= e.hi &&
-                VideoCore::GranulesUnchangedSince(us[i].lo, us[i].hi, e.epoch)) {
-                hit = &e;
-                break;
-            }
-        }
-        int stale_kind = -1;
-        if (hit && g_native_span_check) [[unlikely]] {
-            // Opus G2 #1 compare mode: a hit must not cover CPU-dirty pages (no sync runs). On
-            // one: classify, and take the real sync instead (protective).
-            if (buffer_cache.IsRegionCpuModified(us[i].lo, us[i].hi - us[i].lo)) {
-                stale_kind =
-                    VideoCore::GranulesUnchangedSince(us[i].lo, us[i].hi, hit->epoch) ? 1 : 0;
-                hit = nullptr;
-            }
-        }
-        bool gpu_mod = false;
-        const VideoCore::Buffer* buf = buffer_cache.NativeRunSpan(
-            us[i].lo, us[i].hi, us[i].access, &buffer_barriers, cur_dispatch_run, hit == nullptr,
-            hit ? (hit->gpu_mod ? 1 : 0) : -1, &gpu_mod);
-        if (stale_kind == 1 && !buffer_cache.IsRegionCpuModified(us[i].lo, us[i].hi - us[i].lo)) {
-            stale_kind = 2;
-        }
-        if (stale_kind >= 0) {
-            ++st.ring_span_stale[stale_kind];
-        }
-        if (!buf || std::bit_cast<u64>(static_cast<VkBuffer>(buf->Handle())) != us[i].handle) {
-            return fail(9);
-        }
-        st.ring_span_bytes += us[i].hi - us[i].lo;
-        if (hit) {
-            ++st.ring_span_hits;
-        } else {
-            // Grow the entry of this buffer if it is still current, else replace the oldest.
-            NativeSpanEntry* slot = nullptr;
-            for (auto& e : native_span_cache) {
-                if (e.handle == us[i].handle && e.access == static_cast<u32>(us[i].access)) {
-                    slot = &e;
-                    break;
-                }
-            }
-            // Grow while the old part is still unchanged since its clock (the grown entry keeps
-            // the older clock: conservative), else replace.
-            // Opus G2 #1: only an overlapping / touching range grows the entry (a merged gap was
-            // never validated).
-            if (slot && slot->gen == gen && us[i].lo <= slot->hi && us[i].hi >= slot->lo &&
-                std::max(slot->hi, us[i].hi) - std::min(slot->lo, us[i].lo) <= (u64{64} << 20) &&
-                VideoCore::GranulesUnchangedSince(slot->lo, slot->hi, slot->epoch)) {
-                slot->lo = std::min(slot->lo, us[i].lo);
-                slot->hi = std::max(slot->hi, us[i].hi);
-                slot->gpu_mod = slot->gpu_mod || gpu_mod;
-            } else {
-                if (!slot) {
-                    slot = &native_span_cache[native_span_rr++ % native_span_cache.size()];
-                }
-                *slot = {us[i].handle, static_cast<u32>(us[i].access), us[i].lo, us[i].hi, clock0,
-                         gen, gpu_mod};
-            }
-        }
-    }
-    st.ring_spans += nus;
-    lap(2); // span syncs
     // The members' indirect commands (their records are the job thread's).
     const auto& regs = liverpool->BackRegs();
     const u32 index_size = b.index_size;
@@ -3689,8 +3623,81 @@ bool Rasterizer::NativeRingPrepare(const GraphicsPipeline* base,
     }
     if (n == 0) {
         st.c_ring += __rdtsc() - t0;
-        return false; // spans validated (harmless); legacy mode
+        return false; // no member: legacy mode, before any span work
     }
+    // Validity cache (s410: the global dirty epoch moved between most batches): a superset of
+    // the range in the same buffer was validated at granule clock T, no 2 MB granule of the range
+    // was marked CPU-dirty or GPU-written since T (dirty_epoch.h: every such marking bumps the
+    // clock of its granules; the global epoch moves only together with it) and the buffer
+    // structure is unchanged -> no sync walk, no GPU-modified walk (cached answer), the access
+    // barrier as always.
+    const u64 clock0 = VideoCore::g_granule_clock.load(std::memory_order_acquire);
+    for (u32 i = 0; i < nus; ++i) {
+        auto* hit = static_cast<NativeSpanEntry*>(nullptr);
+        for (auto& e : native_span_cache) {
+            if (e.handle == us[i].handle && e.access == static_cast<u32>(us[i].access) &&
+                e.gen == gen && us[i].lo >= e.lo && us[i].hi <= e.hi &&
+                VideoCore::GranulesUnchangedSince(us[i].lo, us[i].hi, e.epoch)) {
+                hit = &e;
+                break;
+            }
+        }
+        int stale_kind = -1;
+        if (hit && g_native_span_check) [[unlikely]] {
+            // Opus G2 #1 compare mode: a hit must not cover CPU-dirty pages (no sync runs). On
+            // one: classify, and take the real sync instead (protective).
+            if (buffer_cache.IsRegionCpuModified(us[i].lo, us[i].hi - us[i].lo)) {
+                stale_kind =
+                    VideoCore::GranulesUnchangedSince(us[i].lo, us[i].hi, hit->epoch) ? 1 : 0;
+                hit = nullptr;
+            }
+        }
+        bool gpu_mod = false;
+        const VideoCore::Buffer* buf = buffer_cache.NativeRunSpan(
+            us[i].lo, us[i].hi, us[i].access, &buffer_barriers, cur_dispatch_run, hit == nullptr,
+            hit ? (hit->gpu_mod ? 1 : 0) : -1, &gpu_mod);
+        if (stale_kind == 1 && !buffer_cache.IsRegionCpuModified(us[i].lo, us[i].hi - us[i].lo)) {
+            stale_kind = 2;
+        }
+        if (stale_kind >= 0) {
+            ++st.ring_span_stale[stale_kind];
+        }
+        if (!buf || std::bit_cast<u64>(static_cast<VkBuffer>(buf->Handle())) != us[i].handle) {
+            return fail(9);
+        }
+        st.ring_span_bytes += us[i].hi - us[i].lo;
+        if (hit) {
+            ++st.ring_span_hits;
+        } else {
+            // Grow the entry of this buffer if it is still current, else replace the oldest.
+            NativeSpanEntry* slot = nullptr;
+            for (auto& e : native_span_cache) {
+                if (e.handle == us[i].handle && e.access == static_cast<u32>(us[i].access)) {
+                    slot = &e;
+                    break;
+                }
+            }
+            // Grow while the old part is still unchanged since its clock (the grown entry keeps
+            // the older clock: conservative), else replace.
+            // Opus G2 #1: only an overlapping / touching range grows the entry (a merged gap was
+            // never validated).
+            if (slot && slot->gen == gen && us[i].lo <= slot->hi && us[i].hi >= slot->lo &&
+                std::max(slot->hi, us[i].hi) - std::min(slot->lo, us[i].lo) <= (u64{64} << 20) &&
+                VideoCore::GranulesUnchangedSince(slot->lo, slot->hi, slot->epoch)) {
+                slot->lo = std::min(slot->lo, us[i].lo);
+                slot->hi = std::max(slot->hi, us[i].hi);
+                slot->gpu_mod = slot->gpu_mod || gpu_mod;
+            } else {
+                if (!slot) {
+                    slot = &native_span_cache[native_span_rr++ % native_span_cache.size()];
+                }
+                *slot = {us[i].handle, static_cast<u32>(us[i].access), us[i].lo, us[i].hi, clock0,
+                         gen, gpu_mod};
+            }
+        }
+    }
+    st.ring_spans += nus;
+    lap(2); // span syncs
     t_prep_n = n;
     native_prep.epoch = epoch;
     native_prep.gen = gen;
@@ -4303,6 +4310,7 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
 void Rasterizer::NativeClose(u32 why) {
     native_batch.open = false;
     native_batch.cand_valid = false;
+    native_stats.close_key = false;
     ++native_stats.close[std::min<u32>(why, 15)];
     if (native_prep.active) [[unlikely]] {
         if (native_prep.verify && draw_job_tag == native_prep.tag &&
@@ -4454,6 +4462,7 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
             !NativeImageKey(b.base, key, n) || n != b.img_n ||
             std::memcmp(key.data(), native_img_key.data(), n * sizeof(u32)) != 0) {
             NativeClose(12);
+            native_stats.close_key = true; // bindless census: the next opener follows a key change
             return false;
         }
     }
@@ -5169,6 +5178,19 @@ void Rasterizer::NativeLog() {
             }
         }
         LOG_INFO(Render_Vulkan, "NativeTiming: full textured DrawTail by event (cycles):{}", fl);
+        for (u32 a = 0; a < 2; ++a) {
+            std::string cl;
+            for (u32 f = 0; f < 32; ++f) {
+                if (st.n_cop_fl[a][f] != 0) {
+                    cl += fmt::format(" | {}{}{}{}{}: n={} {:.0f}", (f & 1) ? "texmiss " : "",
+                                      (f & 2) ? "recorded " : "", (f & 4) ? "uploaded " : "",
+                                      (f & 8) ? "giant " : "", (f & 16) ? "clip " : "",
+                                      st.n_cop_fl[a][f], per(st.c_cop_fl[a][f], st.n_cop_fl[a][f]));
+                }
+            }
+            LOG_INFO(Render_Vulkan, "NativeTiming: colour openers {} by event (cycles):{}",
+                     a ? "AFTER AN IMAGE-KEY CLOSE" : "other", cl);
+        }
     }
 }
 
