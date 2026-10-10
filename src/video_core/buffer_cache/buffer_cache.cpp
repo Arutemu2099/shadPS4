@@ -638,8 +638,10 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       download_buffer{instance, scheduler, MemoryUsage::Download, DownloadBufferSize},
       device_buffer{instance, scheduler, MemoryUsage::DeviceLocal, DeviceBufferSize},
       gds_buffer{instance, scheduler, MemoryUsage::Stream, 0, AllFlags, DataShareBufferSize},
+      // eShaderDeviceAddress: SHADPS4_NATIVE_PT reads a page-table miss from the table itself.
       bda_pagetable_buffer{instance, scheduler, MemoryUsage::DeviceLocal,
-                           0,        AllFlags,  BDA_PAGETABLE_SIZE} {
+                           0,        AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+                           BDA_PAGETABLE_SIZE} {
     if (const char* mirror = std::getenv("SHADPS4_HOST_MIRROR"); mirror && mirror[0] == '1') {
         host_mirror = instance.IsExternalMemoryHostEnabled();
         host_mirror_max = static_cast<u32>(256_MB);
