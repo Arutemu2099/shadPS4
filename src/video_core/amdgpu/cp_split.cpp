@@ -279,6 +279,12 @@ void Channel::Commit() {
         read_pos.store(committed_pos, std::memory_order_relaxed);
         done_seq.store(committed_seq, std::memory_order_release);
     }
+    if (draw_hook) [[unlikely]] {
+        const auto* rh = reinterpret_cast<const RecordHeader*>(storage + (last_record_pos & mask));
+        if (rh->type == RecordType::Draw) {
+            draw_hook(hook_ctx, last_record_pos);
+        }
+    }
 }
 
 void Channel::Sync(DrainReason reason) {
@@ -522,6 +528,9 @@ void Channel::Publish() {
     unpublished_posts = 0;
     if (write_pos.load(std::memory_order_relaxed) == committed_pos) {
         return;
+    }
+    if (pre_publish) [[unlikely]] {
+        pre_publish(hook_ctx); // L3: the open stretch ends before its draws become visible
     }
     // seq_cst store, then seq_cst load of back_parked: with the back's store of back_parked and
     // load of write_pos in WaitForWork, one of the two always sees the other (no lost wake-up).

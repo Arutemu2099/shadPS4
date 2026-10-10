@@ -1216,6 +1216,12 @@ struct LeanJob {
     Lean::SpanResult res{};
     u64 dcb_hash{};           ///< XXH3 of the DCB words at queue time (L1 lag check)
     std::atomic<bool> lag{};  ///< the words changed before the worker's parse ended
+    /// L3: the worker's stretches of this job in order (fixed size A2MaxStretches, sized once at
+    /// LeanStart, never reallocated under the back's reads). The worker writes xl[k] and
+    /// xl_side[k], then xl_ready = k + 1 (release), then publishes the channel.
+    std::vector<std::unique_ptr<Vulkan::A2::Stretch>> xl;
+    std::vector<A2Entry::Side> xl_side;
+    std::atomic<u32> xl_ready{0};
 };
 struct LeanCounters {
     std::atomic<u64> dcbs{}, eligible{}, skipped{}, cmp{}, bad{}, events{}, pkts{}, pkts_span{},
@@ -1257,6 +1263,20 @@ struct LeanState {
     std::unique_ptr<Lean::Parser> toucher; ///< front: L2 Pretouch before the exclusive lookup
 };
 LeanState g_lean_s;
+/// L3 counters (workers add theirs per job; the back its own) and the per-second placement samples.
+struct LeanXlStats {
+    bool on{}; ///< L2 + SHADPS4_A2 != 0: workers translate
+    std::atomic<u64> taken{}, stretches{}, cap{}, cut_pub{}, walked{};
+    std::atomic<u64> published{}, pub_draws{}, rej_occl{}, rej_gen{}, rej_mat{}, rej_rt{},
+        would{}, back_draws{}, seq_skips{};
+    std::atomic<u64> front_p{}, front_e{}, lean_p{}, lean_e{};
+    std::array<std::atomic<Vulkan::A2::StretchTranslator*>, 8> tr{};
+};
+LeanXlStats g_lean_xl;
+inline void LeanPlaceSample(std::atomic<u64>& p, std::atomic<u64>& e) {
+    (Common::IsPerformanceProcessor(Common::CurrentProcessor()) ? p : e)
+        .fetch_add(1, std::memory_order_relaxed);
+}
 /// The front's DCB being recorded (top level only).
 struct LeanFront {
     LeanJob* job{};
@@ -1820,6 +1840,47 @@ void LeanLog() {
             p.hdr_hit = p.hdr_miss = p.fetch_hit = p.fetch_miss = 0;
             p.pw_header = p.pw_info = p.pw_walk = p.pw_fetch = p.map_lock = p.info_lock = 0;
             p.memo_ineligible = 0;
+        }
+        if (g_lean_xl.on) {
+            auto& x = g_lean_xl;
+            const double ps = 1.0 / std::max(sec, 1e-9);
+            std::array<u64, 32> rf{};
+            for (const auto& t : x.tr) {
+                if (const auto* tr = t.load(std::memory_order_acquire)) {
+                    for (u32 i = 0; i < 32; ++i) {
+                        rf[i] += tr->refusals[i]; // cumulative (racy reads, as A2Log)
+                    }
+                }
+            }
+            std::array<u32, 32> ord{};
+            for (u32 i = 0; i < 32; ++i) {
+                ord[i] = i;
+            }
+            std::sort(ord.begin(), ord.end(), [&](u32 a, u32 b) { return rf[a] > rf[b]; });
+            u64 rtot = 0;
+            for (const u64 v : rf) {
+                rtot += v;
+            }
+            std::string top;
+            for (u32 k = 0; k < 8 && rf[ord[k]] != 0; ++k) {
+                top += fmt::format(" {}={:.1f}%", Vulkan::A2::RefusalName(ord[k]),
+                                   100.0 * double(rf[ord[k]]) / double(std::max<u64>(rtot, 1)));
+            }
+            const u64 st_ = x.stretches.exchange(0), tk = x.taken.exchange(0),
+                      wk = x.walked.exchange(0);
+            LOG_INFO(Render,
+                     "Lean L3: worker draws walked {:.0f}/s taken {:.0f}/s ({:.1f}%) in {:.0f} "
+                     "stretches/s ({:.1f} draws each; cut by publish {:.0f}/s, cap hits {}) | back: "
+                     "published {:.0f}/s ({:.0f} draws/s), rejected occlusion {} buffer-gen {} "
+                     "material {} target {} | A2=2 would {:.0f}/s | back old-path draw records in job "
+                     "channels {:.0f}/s, seq skips {} | refusals (cumulative, of {}):{}",
+                     double(wk) * ps, double(tk) * ps,
+                     100.0 * double(tk) / double(std::max<u64>(wk, 1)), double(st_) * ps, double(tk) / double(std::max<u64>(st_, 1)),
+                     double(x.cut_pub.exchange(0)) * ps, x.cap.exchange(0),
+                     double(x.published.exchange(0)) * ps, double(x.pub_draws.exchange(0)) * ps,
+                     x.rej_occl.exchange(0), x.rej_gen.exchange(0), x.rej_mat.exchange(0),
+                     x.rej_rt.exchange(0), double(x.would.exchange(0)) * ps,
+                     double(x.back_draws.exchange(0)) * ps, x.seq_skips.exchange(0), rtot, top);
         }
         s.l2_taken = s.l2_skipped = s.head_draws = s.back_records = s.back_wait_ticks = 0;
         g_lean_l2.fault_waits = 0;
@@ -3606,6 +3667,175 @@ void Liverpool::A2WorkerLoop(std::stop_token stoken, u32 index) {
     }
 }
 
+/// L3 (SHADPS4_LEAN_PARSE=2 + SHADPS4_A2; notes/architecture-a-2026-10-10.md sec. 16): a lean worker
+/// translates its own draws into A2 stretches while it commits them - A2WorkerLoop's record walk
+/// over its own job channel, with its chain registers as the mirror (at a Draw record's commit they
+/// hold the state at that draw; every record before it is final, a RegWrite record only grows while
+/// it is the newest). Safety argument: every publish of the job channel first ends the open stretch
+/// (pre_publish), so a stretch is complete before its first draw is visible - the back never waits
+/// on a stretch, and its DoneThrough to end_pos never passes the published end.
+struct LeanXl {
+    Vulkan::A2::StretchTranslator* tr{};
+    LeanJob* job{};
+    CpSplit::Channel* ch{};
+    const Regs* regs{};
+    u32 idx{};
+    u64 walk_pos{}; ///< next record to walk (unmasked)
+    u32 n{};        ///< stretches handed over in this job
+    bool open{}, occlusion{}, rt_dirty{};
+    const Vulkan::GraphicsPipeline* rt_pipe{}; ///< pipeline the stretch's key holds
+    std::optional<A2PipeRender> rt_pkey;
+    std::array<u32, 0x20 + 0x20 + 0x10 + 0x78> rt_win{};
+    u64 last_end{}, last_epoch{};
+    std::vector<u32> pending;               // words written since the last taken draw
+    std::vector<std::pair<u32, u32>> delta; // committed through the last taken draw
+    std::array<Shader::BoundStage, Shader::MaxStageTypes> stages{};
+    u32 since_pub{};
+    u64 taken{}, stretches{}, cap{}, cut_pub{}, walked{};
+};
+
+void LeanXlEnd(LeanXl& x) {
+    if (x.open) {
+        if (auto s = x.tr->EndStretch()) {
+            x.job->xl[x.n] = std::move(s);
+            x.job->xl_side[x.n] = {x.last_end, x.last_epoch, std::move(x.delta), 0};
+            x.job->xl_ready.store(++x.n, std::memory_order_release);
+            ++x.stretches;
+        }
+        x.open = false;
+    }
+    x.pending.clear();
+    x.delta.clear();
+}
+
+void LeanXlDraw(LeanXl& x, const CpSplit::RecordHeader& h, u64 pos) {
+    const auto& rec = *reinterpret_cast<const SplitDrawRecord*>(&h + 1);
+    x.stages = {};
+    const u8* stages_end = ReadStages(reinterpret_cast<const u8*>(&rec + 1), rec.stage_count, x.stages);
+    Vulkan::A2::DrawIn in{};
+    in.pipeline = rec.draw.pipeline;
+    in.is_indexed = rec.draw.args.is_indexed;
+    in.is_indirect = rec.draw.args.is_indirect;
+    in.index_offset = rec.draw.args.index_offset;
+    in.stages = &x.stages;
+    in.vi = rec.vi_bytes != 0 ? reinterpret_cast<const CpSplit::VertexInputsPayload*>(stages_end)
+                              : nullptr;
+    in.job_tag = rec.job_tag;
+    in.job_idx = rec.job_idx;
+    in.job_cmd = rec.cmd_address;
+    in.seq = h.seq;
+    in.rec_pos = pos;
+    ++x.walked;
+    if (x.occlusion || !in.pipeline || rec.marker || rec.verify != 0) {
+        LeanXlEnd(x);
+        return;
+    }
+    const Regs& regs = *x.regs;
+    if (x.open && (x.rt_dirty || in.pipeline != x.rt_pipe)) {
+        // Same pass only if the render windows and the pipeline's attachment setup are unchanged
+        // since the stretch's first draw.
+        bool same = true;
+        if (x.rt_dirty) {
+            std::array<u32, 0x20 + 0x20 + 0x10 + 0x78> now{};
+            A2CopyRenderWindows(regs, now);
+            same = now == x.rt_win;
+            x.rt_dirty = false;
+        }
+        if (same && in.pipeline != x.rt_pipe) {
+            same = A2PipeRender{in.pipeline} == *x.rt_pkey;
+            x.rt_pipe = in.pipeline;
+        }
+        if (!same) {
+            LeanXlEnd(x);
+        }
+    }
+    if (!x.open && x.n >= A2MaxStretches) {
+        ++x.cap;
+        return;
+    }
+    if (x.tr->TakeDraw(regs, in)) {
+        if (!x.open) {
+            x.open = true;
+            x.rt_dirty = false;
+            x.rt_pipe = in.pipeline;
+            x.rt_pkey.emplace(in.pipeline);
+            A2CopyRenderWindows(regs, x.rt_win);
+            x.pending.clear();
+            x.delta.clear();
+        }
+        // The words written before this draw inside the stretch are the back's to apply (it
+        // skips their records); later ones stay pending.
+        for (const u32 off : x.pending) {
+            x.delta.emplace_back(off, regs.reg_array[off]);
+        }
+        x.pending.clear();
+        x.last_end = pos + h.size;
+        x.last_epoch = rec.ctx_epoch;
+        ++x.taken;
+    } else {
+        LeanXlEnd(x);
+    }
+}
+
+/// Channel::draw_hook: walk the worker's committed records through the Draw record at draw_pos.
+void LeanXlDrawHook(void* p, u64 draw_pos) {
+    auto& x = *static_cast<LeanXl*>(p);
+    while (x.walk_pos <= draw_pos) {
+        u64 pos = x.walk_pos;
+        const auto* h = x.ch->RecordAtPos(pos); // skips a Wrap
+        const auto* payload = reinterpret_cast<const u8*>(h + 1);
+        switch (h->type) {
+        case CpSplit::RecordType::RegWrite:
+            if (x.open) {
+                const u8* end = reinterpret_cast<const u8*>(h) + h->size;
+                const u8* q = payload;
+                while (q + sizeof(CpSplit::RegWritePayload) <= end) {
+                    const auto* w = reinterpret_cast<const CpSplit::RegWritePayload*>(q);
+                    if (w->count == 0) {
+                        break;
+                    }
+                    for (u32 i = 0; i < w->count; ++i) {
+                        x.pending.push_back(w->word_offset + i);
+                    }
+                    x.rt_dirty = x.rt_dirty || A2TouchesRenderWindows(w->word_offset, w->count);
+                    q += sizeof(CpSplit::RegWritePayload) + size_t{w->count} * sizeof(u32);
+                }
+            }
+            break;
+        case CpSplit::RecordType::Draw:
+            LeanXlDraw(x, *h, pos);
+            break;
+        case CpSplit::RecordType::Packet:
+            if (!A2NoopDma(*h)) {
+                const auto* ph = reinterpret_cast<const PM4Header*>(payload);
+                if (ph->type3.opcode == PM4ItOpcode::EventWrite) {
+                    x.occlusion = true; // the rest of this job stays on the old path
+                }
+                LeanXlEnd(x);
+            }
+            break;
+        default: // ClearState, Extent, EpochBump, ...: a boundary
+            LeanXlEnd(x);
+            break;
+        }
+        x.walk_pos = pos + h->size;
+    }
+    // Lean channels publish by count never: when the back already follows this job, hand over
+    // every 8 draws (each publish ends the open stretch).
+    if (++x.since_pub >= 8 &&
+        g_lean_s.back_cur.load(std::memory_order_relaxed) == x.idx) {
+        x.ch->PublishNow();
+    }
+}
+
+/// Channel::pre_publish: end the open stretch before anything new becomes visible.
+void LeanXlPrePublish(void* p) {
+    auto& x = *static_cast<LeanXl*>(p);
+    x.cut_pub += x.open ? 1 : 0;
+    LeanXlEnd(x);
+    x.since_pub = 0;
+}
+
 void Liverpool::LeanStart() {
     auto& s = g_lean_s;
     s.started = true;
@@ -3622,6 +3852,14 @@ void Liverpool::LeanStart() {
             for (auto& ch : s.ch) {
                 ch = std::make_unique<CpSplit::Channel>(1u << 20);
                 ch->quiet = true;
+            }
+            g_lean_xl.on = g_a2 != 0;
+            if (g_lean_xl.on) {
+                for (u32 i = 0; i < LeanSlots; ++i) {
+                    s.ch[i]->SetPubBatch(~0u);
+                    s.jobs[i].xl.resize(A2MaxStretches);
+                    s.jobs[i].xl_side.resize(A2MaxStretches);
+                }
             }
         }
         LOG_INFO(Render, "Lean L2: {} ({} job channels of 1 MB)", s.l2 ? "on" : "OFF (config)",
@@ -3675,6 +3913,22 @@ void Liverpool::LeanWorkerLoop(std::stop_token stoken, u32 index) {
     }
     env.l2 = g_lean == 2 && s.l2;
     Lean::Parser parser{env};
+    // L3: this worker's stretch translator and arena.
+    std::unique_ptr<Vulkan::A2::Arena> xl_arena;
+    std::unique_ptr<Vulkan::A2::StretchTranslator> xl_tr;
+    LeanXl xl;
+    if (env.l2 && g_lean_xl.on) {
+        xl_arena = std::make_unique<Vulkan::A2::Arena>();
+        Vulkan::A2::WorkerContext actx{};
+        actx.instance = &rasterizer->A2Instance();
+        actx.scheduler = &rasterizer->GetScheduler();
+        actx.buffer_cache = &rasterizer->A2BufferCache();
+        actx.arena = xl_arena.get();
+        actx.worker_index = 16 + index;
+        xl_tr = std::make_unique<Vulkan::A2::StretchTranslator>(actx);
+        xl.tr = xl_tr.get();
+        g_lean_xl.tr[index & 7].store(xl.tr, std::memory_order_release);
+    }
     // L2 fault hook context: publish this job's channel, wait for the back up to its position.
     struct L2Wait {
         CpSplit::Channel* ch{};
@@ -3750,6 +4004,24 @@ void Liverpool::LeanWorkerLoop(std::stop_token stoken, u32 index) {
             // L2: the real channel of this slot; the back follows it from the DcbRef.
             auto& out = *s.ch[idx % LeanSlots];
             l2w = {&out, idx};
+            LeanPlaceSample(g_lean_xl.lean_p, g_lean_xl.lean_e);
+            if (xl.tr) {
+                xl.job = &j;
+                xl.ch = &out;
+                xl.idx = idx;
+                xl.regs = st.regs.get();
+                xl.walk_pos = out.CommittedPos();
+                xl.n = 0;
+                xl.open = xl.occlusion = xl.rt_dirty = false;
+                xl.rt_pipe = nullptr;
+                xl.rt_pkey.reset();
+                xl.pending.clear();
+                xl.delta.clear();
+                xl.since_pub = 0;
+                out.hook_ctx = &xl;
+                out.draw_hook = &LeanXlDrawHook;
+                out.pre_publish = &LeanXlPrePublish;
+            }
             j.res = parser.Parse(j.dcb, j.cut_dw, st, out);
             g_lean_phase.parse += __rdtsc() - ts1;
             parser.FlushPhases(index);
@@ -3775,8 +4047,20 @@ void Liverpool::LeanWorkerLoop(std::stop_token stoken, u32 index) {
             }
             out.Reserve(CpSplit::RecordType::LeanEnd, 0);
             out.Commit();
-            out.PublishNow();
+            out.PublishNow(); // pre_publish ends the last stretch first
             l2w = {};
+            if (xl.tr) {
+                out.draw_hook = nullptr;
+                out.pre_publish = nullptr;
+                out.hook_ctx = nullptr;
+                xl.job = nullptr;
+                auto& gx = g_lean_xl;
+                gx.taken.fetch_add(std::exchange(xl.taken, 0), std::memory_order_relaxed);
+                gx.stretches.fetch_add(std::exchange(xl.stretches, 0), std::memory_order_relaxed);
+                gx.cap.fetch_add(std::exchange(xl.cap, 0), std::memory_order_relaxed);
+                gx.cut_pub.fetch_add(std::exchange(xl.cut_pub, 0), std::memory_order_relaxed);
+                gx.walked.fetch_add(std::exchange(xl.walked, 0), std::memory_order_relaxed);
+            }
             continue; // the back frees the slot at the LeanEnd
         }
         ch.canon = &j.worker_canon;
@@ -7647,11 +7931,128 @@ Liverpool::LeanL2Begin Liverpool::LeanFrontBeginL2(std::span<const u32> dcb,
 }
 
 void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
+    using RT = CpSplit::RecordType;
     auto& s = g_lean_s;
     auto& ch = *s.ch[ref.slot];
+    auto& job = s.jobs[ref.slot];
+    auto& x = g_lean_xl;
     s.back_cur.store(ref.index, std::memory_order_release);
     split->FlushDone(); // the front's depth waits must see everything before this record
     lean_following = true;
+    // L3: replays the worker's stretch at its first draw (A2Execute's publish, mode 1) and returns
+    // true; false = the old path runs the stretch's records (rejected, or A2=2 verify).
+    const auto publish = [&](Vulkan::A2::Stretch& st, const A2Entry::Side& sd,
+                             const CpSplit::RecordHeader& first) {
+        if (g_a2 == 2) {
+            x.would.fetch_add(st.draws, std::memory_order_relaxed);
+            return false;
+        }
+        auto& g = g_a2s;
+        const auto& rec = *reinterpret_cast<const SplitDrawRecord*>(&first + 1);
+        if (rasterizer->A2OcclusionOpen()) {
+            x.rej_occl.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        // A buffer created / deleted / joined since the worker's lookups: its VkBuffer handles may
+        // be stale (A2LookupBuffer reads slots without a lock).
+        if (rasterizer->A2BufferCache().StructGeneration() != st.buf_gen) {
+            x.rej_gen.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        rasterizer->GetScheduler().SwitchStream(0);
+        static thread_local std::vector<VideoCore::ImageId> mat_ids;
+        mat_ids.clear();
+        const bool colour = !st.materials.empty();
+        if (colour) {
+            // Every distinct material once, before the pass (sec. 10); the representative Draw
+            // records are in THIS job channel (not yet released: inside the stretch).
+            const u32 set0 = rasterizer->A2BindlessCur();
+            bool ok = st.materials.size() <= Vulkan::A2::MaxMaterials && rasterizer->A2ColourGates();
+            {
+                // Samplers resolve with the mirror's border-colour base at this draw: the stretch
+                // must not change it.
+                const u32 bc0 = static_cast<u32>(
+                    reinterpret_cast<const u32*>(&mirror->regs.ta_bc_base) -
+                    mirror->regs.reg_array.data());
+                const u32 bc1 = bc0 + static_cast<u32>((sizeof(mirror->regs.ta_bc_base) + 3) / 4);
+                for (const auto& [off, val] : sd.delta) {
+                    ok = ok && (off < bc0 || off >= bc1);
+                }
+            }
+            for (size_t m = 0; ok && m < st.materials.size(); ++m) {
+                const auto& mr = st.materials[m];
+                u64 mp = mr.rec_pos;
+                const auto* mh = ch.RecordAtPos(mp);
+                ok = mh->type == RT::Draw;
+                if (!ok) {
+                    break;
+                }
+                const auto& mrec = *reinterpret_cast<const SplitDrawRecord*>(mh + 1);
+                std::array<Shader::BoundStage, Shader::MaxStageTypes> mst{};
+                ReadStages(reinterpret_cast<const u8*>(&mrec + 1), mrec.stage_count, mst);
+                u32 ni = 0, ns = 0;
+                ok = rasterizer->A2ResolveMaterial(mr.base, mst[u32(Shader::LogicalStage::Fragment)],
+                                                   st.cmds->mat_slots[m].data(), ni, ns, mat_ids);
+            }
+            // A rotation mid-loop invalidates the earlier materials' slots.
+            ok = ok && rasterizer->A2BindlessCur() == set0;
+            if (!ok) {
+                x.rej_mat.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            st.cmds->bindless_set = rasterizer->A2BindlessCommit();
+        }
+        if (g.gpu_write) {
+            rasterizer->A2GlobalBarrier();
+            g.gpu_write = false;
+        }
+        mirror->ctx_epoch = rec.ctx_epoch;
+        rasterizer->A2BeginStretch(rec.draw.pipeline);
+        if (colour && !rasterizer->A2ImagesSafe(mat_ids)) {
+            // A sampled image is a target of this pass: the old path (per-draw barriers) runs the
+            // stretch; the pass it began is reused.
+            x.rej_rt.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        auto& sched = rasterizer->GetScheduler();
+        sched.Record([cmds = st.cmds, inst = &rasterizer->A2Instance()](vk::CommandBuffer cmdbuf) {
+            Vulkan::A2::Replay(*cmds, cmdbuf, *inst);
+        });
+        st.tick->store(sched.CurrentTick(), std::memory_order_release);
+        rasterizer->A2EndStretch();
+        // The stretch's register writes (its records are never visited), after the pass was
+        // resolved from the mirror at its first draw.
+        for (const auto& [off, val] : sd.delta) {
+            mirror->regs.reg_array[off] = val;
+        }
+        mirror->ctx_epoch = sd.ctx_epoch;
+        x.published.fetch_add(1, std::memory_order_relaxed);
+        x.pub_draws.fetch_add(st.draws, std::memory_order_relaxed);
+        return true;
+    };
+    // Per-second line (the s525 swings): this thread's logical processor and clock probe, its
+    // old-path draws and published stretches, and the P/E samples of the front and lean workers.
+    static thread_local u64 sec_tsc = __rdtsc(), sec_draws = 0, sec_pub = 0;
+    if (x.on) [[likely]] {
+        const u64 now = __rdtsc();
+        if (now - sec_tsc > 3'500'000'000ull) {
+            const u32 cpu = Common::CurrentProcessor();
+            const u32 probe = Common::ClockProbe();
+            const u64 bd = x.back_draws.load(std::memory_order_relaxed);
+            const u64 pb = x.published.load(std::memory_order_relaxed);
+            LOG_INFO(Render,
+                     "Lean second: back cpu {} ({}) clock probe {} ticks (~{:.2f} GHz) | back old-path "
+                     "draws {} stretches {} | front P/E {}/{} lean P/E {}/{}",
+                     cpu, Common::IsPerformanceProcessor(cpu) ? "P" : "E", probe,
+                     probe ? 8192.0 / double(probe) * 3.5 : 0.0, bd - sec_draws, pb - sec_pub,
+                     x.front_p.exchange(0), x.front_e.exchange(0), x.lean_p.exchange(0),
+                     x.lean_e.exchange(0));
+            sec_tsc = now;
+            sec_draws = bd;
+            sec_pub = pb;
+        }
+    }
+    u32 si = 0; // next stretch of this job
     u64 wait = 0;
     for (u32 spins = 0;;) {
         if (split->FrontHasExited() || s.stop.load(std::memory_order_relaxed)) [[unlikely]] {
@@ -7659,11 +8060,42 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
         }
         if (const auto* r = ch.Next()) {
             spins = 0;
-            if (r->type == CpSplit::RecordType::LeanEnd) {
+            if (r->type == RT::LeanEnd) {
                 ch.Done(r);
                 break;
             }
-            ExecuteRecordImpl(*r); // the plain path: A2 never sees a worker's records
+            if (r->type == RT::Draw && x.on) {
+                const u32 ready = job.xl_ready.load(std::memory_order_acquire);
+                while (si < ready && job.xl[si]->first_seq < r->seq) {
+                    ++si; // cannot happen (stretches start at a visited draw): counted
+                    x.seq_skips.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (si < ready && job.xl[si]->first_seq == r->seq) {
+                    auto& st = *job.xl[si];
+                    const auto& sd = job.xl_side[si];
+                    ++si;
+                    if (publish(st, sd, *r)) {
+                        ch.DoneThrough(sd.end_pos, st.last_seq);
+                        ++s.back_records;
+                        continue;
+                    }
+                }
+            }
+            switch (r->type) {
+            case RT::Dispatch:
+            case RT::Call:
+                g_a2s.gpu_write = true;
+                break;
+            case RT::Packet:
+                g_a2s.gpu_write = g_a2s.gpu_write || !A2NoopDma(*r);
+                break;
+            case RT::Draw:
+                x.back_draws.fetch_add(1, std::memory_order_relaxed);
+                break;
+            default:
+                break;
+            }
+            ExecuteRecordImpl(*r); // the plain path for everything not in a published stretch
             ch.Done(r);
             ++s.back_records;
             if (num_commands.load(std::memory_order_relaxed) != 0) {
@@ -7678,7 +8110,18 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
     }
     lean_following = false;
     s.back_wait_ticks += wait;
-    s.jobs[ref.slot].state.store(0, std::memory_order_release); // the slot is free again
+    if (x.on) {
+        const u32 n = job.xl_ready.load(std::memory_order_acquire);
+        for (u32 i = 0; i < n; ++i) {
+            auto& st = job.xl[i];
+            if (st && st->tick && st->tick->load(std::memory_order_relaxed) == 0) {
+                st->tick->store(1, std::memory_order_release); // never published: free
+            }
+            st.reset();
+        }
+        job.xl_ready.store(0, std::memory_order_relaxed);
+    }
+    job.state.store(0, std::memory_order_release); // the slot is free again
 }
 
 void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_marker,
@@ -8776,6 +9219,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             if (g_front_cost) [[unlikely]] {
                 FrontCostTick(FrontCostLeanHead);
+            }
+            if (g_lean_xl.on) {
+                LeanPlaceSample(g_lean_xl.front_p, g_lean_xl.front_e);
             }
             const auto l2 =
                 LeanFrontBeginL2(dcb, ccb, EmulatorSettings.IsVkGuestMarkersEnabled());

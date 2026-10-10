@@ -563,6 +563,19 @@ public:
     void PublishNow() {
         Publish();
     }
+    /// L3 (lean job channels, producer thread only): draw_hook runs at the end of every Commit()
+    /// of a Draw record with its unmasked position; pre_publish runs before every publish that
+    /// makes something new visible (count-based, waits, PublishNow).
+    void (*draw_hook)(void*, u64){};
+    void (*pre_publish)(void*){};
+    void* hook_ctx{};
+    /// Publish every n posts (n = ~0u: never by count).
+    void SetPubBatch(u32 n) {
+        pub_batch = n;
+    }
+    [[nodiscard]] u64 CommittedPos() const noexcept {
+        return committed_pos;
+    }
     /// SHADPS4_A2: ring space is free only once the back AND every A2 worker are past it. A
     /// worker holds the position of the record it reads next (~0 when it holds no DCB; it only
     /// grows while held, so a stale value is lower = conservative). WaitForSpace frees space up

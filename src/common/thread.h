@@ -73,6 +73,12 @@ void SampleCommandProcessorCore();
 /// the per-record call on the CP back, not the sampled work). Attribution runs only, never in
 /// an FPS comparison. Off: one inline test of a global per call site.
 extern const bool g_thread_stats;
+/// The logical processor the calling thread runs on (cheap), whether a logical processor is on a
+/// performance core (hybrid parts; true elsewhere), and the clock probe of SampleThreadPlacement
+/// (best of four TSC tick counts of a fixed 4096-step dependent chain, ~2 cycles a step).
+u32 CurrentProcessor();
+bool IsPerformanceProcessor(u32 cpu);
+u32 ClockProbe();
 void SampleThreadPlacementSlow(const char* role, unsigned stride_log2);
 inline void SampleThreadPlacement(const char* role, unsigned stride_log2 = 6) {
     if (g_thread_stats) [[unlikely]] {

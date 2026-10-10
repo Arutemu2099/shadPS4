@@ -504,6 +504,17 @@ std::string LogicalProcessorLoad() {
 }
 } // namespace
 
+u32 CurrentProcessor() {
+    return GetCurrentProcessorNumber();
+}
+bool IsPerformanceProcessor(u32 cpu) {
+    const auto& c = GetCpuClasses();
+    return cpu >= 64 || c.cls[cpu] == c.max_class;
+}
+u32 ClockProbe() {
+    return ClockProbeTicks();
+}
+
 const bool g_thread_stats = [] {
     const char* value = std::getenv("SHADPS4_THREAD_STATS");
     return value && value[0] == '1';
@@ -583,6 +594,15 @@ void ApplyHotThreadPlacement(HotThread) {}
 void SampleCommandProcessorCore() {}
 const bool g_thread_stats = false;
 void SampleThreadPlacementSlow(const char*, unsigned) {}
+u32 CurrentProcessor() {
+    return 0;
+}
+bool IsPerformanceProcessor(u32) {
+    return true;
+}
+u32 ClockProbe() {
+    return 0;
+}
 #endif
 
 std::string GetCurrentThreadName() {
