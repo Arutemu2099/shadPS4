@@ -2879,6 +2879,9 @@ struct NativeRecFrontStats {
     u64 draws{}, tagged{}, no_ring{}, stale{}, heads{}, members{}, broken{}, pipe_moved{},
         epoch_moved{}, ud_ok{}, ud_bad{}, ud_unknown{}, idx_bad{}, inst_bad{}, inst_unknown{},
         other_stage{}, run_draws_2plus{}, gap_dw{};
+    // Stage a2: the job thread's own derivation vs the front's.
+    u64 derived{}, not_derived{}, d_pipe_diff{}, d_flat_ok{}, d_flat_bad{}, d_vi_ok{}, d_vi_bad{},
+        d_stale{}, members_derived{}, pipe_moved_derived{};
     std::array<u64, 8> hist{}; // run length of heads: 1, 2-3, 4-7, ..., 128+
     u32 run_tag{};
     u32 run_head{};
@@ -2890,7 +2893,8 @@ struct NativeRecFrontStats {
 NativeRecFrontStats g_nrf;
 
 void NativeRecFront(const PM4Header* header, const Vulkan::Rasterizer::SplitDraw& draw,
-                    const Regs& regs, u64 ctx_epoch) {
+                    const Regs& regs, u64 ctx_epoch,
+                    const AmdGpu::CpSplit::VertexInputsDerived* front_vi) {
     namespace NR = AmdGpu::NativeRec;
     auto& st = g_nrf;
     ++st.draws;
@@ -2913,6 +2917,12 @@ void NativeRecFront(const PM4Header* header, const Vulkan::Rasterizer::SplitDraw
                  st.broken, st.pipe_moved, st.epoch_moved, st.ud_ok, st.ud_bad, st.ud_unknown,
                  st.idx_bad, st.inst_bad, st.inst_unknown, st.other_stage,
                  st.members ? double(st.gap_dw) / double(st.members) : 0.0, h);
+        LOG_INFO(Render,
+                 "NativeRec front a2: derived={} not_derived={} pipeline differs={} | flat ok={} "
+                 "MISMATCH={} | vertex inputs ok={} MISMATCH={} | payload stale={} | derived "
+                 "members={} of which the pipeline moved={}",
+                 st.derived, st.not_derived, st.d_pipe_diff, st.d_flat_ok, st.d_flat_bad,
+                 st.d_vi_ok, st.d_vi_bad, st.d_stale, st.members_derived, st.pipe_moved_derived);
     };
     const auto* w = reinterpret_cast<const u32*>(header);
     if (header->type3.opcode != PM4ItOpcode::DrawIndex2 || w[6] != 0xc0021000u ||
@@ -2942,6 +2952,10 @@ void NativeRecFront(const PM4Header* header, const Vulkan::Rasterizer::SplitDraw
     const bool inst_known = src.inst_known != 0;
     const u32 gap = src.gap_dwords;
     const u32 count = run_k == 0 ? src.count : 0;
+    const bool derived = src.derived != 0;
+    const void* d_pipeline = src.pipeline;
+    const u32 d_nvs = src.flat_vs_dw, d_nps = src.flat_ps_dw, d_vi_bytes = src.vi_bytes;
+    const u64 d_pos = src.payload_pos;
     std::atomic_thread_fence(std::memory_order_acquire);
     if (src.stamp.load(std::memory_order_relaxed) != idx + 1) {
         ++st.stale;
@@ -2963,6 +2977,10 @@ void NativeRecFront(const PM4Header* header, const Vulkan::Rasterizer::SplitDraw
             ++st.broken;
         } else {
             st.pipe_moved += draw.pipeline != st.run_pipeline;
+            if (src.derived) {
+                ++st.members_derived;
+                st.pipe_moved_derived += draw.pipeline != st.run_pipeline;
+            }
             st.epoch_moved += ctx_epoch != st.run_epoch;
         }
         st.run_next_k = run_k + 1;
@@ -3018,8 +3036,114 @@ void NativeRecFront(const PM4Header* header, const Vulkan::Rasterizer::SplitDraw
             }
         }
     }
+    // Stage a2: publish (VS hash, PS hash, fetch shader) -> pipeline for the job threads, then
+    // compare what the job thread derived for this draw.
+    const Shader::Info* vsi = nullptr;
+    const Shader::Info* psi = nullptr;
+    if (draw.pipeline && draw.draw_class == Vulkan::Rasterizer::DrawClass::Draw && !draw.skip) {
+        const auto stages = draw.pipeline->GetStages();
+        vsi = stages[static_cast<u32>(Shader::LogicalStage::Vertex)];
+        psi = stages[static_cast<u32>(Shader::LogicalStage::Fragment)];
+        bool other = false;
+        for (u32 i = 0; i < stages.size(); ++i) {
+            other = other || (stages[i] && i != static_cast<u32>(Shader::LogicalStage::Vertex) &&
+                              i != static_cast<u32>(Shader::LogicalStage::Fragment));
+        }
+        if (vsi && vsi->stage == Shader::Stage::Vertex && !other) {
+            u64 fetch = 0;
+            u32 fb = 0xffffffffu;
+            if (vsi->has_fetch_shader) {
+                const u32 b = vsi->fetch_shader_sgpr_base;
+                fb = b + 1;
+                if (b + 1 < vsi->user_data.size()) {
+                    fetch = (u64(vsi->user_data[b + 1]) << 32 | vsi->user_data[b]) &
+                            0xFFFFFFFFFFFFull;
+                }
+            }
+            NR::VsPublish(vsi->pgm_hash, fb);
+            NR::TablePublish(vsi->pgm_hash, psi ? psi->pgm_hash : 0, fetch, draw.pipeline);
+        } else {
+            vsi = nullptr;
+        }
+    }
+    if (!derived) {
+        ++st.not_derived;
+    } else if (vsi) {
+        ++st.derived;
+        st.d_pipe_diff += d_pipeline != static_cast<const void*>(draw.pipeline);
+        const u8* payload = NR::g_payloads[tag >> 28].load(std::memory_order_acquire);
+        if (payload) {
+            const u8* base = payload + (d_pos & (NR::PayloadSize - 1));
+            const u32* fvs = reinterpret_cast<const u32*>(base);
+            const u32* fps = fvs + d_nvs;
+            // The flat buffer starts with the 16 user-data registers; only the stage's own
+            // (RSRC2 count) are read, the SRT walker's part after them always is.
+            const auto same_flat = [](const u32* job, std::span<const u32> front, u32 n,
+                                      u32 n_user) {
+                if (n != front.size()) {
+                    return false;
+                }
+                for (u32 i = 0; i < n; ++i) {
+                    if ((i >= 16 || i < n_user) && job[i] != front[i]) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            bool flat_ok = same_flat(fvs, vsi->flattened_ud_buf, d_nvs,
+                                     regs.vs_program.settings.num_user_regs);
+            if (psi) {
+                flat_ok = flat_ok && same_flat(fps, psi->flattened_ud_buf, d_nps,
+                                               regs.ps_program.settings.num_user_regs);
+            }
+            bool vi_ok = true;
+            if (front_vi) {
+                const auto* hdr = reinterpret_cast<const AmdGpu::CpSplit::VertexInputsPayload*>(
+                    base + (u64(d_nvs + d_nps) * 4 + 7) / 8 * 8);
+                const auto* att =
+                    reinterpret_cast<const AmdGpu::CpSplit::VertexInputAttrib*>(hdr + 1);
+                const auto* rng =
+                    reinterpret_cast<const AmdGpu::CpSplit::VertexInputRange*>(att + hdr->count);
+                vi_ok = d_vi_bytes == front_vi->Bytes() && hdr->count == front_vi->header.count &&
+                        hdr->range_count == front_vi->header.range_count;
+                for (u32 a = 0; vi_ok && a < hdr->count; ++a) {
+                    const auto& x = att[a];
+                    const auto& y = front_vi->attribs[a];
+                    vi_ok = x.desc.vk_format == y.desc.vk_format &&
+                            x.desc.stride == y.desc.stride &&
+                            x.desc.location == y.desc.location &&
+                            x.desc.instanced == y.desc.instanced &&
+                            x.base_address == y.base_address && x.size == y.size &&
+                            x.range == y.range;
+                }
+                for (u32 g = 0; vi_ok && g < hdr->range_count; ++g) {
+                    vi_ok = rng[g].base_address == front_vi->ranges[g].base_address &&
+                            rng[g].end_address == front_vi->ranges[g].end_address;
+                }
+            }
+            if (src.stamp.load(std::memory_order_acquire) != idx + 1) {
+                ++st.d_stale;
+            } else {
+                (flat_ok ? st.d_flat_ok : st.d_flat_bad) += 1;
+                if (front_vi) {
+                    (vi_ok ? st.d_vi_ok : st.d_vi_bad) += 1;
+                }
+                if ((!flat_ok || (front_vi && !vi_ok)) && ++st.logged <= 16) {
+                    LOG_WARNING(Render,
+                                "NativeRec a2 MISMATCH: flat {} vi {} (VS flat {} vs {} dw, "
+                                "pipeline {})",
+                                flat_ok ? "ok" : "BAD", vi_ok ? "ok" : "BAD", d_nvs,
+                                vsi->flattened_ud_buf.size(),
+                                d_pipeline == static_cast<const void*>(draw.pipeline)
+                                    ? "same"
+                                    : "differs");
+                }
+            }
+        }
+    }
     log();
 }
+
 } // namespace
 
 void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_marker,
@@ -3056,9 +3180,6 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
     // re-lookup of that draw (DrawRelookup) is only meaningful because this one ran while
     // earlier posted records could still be outstanding. A drain before this line would blind it.
     rasterizer->PrepareDrawFront(draw);
-    if (AmdGpu::NativeRec::g_mode != 0) [[unlikely]] {
-        NativeRecFront(header, draw, regs, context_change_epoch);
-    }
     const bool has_stages = draw.pipeline && draw.draw_class ==
                                                  Vulkan::Rasterizer::DrawClass::Draw &&
                             !draw.skip;
@@ -3115,6 +3236,9 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
     }
     if (verify == DrawVerifySnapshot) {
         bytes += VerifySnapshotBytes;
+    }
+    if (AmdGpu::NativeRec::g_mode != 0) [[unlikely]] {
+        NativeRecFront(header, draw, regs, context_change_epoch, vi_bytes ? &*front_vi : nullptr);
     }
     auto* rec = split->Reserve<SplitDrawRecord>(CpSplit::RecordType::Draw, bytes);
     rec->draw = draw;

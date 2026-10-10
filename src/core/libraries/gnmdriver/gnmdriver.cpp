@@ -30,6 +30,7 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/native_rec.h"
+#include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
@@ -811,8 +812,20 @@ struct RecThread {
     u32 head_idx{};
     u32 run_id{};
     u32 run_index_type{}, run_prim{};
+    // Stage a2.
+    u32 vs_nuser{16}, ps_nuser{16}; ///< RSRC2 user-SGPR counts of the bound VS / PS
+    u8* payload{};
+    u64 payload_pos{};
+    AmdGpu::CpSplit::VertexInputsDerived vi_scratch{};
+    bool run_derived{};
+    u64 spec_key{}; ///< NativeRecSpecKey of VS + PS at the last derived draw
+    u64 run_fetch{};
+    u64 run_vi_key{};
 };
 thread_local RecThread t_rec;
+/// Stage a2 job-side derive outcomes: 0 ok, 1 user data unknown, 2 VS not in the table yet,
+/// 3 no pipeline for (VS, PS, fetch shader); 4 run ended by the vertex layout.
+std::array<std::atomic<u64>, 5> g_nr_d{};
 // Diagnostic: which packet put a gap off the whitelist (opcode; 256 = other SH register, 257 = a
 // marker / flip NOP, 258 = other uconfig, 259 = other DMA).
 std::array<std::atomic<u64>, 260> g_nr_off{};
@@ -917,11 +930,174 @@ bool NativeRecWalk(const u32* to) {
     return landed;
 }
 
-void NativeRecShader(const u32* cmdbuf, u32 size, bool is_set) {
+void NativeRecShader(const u32* cmdbuf, u32 size, bool is_set, u32 stage, const u32* regs) {
     NativeRecWalk(cmdbuf);
     t_rec.cursor = cmdbuf + size;
     t_rec.set_called = t_rec.set_called || is_set;
+    const u32 nuser = regs ? std::min<u32>((regs[3] >> 1) & 0x1f, 16) : 0;
+    (stage == 0 ? t_rec.vs_nuser : t_rec.ps_nuser) = nuser;
 }
+
+/// The fields of the bound descriptors that Shader::StageSpecialization keys a permutation on
+/// (specialization.h), hashed from the job thread's own BoundStage. Equal keys + equal shaders +
+/// equal context = the same pipeline (s382: 2.3% of derived members changed pipeline without it).
+u64 NativeRecSpecKey(const Shader::BoundStage& bs, const Shader::Gcn::FetchShaderData* fetch) {
+    u64 h = 0xcbf29ce484222325ull;
+    const auto mix = [&h](u64 v) { h = (h ^ v) * 0x100000001B3ull; };
+    const auto mix_bytes = [&](const auto& x) {
+        u64 v = 0;
+        std::memcpy(&v, &x, std::min<size_t>(sizeof(x), sizeof(v)));
+        mix(v);
+    };
+    const Shader::Info& info = *bs.info;
+    if (fetch && info.stage == Shader::Stage::Vertex) {
+        for (const auto& attrib : fetch->attributes) {
+            const AmdGpu::Buffer sharp = attrib.GetSharp(bs);
+            mix(u64(AmdGpu::GetNumberClass(sharp.GetNumberFmt())));
+            mix_bytes(sharp.DstSelect());
+        }
+    }
+    for (const auto& desc : info.buffers) {
+        const AmdGpu::Buffer sharp = desc.GetSharp(bs);
+        if (!sharp) {
+            mix(0x51);
+            continue;
+        }
+        mix(u64(sharp.GetStride()) << 8 | u64(sharp.swizzle_enable) << 1 | sharp.add_tid_enable);
+        if (desc.is_formatted) {
+            mix(u64(sharp.GetDataFmt()) << 8 | u64(sharp.GetNumberFmt()));
+            mix_bytes(sharp.DstSelect());
+            mix(u64(sharp.GetNumberConversion()));
+        }
+        if (sharp.swizzle_enable) {
+            mix(u64(sharp.index_stride) << 4 | sharp.element_size);
+        }
+    }
+    for (const auto& desc : info.images) {
+        const AmdGpu::Image sharp = desc.GetSharp(bs);
+        if (!sharp) {
+            mix(0x52);
+            continue;
+        }
+        mix(u64(sharp.GetViewType(desc.is_array)) << 8 |
+            u64(AmdGpu::IsInteger(sharp.GetNumberFmt())) << 4 | u64(sharp.IsCube()) << 2 |
+            u64(sharp.IsBlockCoded1D()) << 1 |
+            u64(!desc.is_written && sharp.GetNumberFmt() == AmdGpu::NumberFormat::Srgb));
+        if (desc.is_written) {
+            mix_bytes(sharp.DstSelect());
+        }
+        mix(u64(sharp.GetNumberConversion()));
+        mix(desc.NumBindings(bs));
+    }
+    for (const auto& desc : info.fmasks) {
+        const AmdGpu::Image sharp = desc.GetSharp(bs);
+        mix(u64(sharp.width) << 32 | sharp.height);
+    }
+    for (const auto& desc : info.samplers) {
+        const AmdGpu::Sampler sharp = desc.GetSharp(bs);
+        mix(u64(sharp.force_unnormalized) << 1 | sharp.force_degamma);
+    }
+    return h;
+}
+
+/// Stage a2: derive what the front's FRONT_DERIVE + stage copy produce (flattened user data of
+/// VS / PS, the vertex inputs) on the job thread, through the program table the front publishes.
+/// Writes into the thread's payload ring; fills the record's derive fields (derived = 0: none).
+void NativeRecDerive(NR::Record& rec) {
+    auto& r = t_rec;
+    rec.derived = 0;
+    rec.pipeline = nullptr;
+    rec.fetch_addr = 0;
+    const u32 need_vs = r.vs_nuser >= 16 ? 0xffffu : ((1u << r.vs_nuser) - 1);
+    const u32 need_ps = r.ps_nuser >= 16 ? 0xffffu : ((1u << r.ps_nuser) - 1);
+    if ((r.vs_known & need_vs) != need_vs || (r.ps_known & need_ps) != need_ps) {
+        g_nr_d[1].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const u64 vs_hash = t_draw_tag_hash[0];
+    const u64 ps_hash = t_draw_tag_hash[1];
+    const u32 fb = NR::VsFetchBase(vs_hash);
+    if (fb == 0) {
+        g_nr_d[2].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    u64 fetch = 0;
+    if (fb != 0xffffffffu) {
+        const u32 base = fb - 1;
+        if (base + 1 >= 16 || (r.vs_known >> base & 3) != 3) {
+            g_nr_d[1].fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        fetch = (u64(r.vs[base + 1]) << 32 | r.vs[base]) & 0xFFFFFFFFFFFFull;
+    }
+    const auto* gp = static_cast<const Vulkan::GraphicsPipeline*>(NR::TableFind(vs_hash, ps_hash, fetch));
+    if (!gp) {
+        g_nr_d[3].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const auto stages = gp->GetStages();
+    const Shader::Info* vsi = stages[static_cast<u32>(Shader::LogicalStage::Vertex)];
+    const Shader::Info* psi = stages[static_cast<u32>(Shader::LogicalStage::Fragment)];
+    if (!vsi || vsi->stage != Shader::Stage::Vertex) {
+        g_nr_d[3].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const u32 nvs = vsi->srt_info.flattened_bufsize_dw;
+    const u32 nps = psi ? psi->srt_info.flattened_bufsize_dw : 0u;
+    if (!r.payload) [[unlikely]] {
+        r.payload = new u8[NR::PayloadSize];
+        NR::g_payloads[t_draw_tag_slot].store(r.payload, std::memory_order_release);
+    }
+    // Room for both flat buffers and a full vertex-input block, 8-aligned, never across the end.
+    const u64 worst = (u64(nvs + nps) * 4 + 7) / 8 * 8 + sizeof(AmdGpu::CpSplit::VertexInputsDerived);
+    u64 pos = r.payload_pos;
+    if ((pos & (NR::PayloadSize - 1)) + worst > NR::PayloadSize) {
+        pos = (pos + NR::PayloadSize) & ~(NR::PayloadSize - 1);
+    }
+    u8* const base = r.payload + (pos & (NR::PayloadSize - 1));
+    u32* flat_vs = reinterpret_cast<u32*>(base);
+    u32* flat_ps = flat_vs + nvs;
+    // As Info::RefreshFlatBuf: the user data first, then the SRT walker.
+    std::memset(flat_vs, 0, size_t(nvs + nps) * 4);
+    std::memcpy(flat_vs, r.vs.data(), std::min<u32>(nvs, 16) * 4);
+    if (vsi->srt_info.walker_func && nvs != 0) {
+        vsi->srt_info.walker_func(r.vs.data(), flat_vs);
+    }
+    if (psi && nps != 0) {
+        std::memcpy(flat_ps, r.ps.data(), std::min<u32>(nps, 16) * 4);
+        if (psi->srt_info.walker_func) {
+            psi->srt_info.walker_func(r.ps.data(), flat_ps);
+        }
+    }
+    u8* vi_out = base + (u64(nvs + nps) * 4 + 7) / 8 * 8;
+    Shader::BoundStage vs{};
+    vs.info = vsi;
+    vs.user_data = std::span<const u32>{r.vs.data(), 16};
+    vs.flattened_ud_buf = std::span<const u32>{flat_vs, nvs};
+    vs.pgm_base = VAddr{t_draw_tag_pgm[0]} << 8;
+    auto& vi = r.vi_scratch;
+    gp->DeriveVertexInputs(vi, 0, 0, vs);
+    vi.Write(vi_out);
+    r.spec_key = NativeRecSpecKey(vs, gp->GetFetchShader());
+    if (psi) {
+        Shader::BoundStage ps{};
+        ps.info = psi;
+        ps.user_data = std::span<const u32>{r.ps.data(), 16};
+        ps.flattened_ud_buf = std::span<const u32>{flat_ps, nps};
+        ps.pgm_base = VAddr{t_draw_tag_pgm[1]} << 8;
+        r.spec_key = r.spec_key * 31 + NativeRecSpecKey(ps, nullptr);
+    }
+    rec.flat_vs_dw = nvs;
+    rec.flat_ps_dw = nps;
+    rec.vi_bytes = vi.Bytes();
+    rec.payload_pos = pos;
+    rec.pipeline = gp;
+    rec.fetch_addr = fetch;
+    rec.derived = 1;
+    r.payload_pos = pos + (u64(vi_out - base) + rec.vi_bytes + 7) / 8 * 8;
+    g_nr_d[0].fetch_add(1, std::memory_order_relaxed);
+}
+
 
 std::array<std::atomic<u64>, 12> g_nr_why{};
 
@@ -939,7 +1115,30 @@ u32 NativeRecDraw(const u32* cmdbuf, u64 index_addr, u32 index_count, u32 tag) {
     r.gap = 0;
     r.cursor = cmdbuf + 10;
     const u32 run_id = tag & 0x0fffffffu;
-    const bool cont = r.head && wl && !r.set_called && run_id == r.run_id &&
+    const u32 idx = r.next++;
+    NR::Record& rec = r.ring[idx & (NR::RingSize - 1)];
+    rec.stamp.store(0, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    NativeRecDerive(rec);
+    // The vertex layout (fetch shader, attribute formats / strides) is part of the pipeline: a
+    // run ends where it changes (s380: 2.9% of members changed pipeline under one shader pair).
+    u64 vi_key = 0;
+    if (rec.derived) {
+        const auto& vi = r.vi_scratch;
+        vi_key = (rec.fetch_addr ^ r.spec_key) * 0x9E3779B97F4A7C15ull + vi.header.count;
+        for (u32 a = 0; a < vi.header.count; ++a) {
+            const auto& d = vi.attribs[a].desc;
+            vi_key = (vi_key ^ (u64(d.vk_format) << 32 | d.stride)) * 0x100000001B3ull;
+            vi_key = (vi_key ^ (u64(d.location) << 8 | d.instanced)) * 0x100000001B3ull;
+        }
+    }
+    // A run continues only through draws the job thread derived (the front skips members in
+    // stage b), with the head's vertex layout.
+    const bool layout_same = rec.derived && r.run_derived && vi_key == r.run_vi_key;
+    if (r.head && rec.derived && r.run_derived && !layout_same) {
+        g_nr_d[4].fetch_add(1, std::memory_order_relaxed);
+    }
+    const bool cont = layout_same && r.head && wl && !r.set_called && run_id == r.run_id &&
                       r.head->count < NR::MaxRun && r.it_known && r.index_type == r.run_index_type &&
                       r.prim_known && r.prim == r.run_prim &&
                       r.head->stamp.load(std::memory_order_relaxed) == r.head_idx + 1;
@@ -971,6 +1170,11 @@ u32 NativeRecDraw(const u32* cmdbuf, u64 index_addr, u32 index_count, u32 tag) {
                     off += fmt::format(" {:#x}={}", i, c);
                 }
             }
+            LOG_INFO(Lib_GnmDriver,
+                     "NativeRec job-side derive: ok={} user-data unknown={} VS not in table={} "
+                     "no pipeline={} | runs ended by the vertex layout={}",
+                     g_nr_d[0].exchange(0), g_nr_d[1].exchange(0), g_nr_d[2].exchange(0),
+                     g_nr_d[3].exchange(0), g_nr_d[4].exchange(0));
             LOG_INFO(Lib_GnmDriver, "NativeRec off-whitelist packets (256 SH 257 NOP 258 uconfig 259 DMA):{} last NOP payload {:#x}",
                      off, g_nr_last_nop.load());
             LOG_INFO(Lib_GnmDriver,
@@ -982,10 +1186,6 @@ u32 NativeRecDraw(const u32* cmdbuf, u64 index_addr, u32 index_count, u32 tag) {
         (void)n;
     }
     r.set_called = false;
-    const u32 idx = r.next++;
-    NR::Record& rec = r.ring[idx & (NR::RingSize - 1)];
-    rec.stamp.store(0, std::memory_order_relaxed);
-    std::atomic_thread_fence(std::memory_order_release);
     rec.tag = tag;
     rec.cmd = cmdbuf;
     rec.index_addr = index_addr;
@@ -1014,6 +1214,8 @@ u32 NativeRecDraw(const u32* cmdbuf, u64 index_addr, u32 index_count, u32 tag) {
         r.run_id = run_id;
         r.run_index_type = r.index_type;
         r.run_prim = r.prim;
+        r.run_derived = rec.derived != 0;
+        r.run_vi_key = vi_key;
     }
     rec.stamp.store(idx + 1, std::memory_order_release);
     return idx;
@@ -2326,7 +2528,7 @@ s32 PS4_SYSV_ABI sceGnmSetPsShader350(u32* cmdbuf, u32 size, const u32* ps_regs)
             GapShaderSet(1, ps_regs, cmdbuf, size);
         }
         if (NR::g_mode) {
-            NativeRecShader(cmdbuf, size, true);
+            NativeRecShader(cmdbuf, size, true, 1, ps_regs);
         }
     }
 
@@ -2433,7 +2635,7 @@ s32 PS4_SYSV_ABI sceGnmSetVsShader(u32* cmdbuf, u32 size, const u32* vs_regs, u3
             GapShaderSet(0, vs_regs, cmdbuf, size);
         }
         if (NR::g_mode) {
-            NativeRecShader(cmdbuf, size, true);
+            NativeRecShader(cmdbuf, size, true, 0, vs_regs);
         }
     }
 
@@ -3098,7 +3300,7 @@ s32 PS4_SYSV_ABI sceGnmUpdatePsShader350(u32* cmdbuf, u32 size, const u32* ps_re
             GapShaderSet(1, ps_regs, cmdbuf, size);
         }
         if (NR::g_mode) {
-            NativeRecShader(cmdbuf, size, ps_regs == nullptr);
+            NativeRecShader(cmdbuf, size, ps_regs == nullptr, 1, ps_regs);
         }
     }
 
@@ -3153,7 +3355,7 @@ s32 PS4_SYSV_ABI sceGnmUpdateVsShader(u32* cmdbuf, u32 size, const u32* vs_regs,
             GapShaderSet(0, vs_regs, cmdbuf, size);
         }
         if (NR::g_mode) {
-            NativeRecShader(cmdbuf, size, vs_regs == nullptr);
+            NativeRecShader(cmdbuf, size, vs_regs == nullptr, 0, vs_regs);
         }
     }
 

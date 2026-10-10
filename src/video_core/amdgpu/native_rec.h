@@ -41,7 +41,111 @@ struct Record {
     // submitted: the game submits after its jobs finished).
     u32 count;
     const u32* end; ///< dword after the run's last trailing NOP
+    // Stage a2: what the job thread derived itself through the program table (0: not derived).
+    u32 derived;
+    u32 flat_vs_dw;
+    u32 flat_ps_dw;
+    u32 vi_bytes;
+    u64 payload_pos;      ///< byte position in the thread's payload ring: flat VS, flat PS, vi
+    const void* pipeline; ///< the Vulkan::GraphicsPipeline the derivation used
+    u64 fetch_addr;
 };
+
+constexpr u32 PayloadBits = 23; // 8 MB per thread
+constexpr u64 PayloadSize = u64{1} << PayloadBits;
+inline std::array<std::atomic<u8*>, MaxSlots> g_payloads{};
+
+/// Program table: (VS hash, PS hash, fetch shader address) -> the pipeline the front looked up
+/// for such a draw. Written by the front only, read lock-free by the job threads.
+struct ProgramEntry {
+    std::atomic<u64> key{};
+    u64 vs_hash{}, ps_hash{}, fetch_addr{};
+    std::atomic<const void*> pipeline{};
+};
+constexpr u32 TableSize = 8192;
+inline std::array<ProgramEntry, TableSize> g_table{};
+/// VS hash -> fetch_shader_sgpr_base + 1 (0: unknown), 0xffffffff: no fetch shader.
+struct VsEntry {
+    std::atomic<u64> vs_hash{};
+    std::atomic<u32> fetch_base{};
+};
+inline std::array<VsEntry, TableSize> g_vs_table{};
+
+inline u64 TableKey(u64 vs, u64 ps, u64 fetch) {
+    const u64 k = vs * 0x9E3779B97F4A7C15ull ^ (ps + 0x632BE59BD9B4E019ull) * 0xC2B2AE3D27D4EB4Full ^
+                  (fetch + 1) * 0x165667B19E3779F9ull;
+    return k ? k : 1;
+}
+
+inline const void* TableFind(u64 vs, u64 ps, u64 fetch) {
+    const u64 k = TableKey(vs, ps, fetch);
+    for (u32 i = 0; i < 16; ++i) {
+        const auto& e = g_table[(k + i) & (TableSize - 1)];
+        const u64 ek = e.key.load(std::memory_order_acquire);
+        if (ek == 0) {
+            return nullptr;
+        }
+        if (ek == k && e.vs_hash == vs && e.ps_hash == ps && e.fetch_addr == fetch) {
+            return e.pipeline.load(std::memory_order_acquire);
+        }
+    }
+    return nullptr;
+}
+
+/// Front thread only.
+inline void TablePublish(u64 vs, u64 ps, u64 fetch, const void* pipeline) {
+    const u64 k = TableKey(vs, ps, fetch);
+    for (u32 i = 0; i < 16; ++i) {
+        auto& e = g_table[(k + i) & (TableSize - 1)];
+        const u64 ek = e.key.load(std::memory_order_relaxed);
+        if (ek == k && e.vs_hash == vs && e.ps_hash == ps && e.fetch_addr == fetch) {
+            if (e.pipeline.load(std::memory_order_relaxed) != pipeline) {
+                e.pipeline.store(pipeline, std::memory_order_release);
+            }
+            return;
+        }
+        if (ek == 0) {
+            e.vs_hash = vs;
+            e.ps_hash = ps;
+            e.fetch_addr = fetch;
+            e.pipeline.store(pipeline, std::memory_order_relaxed);
+            e.key.store(k, std::memory_order_release);
+            return;
+        }
+    }
+}
+
+inline u32 VsFetchBase(u64 vs) {
+    const u64 k = vs ? vs : 1;
+    for (u32 i = 0; i < 16; ++i) {
+        const auto& e = g_vs_table[(k * 0x9E3779B97F4A7C15ull + i) & (TableSize - 1)];
+        const u64 h = e.vs_hash.load(std::memory_order_acquire);
+        if (h == 0) {
+            return 0;
+        }
+        if (h == k) {
+            return e.fetch_base.load(std::memory_order_relaxed);
+        }
+    }
+    return 0;
+}
+
+/// Front thread only. fetch_base: fetch_shader_sgpr_base + 1, or 0xffffffff for none.
+inline void VsPublish(u64 vs, u32 fetch_base) {
+    const u64 k = vs ? vs : 1;
+    for (u32 i = 0; i < 16; ++i) {
+        auto& e = g_vs_table[(k * 0x9E3779B97F4A7C15ull + i) & (TableSize - 1)];
+        const u64 h = e.vs_hash.load(std::memory_order_relaxed);
+        if (h == k) {
+            return;
+        }
+        if (h == 0) {
+            e.fetch_base.store(fetch_base, std::memory_order_relaxed);
+            e.vs_hash.store(k, std::memory_order_release);
+            return;
+        }
+    }
+}
 
 inline std::array<std::atomic<Record*>, MaxSlots> g_rings{};
 
