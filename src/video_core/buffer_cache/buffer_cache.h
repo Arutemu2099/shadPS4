@@ -863,6 +863,8 @@ private:
     u64 last_sync_upload_bytes{}; // SHADPS4_BUFFER_TRAFFIC: bytes the last SynchronizeBuffer uploaded
     // SHADPS4_BIND_MEMO_STATS: see SyncUploadBytesTotal and StructGeneration.
     u64 sync_upload_bytes_total{};
+    u64 sync_upload_calls{};
+    u64 sync_upload_log_tsc{};
     std::atomic<u64> struct_generation{0};
 
     /**

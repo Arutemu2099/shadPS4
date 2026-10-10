@@ -5353,6 +5353,16 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     last_sync_upload_bytes = total_size_bytes;
     sync_upload_bytes_total += total_size_bytes;
     if (total_size_bytes != 0) {
+        // Upload volume, every ~5 s, only from calls that upload (NATIVE_COHERENT pair check).
+        ++sync_upload_calls;
+        const u64 now = __rdtsc();
+        if (now - sync_upload_log_tsc > 17'500'000'000ULL) {
+            sync_upload_log_tsc = now;
+            LOG_INFO(Render, "SyncUploads: total={} MB uploads={} coherent={}",
+                     sync_upload_bytes_total >> 20, sync_upload_calls, g_native_coherent);
+        }
+    }
+    if (total_size_bytes != 0) {
         // Whole tracker pages: a later binding of the same page would have found it dirty too.
         const u64 page_lo = device_addr & ~u64{0xfff};
         const u64 page_hi = (device_addr + size + 0xfff) & ~u64{0xfff};
