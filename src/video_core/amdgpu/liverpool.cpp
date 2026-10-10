@@ -21,6 +21,7 @@
 #include "common/fault_monitor.h"
 #include "common/fence_watch.h"
 #include "video_core/buffer_cache/protect_queue.h"
+#include "video_core/buffer_cache/back_clean.h"
 #include "video_core/buffer_cache/submit_epoch.h"
 #include "common/polyfill_thread.h"
 #include "common/scope_exit.h"
@@ -1892,6 +1893,13 @@ void Liverpool::ExecuteRecordImpl(const CpSplit::RecordHeader& record) {
     case CpSplit::RecordType::EpochBump: {
         const auto* epoch = reinterpret_cast<const CpSplit::EpochPayload*>(payload);
         VideoCore::BumpSubmitEpoch(static_cast<PM4ItOpcode>(epoch->opcode));
+        if (VideoCore::g_native_coherent != 0 && rasterizer) {
+            // Milestone 1 (native-path sec. 17): memory coherence once per submission. A
+            // submission start (Nop) is bounded by the tail the front read; other points (memory
+            // wait satisfied, CP-side guest write) take everything logged so far.
+            const auto op = static_cast<PM4ItOpcode>(epoch->opcode);
+            rasterizer->GetBufferCache().CoherenceSync(op == PM4ItOpcode::Nop, epoch->pad);
+        }
         break;
     }
     case CpSplit::RecordType::Draw:
@@ -2245,7 +2253,7 @@ void Liverpool::BumpEpoch(PM4ItOpcode opcode) {
     if (split_enabled) [[unlikely]] {
         // In stream order on the back. Delaying a bump only makes an upload happen earlier
         // (submit_epoch.h: an extra bump is safe, a missing one is not).
-        if (VideoCore::g_epoch_defer_upload) {
+        if (VideoCore::g_epoch_defer_upload || VideoCore::g_native_coherent != 0) {
             split->EmitEpochBump(static_cast<u32>(opcode));
         }
         return;

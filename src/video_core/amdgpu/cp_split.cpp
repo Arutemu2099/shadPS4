@@ -14,6 +14,7 @@
 #include "common/logging/log.h"
 #include "common/readback_offload.h"
 #include "video_core/amdgpu/cp_split.h"
+#include "video_core/buffer_cache/back_clean.h"
 
 namespace AmdGpu::CpSplit {
 
@@ -403,7 +404,9 @@ void Channel::EmitExtent(u32 slot, u32 raw) {
 void Channel::EmitEpochBump(u32 opcode) {
     auto* payload = Reserve<EpochPayload>(RecordType::EpochBump);
     payload->opcode = opcode;
-    payload->pad = 0;
+    // SHADPS4_NATIVE_COHERENT: the dirty-log tail now (low 32 bits); for a submission start it
+    // bounds what the back's coherence point must upload.
+    payload->pad = static_cast<u32>(VideoCore::DirtyLog::Start());
     Commit();
 }
 

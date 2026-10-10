@@ -25,6 +25,7 @@
 #include "common/readback_unmap_gate.h"
 #include "common/slot_vector.h"
 #include "common/types.h"
+#include "video_core/buffer_cache/back_clean.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/submit_epoch.h"
 #include "video_core/buffer_cache/fault_manager.h"
@@ -272,6 +273,23 @@ public:
     [[nodiscard]] std::pair<Buffer*, u32> ObtainReadLean(VAddr device_addr, u32 size,
                                                          BufferId buffer_id);
     [[nodiscard]] bool LeanReadOk();
+
+    /// SHADPS4_NATIVE_COHERENT (back_clean.h, native-path sec. 17): a coherence point in stream
+    /// order (EpochBump record). `bounded`: a submission start, whose record carries the low 32
+    /// bits of the dirty-log tail the front read when it began parsing the submission; entries
+    /// after it are guest writes made after the submit and wait for the next point. CP thread.
+    void CoherenceSync(bool bounded, u32 bound_lo);
+    /// True when a binding of this kind needs no validity work (memory is coherent for the
+    /// submission): reads that are not texel buffers, on the CP thread, after the first point.
+    [[nodiscard]] bool CoherentSkip(bool is_written, bool is_texel) const noexcept {
+        return g_native_coherent != 0 && coherent_live && !is_written && !is_texel &&
+               Common::FaultMonitor::t_is_cp_thread;
+    }
+    /// NATIVE_COHERENT=2: runs the per-binding sync the skip replaced and classifies any upload.
+    void CoherentVerify(Buffer& buffer, VAddr addr, u32 size);
+    void NoteCoherentSpanSkip() noexcept {
+        ++coherent_stats.span_skips;
+    }
 
     /// SHADPS4_DRAW_REPEAT_HEAP: the read-sync fast path's clean answer for a range (no upload due).
     [[nodiscard]] bool ReadRangeClean(VAddr addr, u64 size);
@@ -758,6 +776,16 @@ private:
     u64 read_memo_calls{};
     u64 read_memo_verify_bad{};
     u64 buffer_memo_serial{};
+    /// SHADPS4_NATIVE_COHERENT state (CP thread).
+    bool coherent_live{};
+    bool coherent_warned{};
+    u64 coherent_head{DirtyLog::Start()};
+    std::vector<std::pair<u64, u64>> coherent_runs;
+    struct CoherentStats {
+        u64 points{}, bounded{}, sweeps{}, runs{}, bytes{}, cyc{}, max_cyc{}, dma_syncs{};
+        u64 skips{}, span_skips{}, created{}, verified{}, v_late{}, v_cp{}, v_bad{}, v_raced{},
+            v_bytes{};
+    } coherent_stats;
     /// [0] BindBuffers (uniform/storage) [1] other callers: calls, hits, key miss, epoch miss,
     /// guard (generation or serial) miss.
     std::array<std::array<u64, 5>, 2> read_memo_stats{};

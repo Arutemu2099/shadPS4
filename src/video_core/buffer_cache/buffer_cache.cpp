@@ -3910,6 +3910,12 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + num_bytes / sizeof(u32), value);
             memory_tracker->ClearRecent(address, num_bytes);
+            if (g_native_coherent != 0 && coherent_live) {
+                // SHADPS4_NATIVE_COHERENT: the CP wrote guest memory mid-submission; later reads
+                // in this submission skip validity, so the bytes are due now.
+                ++coherent_stats.dma_syncs;
+                SynchronizeBuffersInRange(address, num_bytes);
+            }
             return;
         }
     }
@@ -3938,6 +3944,11 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
             // Both buffers were not transferred to GPU yet. Can safely copy in host memory.
             memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
             memory_tracker->ClearRecent(dst, num_bytes);
+            if (g_native_coherent != 0 && coherent_live) {
+                // SHADPS4_NATIVE_COHERENT: as FillBuffer's CPU path.
+                ++coherent_stats.dma_syncs;
+                SynchronizeBuffersInRange(dst, num_bytes);
+            }
             return;
         }
         // Without a readback there's nothing we can do with this
@@ -4179,6 +4190,20 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     // share no code: the early exit below (a tracker query plus a guest-memory memcpy) and the
     // SynchronizeBuffer fall-through. Time them separately - the split decides which is worth
     // cutting, and it has never actually been measured.
+    // SHADPS4_NATIVE_COHERENT: memory was made coherent at the submission's start (CoherenceSync;
+    // a buffer created since was synced whole in CreateBuffer). A read is the lookup only.
+    if (CoherentSkip(is_written, is_texel_buffer)) {
+        if (IsBufferInvalid(buffer_id)) {
+            buffer_id = FindBuffer(device_addr, size);
+        }
+        Buffer& buffer = slot_buffers[buffer_id];
+        buffer.NoteMainAccess(scheduler.CurrentTick(), false);
+        ++coherent_stats.skips;
+        if (g_native_coherent == 2) [[unlikely]] {
+            CoherentVerify(buffer, device_addr, size);
+        }
+        return {&buffer, buffer.Offset(device_addr)};
+    }
     // SHADPS4_LEAN: no probe object at all. An inactive probe still costs a ~100-byte construction,
     // the sampling-flag guard and a destructor check per call (a19 profile: 9 of 1279 CP samples
     // under BufferSampleProbe frames).
@@ -4907,6 +4932,14 @@ std::pair<Buffer*, u32> BufferCache::ObtainReadLean(VAddr device_addr, u32 size,
     Buffer& buffer = slot_buffers[buffer_id];
     // As ObtainBuffer: NoteMainAccess, then the memo probe with the epoch and guard read first.
     buffer.NoteMainAccess(scheduler.CurrentTick(), false);
+    if (CoherentSkip(false, false)) {
+        // SHADPS4_NATIVE_COHERENT: no memo probe, no clean check (see ObtainBuffer).
+        ++coherent_stats.skips;
+        if (g_native_coherent == 2) [[unlikely]] {
+            CoherentVerify(buffer, device_addr, size);
+        }
+        return {&buffer, buffer.Offset(device_addr)};
+    }
     const u64 epoch = g_dirty_epoch.load(std::memory_order_acquire);
     const bool serial_guard = g_read_bind_memo >= 3;
     const u64 gen = serial_guard ? buffer.memo_serial : StructGeneration();
@@ -5110,6 +5143,13 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
         JoinOverlap(new_buffer_id, overlap_id, !overlap.has_stream_leap);
     }
     Register(new_buffer_id);
+    if (g_native_coherent != 0 && coherent_live && Common::FaultMonitor::t_is_cp_thread) {
+        // SHADPS4_NATIVE_COHERENT: reads of this buffer skip validity from now on, so every page
+        // the joined buffers did not carry is uploaded now (the tracker starts them dirty), not
+        // at a binding.
+        ++coherent_stats.created;
+        SynchronizeBuffer(new_buffer, new_buffer.CpuAddr(), size, false, false, nullptr);
+    }
     return new_buffer_id;
 }
 
@@ -5708,6 +5748,117 @@ void BufferCache::SynchronizeBuffersInRange(VAddr device_addr, u64 size) {
         u32 size = static_cast<u32>(end - start);
         SynchronizeBuffer(buffer, start, size, false, false, nullptr);
     });
+}
+
+void BufferCache::CoherenceSync(bool bounded, u32 bound_lo) {
+    if (g_native_coherent == 0) {
+        return;
+    }
+    if (g_back_clean == 0) {
+        if (!coherent_warned) {
+            coherent_warned = true;
+            LOG_CRITICAL(Render, "NativeCoherent: needs SHADPS4_BACK_CLEAN=1 (the dirty log); off");
+        }
+        return;
+    }
+    auto& cs = coherent_stats;
+    const u64 c0 = __rdtsc();
+    const u64 tail = DirtyLog::Start();
+    u64 end = tail;
+    if (bounded) {
+        // The front read the tail when it began the submission; it is at most one u32 lap back.
+        end = tail - static_cast<u32>(static_cast<u32>(tail) - bound_lo);
+        ++cs.bounded;
+    }
+    coherent_runs.clear();
+    const bool ok = DirtyLog::DrainTo(coherent_head, end, [this](u64 first, u64 count, bool) {
+        coherent_runs.emplace_back(first, count);
+    });
+    const u64 bytes0 = sync_upload_bytes_total;
+    if (!ok || !coherent_live) {
+        // First point, or log entries were lost: every cached buffer, whole (rare: loading).
+        ++cs.sweeps;
+        ForEachBufferInRange(0, u64{1} << 40, [this](BufferId, Buffer& buffer) {
+            SynchronizeBuffer(buffer, buffer.CpuAddr(), static_cast<u32>(buffer.SizeBytes()),
+                              false, false, nullptr);
+        });
+    } else if (!coherent_runs.empty()) {
+        std::sort(coherent_runs.begin(), coherent_runs.end());
+        u64 lo = coherent_runs[0].first;
+        u64 hi = lo + coherent_runs[0].second;
+        const auto flush = [&] {
+            ++cs.runs;
+            SynchronizeBuffersInRange(lo << TRACKER_PAGE_BITS, (hi - lo) << TRACKER_PAGE_BITS);
+        };
+        for (size_t i = 1; i < coherent_runs.size(); ++i) {
+            const auto [first, count] = coherent_runs[i];
+            if (first <= hi) {
+                hi = std::max(hi, first + count);
+                continue;
+            }
+            flush();
+            lo = first;
+            hi = first + count;
+        }
+        flush();
+    }
+    memory_tracker->BackCleanSync();
+    coherent_live = true;
+    ++cs.points;
+    cs.bytes += sync_upload_bytes_total - bytes0;
+    const u64 dt = __rdtsc() - c0;
+    cs.cyc += dt;
+    cs.max_cyc = std::max(cs.max_cyc, dt);
+    if ((cs.points & 0x7fff) == 0) {
+        LOG_INFO(Render,
+                 "NativeCoherent: mode={} points={} (bounded {}) sweeps={} runs={} uploaded={} KB "
+                 "cycles/point={:.0f} (max {}) dma_syncs={} created={} | skips={} span_skips={} | "
+                 "verify: checked={} late={} cp={} BAD={} raced={} bytes={} KB",
+                 g_native_coherent, cs.points, cs.bounded, cs.sweeps, cs.runs, cs.bytes >> 10,
+                 double(cs.cyc) / double(cs.points), cs.max_cyc, cs.dma_syncs, cs.created,
+                 cs.skips, cs.span_skips, cs.verified, cs.v_late, cs.v_cp, cs.v_bad, cs.v_raced,
+                 cs.v_bytes >> 10);
+        cs.max_cyc = 0;
+    }
+}
+
+void BufferCache::CoherentVerify(Buffer& buffer, VAddr addr, u32 size) {
+    // The per-binding sync the skip replaced. An upload means a page of the range was dirty:
+    // after the point's drained position by a guest thread = written after the submission began
+    // (legal to miss, submit_epoch.h); by the CP thread = the CP's own write mid-submission that
+    // nothing synced (a bug); no log entry at all = a bug.
+    auto& cs = coherent_stats;
+    ++cs.verified;
+    const u64 before = sync_upload_bytes_total;
+    SynchronizeBuffer(buffer, addr, size, false, false, nullptr);
+    const u64 uploaded = sync_upload_bytes_total - before;
+    if (uploaded == 0) {
+        return;
+    }
+    cs.v_bytes += uploaded;
+    const u64 lo = addr >> TRACKER_PAGE_BITS;
+    const u64 hi = (addr + size + TRACKER_BYTES_PER_PAGE - 1) >> TRACKER_PAGE_BITS;
+    bool late = false;
+    bool cp = false;
+    u64 head = coherent_head;
+    const bool ok = DirtyLog::DrainTo(head, ~u64{0}, [&](u64 first, u64 count, bool by_cp) {
+        if (first < hi && lo < first + count) {
+            (by_cp ? cp : late) = true;
+        }
+    });
+    if (!ok) {
+        ++cs.v_raced;
+    } else if (cp) {
+        if (++cs.v_cp <= 20) {
+            LOG_ERROR(Render, "NativeCoherent verify: CP-written page not synced, {:#x}+{:#x} ({} B)",
+                      addr, size, uploaded);
+        }
+    } else if (late) {
+        ++cs.v_late;
+    } else if (++cs.v_bad <= 20) {
+        LOG_ERROR(Render, "NativeCoherent verify: BAD, {:#x}+{:#x} uploaded {} B with no log entry",
+                  addr, size, uploaded);
+    }
 }
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* value, u32 num_bytes) {

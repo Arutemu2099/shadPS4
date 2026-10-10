@@ -487,6 +487,13 @@ public:
         return back_clean.DrainedTo();
     }
 
+    /// SHADPS4_NATIVE_COHERENT: keeps the back's private bits drained while no read binding asks.
+    void BackCleanSync() {
+        if (g_back_clean != 0) {
+            back_clean.Sync();
+        }
+    }
+
     UploadPath ForEachUploadRange(VAddr query_cpu_range, u64 query_size, bool is_written,
                                   auto&& func, auto&& on_upload) {
         if (g_back_clean != 0 && !is_written && !g_epoch_defer_upload && query_size != 0 &&

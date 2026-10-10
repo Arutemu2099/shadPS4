@@ -14,6 +14,7 @@
 #include <vector>
 #include <immintrin.h>
 
+#include "common/fault_monitor.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/region_definitions.h"
 
@@ -76,6 +77,22 @@ inline const int g_read_sync_fast = [] {
     return mode == 1 || mode == 2 ? mode : 0;
 }();
 
+/// SHADPS4_NATIVE_COHERENT=1 (=2 verify), default off (notes/native-path-2026-10-09.md sec. 17,
+/// milestone 1 of the native renderer): CPU-written guest memory is made coherent with the cached
+/// GPU buffers once per guest submission instead of per binding. At every submission start (and
+/// at every other point the CP's legal view of guest memory moves: a satisfied memory wait, a
+/// CP-side guest write) the back drains this log and uploads every dirty page that lies in a
+/// cached buffer (BufferCache::CoherenceSync); new buffers are synced whole when created, the
+/// CP's own DMA writes when they happen. A read binding then needs no validity check at all: it
+/// is the buffer lookup and the access barrier. A page the guest writes after its submission
+/// started is not legally visible to that submission (submit_epoch.h) and is uploaded at the next
+/// point. Needs SHADPS4_BACK_CLEAN=1 (the log) and the CP split (the points arrive as records).
+inline const int g_native_coherent = [] {
+    const char* env = std::getenv("SHADPS4_NATIVE_COHERENT");
+    const int mode = env ? env[0] - '0' : 0;
+    return mode == 1 || mode == 2 ? mode : 0;
+}();
+
 class DirtyLog {
 public:
     static constexpr u64 Capacity = 1ULL << 16;
@@ -89,8 +106,43 @@ public:
             return;
         }
         const u64 index = Tail().fetch_add(1, std::memory_order_seq_cst);
-        slots[index & Mask].store(((index & TagMask) << 40) | (first_page << 12) | (count - 1),
+        // Bit 10: appended by the CP thread (its own guest writes; NATIVE_COHERENT=2 classifies).
+        const u64 cp = Common::FaultMonitor::t_is_cp_thread ? (1ULL << 10) : 0;
+        slots[index & Mask].store(((index & TagMask) << 40) | (first_page << 12) | cp | (count - 1),
                                   std::memory_order_release);
+    }
+
+    /// As Drain, but stops at `end` (clamped to the tail) and passes f(first, count, by_cp).
+    /// A second consumer with its own head (NATIVE_COHERENT). Returns false if entries were lost
+    /// (head is then the tail).
+    template <typename F>
+    static bool DrainTo(u64& head, u64 end, F&& f) {
+        const u64 tail = Tail().load(std::memory_order_seq_cst);
+        if (end > tail) {
+            end = tail;
+        }
+        if (end <= head) [[likely]] {
+            return true;
+        }
+        if (tail - head > Capacity / 2) {
+            head = tail;
+            return false;
+        }
+        while (head != end) {
+            const u64 want = head & TagMask;
+            u64 value = slots[head & Mask].load(std::memory_order_acquire);
+            for (u32 spins = 0; (value >> 40) != want; ++spins) {
+                if (spins == 2048 || Tail().load(std::memory_order_relaxed) - head >= Capacity) {
+                    head = Tail().load(std::memory_order_seq_cst);
+                    return false;
+                }
+                _mm_pause();
+                value = slots[head & Mask].load(std::memory_order_acquire);
+            }
+            f((value >> 12) & 0xfffffffULL, (value & 0x3ff) + 1, (value & (1ULL << 10)) != 0);
+            ++head;
+        }
+        return true;
     }
 
     /// The single consumer (CP back). Calls f(first_page, count) for every entry appended before

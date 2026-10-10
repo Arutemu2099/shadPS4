@@ -4803,6 +4803,21 @@ const VideoCore::Buffer* Rasterizer::NativeSpanSync(VAddr lo, VAddr hi,
     if (!b0 || !b0->IsInBounds(lo, hi - lo)) {
         return nullptr;
     }
+    if (buffer_cache.CoherentSkip(false, false)) {
+        // SHADPS4_NATIVE_COHERENT (sec. 17): memory is coherent for the submission - no span
+        // cache, no granule clocks, no sync; the lookup above and the access barrier.
+        buffer_cache.NoteCoherentSpanSkip();
+        const VideoCore::Buffer* buf = buffer_cache.NativeRunSpan(
+            lo, hi, access, &buffer_barriers, cur_dispatch_run, false, -1, nullptr);
+        if (buf != b0) {
+            return nullptr;
+        }
+        if (VideoCore::g_native_coherent == 2) [[unlikely]] {
+            buffer_cache.CoherentVerify(const_cast<VideoCore::Buffer&>(*buf), lo,
+                                        static_cast<u32>(hi - lo));
+        }
+        return buf;
+    }
     const u64 handle = std::bit_cast<u64>(static_cast<VkBuffer>(b0->Handle()));
     const u64 gen = buffer_cache.StructGeneration();
     const u64 clock0 = VideoCore::g_granule_clock.load(std::memory_order_acquire);
