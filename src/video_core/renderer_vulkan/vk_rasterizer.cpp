@@ -3965,6 +3965,13 @@ void Rasterizer::NoteRecordCycles(u64 dt) {
 bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline* native,
                             bool is_indexed, u32 index_offset,
                             const AmdGpu::CpSplit::VertexInputsPayload* front_vi, bool colour) {
+    std::array<u64, 6> no_ph{};
+    u64 no_t = __rdtsc();
+    const auto no_lap = [&](u32 ph) {
+        const u64 now = __rdtsc();
+        no_ph[ph] += now - no_t;
+        no_t = now;
+    };
     // Back thread, inside DrawTail after BindResources and the vertex / index binds of `base`.
     // native == nullptr: verify mode (only the batch keys are captured; nothing changes).
     auto& b = native_batch;
@@ -4011,6 +4018,7 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         return fail(__LINE__);
     }
     const auto& regs = liverpool->BackRegs();
+    no_lap(0); // pre-checks
     b.base = base;
     b.ctx_epoch = liverpool->BackContextEpoch();
     std::memcpy(native_ctx.data(), &regs.reg_array[AmdGpu::Regs::ContextRegWordOffset],
@@ -4058,6 +4066,7 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         }
         b.smp_gen = texture_cache.SamplerGeneration();
         b.border = regs.ta_bc_base.base_addr;
+        no_lap(1); // keys, context copy, image key, gates
         if (native && native->native_bindless) {
             // SHADPS4_NATIVE_BINDLESS: the opener's slots, checked against what BindTextures
             // just bound for it (the generic writes: views + layouts, samplers, in order).
@@ -4106,6 +4115,7 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
             bindless.last_tick[b.bl_set] = scheduler.CurrentTick();
             ++native_stats.bl_open;
         }
+        no_lap(2); // bindless resolve
         const auto* attribs = AmdGpu::CpSplit::VertexInputAttribs(*front_vi);
         for (u32 k = 0; k < vi.n; ++k) {
             const u32 loc = attribs[k].desc.location;
@@ -4224,6 +4234,7 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
     if (!colour && g_native_rec_run != 0) [[unlikely]] {
         NativeRunValidate(base, &buffer_barriers);
     }
+    no_lap(3); // vertex locations, buffers / record words
     const bool gpu_direct =
         AmdGpu::NativeRec::g_gpu_mode == 1 || AmdGpu::NativeRec::g_gpu_mode == 3;
     // Opus G2 #7: NATIVE_REC_PREP with GPU_DIRECT 1 / 3 would overwrite the ring's prepared
@@ -4242,6 +4253,7 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         b.ring = prepared && !ring_verify;
         native_stats.ring_opens_legacy += !prepared;
     }
+    no_lap(4); // ring prepare
     const u64 table_bytes = gpu_direct ? Shader::NativeTableDwords * 4 : 0;
     auto& stream = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
     if (!stream.IsCoherent()) {
@@ -4493,6 +4505,13 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         st.seg_prev_rt = hr;
         st.seg_prev_index = b.index_size;
         st.seg_generic_since = false;
+    }
+    no_lap(5); // stream map, table, records, writes
+    if (colour) {
+        for (u32 ph = 0; ph < 6; ++ph) {
+            native_stats.c_no_ph[ph] += no_ph[ph];
+        }
+        ++native_stats.n_no;
     }
     return true;
 }
@@ -5889,6 +5908,16 @@ void Rasterizer::NativeLog() {
         LOG_INFO(Render_Vulkan, "NativeWhyOther: generic DrawTail draws by reason (most cycles "
                                 "first):{}",
                  wl);
+    }
+    if (st.n_no != 0) {
+        const auto per = [&](u32 ph) { return double(st.c_no_ph[ph]) / double(st.n_no); };
+        LOG_INFO(Render_Vulkan,
+                 "NativeOpenPhases (colour, successful, cycles): pre-checks {:.0f} keys+ctx+image "
+                 "key {:.0f} bindless resolve {:.0f} vertex+buffers {:.0f} ring prepare {:.0f} "
+                 "stream+records {:.0f} (n={}) | generic colour openers' BindResources {:.0f} (n={})",
+                 per(0), per(1), per(2), per(3), per(4), per(5), st.n_no,
+                 double(st.c_bind_copen) / double(std::max<u64>(st.n_bind_copen, 1)),
+                 st.n_bind_copen);
     }
     if (st.nd_cand != 0) {
         LOG_INFO(Render_Vulkan,
