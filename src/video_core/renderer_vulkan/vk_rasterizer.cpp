@@ -3519,15 +3519,26 @@ bool Rasterizer::NativeRingPrepare(const GraphicsPipeline* base,
                 break;
             }
         }
+        int stale_kind = -1;
         if (hit && g_native_span_check) [[unlikely]] {
-            // Opus G2 #1 compare mode: a hit must not cover CPU-dirty pages (no sync runs).
-            st.ring_span_stale +=
-                buffer_cache.IsRegionCpuModified(us[i].lo, us[i].hi - us[i].lo) ? 1 : 0;
+            // Opus G2 #1 compare mode: a hit must not cover CPU-dirty pages (no sync runs). On
+            // one: classify, and take the real sync instead (protective).
+            if (buffer_cache.IsRegionCpuModified(us[i].lo, us[i].hi - us[i].lo)) {
+                stale_kind =
+                    VideoCore::GranulesUnchangedSince(us[i].lo, us[i].hi, hit->epoch) ? 1 : 0;
+                hit = nullptr;
+            }
         }
         bool gpu_mod = false;
         const VideoCore::Buffer* buf = buffer_cache.NativeRunSpan(
             us[i].lo, us[i].hi, us[i].access, &buffer_barriers, cur_dispatch_run, hit == nullptr,
             hit ? (hit->gpu_mod ? 1 : 0) : -1, &gpu_mod);
+        if (stale_kind == 1 && !buffer_cache.IsRegionCpuModified(us[i].lo, us[i].hi - us[i].lo)) {
+            stale_kind = 2;
+        }
+        if (stale_kind >= 0) {
+            ++st.ring_span_stale[stale_kind];
+        }
         if (!buf || std::bit_cast<u64>(static_cast<VkBuffer>(buf->Handle())) != us[i].handle) {
             return fail(9);
         }
@@ -5066,7 +5077,8 @@ void Rasterizer::NativeLog() {
                  "NativeGpu ring: batches={} members={} ({:.2f} per batch) legacy opens={} | ring "
                  "cycles per member {:.0f} spans per batch {:.2f} (phases per batch: records {:.0f} "
                  "bases {:.0f} span syncs {:.0f} commands {:.0f}; KB per span {:.0f}; span cache "
-                 "hits {:.1f}%, stale hits {}, inherited batches {}) | ring-join ok={} refused "
+                 "hits {:.1f}%, stale hits race/normal-too/MISSED {}/{}/{}, inherited batches {}) "
+                 "| ring-join ok={} refused "
                  "{}/{}/{}/{} compare ok={} MISMATCH={} | refusals:{} "
                  "| confirmed={} (colour {}) | ring verify: ok={} MISMATCH={} join refused a "
                  "predicted member={} (image key c12={}, recorded c10={})",
@@ -5081,7 +5093,8 @@ void Rasterizer::NativeLog() {
                  double(st.c_ring_ph[3]) / double(std::max<u64>(st.ring_runs, 1)),
                  double(st.ring_span_bytes) / 1024.0 / double(std::max<u64>(st.ring_spans, 1)),
                  100.0 * double(st.ring_span_hits) / double(std::max<u64>(st.ring_spans, 1)),
-                 st.ring_span_stale, st.ring_inh_runs, st.rj_ok, st.rj_fail[0], st.rj_fail[1],
+                 st.ring_span_stale[0], st.ring_span_stale[1], st.ring_span_stale[2],
+                 st.ring_inh_runs, st.rj_ok, st.rj_fail[0], st.rj_fail[1],
                  st.rj_fail[2], st.rj_fail[3], st.rj_cmp_ok, st.rj_cmp_bad, rf,
                  st.prep_conf, st.prep_conf_col, st.prep_cmp_ok, st.prep_cmp_bad,
                  st.prep_join_refused, st.prep_jref[12], st.prep_jref[10]);

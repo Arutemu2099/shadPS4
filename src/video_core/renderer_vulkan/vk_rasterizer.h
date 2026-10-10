@@ -636,7 +636,10 @@ private:
         std::array<u64, 4> c_ring_ph{};
         u64 ring_span_hits{};
         u64 ring_span_bytes{};
-        u64 ring_span_stale{}; ///< SHADPS4_NATIVE_SPAN_CHECK: cache hits over CPU-dirty pages
+        /// SHADPS4_NATIVE_SPAN_CHECK: cache hits over CPU-dirty pages, by kind: 0 the granule
+        /// clock moved meanwhile (a marking in flight), 1 still dirty after a real sync (the
+        /// normal path leaves them too), 2 a real sync cleaned them (the skip missed an upload).
+        std::array<u64, 3> ring_span_stale{};
         u64 ring_inh_runs{};   ///< ring batches with inherited registers
         /// Ring-join: joins into ring batches, refusals (0 not the next ring entry, 1 job record
         /// gone / no GPU record, 2 another inherited set, 3 inherited values), =2 compare.
