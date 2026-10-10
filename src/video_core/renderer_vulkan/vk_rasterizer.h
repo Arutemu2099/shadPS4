@@ -613,6 +613,9 @@ private:
         std::array<u64, 8> c_prep_ph{}; ///< head, member compute, spans, final; 4-6 inside compute
         u64 prep_looked{};              ///< members that passed the compute loop
         u64 prep_spans{};               ///< NativeRunSpan calls of the prepares
+        /// SHADPS4_NATIVE_GPU_DIRECT=2: 0 no ring / stale, 1 no GPU record, 2 union gone, 3 ok,
+        /// 4 mismatch.
+        std::array<u64, 5> gv{};
         std::array<u64, 4> prep_c10{};  ///< verify: close 10 of a prepared member by where
         std::array<u64, 16> prep_stop{};
         std::array<u64, 16> prep_refuse{};
@@ -627,6 +630,11 @@ private:
                        const std::array<u32, Shader::NUM_BUFFERS>& o_off,
                        const std::array<u32, Shader::NUM_BUFFERS>& o_rsize);
     bool NativeCtxSame();
+    void NativeGpuVerify(const u32* ud, const std::array<u32, Shader::NUM_BUFFERS>& off,
+                         const std::array<u32, Shader::NUM_BUFFERS>& size,
+                         const std::array<u64, Shader::NUM_BUFFERS>& cpu, const u32* voff,
+                         const AmdGpu::CpSplit::VertexInputAttrib* attribs, const u32* cmd,
+                         u32 vertex_offset, u32 instance_offset);
     /// SHADPS4_NATIVE_REC_PREP: bounds of the buffers the prepares checked ranges against, by
     /// VkBuffer, valid while the buffer structure generation stays put.
     struct NativeBoundsEntry {

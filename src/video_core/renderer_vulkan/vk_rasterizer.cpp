@@ -3080,6 +3080,130 @@ void Rasterizer::NativePrepare(const GraphicsPipeline* base,
     st.c_prep += __rdtsc() - t0;
 }
 
+void Rasterizer::NativeGpuVerify(const u32* ud, const std::array<u32, Shader::NUM_BUFFERS>& off,
+                                 const std::array<u32, Shader::NUM_BUFFERS>& size,
+                                 const std::array<u64, Shader::NUM_BUFFERS>& cpu,
+                                 const u32* voff, const AmdGpu::CpSplit::VertexInputAttrib* attribs,
+                                 const u32* cmd, u32 vertex_offset, u32 instance_offset) {
+    // SHADPS4_NATIVE_GPU_DIRECT=2 (sec. 10, stage G1): the job thread's GPU record and run union
+    // of the draw a join / open is writing now, against what it writes. Back thread.
+    namespace NR = AmdGpu::NativeRec;
+    auto& st = native_stats;
+    auto& b = native_batch;
+    if (draw_job_tag == 0) {
+        return;
+    }
+    const u32 slot = draw_job_tag >> 28;
+    const NR::Record* ring = NR::g_rings[slot].load(std::memory_order_acquire);
+    const u32* gpu = NR::g_gpu_recs[slot].load(std::memory_order_acquire);
+    const NR::RunUnion* unions = NR::g_unions[slot].load(std::memory_order_acquire);
+    if (!ring || !gpu || !unions) {
+        ++st.gv[0];
+        return;
+    }
+    const u32 idx = draw_job_idx;
+    const NR::Record& r = ring[idx & (NR::RingSize - 1)];
+    const u32 gpu_ok = r.gpu_ok, union_idx = r.union_idx, vo_ud = r.vo_ud, io_ud = r.io_ud;
+    const u32 run_k = r.run_k, head_idx = r.head_idx, vcount = r.vcount;
+    const u32 index_count = r.index_count, instances = r.instances, inst_known = r.inst_known;
+    const u64 index_addr = r.index_addr;
+    const auto vaddr = r.vaddr;
+    const bool cmd_ok = static_cast<const void*>(r.cmd) == draw_job_cmd;
+    std::array<u32, NR::GpuRecDwords> g;
+    std::memcpy(g.data(), gpu + size_t(idx & (NR::RingSize - 1)) * NR::GpuRecDwords, sizeof(g));
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (r.stamp.load(std::memory_order_relaxed) != idx + 1 || !cmd_ok) {
+        ++st.gv[0];
+        return;
+    }
+    if (!gpu_ok) {
+        ++st.gv[1];
+        return;
+    }
+    std::string why;
+    if (std::memcmp(g.data(), ud, sizeof(u32) * Shader::NUM_USER_DATA_REGS) != 0) {
+        why = "user data";
+    }
+    for (u32 bi = 0; why.empty() && bi < Shader::NUM_BUFFERS; ++bi) {
+        if (!(b.guest_mask & (u64{1} << bi))) {
+            continue;
+        }
+        const u32 want = static_cast<u32>(g[Shader::NativeRecordOffOffset + bi] -
+                                          static_cast<u32>(cpu[bi]));
+        if (want != off[bi] || g[Shader::NativeRecordSizeOffset + bi] != size[bi]) {
+            why = fmt::format("buffer {}: job {:#x}-{:#x} = {:#x} size {:#x}, join {:#x} size {:#x}",
+                              bi, g[Shader::NativeRecordOffOffset + bi], cpu[bi], want,
+                              g[Shader::NativeRecordSizeOffset + bi], off[bi], size[bi]);
+        }
+    }
+    if (why.empty() && voff && attribs) {
+        for (u32 a = 0; a < vcount && why.empty(); ++a) {
+            if (vaddr[a] == 0) {
+                continue;
+            }
+            const u32 loc = attribs[a].desc.location;
+            const auto* vb = buffer_cache.NativeBufferAt(vaddr[a]);
+            if (loc >= Shader::NativeMaxPulledLocations || !vb) {
+                continue;
+            }
+            const u64 want = vaddr[a] - vb->CpuAddr();
+            if (g[Shader::NativeRecordVoffOffset + loc] != static_cast<u32>(vaddr[a]) ||
+                want != voff[loc]) {
+                why = fmt::format("vertex location {}: job {:#x} join {:#x}", loc, want, voff[loc]);
+            }
+        }
+    }
+    if (why.empty()) {
+        const auto* ib = buffer_cache.NativeBufferAt(index_addr);
+        const u32 want_first =
+            ib ? static_cast<u32>((index_addr - ib->CpuAddr()) / b.index_size) : ~0u;
+        const auto& regs = liverpool->BackRegs();
+        const u32 want_vo = regs.index_offset != 0 ? regs.index_offset : vo_ud;
+        if (index_count != cmd[0] || (inst_known && instances != cmd[1]) ||
+            want_first != cmd[2] || want_vo != vertex_offset || io_ud != instance_offset) {
+            why = fmt::format("command: job count {} inst {} first {} vo {} io {}, join {} {} {} "
+                              "{} {}",
+                              index_count, instances, want_first, want_vo, io_ud, cmd[0], cmd[1],
+                              cmd[2], vertex_offset, instance_offset);
+        }
+    }
+    // The run union must cover this draw (k < n, every range inside).
+    const NR::RunUnion& u = unions[union_idx & NR::UnionMask];
+    const u32 ustamp = u.stamp.load(std::memory_order_acquire);
+    const u32 un = u.n.load(std::memory_order_acquire);
+    bool union_ok = ustamp == head_idx + 1 && run_k < un;
+    if (!union_ok) {
+        ++st.gv[2]; // union gone (overwritten / killed) or not covering yet
+    } else if (why.empty()) {
+        for (u32 bi = 0; bi < Shader::NUM_BUFFERS; ++bi) {
+            if (!(b.guest_mask & (u64{1} << bi))) {
+                continue;
+            }
+            const u64 full = cpu[bi] + off[bi];
+            if (full < u.lo[bi] || full + size[bi] > u.hi[bi]) {
+                why = fmt::format("union buffer {}: {:#x}+{:#x} outside {:#x}-{:#x}", bi, full,
+                                  size[bi], u.lo[bi], u.hi[bi]);
+                break;
+            }
+        }
+        for (u32 a = 0; why.empty() && a < vcount; ++a) {
+            if (vaddr[a] != 0 && (vaddr[a] < u.vlo[a] || vaddr[a] >= u.vhi[a])) {
+                why = fmt::format("union vertex {}", a);
+            }
+        }
+        if (why.empty() && (index_addr < u.ilo ||
+                            index_addr + u64(index_count) * b.index_size > u.ihi)) {
+            why = "union index";
+        }
+    }
+    if (why.empty()) {
+        ++st.gv[3];
+    } else if (++st.gv[4] <= 16) {
+        LOG_CRITICAL(Render_Vulkan, "NativeGpu verify MISMATCH ({}, k {}): {}",
+                     b.colour ? "colour" : "shadow", run_k, why);
+    }
+}
+
 void Rasterizer::NativePrepWrite() {
     // NativeOpen, after draw 0's record and command: the prepared members go into slots 1..n.
     auto& b = native_batch;
@@ -3382,7 +3506,8 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
             if (bi >= buffer_infos.size()) {
                 return fail(__LINE__);
             }
-            if (desc.buffer_type == Shader::BufferType::Guest && g_native_prep != 0 &&
+            if (desc.buffer_type == Shader::BufferType::Guest &&
+                (g_native_prep != 0 || AmdGpu::NativeRec::g_gpu_mode != 0) &&
                 bi < Shader::NUM_BUFFERS) {
                 const auto vsharp = desc.GetSharp(bound);
                 open_addr[bi] = vsharp.base_address;
@@ -3515,6 +3640,19 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
     if (g_native_prep != 0) [[unlikely]] {
         NativePrepWrite();
     }
+    if (AmdGpu::NativeRec::g_gpu_mode == 2) [[unlikely]] {
+        std::array<u64, Shader::NUM_BUFFERS> cpu{};
+        for (u32 i = 0; i < Shader::NUM_BUFFERS; ++i) {
+            if (b.guest_mask & (u64{1} << i)) {
+                const auto* ob = buffer_cache.NativeBufferAt(open_addr[i]);
+                cpu[i] = ob ? ob->CpuAddr() : 0;
+            }
+        }
+        NativeGpuVerify(push_data.ud_regs.data(), rec_off, rec_size, cpu,
+                        colour ? col_voff.data() : nullptr,
+                        AmdGpu::CpSplit::VertexInputAttribs(*front_vi), cmd, vertex_offset,
+                        instance_offset);
+    }
     return true;
 }
 
@@ -3646,6 +3784,7 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
     const size_t carry0 = native_carry.size();
     std::array<u32, Shader::NUM_BUFFERS> rec_off{};
     std::array<u32, Shader::NUM_BUFFERS> rec_size{};
+    std::array<u64, Shader::NUM_BUFFERS> join_cpu{}; // GPU_DIRECT=2: each slot's buffer base
     bool ok = true;
     u32 bi = 0;
     // SHADPS4_NATIVE_REC_RUN: a run head that joins validates its run's spans here; anything
@@ -3712,6 +3851,7 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
                                               desc.is_formatted, VideoCore::BufferId{},
                                               Common::BufferSampleCaller::Storage);
                 const u64 handle = std::bit_cast<u64>(static_cast<VkBuffer>(vk_buffer->Handle()));
+                join_cpu[bi] = vk_buffer->CpuAddr();
                 if (barriers) {
                     if (auto barrier = vk_buffer->GetBarrier(vk::AccessFlagBits2::eShaderRead,
                                                              vk::PipelineStageFlagBits2::eAllCommands,
@@ -3870,6 +4010,11 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
                         static_cast<u32>(jvi.ib_off / b.index_size), static_cast<u32>(s32(vo)),
                         instance_offset};
     std::memcpy(b.cmds + u64(b.n) * NativeCmdBytes, cmd, sizeof(cmd));
+    if (AmdGpu::NativeRec::g_gpu_mode == 2) [[unlikely]] {
+        NativeGpuVerify(push.ud_regs.data(), rec_off, rec_size, join_cpu,
+                        b.colour ? col_voff.data() : nullptr, join_attribs, cmd, vertex_offset,
+                        instance_offset);
+    }
     if (native_prep.active && native_prep.verify) [[unlikely]] {
         // SHADPS4_NATIVE_REC_PREP=2: the open's prepared record / command vs this join's.
         auto& p = native_prep;
@@ -4159,6 +4304,12 @@ void Rasterizer::NativeLog() {
                  arr(st.prep_stop), st.prep_conf, st.prep_conf_col, arr(st.prep_refuse),
                  st.prep_cmp_ok, st.prep_cmp_bad, st.prep_join_refused, arr(st.prep_jref),
                  st.prep_c10[1], st.prep_c10[2], st.prep_c10[3]);
+    }
+    if (AmdGpu::NativeRec::g_gpu_mode != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "NativeGpu verify: ok={} MISMATCH={} | no ring / stale={} no GPU record={} union "
+                 "gone or short={}",
+                 st.gv[3], st.gv[4], st.gv[0], st.gv[1], st.gv[2]);
     }
     if (st.n_rec[0] + st.n_rec[3] + st.n_rec[9] != 0) {
         const auto per = [](u64 c, u64 n) { return n ? double(c) / double(n) : 0.0; };

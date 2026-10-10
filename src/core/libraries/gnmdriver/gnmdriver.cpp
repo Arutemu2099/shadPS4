@@ -30,6 +30,8 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/native_rec.h"
+#include "shader_recompiler/backend/bindings.h"
+#include "shader_recompiler/native_emit.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
@@ -835,6 +837,11 @@ struct RecThread {
     u64 spec_key{}; ///< NativeRecSpecKey of VS + PS at the last derived draw
     u64 run_fetch{};
     u64 run_vi_key{};
+    // SHADPS4_NATIVE_GPU_DIRECT: the GPU record ring, the run-union ring and the open run's entry.
+    u32* gpu{};
+    NR::RunUnion* unions{};
+    u32 union_next{};
+    u32 run_union{~0u};
 };
 thread_local RecThread t_rec;
 /// Stage a2 job-side derive outcomes: 0 ok, 1 user data unknown, 2 VS not in the table yet,
@@ -1125,6 +1132,153 @@ void NativeRecDerive(NR::Record& rec) {
 }
 
 
+/// SHADPS4_NATIVE_GPU_DIRECT (notes/native-path-2026-10-09.md sec. 10): the GPU record of a
+/// derived draw (what NativeOpen / NativeJoin would write, with guest addresses instead of buffer
+/// offsets) and the run's binding ranges. Called after the run decision (rec.run_k / head_idx set).
+void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
+    auto& r = t_rec;
+    rec.gpu_ok = 0;
+    rec.union_idx = ~0u;
+    if (!r.gpu) [[unlikely]] {
+        r.gpu = new u32[size_t(NR::RingSize) * NR::GpuRecDwords]();
+        r.unions = new NR::RunUnion[NR::UnionMask + 1]();
+        NR::g_gpu_recs[slot].store(r.gpu, std::memory_order_release);
+        NR::g_unions[slot].store(r.unions, std::memory_order_release);
+    }
+    if (!rec.derived || !r.it_known) {
+        if (rec.run_k == 0) {
+            r.run_union = ~0u;
+        } else if (r.run_union != ~0u) {
+            r.unions[r.run_union & NR::UnionMask].stamp.store(0, std::memory_order_release);
+            r.run_union = ~0u;
+        }
+        return;
+    }
+    const auto* gp = static_cast<const Vulkan::GraphicsPipeline*>(rec.pipeline);
+    const auto stages = gp->GetStages();
+    constexpr u32 vs_i = static_cast<u32>(Shader::LogicalStage::Vertex);
+    constexpr u32 ps_i = static_cast<u32>(Shader::LogicalStage::Fragment);
+    if (rec.run_k == 0) {
+        // A new run: claim a union entry (stamp 0 while it is reset).
+        r.run_union = r.union_next++;
+        auto& nu = r.unions[r.run_union & NR::UnionMask];
+        nu.stamp.store(0, std::memory_order_relaxed);
+        nu.n.store(0, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        nu.guest_mask = 0;
+        nu.eq_mask = ~u64{0};
+        nu.vcount = 0;
+        nu.vlo.fill(~u64{0});
+        nu.vhi.fill(0);
+        nu.ilo = ~u64{0};
+        nu.ihi = 0;
+        nu.stamp.store(idx + 1, std::memory_order_release);
+    }
+    if (r.run_union == ~0u) {
+        return;
+    }
+    auto& u = r.unions[r.run_union & NR::UnionMask];
+    if (u.stamp.load(std::memory_order_relaxed) != rec.head_idx + 1) {
+        r.run_union = ~0u;
+        return;
+    }
+    // A draw of the run without a GPU record: the union no longer covers the run (no later draw
+    // may publish a count past it).
+    const auto kill = [&] {
+        u.stamp.store(0, std::memory_order_release);
+        r.run_union = ~0u;
+    };
+    std::array<u32, NR::GpuRecDwords> g{};
+    const u8* base = r.payload + (rec.payload_pos & (NR::PayloadSize - 1));
+    const u32* flat_vs = reinterpret_cast<const u32*>(base);
+    const u32* flat_ps = flat_vs + rec.flat_vs_dw;
+    Shader::PushData push{};
+    Shader::Backend::Bindings bnd{};
+    u32 bi = 0;
+    auto* memory = Core::Memory::Instance();
+    for (u32 i = 0; i < stages.size(); ++i) {
+        const Shader::Info* info = stages[i];
+        if (!info) {
+            continue;
+        }
+        if (i != vs_i && i != ps_i) {
+            return kill();
+        }
+        Shader::BoundStage bs{};
+        bs.info = info;
+        bs.user_data = std::span<const u32>{i == vs_i ? r.vs.data() : r.ps.data(), 16};
+        bs.flattened_ud_buf = std::span<const u32>{i == vs_i ? flat_vs : flat_ps,
+                                                   i == vs_i ? rec.flat_vs_dw : rec.flat_ps_dw};
+        bs.pgm_base = VAddr{i == vs_i ? rec.vs_pgm : rec.ps_pgm} << 8;
+        bs.PushUd(bnd, push);
+        for (const auto& desc : info->buffers) {
+            if (bi >= NR::UnionSlots) {
+                return kill();
+            }
+            if (desc.buffer_type == Shader::BufferType::Guest) {
+                const auto vsharp = desc.GetSharp(bs);
+                const u64 addr = vsharp.base_address;
+                const u64 size = (addr == 0 || vsharp.GetSize() == 0)
+                                     ? 0
+                                     : memory->ClampRangeSize(addr, vsharp.GetSize());
+                g[Shader::NativeRecordOffOffset + bi] = static_cast<u32>(addr);
+                g[Shader::NativeRecordSizeOffset + bi] =
+                    static_cast<u32>(std::min<u64>(size, 0xffffffffull));
+                const u64 bit = u64{1} << bi;
+                if (!(u.guest_mask & bit)) {
+                    u.lo[bi] = addr;
+                    u.hi[bi] = addr + size;
+                    u.first_addr[bi] = addr;
+                    u.first_size[bi] = static_cast<u32>(std::min<u64>(size, 0xffffffffull));
+                    u.guest_mask |= bit;
+                } else {
+                    u.lo[bi] = std::min(u.lo[bi], addr);
+                    u.hi[bi] = std::max<u64>(u.hi[bi], addr + size);
+                    if (addr != u.first_addr[bi] ||
+                        std::min<u64>(size, 0xffffffffull) != u.first_size[bi]) {
+                        u.eq_mask &= ~bit;
+                    }
+                }
+            }
+            ++bi;
+        }
+    }
+    std::memcpy(g.data(), push.ud_regs.data(), sizeof(u32) * Shader::NUM_USER_DATA_REGS);
+    const auto& vi = r.vi_scratch;
+    const u32 vcount = std::min<u32>(vi.header.count, 16);
+    rec.vcount = vcount;
+    for (u32 a = 0; a < vcount; ++a) {
+        const auto& at = vi.attribs[a];
+        const bool null = at.range == AmdGpu::CpSplit::VertexInputNoRange;
+        const u64 vaddr = null ? 0 : at.base_address;
+        rec.vaddr[a] = vaddr;
+        if (!null) {
+            const u32 loc = at.desc.location;
+            if (loc < Shader::NativeMaxPulledLocations) {
+                g[Shader::NativeRecordVoffOffset + loc] = static_cast<u32>(vaddr);
+                g[Shader::NativeRecordVsizeOffset + loc] = 0xffffffffu;
+            }
+            u.vlo[a] = std::min(u.vlo[a], vaddr);
+            u.vhi[a] = std::max<u64>(u.vhi[a], vaddr + at.size);
+        }
+    }
+    u.vcount = std::max(u.vcount, vcount);
+    const u32 index_size = (r.index_type & 3) == 1 ? 4u : 2u;
+    u.ilo = std::min(u.ilo, rec.index_addr);
+    u.ihi = std::max<u64>(u.ihi, rec.index_addr + u64(rec.index_count) * index_size);
+    const auto* fetch = gp->GetFetchShader();
+    rec.vo_ud = fetch && fetch->vertex_offset_sgpr >= 0 && fetch->vertex_offset_sgpr < 16
+                    ? r.vs[fetch->vertex_offset_sgpr]
+                    : 0;
+    rec.io_ud = fetch && fetch->instance_offset_sgpr >= 0 && fetch->instance_offset_sgpr < 16
+                    ? r.vs[fetch->instance_offset_sgpr]
+                    : 0;
+    std::memcpy(r.gpu + size_t(idx & (NR::RingSize - 1)) * NR::GpuRecDwords, g.data(), sizeof(g));
+    rec.union_idx = r.run_union;
+    rec.gpu_ok = 1;
+    u.n.store(rec.run_k + 1, std::memory_order_release);
+}
+
 std::array<std::atomic<u64>, 12> g_nr_why{};
 
 /// Returns the ring index written for this draw.
@@ -1250,6 +1404,9 @@ u32 NativeRecDraw(const u32* cmdbuf, u64 index_addr, u32 index_count, u32 tag) {
         r.run_prim = r.prim;
         r.run_derived = rec.derived != 0;
         r.run_vi_key = vi_key;
+    }
+    if (NR::g_gpu_mode != 0) [[unlikely]] {
+        NativeRecGpu(rec, idx, tag >> 28);
     }
     rec.stamp.store(idx + 1, std::memory_order_release);
     return idx;

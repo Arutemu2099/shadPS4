@@ -52,7 +52,44 @@ struct Record {
     u64 fetch_addr;
     u32 vs_pgm; ///< the bound VS / PS program address >> 8 (the game binds per-object copies)
     u32 ps_pgm;
+    // SHADPS4_NATIVE_GPU_DIRECT (sec. 10): 1 = the GPU record of this draw is written (g_gpu_recs
+    // at the same ring index); the run's ranges live in g_unions[union_idx & UnionMask]; the
+    // values of the fetch shader's vertex / instance offset SGPRs (0 when none); per fetch
+    // attribute, the stream's guest address (0: null stream).
+    u32 gpu_ok;
+    u32 union_idx;
+    u32 vo_ud;
+    u32 io_ud;
+    u32 vcount;
+    std::array<u64, 16> vaddr;
 };
+
+// SHADPS4_NATIVE_GPU_DIRECT (notes/native-path-2026-10-09.md sec. 10): the job thread writes,
+// per derived draw, the record the native shaders read (Shader::NativeRecordDwords dwords: user
+// data in push layout, each Guest binding's guest address (low 32 bits) and size, each pulled
+// vertex location's guest address (low 32 bits)); the GPU subtracts a per-batch base. And per
+// run, the union of every binding's range over the run's draws so far (count published last).
+inline const int g_gpu_mode = [] {
+    const char* v = std::getenv("SHADPS4_NATIVE_GPU_DIRECT");
+    return v ? std::atoi(v) : 0;
+}();
+constexpr u32 GpuRecDwords = 128;
+inline std::array<std::atomic<u32*>, MaxSlots> g_gpu_recs{};
+constexpr u32 UnionBits = 12;
+constexpr u32 UnionMask = (1u << UnionBits) - 1;
+constexpr u32 UnionSlots = 40; // Shader::NUM_BUFFERS
+struct RunUnion {
+    std::atomic<u32> stamp; ///< head ring index + 1 (0 while being started)
+    std::atomic<u32> n;     ///< draws of the run the ranges cover (published after them)
+    u64 guest_mask;         ///< Guest binding slots
+    u64 eq_mask;            ///< slots whose (address, size) was the same for every draw
+    std::array<u64, UnionSlots> lo, hi, first_addr;
+    std::array<u32, UnionSlots> first_size;
+    u32 vcount;
+    std::array<u64, 16> vlo, vhi;
+    u64 ilo, ihi;
+};
+inline std::array<std::atomic<RunUnion*>, MaxSlots> g_unions{};
 
 constexpr u32 PayloadBits = 23; // 8 MB per thread
 constexpr u64 PayloadSize = u64{1} << PayloadBits;
