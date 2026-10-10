@@ -2928,6 +2928,8 @@ struct NativeRecFrontStats {
 };
 NativeRecFrontStats g_nrf;
 
+u32 NativeNeedCached(const Shader::Info* info, const Shader::Gcn::FetchShaderData* fetch);
+
 void NativeRecFront(const PM4Header* header, const Vulkan::Rasterizer::SplitDraw& draw,
                     const Regs& regs, u64 ctx_epoch,
                     const AmdGpu::CpSplit::VertexInputsDerived* front_vi) {
