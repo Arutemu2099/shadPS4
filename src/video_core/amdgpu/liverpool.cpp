@@ -1619,7 +1619,8 @@ void LeanLog() {
              "(events {}, no mark {}) | dispatch-run bumps in spans {} | coverage: packets "
              "{:.1f}% draws {:.1f}% | epoch bumps inside worker spans {} (first opcode {:#x}) | stops (by Lean::Stop "
              "value):{} | other-stop opcodes:{} | faults: pre-check stops SRT protected {} "
-             "unmapped {} V# protected {} unmapped {} walker not understood {} flat overflow {}; "
+             "unmapped {} V# protected {} unmapped {} walker not understood {} flat overflow {} code "
+             "protected {} code unmapped / no header {}; "
              "FALLBACK faults (must be 0) {} first {:#x} {:#x} | worker shared-lock takes per draw {:.2f}",
              g_lean, sec, c.dcbs.load(), c.eligible.load(), c.skipped.load(),
              double(s.chain_cyc) / 3.5e6 / std::max(sec, 1e-9), s.chain_cmp, s.chain_bad_win,
@@ -1631,6 +1632,7 @@ void LeanLog() {
              g_lean_fault_stats.precheck[0].load(), g_lean_fault_stats.precheck[1].load(),
              g_lean_fault_stats.precheck[2].load(), g_lean_fault_stats.precheck[3].load(),
              g_lean_fault_stats.precheck[4].load(), g_lean_fault_stats.precheck[5].load(),
+             g_lean_fault_stats.precheck[6].load(), g_lean_fault_stats.precheck[7].load(),
              g_lean_fault_stats.fallback.load(), g_lean_fault_stats.first[0].load(),
              g_lean_fault_stats.first[1].load(),
              g_lean_fault_stats.lock_draws.load()

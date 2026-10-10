@@ -148,6 +148,8 @@ private:
     bool CheckedWalk(const Shader::Info& info, const u32* user_data, std::vector<u32>& flat);
     /// IsMapped + AnyReadProtected for one guest read; `kind` 0 SRT, 2 V#.
     bool ReadOk(VAddr addr, u64 size, u32 kind) const;
+    /// The shader header search (AmdGpu::SearchBinaryInfo) page-checked; kind 6 / 7.
+    bool HeaderOk(VAddr code) const;
     struct WalkOp {
         u8 op;
         s32 disp;

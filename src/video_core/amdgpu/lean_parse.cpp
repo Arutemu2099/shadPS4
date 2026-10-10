@@ -785,11 +785,53 @@ bool Parser::ReadOk(VAddr addr, u64 size, u32 kind) const {
     return true;
 }
 
+bool Parser::HeaderOk(VAddr code) const {
+    // AmdGpu::SearchBinaryInfo's reads, each page checked before it is touched.
+    if (code >= (u64{1} << 40)) {
+        g_lean_fault_stats.precheck[7].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (!ReadOk(code, 8, 6)) {
+        return false;
+    }
+    const auto* w = reinterpret_cast<const u32*>(code);
+    constexpr u32 token_mov_vcchi = 0xBEEB03FF;
+    if (w[0] == token_mov_vcchi) {
+        const VAddr info = code + (u64{w[1]} + 1) * 8;
+        if (!ReadOk(info, sizeof(AmdGpu::BinaryInfo), 6)) {
+            return false;
+        }
+        if (reinterpret_cast<const AmdGpu::BinaryInfo*>(info)->Valid()) {
+            return true;
+        }
+    }
+    constexpr u32 search_limit = 0x4000;
+    VAddr checked_end = code; // [code, checked_end) verified
+    for (u32 i = 0; i < search_limit; ++i) {
+        const VAddr at = code + u64{i} * 4;
+        while (at + sizeof(AmdGpu::BinaryInfo) > checked_end) {
+            const VAddr page_end = (checked_end & ~VAddr{0xfff}) + 0x1000;
+            if (!ReadOk(checked_end, page_end - checked_end, 6)) {
+                return false;
+            }
+            checked_end = page_end;
+        }
+        if (reinterpret_cast<const AmdGpu::BinaryInfo*>(at)->Valid()) {
+            return true;
+        }
+    }
+    g_lean_fault_stats.precheck[7].fetch_add(1, std::memory_order_relaxed); // no header: the front asserts
+    return false;
+}
+
 bool Parser::Prewalk(const Regs& regs) {
     // ResolveStageReadOnly's guest reads for the bound Fragment / Vertex stages, done here with no
     // lock held: GetParams (the shader header) and RefreshFlatBuf (user data + the SRT walk).
     auto& sc = *scratch;
     sc.prewalked = false;
+    if (regs.stage_enable.raw != AmdGpu::ShaderStageEnable::VgtStages::Vs) {
+        return true; // LookupGraphicsShared returns null (UnsupportedStages) before any read
+    }
     const std::array<std::pair<Shader::Stage, Shader::LogicalStage>, 2> stages{{
         {Shader::Stage::Fragment, Shader::LogicalStage::Fragment},
         {Shader::Stage::Vertex, Shader::LogicalStage::Vertex},
@@ -805,6 +847,9 @@ bool Parser::Prewalk(const Regs& regs) {
         const auto* pgm = regs.ProgramForStage(in_idx);
         if (!pgm || !pgm->Address<u32*>()) {
             continue;
+        }
+        if (!HeaderOk(pgm->Address<VAddr>())) {
+            return false;
         }
         const auto params = AmdGpu::GetParams(*pgm);
         sc.pre_params[out_idx] = params;
