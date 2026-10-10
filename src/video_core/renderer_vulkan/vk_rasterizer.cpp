@@ -2642,6 +2642,21 @@ void Rasterizer::NativePrepare(const GraphicsPipeline* base,
     std::array<Bounds, Shader::NUM_BUFFERS> slot_b{};
     std::array<Bounds, 16> vb_b{};
     Bounds ib_b{};
+    // Running per-slot unions: the stretch also ends before any one range passes NativeRunSpan's
+    // 64 MB, so the span sync below cannot refuse the whole prepare.
+    struct Run {
+        VAddr lo{~VAddr{0}}, hi{};
+        bool Fits(VAddr a, u64 size) const {
+            return std::max<VAddr>(hi, a + size) - std::min(lo, a) <= (u64{64} << 20);
+        }
+        void Add(VAddr a, u64 size) {
+            lo = std::min(lo, a);
+            hi = std::max<VAddr>(hi, a + size);
+        }
+    };
+    std::array<Run, Shader::NUM_BUFFERS> slot_u{};
+    std::array<Run, 16> vb_u{};
+    Run ib_u{};
     const auto inside = [&](Bounds& bd, VAddr a, u64 size, u64 want) {
         if (a >= bd.lo && a + size <= bd.hi && bd.handle == want) {
             return true;
@@ -2820,19 +2835,33 @@ void Rasterizer::NativePrepare(const GraphicsPipeline* base,
         m.cmd = cmd;
         for (u32 bi = 0; ok && bi < Shader::NUM_BUFFERS; ++bi) {
             if ((b.guest_mask & (u64{1} << bi)) && m.addr[bi] != 0) {
-                ok = inside(slot_b[bi], m.addr[bi], m.size[bi], b.buf[bi]);
+                ok = inside(slot_b[bi], m.addr[bi], m.size[bi], b.buf[bi]) &&
+                     slot_u[bi].Fits(m.addr[bi], m.size[bi]);
             }
         }
         for (u32 a = 0; ok && a < b.vb_n; ++a) {
             if (m.vaddr[a] != 0 && m.vsize[a] != 0) {
-                ok = inside(vb_b[a], m.vaddr[a], m.vsize[a], b.vb[a]);
+                ok = inside(vb_b[a], m.vaddr[a], m.vsize[a], b.vb[a]) &&
+                     vb_u[a].Fits(m.vaddr[a], m.vsize[a]);
             }
         }
-        ok = ok && inside(ib_b, index_addr, u64(index_count) * index_size, b.ib);
+        const u64 ibytes = u64(index_count) * index_size;
+        ok = ok && inside(ib_b, index_addr, ibytes, b.ib) && ib_u.Fits(index_addr, ibytes);
         if (!ok) {
             why = 9; // a range outside the batch's buffer: the next batch starts here
             break;
         }
+        for (u32 bi = 0; bi < Shader::NUM_BUFFERS; ++bi) {
+            if ((b.guest_mask & (u64{1} << bi)) && m.addr[bi] != 0) {
+                slot_u[bi].Add(m.addr[bi], m.size[bi]);
+            }
+        }
+        for (u32 a = 0; a < b.vb_n; ++a) {
+            if (m.vaddr[a] != 0 && m.vsize[a] != 0) {
+                vb_u[a].Add(m.vaddr[a], m.vsize[a]);
+            }
+        }
+        ib_u.Add(index_addr, ibytes);
         n = j + 1;
     }
     st.prep_looked += n;
