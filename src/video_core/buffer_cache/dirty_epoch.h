@@ -24,10 +24,12 @@ inline std::atomic<std::uint64_t> g_image_epoch{1};
 inline constexpr std::uint32_t GranuleBits = 21;
 inline constexpr std::size_t NumGranules = std::size_t{1} << (40 - GranuleBits);
 inline std::atomic<std::uint64_t> g_granule_clock{1};
-/// Only SHADPS4_STATIC_KEY_CENSUS reads the clock (Opus review 2026-10-09 item 6: off = no cost).
+/// Only SHADPS4_STATIC_KEY_CENSUS and SHADPS4_NATIVE_GPU_DIRECT=1 (the ring batches' span
+/// validity cache) read the clock (Opus review 2026-10-09 item 6: off = no cost).
 inline const bool g_granule_clock_on = [] {
     const char* v = std::getenv("SHADPS4_STATIC_KEY_CENSUS");
-    return v && v[0] == '1';
+    const char* g = std::getenv("SHADPS4_NATIVE_GPU_DIRECT");
+    return (v && v[0] == '1') || (g && g[0] == '1' && g[1] == 0);
 }();
 inline std::atomic<std::uint64_t> g_granule_gen[NumGranules]{};
 

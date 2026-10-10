@@ -3737,7 +3737,7 @@ const Buffer* BufferCache::NativeBufferAt(VAddr addr) {
 const Buffer* BufferCache::NativeRunSpan(
     VAddr lo, VAddr hi, NativeRunAccess access,
     boost::container::small_vector<vk::BufferMemoryBarrier2, 16>* barriers, u64 dispatch_run,
-    bool sync) {
+    bool sync, int gpu_mod_hint, bool* gpu_mod_out) {
     if (lo == 0 || hi <= lo || hi - lo > (u64{64} << 20)) {
         return nullptr;
     }
@@ -3777,8 +3777,14 @@ const Buffer* BufferCache::NativeRunSpan(
             barriers->emplace_back(*barrier);
         }
         break;
-    case NativeRunAccess::Vertex:
-        if (IsRegionGpuModified(lo, size)) {
+    case NativeRunAccess::Vertex: {
+        // gpu_mod_hint (SHADPS4_NATIVE_GPU_DIRECT): the caller's cached answer for a superset
+        // that saw no GPU write since (1 may only add a barrier the walk would not).
+        const bool gm = gpu_mod_hint >= 0 ? gpu_mod_hint != 0 : IsRegionGpuModified(lo, size);
+        if (gpu_mod_out) {
+            *gpu_mod_out = gm;
+        }
+        if (gm) {
             if (auto barrier =
                     buffer->GetBarrier(vk::AccessFlagBits2::eVertexAttributeRead,
                                        vk::PipelineStageFlagBits2::eVertexAttributeInput)) {
@@ -3786,8 +3792,12 @@ const Buffer* BufferCache::NativeRunSpan(
             }
         }
         break;
+    }
     case NativeRunAccess::Index:
-        if (IsRegionGpuModified(lo, size)) {
+        if (gpu_mod_hint >= 0 ? gpu_mod_hint != 0 : IsRegionGpuModified(lo, size)) {
+            if (gpu_mod_out) {
+                *gpu_mod_out = true;
+            }
             if (auto barrier = buffer->GetBarrier(vk::AccessFlagBits2::eIndexRead,
                                                   vk::PipelineStageFlagBits2::eIndexInput)) {
                 barriers->emplace_back(*barrier);

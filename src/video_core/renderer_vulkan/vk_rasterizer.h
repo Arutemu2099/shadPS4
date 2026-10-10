@@ -651,7 +651,8 @@ private:
         u64 handle;
         u32 access;
         VAddr lo, hi;
-        u64 epoch, gen;
+        u64 epoch, gen; ///< epoch: the granule clock before the validation
+        bool gpu_mod;   ///< vertex / index: the range had GPU-written pages at the validation
     };
     std::array<NativeSpanEntry, 16> native_span_cache{};
     u32 native_span_rr{};

@@ -3438,20 +3438,27 @@ bool Rasterizer::NativeRingPrepare(const GraphicsPipeline* base,
         return fail(8);
     }
     lap(1); // bases, span list
+    // Validity cache (s410: the global dirty epoch moved between most batches): a superset of
+    // the range in the same buffer was validated at granule clock T, no 2 MB granule of the range
+    // was marked CPU-dirty or GPU-written since T (dirty_epoch.h: every such marking bumps the
+    // clock of its granules; the global epoch moves only together with it) and the buffer
+    // structure is unchanged -> no sync walk, no GPU-modified walk (cached answer), the access
+    // barrier as always.
+    const u64 clock0 = VideoCore::g_granule_clock.load(std::memory_order_acquire);
     for (u32 i = 0; i < nus; ++i) {
-        // Validity cache: a superset of this range in the same buffer was synced since the last
-        // CPU write (dirty epoch) and buffer-structure change -> only the access barrier.
         auto* hit = static_cast<NativeSpanEntry*>(nullptr);
         for (auto& e : native_span_cache) {
             if (e.handle == us[i].handle && e.access == static_cast<u32>(us[i].access) &&
-                e.epoch == epoch && e.gen == gen && us[i].lo >= e.lo && us[i].hi <= e.hi) {
+                e.gen == gen && us[i].lo >= e.lo && us[i].hi <= e.hi &&
+                VideoCore::GranulesUnchangedSince(us[i].lo, us[i].hi, e.epoch)) {
                 hit = &e;
                 break;
             }
         }
-        const VideoCore::Buffer* buf =
-            buffer_cache.NativeRunSpan(us[i].lo, us[i].hi, us[i].access, &buffer_barriers,
-                                       cur_dispatch_run, hit == nullptr);
+        bool gpu_mod = false;
+        const VideoCore::Buffer* buf = buffer_cache.NativeRunSpan(
+            us[i].lo, us[i].hi, us[i].access, &buffer_barriers, cur_dispatch_run, hit == nullptr,
+            hit ? (hit->gpu_mod ? 1 : 0) : -1, &gpu_mod);
         if (!buf || std::bit_cast<u64>(static_cast<VkBuffer>(buf->Handle())) != us[i].handle) {
             return fail(9);
         }
@@ -3467,16 +3474,20 @@ bool Rasterizer::NativeRingPrepare(const GraphicsPipeline* base,
                     break;
                 }
             }
-            if (slot && slot->epoch == epoch && slot->gen == gen &&
-                std::max(slot->hi, us[i].hi) - std::min(slot->lo, us[i].lo) <= (u64{64} << 20)) {
+            // Grow while the old part is still unchanged since its clock (the grown entry keeps
+            // the older clock: conservative), else replace.
+            if (slot && slot->gen == gen &&
+                std::max(slot->hi, us[i].hi) - std::min(slot->lo, us[i].lo) <= (u64{64} << 20) &&
+                VideoCore::GranulesUnchangedSince(slot->lo, slot->hi, slot->epoch)) {
                 slot->lo = std::min(slot->lo, us[i].lo);
                 slot->hi = std::max(slot->hi, us[i].hi);
+                slot->gpu_mod = slot->gpu_mod || gpu_mod;
             } else {
                 if (!slot) {
                     slot = &native_span_cache[native_span_rr++ % native_span_cache.size()];
                 }
-                *slot = {us[i].handle, static_cast<u32>(us[i].access), us[i].lo, us[i].hi, epoch,
-                         gen};
+                *slot = {us[i].handle, static_cast<u32>(us[i].access), us[i].lo, us[i].hi, clock0,
+                         gen, gpu_mod};
             }
         }
     }
