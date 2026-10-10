@@ -295,6 +295,17 @@ private:
                      Shader::PushData& push_data);
     void BindTextures(const Shader::BoundStage& bound, Shader::Backend::Bindings& binding);
     bool BindResources(const Pipeline* pipeline);
+    /// SHADPS4_NATIVE_DIRECT (notes/native-path-2026-10-09.md sec. 15): the native run start.
+    /// Candidate = a bindless colour variant (ring mode) for a draw with a job-thread record;
+    /// the bind = set 0 from the draw's V#s (validity cache, no per-binding lookups, no texture
+    /// lookups: images are bindless slots), vertex / index from the front, then NativeOpen.
+    /// False: nothing to undo, the generic BindResources follows.
+    const GraphicsPipeline* NativeDirectCandidate(const GraphicsPipeline* pipeline, bool is_indexed,
+                                                  const AmdGpu::CpSplit::VertexInputsPayload* vi);
+    bool NativeDirectBind(const GraphicsPipeline* base, const GraphicsPipeline* native,
+                          u32 index_offset, const AmdGpu::CpSplit::VertexInputsPayload* front_vi,
+                          bool open);
+    const VideoCore::Buffer* NativeSpanSync(VAddr lo, VAddr hi, VideoCore::NativeRunAccess access);
 
     /// SHADPS4_BIND_MEMO_STATS=1 (diagnostic, default off; notes/bind-memo-stats-2026-09-25.md):
     /// evaluates a per-stage binding memo next to the unchanged full path and logs its hit rate,
@@ -674,6 +685,11 @@ private:
         // SHADPS4_NATIVE_TIMING, colour split: colour joins (and their phases) and the DrawTail
         // of draws that opened a colour batch.
         u64 c_cjoin_ok{}, n_cjoin_ok{}, c_tail_copen{}, n_tail_copen{};
+        /// SHADPS4_NATIVE_DIRECT: candidates, direct openers, failures by reason, verify, the
+        /// direct openers' DrawTail cycles.
+        u64 nd_cand{}, nd_ok{}, nd_vfy_ok{}, nd_vfy_bad{}, c_tail_dopen{}, n_tail_dopen{};
+        std::array<u64, 16> nd_fail{};
+        bool last_open_direct{};
         /// Bindless census (sec. 11): colour openers by DrawTail event flags (texmiss 1,
         /// recorded 2, uploaded 4, giant 8, clip 16), [1] = right after an image-key close.
         bool close_key{};

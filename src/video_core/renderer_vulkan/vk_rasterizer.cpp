@@ -2240,6 +2240,10 @@ void Rasterizer::ExecuteDraw(const SplitDraw& draw,
                 native_stats.seg_last_native = true;
                 native_stats.c_tail_copen += dt;
                 ++native_stats.n_tail_copen;
+                if (native_stats.last_open_direct) {
+                    native_stats.c_tail_dopen += dt;
+                    ++native_stats.n_tail_dopen;
+                }
                 {
                     const u32 a = native_stats.close_key ? 1u : 0u;
                     const u32 fl = native_stats.last_flags & 31;
@@ -2552,6 +2556,13 @@ static const int g_native_prep = [] {
 static const int g_native_ring_join = [] {
     const char* e = std::getenv("SHADPS4_NATIVE_RING_JOIN");
     return e ? std::atoi(e) : 1;
+}();
+// SHADPS4_NATIVE_DIRECT (sec. 15): 1 = native run start (no BindResources for bindless colour
+// openers with a job record), 2 = verify (direct bind built, then the generic bind; compared
+// binding by binding; the generic renders).
+static const int g_native_direct = [] {
+    const char* e = std::getenv("SHADPS4_NATIVE_DIRECT");
+    return e ? std::atoi(e) : 0;
 }();
 // SHADPS4_NATIVE_SPAN_CHECK=1 (Opus G2 #1): count ring span-cache hits over CPU-dirty pages.
 static const bool g_native_span_check = [] {
@@ -4745,6 +4756,211 @@ bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::I
     return true;
 }
 
+const VideoCore::Buffer* Rasterizer::NativeSpanSync(VAddr lo, VAddr hi,
+                                                   VideoCore::NativeRunAccess access) {
+    // One range validated through the ring's validity cache (granule clocks, sec. 10): a
+    // superset validated since its granules last changed -> no sync walk; else the lean sync.
+    // The access barrier always. Null: not inside one cached buffer (the generic path creates /
+    // joins buffers).
+    const VideoCore::Buffer* b0 = buffer_cache.NativeBufferAt(lo);
+    if (!b0 || !b0->IsInBounds(lo, hi - lo)) {
+        return nullptr;
+    }
+    const u64 handle = std::bit_cast<u64>(static_cast<VkBuffer>(b0->Handle()));
+    const u64 gen = buffer_cache.StructGeneration();
+    const u64 clock0 = VideoCore::g_granule_clock.load(std::memory_order_acquire);
+    NativeSpanEntry* hit = nullptr;
+    for (auto& e : native_span_cache) {
+        if (e.handle == handle && e.access == static_cast<u32>(access) && e.gen == gen &&
+            lo >= e.lo && hi <= e.hi && VideoCore::GranulesUnchangedSince(lo, hi, e.epoch)) {
+            hit = &e;
+            break;
+        }
+    }
+    bool gpu_mod = false;
+    const VideoCore::Buffer* buf =
+        buffer_cache.NativeRunSpan(lo, hi, access, &buffer_barriers, cur_dispatch_run,
+                                   hit == nullptr, hit ? (hit->gpu_mod ? 1 : 0) : -1, &gpu_mod);
+    if (!buf || buf != b0) {
+        return nullptr;
+    }
+    if (!hit) {
+        NativeSpanEntry* slot = nullptr;
+        for (auto& e : native_span_cache) {
+            if (e.handle == handle && e.access == static_cast<u32>(access)) {
+                slot = &e;
+                break;
+            }
+        }
+        if (slot && slot->gen == gen && lo <= slot->hi && hi >= slot->lo &&
+            std::max(slot->hi, hi) - std::min(slot->lo, lo) <= (u64{64} << 20) &&
+            VideoCore::GranulesUnchangedSince(slot->lo, slot->hi, slot->epoch)) {
+            slot->lo = std::min(slot->lo, lo);
+            slot->hi = std::max(slot->hi, hi);
+            slot->gpu_mod = slot->gpu_mod || gpu_mod;
+        } else {
+            if (!slot) {
+                slot = &native_span_cache[native_span_rr++ % native_span_cache.size()];
+            }
+            *slot = {handle, static_cast<u32>(access), lo, hi, clock0, gen, gpu_mod};
+        }
+    }
+    return buf;
+}
+
+const GraphicsPipeline* Rasterizer::NativeDirectCandidate(
+    const GraphicsPipeline* pipeline, bool is_indexed,
+    const AmdGpu::CpSplit::VertexInputsPayload* vi) {
+    if (g_native_direct == 0 || VideoCore::g_native_pass != 1 || !is_indexed || !vi ||
+        !VideoCore::g_native_colour || AmdGpu::NativeRec::g_gpu_mode != 1 || draw_job_tag == 0 ||
+        native_bindings || !build_set_writes || (occlusion && occlusion->Open()) ||
+        pipeline->native_variant.load(std::memory_order_relaxed) != nullptr ||
+        pipeline->native_colour[0].key.load(std::memory_order_relaxed) == 0) {
+        return nullptr;
+    }
+    const auto* v = pipeline->NativeColourVariant(
+        VideoCore::NativeVertexKey(AmdGpu::CpSplit::VertexInputAttribs(*vi), vi->count));
+    if (!v || !v->native_bindless ||
+        v->native_table_binding == GraphicsPipeline::NoNativeRecords) {
+        return nullptr;
+    }
+    ++native_stats.nd_cand;
+    return v;
+}
+
+bool Rasterizer::NativeDirectBind(const GraphicsPipeline* base, const GraphicsPipeline* native,
+                                  u32 index_offset,
+                                  const AmdGpu::CpSplit::VertexInputsPayload* front_vi,
+                                  bool open) {
+    // Back thread, DrawTail in place of BindResources (sec. 15). The draw's own V#s give set 0
+    // (whole-range Guest buffers, the generic alignment / push offsets so NativeOpen reads them
+    // like a generic bind); images and samplers are not written (the bindless PS samples the
+    // global arrays at the record's slots). Then the vertex / index bindings from the front
+    // and NativeOpen (ring mode, bindless) - all before the rendering state, so any failure
+    // leaves the generic BindResources to run.
+    namespace NR = AmdGpu::NativeRec;
+    auto& st = native_stats;
+    const auto fail = [&](u32 why) {
+        ++st.nd_fail[std::min<u32>(why, 15)];
+        return false;
+    };
+    const NR::Record* ring = NR::g_rings[draw_job_tag >> 28].load(std::memory_order_acquire);
+    if (!ring) {
+        return fail(1);
+    }
+    const NR::Record& r0 = ring[draw_job_idx & (NR::RingSize - 1)];
+    const u32 gpu_ok = r0.gpu_ok;
+    const u64 inh_slots = r0.inh_slots;
+    const void* cmd = r0.cmd;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (r0.stamp.load(std::memory_order_relaxed) != draw_job_idx + 1 || cmd != draw_job_cmd ||
+        !gpu_ok) {
+        return fail(2);
+    }
+    if (inh_slots != 0) {
+        return fail(3); // v1: inherited V#s are outside the union and not synced here
+    }
+    if (!pending_stencil_writebacks.empty()) {
+        return fail(4);
+    }
+    if (open && native_batch.open) {
+        NativeClose(1);
+    }
+    set_write_index = 0;
+    set_writes.clear();
+    buffer_barriers.clear();
+    if (!native_carry.empty()) [[unlikely]] {
+        buffer_barriers.insert(buffer_barriers.end(), native_carry.begin(), native_carry.end());
+        native_carry.clear();
+    }
+    buffer_infos.clear();
+    image_infos.clear();
+    binding_compute = false;
+    const auto& regs = liverpool->BackRegs();
+    Shader::Backend::Bindings binding{};
+    push_data = MakeUserData(regs);
+    for (const auto& bound : BoundStages(base)) {
+        const auto* stage = bound.info;
+        if (!stage) {
+            continue;
+        }
+        bound.PushUd(binding, push_data);
+        for (const auto& desc : stage->buffers) {
+            if (desc.buffer_type != Shader::BufferType::Guest || desc.is_formatted ||
+                desc.is_written || desc.inline_cbuf) {
+                return fail(5);
+            }
+            const auto vsharp = desc.GetSharp(bound);
+            if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
+                return fail(6);
+            }
+            const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+            const bool is_storage = desc.IsStorage(vsharp);
+            const u32 alignment =
+                is_storage ? instance.StorageMinAlignment() : instance.UniformMinAlignment();
+            const VideoCore::Buffer* buf = NativeSpanSync(
+                vsharp.base_address, vsharp.base_address + size, VideoCore::NativeRunAccess::Storage);
+            if (!buf) {
+                return fail(7);
+            }
+            const u64 offset = vsharp.base_address - buf->CpuAddr();
+            const u64 offset_aligned = Common::AlignDown(offset, alignment);
+            const u32 adjust = static_cast<u32>(offset - offset_aligned);
+            if (adjust % 4 != 0 || adjust >= 256 || offset_aligned > 0xffffffffull) {
+                return fail(8);
+            }
+            push_data.AddOffset(binding.buffer, adjust);
+            buffer_infos.emplace_back(buf->Handle(), offset_aligned, size + adjust);
+            auto& w = set_writes.emplace_back();
+            w.dstSet = VK_NULL_HANDLE;
+            w.dstBinding = binding.unified++;
+            w.dstArrayElement = 0;
+            w.descriptorCount = 1;
+            w.descriptorType =
+                is_storage ? vk::DescriptorType::eStorageBuffer : vk::DescriptorType::eUniformBuffer;
+            w.pBufferInfo = &buffer_infos.back();
+            ++binding.buffer;
+        }
+        for (const auto& desc : stage->images) {
+            binding.unified += desc.NumBindings(bound);
+        }
+        binding.unified += static_cast<u32>(stage->samplers.size());
+    }
+    set_write_index = static_cast<u32>(set_writes.size());
+    native_bound_count = binding.unified;
+    // Vertex / index bindings as a join computes them (syncs + GPU-written barriers).
+    VideoCore::NativeJoinVi jvi{};
+    buffer_cache.NativeJoinVertexIndex(*front_vi, index_offset, jvi, &buffer_barriers);
+    auto& tvi = VideoCore::t_native_vi;
+    tvi.n = jvi.n;
+    tvi.buf = jvi.buf;
+    tvi.off = jvi.off;
+    tvi.stride = jvi.stride;
+    tvi.ib_buf = jvi.ib_buf;
+    tvi.ib_off = jvi.ib_off;
+    tvi.ib_type =
+        regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2u : 4u;
+    tvi.gpu_mod = false;
+    const auto* attribs = AmdGpu::CpSplit::VertexInputAttribs(*front_vi);
+    for (u32 k = 0; k < front_vi->count && k < 16; ++k) {
+        if (attribs[k].base_address != 0 && attribs[k].size != 0 &&
+            buffer_cache.IsRegionGpuModified(attribs[k].base_address, attribs[k].size)) {
+            tvi.gpu_mod = true;
+        }
+    }
+    if (!open) {
+        return true;
+    }
+    attachment_feedback_loop = false; // BeginRendering recomputes it; the slot resolve refuses
+                                      // any image that is this draw's target
+    if (!NativeOpen(base, native, true, index_offset, front_vi, true)) {
+        return fail(9);
+    }
+    draw_repeat.valid = false;
+    ++st.nd_ok;
+    return true;
+}
+
 bool Rasterizer::NativeRingJoinOk() {
     // Back thread, NativeJoin of a ring batch: the draw's job record must be the batch's next
     // ring entry (the multi-draw reads draw i at first + i) with a GPU record and the opener's
@@ -5613,6 +5829,16 @@ void Rasterizer::NativeLog() {
                                 "first):{}",
                  wl);
     }
+    if (st.nd_cand != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "NativeDirect: candidates={} direct openers={} (DrawTail {:.0f} cycles each) | "
+                 "fails 1..9: {} {} {} {} {} {} {} {} {} | verify ok={} MISMATCH={}",
+                 st.nd_cand, st.nd_ok,
+                 double(st.c_tail_dopen) / double(std::max<u64>(st.n_tail_dopen, 1)),
+                 st.nd_fail[1], st.nd_fail[2], st.nd_fail[3], st.nd_fail[4], st.nd_fail[5],
+                 st.nd_fail[6], st.nd_fail[7], st.nd_fail[8], st.nd_fail[9], st.nd_vfy_ok,
+                 st.nd_vfy_bad);
+    }
     if (st.bl_open + st.bl_open_fail != 0) {
         LOG_INFO(Render_Vulkan,
                  "NativeBindless: batches={} open fail={} | joins with other images={} failed={} "
@@ -5986,11 +6212,81 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     // SHADPS4_DRAW_REPEAT: the previous draw's resolved bindings stand when this draw repeats
     // its binding inputs and nothing changed in between (DrawRepeatMatch).
     const int repeat_mode = g_draw_repeat;
-    const bool repeat =
-        repeat_mode != 0 && native_carry.empty() && DrawRepeatMatch(pipeline, rs_hit);
+    // SHADPS4_NATIVE_DIRECT (sec. 15): the native run start takes the place of BindResources.
+    const GraphicsPipeline* direct_native =
+        g_native_direct != 0 ? NativeDirectCandidate(pipeline, is_indexed, front_vi) : nullptr;
+    bool direct_ok = false;
+    if (direct_native && g_native_direct == 1) {
+        direct_ok = NativeDirectBind(pipeline, direct_native, index_offset, front_vi, true);
+    } else if (direct_native && g_native_direct == 2) [[unlikely]] {
+        // Verify: the direct set-0 buffer writes + push offsets vs the generic bind's.
+        if (NativeDirectBind(pipeline, direct_native, index_offset, front_vi, false)) {
+            struct W {
+                u32 binding;
+                u64 buffer, offset, range;
+                vk::DescriptorType type;
+            };
+            std::vector<W> dw;
+            for (u32 i = 0; i < set_write_index; ++i) {
+                const auto& w = set_writes[i];
+                dw.push_back({w.dstBinding,
+                              std::bit_cast<u64>(static_cast<VkBuffer>(w.pBufferInfo->buffer)),
+                              w.pBufferInfo->offset, w.pBufferInfo->range, w.descriptorType});
+            }
+            const auto dpush = push_data;
+            const auto dvi = VideoCore::t_native_vi;
+            BindResources(pipeline);
+            std::string why;
+            u32 found = 0;
+            for (u32 i = 0; i < set_write_index && why.empty(); ++i) {
+                const auto& w = set_writes[i];
+                if (w.descriptorType != vk::DescriptorType::eStorageBuffer &&
+                    w.descriptorType != vk::DescriptorType::eUniformBuffer) {
+                    continue;
+                }
+                for (const auto& d : dw) {
+                    if (d.binding != w.dstBinding) {
+                        continue;
+                    }
+                    ++found;
+                    if (d.type != w.descriptorType ||
+                        d.buffer != std::bit_cast<u64>(static_cast<VkBuffer>(w.pBufferInfo->buffer)) ||
+                        d.offset != w.pBufferInfo->offset || d.range != w.pBufferInfo->range) {
+                        why = fmt::format("binding {}: direct {:#x}+{:#x}/{:#x} generic {:#x}+{:#x}/{:#x}",
+                                          d.binding, d.buffer, d.offset, d.range,
+                                          std::bit_cast<u64>(static_cast<VkBuffer>(w.pBufferInfo->buffer)),
+                                          w.pBufferInfo->offset, w.pBufferInfo->range);
+                    }
+                }
+            }
+            if (why.empty() && found != dw.size()) {
+                why = fmt::format("{} direct buffer writes, {} matched", dw.size(), found);
+            }
+            if (why.empty() && (std::memcmp(dpush.buf_offsets.data(), push_data.buf_offsets.data(),
+                                            sizeof(dpush.buf_offsets)) != 0 ||
+                                std::memcmp(dpush.ud_regs.data(), push_data.ud_regs.data(),
+                                            sizeof(dpush.ud_regs)) != 0)) {
+                why = "push data";
+            }
+            if (why.empty()) {
+                ++native_stats.nd_vfy_ok;
+            } else if (++native_stats.nd_vfy_bad <= 16) {
+                LOG_CRITICAL(Render_Vulkan, "NativeDirect verify MISMATCH: {}", why);
+            }
+            (void)dvi;
+            direct_native = nullptr; // the generic bind stands; the normal flow follows
+        }
+    }
+    const bool repeat = !direct_ok && repeat_mode != 0 && native_carry.empty() &&
+                        DrawRepeatMatch(pipeline, rs_hit);
     native_stats.last_tail_repeat = repeat && repeat_mode == 1;
     bool bound;
-    if (repeat && repeat_mode == 1) {
+    if (direct_ok) {
+        bound = true;
+    } else if (g_native_direct == 2 && direct_native == nullptr && native_stats.nd_cand != 0 &&
+               false) {
+        bound = true;
+    } else if (repeat && repeat_mode == 1) {
         DrawRepeatApply(pipeline);
         bound = true;
     } else if (repeat) {
@@ -6175,7 +6471,11 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     // SHADPS4_NATIVE_PASS: this draw opens a native batch (its own records go first).
     bool native_open = false;
     native_stats.last_why = is_indexed ? "native pass off" : "not indexed";
-    if (VideoCore::g_native_pass == 1 && is_indexed) [[unlikely]] {
+    native_stats.last_open_direct = direct_ok;
+    if (direct_ok) [[unlikely]] {
+        native_open = true;
+        pipeline = direct_native;
+    } else if (VideoCore::g_native_pass == 1 && is_indexed) [[unlikely]] {
         if (native_batch.open) {
             NativeClose(1);
         }
