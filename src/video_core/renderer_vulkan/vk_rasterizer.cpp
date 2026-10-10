@@ -3736,23 +3736,28 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
         auto& p = native_prep;
         const u32 j = p.next_idx - p.first_idx;
         if (draw_job_tag == p.tag && draw_job_idx == p.next_idx && j < p.n) {
+            // Compare with the join's local copies: `rec` lives in write-combined stream memory
+            // (a read there costs ~10 k cycles, s395).
             const u32* pr = p.side.data() + size_t(j) * (Shader::NativeRecordDwords + 5);
             std::string why;
-            if (std::memcmp(pr, rec, sizeof(u32) * Shader::NUM_USER_DATA_REGS) != 0) {
+            if (std::memcmp(pr, push.ud_regs.data(), sizeof(u32) * Shader::NUM_USER_DATA_REGS) !=
+                0) {
                 why = "user data";
             }
             for (u32 i = 0; why.empty() && i < Shader::NUM_BUFFERS; ++i) {
                 const u32 oo = Shader::NativeRecordOffOffset + i;
                 const u32 so = Shader::NativeRecordSizeOffset + i;
-                if ((b.guest_mask & (u64{1} << i)) && (pr[oo] != rec[oo] || pr[so] != rec[so])) {
+                if ((b.guest_mask & (u64{1} << i)) &&
+                    (pr[oo] != rec_off[i] || pr[so] != rec_size[i])) {
                     why = fmt::format("buffer {} ({:#x}+{:#x} vs {:#x}+{:#x})", i, pr[oo], pr[so],
-                                      rec[oo], rec[so]);
+                                      rec_off[i], rec_size[i]);
                 }
             }
             if (why.empty() && b.colour &&
-                std::memcmp(pr + Shader::NativeRecordVoffOffset,
-                            rec + Shader::NativeRecordVoffOffset,
-                            sizeof(u32) * 2 * Shader::NativeMaxPulledLocations) != 0) {
+                (std::memcmp(pr + Shader::NativeRecordVoffOffset, col_voff.data(),
+                             sizeof(col_voff)) != 0 ||
+                 std::memcmp(pr + Shader::NativeRecordVsizeOffset, col_vsize.data(),
+                             sizeof(col_vsize)) != 0)) {
                 why = "vertex offsets";
             }
             if (why.empty() &&
