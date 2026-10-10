@@ -3139,11 +3139,13 @@ void NativeRecFront(const PM4Header* header, const Vulkan::Rasterizer::SplitDraw
                                     ? NativeNeedCached(vsi, draw.pipeline->GetFetchShader())
                                     : 0xffffffffu;
             const u32 need_ps = NR::g_needs_on && psi ? NativeNeedCached(psi, nullptr) : 0xffffffffu;
+            // Inherited registers (needed, unknown to the job) are stale on purpose (sec. 11).
             bool flat_ok = same_flat(fvs, vsi->flattened_ud_buf, d_nvs,
-                                     regs.vs_program.settings.num_user_regs, need_vs);
+                                     regs.vs_program.settings.num_user_regs, need_vs & vs_known);
             if (psi) {
                 flat_ok = flat_ok && same_flat(fps, psi->flattened_ud_buf, d_nps,
-                                               regs.ps_program.settings.num_user_regs, need_ps);
+                                               regs.ps_program.settings.num_user_regs,
+                                               need_ps & ps_known);
             }
             bool vi_ok = true;
             if (front_vi) {
@@ -3325,32 +3327,43 @@ u32 NativeNeedMask(const Shader::Info* info, const Shader::Gcn::FetchShaderData*
             add(d.sharp_idx, 8);
         }
     }
+    // Strict (never inherited): the walker's roots (its flat output would be stale) and the
+    // fetch shader's SGPRs (vertex inputs, offsets).
+    u32 strict = 0;
+    const auto add_strict = [&](u32 idx, u32 count) {
+        for (u32 i = 0; i < count; ++i) {
+            if (idx + i < 16) {
+                strict |= 1u << (idx + i);
+            }
+        }
+    };
     bool ok = true;
-    m |= NativeWalkerRoots(info->srt_info, ok);
+    strict |= NativeWalkerRoots(info->srt_info, ok);
     if (!ok) {
         return 0xffffffffu;
     }
     if (info->stage == Shader::Stage::Vertex) {
         if (info->has_fetch_shader) {
-            add(info->fetch_shader_sgpr_base, 2);
+            add_strict(info->fetch_shader_sgpr_base, 2);
         }
         if (fetch) {
             if (fetch->vertex_offset_sgpr >= 0) {
-                add(static_cast<u32>(fetch->vertex_offset_sgpr), 1);
+                add_strict(static_cast<u32>(fetch->vertex_offset_sgpr), 1);
             }
             if (fetch->instance_offset_sgpr >= 0) {
-                add(static_cast<u32>(fetch->instance_offset_sgpr), 1);
+                add_strict(static_cast<u32>(fetch->instance_offset_sgpr), 1);
             }
             for (const auto& attrib : fetch->attributes) {
                 if (attrib.sgpr_base != Shader::IR::NumScalarRegs) {
-                    add(attrib.sgpr_base, 2); // a pointer to the V# list
+                    add_strict(attrib.sgpr_base, 2); // a pointer to the V# list
                 } else {
-                    add(attrib.dword_offset, 4);
+                    add_strict(attrib.dword_offset, 4);
                 }
             }
         }
     }
-    return m;
+    m |= strict;
+    return (m & 0xffffu) | ((strict & 0xffffu) << 16);
 }
 
 /// Front thread: NativeNeedMask per Info, cached (Infos live as long as the pipeline cache).
@@ -3453,8 +3466,14 @@ bool Liverpool::NativeRecMember(const PM4Header* header, const char* name, bool 
     const auto ud_vs = src.ud_vs;
     const auto ud_ps = src.ud_ps;
     const VAddr vs_pgm = VAddr{src.vs_pgm} << 8, ps_pgm = VAddr{src.ps_pgm} << 8;
+    const u32 inh = src.inh_vs | src.inh_ps;
     std::atomic_thread_fence(std::memory_order_acquire);
     if (src.stamp.load(std::memory_order_relaxed) != idx + 1 || !cmd_ok) {
+        return refuse(1);
+    }
+    if (inh != 0) {
+        // Coverage (sec. 11): the job's user data holds stale inherited registers; the normal
+        // path (the front's own registers) builds this record.
         return refuse(1);
     }
     if (run_k != run.next_k || head_idx != run.head_idx || src_tag != run.tag || !derived) {

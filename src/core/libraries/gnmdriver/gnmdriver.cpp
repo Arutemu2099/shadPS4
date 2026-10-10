@@ -842,6 +842,9 @@ struct RecThread {
     NR::RunUnion* unions{};
     u32 union_next{};
     u32 run_union{~0u};
+    // Coverage (sec. 11): the inherited registers of the last derive and of the open run.
+    u32 inh_vs{}, inh_ps{};
+    u32 run_inh_vs{}, run_inh_ps{};
 };
 thread_local RecThread t_rec;
 /// Stage a2 job-side derive outcomes: 0 ok, 1 user data unknown, 2 VS not in the table yet,
@@ -1044,6 +1047,10 @@ void NativeRecDerive(NR::Record& rec) {
     rec.derived = 0;
     rec.pipeline = nullptr;
     rec.fetch_addr = 0;
+    rec.inh_vs = 0;
+    rec.inh_ps = 0;
+    r.inh_vs = 0;
+    r.inh_ps = 0;
     const u32 cnt_vs = r.vs_nuser >= 16 ? 0xffffu : ((1u << r.vs_nuser) - 1);
     const u32 cnt_ps = r.ps_nuser >= 16 ? 0xffffu : ((1u << r.ps_nuser) - 1);
     const u64 vs_hash = t_draw_tag_hash[0];
@@ -1069,12 +1076,20 @@ void NativeRecDerive(NR::Record& rec) {
         g_nr_d[3].fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    // Coverage (sec. 11): every register the stages read must be known; with an unknown read mask
-    // every register below the RSRC2 count.
+    // Coverage (sec. 11): every strict register (walker roots, fetch SGPRs) must be known; the
+    // other needed ones may be inherited (constant over the run; the back takes them from the
+    // batch opener and checks them at every member). With an unknown read mask: every register
+    // below the RSRC2 count, strict.
     const u32 nv = static_cast<u32>(needs), np = static_cast<u32>(needs >> 32);
     const u32 need_vs = nv == 0xffffffffu ? cnt_vs : (nv & cnt_vs);
     const u32 need_ps = np == 0xffffffffu ? cnt_ps : (np & cnt_ps);
-    if ((r.vs_known & need_vs) != need_vs || (r.ps_known & need_ps) != need_ps) {
+    const u32 strict_vs = nv == 0xffffffffu ? need_vs : ((nv >> 16) & cnt_vs);
+    const u32 strict_ps = np == 0xffffffffu ? need_ps : ((np >> 16) & cnt_ps);
+    r.inh_vs = NR::g_inherit_on ? need_vs & ~r.vs_known : 0;
+    r.inh_ps = NR::g_inherit_on ? need_ps & ~r.ps_known : 0;
+    if ((r.vs_known & strict_vs) != strict_vs || (r.ps_known & strict_ps) != strict_ps ||
+        (!NR::g_inherit_on &&
+         ((r.vs_known & need_vs) != need_vs || (r.ps_known & need_ps) != need_ps))) {
         g_nr_d[1].fetch_add(1, std::memory_order_relaxed);
         // Diagnostic: masks unknown (VS / PS) vs known-but-missing, and which registers.
         g_nr_need[nv == 0xffffffffu ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
@@ -1149,6 +1164,8 @@ void NativeRecDerive(NR::Record& rec) {
     rec.pipeline = gp;
     rec.fetch_addr = fetch;
     rec.derived = 1;
+    rec.inh_vs = r.inh_vs;
+    rec.inh_ps = r.inh_ps;
     r.payload_pos = pos + (u64(vi_out - base) + rec.vi_bytes + 7) / 8 * 8;
     g_nr_d[0].fetch_add(1, std::memory_order_relaxed);
 }
@@ -1161,6 +1178,8 @@ void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
     auto& r = t_rec;
     rec.gpu_ok = 0;
     rec.union_idx = ~0u;
+    rec.push_inh = 0;
+    rec.inh_slots = 0;
     if (!r.gpu) [[unlikely]] {
         if (const auto alloc = NR::g_gpu_alloc.load(std::memory_order_acquire)) {
             r.gpu = alloc(slot); // ring mode: mapped GPU memory
@@ -1249,10 +1268,29 @@ void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
         bs.flattened_ud_buf = std::span<const u32>{i == vs_i ? flat_vs : flat_ps,
                                                    i == vs_i ? rec.flat_vs_dw : rec.flat_ps_dw};
         bs.pgm_base = VAddr{i == vs_i ? rec.vs_pgm : rec.ps_pgm} << 8;
+        const u32 inh = i == vs_i ? rec.inh_vs : rec.inh_ps;
+        {
+            // Push-layout slots of inherited registers (PushUd's order: ud_mask ascending).
+            u32 p = bnd.user_data;
+            for (u32 mask = info->ud_mask.mask; mask != 0; mask &= mask - 1) {
+                const u32 reg = static_cast<u32>(std::countr_zero(mask));
+                if (((inh >> reg) & 1) && p < 32) {
+                    rec.push_inh |= 1u << p;
+                }
+                ++p;
+            }
+        }
         bs.PushUd(bnd, push);
         for (const auto& desc : info->buffers) {
             if (bi >= NR::UnionSlots) {
                 return kill();
+            }
+            if (desc.buffer_type == Shader::BufferType::Guest && !desc.inline_cbuf &&
+                desc.sharp_idx < 16 && ((inh >> desc.sharp_idx) & 0xfu) != 0) {
+                // The V# sits in inherited registers: the opener's binding (the back's table).
+                rec.inh_slots |= u64{1} << bi;
+                ++bi;
+                continue;
             }
             if (desc.buffer_type == Shader::BufferType::Guest) {
                 const auto vsharp = desc.GetSharp(bs);
@@ -1288,7 +1326,8 @@ void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
             add_key(desc.GetSharp(bs));
         }
     }
-    rec.img_n = key_ok ? kn : ~0u;
+    // An image / sampler in inherited registers: the key is stale -> no image-key match.
+    rec.img_n = key_ok && (rec.inh_vs | rec.inh_ps) == 0 ? kn : ~0u;
     NR::ImageKeyHash(key.data(), kn, rec.img_h1, rec.img_h2);
     std::memcpy(g.data(), push.ud_regs.data(), sizeof(u32) * Shader::NUM_USER_DATA_REGS);
     const auto& vi = r.vi_scratch;
@@ -1370,7 +1409,8 @@ u32 NativeRecDraw(const u32* cmdbuf, u64 index_addr, u32 index_count, u32 tag) {
     }
     // A run continues only through draws the job thread derived (the front skips members in
     // stage b), with the head's vertex layout.
-    const bool layout_same = rec.derived && r.run_derived && vi_key == r.run_vi_key;
+    const bool layout_same = rec.derived && r.run_derived && vi_key == r.run_vi_key &&
+                             rec.inh_vs == r.run_inh_vs && rec.inh_ps == r.run_inh_ps;
     if (r.head && rec.derived && r.run_derived && !layout_same) {
         g_nr_d[4].fetch_add(1, std::memory_order_relaxed);
     }
@@ -1467,6 +1507,8 @@ u32 NativeRecDraw(const u32* cmdbuf, u64 index_addr, u32 index_count, u32 tag) {
         r.run_prim = r.prim;
         r.run_derived = rec.derived != 0;
         r.run_vi_key = vi_key;
+        r.run_inh_vs = rec.inh_vs;
+        r.run_inh_ps = rec.inh_ps;
     }
     if (NR::g_gpu_mode != 0) [[unlikely]] {
         NativeRecGpu(rec, idx, tag >> 28);

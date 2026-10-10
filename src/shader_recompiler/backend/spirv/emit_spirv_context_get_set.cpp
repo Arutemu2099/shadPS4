@@ -50,7 +50,18 @@ Id EmitGetUserData(EmitContext& ctx, IR::ScalarReg reg) {
     const u32 index = ctx.binding.user_data + ctx.info.ud_mask.Index(reg);
     if (ctx.native) {
         // SHADPS4_NATIVE_PASS: this draw's registers, from the records SSBO.
-        const Id ud_reg{ctx.NativeRecordLoad(Shader::NativeRecordUdOffset + index)};
+        Id ud_reg{ctx.NativeRecordLoad(Shader::NativeRecordUdOffset + index)};
+        if (ctx.native_ring) {
+            // Coverage (sec. 11): an inherited register comes from the batch table.
+            const Id bit{ctx.OpBitwiseAnd(
+                ctx.U32[1],
+                ctx.OpShiftRightLogical(ctx.U32[1],
+                                        ctx.NativeTableLoad(Shader::NativeTablePushInh),
+                                        ctx.ConstU32(index)),
+                ctx.ConstU32(1u))};
+            ud_reg = ctx.OpSelect(ctx.U32[1], ctx.OpINotEqual(ctx.U1[1], bit, ctx.u32_zero_value),
+                                  ctx.NativeTableLoad(Shader::NativeTableUd + index), ud_reg);
+        }
         ctx.Name(ud_reg, fmt::format("ud_{}", u32(reg)));
         return ud_reg;
     }

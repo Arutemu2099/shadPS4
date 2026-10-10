@@ -66,6 +66,14 @@ struct Record {
     /// count and two independent 64-bit hashes (ImageKeyHash).
     u32 img_n;
     u64 img_h1, img_h2;
+    /// Coverage (sec. 11): needed user-data registers the job thread never saw written - state a
+    /// command buffer inherited from an earlier one (another job thread's). Constant over a run
+    /// (a write in any gap of the run makes them known and ends the run's inherited set). The
+    /// GPU record holds stale values for them: the push-layout user-data slots (push_inh) and
+    /// the Guest binding slots whose V# sits in them (inh_slots) come from the batch opener.
+    u32 inh_vs, inh_ps;
+    u32 push_inh;
+    u64 inh_slots;
 };
 
 /// SHADPS4_NATIVE_GPU_DIRECT: two independent 64-bit hashes of an image key (raw T# / S# words).
@@ -132,9 +140,10 @@ struct ProgramEntry {
     std::atomic<u64> key{};
     u64 vs_hash{}, ps_hash{}, fetch_addr{};
     std::atomic<const void*> pipeline{};
-    /// Coverage (sec. 11): the user-data registers each stage really reads (VS low 32 bits, PS
-    /// high; a half of 0xffffffff = unknown -> the RSRC2-count rule). Published before the
-    /// pipeline / key.
+    /// Coverage (sec. 11): per stage (VS low 32 bits, PS high) the user-data registers it really
+    /// reads (low 16 bits) and the strict subset that may not be inherited (SRT walker roots,
+    /// fetch-shader SGPRs; high 16 bits); a half of 0xffffffff = unknown -> the RSRC2-count rule.
+    /// Published before the pipeline / key.
     std::atomic<u64> needs{~u64{0}};
 };
 constexpr u32 TableSize = 8192;
@@ -198,6 +207,11 @@ inline void TablePublish(u64 vs, u64 ps, u64 fetch, const void* pipeline, NeedsF
     }
 }
 
+/// SHADPS4_NATIVE_REC_INHERIT=0: no inherited registers (every needed register must be known).
+inline const bool g_inherit_on = [] {
+    const char* v = std::getenv("SHADPS4_NATIVE_REC_INHERIT");
+    return !v || v[0] != '0';
+}();
 /// SHADPS4_NATIVE_REC_NEEDS=0 turns the read-mask rule off (the RSRC2-count rule everywhere).
 inline const bool g_needs_on = [] {
     const char* v = std::getenv("SHADPS4_NATIVE_REC_NEEDS");

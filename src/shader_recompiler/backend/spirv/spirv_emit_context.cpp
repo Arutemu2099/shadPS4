@@ -288,12 +288,21 @@ void EmitContext::DefineBufferProperties() {
         if (native) {
             // The full byte offset of this draw's binding inside the bound VkBuffer.
             buf_offset = NativeRecordLoad(Shader::NativeRecordOffOffset + binding);
+            native_size_bytes[i] = NativeRecordLoad(Shader::NativeRecordSizeOffset + binding);
             if (native_ring) {
                 // The record holds the guest address (low 32 bits); the table the buffer's base.
                 buf_offset = OpISub(U32[1], buf_offset,
                                     NativeTableLoad(Shader::NativeTableBase + binding));
+                // Coverage (sec. 11): an inherited binding's size comes from the table.
+                const Id word{NativeTableLoad(Shader::NativeTableInhSlots + binding / 32)};
+                const Id bit{OpBitwiseAnd(
+                    U32[1], OpShiftRightLogical(U32[1], word, ConstU32(binding % 32)),
+                    ConstU32(1u))};
+                native_size_bytes[i] =
+                    OpSelect(U32[1], OpINotEqual(U1[1], bit, u32_zero_value),
+                             NativeTableLoad(Shader::NativeTableSize + binding),
+                             native_size_bytes[i]);
             }
-            native_size_bytes[i] = NativeRecordLoad(Shader::NativeRecordSizeOffset + binding);
             native_size_dw[i] = OpShiftRightLogical(U32[1], native_size_bytes[i], ConstU32(2U));
         } else {
             const u32 half = PushData::BufOffsetIndex + (binding >> 4);

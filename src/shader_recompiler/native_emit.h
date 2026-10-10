@@ -91,8 +91,16 @@ constexpr u32 NativeTableFirst = 0;
 constexpr u32 NativeTableMask = 1;
 constexpr u32 NativeTableBase = 2;
 constexpr u32 NativeTableVbase = 2 + NUM_BUFFERS;
-constexpr u32 NativeTableDwords = 64;
-static_assert(NativeTableVbase + NativeMaxPulledLocations <= NativeTableDwords);
+/// Coverage (sec. 11): push-layout user-data slots taken from the table (mask) and their values;
+/// Guest binding slots whose size comes from the table (mask over two dwords) and the sizes
+/// (their offset is folded into the base: record word - base = the opener's offset).
+constexpr u32 NativeTablePushInh = NativeTableVbase + NativeMaxPulledLocations; // 58
+constexpr u32 NativeTableInhSlots = NativeTablePushInh + 1;                      // 59, 60
+constexpr u32 NativeTableUd = 64;
+constexpr u32 NativeTableSize = NativeTableUd + NUM_USER_DATA_REGS; // 80
+constexpr u32 NativeTableDwords = 128;
+static_assert(NativeTableInhSlots + 2 <= NativeTableUd);
+static_assert(NativeTableSize + NUM_BUFFERS <= NativeTableDwords);
 /// SHADPS4_NATIVE_GPU_DIRECT=1: native variants are compiled in ring mode.
 inline const bool g_native_ring = [] {
     const char* v = std::getenv("SHADPS4_NATIVE_GPU_DIRECT");
