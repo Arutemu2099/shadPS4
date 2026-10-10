@@ -4878,6 +4878,12 @@ bool Rasterizer::NativeDirectBind(const GraphicsPipeline* base, const GraphicsPi
     binding_compute = false;
     const auto& regs = liverpool->BackRegs();
     Shader::Backend::Bindings binding{};
+    u64 nd_t = __rdtsc();
+    const auto nd_lap = [&](u32 ph) {
+        const u64 now = __rdtsc();
+        st.c_nd_ph[ph] += now - nd_t;
+        nd_t = now;
+    };
     push_data = MakeUserData(regs);
     for (const auto& bound : BoundStages(base)) {
         const auto* stage = bound.info;
@@ -4976,6 +4982,7 @@ bool Rasterizer::NativeDirectBind(const GraphicsPipeline* base, const GraphicsPi
     }
     set_write_index = static_cast<u32>(set_writes.size());
     native_bound_count = binding.unified;
+    nd_lap(0);
     // Vertex / index bindings as a join computes them (syncs + GPU-written barriers).
     VideoCore::NativeJoinVi jvi{};
     buffer_cache.NativeJoinVertexIndex(*front_vi, index_offset, jvi, &buffer_barriers);
@@ -4996,12 +5003,15 @@ bool Rasterizer::NativeDirectBind(const GraphicsPipeline* base, const GraphicsPi
             tvi.gpu_mod = true;
         }
     }
+    nd_lap(1);
     if (!open) {
         return true;
     }
     attachment_feedback_loop = false; // BeginRendering recomputes it; the slot resolve refuses
                                       // any image that is this draw's target
-    if (!NativeOpen(base, native, true, index_offset, front_vi, true)) {
+    const bool opened = NativeOpen(base, native, true, index_offset, front_vi, true);
+    nd_lap(2);
+    if (!opened) {
         return fail(9);
     }
     draw_repeat.valid = false;
@@ -5881,12 +5891,16 @@ void Rasterizer::NativeLog() {
         LOG_INFO(Render_Vulkan,
                  "NativeDirect: candidates={} direct openers={} (DrawTail {:.0f} cycles each) | "
                  "fails 1..9: {} {} {} {} {} {} {} {} {} | verify ok={} MISMATCH={} "
-                 "(restructured between the binds {})",
+                 "(restructured between the binds {}) | cycles per direct bind: buffers {:.0f} "
+                 "vertex+index {:.0f} NativeOpen {:.0f} | NativeOpen fail lines: see NativeOpenFail",
                  st.nd_cand, st.nd_ok,
                  double(st.c_tail_dopen) / double(std::max<u64>(st.n_tail_dopen, 1)),
                  st.nd_fail[1], st.nd_fail[2], st.nd_fail[3], st.nd_fail[4], st.nd_fail[5],
                  st.nd_fail[6], st.nd_fail[7], st.nd_fail[8], st.nd_fail[9], st.nd_vfy_ok,
-                 st.nd_vfy_bad, st.nd_fail[15]);
+                 st.nd_vfy_bad, st.nd_fail[15],
+                 double(st.c_nd_ph[0]) / double(std::max<u64>(st.nd_cand, 1)),
+                 double(st.c_nd_ph[1]) / double(std::max<u64>(st.nd_cand, 1)),
+                 double(st.c_nd_ph[2]) / double(std::max<u64>(st.nd_cand, 1)));
     }
     if (st.bl_open + st.bl_open_fail != 0) {
         LOG_INFO(Render_Vulkan,
