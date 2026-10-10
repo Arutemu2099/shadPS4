@@ -4612,6 +4612,7 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         }
         ++native_stats.n_no;
     }
+    segb_opened = !b.verify;
     return true;
 }
 

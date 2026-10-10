@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -823,6 +824,13 @@ struct SplitDrawRecord {
     u32 job_idx;             ///< heads, members and refused members alike (REC_PREP, sec. 9)
     u32 job_member;          ///< 1: posted by the member path (NativeRecMember)
     u32 job_pad;
+    // SHADPS4_NATIVE_SEGB (brick B): the front segment builder's prediction for this draw
+    // (segb_id 0: outside every segment); the member's (slot, ring index) are job_tag / job_idx.
+    u32 segb_id;          ///< 1-based segment number
+    u32 segb_member;      ///< position in the segment (0 = the opener)
+    u64 segb_index_addr;  ///< predicted index guest address (= index union lo + firstIndex * size)
+    u32 segb_index_count; ///< predicted indexCount
+    u32 segb_instances;   ///< predicted instanceCount
 };
 static_assert(sizeof(SplitDrawRecord) % 8 == 0);
 
@@ -1280,6 +1288,10 @@ Liverpool::Liverpool() {
             LOG_INFO(Render, "CpSplit: FRONT_DERIVE {} (vertex inputs{})", split_front_derive,
                      detail);
         }
+    }
+    if (AmdGpu::NativeRec::g_segb != 0) {
+        LOG_INFO(Render, "NativeSegB: on (front segment builder, census + verify only; pt {})",
+                 Shader::g_native_pt);
     }
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
 }
@@ -1993,6 +2005,11 @@ int Liverpool::NativePeekNextDraw(const void* pipeline) {
     return -1;
 }
 
+namespace {
+/// SHADPS4_NATIVE_SEGB, back thread: defined after the SegB namespace below.
+void NativeSegBBack(const SplitDrawRecord& rec, const Regs& regs, Vulkan::Rasterizer& tr);
+} // namespace
+
 void Liverpool::ExecuteDrawRecord(const CpSplit::RecordHeader& record) {
     back_draw_record = &record;
     struct ResetPeek {
@@ -2046,11 +2063,21 @@ void Liverpool::ExecuteDrawRecord(const CpSplit::RecordHeader& record) {
     translating.draw_job_idx = rec.job_idx;
     translating.draw_job_cmd = rec.cmd_address;
     translating.draw_job_member = rec.job_member != 0;
+    // SHADPS4_NATIVE_SEGB: what this record becomes (rec_outcome 4/5 confirm, 1/2 join, 3 tail
+    // = opener if segb_opened else generic) and the front's prediction against the mirror.
+    const bool segb = AmdGpu::NativeRec::g_segb != 0;
+    if (segb) [[unlikely]] {
+        translating.rec_outcome = 0;
+        translating.segb_opened = false;
+    }
     // SHADPS4_NATIVE_REC_PREP (notes/native-path-2026-10-09.md sec. 9): a run member the batch
     // open already prepared from the job records is confirmed here (count + 1) instead of being
     // joined; any refusal falls through to the normal path below.
     if (translating.native_prep.active) [[unlikely]] {
         if (translating.NativePrepConfirm(rec.draw, rec.verify == 0 && !rec.marker, vi_block)) {
+            if (segb) [[unlikely]] {
+                NativeSegBBack(rec, BackRegs(), translating);
+            }
             return;
         }
     }
@@ -2064,6 +2091,9 @@ void Liverpool::ExecuteDrawRecord(const CpSplit::RecordHeader& record) {
         translating.ScopeMarkerEnd();
     } else {
         translating.ExecuteDraw(rec.draw, stages, vi_block);
+    }
+    if (segb) [[unlikely]] {
+        NativeSegBBack(rec, BackRegs(), translating);
     }
 }
 
@@ -3238,6 +3268,483 @@ struct NativeRecMemberStats {
 std::vector<u8> g_nr_scratch;
 bool g_nr_scratch_valid{};
 
+// SHADPS4_NATIVE_SEGB (notes/native-path-2026-10-09.md sec. 20, milestone 3 brick B): the front
+// groups consecutive draws into the segments a native Segment record could execute - every
+// member has a derived job record with a GPU record, the segment's pipeline with a published
+// ring (+ pt when SHADPS4_NATIVE_PT is on) bindless colour variant for its vertex description,
+// the same index type, instance offset 0, only whitelisted packets since the previous member
+// (user-data SET_SH_REG, plain NOP, INDEX_TYPE, NUM_INSTANCES, INDEX_BASE, INDEX_BUFFER_SIZE),
+// fewer than 64 members, and per-class unions (index range, each pulled vertex stream, each
+// Guest binding slot) within 64 MB - and predicts each member's indirect command. Census and
+// verify only: every draw is still posted and the back compares the prediction with what it
+// draws (NativeSegBBack). The Guest slot ranges come from the job run's union (RunUnion, CPU
+// memory): a superset of the draw's own, since the GPU record ring is write-combined memory
+// (a read there costs ~10 k cycles, s395). Front thread.
+namespace SegB {
+constexpr u32 MaxMembers = 64;
+constexpr u64 MaxUnion = 64ull << 20;
+/// Why a draw stayed outside (1-9, also closing the open segment) or a segment closed (10-17).
+enum Reason : u32 {
+    RNone = 0,
+    RNoTag,          ///< not a tagged DrawIndex2 (every other draw packet included)
+    RStale,          ///< no job ring, or the record was overwritten
+    RNoGpuRec,       ///< not derived by the job thread, or no GPU record
+    RNoVariant,      ///< no published colour variant for this vertex description
+    RVariantNoRing,  ///< the variant is not ring (+ pt) + bindless, or a shadow pipeline
+    RInherited,      ///< inherited user data / V# slots (the member path refuses these too)
+    RInstanceOffset, ///< the fetch shader's instance offset SGPR is not 0
+    RNotPlain,       ///< filtered / skipped / no pipeline / no vertex inputs
+    RNoUnion,        ///< the job run's union entry is gone (NativeRecGpu killed it)
+    RPipeline,       ///< another pipeline
+    RIndexType,      ///< the index type changed
+    RPacket,         ///< an off-whitelist packet since the previous member (kind in pk[])
+    RCount,          ///< 64 members
+    RIndexUnion,     ///< the index union would pass 64 MB
+    RVertexUnion,
+    RGuestUnion,
+    RMisaligned,     ///< the index address is not a whole number of indices from the opener's
+    NumReasons,
+};
+enum PacketKind : u32 {
+    PkNone = 0,
+    PkCtx,      ///< SET_CONTEXT_REG, SET_CONFIG_REG, CONTEXT_CONTROL, CLEAR_STATE
+    PkSh,       ///< SET_SH_REG outside the VS / PS user-data registers
+    PkUconfig,
+    PkNop,      ///< a NOP with a back effect (flip, guest marker)
+    PkDispatch,
+    PkEvent,    ///< EVENT_WRITE / EOP / EOS / RELEASE_MEM
+    PkDma,      ///< DMA_DATA / WRITE_DATA / COPY_DATA
+    PkWait,     ///< WAIT_REG_MEM, semaphores, COND_EXEC, PFP_SYNC_ME, ACQUIRE_MEM, REWIND
+    PkIb,
+    PkSubmit,   ///< a new top-level command buffer (ProcessGraphics entry)
+    PkOther,
+    NumPacketKinds,
+};
+struct Pred {
+    u32 id{}, member{};
+    u64 index_addr{};
+    u32 index_count{}, instances{};
+};
+struct State {
+    bool open{};
+    u32 next_id{}, id{}, n{};
+    const void* pipeline{};
+    u32 index_type{}, index_size{};
+    u64 addr0{}; ///< the opener's index address (the alignment reference: lo may still drop)
+    u64 ilo{}, ihi{};
+    std::array<u64, 16> vlo{}, vhi{};
+    u64 gmask{};
+    std::array<u64, AmdGpu::NativeRec::UnionSlots> glo{}, ghi{};
+    u32 nmat{};
+    std::array<u64, MaxMembers> mat_h1{}, mat_h2{};
+    u32 packet{}; ///< first off-whitelist packet kind since the last draw (PkNone: clean)
+    // Counters, reset at every log.
+    u64 draws{}, in_seg{}, segments{}, mat_sum{};
+    std::array<u64, 7> hist{}; ///< closed segments by member count 1/2-3/4-7/8-15/16-31/32-63/64
+    std::array<u64, 4> mat_hist{};
+    std::array<u64, NumReasons> close{}, outside{};
+    std::array<u64, NumPacketKinds> pk{};
+    u32 calls{};
+    std::chrono::steady_clock::time_point window{};
+};
+State g_state;
+
+void NoteSegment(State& s) {
+    const u32 n = s.n;
+    ++s.segments;
+    ++s.hist[n <= 1 ? 0 : n <= 3 ? 1 : n <= 7 ? 2 : n <= 15 ? 3 : n <= 31 ? 4 : n <= 63 ? 5 : 6];
+    s.mat_sum += s.nmat;
+    ++s.mat_hist[s.nmat <= 1 ? 0 : s.nmat <= 3 ? 1 : s.nmat <= 7 ? 2 : 3];
+    s.open = false;
+}
+
+void Close(State& s, u32 why) {
+    if (s.open) {
+        ++s.close[why];
+        NoteSegment(s);
+    }
+}
+
+void MaybeLog(State& s) {
+    if ((++s.calls & 1023) != 0) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (s.window == std::chrono::steady_clock::time_point{}) {
+        s.window = now;
+        return;
+    }
+    if (now - s.window < std::chrono::seconds(10)) {
+        return;
+    }
+    s.window = now;
+    const auto& c = s.close;
+    const auto& o = s.outside;
+    const auto& p = s.pk;
+    LOG_INFO(Render,
+             "NativeSegB front: draws={} in_segments={} ({:.1f}%) segments={} | members per "
+             "segment 1/2-3/4-7/8-15/16-31/32-63/64: {} {} {} {} {} {} {} | close: pipeline={} "
+             "index_type={} packet={} (ctx {} sh {} uconfig {} nop {} dispatch {} event {} dma {} "
+             "wait {} ib {} submit {} other {}) count={} index_union={} vertex_union={} "
+             "guest_union={} index_misaligned={} outside_draw={} | outside: no_tag={} stale={} "
+             "no_gpu_rec={} no_variant={} variant_not_ring_pt={} inherited={} instance_offset={} "
+             "not_plain={} no_union={} | materials per segment mean {:.2f} 1/2-3/4-7/8+: {} {} {} {}",
+             s.draws, s.in_seg, s.draws ? 100.0 * double(s.in_seg) / double(s.draws) : 0.0,
+             s.segments, s.hist[0], s.hist[1], s.hist[2], s.hist[3], s.hist[4], s.hist[5],
+             s.hist[6], c[RPipeline], c[RIndexType], c[RPacket], p[PkCtx], p[PkSh], p[PkUconfig],
+             p[PkNop], p[PkDispatch], p[PkEvent], p[PkDma], p[PkWait], p[PkIb], p[PkSubmit],
+             p[PkOther], c[RCount], c[RIndexUnion], c[RVertexUnion], c[RGuestUnion], c[RMisaligned],
+             c[RNoTag] + c[RStale] + c[RNoGpuRec] + c[RNoVariant] + c[RVariantNoRing] + c[RInherited] +
+                 c[RInstanceOffset] + c[RNotPlain] + c[RNoUnion],
+             o[RNoTag], o[RStale], o[RNoGpuRec], o[RNoVariant], o[RVariantNoRing], o[RInherited],
+             o[RInstanceOffset], o[RNotPlain], o[RNoUnion],
+             s.segments ? double(s.mat_sum) / double(s.segments) : 0.0, s.mat_hist[0],
+             s.mat_hist[1], s.mat_hist[2], s.mat_hist[3]);
+    s.draws = s.in_seg = s.segments = s.mat_sum = 0;
+    s.hist.fill(0);
+    s.mat_hist.fill(0);
+    s.close.fill(0);
+    s.outside.fill(0);
+    s.pk.fill(0);
+}
+
+/// Every gfx type-3 packet the front parses (ProcessGraphics); draws are classified in
+/// NativeSegBDraw. Keeps the first off-whitelist kind since the last draw.
+void NotePacket(PM4ItOpcode opcode, const PM4Header* header, u32 count, bool guest_markers) {
+    auto& s = g_state;
+    if (s.packet != PkNone) {
+        return;
+    }
+    u32 kind = PkNone;
+    switch (opcode) {
+    case PM4ItOpcode::Nop:
+        kind = NopHasBackEffect(header, guest_markers) ? PkNop : PkNone;
+        break;
+    case PM4ItOpcode::IndexType:
+    case PM4ItOpcode::NumInstances:
+    case PM4ItOpcode::IndexBase:
+    case PM4ItOpcode::IndexBufferSize:
+    case PM4ItOpcode::DrawIndex2:
+    case PM4ItOpcode::DrawIndexOffset2:
+    case PM4ItOpcode::DrawIndexAuto:
+    case PM4ItOpcode::DrawIndirect:
+    case PM4ItOpcode::DrawIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirect:
+    case PM4ItOpcode::DrawIndexIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirectCountMulti:
+        break;
+    case PM4ItOpcode::SetShReg: {
+        // The job walker's ranges: VS user data 0x4c-0x5b, PS user data 0x0c-0x1b.
+        const u32 off = reinterpret_cast<const PM4CmdSetData*>(header)->reg_offset;
+        const u32 n = count - 1;
+        const bool vs = off >= 0x4c && off + n <= 0x5c;
+        const bool ps = off >= 0x0c && off + n <= 0x1c;
+        kind = (vs || ps) ? PkNone : PkSh;
+        break;
+    }
+    case PM4ItOpcode::SetContextReg:
+    case PM4ItOpcode::SetConfigReg:
+    case PM4ItOpcode::ContextControl:
+    case PM4ItOpcode::ClearState:
+        kind = PkCtx;
+        break;
+    case PM4ItOpcode::SetUconfigReg:
+        kind = PkUconfig;
+        break;
+    case PM4ItOpcode::DispatchDirect:
+    case PM4ItOpcode::DispatchIndirect:
+        kind = PkDispatch;
+        break;
+    case PM4ItOpcode::EventWrite:
+    case PM4ItOpcode::EventWriteEop:
+    case PM4ItOpcode::EventWriteEos:
+    case PM4ItOpcode::ReleaseMem:
+        kind = PkEvent;
+        break;
+    case PM4ItOpcode::DmaData:
+    case PM4ItOpcode::WriteData:
+    case PM4ItOpcode::CopyData:
+        kind = PkDma;
+        break;
+    case PM4ItOpcode::WaitRegMem:
+    case PM4ItOpcode::MemSemaphore:
+    case PM4ItOpcode::WaitOnCeCounter:
+    case PM4ItOpcode::CondExec:
+    case PM4ItOpcode::PfpSyncMe:
+    case PM4ItOpcode::AcquireMem:
+    case PM4ItOpcode::Rewind:
+        kind = PkWait;
+        break;
+    case PM4ItOpcode::IndirectBuffer:
+        kind = PkIb;
+        break;
+    default:
+        kind = PkOther;
+        break;
+    }
+    s.packet = kind;
+}
+
+/// A new top-level command buffer: a sequence point (epoch bump, coherence sync) with no packet.
+void NoteSubmit() {
+    if (g_state.packet == PkNone) {
+        g_state.packet = PkSubmit;
+    }
+}
+
+/// One call per graphics draw the front posts (the member path or EmitDraw). `plain`: a draw
+/// of class Draw with a pipeline that was not skipped. True = the draw joined / opened a segment
+/// and `pred` is its prediction.
+bool NativeSegBDraw(const PM4Header* header, const Vulkan::GraphicsPipeline* pipeline, bool plain,
+                    const CpSplit::VertexInputAttrib* attribs, u32 vi_count, const Regs& regs,
+                    Pred& pred) {
+    namespace NR = AmdGpu::NativeRec;
+    auto& s = g_state;
+    ++s.draws;
+    const u32 packet = std::exchange(s.packet, u32{PkNone});
+    MaybeLog(s);
+    const auto outside = [&](u32 why) {
+        ++s.outside[why];
+        Close(s, why);
+        return false;
+    };
+    const auto* w = reinterpret_cast<const u32*>(header);
+    if (header->type3.opcode != PM4ItOpcode::DrawIndex2 || w[6] != 0xc0021000u ||
+        w[7] != NR::Magic) {
+        return outside(RNoTag);
+    }
+    const u32 tag = w[8];
+    const u32 idx = w[9];
+    const u32 slot = tag >> 28;
+    const NR::Record* ring = NR::g_rings[slot].load(std::memory_order_acquire);
+    if (!ring) {
+        return outside(RStale);
+    }
+    const NR::Record& src = ring[idx & (NR::RingSize - 1)];
+    if (src.stamp.load(std::memory_order_acquire) != idx + 1) {
+        return outside(RStale);
+    }
+    // Seqlock read (Opus review 1): copy, fence, re-check the stamp, then use.
+    const bool cmd_ok = src.cmd == w;
+    const bool derived = src.derived != 0, gpu_ok = src.gpu_ok != 0;
+    const u32 inh = src.inh_vs | src.inh_ps;
+    const u64 inh_slots = src.inh_slots;
+    const u32 io_ud = src.io_ud;
+    const u64 index_addr = src.index_addr;
+    const u32 index_count = src.index_count;
+    const u32 union_idx = src.union_idx, head_idx = src.head_idx;
+    const u64 h1 = src.img_h1, h2 = src.img_h2;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (src.stamp.load(std::memory_order_relaxed) != idx + 1 || !cmd_ok) {
+        return outside(RStale);
+    }
+    if (!derived || !gpu_ok) {
+        return outside(RNoGpuRec);
+    }
+    if (inh != 0 || inh_slots != 0) {
+        return outside(RInherited);
+    }
+    if (!plain || !pipeline || !attribs || vi_count == 0) {
+        return outside(RNotPlain);
+    }
+    if (io_ud != 0) {
+        return outside(RInstanceOffset);
+    }
+    // The variant the back would bind (NativeDirectCandidate's rule): a colour variant of this
+    // vertex description, bindless, with the batch table (ring) and, in pt mode, the page table.
+    if (pipeline->native_variant.load(std::memory_order_relaxed) != nullptr ||
+        pipeline->native_colour[0].key.load(std::memory_order_relaxed) == 0) {
+        return outside(RNoVariant);
+    }
+    const auto* v = pipeline->NativeColourVariant(VideoCore::NativeVertexKey(attribs, vi_count));
+    if (!v) {
+        return outside(RNoVariant);
+    }
+    if (!v->native_bindless ||
+        v->native_table_binding == Vulkan::GraphicsPipeline::NoNativeRecords ||
+        (Shader::g_native_pt != 0 &&
+         v->native_pagetable_binding == Vulkan::GraphicsPipeline::NoNativeRecords)) {
+        return outside(RVariantNoRing);
+    }
+    // The Guest binding ranges: the job run's union so far (CPU memory; a superset).
+    NR::RunUnion* unions = NR::g_unions[slot].load(std::memory_order_acquire);
+    if (!unions || union_idx == ~0u) {
+        return outside(RNoUnion);
+    }
+    const NR::RunUnion& ru = unions[union_idx & NR::UnionMask];
+    if (ru.stamp.load(std::memory_order_acquire) != head_idx + 1) {
+        return outside(RNoUnion);
+    }
+    const u64 gmask = ru.guest_mask;
+    std::array<u64, NR::UnionSlots> glo{}, ghi{};
+    for (u64 m = gmask; m != 0; m &= m - 1) {
+        const u32 bi = static_cast<u32>(std::countr_zero(m));
+        glo[bi] = ru.lo[bi];
+        ghi[bi] = ru.hi[bi];
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (ru.stamp.load(std::memory_order_relaxed) != head_idx + 1) {
+        return outside(RNoUnion);
+    }
+    const u32 isize = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2u : 4u;
+    const u64 ilo = index_addr, ihi = index_addr + u64(index_count) * isize;
+    const u32 vcount = std::min<u32>(vi_count, 16);
+    if (s.open) {
+        u32 why = RNone;
+        if (s.pipeline != pipeline) {
+            why = RPipeline;
+        } else if (s.index_type != regs.index_buffer_type.raw) {
+            why = RIndexType;
+        } else if (packet != PkNone) {
+            why = RPacket;
+            ++s.pk[packet];
+        } else if (s.n >= MaxMembers) {
+            why = RCount;
+        } else if ((index_addr - s.addr0) % isize != 0) {
+            why = RMisaligned;
+        } else if (std::max(ihi, s.ihi) - std::min(ilo, s.ilo) > MaxUnion) {
+            why = RIndexUnion;
+        }
+        for (u32 a = 0; why == RNone && a < vcount; ++a) {
+            if (attribs[a].base_address == 0 || attribs[a].size == 0) {
+                continue;
+            }
+            const u64 lo = std::min<u64>(s.vlo[a], attribs[a].base_address);
+            const u64 hi = std::max<u64>(s.vhi[a], attribs[a].base_address + attribs[a].size);
+            if (hi - lo > MaxUnion) {
+                why = RVertexUnion;
+            }
+        }
+        for (u64 m = gmask; why == RNone && m != 0; m &= m - 1) {
+            const u32 bi = static_cast<u32>(std::countr_zero(m));
+            const bool had = ((s.gmask >> bi) & 1) != 0;
+            const u64 lo = had ? std::min(s.glo[bi], glo[bi]) : glo[bi];
+            const u64 hi = had ? std::max(s.ghi[bi], ghi[bi]) : ghi[bi];
+            if (hi - lo > MaxUnion) {
+                why = RGuestUnion;
+            }
+        }
+        if (why != RNone) {
+            Close(s, why);
+        }
+    }
+    if (!s.open) {
+        s.open = true;
+        s.id = ++s.next_id;
+        s.n = 0;
+        s.pipeline = pipeline;
+        s.index_type = regs.index_buffer_type.raw;
+        s.index_size = isize;
+        s.addr0 = index_addr;
+        s.ilo = ~u64{0};
+        s.ihi = 0;
+        s.vlo.fill(~u64{0});
+        s.vhi.fill(0);
+        s.gmask = 0;
+        s.nmat = 0;
+    }
+    // The member's command against the union lo as it stands (exact division: every member is
+    // a whole number of indices from the opener, so from any lo).
+    const u64 lo_now = std::min(s.ilo, ilo);
+    const u64 first_index = (index_addr - lo_now) / isize;
+    pred.id = s.id;
+    pred.member = s.n;
+    pred.index_addr = lo_now + first_index * isize;
+    pred.index_count = index_count;
+    pred.instances = regs.num_instances.NumInstances();
+    s.ilo = lo_now;
+    s.ihi = std::max(s.ihi, ihi);
+    for (u32 a = 0; a < vcount; ++a) {
+        if (attribs[a].base_address != 0 && attribs[a].size != 0) {
+            s.vlo[a] = std::min<u64>(s.vlo[a], attribs[a].base_address);
+            s.vhi[a] = std::max<u64>(s.vhi[a], attribs[a].base_address + attribs[a].size);
+        }
+    }
+    for (u64 m = gmask; m != 0; m &= m - 1) {
+        const u32 bi = static_cast<u32>(std::countr_zero(m));
+        const bool had = ((s.gmask >> bi) & 1) != 0;
+        s.glo[bi] = had ? std::min(s.glo[bi], glo[bi]) : glo[bi];
+        s.ghi[bi] = had ? std::max(s.ghi[bi], ghi[bi]) : ghi[bi];
+    }
+    s.gmask |= gmask;
+    bool seen = false;
+    for (u32 i = 0; i < s.nmat && !seen; ++i) {
+        seen = s.mat_h1[i] == h1 && s.mat_h2[i] == h2;
+    }
+    if (!seen && s.nmat < MaxMembers) {
+        s.mat_h1[s.nmat] = h1;
+        s.mat_h2[s.nmat] = h2;
+        ++s.nmat;
+    }
+    ++s.n;
+    ++s.in_seg;
+    return true;
+}
+
+/// Back thread, after each draw record ran: the prediction against the mirror's draw registers
+/// and what today's path did with the member (rec_outcome / segb_opened).
+struct BackStats {
+    u64 predicted{}, ok{}, bad{}, opener{}, join{}, confirm{}, generic{}, other{};
+    u32 logged{};
+    u32 calls{};
+    std::chrono::steady_clock::time_point window{};
+} g_back;
+} // namespace SegB
+
+void NativeSegBBack(const SplitDrawRecord& rec, const Regs& regs, Vulkan::Rasterizer& tr) {
+    auto& s = SegB::g_back;
+    if (rec.segb_id != 0) {
+        ++s.predicted;
+        const u32 isize = regs.index_buffer_type.index_type == IndexType::Index16 ? 2u : 4u;
+        const u64 addr = regs.index_base_address.Address<u64>() +
+                         u64(rec.draw.args.index_offset) * isize;
+        const u32 count = regs.num_indices;
+        const u32 inst = regs.num_instances.NumInstances();
+        if (addr == rec.segb_index_addr && count == rec.segb_index_count &&
+            inst == rec.segb_instances) {
+            ++s.ok;
+        } else {
+            ++s.bad;
+            if (++s.logged <= 20) {
+                LOG_WARNING(Render,
+                            "NativeSegB back MISMATCH: segment {} member {} (slot {} ring {}): "
+                            "index address predicted {:#x} real {:#x}, count {} / {}, instances "
+                            "{} / {}",
+                            rec.segb_id, rec.segb_member, rec.job_tag >> 28, rec.job_idx,
+                            rec.segb_index_addr, addr, rec.segb_index_count, count,
+                            rec.segb_instances, inst);
+            }
+        }
+        const u32 o = tr.rec_outcome;
+        if (o == 4 || o == 5) {
+            ++s.confirm;
+        } else if (o == 1 || o == 2) {
+            ++s.join;
+        } else if (o == 3) {
+            ++(tr.segb_opened ? s.opener : s.generic);
+        } else {
+            ++s.other;
+        }
+    }
+    if ((++s.calls & 1023) != 0) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (s.window == std::chrono::steady_clock::time_point{}) {
+        s.window = now;
+        return;
+    }
+    if (now - s.window < std::chrono::seconds(10)) {
+        return;
+    }
+    s.window = now;
+    LOG_INFO(Render,
+             "NativeSegB back: predicted members={} compare ok={} MISMATCH={} | handled today as: "
+             "opener={} legacy_join={} ring_confirm={} generic={} other={}",
+             s.predicted, s.ok, s.bad, s.opener, s.join, s.confirm, s.generic, s.other);
+    s.predicted = s.ok = s.bad = s.opener = s.join = s.confirm = s.generic = s.other = 0;
+}
+
 u32 StageBlockBytes(u32 ud_dw, u32 flat_dw) {
     return static_cast<u32>((sizeof(CpSplit::StagePayload) + size_t(ud_dw + flat_dw) * 4 + 7) &
                             ~size_t{7});
@@ -3568,6 +4075,13 @@ bool Liverpool::NativeRecMember(const PM4Header* header, const char* name, bool 
         ++run.next_k;
         return false;
     }
+    SegB::Pred segb{};
+    if (NR::g_segb != 0) [[unlikely]] {
+        // SHADPS4_NATIVE_SEGB: the vertex block in `local` (the head's descriptions patched in).
+        const auto* vih = reinterpret_cast<const CpSplit::VertexInputsPayload*>(out);
+        SegB::NativeSegBDraw(header, run.pipeline, true, CpSplit::VertexInputAttribs(*vih),
+                             vih->count, regs, segb);
+    }
     auto* rec = split->Reserve<SplitDrawRecord>(CpSplit::RecordType::Draw,
                                                 sizeof(SplitDrawRecord) + body);
     rec->draw = draw;
@@ -3584,6 +4098,11 @@ bool Liverpool::NativeRecMember(const PM4Header* header, const char* name, bool 
     rec->job_idx = idx;
     rec->job_member = 1;
     rec->job_pad = 0;
+    rec->segb_id = segb.id;
+    rec->segb_member = segb.member;
+    rec->segb_index_addr = segb.index_addr;
+    rec->segb_index_count = segb.index_count;
+    rec->segb_instances = segb.instances;
     std::memcpy(reinterpret_cast<u8*>(rec + 1), local.data(), body);
     split->Commit();
     if (split_run_ahead) {
@@ -3765,6 +4284,12 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
     if (AmdGpu::NativeRec::g_mode != 0) [[unlikely]] {
         NativeRecFront(header, draw, regs, context_change_epoch, vi_bytes ? &*front_vi : nullptr);
     }
+    SegB::Pred segb{};
+    if (AmdGpu::NativeRec::g_segb != 0) [[unlikely]] {
+        SegB::NativeSegBDraw(header, draw.pipeline, has_stages,
+                             vi_bytes ? front_vi->attribs.data() : nullptr,
+                             vi_bytes ? front_vi->header.count : 0u, regs, segb);
+    }
     auto* rec = split->Reserve<SplitDrawRecord>(CpSplit::RecordType::Draw, bytes);
     rec->draw = draw;
     rec->ctx_epoch = context_change_epoch;
@@ -3780,6 +4305,11 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
     rec->job_idx = 0;
     rec->job_member = 0;
     rec->job_pad = 0;
+    rec->segb_id = segb.id;
+    rec->segb_member = segb.member;
+    rec->segb_index_addr = segb.index_addr;
+    rec->segb_index_count = segb.index_count;
+    rec->segb_instances = segb.instances;
     if (AmdGpu::NativeRec::g_mode >= 2 && header->type3.opcode == PM4ItOpcode::DrawIndex2) {
         const auto* w = reinterpret_cast<const u32*>(header);
         if (w[6] == 0xc0021000u && w[7] == AmdGpu::NativeRec::Magic) {
@@ -4591,6 +5121,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     const bool is_indirect_gfx = std::exchange(starting_indirect_gfx, false);
     if (!is_indirect_gfx) {
         BumpEpoch(PM4ItOpcode::Nop);
+        if (AmdGpu::NativeRec::g_segb != 0) [[unlikely]] {
+            SegB::NoteSubmit();
+        }
     }
     SplitSpanScope split_span{*this, &dcb,
                               is_indirect_gfx ? CpSplit::DrainReason::TaskGuardIb
@@ -4649,6 +5182,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
             g_dispatch_sync.Note(64, opcode, header);
+            if (AmdGpu::NativeRec::g_segb != 0) [[unlikely]] {
+                SegB::NotePacket(opcode, header, count, guest_markers_enabled);
+            }
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 // Flip IRQ and guest markers are back work; the body is in ExecuteGfxPacket.

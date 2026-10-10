@@ -138,6 +138,9 @@ public:
     u32 draw_job_idx{};
     const void* draw_job_cmd{};
     bool draw_job_member{};
+    /// SHADPS4_NATIVE_SEGB: NativeOpen opened a live batch while this draw record ran (reset by
+    /// Liverpool::ExecuteDrawRecord; with rec_outcome it tells an opener from a generic draw).
+    bool segb_opened{};
     /// SHADPS4_NATIVE_REC_PREP (notes/native-path-2026-10-09.md sec. 9): the open batch's run
     /// members prepared from the job records (records + indirect commands in the batch slots,
     /// count not advanced); each is confirmed at its own draw record (NativePrepConfirm).

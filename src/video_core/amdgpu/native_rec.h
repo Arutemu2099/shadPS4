@@ -266,4 +266,12 @@ inline const int g_mode = [] {
     return v ? std::atoi(v) : 0;
 }();
 
+/// SHADPS4_NATIVE_SEGB (notes/native-path-2026-10-09.md sec. 20, milestone 3 brick B): the front
+/// builds segments of consecutive native members and predicts each member's indirect command;
+/// census and verify only (every draw still runs as today; the back compares). 0 = off.
+inline const int g_segb = [] {
+    const char* v = std::getenv("SHADPS4_NATIVE_SEGB");
+    return v ? std::atoi(v) : 0;
+}();
+
 } // namespace AmdGpu::NativeRec
