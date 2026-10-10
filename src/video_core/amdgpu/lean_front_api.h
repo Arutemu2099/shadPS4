@@ -44,6 +44,8 @@ struct LeanFaultStats {
     /// Shared-lock takes of the pipeline cache by lean workers, and the draws they were for
     /// (watch item: contention with the front's exclusive lock).
     std::atomic<u64> lock_takes{}, lock_draws{};
+    /// PipelineMiss sub-reasons (Vulkan::GraphicsLookupScratch::Miss).
+    std::array<std::atomic<u64>, 8> miss{};
 };
 inline LeanFaultStats g_lean_fault_stats;
 inline void LeanNoteWorkerFault(u64 addr) {

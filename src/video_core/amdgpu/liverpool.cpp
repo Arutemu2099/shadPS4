@@ -1204,12 +1204,18 @@ struct LeanJob {
     std::vector<std::pair<u32, u32>> front_marks; ///< (packet dword offset, events before it)
     std::vector<u64> worker_canon;
     Lean::SpanResult res{};
+    u64 begin_seq{};          ///< the front's emitted count at the DCB start (L1 lag check)
+    std::atomic<bool> lag{};  ///< the back had started the DCB before the worker finished
 };
 struct LeanCounters {
     std::atomic<u64> dcbs{}, eligible{}, skipped{}, cmp{}, bad{}, events{}, pkts{}, pkts_span{},
         draws{}, draws_span{}, no_mark{}, epoch_bumps{}, run_bumps{};
     std::atomic<u32> epoch_bump_op{}; ///< first offending opcode | 0x100 (0: none)
-    std::array<std::atomic<u64>, 16> stops{};
+    /// L2 stage b: parity breaks, L1 lag-excluded jobs, BAD spans by first-difference kind, the
+    /// front's draws and its NativeRec member-path draws (job_member = 1).
+    std::atomic<u64> parity{}, lag{}, front_draws{}, front_member{};
+    std::array<std::atomic<u64>, 32> bad_kind{};
+    std::array<std::atomic<u64>, 32> stops{};
     std::array<std::atomic<u64>, 256> stop_ops{};
 };
 struct LeanState {
@@ -1346,9 +1352,11 @@ bool LeanSupported(const PM4Header* header, bool guest_markers) {
 
 /// The chain's register-only pass over one DCB (+ the non-register items the supported packets
 /// change, mirroring ProcessGraphics), finding the cut and counting packets / draws.
-void LeanChainScan(std::span<const u32> dcb, LeanState& s, bool guest_markers, u32& cut_dw,
-                   u32& pkts, u32& draws) {
+void LeanChainScan(std::span<const u32> dcb, LeanState& s, bool guest_markers, bool post_dma,
+                   u32& cut_dw, u32& pkts, u32& draws) {
     const u32* base = dcb.data();
+    const std::span<const u32> full = dcb;
+    const Lean::StaticEnv senv{.guest_markers = guest_markers, .split_post_dma = post_dma};
     auto& r = *s.regs;
     cut_dw = static_cast<u32>(dcb.size());
     bool cut = false;
@@ -1365,9 +1373,13 @@ void LeanChainScan(std::span<const u32> dcb, LeanState& s, bool guest_markers, u
         const auto* w = reinterpret_cast<const u32*>(header);
         const auto op = static_cast<PM4ItOpcode>(header->type3.opcode.Value());
         ++pkts;
-        if (!cut && !LeanSupported(header, guest_markers)) {
-            cut = true;
-            cut_dw = static_cast<u32>(dcb.data() - base);
+        if (!cut) {
+            u32 sop = 0;
+            const u32 at = static_cast<u32>(dcb.data() - base);
+            if (Lean::StaticCheck(full, at, r, senv, sop) != Lean::Stop::None) {
+                cut = true;
+                cut_dw = at;
+            }
         }
         switch (op) {
         case PM4ItOpcode::ClearState:
@@ -1523,11 +1535,16 @@ void LeanCompare(LeanJob& j) {
             c.epoch_bump_op.compare_exchange_strong(none, 0x100u | static_cast<u32>(e & 0xff));
         }
     }
-    c.stops[std::min<u32>(static_cast<u32>(res.stop), 15)] += 1;
+    c.stops[std::min<u32>(static_cast<u32>(res.stop), 31)] += 1;
+    if (Lean::IsStaticStop(res.stop)) {
+        ++c.parity; // the chain should have cut at this packet
+    }
     if (res.stop != Lean::Stop::End && res.stop != Lean::Stop::Cut) {
         c.stop_ops[res.stop_opcode & 255] += 1;
     }
-    if (n_front == ~size_t{0}) {
+    if (j.lag.load(std::memory_order_acquire)) {
+        ++c.lag; // the guest may have rewritten the buffer before the worker read it
+    } else if (n_front == ~size_t{0}) {
         ++c.no_mark;
     } else {
         ++c.cmp;
@@ -1538,6 +1555,8 @@ void LeanCompare(LeanJob& j) {
             ++i;
         }
         if (i != n_front || i != j.worker_canon.size()) {
+            const u64 fe = i < n_front ? j.front_canon[i] : (i < j.worker_canon.size() ? j.worker_canon[i] : 0);
+            c.bad_kind[(fe >> 56) & 31] += 1;
             if (++c.bad <= 24) {
                 LOG_WARNING(Render,
                             "Lean verify: DCB {} differs at event {} of front {} / worker {}: front "
@@ -1653,11 +1672,32 @@ void LeanLog() {
     const u64 now = __rdtsc();
     const double sec = double(now - s.win_tsc) / 3.5e9;
     std::string stops;
-    for (u32 i = 0; i < 16; ++i) {
+    for (u32 i = 0; i < 32; ++i) {
         if (c.stops[i] != 0) {
             stops += fmt::format(" {}={}", i, c.stops[i].load());
         }
     }
+    std::string kinds, misses;
+    for (u32 i = 0; i < 32; ++i) {
+        if (c.bad_kind[i] != 0) {
+            kinds += fmt::format(" {}={}", i, c.bad_kind[i].load());
+            c.bad_kind[i] = 0;
+        }
+    }
+    for (u32 i = 0; i < 8; ++i) {
+        if (g_lean_fault_stats.miss[i] != 0) {
+            misses += fmt::format(" {}={}", i, g_lean_fault_stats.miss[i].load());
+        }
+    }
+    LOG_INFO(Render,
+             "Lean (mode {}) L2 counters: parity breaks {} (gate 0) | lag-excluded jobs {} | BAD by "
+             "first-difference kind:{} | pipeline-miss sub-reasons (cumulative; 1 unsupported stages, 2 "
+             "no program, 3 precompiled first use, 4 no permutation, 5 no pipeline, 6 pending):{} | "
+             "front draws {} NativeRec member-path {} ({:.1f}%)",
+             g_lean, c.parity.load(), c.lag.load(), kinds, misses, c.front_draws.load(),
+             c.front_member.load(),
+             c.front_draws ? 100.0 * double(c.front_member) / double(c.front_draws) : 0.0);
+    c.parity = c.lag = c.front_draws = c.front_member = 0;
     std::string ops;
     for (u32 i = 0; i < 256; ++i) {
         if (c.stop_ops[i] != 0) {
@@ -3499,6 +3539,9 @@ void Liverpool::LeanWorkerLoop(std::stop_token stoken, u32 index) {
         ch.canon = &j.worker_canon;
         j.res = parser.Parse(j.dcb, j.cut_dw, st, ch);
         ch.canon = nullptr;
+        // L1 lag: the back already ran (part of) this DCB, so the game may have rewritten it.
+        j.lag.store(split->DoneSeq() >= j.begin_seq,
+                    std::memory_order_release);
         if (j.done_mask.fetch_or(2, std::memory_order_acq_rel) == 1) {
             LeanCompare(j);
         }
@@ -7251,10 +7294,12 @@ void Liverpool::LeanFrontBegin(std::span<const u32> dcb, std::span<const u32> cc
         j.front_canon.clear();
         j.front_marks.clear();
         j.worker_canon.clear();
+        j.begin_seq = split->EmittedSeq();
+        j.lag.store(false, std::memory_order_relaxed);
         queued = true;
     }
     u32 cut = 0, pkts = 0, draws = 0;
-    LeanChainScan(dcb, s, guest_markers, cut, pkts, draws);
+    LeanChainScan(dcb, s, guest_markers, split_post_dma, cut, pkts, draws);
     s.chain_cyc += __rdtsc() - t0;
     c.pkts += pkts;
     c.draws += draws;
@@ -7280,8 +7325,14 @@ void Liverpool::LeanFrontBegin(std::span<const u32> dcb, std::span<const u32> cc
 
 void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_marker,
                          const CpSplit::DrawArgs& args) {
+    if (g_lean != 0) [[unlikely]] {
+        ++g_lean_s.c.front_draws;
+    }
     if (AmdGpu::NativeRec::g_mode >= 2) [[unlikely]] {
         if (NativeRecMember(header, name, host_marker, args)) {
+            if (g_lean != 0) [[unlikely]] {
+                ++g_lean_s.c.front_member;
+            }
             return;
         }
     }

@@ -144,7 +144,7 @@ constexpr const char* StopNames[] = {
     "none",          "cut",           "end",       "unsupported",    "overrun",
     "hint-missing",  "bad-set-base",  "nop-back",  "dma-sync",       "dma-guard",
     "pipeline-miss", "native-unchecked", "colour-variant-missing", "config",
-    "fault",         "fault-fallback",
+    "fault",         "fault-fallback", "non-vs-draw",
 };
 static_assert(std::size(StopNames) == static_cast<size_t>(Stop::Count));
 
@@ -183,6 +183,7 @@ Parser::Parser(const Env& env_) : env{env_} {
                     env.split_run_ahead && !env.split_verify && NativeRec::g_segb == 0 &&
                     !env.draw_tag_front && !EnvFlag("SHADPS4_DISPATCH_SYNC_STATS") && !SplitHazard::Enabled();
     config_stop = ok ? Stop::None : Stop::Config;
+    static_env = StaticEnv{.guest_markers = env.guest_markers, .split_post_dma = env.split_post_dma};
     viewport_memo = LeanViewportMemoEnabled();
     // Liverpool::BumpEpoch in split mode emits a record only under these flags.
     epoch_records = VideoCore::g_epoch_defer_upload || VideoCore::g_native_coherent != 0;
@@ -230,6 +231,8 @@ Stop Parser::DecideDraw(const PM4Header* header, std::span<const u32> dcb, u32 o
                 return Stop::FaultFallback;
             }
             if (!plan.draw.pipeline) {
+                g_lean_fault_stats.miss[static_cast<u32>(scratch->miss) & 7].fetch_add(
+                    1, std::memory_order_relaxed);
                 return Stop::PipelineMiss;
             }
             if (VideoCore::g_native_pass != 0 && !plan.draw.pipeline->native_checked) {
@@ -374,6 +377,172 @@ void Parser::EmitDraw(const PM4Header* header, const DrawPlan& plan, ChainState&
     out.MaybeLog();
 }
 
+bool IsStaticStop(Stop stop) {
+    switch (stop) {
+    case Stop::Unsupported:
+    case Stop::Overrun:
+    case Stop::HintMissing:
+    case Stop::BadSetBase:
+    case Stop::NopBackEffect:
+    case Stop::DmaSync:
+    case Stop::DmaGuard:
+    case Stop::NonVsDraw:
+        return true;
+    default:
+        return false;
+    }
+}
+
+Stop StaticCheck(std::span<const u32> dcb, u32 off, const Regs& regs, const StaticEnv& env,
+                 u32& opcode) {
+    // The parser's per-packet checks that do not depend on runtime state, in its order.
+    using CR = Liverpool;
+    opcode = 0;
+    const u32 n = static_cast<u32>(dcb.size());
+    const u32 num_regs = static_cast<u32>(regs.reg_array.size());
+    const u32* w = dcb.data() + off;
+    const auto* header = reinterpret_cast<const PM4Header*>(w);
+    if (header->type == 2) {
+        return Stop::None;
+    }
+    if (header->type != 3) {
+        return Stop::Unsupported; // type 0 / 1: the front asserts
+    }
+    const u32 count = header->type3.NumWords();
+    const u32 dwords = count + 1;
+    opcode = static_cast<u32>(header->type3.opcode.Value());
+    if (count == 0) {
+        return Stop::Unsupported;
+    }
+    if (off + dwords > n) {
+        return Stop::Overrun;
+    }
+    switch (static_cast<PM4ItOpcode>(opcode)) {
+    case PM4ItOpcode::Nop:
+        return LeanNopHasBackEffect(header, env.guest_markers) ? Stop::NopBackEffect : Stop::None;
+    case PM4ItOpcode::ContextControl:
+    case PM4ItOpcode::AcquireMem:
+    case PM4ItOpcode::ClearState:
+    case PM4ItOpcode::IndexType:
+    case PM4ItOpcode::IndexBase:
+    case PM4ItOpcode::IndexBufferSize:
+    case PM4ItOpcode::NumInstances:
+        return Stop::None;
+    case PM4ItOpcode::SetConfigReg:
+        return Regs::ConfigRegWordOffset + (w[1] & 0xffff) + (count - 1) > num_regs
+                   ? Stop::Unsupported
+                   : Stop::None;
+    case PM4ItOpcode::SetUconfigReg:
+        return Regs::UconfigRegWordOffset + (w[1] & 0xffff) + (count - 1) > num_regs
+                   ? Stop::Unsupported
+                   : Stop::None;
+    case PM4ItOpcode::SetContextReg: {
+        const u32 reg_addr = Regs::ContextRegWordOffset + (w[1] & 0xffff);
+        if (reg_addr + (count - 1) > num_regs) {
+            return Stop::Unsupported;
+        }
+        u32 hint = ~0u;
+        switch (reg_addr) {
+        case CR::CbColor0Base:
+        case CR::CbColor1Base:
+        case CR::CbColor2Base:
+        case CR::CbColor3Base:
+        case CR::CbColor4Base:
+        case CR::CbColor5Base:
+        case CR::CbColor6Base:
+        case CR::CbColor7Base: {
+            const u32 nop_offset = header->type3.count.Value();
+            if (nop_offset == 0x0e || nop_offset == 0x0d || nop_offset == 0x0b) {
+                hint = nop_offset;
+            }
+            break;
+        }
+        case CR::CbColor0Cmask:
+        case CR::CbColor1Cmask:
+        case CR::CbColor2Cmask:
+        case CR::CbColor3Cmask:
+        case CR::CbColor4Cmask:
+        case CR::CbColor5Cmask:
+        case CR::CbColor6Cmask:
+        case CR::CbColor7Cmask:
+            if (header->type3.count == 0x04) {
+                hint = 0x04;
+            }
+            break;
+        case CR::DbZInfo:
+            if (header->type3.count == 8) {
+                hint = 20;
+            }
+            break;
+        default:
+            break;
+        }
+        if (hint != ~0u) {
+            if (off + 2 + hint + 2 > n) {
+                return Stop::Overrun;
+            }
+            if (w[2 + hint] != ExtentHintHeader) {
+                return Stop::HintMissing;
+            }
+        }
+        return Stop::None;
+    }
+    case PM4ItOpcode::SetShReg: {
+        const u32 reg_off = w[1] & 0xffff;
+        const size_t set_size = size_t{count - 1} * sizeof(u32);
+        if (reg_off >= 0x200 && reg_off <= (0x200 + sizeof(ComputeProgram) / 4)) {
+            const size_t byte_off = size_t{reg_off - 0x200} * sizeof(u32);
+            return set_size > sizeof(ComputeProgram) || byte_off + set_size > sizeof(ComputeProgram)
+                       ? Stop::Unsupported
+                       : Stop::None;
+        }
+        return Regs::ShRegWordOffset + reg_off + (count - 1) > num_regs ? Stop::Unsupported
+                                                                        : Stop::None;
+    }
+    case PM4ItOpcode::SetBase:
+        return reinterpret_cast<const PM4CmdSetBase*>(header)->base_index.Value() !=
+                       PM4CmdSetBase::BaseIndex::DrawIndexIndirPatchTable
+                   ? Stop::BadSetBase
+                   : Stop::None;
+    case PM4ItOpcode::DmaData: {
+        const auto* dma = reinterpret_cast<const PM4DmaData*>(header);
+        if (dma->dst_addr_lo != 0x3022C) {
+            return Stop::Unsupported;
+        }
+        if (!env.split_post_dma) {
+            return Stop::DmaSync;
+        }
+        if (dma->dst_sel == DmaDataDst::Memory || dma->dst_sel == DmaDataDst::MemoryUsingL2) {
+            const VAddr dst = dma->DstAddress<VAddr>();
+            const VAddr dst_end = dst + dma->NumBytes();
+            const auto lo = reinterpret_cast<VAddr>(w);
+            const VAddr hi = lo + size_t{n - off} * sizeof(u32);
+            if (dst < hi && lo < dst_end) {
+                return Stop::DmaGuard;
+            }
+        }
+        return Stop::None;
+    }
+    case PM4ItOpcode::DrawIndex2:
+    case PM4ItOpcode::DrawIndexOffset2:
+    case PM4ItOpcode::DrawIndexAuto:
+        if (regs.stage_enable.raw != AmdGpu::ShaderStageEnable::VgtStages::Vs) {
+            return Stop::NonVsDraw;
+        }
+        if (NativeRec::g_mode >= 2 && static_cast<PM4ItOpcode>(opcode) == PM4ItOpcode::DrawIndex2) {
+            if (off + 8 > n) {
+                return Stop::Overrun;
+            }
+            if (w[6] == 0xc0021000u && w[7] == NativeRec::Magic && off + 10 > n) {
+                return Stop::Overrun;
+            }
+        }
+        return Stop::None;
+    default:
+        return Stop::Unsupported;
+    }
+}
+
 SpanResult Parser::Parse(std::span<const u32> dcb, u32 cut_dw, ChainState& st,
                          CpSplit::Channel& out) {
     SpanResult r{};
@@ -425,6 +594,14 @@ SpanResult Parser::Parse(std::span<const u32> dcb, u32 cut_dw, ChainState& st,
         }
         if (off + dwords > limit) {
             return stop_at(Stop::Cut, off, opcode_u);
+        }
+        {
+            // The shared static predicate first (the chain cut with the same function).
+            u32 sop = 0;
+            const Stop s = StaticCheck(dcb, off, regs, static_env, sop);
+            if (s != Stop::None) {
+                return stop_at(s, off, opcode_u);
+            }
         }
 
         Stop stop = Stop::None;

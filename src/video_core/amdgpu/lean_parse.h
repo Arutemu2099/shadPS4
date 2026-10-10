@@ -106,10 +106,24 @@ enum class Stop : u32 {
     Fault,                ///< a guest read the pre-check found read-protected / unmapped (or a
                           ///< walker it could not interpret): the front parses from here
     FaultFallback,        ///< a fault happened anyway (racing protect; counted, must be 0)
+    NonVsDraw,            ///< a draw packet with a stage setup other than plain Vs (static)
     Count,
 };
 
 const char* StopName(Stop stop);
+
+/// What StaticCheck needs besides the packet and the registers.
+struct StaticEnv {
+    bool guest_markers{};
+    bool split_post_dma{};
+};
+/// Every stop decidable from the packet words of `dcb` at `off` and the registers BEFORE the
+/// packet (L2: the chain's cut and the worker's static stops are this one function). Returns
+/// Stop::None for a packet the worker parses (type-2 padding included); `opcode` = its opcode.
+Stop StaticCheck(std::span<const u32> dcb, u32 off, const Regs& regs, const StaticEnv& env,
+                 u32& opcode);
+/// True for the stops StaticCheck can return (a worker stop with one of these = parity break).
+bool IsStaticStop(Stop stop);
 
 struct SpanResult {
     u32 packets{};     ///< packets fully parsed (type-2 padding included)
@@ -159,6 +173,7 @@ private:
         u64 imm;
     };
     std::unordered_map<const void*, std::vector<WalkOp>> walk_plans; ///< per walker code
+    StaticEnv static_env{};
     struct DrawPlan;
     Stop DecideDraw(const PM4Header* header, std::span<const u32> dcb, u32 off,
                     const char* name, const CpSplit::DrawArgs& args, const ChainState& st,

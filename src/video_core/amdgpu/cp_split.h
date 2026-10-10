@@ -529,6 +529,13 @@ public:
     }
     /// SHADPS4_A2 (any thread): the published end (unmasked). A record whose header position is
     /// below it is complete and immutable until the back releases it.
+    /// Records emitted so far (front) / the newest seq the back has published as done.
+    [[nodiscard]] u64 EmittedSeq() const noexcept {
+        return emitted;
+    }
+    [[nodiscard]] u64 DoneSeq() const noexcept {
+        return done_seq.load(std::memory_order_acquire);
+    }
     [[nodiscard]] u64 PublishedEnd() const noexcept {
         return write_pos.load(std::memory_order_acquire);
     }
