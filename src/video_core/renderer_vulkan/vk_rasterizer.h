@@ -127,6 +127,10 @@ public:
     /// SHADPS4_DRAW_TAG: the game job thread's (slot, sub-run) tag of the draw ExecuteDraw runs
     /// next (0 = untagged), set by Liverpool::ExecuteDrawRecord.
     u32 draw_tag{};
+    /// SHADPS4_NATIVE_REC_RUN: the job-thread run this draw heads (tag 0: none), set by
+    /// Liverpool::ExecuteDrawRecord.
+    u32 nr_head_tag{};
+    u32 nr_head_idx{};
     /// Back thread: runs a dispatch the front looked up. The caller points
     /// Liverpool::BackCsRegs() at the record's ComputeProgram snapshot.
     void ExecuteDispatch(const ComputePipeline* pipeline,
@@ -464,8 +468,19 @@ private:
     static constexpr u32 NativeMaxDraws = 64;
     static constexpr u32 NativeRecBytes = Shader::NativeRecordDwords * 4;
     static constexpr u32 NativeCmdBytes = 20; // VkDrawIndexedIndirectCommand
+    struct NativeRunSpan {
+        VAddr lo{}, hi{}, cpu{};
+        u64 handle{};
+    };
     struct NativeBatch {
         bool open{};
+        // SHADPS4_NATIVE_REC_RUN (stage c1): spans validated once at the open for the job-thread
+        // run the opener heads; valid while the dirty epoch and buffer structure stay put.
+        bool run_valid{};
+        u64 run_epoch{}, run_gen{};
+        std::array<NativeRunSpan, Shader::NUM_BUFFERS> run_buf{};
+        std::array<NativeRunSpan, 16> run_vb{};
+        NativeRunSpan run_ib{};
         bool verify{};
         const GraphicsPipeline* base{};
         u64 seq{};
@@ -524,6 +539,12 @@ private:
     std::array<u32, 0x400> native_ctx{};
     struct NativeStats {
         u64 opens{}, joins{}, open_fail{}, verify_draws{}, verify_mismatch{}, epoch_same{};
+        // SHADPS4_NATIVE_REC_RUN: runs validated / refused (0 ring 1 record 2 infos 3 buffers 4
+        // vertex count 5-7 buffer / vertex / index span), member bindings and vertex-index sets
+        // taken from the spans, verify mismatches.
+        u64 run_ok{}, run_buf_fast{}, run_buf_slow{}, run_vi_fast{}, run_vi_slow{},
+            run_mismatch{};
+        std::array<u64, 8> run_fail{};
         std::array<u64, 16> close{};
         u64 tick_moved{};
         // SHADPS4_NATIVE_COLOUR: colour batches; textured indexed draws (any image binding) and
@@ -561,6 +582,9 @@ private:
     void NativeClose(u32 why);
     void NativeVerifyCompare(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset);
     void NativeLog();
+    void NativeRunValidate(const GraphicsPipeline* base, Pipeline::BufferBarriers* barriers);
+    bool NativeRunVi(const AmdGpu::CpSplit::VertexInputsPayload& vi, u32 index_offset,
+                     VideoCore::NativeJoinVi& out) const;
     /// SHADPS4_DRAW_TAG + SHADPS4_NATIVE_TIMING: the back's real cycles grouped by the game's
     /// runs (consecutive draws with one job-thread tag). cls: 0 shadow join, 1 shadow opener,
     /// 2 colour join, 3 colour opener, 4 full untextured, 5 repeat untextured, 6 full textured,

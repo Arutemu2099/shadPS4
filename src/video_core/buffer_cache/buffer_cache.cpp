@@ -3722,6 +3722,54 @@ void BufferCache::BindVertexBuffersDerived(
         std::span<const vk::DeviceSize>{host_sizes}, std::span<const vk::DeviceSize>{host_strides});
 }
 
+const Buffer* BufferCache::NativeRunSpan(
+    VAddr lo, VAddr hi, NativeRunAccess access,
+    boost::container::small_vector<vk::BufferMemoryBarrier2, 16>* barriers, u64 dispatch_run) {
+    if (lo == 0 || hi <= lo || hi - lo > (u64{64} << 20)) {
+        return nullptr;
+    }
+    const BufferId id = page_table[lo >> CACHING_PAGEBITS].buffer_id;
+    if (!id) {
+        return nullptr;
+    }
+    const Buffer& found = slot_buffers[id];
+    if (found.is_deleted || !found.IsInBounds(lo, hi - lo)) {
+        return nullptr;
+    }
+    const u64 size = memory->ClampRangeSize(lo, hi - lo);
+    const auto [buffer, offset] = ObtainBuffer(lo, static_cast<u32>(size), false);
+    if (buffer != &found) {
+        return nullptr;
+    }
+    switch (access) {
+    case NativeRunAccess::Storage:
+        if (auto barrier = buffer->GetBarrier(vk::AccessFlagBits2::eShaderRead,
+                                              vk::PipelineStageFlagBits2::eAllCommands, 0,
+                                              dispatch_run)) {
+            barriers->emplace_back(*barrier);
+        }
+        break;
+    case NativeRunAccess::Vertex:
+        if (IsRegionGpuModified(lo, size)) {
+            if (auto barrier =
+                    buffer->GetBarrier(vk::AccessFlagBits2::eVertexAttributeRead,
+                                       vk::PipelineStageFlagBits2::eVertexAttributeInput)) {
+                barriers->emplace_back(*barrier);
+            }
+        }
+        break;
+    case NativeRunAccess::Index:
+        if (IsRegionGpuModified(lo, size)) {
+            if (auto barrier = buffer->GetBarrier(vk::AccessFlagBits2::eIndexRead,
+                                                  vk::PipelineStageFlagBits2::eIndexInput)) {
+                barriers->emplace_back(*barrier);
+            }
+        }
+        break;
+    }
+    return buffer;
+}
+
 void BufferCache::NativeJoinVertexIndex(
     const AmdGpu::CpSplit::VertexInputsPayload& vi, u32 index_offset, NativeJoinVi& out,
     boost::container::small_vector<vk::BufferMemoryBarrier2, 16>* barriers) {

@@ -37,6 +37,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/amdgpu/mtb_census.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/amdgpu/native_rec.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/texture_cache/image_view.h"
@@ -2306,6 +2307,212 @@ bool Rasterizer::NativeImageKey(const GraphicsPipeline* base, std::array<u32, 51
     return true;
 }
 
+// SHADPS4_NATIVE_REC_RUN: 1 = members of a validated shadow run take their bindings from the
+// run's spans, 2 = verify (both paths, compare handle / offset; the normal result is used).
+static const int g_native_rec_run = [] {
+    const char* e = std::getenv("SHADPS4_NATIVE_REC_RUN");
+    return e ? std::atoi(e) : 0;
+}();
+
+void Rasterizer::NativeRunValidate(const GraphicsPipeline* base,
+                                   Pipeline::BufferBarriers* barriers) {
+    // SHADPS4_NATIVE_REC_RUN (stage c1, notes/native-path-2026-10-09.md sec. 7): at a shadow
+    // batch's open, if the draw heads a job-thread run, read the members' records and validate one
+    // span per guest buffer slot, vertex stream and the index buffer, each inside ONE existing
+    // buffer; members then take offsets inside the spans (NativeJoin) while the dirty epoch and
+    // the buffer structure generation stay put. Back thread, before the multi-draw is recorded.
+    namespace NR = AmdGpu::NativeRec;
+    auto& b = native_batch;
+    auto& st = native_stats;
+    b.run_valid = false;
+    if (g_native_rec_run == 0 || nr_head_tag == 0 || NR::g_mode < 2) {
+        return;
+    }
+    const auto fail = [&](u32 why) { ++st.run_fail[std::min<u32>(why, 7)]; };
+    const u32 slot = nr_head_tag >> 28;
+    const NR::Record* ring = NR::g_rings[slot].load(std::memory_order_acquire);
+    const u8* payload = NR::g_payloads[slot].load(std::memory_order_acquire);
+    if (!ring || !payload) {
+        return fail(0);
+    }
+    const u32 idx = nr_head_idx;
+    const NR::Record& head = ring[idx & (NR::RingSize - 1)];
+    const u32 count = head.count.load(std::memory_order_acquire);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (head.stamp.load(std::memory_order_relaxed) != idx + 1 || count < 2) {
+        return fail(0);
+    }
+    const u32 n = std::min<u32>(count, NativeMaxDraws);
+    const auto base_stages = base->GetStages();
+    struct Span {
+        VAddr lo{~VAddr{0}}, hi{};
+        void Add(VAddr a, u64 size) {
+            lo = std::min(lo, a);
+            hi = std::max<VAddr>(hi, a + size);
+        }
+    };
+    std::array<Span, Shader::NUM_BUFFERS> sb{};
+    std::array<Span, 16> sv{};
+    Span si{};
+    u64 first_pos = 0;
+    for (u32 k = 1; k < n; ++k) {
+        const u32 mi = idx + k;
+        const NR::Record& r = ring[mi & (NR::RingSize - 1)];
+        if (r.stamp.load(std::memory_order_acquire) != mi + 1) {
+            return fail(1);
+        }
+        const u32 run_k = r.run_k, head_idx = r.head_idx;
+        const bool derived = r.derived != 0;
+        const void* pipeline = r.pipeline;
+        const u32 nvs = r.flat_vs_dw, nps = r.flat_ps_dw, vi_bytes = r.vi_bytes;
+        const u64 pos = r.payload_pos;
+        const auto ud_vs = r.ud_vs;
+        const auto ud_ps = r.ud_ps;
+        const VAddr vs_pgm = VAddr{r.vs_pgm} << 8, ps_pgm = VAddr{r.ps_pgm} << 8;
+        const u64 index_addr = r.index_addr;
+        const u32 index_count = r.index_count;
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (r.stamp.load(std::memory_order_relaxed) != mi + 1 || run_k != k || head_idx != idx ||
+            !derived || !pipeline || nvs > 1024 || nps > 1024 ||
+            vi_bytes < sizeof(AmdGpu::CpSplit::VertexInputsPayload)) {
+            return fail(1);
+        }
+        const auto rstages = static_cast<const GraphicsPipeline*>(pipeline)->GetStages();
+        const u32 vs_i = static_cast<u32>(Shader::LogicalStage::Vertex);
+        const u32 ps_i = static_cast<u32>(Shader::LogicalStage::Fragment);
+        if (rstages[vs_i] != base_stages[vs_i] || rstages[ps_i] != base_stages[ps_i]) {
+            return fail(2);
+        }
+        if (k == 1) {
+            first_pos = pos;
+        }
+        const u8* pl = payload + (pos & (NR::PayloadSize - 1));
+        const u32* flat_vs = reinterpret_cast<const u32*>(pl);
+        const u32* flat_ps = flat_vs + nvs;
+        u32 bi = 0;
+        for (u32 i = 0; i < base_stages.size(); ++i) {
+            const Shader::Info* info = base_stages[i];
+            if (!info) {
+                continue;
+            }
+            if (i != vs_i && i != ps_i) {
+                return fail(2);
+            }
+            Shader::BoundStage bs{};
+            bs.info = info;
+            bs.user_data = std::span<const u32>{i == vs_i ? ud_vs.data() : ud_ps.data(), 16};
+            bs.flattened_ud_buf =
+                std::span<const u32>{i == vs_i ? flat_vs : flat_ps, i == vs_i ? nvs : nps};
+            bs.pgm_base = i == vs_i ? vs_pgm : ps_pgm;
+            for (const auto& desc : info->buffers) {
+                if (bi >= sb.size()) {
+                    return fail(3);
+                }
+                if (b.guest_mask & (u64{1} << bi)) {
+                    const auto vsharp = desc.GetSharp(bs);
+                    if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
+                        return fail(3);
+                    }
+                    sb[bi].Add(vsharp.base_address,
+                               memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize()));
+                }
+                ++bi;
+            }
+        }
+        const auto* hdr = reinterpret_cast<const AmdGpu::CpSplit::VertexInputsPayload*>(
+            pl + (u64(nvs + nps) * 4 + 7) / 8 * 8);
+        if (hdr->count != b.vb_n || hdr->count > sv.size()) {
+            return fail(4);
+        }
+        const auto* att = reinterpret_cast<const AmdGpu::CpSplit::VertexInputAttrib*>(hdr + 1);
+        for (u32 a = 0; a < hdr->count; ++a) {
+            if (att[a].range != AmdGpu::CpSplit::VertexInputNoRange && att[a].base_address != 0 &&
+                att[a].size != 0) {
+                sv[a].Add(att[a].base_address, att[a].size);
+            }
+        }
+        si.Add(index_addr, u64(index_count) * b.index_size);
+    }
+    // The payload is intact only if the job thread has not claimed past the first member's.
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (NR::g_payload_claim[slot].load(std::memory_order_relaxed) - first_pos > NR::PayloadSize) {
+        return fail(1);
+    }
+    // Validate each span once, inside one existing buffer, against the batch's handles.
+    const auto validate = [&](const Span& s, u64 want_handle, VideoCore::NativeRunAccess access,
+                              NativeRunSpan& out) {
+        if (s.hi <= s.lo) {
+            out = {};
+            return true; // unused
+        }
+        const VideoCore::Buffer* buf =
+            buffer_cache.NativeRunSpan(s.lo, s.hi, access, barriers, cur_dispatch_run);
+        if (!buf) {
+            return false;
+        }
+        const u64 handle = std::bit_cast<u64>(static_cast<VkBuffer>(buf->Handle()));
+        if (handle != want_handle) {
+            return false;
+        }
+        out = {.lo = s.lo, .hi = s.hi, .cpu = buf->CpuAddr(), .handle = handle};
+        return true;
+    };
+    for (u32 bi = 0; bi < sb.size(); ++bi) {
+        if ((b.guest_mask & (u64{1} << bi)) &&
+            !validate(sb[bi], b.buf[bi], VideoCore::NativeRunAccess::Storage, b.run_buf[bi])) {
+            return fail(5);
+        }
+    }
+    for (u32 a = 0; a < b.vb_n; ++a) {
+        if (!validate(sv[a], b.vb[a], VideoCore::NativeRunAccess::Vertex, b.run_vb[a])) {
+            return fail(6);
+        }
+    }
+    if (!validate(si, b.ib, VideoCore::NativeRunAccess::Index, b.run_ib)) {
+        return fail(7);
+    }
+    b.run_valid = true;
+    b.run_epoch = VideoCore::g_dirty_epoch.load(std::memory_order_acquire);
+    b.run_gen = buffer_cache.StructGeneration();
+    ++st.run_ok;
+}
+
+bool Rasterizer::NativeRunVi(const AmdGpu::CpSplit::VertexInputsPayload& vi, u32 index_offset,
+                             VideoCore::NativeJoinVi& out) const {
+    // NativeJoinVertexIndex's results from the run's spans, or false when a range is outside.
+    const auto& b = native_batch;
+    const auto* attribs = AmdGpu::CpSplit::VertexInputAttribs(vi);
+    out.n = std::min<u32>(vi.count, static_cast<u32>(out.buf.size()));
+    for (u32 k = 0; k < out.n; ++k) {
+        const auto& a = attribs[k];
+        if (a.range == AmdGpu::CpSplit::VertexInputNoRange) {
+            out.buf[k] = 0;
+            out.off[k] = 0;
+        } else {
+            const auto& s = b.run_vb[k];
+            if (s.handle == 0 || a.base_address < s.lo || a.base_address + a.size > s.hi) {
+                return false;
+            }
+            out.buf[k] = s.handle;
+            out.off[k] = a.base_address - s.cpu;
+        }
+        out.stride[k] = a.desc.stride;
+    }
+    const auto& regs = liverpool->BackRegs();
+    const bool is_index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
+    const u32 index_size = is_index16 ? sizeof(u16) : sizeof(u32);
+    const VAddr index_address =
+        regs.index_base_address.Address<VAddr>() + index_offset * index_size;
+    const u64 index_bytes = u64(regs.num_indices) * index_size;
+    const auto& s = b.run_ib;
+    if (s.handle == 0 || index_address < s.lo || index_address + index_bytes > s.hi) {
+        return false;
+    }
+    out.ib_buf = s.handle;
+    out.ib_off = index_address - s.cpu;
+    return true;
+}
+
 bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline* native,
                             bool is_indexed, u32 index_offset,
                             const AmdGpu::CpSplit::VertexInputsPayload* front_vi, bool colour) {
@@ -2501,6 +2708,9 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
     if (b.verify) {
         b.open = true;
         return true;
+    }
+    if (!colour && g_native_rec_run != 0) [[unlikely]] {
+        NativeRunValidate(base, &buffer_barriers);
     }
     auto& stream = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
     if (!stream.IsCoherent()) {
@@ -2726,6 +2936,16 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
     std::array<u32, Shader::NUM_BUFFERS> rec_size{};
     bool ok = true;
     u32 bi = 0;
+    // SHADPS4_NATIVE_REC_RUN: a run head that joins validates its run's spans here; anything
+    // that records or needs a barrier closes the batch below (carry / RecordSeq checks), as for
+    // the join's own lookups.
+    if (g_native_rec_run != 0 && !b.colour && !b.verify && nr_head_tag != 0) [[unlikely]] {
+        NativeRunValidate(b.base, &native_carry);
+    }
+    // SHADPS4_NATIVE_REC_RUN: spans validated at the open or by this run's head, still valid.
+    const bool run_ok = b.run_valid && !b.verify &&
+                        VideoCore::g_dirty_epoch.load(std::memory_order_acquire) == b.run_epoch &&
+                        buffer_cache.StructGeneration() == b.run_gen;
     for (const auto& bound : BoundStages(b.base)) {
         if (!bound.info) {
             continue;
@@ -2738,6 +2958,43 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
                     break;
                 }
                 const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+                if (run_ok && !desc.is_formatted) {
+                    const auto& s = b.run_buf[bi];
+                    if (s.handle != 0 && vsharp.base_address >= s.lo &&
+                        vsharp.base_address + size <= s.hi) {
+                        const u64 fast_off = vsharp.base_address - s.cpu;
+                        ++native_stats.run_buf_fast; // candidates (verify: compared)
+                        if (g_native_rec_run == 1) {
+                            b.cand_buf[bi] = s.handle;
+                            b.cand_off[bi] = fast_off;
+                            b.cand_size[bi] = size;
+                            rec_size[bi] = static_cast<u32>(std::min<u64>(size, 0xffffffffull));
+                            if (s.handle != b.buf[bi] || fast_off > 0xffffffffull) {
+                                ok = false;
+                            }
+                            rec_off[bi] = static_cast<u32>(fast_off);
+                            ++bi;
+                            continue;
+                        }
+                        // Verify: the normal lookup below must give the same handle / offset.
+                        const auto [vbuf, voff] = buffer_cache.ObtainBuffer(
+                            vsharp.base_address, static_cast<u32>(size), false, desc.is_formatted,
+                            VideoCore::BufferId{}, Common::BufferSampleCaller::Storage);
+                        if (std::bit_cast<u64>(static_cast<VkBuffer>(vbuf->Handle())) != s.handle ||
+                            voff != fast_off) {
+                            if (++native_stats.run_mismatch <= 16) {
+                                LOG_CRITICAL(Render_Vulkan,
+                                             "NativeRun verify MISMATCH: buffer slot {} offset {} "
+                                             "vs {}",
+                                             bi, voff, fast_off);
+                            }
+                        }
+                    } else {
+                        ++native_stats.run_buf_slow;
+                    }
+                } else if (run_ok) {
+                    ++native_stats.run_buf_slow;
+                }
                 const auto [vk_buffer, offset] =
                     buffer_cache.ObtainBuffer(vsharp.base_address, static_cast<u32>(size), false,
                                               desc.is_formatted, VideoCore::BufferId{},
@@ -2768,7 +3025,27 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
     lap(0); // checks + user data + buffers
     VideoCore::NativeJoinVi jvi{};
     if (ok) {
-        buffer_cache.NativeJoinVertexIndex(*front_vi, draw.args.index_offset, jvi, barriers);
+        const bool vi_fast =
+            run_ok && NativeRunVi(*front_vi, draw.args.index_offset, jvi);
+        native_stats.run_vi_fast += vi_fast; // candidates (verify: compared)
+        if (vi_fast && g_native_rec_run == 1) {
+        } else {
+            VideoCore::NativeJoinVi ref{};
+            buffer_cache.NativeJoinVertexIndex(*front_vi, draw.args.index_offset, ref, barriers);
+            if (vi_fast) {
+                bool same = ref.n == jvi.n && ref.ib_buf == jvi.ib_buf && ref.ib_off == jvi.ib_off;
+                for (u32 k = 0; same && k < ref.n; ++k) {
+                    same = ref.buf[k] == jvi.buf[k] && ref.off[k] == jvi.off[k] &&
+                           ref.stride[k] == jvi.stride[k];
+                }
+                if (!same && ++native_stats.run_mismatch <= 16) {
+                    LOG_CRITICAL(Render_Vulkan, "NativeRun verify MISMATCH: vertex / index");
+                }
+            } else if (run_ok) {
+                ++native_stats.run_vi_slow;
+            }
+            jvi = ref;
+        }
     }
     lap(1); // vertex / index
     s64 q = 0;
@@ -3068,6 +3345,15 @@ void Rasterizer::NativeLog() {
                             w[7], w[8], w[9], w[10], w[11]);
             }
         }
+    }
+    if (g_native_rec_run != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "NativeRun: runs validated={} refused (ring/record/infos/buffers/vertex count/"
+                 "buffer span/vertex span/index span)={} {} {} {} {} {} {} {} | member bindings "
+                 "fast={} slow={} | vertex-index fast={} slow={} | verify MISMATCH={}",
+                 st.run_ok, st.run_fail[0], st.run_fail[1], st.run_fail[2], st.run_fail[3],
+                 st.run_fail[4], st.run_fail[5], st.run_fail[6], st.run_fail[7], st.run_buf_fast,
+                 st.run_buf_slow, st.run_vi_fast, st.run_vi_slow, st.run_mismatch);
     }
     if (st.open_fail != 0) {
         std::string lines;

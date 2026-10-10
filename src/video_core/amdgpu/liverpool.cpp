@@ -810,6 +810,8 @@ struct SplitDrawRecord {
     u32 vi_bytes;            ///< FRONT_DERIVE: bytes of the VertexInputsPayload block after the
                              ///< stage blocks (0: none).
     u32 pad;
+    u32 nr_tag;              ///< SHADPS4_NATIVE_REC: the job-thread run this draw heads (0: none)
+    u32 nr_idx;
 };
 static_assert(sizeof(SplitDrawRecord) % 8 == 0);
 
@@ -2007,6 +2009,8 @@ void Liverpool::ExecuteDrawRecord(const CpSplit::RecordHeader& record) {
     // SHADPS4_MTB_P1: split draws translate on the worker instance (P1d).
     Vulkan::Rasterizer& translating = rasterizer->Translating();
     translating.draw_tag = rec.pad;
+    translating.nr_head_tag = rec.nr_tag;
+    translating.nr_head_idx = rec.nr_idx;
     MtbConflict::g_in_draw = MtbConflict::g_enabled;
     SCOPE_EXIT {
         MtbConflict::g_in_draw = false;
@@ -3355,6 +3359,8 @@ bool Liverpool::NativeRecMember(const PM4Header* header, const char* name, bool 
     rec->verify = 0;
     rec->vi_bytes = vi_bytes;
     rec->pad = 0;
+    rec->nr_tag = 0;
+    rec->nr_idx = 0;
     std::memcpy(reinterpret_cast<u8*>(rec + 1), local.data(), body);
     split->Commit();
     if (split_run_ahead) {
@@ -3545,6 +3551,8 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
     rec->verify = verify;
     rec->vi_bytes = vi_bytes;
     rec->pad = tag;
+    rec->nr_tag = 0;
+    rec->nr_idx = 0;
     // Copied now: the front's next lookup rewrites these Info fields (inventory 4.4). With
     // run-ahead this is what makes the record self-contained: the back reads user data, flat
     // buffer and pgm_base only from here, and the Info only for its immutable part.
@@ -3569,6 +3577,10 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
                       draw.draw_class == Vulkan::Rasterizer::DrawClass::Draw && !draw.skip,
                       vi_bytes, reinterpret_cast<const u8*>(rec + 1),
                       rec->stage_count);
+        if (g_nr_run.active && g_nr_run.next_k == 1) {
+            rec->nr_tag = g_nr_run.tag;
+            rec->nr_idx = g_nr_run.head_idx;
+        }
         auto& st = g_nr_mst;
         st.c_normal += __rdtsc() - t_nr;
         if ((++st.n_normal & 0x3ffff) == 0) {

@@ -85,6 +85,8 @@ class MemoryTracker;
 class PageManager;
 class ReadbackQueue;
 
+enum class NativeRunAccess : u32 { Storage, Vertex, Index };
+
 class BufferCache {
 public:
     static constexpr u32 CACHING_PAGEBITS = 14;
@@ -183,6 +185,12 @@ public:
     /// lookups / syncs BindVertexBuffersDerived and BindIndexBuffer make, without recording
     /// anything; host handles and offsets go to `out`. With `barriers` non-null the hazard state
     /// is advanced exactly as those functions do and any barrier is appended there.
+    /// SHADPS4_NATIVE_REC_RUN (stage c1): the one existing buffer that contains [lo, hi) - no
+    /// creation, no merge - synced once through ObtainBuffer, with the barrier the access needs
+    /// appended to `barriers`. nullptr when the span is not inside one buffer or over 64 MB.
+    const Buffer* NativeRunSpan(VAddr lo, VAddr hi, NativeRunAccess access,
+                                boost::container::small_vector<vk::BufferMemoryBarrier2, 16>* barriers,
+                                u64 dispatch_run);
     void NativeJoinVertexIndex(const AmdGpu::CpSplit::VertexInputsPayload& vi, u32 index_offset,
                                NativeJoinVi& out,
                                boost::container::small_vector<vk::BufferMemoryBarrier2, 16>* barriers);
