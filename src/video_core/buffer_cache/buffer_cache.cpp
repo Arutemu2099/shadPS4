@@ -19,6 +19,7 @@
 #include "common/scope_exit.h"
 #include "common/thread.h"
 #include "core/memory.h"
+#include "shader_recompiler/native_emit.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/mtb_census.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -634,7 +635,10 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       memory{Core::Memory::Instance()}, texture_cache{texture_cache_}, page_manager{tracker},
       fault_manager{instance, scheduler, *this, CACHING_PAGEBITS, CACHING_NUMPAGES},
       staging_buffer{instance, scheduler, MemoryUsage::Upload, StagingBufferSize},
-      stream_buffer{instance, scheduler, MemoryUsage::Stream, UboStreamBufferSize},
+      // eShaderDeviceAddress: SHADPS4_NATIVE_SEG reads a batch's record list from it by pointer.
+      stream_buffer{instance, scheduler, MemoryUsage::Stream, UboStreamBufferSize,
+                    Shader::g_native_seg != 0 ? vk::BufferUsageFlagBits::eShaderDeviceAddress
+                                              : vk::BufferUsageFlags{}},
       download_buffer{instance, scheduler, MemoryUsage::Download, DownloadBufferSize},
       device_buffer{instance, scheduler, MemoryUsage::DeviceLocal, DeviceBufferSize},
       gds_buffer{instance, scheduler, MemoryUsage::Stream, 0, AllFlags, DataShareBufferSize},

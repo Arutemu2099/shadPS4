@@ -1446,6 +1446,7 @@ Rasterizer::Rasterizer(Rasterizer& primary, WorkerTag)
     tex_bind_memo = primary.tex_bind_memo;
     native_pt_on = primary.native_pt_on;
     native_pt_extra = primary.native_pt_extra;
+    native_seg_on = primary.native_seg_on;
 }
 
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
@@ -1467,6 +1468,14 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     if (Shader::g_native_pt != 0) {
         LOG_INFO(Render_Vulkan, "NativePt: mode {}{}", Shader::g_native_pt,
                  native_pt_on ? "" : " (needs SHADPS4_NATIVE_GPU_DIRECT=1; off)");
+    }
+    native_seg_on = Shader::g_native_seg != 0 && native_pt_on;
+    if (Shader::g_native_seg != 0) {
+        LOG_INFO(Render_Vulkan, "NativeSeg: mode {}{}{}", Shader::g_native_seg,
+                 native_seg_on ? "" : " (needs SHADPS4_NATIVE_GPU_DIRECT=1 and SHADPS4_NATIVE_PT; off)",
+                 Shader::g_native_seg == 2 && !Shader::g_native_seg_compare
+                     ? " (the compare needs SHADPS4_NATIVE_PT=2; running as 1)"
+                     : "");
     }
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
@@ -3275,6 +3284,9 @@ Rasterizer* g_ring_owner = nullptr;
 std::mutex g_ring_mutex;
 std::array<VideoCore::StreamBuffer*, AmdGpu::NativeRec::MaxSlots> g_ring_bufs{};
 } // namespace
+// SHADPS4_NATIVE_SEG: the shaders' ring mask and pseudo-slot mirror the job ring's constants.
+static_assert(AmdGpu::NativeRec::RingSize - 1 == Shader::NativeSegRingMask);
+static_assert(AmdGpu::NativeRec::MaxSlots == Shader::NativeSegLegacySlot);
 
 void Rasterizer::NativeGpuRingInit(Rasterizer* owner) {
     std::scoped_lock lk{g_ring_mutex};
@@ -3291,12 +3303,19 @@ u32* Rasterizer::NativeGpuRingAlloc(u32 slot) {
     }
     auto*& buf = g_ring_bufs[slot];
     if (!buf) {
+        // eShaderDeviceAddress: SHADPS4_NATIVE_SEG reads the records by pointer.
         buf = new VideoCore::StreamBuffer(r->instance, r->scheduler, VideoCore::MemoryUsage::Stream,
-                                          u64(NR::RingSize) * NR::GpuRecDwords * sizeof(u32));
+                                          u64(NR::RingSize) * NR::GpuRecDwords * sizeof(u32),
+                                          Shader::g_native_seg != 0
+                                              ? vk::BufferUsageFlagBits::eShaderDeviceAddress
+                                              : vk::BufferUsageFlags{});
     }
     if (buf->mapped_data.empty() || !buf->IsCoherent()) {
         LOG_WARNING(Render_Vulkan, "NativeGpu: ring of slot {} is not mapped coherent memory", slot);
         return nullptr;
+    }
+    if (Shader::g_native_seg != 0) {
+        NR::g_gpu_bda[slot].store(buf->BufferDeviceAddress(), std::memory_order_release);
     }
     NR::g_gpu_handles[slot].store(std::bit_cast<u64>(static_cast<VkBuffer>(buf->Handle())),
                                   std::memory_order_release);
@@ -4279,11 +4298,14 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
     }
     no_lap(4); // ring prepare
     const u64 table_bytes = gpu_direct ? Shader::NativeTableDwords * 4 : 0;
+    // SHADPS4_NATIVE_SEG: the batch's record list (a u32 per draw) after the count.
+    const u64 seg_bytes = native_seg_on ? u64(NativeMaxDraws) * 4 : 0;
     auto& stream = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
     if (!stream.IsCoherent()) {
         return fail(__LINE__);
     }
-    const u64 total = u64(NativeMaxDraws) * (NativeRecBytes + NativeCmdBytes) + 16 + table_bytes;
+    const u64 total =
+        u64(NativeMaxDraws) * (NativeRecBytes + NativeCmdBytes) + 16 + table_bytes + seg_bytes;
     const u64 seq_before_map = scheduler.RecordSeq();
     const u64 tick_before_map = scheduler.CurrentTick();
     const auto [map_ptr, map_off] = stream.Map(total, instance.StorageMinAlignment(), false);
@@ -4313,6 +4335,12 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
                 native_ring_table[Shader::NativeTablePtFallback] = static_cast<u32>(fb);
                 native_ring_table[Shader::NativeTablePtFallback + 1] = static_cast<u32>(fb >> 32);
             }
+        }
+        if (native_seg_on) [[unlikely]] {
+            const u64 list_off = u64(NativeMaxDraws) * (NativeRecBytes + NativeCmdBytes) + 16;
+            NativeSegOpen(stream.BufferDeviceAddress() + offset,
+                          stream.BufferDeviceAddress() + offset + list_off,
+                          reinterpret_cast<u32*>(ptr + list_off));
         }
         std::memcpy(map_ptr, native_ring_table.data(), table_bytes);
     }
@@ -5894,6 +5922,33 @@ void Rasterizer::NativePtRecord(u32* rec, const std::array<u64, Shader::NUM_BUFF
     std::memcpy(rec + Shader::NativeRecordHiOffset, hi.data(), sizeof(hi));
 }
 
+void Rasterizer::NativeSegOpen(u64 recs_addr, u64 list_addr, u32* list) {
+    // SHADPS4_NATIVE_SEG (sec. 20 brick A), NativeOpen before the table copy: the table's slot
+    // addresses (every job ring's; NativeSegLegacySlot = this batch's own records at recs_addr)
+    // and the list's address; then the whole list, once: member i's record is ring entry
+    // ring_idx0 + i of the opener's job slot (a ring join appends at ring_idx0 + n;
+    // NativeRingPrepare set first_idx = idx + 1) or record i of the batch's own buffer.
+    // Sequential stores into write-combined memory only.
+    namespace NR = AmdGpu::NativeRec;
+    auto& table = native_ring_table;
+    const auto put = [&](u32 slot, u64 addr) {
+        table[Shader::NativeTableSlotAddr + 2 * slot] = static_cast<u32>(addr);
+        table[Shader::NativeTableSlotAddr + 2 * slot + 1] = static_cast<u32>(addr >> 32);
+    };
+    for (u32 s = 0; s < NR::MaxSlots; ++s) {
+        put(s, NR::g_gpu_bda[s].load(std::memory_order_acquire));
+    }
+    put(Shader::NativeSegLegacySlot, recs_addr);
+    table[Shader::NativeTableSegList] = static_cast<u32>(list_addr);
+    table[Shader::NativeTableSegList + 1] = static_cast<u32>(list_addr >> 32);
+    const auto& b = native_batch;
+    const u32 slot_bits = (b.ring ? draw_job_tag >> 28 : Shader::NativeSegLegacySlot) << 24;
+    const u32 idx0 = b.ring ? draw_job_idx : 0u;
+    for (u32 i = 0; i < NativeMaxDraws; ++i) {
+        list[i] = slot_bits | ((idx0 + i) & Shader::NativeSegRingMask);
+    }
+}
+
 void Rasterizer::NativeLog() {
     const auto& st = native_stats;
     std::string closes;
@@ -5920,6 +5975,21 @@ void Rasterizer::NativeLog() {
                             "{:08x} draw {} guest {:02x}_{:08x}",
                             (w[7] & 0xff) == 2 ? "ps" : "vs", w[0], w[7] >> 8, w[1], w[2], w[3],
                             w[4], w[6], w[5]);
+            }
+        }
+        if (native_seg_on && Shader::g_native_seg_compare) {
+            // SHADPS4_NATIVE_SEG=2: the same buffer, counter dword 1, entries from dword 2048.
+            LOG_INFO(Render_Vulkan, "NativeSeg compare: {} mismatching record words", d[1]);
+            if (d[1] != 0 && native_seg_logged < 4) {
+                ++native_seg_logged;
+                for (u32 e = 0; e < 64 && e < d[1]; ++e) {
+                    const u32* w = d + 2048 + e * 16;
+                    LOG_WARNING(Render_Vulkan,
+                                "NativeSeg compare: {} word {} entry {:08x} ptr {:08x} ssbo "
+                                "{:08x} draw {} record {:08x}_{:08x}",
+                                (w[7] & 0xff) == 2 ? "ps" : "vs", w[0], w[1], w[2], w[3], w[4],
+                                w[6], w[5]);
+                }
             }
         }
     }

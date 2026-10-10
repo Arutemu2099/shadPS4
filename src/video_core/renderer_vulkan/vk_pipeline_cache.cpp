@@ -1199,6 +1199,9 @@ void PipelineCache::PrepareNativeVariant(const GraphicsPipeline* base) {
                 Shader::t_native_emit.pt_compare = Shader::g_native_pt == 2 && Shader::g_native_ring;
                 Shader::t_native_emit.pagetable_binding = rb + 2;
                 Shader::t_native_emit.pt_debug_binding = rb + 3;
+                Shader::t_native_emit.seg = Shader::g_native_seg != 0 && Shader::t_native_emit.pt;
+                Shader::t_native_emit.seg_compare =
+                    Shader::g_native_seg_compare && Shader::t_native_emit.pt;
             }
             ~NativeEmitScope() {
                 Shader::t_native_emit = {};
@@ -1580,6 +1583,9 @@ void PipelineCache::PrepareNativeColour(const GraphicsPipeline* base,
     emit.pt_compare = Shader::g_native_pt == 2 && emit.ring;
     emit.pagetable_binding = emit.table_binding + 1;
     emit.pt_debug_binding = emit.table_binding + 2;
+    // SHADPS4_NATIVE_SEG (sec. 20 brick A): records by pointer through the batch's list.
+    emit.seg = Shader::g_native_seg != 0 && emit.pt;
+    emit.seg_compare = Shader::g_native_seg_compare && emit.pt;
     // SHADPS4_NATIVE_BINDLESS (sec. 12): the PS samples the global arrays; the VS has no image
     // or sampler, the PS at most 16 of each, all sampled (no storage, no mip fallback).
     emit.bindless = [&] {

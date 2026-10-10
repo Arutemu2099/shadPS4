@@ -736,7 +736,8 @@ public:
 class StreamBuffer : public Buffer {
 public:
     explicit StreamBuffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
-                          MemoryUsage usage, u64 size_bytes_);
+                          MemoryUsage usage, u64 size_bytes_,
+                          vk::BufferUsageFlags extra_flags = {});
 
     bool IsCoherent() const noexcept {
         return is_coherent;

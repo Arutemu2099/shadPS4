@@ -253,6 +253,7 @@ public:
     Id vertex_index{};
     Id NativeRecordLoad(u32 dword);
     Id NativeTableLoad(u32 dword);
+    Id NativeTableLoad(Id dword);
     bool native_bindless{};
     Id draw_index{};          // SHADPS4_NATIVE_PASS: DrawIndex built-in (native variant VS)
     Id native_records{};      // SHADPS4_NATIVE_PASS: records SSBO (uint data[])
@@ -286,6 +287,13 @@ public:
     std::array<Id, NUM_BUFFERS> native_guest_hi{};
     void NativePtTranslate(u32 handle, u32 binding, Id record_word, Id inherited);
     void NativePtMismatch(u32 handle, Id rel_index, Id pt_bits, Id desc_bits, u32 width);
+    // SHADPS4_NATIVE_SEG (sec. 20 brick A): the record is read by pointer (NativeRecordLoad)
+    // from the batch's list entry; =2 every word is also read the SSBO way and compared.
+    bool native_seg{};
+    bool native_seg_compare{};
+    Id native_rec_ptr{};   // u64 device address of this draw's record
+    Id native_seg_entry{}; // the list entry (compare entries)
+    void NativeSegRecordPointer(Id draw);
     std::array<Id, IR::NumParams> native_attr_value{}; // VS: pulled vec4 per fetch semantic
     Id NativeVbufLoad(Id dword_index);
     Id NativePullAttribute(u32 location, Id vertex_index_value);
@@ -427,6 +435,7 @@ public:
 
     Id get_bda_pointer{};
     Id native_pt_report{}; // SHADPS4_NATIVE_PT=2: void(binding, rel, pt, desc, draw, lo, hi, tag)
+    Id native_seg_report{}; // SHADPS4_NATIVE_SEG=2: void(word, entry, ptr, ssbo, draw, lo, hi, tag)
 
     Id read_const{};
     Id read_const_dynamic{};
@@ -453,7 +462,7 @@ private:
     Id DefineUfloatM5ToFloat32(u32 mantissa_bits, std::string_view name);
 
     Id DefineGetBdaPointer();
-    Id DefineNativePtReport();
+    Id DefineNativePtReport(std::string_view name, u32 counter_dword, u32 entries_dword);
 
     Id DefineReadConst(bool dynamic);
 

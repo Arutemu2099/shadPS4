@@ -129,6 +129,8 @@ inline std::array<std::atomic<RunUnion*>, MaxSlots> g_unions{};
 /// VkBuffer handle per slot.
 inline std::atomic<u32* (*)(u32 slot)> g_gpu_alloc{nullptr};
 inline std::array<std::atomic<u64>, MaxSlots> g_gpu_handles{};
+/// SHADPS4_NATIVE_SEG: the ring's device address (published before its handle; 0: none).
+inline std::array<std::atomic<u64>, MaxSlots> g_gpu_bda{};
 /// The job thread's next ring index (relaxed; the back's ring-lifetime check).
 inline std::array<std::atomic<u32>, MaxSlots> g_job_next{};
 

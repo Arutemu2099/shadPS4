@@ -653,6 +653,12 @@ private:
     u32 native_pt_extra{};
     std::unique_ptr<VideoCore::Buffer> native_pt_dbg;
     u32 native_pt_logged{};
+    /// SHADPS4_NATIVE_SEG (sec. 20 brick A): records addressed through a per-batch list by
+    /// pointer; on = the flag with pt on. The open writes the table's slot addresses and the
+    /// list (compare entries share native_pt_dbg: dword 1, entries from dword 2048).
+    bool native_seg_on{};
+    u32 native_seg_logged{};
+    void NativeSegOpen(u64 recs_addr, u64 list_addr, u32* list);
     /// The back's own (legacy) record in pt mode: guest address low 32 bits in the Guest offset
     /// words and the hi bytes (vertex hi bytes 0: unused by the shaders).
     void NativePtRecord(u32* rec, const std::array<u64, Shader::NUM_BUFFERS>& addr) const;

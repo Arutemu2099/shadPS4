@@ -81,6 +81,8 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
                       info.l_stage == LogicalStage::Fragment;
     native_pt = native_ring && Shader::t_native_emit.pt;
     native_pt_compare = native_pt && Shader::t_native_emit.pt_compare;
+    native_seg = native_pt && Shader::t_native_emit.seg;
+    native_seg_compare = native_seg && Shader::t_native_emit.seg_compare;
     if (info.uses_dma || native_pt) {
         SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
     } else {
@@ -252,7 +254,11 @@ void EmitContext::DefineBufferProperties() {
                 OpStore(native_draw_out, draw);
             }
         }
-        if (native_ring) {
+        if (native_seg) {
+            // SHADPS4_NATIVE_SEG: the record by pointer; the SSBO index below only for =2.
+            NativeSegRecordPointer(draw);
+        }
+        if (native_ring && (!native_seg || native_seg_compare)) {
             // SHADPS4_NATIVE_GPU_DIRECT: entry (first + draw) & mask of the records buffer.
             draw = OpBitwiseAnd(U32[1],
                                 OpIAdd(U32[1], NativeTableLoad(Shader::NativeTableFirst), draw),
@@ -1082,7 +1088,11 @@ void EmitContext::NativePtMismatch(u32 handle, Id rel_index, Id pt_bits, Id desc
                    ConstU32(tag));
 }
 
-Id EmitContext::DefineNativePtReport() {
+Id EmitContext::DefineNativePtReport(std::string_view name, u32 counter_dword,
+                                     u32 entries_dword) {
+    // void(a, b, x, y, c, d, e, tag): when x != y, count at the compare SSBO's counter_dword and
+    // store the 8 words as entry (count < 64 ? count : 64) from entries_dword (NATIVE_PT=2 at
+    // 0 / 16, NATIVE_SEG=2 at 1 / 2048).
     const Id func_type{TypeFunction(void_id, U32[1], U32[1], U32[1], U32[1], U32[1], U32[1],
                                     U32[1], U32[1])};
     const Id func{OpFunction(void_id, spv::FunctionControlMask::MaskNone, func_type)};
@@ -1090,7 +1100,7 @@ Id EmitContext::DefineNativePtReport() {
     for (auto& param : p) {
         param = OpFunctionParameter(U32[1]);
     }
-    Name(func, "native_pt_report");
+    Name(func, name);
     AddLabel();
     const Id report_label{OpLabel()};
     const Id merge_label{OpLabel()};
@@ -1098,10 +1108,12 @@ Id EmitContext::DefineNativePtReport() {
     OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
     OpBranchConditional(bad, report_label, merge_label);
     AddLabel(report_label);
-    const Id ptr0{OpAccessChain(native_records_ptr, native_pt_dbg, u32_zero_value, u32_zero_value)};
+    const Id ptr0{OpAccessChain(native_records_ptr, native_pt_dbg, u32_zero_value,
+                                ConstU32(counter_dword))};
     const Id old{OpAtomicIAdd(U32[1], ptr0, ConstU32(1u), u32_zero_value, ConstU32(1u))};
     const Id slot{OpSelect(U32[1], OpULessThan(U1[1], old, ConstU32(64u)), old, ConstU32(64u))};
-    const Id base{OpIAdd(U32[1], ConstU32(16u), OpIMul(U32[1], slot, ConstU32(16u)))};
+    const Id base{
+        OpIAdd(U32[1], ConstU32(entries_dword), OpIMul(U32[1], slot, ConstU32(16u)))};
     for (u32 i = 0; i < p.size(); ++i) {
         OpStore(OpAccessChain(native_records_ptr, native_pt_dbg, u32_zero_value,
                               OpIAdd(U32[1], base, ConstU32(i))),
@@ -1112,6 +1124,38 @@ Id EmitContext::DefineNativePtReport() {
     OpReturn();
     OpFunctionEnd();
     return func;
+}
+
+void EmitContext::NativeSegRecordPointer(Id draw) {
+    // SHADPS4_NATIVE_SEG (sec. 20 brick A): the batch's list entry of this draw (by pointer, at
+    // the table's list address) names the record: slot in bits 24..31 (a job thread's ring, or
+    // NativeSegLegacySlot = the batch's own records; clamped so a bad entry stays inside the
+    // table), ring index in the low bits (masked by the ring size). The slot's device address
+    // is in the table. Once per invocation (VS: DrawIndex, PS: the flat draw varying).
+    const auto u64_of = [&](Id lo32, Id hi32) {
+        return OpBitwiseOr(U64, OpUConvert(U64, lo32),
+                           OpShiftLeftLogical(U64, OpUConvert(U64, hi32), ConstU32(32u)));
+    };
+    const auto load_ptr = [&](Id addr) {
+        return OpLoad(U32[1], OpConvertUToPtr(physical_pointer_type_u32, addr),
+                      spv::MemoryAccessMask::Aligned, 4u);
+    };
+    const Id list{u64_of(NativeTableLoad(Shader::NativeTableSegList),
+                         NativeTableLoad(Shader::NativeTableSegList + 1))};
+    const Id entry{load_ptr(OpIAdd(
+        U64, list, OpUConvert(U64, OpShiftLeftLogical(U32[1], draw, ConstU32(2u)))))};
+    Name(entry, "native_seg_entry");
+    const Id slot{OpUMin(U32[1], OpShiftRightLogical(U32[1], entry, ConstU32(24u)),
+                         ConstU32(Shader::NativeSegSlots - 1))};
+    const Id word{OpIAdd(U32[1], ConstU32(Shader::NativeTableSlotAddr),
+                         OpShiftLeftLogical(U32[1], slot, ConstU32(1u)))};
+    const Id base{u64_of(NativeTableLoad(word), NativeTableLoad(OpIAdd(U32[1], word, ConstU32(1u))))};
+    const Id ridx{OpBitwiseAnd(U32[1], entry, ConstU32(Shader::NativeSegRingMask))};
+    native_rec_ptr = OpIAdd(
+        U64, base,
+        OpUConvert(U64, OpIMul(U32[1], ridx, ConstU32(Shader::NativeRecordDwords * 4))));
+    Name(native_rec_ptr, "native_rec_ptr");
+    native_seg_entry = entry;
 }
 
 Id EmitContext::NativeVbufLoad(Id dword_index) {
@@ -1317,6 +1361,10 @@ Id EmitContext::NativeTableLoad(u32 dword) {
                   OpAccessChain(native_records_ptr, native_table, u32_zero_value, ConstU32(dword)));
 }
 
+Id EmitContext::NativeTableLoad(Id dword) {
+    return OpLoad(U32[1], OpAccessChain(native_records_ptr, native_table, u32_zero_value, dword));
+}
+
 Id EmitContext::LoadImage(const TextureDefinition& texture) {
     if (!texture.bindless) {
         return OpLoad(texture.image_type, texture.id);
@@ -1339,6 +1387,26 @@ Id EmitContext::LoadSampler(u32 index) {
 }
 
 Id EmitContext::NativeRecordLoad(u32 dword) {
+    if (native_seg) {
+        // SHADPS4_NATIVE_SEG: the word through the record pointer; =2 the SSBO word too, a
+        // mismatch reported through the branching helper (the pointer's value is what the draw
+        // uses, so a mismatch is also visible on screen).
+        const Id addr{OpIAdd(U64, native_rec_ptr, Constant(U64, u64{dword} * 4))};
+        const Id value{OpLoad(U32[1], OpConvertUToPtr(physical_pointer_type_u32, addr),
+                              spv::MemoryAccessMask::Aligned, 4u)};
+        if (native_seg_compare) {
+            const Id index{OpIAdd(U32[1], native_rec_base, ConstU32(dword))};
+            const Id ssbo{OpLoad(
+                U32[1], OpAccessChain(native_records_ptr, native_records, u32_zero_value, index))};
+            const u32 tag = (l_stage == LogicalStage::Fragment ? 2u : 1u) | (dword << 8);
+            OpFunctionCall(void_id, native_seg_report, ConstU32(dword), native_seg_entry, value,
+                           ssbo, native_draw, OpUConvert(U32[1], native_rec_ptr),
+                           OpUConvert(U32[1], OpShiftRightLogical(U64, native_rec_ptr,
+                                                                  ConstU32(32u))),
+                           ConstU32(tag));
+        }
+        return value;
+    }
     const Id index{OpIAdd(U32[1], native_rec_base, ConstU32(dword))};
     return OpLoad(U32[1], OpAccessChain(native_records_ptr, native_records, u32_zero_value, index));
 }
@@ -1803,7 +1871,10 @@ void EmitContext::DefineFunctions() {
         get_bda_pointer = DefineGetBdaPointer();
     }
     if (native_pt_compare && Sirit::ValidId(native_pt_dbg)) {
-        native_pt_report = DefineNativePtReport();
+        native_pt_report = DefineNativePtReport("native_pt_report", 0, 16);
+    }
+    if (native_seg_compare && Sirit::ValidId(native_pt_dbg)) {
+        native_seg_report = DefineNativePtReport("native_seg_report", 1, 2048);
     }
 
     if (True(info.readconst_types & Info::ReadConstType::Immediate)) {

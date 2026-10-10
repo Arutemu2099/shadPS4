@@ -87,6 +87,15 @@ struct NativeEmit {
     /// arrays (set 1, binding 0 / 1) at the record's slot words NativeRecordImgOffset + i /
     /// NativeRecordSmpOffset + j. Set-0 numbering is unchanged.
     bool bindless{};
+    /// SHADPS4_NATIVE_SEG (sec. 20 brick A; ring + pt only): draw i's record is named by the
+    /// batch's u32 list at the table's NativeTableSegList address: entry = list[i], slot =
+    /// entry >> 24 (a job thread's ring, NativeSegLegacySlot = the batch's own records), ring
+    /// index = entry & NativeSegRingMask; record = the slot's device address (table) + index x
+    /// NativeRecordDwords x 4, every record word a PhysicalStorageBuffer load. The records
+    /// SSBO stays declared and bound (layout unchanged). =2: each word is also read the SSBO
+    /// way and mismatches go to the pt compare SSBO (dword 1 count, entries from dword 2048).
+    bool seg{};
+    bool seg_compare{};
 };
 inline thread_local NativeEmit t_native_emit{};
 
@@ -132,10 +141,20 @@ constexpr u32 NativeTableSize = NativeTableUd + NUM_USER_DATA_REGS; // 80
 constexpr u32 NativeTablePtLo = NativeTableSize + NUM_BUFFERS;             // 120
 constexpr u32 NativeTablePtHi = NativeTablePtLo + NUM_BUFFERS;             // 160
 constexpr u32 NativeTablePtFallback = NativeTablePtHi + NativeRecordHiDwords; // 170, 171
-constexpr u32 NativeTableDwords = 192;
+/// SHADPS4_NATIVE_SEG: per job slot the u64 device address of its record ring, slot
+/// NativeSegLegacySlot the batch's own records; then the u64 address of the batch's record list
+/// (a u32 per draw: slot << 24 | ring index). The ring mask is the job ring's (asserted against
+/// AmdGpu::NativeRec::RingSize in vk_rasterizer.cpp).
+constexpr u32 NativeSegLegacySlot = 16; // = AmdGpu::NativeRec::MaxSlots
+constexpr u32 NativeSegSlots = NativeSegLegacySlot + 1;
+constexpr u32 NativeSegRingMask = (1u << 14) - 1;
+constexpr u32 NativeTableSlotAddr = 176;                                       // 176..209
+constexpr u32 NativeTableSegList = NativeTableSlotAddr + 2 * NativeSegSlots; // 210, 211
+constexpr u32 NativeTableDwords = 256;
 static_assert(NativeTableInhSlots + 2 <= NativeTableUd);
 static_assert(NativeTableSize + NUM_BUFFERS <= NativeTablePtLo);
-static_assert(NativeTablePtFallback + 2 <= NativeTableDwords);
+static_assert(NativeTablePtFallback + 2 <= NativeTableSlotAddr);
+static_assert(NativeTableSegList + 2 <= NativeTableDwords);
 /// SHADPS4_NATIVE_GPU_DIRECT=1: native variants are compiled in ring mode.
 inline const bool g_native_ring = [] {
     const char* v = std::getenv("SHADPS4_NATIVE_GPU_DIRECT");
@@ -147,6 +166,14 @@ inline const int g_native_pt = [] {
     const char* v = std::getenv("SHADPS4_NATIVE_PT");
     return v && (v[0] == '1' || v[0] == '2') && v[1] == 0 ? v[0] - '0' : 0;
 }();
+/// SHADPS4_NATIVE_SEG=1 / 2 (meaningful with GPU_DIRECT=1 and NATIVE_PT only): native variants
+/// read their records by pointer through the batch's list; 2 = compare against the SSBO path
+/// (through NATIVE_PT=2's compare SSBO, so it needs that mode: otherwise it runs as 1).
+inline const int g_native_seg = [] {
+    const char* v = std::getenv("SHADPS4_NATIVE_SEG");
+    return v && (v[0] == '1' || v[0] == '2') && v[1] == 0 ? v[0] - '0' : 0;
+}();
+inline const bool g_native_seg_compare = g_native_seg == 2 && g_native_pt == 2;
 /// The highest location the flat draw-index varying may use (with 4 built-in components the
 /// 128-component output budget allows locations up to 30; one spare).
 constexpr u32 NativeDrawIndexMaxLocation = 29;
