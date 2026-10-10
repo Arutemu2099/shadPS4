@@ -5774,6 +5774,18 @@ void BufferCache::CoherenceSync(bool bounded, u32 bound_lo) {
     const bool ok = DirtyLog::DrainTo(coherent_head, end, [this](u64 first, u64 count, bool) {
         coherent_runs.emplace_back(first, count);
     });
+    if (bounded && ok && end != tail) {
+        // The bound is the front's view; the front runs ahead of the back, so the CP's own guest
+        // writes (bit 10; before this point in stream order) may sit after it (s451: 75 missed
+        // pages at load). Peek past the bound for them; they are drained again later (clean then).
+        u64 peek = coherent_head;
+        DirtyLog::DrainTo(peek, tail, [this, &cs](u64 first, u64 count, bool by_cp) {
+            if (by_cp) {
+                ++cs.cp_peeked;
+                coherent_runs.emplace_back(first, count);
+            }
+        });
+    }
     const u64 bytes0 = sync_upload_bytes_total;
     if (!ok || !coherent_live) {
         // First point, or log entries were lost: every cached buffer, whole (rare: loading).
@@ -5812,11 +5824,11 @@ void BufferCache::CoherenceSync(bool bounded, u32 bound_lo) {
     if ((cs.points & 0x7fff) == 0) {
         LOG_INFO(Render,
                  "NativeCoherent: mode={} points={} (bounded {}) sweeps={} runs={} uploaded={} KB "
-                 "cycles/point={:.0f} (max {}) dma_syncs={} created={} | skips={} span_skips={} | "
+                 "cycles/point={:.0f} (max {}) dma_syncs={} created={} cp_peeked={} | skips={} span_skips={} | "
                  "verify: checked={} late={} cp={} BAD={} raced={} bytes={} KB",
                  g_native_coherent, cs.points, cs.bounded, cs.sweeps, cs.runs, cs.bytes >> 10,
                  double(cs.cyc) / double(cs.points), cs.max_cyc, cs.dma_syncs, cs.created,
-                 cs.skips, cs.span_skips, cs.verified, cs.v_late, cs.v_cp, cs.v_bad, cs.v_raced,
+                 cs.cp_peeked, cs.skips, cs.span_skips, cs.verified, cs.v_late, cs.v_cp, cs.v_bad, cs.v_raced,
                  cs.v_bytes >> 10);
         cs.max_cyc = 0;
     }
@@ -5840,18 +5852,24 @@ void BufferCache::CoherentVerify(Buffer& buffer, VAddr addr, u32 size) {
     const u64 hi = (addr + size + TRACKER_BYTES_PER_PAGE - 1) >> TRACKER_PAGE_BITS;
     bool late = false;
     bool cp = false;
+    u64 cp_page = 0;
     u64 head = coherent_head;
     const bool ok = DirtyLog::DrainTo(head, ~u64{0}, [&](u64 first, u64 count, bool by_cp) {
         if (first < hi && lo < first + count) {
             (by_cp ? cp : late) = true;
+            if (by_cp) {
+                cp_page = first;
+            }
         }
     });
     if (!ok) {
         ++cs.v_raced;
     } else if (cp) {
         if (++cs.v_cp <= 20) {
-            LOG_ERROR(Render, "NativeCoherent verify: CP-written page not synced, {:#x}+{:#x} ({} B)",
-                      addr, size, uploaded);
+            LOG_ERROR(Render,
+                      "NativeCoherent verify: CP-written page not synced, {:#x}+{:#x} ({} B), CP "
+                      "entry page {:#x}",
+                      addr, size, uploaded, cp_page << TRACKER_PAGE_BITS);
         }
     } else if (late) {
         ++cs.v_late;

@@ -782,7 +782,8 @@ private:
     u64 coherent_head{DirtyLog::Start()};
     std::vector<std::pair<u64, u64>> coherent_runs;
     struct CoherentStats {
-        u64 points{}, bounded{}, sweeps{}, runs{}, bytes{}, cyc{}, max_cyc{}, dma_syncs{};
+        u64 points{}, bounded{}, sweeps{}, runs{}, bytes{}, cyc{}, max_cyc{}, dma_syncs{},
+            cp_peeked{};
         u64 skips{}, span_skips{}, created{}, verified{}, v_late{}, v_cp{}, v_bad{}, v_raced{},
             v_bytes{};
     } coherent_stats;
