@@ -59,6 +59,7 @@
 
 #include "common/assert.h"
 #include "common/decoder.h"
+#include "shader_recompiler/frontend/decode.h"
 #include "video_core/amdgpu/lean_front_api.h"
 #include "video_core/amdgpu/lean_parse.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -265,9 +266,12 @@ Stop Parser::DecideDraw(const PM4Header* header, std::span<const u32> dcb, u32 o
         if (const auto* fetch = scratch->fetch_shader) {
             // One V# per fetch attribute, read through a user-data pointer (Info::ReadUdReg).
             for (const auto& attrib : fetch->attributes) {
-                if (attrib.sgpr_base == Shader::IR::NumScalarRegs ||
-                    attrib.sgpr_base + 1u >= vslot.user_data.size()) {
-                    continue; // from the user data itself (no guest read) / bound by ReadUdReg
+                if (attrib.sgpr_base == Shader::IR::NumScalarRegs) {
+                    continue; // from the user data itself (no guest read)
+                }
+                if (attrib.sgpr_base + 1u >= vslot.user_data.size()) {
+                    g_lean_fault_stats.precheck[3].fetch_add(1, std::memory_order_relaxed);
+                    return Stop::Fault; // ReadUdReg would build a pointer past the user data
                 }
                 const u64 base = (u64{vslot.user_data[attrib.sgpr_base]} |
                                   (u64{vslot.user_data[attrib.sgpr_base + 1u]} << 32)) &
@@ -785,7 +789,8 @@ bool Parser::ReadOk(VAddr addr, u64 size, u32 kind) const {
     return true;
 }
 
-bool Parser::HeaderOk(VAddr code) const {
+bool Parser::HeaderOk(VAddr code, const AmdGpu::BinaryInfo*& found) const {
+    found = nullptr;
     // AmdGpu::SearchBinaryInfo's reads, each page checked before it is touched.
     if (code >= (u64{1} << 40)) {
         g_lean_fault_stats.precheck[7].fetch_add(1, std::memory_order_relaxed);
@@ -802,6 +807,7 @@ bool Parser::HeaderOk(VAddr code) const {
             return false;
         }
         if (reinterpret_cast<const AmdGpu::BinaryInfo*>(info)->Valid()) {
+            found = reinterpret_cast<const AmdGpu::BinaryInfo*>(info);
             return true;
         }
     }
@@ -817,11 +823,84 @@ bool Parser::HeaderOk(VAddr code) const {
             checked_end = page_end;
         }
         if (reinterpret_cast<const AmdGpu::BinaryInfo*>(at)->Valid()) {
+            found = reinterpret_cast<const AmdGpu::BinaryInfo*>(at);
             return true;
         }
     }
     g_lean_fault_stats.precheck[7].fetch_add(1, std::memory_order_relaxed); // no header: the front asserts
     return false;
+}
+
+bool Parser::FetchOk(const Shader::Info& info, std::span<const u32> ud) const {
+    // Gcn::GetFetchShaderCode (unmasked pointer) + DecodeFetchShader + the attributes' V#s.
+    auto& st = g_lean_fault_stats;
+    const auto bad = [&] {
+        st.precheck[7].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    };
+    const u32 sb = info.fetch_shader_sgpr_base;
+    if (sb + 1u >= ud.size()) {
+        return bad();
+    }
+    const VAddr code = u64{ud[sb]} | (u64{ud[sb + 1u]} << 32);
+    if (code >= (u64{1} << 40)) {
+        return bad();
+    }
+    struct Load {
+        u32 dword_offset;
+        u32 base_sgpr;
+    };
+    std::array<Load, 104> loads{};
+    Shader::Gcn::GcnDecodeContext decoder;
+    VAddr checked_end = code; // [code, checked_end) verified
+    VAddr pos = code;
+    for (u32 n = 0;; ++n) {
+        if (n == 1024) {
+            return bad();
+        }
+        while (pos + 16 > checked_end) { // an instruction is at most 12 bytes
+            const VAddr page_end = (checked_end & ~VAddr{0xfff}) + 0x1000;
+            if (!ReadOk(checked_end, page_end - checked_end, 6)) {
+                return false;
+            }
+            checked_end = page_end;
+        }
+        Shader::Gcn::GcnCodeSlice slice(reinterpret_cast<const u32*>(pos),
+                                        reinterpret_cast<const u32*>(checked_end));
+        const auto inst = decoder.decodeInstruction(slice);
+        if (inst.length == 0) {
+            return bad();
+        }
+        pos += inst.length;
+        if (inst.opcode == Shader::Gcn::Opcode::S_SETPC_B64) {
+            return true;
+        }
+        if (inst.inst_class == Shader::Gcn::InstClass::ScalarMemRd) {
+            const u32 d = inst.dst[0].code;
+            if (d >= loads.size()) {
+                return bad();
+            }
+            loads[d] = Load{inst.control.smrd.offset, inst.src[0].code * 2u};
+            continue;
+        }
+        if (inst.inst_class == Shader::Gcn::InstClass::VectorMemBufFmt) {
+            const u32 b = inst.src[2].code * 4u;
+            if (b >= loads.size()) {
+                return bad();
+            }
+            const u32 sgpr = loads[b].base_sgpr;
+            if (sgpr == Shader::IR::NumScalarRegs) {
+                continue; // ReadUdReg reads the user data itself (host)
+            }
+            if (sgpr + 1u >= ud.size()) {
+                return bad();
+            }
+            const VAddr base = (u64{ud[sgpr]} | (u64{ud[sgpr + 1u]} << 32)) & 0xFFFFFFFFFFFFull;
+            if (!ReadOk(base + u64{loads[b].dword_offset} * 4, sizeof(AmdGpu::Buffer), 2)) {
+                return false;
+            }
+        }
+    }
 }
 
 bool Parser::Prewalk(const Regs& regs) {
@@ -841,6 +920,7 @@ bool Parser::Prewalk(const Regs& regs) {
         const u32 out_idx = static_cast<u32>(out);
         sc.pre_params[out_idx].reset();
         sc.pre_flat[out_idx].clear();
+        sc.pre_missing[out_idx] = false;
         if (!regs.stage_enable.IsStageEnabled(in_idx)) {
             continue;
         }
@@ -848,17 +928,28 @@ bool Parser::Prewalk(const Regs& regs) {
         if (!pgm || !pgm->Address<u32*>()) {
             continue;
         }
-        if (!HeaderOk(pgm->Address<VAddr>())) {
+        const AmdGpu::BinaryInfo* bin = nullptr;
+        if (!HeaderOk(pgm->Address<VAddr>(), bin)) {
             return false;
         }
-        const auto params = AmdGpu::GetParams(*pgm);
+        // AmdGpu::GetParams from the checked header (no second search, no memo).
+        const Shader::ShaderParams params{
+            .user_data = pgm->user_data,
+            .code = std::span<const u32>{pgm->Address<u32*>(), bin->length / sizeof(u32)},
+            .hash = bin->shader_hash,
+        };
         sc.pre_params[out_idx] = params;
         g_lean_fault_stats.lock_takes.fetch_add(1, std::memory_order_relaxed);
         const Shader::Info* info = env.pipeline_cache->ProgramInfoFor(params.hash);
         if (!info) {
-            continue; // the lookup misses on it before using the flat buffer
+            sc.pre_missing[out_idx] = true; // the lookup misses on it (no flat buffer built)
+            continue;
         }
         if (!CheckedWalk(*info, params.user_data.data(), sc.pre_flat[out_idx])) {
+            return false;
+        }
+        if (out == Shader::LogicalStage::Vertex && info->has_fetch_shader &&
+            !FetchOk(*info, params.user_data)) {
             return false;
         }
     }

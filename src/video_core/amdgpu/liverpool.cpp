@@ -1585,9 +1585,14 @@ void LeanCompare(LeanJob& j) {
                     fr += fmt::format(" {:x}", j.front_canon[k]);
                     wk += fmt::format(" {:x}", j.worker_canon[k]);
                 }
-                LOG_WARNING(Render, "Lean verify user data: DCB {} event {}: logical stage {} user-data "
-                                    "slot {}: TRUE (registers) {:#x} front {:#x} worker {:#x} -> {}",
-                            j.index.load(), i, stage, slot, tv, static_cast<u32>(j.front_canon[i]),
+                LOG_WARNING(Render, "Lean verify user data: DCB {} event {}: stages_en {:#x} ({}) logical "
+                                    "stage {} user-data slot {}: TRUE (registers) {:#x} front {:#x} worker "
+                                    "{:#x} -> {}",
+                            j.index.load(), i, static_cast<u32>(truth->stage_enable.raw),
+                            truth->stage_enable.raw == AmdGpu::ShaderStageEnable::VgtStages::Vs
+                                ? "plain Vs"
+                                : "NOT plain Vs",
+                            stage, slot, tv, static_cast<u32>(j.front_canon[i]),
                             static_cast<u32>(j.worker_canon[i]),
                             tv == static_cast<u32>(j.front_canon[i])
                                 ? "worker wrong"

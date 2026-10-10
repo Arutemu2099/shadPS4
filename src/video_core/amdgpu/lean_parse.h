@@ -149,7 +149,10 @@ private:
     /// IsMapped + AnyReadProtected for one guest read; `kind` 0 SRT, 2 V#.
     bool ReadOk(VAddr addr, u64 size, u32 kind) const;
     /// The shader header search (AmdGpu::SearchBinaryInfo) page-checked; kind 6 / 7.
-    bool HeaderOk(VAddr code) const;
+    bool HeaderOk(VAddr code, const AmdGpu::BinaryInfo*& found) const;
+    /// Gcn::ParseFetchShader's reads page-checked: the fetch code (decoded to S_SETPC_B64) and
+    /// the V# of every attribute (Info::ReadUdReg); kinds 6 / 7 (code), 2 / 3 (V#).
+    bool FetchOk(const Shader::Info& info, std::span<const u32> user_data) const;
     struct WalkOp {
         u8 op;
         s32 disp;

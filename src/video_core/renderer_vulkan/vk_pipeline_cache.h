@@ -162,6 +162,8 @@ struct GraphicsLookupScratch {
     bool prewalked{};
     std::array<std::optional<Shader::ShaderParams>, MaxShaderStages> pre_params{};
     std::array<std::vector<u32>, MaxShaderStages> pre_flat{};
+    /// The program was not in program_cache at the prewalk (no flat buffer was built): a miss.
+    std::array<bool, MaxShaderStages> pre_missing{};
 };
 
 class PipelineCache {

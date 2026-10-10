@@ -27,6 +27,7 @@
 #include "shader_recompiler/native_emit.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/runtime_info.h"
+#include "video_core/amdgpu/lean_front_api.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
 #include "video_core/native_census.h"
@@ -2650,10 +2651,15 @@ PipelineCache::Resolve PipelineCache::ResolveStageReadOnly(
         return Resolve::Unbound;
     }
     const bool pre = out.prewalked && out.pre_params[out_idx].has_value();
+    if (AmdGpu::t_lean_worker && !pre) [[unlikely]] {
+        out.miss = Miss::NoProgram; // a lean worker never reads guest memory under the lock
+        return Resolve::Miss;
+    }
     const auto params = pre ? *out.pre_params[out_idx] : AmdGpu::GetParams(*pgm);
     const auto it = program_cache.find(params.hash);
-    if (it == program_cache.end()) {
-        out.miss = Miss::NoProgram; // the front would translate and compile it
+    if (it == program_cache.end() || (pre && out.pre_missing[out_idx])) {
+        out.miss = Miss::NoProgram; // the front would translate and compile it (or: published
+                                    // after the worker's prewalk, which built no flat buffer)
         return Resolve::Miss;
     }
     const Program& program = *it->second;
