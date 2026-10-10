@@ -3666,12 +3666,17 @@ void NotePacket(PM4ItOpcode opcode, const PM4Header* header, u32 count, bool gue
     case PM4ItOpcode::DrawIndexIndirectCountMulti:
         break;
     case PM4ItOpcode::SetShReg: {
-        // The job walker's ranges: VS user data 0x4c-0x5b, PS user data 0x0c-0x1b.
+        // The job walker's ranges: VS user data 0x4c-0x5b, PS user data 0x0c-0x1b. v2 (SEGX):
+        // the program registers (PGM_LO / HI / RSRC1 / RSRC2, VS 0x48-0x4b, PS 0x08-0x0b: the
+        // game binds a shader copy per object) continue too - the next draw's pipeline
+        // identity check closes when the pipeline really differs.
         const u32 off = reinterpret_cast<const PM4CmdSetData*>(header)->reg_offset;
         const u32 n = count - 1;
         const bool vs = off >= 0x4c && off + n <= 0x5c;
         const bool ps = off >= 0x0c && off + n <= 0x1c;
-        kind = (vs || ps) ? PkNone : PkSh;
+        const bool vs_pgm = s.segx && off >= 0x48 && off + n <= 0x4c;
+        const bool ps_pgm = s.segx && off >= 0x08 && off + n <= 0x0c;
+        kind = (vs || ps || vs_pgm || ps_pgm) ? PkNone : PkSh;
         if (kind == PkSh && s.open) {
             s.sh_off.Note(off);
         }
