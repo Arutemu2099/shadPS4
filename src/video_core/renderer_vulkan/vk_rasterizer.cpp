@@ -5429,7 +5429,7 @@ const GraphicsPipeline* Rasterizer::NativeDirectCandidate(
     // The normal path's single-draw rule (advisor ~01:15: without it, singles became openers
     // at ~13 k instead of generic draws at ~7.9 k): open only if the next queued draw shares the
     // pipeline.
-    if (segx_pending == nullptr && liverpool->NativePeekNextDraw(pipeline) == 0) {
+    if (segx_left == 0 && liverpool->NativePeekNextDraw(pipeline) == 0) {
         ++native_stats.nd_fail[10];
         return nullptr;
     }
@@ -7382,7 +7382,7 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
                 const char* e = std::getenv("SHADPS4_NATIVE_COLOUR_PEEK");
                 return !e || e[0] != '0';
             }();
-            if (colour && peek) {
+            if (colour && peek && segx_left == 0) {
                 const int next = liverpool->NativePeekNextDraw(pipeline);
                 ++(next > 0 ? native_stats.peek_yes
                             : next == 0 ? native_stats.peek_no : native_stats.peek_unknown);

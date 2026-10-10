@@ -3417,7 +3417,7 @@ struct State {
     u32 nidx0{}, ninst0{};
     // Counters, reset at every log.
     u64 draws{}, in_seg{}, segments{}, mat_sum{}, inh_members{};
-    u64 posted{}, posted_members{}, op_range{}, op_st{}, op_cull{};
+    u64 posted{}, posted_members{}, op_range{}, op_st{}, op_cull{}, singles{};
     std::array<u64, 7> hist{}; ///< closed segments by member count 1/2-3/4-7/8-15/16-31/32-63/64
     std::array<u64, 4> mat_hist{};
     std::array<u64, NumReasons> close{}, outside{};
@@ -3536,6 +3536,7 @@ void PostSegment(State& s) {
     }
     ++s.posted;
     s.posted_members += s.n;
+    s.singles += s.n == 1;
     for (u32 i = 0; i < n_ops; ++i) {
         (ops[i].kind == CpSplit::SegOpDrawRange ? s.op_range
          : ops[i].kind == CpSplit::SegOpStencil  ? s.op_st
@@ -3628,12 +3629,12 @@ void MaybeLog(State& s) {
         LOG_INFO(Render,
                  "NativeSegX front: mode {} segment records posted={} members={} ops: draw "
                  "ranges={} stencil={} cull={} | state changes pending at a close (dropped, no "
-                 "member followed): stencil={} cull={}",
+                 "member followed): stencil={} cull={} | singles returned={}",
                  s.exec ? 1 : 2, s.posted, s.posted_members, s.op_range, s.op_st, s.op_cull,
-                 s.drop_st, s.drop_cull);
+                 s.drop_st, s.drop_cull, s.singles);
     }
     s.draws = s.in_seg = s.segments = s.mat_sum = s.inh_members = 0;
-    s.posted = s.posted_members = s.op_range = s.op_st = s.op_cull = 0;
+    s.posted = s.posted_members = s.op_range = s.op_st = s.op_cull = s.singles = 0;
     s.hist.fill(0);
     s.mat_hist.fill(0);
     s.close.fill(0);
@@ -4355,7 +4356,7 @@ namespace {
 /// 6 Guest union, 7 ops, 8 segment prepare failed, 9 the open was not reached, 10 other.
 struct SegXBack {
     u64 segments{}, members{}, ok{}, refused{}, op_range{}, op_st{}, op_cull{}, cycles{};
-    u64 replayed{}, replayed_members{};
+    u64 replayed{}, replayed_members{}, singles{};
     std::array<u64, 12> why{};
     u32 logged{};
     u32 calls{};
@@ -4384,8 +4385,48 @@ void Liverpool::ExecuteSegmentRecord(const CpSplit::RecordHeader& record) {
     }
     const auto* vi =
         drec->vi_bytes != 0 ? reinterpret_cast<const CpSplit::VertexInputsPayload*>(body) : nullptr;
-    const u64 t0 = __rdtsc();
     Vulkan::Rasterizer& tr = rasterizer->Translating();
+    if (seg->n == 1) {
+        // Brick C v3 item 1: a single-member segment is an ordinary draw of today's path (no
+        // evaluation, no segment open); in =1 its withheld record runs here with ITS draw
+        // registers and stencil / cull state (the mirror holds the next draw's).
+        ++s.singles;
+        if (NR::g_segx == 1 && seg->n_rec >= 1) {
+            auto& mregs = mirror->regs;
+            constexpr u32 ctx0 = Regs::ContextRegWordOffset;
+            const auto save_ib = mregs.index_base_address;
+            const u32 save_ni = mregs.num_indices;
+            const auto save_inst = mregs.num_instances;
+            const auto save_it = mregs.index_buffer_type;
+            const u32 save_sf = mregs.reg_array[ctx0 + 0x10C];
+            const u32 save_sb = mregs.reg_array[ctx0 + 0x10D];
+            const u32 save_pc = mregs.reg_array[ctx0 + 0x205];
+            for (u32 i = 0; i < seg->n_ops && ops[i].kind != CpSplit::SegOpDrawRange; ++i) {
+                if (ops[i].kind == CpSplit::SegOpStencil) {
+                    mregs.reg_array[ctx0 + 0x10C] = ops[i].a;
+                    mregs.reg_array[ctx0 + 0x10D] = ops[i].b;
+                } else if (ops[i].kind == CpSplit::SegOpCull) {
+                    mregs.reg_array[ctx0 + 0x205] = ops[i].a;
+                }
+            }
+            std::memcpy(&mregs.index_base_address, &seg->index_base0, sizeof(u64));
+            mregs.num_indices = seg->num_indices0;
+            mregs.num_instances.num_instances = seg->num_instances0;
+            mregs.index_buffer_type.raw = seg->index_type;
+            tr.segx_pending = nullptr;
+            tr.segx_left = 0;
+            ExecuteDrawRecord(record, drec);
+            mregs.index_base_address = save_ib;
+            mregs.num_indices = save_ni;
+            mregs.num_instances = save_inst;
+            mregs.index_buffer_type = save_it;
+            mregs.reg_array[ctx0 + 0x10C] = save_sf;
+            mregs.reg_array[ctx0 + 0x10D] = save_sb;
+            mregs.reg_array[ctx0 + 0x205] = save_pc;
+        }
+        return;
+    }
+    const u64 t0 = __rdtsc();
     u32 why = 0;
     bool ok = tr.NativeSegEvaluate(*seg, drec->draw.pipeline, vi, list, why);
     if (NR::g_segx == 1) {
@@ -4423,8 +4464,10 @@ void Liverpool::ExecuteSegmentRecord(const CpSplit::RecordHeader& record) {
         tr.segx_cmds = cmds;
         tr.segx_list = list;
         tr.segx_result = 0;
+        tr.segx_left = seg->n - 1;
         ExecuteDrawRecord(record, drec);
         tr.segx_pending = nullptr;
+        tr.segx_left = 0;
         if (ok) {
             ok = tr.segx_result == 1;
             why = ok ? 0 : tr.segx_result == 0 ? 9 : tr.segx_result;
@@ -4447,7 +4490,9 @@ void Liverpool::ExecuteSegmentRecord(const CpSplit::RecordHeader& record) {
                     mregs.index_base_address.base_addr_hi = static_cast<u32>(addr >> 32);
                     mregs.num_indices = c[0];
                     mregs.num_instances.num_instances = c[1];
+                    tr.segx_left = seg->n - 1 - j;
                     ExecuteDrawRecord(record, recs + seg->rec_off[j]);
+                    tr.segx_left = 0;
                     ++s.replayed_members;
                 }
             }
@@ -4494,14 +4539,14 @@ void Liverpool::ExecuteSegmentRecord(const CpSplit::RecordHeader& record) {
              "NativeSegX: mode {} segments={} members={} evaluated ok={} refused={} (variant {} "
              "lifetime {} index_union {} vertex_union {} vertex_bufs {} guest_union {} ops {} "
              "prepare {} open {} other {}) ops: draw ranges={} stencil={} cull={} | cycles per "
-             "segment open {:.0f} | replayed segments={} members={}",
+             "segment open {:.0f} | replayed segments={} members={} | singles returned={}",
              NR::g_segx, s.segments, s.members, s.ok, s.refused, s.why[1], s.why[2], s.why[3],
              s.why[4], s.why[5], s.why[6], s.why[7], s.why[8], s.why[9], s.why[10] + s.why[11],
              s.op_range, s.op_st, s.op_cull,
              s.segments ? double(s.cycles) / double(s.segments) : 0.0, s.replayed,
-             s.replayed_members);
+             s.replayed_members, s.singles);
     s.segments = s.members = s.ok = s.refused = s.op_range = s.op_st = s.op_cull = s.cycles = 0;
-    s.replayed = s.replayed_members = 0;
+    s.replayed = s.replayed_members = s.singles = 0;
     s.why.fill(0);
 }
 

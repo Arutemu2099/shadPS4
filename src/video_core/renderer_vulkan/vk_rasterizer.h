@@ -155,6 +155,10 @@ public:
     const u32* segx_cmds{};
     const u32* segx_list{};
     u32 segx_result{};
+    /// Brick C v3 item 1: draws of the Segment record being executed that still run after the
+    /// current one (member 0 of a segment of n: n - 1; a replayed member j: n - 1 - j). While it
+    /// is > 0 the single-draw peek is skipped: the next POSTED record is not a member.
+    u32 segx_left{};
     /// SHADPS4_NATIVE_REC_PREP (notes/native-path-2026-10-09.md sec. 9): the open batch's run
     /// members prepared from the job records (records + indirect commands in the batch slots,
     /// count not advanced); each is confirmed at its own draw record (NativePrepConfirm).
