@@ -1247,14 +1247,6 @@ void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
     u32 kn = 0;
     bool key_ok = true;
     bool key_inh = false;
-    const auto add_zero = [&](u32 words) {
-        if (kn + words > key.size()) {
-            key_ok = false;
-            return;
-        }
-        std::memset(&key[kn], 0, words * sizeof(u32));
-        kn += words;
-    };
     const auto add_key = [&](const auto& sharp) {
         constexpr u32 words = static_cast<u32>(sizeof(sharp) / sizeof(u32));
         if (kn + words > key.size()) {
@@ -1332,29 +1324,29 @@ void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
             }
             ++bi;
         }
-        // A T# / S# read straight from inherited registers: zeros of the same width in the key
-        // and ImgInhBit; the back compares members with the opener's job key only (the inherited
-        // registers themselves are compared with the opener's at every confirm, sec. 11).
-        const auto inh_sharp = [&](u32 idx, u32 words) {
-            return idx < 16 && ((u64{inh} >> idx) & ((u64{1} << words) - 1)) != 0;
+        // A T# / S# word read straight from an inherited register: 0 in the key (ImgInhBit).
+        // Only those words - the known words still tell materials apart (advisor: s418 showed
+        // half-inherited 4-register groups). The back compares members with the opener's job
+        // key; the inherited registers themselves are compared with the opener's at every
+        // confirm (sec. 11).
+        const auto add_key_inh = [&](const auto& sharp, u32 idx, u32 reg_words) {
+            const u32 at = kn;
+            add_key(sharp);
+            if (!key_ok || idx >= 16) {
+                return;
+            }
+            for (u32 w = 0; w < reg_words && idx + w < 16; ++w) {
+                if ((inh >> (idx + w)) & 1) {
+                    key[at + w] = 0;
+                    key_inh = true;
+                }
+            }
         };
         for (const auto& desc : info->images) {
-            const auto sharp = desc.GetSharp(bs);
-            if (inh_sharp(desc.sharp_idx, desc.is_r128 ? 4u : 8u)) {
-                key_inh = true;
-                add_zero(static_cast<u32>(sizeof(sharp) / sizeof(u32)));
-            } else {
-                add_key(sharp);
-            }
+            add_key_inh(desc.GetSharp(bs), desc.sharp_idx, desc.is_r128 ? 4u : 8u);
         }
         for (const auto& desc : info->samplers) {
-            const auto sharp = desc.GetSharp(bs);
-            if (!desc.is_inline_sampler && inh_sharp(desc.sharp_idx, 4u)) {
-                key_inh = true;
-                add_zero(static_cast<u32>(sizeof(sharp) / sizeof(u32)));
-            } else {
-                add_key(sharp);
-            }
+            add_key_inh(desc.GetSharp(bs), desc.sharp_idx, desc.is_inline_sampler ? 0u : 4u);
         }
     }
     rec.img_n = key_ok ? (kn | (key_inh ? NR::ImgInhBit : 0u)) : ~0u;
