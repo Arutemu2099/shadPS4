@@ -4598,7 +4598,7 @@ bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::I
         bl.sampler_gen = sg;
     }
     if (bl.img_cache.empty()) {
-        bl.img_cache.resize(4096);
+        bl.img_cache.resize(16384);
         bl.smp_cache.resize(1024);
     }
     const Shader::BoundStage* fs = nullptr;
@@ -4633,13 +4633,18 @@ bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::I
         std::array<u32, 8> words;
         static_assert(sizeof(tsharp) == sizeof(words));
         std::memcpy(words.data(), &tsharp, sizeof(words));
-        u64 hsh = std::bit_cast<u64>(&desc) * 0x9E3779B97F4A7C15ull;
+        // Keyed by the T# words + the descriptor bits ImageDesc depends on (BindTextures'
+        // decoded-image cache uses the same three), so pipelines sharing a texture share it.
+        const void* dkey = reinterpret_cast<const void*>(
+            uintptr_t(desc.is_depth) | uintptr_t(desc.is_array) << 1 | uintptr_t(desc.is_r128) << 2 |
+            uintptr_t(1) << 8);
+        u64 hsh = std::bit_cast<u64>(dkey) * 0x9E3779B97F4A7C15ull;
         for (const u32 w : words) {
             hsh = (hsh ^ w) * 0x100000001B3ull;
         }
         auto& e = bl.img_cache[(hsh ^ (hsh >> 29)) & (bl.img_cache.size() - 1)];
         const u64 tc0 = __rdtsc();
-        if (e.gen == bl.img_gen && e.desc == &desc && e.words == words &&
+        if (e.gen == bl.img_gen && e.desc == dkey && e.words == words &&
             texture_cache.BindlessEntryValid(e.id, e.uid, e.tex_gen, e.local, e.overlap)) {
             auto& image = texture_cache.PeekImage(e.id);
             if (image.backing == e.backing && image.backing->state_serial == e.serial) {
@@ -4692,7 +4697,7 @@ bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::I
             device.updateDescriptorSets(w, {});
             bl.view_slot.emplace(vkey, slot);
         }
-        e = {&desc,
+        e = {dkey,
              words,
              bl.img_gen,
              slot,
@@ -4700,8 +4705,11 @@ bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::I
              image.image_uid,
              texture_cache.StructGeneration(),
              std::atomic_ref<u64>{image.overlap_epoch}.load(std::memory_order_relaxed),
-             image.info.guest_address == idesc.info.guest_address &&
-                 image.info.guest_size == idesc.info.guest_size,
+             // Contained (not only exact): an image registered on any page of this T#'s range
+             // is on the found image's pages too and bumps its overlap epoch.
+             idesc.info.guest_address >= image.info.guest_address &&
+                 idesc.info.guest_address + idesc.info.guest_size <=
+                     image.info.guest_address + image.info.guest_size,
              image.backing,
              image.backing->state_serial,
              vh,
