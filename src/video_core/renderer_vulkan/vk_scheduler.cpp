@@ -1581,6 +1581,11 @@ void Scheduler::LaneSwitch(u32 stream) {
     t_lane_mode = stream == 1;
     Rc().native_heaps_bound = false;
     VideoCore::g_record_stream = stream;
+    if (stream == 1) {
+        // p1e: inline lane records do not pass the worker; move RecordSeq() ("nothing recorded
+        // since") so draw repeat / native joins / dispatch runs see them.
+        ++synchronous_borrows;
+    }
 }
 
 void Scheduler::LaneSubmit() {
@@ -1646,8 +1651,8 @@ u64 Scheduler::LaneCutNow() {
 
 void Scheduler::LaneLabelCut() {
     ++lane_c[4];
+    // p1e: mark only; the segment is cut at the next main flush (or by a fault download).
     lane_label_value = asc_dirty ? open_asc_value : asc_last_submitted.load();
-    LaneSubmitIfOpen(); // p1d: a deferred segment goes out right after the open batch's flush
 }
 
 void Scheduler::LaneFallbackMain() {
@@ -1655,7 +1660,15 @@ void Scheduler::LaneFallbackMain() {
     if (!lane_enabled) {
         return;
     }
-    const u64 newest = asc_dirty ? LaneCutNow() : asc_last_submitted.load();
+    u64 newest = asc_last_submitted.load();
+    if (asc_dirty) {
+        if (asc_wait_main >= master_semaphore.CurrentTick()) {
+            newest = LaneCutNow(); // deferred: main must flush first (rare)
+        } else {
+            newest = open_asc_value; // p1e: pin it - submitted before this batch, which waits it
+            lane_pinned = open_asc_value;
+        }
+    }
     VideoCore::g_main_wait_asc = std::max(VideoCore::g_main_wait_asc, newest);
 }
 

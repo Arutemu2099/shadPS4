@@ -124,7 +124,7 @@ inline u64 g_lc_seq = 0;
 /// gfx EOP label the back wrote (labels are written at record time: WAR rule); big main notes.
 inline bool g_lane_on = false;
 inline std::array<u64, 16>* g_lane_counters = nullptr; // Scheduler::lane_c (back thread)
-inline std::array<u64, 5>* g_lane_open_src = nullptr;  // Scheduler::lane_open_src (p1d)
+inline std::array<u64, 7>* g_lane_open_src = nullptr;  // Scheduler::lane_open_src (p1d / p1e)
 inline u64 g_gfx_label_tick = 0;
 struct LaneBig {
     u64 lo, hi, tick;
@@ -135,10 +135,14 @@ inline u64 g_lc_big_evicted = 0; // newest tick of an unfinished big note overwr
 inline std::atomic<u64> g_lc_big_lost{0};
 /// p1b: newest main tick noted per 1 MB (hashed; a big query reads these) and newest unfinished main
 /// tick lost to a bucket overwrite per 1 MB.
-inline std::array<u64, 4096> g_lc_mb{};
-inline std::array<u64, 4096> g_lc_lost_mb{};
+inline std::array<u64, 65536> g_lc_win{};      // p1e: newest main tick per 64 KB window (hashed)
+inline std::array<u64, 65536> g_lc_lost_win{}; // p1e: newest unfinished main tick lost per window
+inline u32 LaneWin(u64 w) noexcept {
+    return u32((w * 0x9E3779B97F4A7C15ull) >> 48);
+}
 inline u64 g_lc_main_newest = 0;
 inline bool g_lc_coarse = false; // p1d: the last LaneMainProducer answer came from a coarse source
+inline u32 g_lc_src = 0; // p1e: 0 exact, 1 window table, 5 big list, 6 lost (bucket / big list)
 inline u64 g_lc_done = 0;     // main ticks complete (known semaphore value)
 inline u32 t_lc_rec_flags = 0; // bit 0: open-batch hit, bit 1: in-flight hit (current early record)
 /// 0 early reads checked, 1/2 newest producer main write open / in flight, 3/4 main upload open / in
@@ -176,9 +180,9 @@ inline void LaneNoteRange(u64 lo, u64 hi, u64 tick, u32 kind) noexcept {
     g_lc[14].fetch_add(1, std::memory_order_relaxed);
     if (kind < 2 && g_lane_on) {
         g_lc_main_newest = std::max(g_lc_main_newest, tick);
-        const u64 m1 = std::min((hi - 1) >> 20, (lo >> 20) + 255);
-        for (u64 m = lo >> 20; m <= m1; ++m) {
-            u64& e = g_lc_mb[m & 4095];
+        const u64 wl = std::min((hi - 1) >> 16, w0 + 1023);
+        for (u64 w = w0; w <= wl; ++w) {
+            u64& e = g_lc_win[LaneWin(w)];
             e = std::max(e, tick);
         }
     }
@@ -192,7 +196,7 @@ inline void LaneNoteRange(u64 lo, u64 hi, u64 tick, u32 kind) noexcept {
         }
         auto& slot = t.b[k][t.pos[k]++ & 7];
         if (kind < 2 && g_lane_on && slot.seq != 0 && slot.tick > g_lc_done) {
-            u64& e = g_lc_lost_mb[(w >> 4) & 4095];
+            u64& e = g_lc_lost_win[LaneWin(w)];
             e = std::max(e, slot.tick);
         }
         slot = {lo, hi, tick, seq, kind};
@@ -222,35 +226,40 @@ inline u64 LaneMainProducer(u64 lo, u64 hi) noexcept {
     if (hi <= lo) {
         return 0;
     }
-    const u64 m0 = lo >> 20, m1 = (hi - 1) >> 20;
-    if (((hi - 1) >> 16) - (lo >> 16) > 63) {
-        // p1b: more than the 64 windows LaneFind reads: the per-MB newest ticks (conservative).
-        if (m1 - m0 > 1023) {
+    const u64 w0 = lo >> 16, w1 = (hi - 1) >> 16;
+    g_lc_src = 0;
+    if (w1 - w0 > 63) {
+        // p1e: more than the 64 windows LaneFind reads: the per-window newest ticks.
+        if (w1 - w0 > 1023) {
             t = g_lc_main_newest;
         } else {
-            for (u64 m = m0; m <= m1; ++m) {
-                t = std::max(t, g_lc_mb[m & 4095]);
+            for (u64 w = w0; w <= w1; ++w) {
+                t = std::max(t, g_lc_win[LaneWin(w)]);
             }
         }
+        g_lc_src = 1;
     } else if (const LaneNote* m = LaneFind(g_lc_main, lo, hi)) {
         t = m->tick;
     }
-    const u64 exact = (((hi - 1) >> 16) - (lo >> 16) > 63) ? 0 : t;
-    for (u64 m = m0; m <= m1 && m <= m0 + 1023; ++m) {
-        t = std::max(t, g_lc_lost_mb[m & 4095]); // a lost unfinished note in this MB
+    const auto raise = [&](u64 v, u32 src) {
+        if (v > g_lc_done && v > t) {
+            t = v;
+            g_lc_src = src;
+        }
+    };
+    for (u64 w = w0; w <= w1 && w <= w0 + 1023; ++w) {
+        raise(g_lc_lost_win[LaneWin(w)], 6); // a lost unfinished note in this window
     }
+    for (const LaneBig& b : g_lc_big) {
+        if (b.lo < hi && lo < b.hi) {
+            raise(b.tick, 5);
+        }
+    }
+    raise(g_lc_big_evicted, 6); // a big note was lost: assume it covered this range
     if (t <= g_lc_done) {
         t = 0;
     }
-    for (const LaneBig& b : g_lc_big) {
-        if (b.tick > g_lc_done && b.tick > t && b.lo < hi && lo < b.hi) {
-            t = b.tick;
-        }
-    }
-    if (g_lc_big_evicted > g_lc_done) {
-        t = std::max(t, g_lc_big_evicted); // a big note was lost: assume it covered this range
-    }
-    g_lc_coarse = t > exact;
+    g_lc_coarse = g_lc_src != 0;
     return t;
 }
 inline void EarlyInvPrune(u64 read_pos) noexcept {

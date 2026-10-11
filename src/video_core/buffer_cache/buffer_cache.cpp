@@ -4111,11 +4111,11 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
             g_lc_done = scheduler.GetMasterSemaphore()->KnownGpuTick();
             if (!src_gds) {
                 const u64 t = LaneMainProducer(src, src + num_bytes);
-                scheduler.LaneNeedMain(t, g_lc_coarse ? 1 : 0);
+                scheduler.LaneNeedMain(t, g_lc_src);
             }
             if (!dst_gds) {
                 const u64 t = LaneMainProducer(dst, dst + num_bytes);
-                scheduler.LaneNeedMain(t, g_lc_coarse ? 1 : 0);
+                scheduler.LaneNeedMain(t, g_lc_src);
             }
             if (src_gds || dst_gds) {
                 scheduler.LaneNeedMain(gds_buffer.main_access_tick, 3, true);
@@ -4361,7 +4361,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     if (g_lane_on && Vulkan::Scheduler::t_lane_mode) [[unlikely]] {
         g_lc_done = scheduler.GetMasterSemaphore()->KnownGpuTick();
         const u64 t = LaneMainProducer(device_addr, device_addr + size);
-        scheduler.LaneNeedMain(t, g_lc_coarse ? 1 : 0);
+        scheduler.LaneNeedMain(t, g_lc_src);
         if (is_written) {
             scheduler.LaneNeedMain(g_gfx_label_tick, 2, true); // WAR, never the open batch (p1d)
         }

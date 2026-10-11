@@ -2294,8 +2294,8 @@ void LeanLog() {
                             v[i] = double(c[i]) * ps;
                             c[i] = 0;
                         }
-                        std::array<double, 5> os{};
-                        for (u32 i = 0; i < 5; ++i) {
+                        std::array<double, 7> os{};
+                        for (u32 i = 0; i < 7; ++i) {
                             os[i] = double((*VideoCore::g_lane_open_src)[i]) * ps;
                             (*VideoCore::g_lane_open_src)[i] = 0;
                         }
@@ -2306,13 +2306,14 @@ void LeanLog() {
                                  "{:.0f}/s, early records kept on main {:.0f}/s (unrouted {:.0f}) | "
                                  "packets lane {:.0f} main {:.0f} | rule A waits in flight {:.0f}/s, "
                                  "on the open batch {:.0f}/s | main flushes waiting on the lane "
-                                 "{:.0f}/s | fault pre-cuts {:.0f}/s | p1d: cuts left open (deferred) "
+                                 "{:.0f}/s | fault pre-cuts {:.0f}/s | p1e: pinned segments cut "
                                  "{:.0f}/s, WAR / GDS capped {:.0f}/s, open-batch waits by source "
-                                 "exact {:.0f} coarse {:.0f} WAR {:.0f} GDS {:.0f} carry {:.0f} | big "
-                                 "main notes {:.0f}/s, lost unfinished {:.0f}/s",
+                                 "exact {:.0f} window table {:.0f} WAR {:.0f} GDS {:.0f} carry {:.0f} "
+                                 "big list {:.0f} lost {:.0f} | big main notes {:.0f}/s, lost "
+                                 "unfinished {:.0f}/s",
                                  v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[12], v[7], v[8], v[9],
                                  v[10], v[11], v[13], v[14], v[15], os[0], os[1], os[2], os[3],
-                                 os[4],
+                                 os[4], os[5], os[6],
                                  double(VideoCore::g_lc[19].exchange(0)) * ps,
                                  double(VideoCore::g_lc_big_lost.exchange(0)) * ps);
                     }
