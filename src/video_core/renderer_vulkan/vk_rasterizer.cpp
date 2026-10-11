@@ -8382,9 +8382,22 @@ void Rasterizer::DispatchDirect() {
     DispatchDirectTail(pipeline);
 }
 
-void Rasterizer::MaybeEarlyCut() {
+int Rasterizer::EarlyCutMode() {
+    static const int m = [] {
+        const char* e = std::getenv("SHADPS4_READBACK_EARLY_CUT");
+        return e ? std::atoi(e) : 0;
+    }();
+    return m;
+}
+
+void Rasterizer::MaybeEarlyCut(bool run_end) {
     // q7 (SHADPS4_READBACK_EARLY_CUT): this dispatch wrote a recently read-back window - end the
     // batch now so the readback waits for the GPU only up to here, not for the rest of the frame.
+    // q7b: mode 2 cuts once, at the end of the dispatch run (A2Execute, the next non-dispatch
+    // record); mode 1 after every such dispatch.
+    if ((EarlyCutMode() == 2) != run_end) {
+        return;
+    }
     if (!buffer_cache.TakeEarlyCut() || Scheduler::t_lane_mode || scheduler.ActiveStream() != 0) {
         return;
     }

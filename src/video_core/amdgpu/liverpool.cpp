@@ -4954,6 +4954,10 @@ void Liverpool::A2Execute(const CpSplit::RecordHeader& record) {
     using RT = CpSplit::RecordType;
     auto& g = g_a2s;
     auto& c = g.c;
+    if (record.type != RT::Dispatch && rasterizer &&
+        Vulkan::Rasterizer::EarlyCutMode() == 2) [[unlikely]] {
+        rasterizer->MaybeEarlyCut(true); // q7b: the dispatch run that wrote a hot window ended
+    }
     if (!g.started && rasterizer) [[unlikely]] {
         g.started = true;
         c.start_ns = A2NowNs();

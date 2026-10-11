@@ -2289,7 +2289,7 @@ std::atomic<u32> g_rb_hot_next{0};
 bool EarlyCutOn() {
     static const bool on = [] {
         const char* e = std::getenv("SHADPS4_READBACK_EARLY_CUT");
-        return e && e[0] == '1';
+        return e && (e[0] == '1' || e[0] == '2'); // q7b: 2 = once per dispatch run
     }();
     return on;
 }
