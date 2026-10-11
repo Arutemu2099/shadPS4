@@ -234,6 +234,13 @@ public:
 
     /// SHADPS4_BIND_MEMO_STATS: bumped by every InvalidatePreparedImages call (image register,
     /// unregister, delete, deferred erase), whether or not the prepared-image memo is enabled.
+    /// l4e: the GC tick and the age tick the LRU touches write (material memo touch skip).
+    [[nodiscard]] u64 GcTickNow() const noexcept {
+        return gc_tick;
+    }
+    [[nodiscard]] u64 AgeTickNow() const {
+        return AgeTick();
+    }
     [[nodiscard]] u64 StructGeneration() const noexcept {
         return struct_generation.load(std::memory_order_acquire);
     }

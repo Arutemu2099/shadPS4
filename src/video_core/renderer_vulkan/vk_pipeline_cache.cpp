@@ -503,11 +503,13 @@ private:
                          std::hash<GraphicsPipelineKey>{}(job->key));
                 job->base->native_colour_why.store("no push descriptors", std::memory_order_relaxed);
                 slot.state.store(2, std::memory_order_release);
+                PipelineCache::g_nc_claims[6].fetch_add(1, std::memory_order_relaxed);
             } else {
                 variant->native_vertex_binding = job->vertex_binding;
                 variant->native_table_binding = job->table_binding;
                 variant->native_pt_debug_binding = job->pt_debug_binding;
                 slot.variant.store(variant.get(), std::memory_order_release);
+                PipelineCache::g_nc_claims[5].fetch_add(1, std::memory_order_relaxed);
             }
             if (++built <= 64 || (built & 63) == 0) {
                 LOG_INFO(Render_Vulkan, "NativeColour: variant #{} of {:#x} slot {} built in {:.1f} ms",
@@ -1466,6 +1468,7 @@ void PipelineCache::PrepareNativeColourLocked(const GraphicsPipeline* base,
         base->native_colour_why.store(why, std::memory_order_relaxed);
         if (claimed) {
             claimed->state.store(2, std::memory_order_release);
+            g_nc_claims[1].fetch_add(1, std::memory_order_relaxed);
         }
         if (native_colour_logged++ < 2000) {
             LOG_INFO(Render_Vulkan, "NativeColour: pipeline {:#x} not eligible ({})",
@@ -1577,6 +1580,7 @@ void PipelineCache::PrepareNativeColourLocked(const GraphicsPipeline* base,
     // From here on the slot is claimed for this key whatever happens (a failure is final).
     base->native_colour[free_slot].key.store(key, std::memory_order_release);
     claimed = &base->native_colour[free_slot];
+    g_nc_claims[0].fetch_add(1, std::memory_order_relaxed);
     // Per-description eligibility: per-vertex attributes of pullable formats, locations < 16,
     // number class matching the shader's input type.
     Shader::NativeEmit emit{};
@@ -1596,6 +1600,7 @@ void PipelineCache::PrepareNativeColourLocked(const GraphicsPipeline* base,
                          std::hash<GraphicsPipelineKey>{}(base->GetGraphicsKey()),
                          vk::to_string(static_cast<vk::Format>(d.vk_format)));
             }
+            g_nc_claims[2].fetch_add(1, std::memory_order_relaxed);
             return;
         }
         emit.attrs[d.location] = attr;
@@ -1786,6 +1791,7 @@ void PipelineCache::PrepareNativeColourLocked(const GraphicsPipeline* base,
             LOG_WARNING(Render_Vulkan, "NativeColour: records binding {} vs {}", next,
                         emit.records_binding);
         }
+        g_nc_claims[3].fetch_add(1, std::memory_order_relaxed);
         return;
     }
     job->bindings.push_back({
@@ -1848,6 +1854,7 @@ void PipelineCache::PrepareNativeColourLocked(const GraphicsPipeline* base,
         native_colour_compiler = std::make_unique<NativeColourCompiler>(
             instance, scheduler, desc_heap, profile, *pipeline_cache);
     }
+    g_nc_claims[4].fetch_add(1, std::memory_order_relaxed);
     native_colour_compiler->Push(std::move(job));
 }
 

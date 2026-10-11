@@ -5284,7 +5284,11 @@ int MatMemoMode() {
     }();
     return m;
 }
-constexpr size_t MatMemoSize = 2048;
+constexpr size_t MatMemoSets = 4096; // l4e: 2 ways each
+constexpr size_t MatMemoSize = MatMemoSets * 2;
+size_t MatMemoSet(u64 h1) {
+    return ((h1 ^ (h1 >> 31)) & (MatMemoSets - 1)) * 2;
+}
 } // namespace
 
 bool Rasterizer::A2MaterialMemoValid(const MatMemo& m) {
@@ -5297,8 +5301,7 @@ bool Rasterizer::A2MaterialMemoValid(const MatMemo& m) {
     }
     for (u32 i = 0; i < m.n_img; ++i) {
         const auto& e = m.img[i];
-        if (e.gen != bl.img_gen ||
-            !texture_cache.BindlessEntryValid(e.id, e.uid, e.tex_gen, e.local, e.overlap)) {
+        if (!texture_cache.BindlessEntryValid(e.id, e.uid, e.tex_gen, e.local, e.overlap)) {
             return false;
         }
         const auto& image = texture_cache.PeekImage(e.id);
@@ -5317,16 +5320,29 @@ bool Rasterizer::A2MaterialMemo(const GraphicsPipeline* base, u64 h1, u64 h2, u3
     }
     auto& st = native_stats;
     const u64 t0 = __rdtsc();
-    const auto& m = mat_memo[(h1 ^ (h1 >> 31)) & (MatMemoSize - 1)];
-    if (m.base != base || m.h1 != h1 || m.h2 != h2 || m.kn != kn) {
+    const size_t set = MatMemoSet(h1);
+    MatMemo* hit = nullptr;
+    for (size_t w = 0; w < 2 && !hit; ++w) {
+        auto& c = mat_memo[set + w];
+        if (c.base == base && c.h1 == h1 && c.h2 == h2 && c.kn == kn) {
+            hit = &c;
+        }
+    }
+    if (!hit) {
         ++st.mm_miss;
         return false;
     }
+    auto& m = *hit;
     if (!A2MaterialMemoValid(m)) {
         ++st.mm_stale;
         return false;
     }
-    if (m.n_smp != 0 &&
+    // l4e: the touches write gc_tick / AgeTick; skipped when this entry already wrote these
+    // same values (the sampler generation is unchanged: A2MaterialMemoValid).
+    const u64 gc = texture_cache.GcTickNow();
+    const u64 age = texture_cache.AgeTickNow();
+    const bool touch = m.touch_gc != gc || m.touch_age != age;
+    if (touch && m.n_smp != 0 &&
         !texture_cache.TouchSamplers(std::span{m.lru.data(), m.n_smp}, bindless.sampler_gen)) {
         ++st.mm_stale;
         return false;
@@ -5335,9 +5351,18 @@ bool Rasterizer::A2MaterialMemo(const GraphicsPipeline* base, u64 h1, u64 h2, u3
         NativeClose(15); // as A2ResolveMaterial
     }
     for (u32 i = 0; i < m.n_img; ++i) {
-        texture_cache.TouchImageAccess(texture_cache.PeekImage(m.img[i].id));
+        if (touch) {
+            texture_cache.TouchImageAccess(texture_cache.PeekImage(m.img[i].id));
+        }
         ids.push_back(m.img[i].id);
     }
+    if (touch) {
+        m.touch_gc = gc;
+        m.touch_age = age;
+    } else {
+        ++st.mm_touch_skip;
+    }
+    m.used = ++mat_memo_clock;
     bindless.tex_gen = texture_cache.StructGeneration();
     n_img = m.n_img;
     n_smp = m.n_smp;
@@ -5361,7 +5386,20 @@ bool Rasterizer::A2ResolveMaterial(const GraphicsPipeline* base, const Shader::B
     if (memo && mat_memo.empty()) {
         mat_memo.resize(MatMemoSize);
     }
-    MatMemo* mm = memo ? &mat_memo[(h1 ^ (h1 >> 31)) & (MatMemoSize - 1)] : nullptr;
+    MatMemo* mm = nullptr;
+    if (memo) {
+        // l4e: the way holding this key, else the least recently used of the two.
+        const size_t set = MatMemoSet(h1);
+        for (size_t w = 0; w < 2 && !mm; ++w) {
+            auto& c = mat_memo[set + w];
+            if (c.base == base && c.h1 == h1 && c.h2 == h2 && c.kn == kn) {
+                mm = &c;
+            }
+        }
+        if (!mm) {
+            mm = mat_memo[set].used <= mat_memo[set + 1].used ? &mat_memo[set] : &mat_memo[set + 1];
+        }
+    }
     // =2: a valid entry is compared with the full resolve below (taken before it refreshes).
     const bool vfy = mode == 2 && mm && mm->base == base && mm->h1 == h1 && mm->h2 == h2 &&
                      mm->kn == kn && A2MaterialMemoValid(*mm);
@@ -5371,8 +5409,9 @@ bool Rasterizer::A2ResolveMaterial(const GraphicsPipeline* base, const Shader::B
     }
     std::array<VideoCore::ImageId, Shader::NativeBindlessMax> got{};
     MatMemo fill{};
+    std::array<BindlessImgEntry, Shader::NativeBindlessMax> cap{};
     if (memo) {
-        bindless.cap_img = fill.img.data();
+        bindless.cap_img = cap.data();
         bindless.cap_lru = fill.lru.data();
     }
     const bool ok =
@@ -5408,6 +5447,14 @@ bool Rasterizer::A2ResolveMaterial(const GraphicsPipeline* base, const Shader::B
         fill.n_img = n_img;
         fill.n_smp = n_smp;
         std::memcpy(fill.slots.data(), slots, sizeof(fill.slots));
+        for (u32 i = 0; i < n_img; ++i) {
+            const auto& e = cap[i];
+            fill.img[i] = {e.id, e.local, e.uid, e.tex_gen, e.overlap, e.backing, e.serial};
+        }
+        // The full resolve just touched everything at these ticks.
+        fill.touch_gc = texture_cache.GcTickNow();
+        fill.touch_age = texture_cache.AgeTickNow();
+        fill.used = ++mat_memo_clock;
         *mm = fill;
     }
     ids.insert(ids.end(), got.begin(), got.begin() + n_img);
@@ -7126,12 +7173,21 @@ void Rasterizer::NativeLog() {
                  double(st.c_bl_smp) / double(std::max<u64>(st.n_bl_res, 1)),
                  double(st.c_bl_touch) / double(std::max<u64>(st.n_bl_res, 1)));
     }
+    {
+        const auto& cl = PipelineCache::g_nc_claims;
+        LOG_INFO(Render_Vulkan,
+                 "NativeColour claims (cumulative): claimed {} refused with a reason {} vertex format {} "
+                 "records binding {} pushed {} built {} built without push descriptors {}",
+                 cl[0].load(), cl[1].load(), cl[2].load(), cl[3].load(), cl[4].load(), cl[5].load(),
+                 cl[6].load());
+    }
     if (st.mm_hit + st.mm_miss + st.mm_stale + st.mm_vfy != 0) {
         LOG_INFO(Render_Vulkan,
                  "A2 material memo (SHADPS4_A2_MAT_MEMO): hits {} misses {} stale {} | cycles per "
-                 "hit {:.0f} | verify compares {} BAD {}",
+                 "hit {:.0f} | touches skipped (same ticks) {} | verify compares {} BAD {}",
                  st.mm_hit, st.mm_miss, st.mm_stale,
-                 double(st.c_mm_hit) / double(std::max<u64>(st.mm_hit, 1)), st.mm_vfy, st.mm_bad);
+                 double(st.c_mm_hit) / double(std::max<u64>(st.mm_hit, 1)), st.mm_touch_skip,
+                 st.mm_vfy, st.mm_bad);
     }
     if (st.n_rec[0] + st.n_rec[3] + st.n_rec[9] != 0) {
         const auto per = [](u64 c, u64 n) { return n ? double(c) / double(n) : 0.0; };

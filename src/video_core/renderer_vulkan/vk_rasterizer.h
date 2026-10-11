@@ -781,16 +781,26 @@ private:
         u64 tex_gen{~0ull}, img_epoch{~0ull}, meta_epoch{~0ull}, sampler_gen{~0ull};
     } bindless;
     /// SHADPS4_A2_MAT_MEMO (l4d): one resolved stretch material.
+    struct MatMemoImg {
+        VideoCore::ImageId id{};
+        bool local{};
+        u64 uid{}, tex_gen{}, overlap{};
+        const void* backing{};
+        u64 serial{};
+    };
     struct MatMemo {
         const GraphicsPipeline* base{};
         u64 h1{}, h2{};
         u32 kn{};
         u64 img_gen{}, smp_gen{};
         u32 n_img{}, n_smp{};
+        u64 touch_gc{~0ull}, touch_age{~0ull}; ///< l4e: the last touch's gc_tick / AgeTick
+        u64 used{}; ///< l4e: replacement order within the set
         std::array<u32, 2 * Shader::NativeBindlessMax> slots{};
-        std::array<BindlessImgEntry, Shader::NativeBindlessMax> img{};
+        std::array<MatMemoImg, Shader::NativeBindlessMax> img{};
         std::array<size_t, Shader::NativeBindlessMax> lru{};
     };
+    u64 mat_memo_clock{};
     std::vector<MatMemo> mat_memo;
     bool A2MaterialMemoValid(const MatMemo& m);
     /// Back thread: the fragment stage's image / sampler slots of the draw `base` describes now
@@ -915,7 +925,7 @@ private:
         u64 c_bl_hit{}, c_bl_miss{}; ///< cycles in image hits / misses
         u64 c_bl_smp{}, c_bl_touch{}, n_bl_res{}; ///< sampler loop / LRU touch cycles, resolves
         /// l4d material memo: hits, misses (no entry), stale entries, verify compares / BAD.
-        u64 mm_hit{}, mm_miss{}, mm_stale{}, mm_vfy{}, mm_bad{}, c_mm_hit{};
+        u64 mm_hit{}, mm_miss{}, mm_stale{}, mm_vfy{}, mm_bad{}, c_mm_hit{}, mm_touch_skip{};
         /// Segment census (sec. 14): pipeline-change closes by bits 1 = fixed state equal (key
         /// minus shaders and vertex formats), 2 = vertex formats equal, 4 = next pipeline has a
         /// native variant, 8 = context registers moved; native -> non-native draw transitions.

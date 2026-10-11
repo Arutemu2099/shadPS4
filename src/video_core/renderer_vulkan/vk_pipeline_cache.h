@@ -447,6 +447,12 @@ private:
     struct NativeColourCompiler;
     std::chrono::steady_clock::time_point native_colour_last{};
     u32 native_colour_logged{};
+public:
+    /// l4e census: colour variant claims - 0 claimed, 1 refused with a reason after the claim,
+    /// 2 vertex format not pulled, 3 records binding, 4 pushed to the compiler, 5 built, 6 built
+    /// without push descriptors.
+    static inline std::array<std::atomic<u64>, 8> g_nc_claims{};
+private:
     u32 async_pending{};         // queued, not yet published; lookup thread only
     double lookup_translate_ms{}; // GetProgram's module creation time within this lookup
     // PipelineCompile / PipelineCompileSummary log lines (both modes). skipped_draws counts
