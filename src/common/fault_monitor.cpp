@@ -22,6 +22,7 @@
 
 #include <immintrin.h>
 #include <cstring>
+#include <map>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -612,9 +613,23 @@ struct GmCensus {
     std::array<std::atomic<u64>, 16> gnm_all_ticks{}, gnm_all_n{}; // gnm waits, every thread
     std::mutex rip_mutex;
     std::unordered_map<u64, u32> rip_eboot; // 64 B buckets of the eboot offset
-    u64 rip_samples{}, rip_eboot_n{}, rip_guest_other{}, rip_host{};
+    u64 rip_samples{}, rip_eboot_n{}, rip_guest_other{}, rip_host{}, rip_samples_window{};
     std::unordered_map<u64, u32> rip_host_buckets; // 4 KB buckets of host addresses
     bool sampler_started{};
+    // gmc3: delay() callers (first two eboot return addresses) and episodes
+    std::unordered_map<u64, u32> delay_callers; // key: c1 offset << 32 | c2 offset
+    struct Ep {
+        u64 episodes{}, samples{};
+    };
+    std::unordered_map<u64, Ep> delay_eps; // by c1 offset
+    u64 last_c1{~0ULL}, run{};
+    u64 win32u_n{}, win32u_in_gpu_wait{};
+    u64 win32u_lo{}, win32u_hi{};
+    std::mutex gpu_mutex;
+    struct GpuPath {
+        u64 n{}, ticks{};
+    };
+    std::map<std::array<u64, 4>, GpuPath> gpu_paths;
     std::array<std::atomic<u64>, 8> gm_fault_n{}, gm_fault_ticks{}, all_fault_n{}, all_fault_ticks{};
     std::mutex page_mutex;
     u64 frame{~0ULL};
@@ -650,21 +665,81 @@ void MarkGameMainThread() {
         // ResumeThread; nothing here takes a lock or allocates while it is suspended.
         std::thread([h] {
             timeBeginPeriod(1);
+            HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr,
+                                                  CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                                  TIMER_ALL_ACCESS);
+            if (HMODULE w = GetModuleHandleA("win32u.dll")) {
+                MEMORY_BASIC_INFORMATION mbi{};
+                // the whole image: walk regions with the same allocation base
+                u64 a = reinterpret_cast<u64>(w);
+                g_gm.win32u_lo = a;
+                while (VirtualQuery(reinterpret_cast<void*>(a), &mbi, sizeof(mbi)) &&
+                       mbi.AllocationBase == w) {
+                    a += mbi.RegionSize;
+                }
+                g_gm.win32u_hi = a;
+            }
             for (;;) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                if (timer) {
+                    LARGE_INTEGER due{};
+                    due.QuadPart = -5000; // 0.5 ms
+                    SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
+                    WaitForSingleObject(timer, INFINITE);
+                } else {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                const u32 in_gpu = g_gm_in_gpu_wait.load(std::memory_order_relaxed);
                 if (SuspendThread(h) == DWORD(-1)) {
                     continue;
                 }
                 CONTEXT ctx{};
-                ctx.ContextFlags = CONTEXT_CONTROL;
+                ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
                 const BOOL ok = GetThreadContext(h, &ctx);
+                std::array<u64, 64> stack{};
+                const bool in_delay = ok && ctx.Rip >= 0x80053b2b0ULL && ctx.Rip < 0x80053b360ULL;
+                if (in_delay) {
+                    // the guest stack is ordinary committed memory; copied while suspended
+                    std::memcpy(stack.data(), reinterpret_cast<const void*>(ctx.Rsp), sizeof(stack));
+                }
                 ResumeThread(h);
                 if (!ok) {
                     continue;
                 }
                 const u64 rip = ctx.Rip;
+                u64 c1 = 0, c2 = 0;
+                if (in_delay) {
+                    for (const u64 v : stack) {
+                        if (v >= 0x800000000ULL && v < 0x800cc8000ULL &&
+                            !(v >= 0x80053b2b0ULL && v < 0x80053b360ULL)) {
+                            if (c1 == 0) {
+                                c1 = v - 0x800000000ULL;
+                            } else {
+                                c2 = v - 0x800000000ULL;
+                                break;
+                            }
+                        }
+                    }
+                }
                 std::scoped_lock lk{g_gm.rip_mutex};
                 ++g_gm.rip_samples;
+                const u64 cur = in_delay ? c1 : ~0ULL;
+                if (cur != g_gm.last_c1) {
+                    if (g_gm.last_c1 != ~0ULL && g_gm.run != 0) {
+                        auto& ep = g_gm.delay_eps[g_gm.last_c1];
+                        ++ep.episodes;
+                        ep.samples += g_gm.run;
+                    }
+                    g_gm.last_c1 = cur;
+                    g_gm.run = 0;
+                }
+                if (in_delay) {
+                    ++g_gm.run;
+                    ++g_gm.delay_callers[c1 << 32 | (c2 & 0xffffffffULL)];
+                }
+                if (rip >= g_gm.win32u_lo && rip < g_gm.win32u_hi) {
+                    ++g_gm.win32u_n;
+                    g_gm.win32u_in_gpu_wait += in_gpu != 0;
+                }
                 if (rip >= 0x800000000ULL && rip < 0x8087a8000ULL) {
                     ++g_gm.rip_eboot_n;
                     ++g_gm.rip_eboot[(rip - 0x800000000ULL) >> 6];
@@ -678,6 +753,22 @@ void MarkGameMainThread() {
         }).detach();
     }
 #endif
+}
+
+std::atomic<u32> g_gm_in_gpu_wait{0};
+
+void NoteGameMainGpuWait(u64 ticks) {
+    void* frames[4]{};
+    const u32 n = RtlCaptureStackBackTrace(1, 4, frames, nullptr);
+    std::array<u64, 4> key{};
+    const u64 exe = reinterpret_cast<u64>(GetModuleHandleA(nullptr));
+    for (u32 i = 0; i < n && i < 4; ++i) {
+        key[i] = reinterpret_cast<u64>(frames[i]) - exe;
+    }
+    std::scoped_lock lk{g_gm.gpu_mutex};
+    auto& p = g_gm.gpu_paths[key];
+    ++p.n;
+    p.ticks += ticks;
 }
 
 void NoteGnmWait(u32 kind, u64 ticks) {
@@ -845,6 +936,7 @@ void GameMainCensusMaybeLog() {
             }
             g_gm.rip_eboot.clear();
             g_gm.rip_host_buckets.clear();
+            g_gm.rip_samples_window = g_gm.rip_samples;
             g_gm.rip_samples = g_gm.rip_eboot_n = g_gm.rip_guest_other = g_gm.rip_host = 0;
         }
         std::sort(top.rbegin(), top.rend());
@@ -875,6 +967,61 @@ void GameMainCensusMaybeLog() {
                  n, 100.0 * eb / std::max<u64>(n, 1), 100.0 * go / std::max<u64>(n, 1),
                  100.0 * ho / std::max<u64>(n, 1), s);
         LOG_INFO(Render, "GameMain census RIP host top 4 KB pages:{}", hs);
+    }
+    {
+        std::vector<std::pair<u32, u64>> callers;
+        std::vector<std::pair<u64, std::pair<u64, u64>>> eps; // samples, (c1, episodes)
+        u64 n = 0, w = 0, wg = 0;
+        {
+            std::scoped_lock lk{g_gm.rip_mutex};
+            n = std::max<u64>(1, g_gm.rip_samples_window);
+            for (const auto& [k, c] : g_gm.delay_callers) {
+                callers.emplace_back(c, k);
+            }
+            for (const auto& [c1, ep] : g_gm.delay_eps) {
+                eps.push_back({ep.samples, {c1, ep.episodes}});
+            }
+            w = g_gm.win32u_n;
+            wg = g_gm.win32u_in_gpu_wait;
+            g_gm.delay_callers.clear();
+            g_gm.delay_eps.clear();
+            g_gm.win32u_n = g_gm.win32u_in_gpu_wait = 0;
+        }
+        std::sort(callers.rbegin(), callers.rend());
+        std::sort(eps.rbegin(), eps.rend());
+        std::string cs, es;
+        for (size_t i = 0; i < std::min<size_t>(callers.size(), 14); ++i) {
+            cs += fmt::format(" {:#x}<-{:#x}:{:.1f}%", callers[i].second >> 32,
+                              callers[i].second & 0xffffffffULL, 100.0 * callers[i].first / double(n));
+        }
+        for (size_t i = 0; i < std::min<size_t>(eps.size(), 10); ++i) {
+            const double episodes = double(eps[i].second.second);
+            es += fmt::format(" {:#x}: {:.1f}% {:.0f}/s {:.2f} ms each", eps[i].second.first,
+                              100.0 * eps[i].first / double(n), episodes / sec,
+                              episodes > 0 ? double(eps[i].first) * 0.5 / episodes : 0.0);
+        }
+        LOG_INFO(Render,
+                 "GameMain census delay(): callers (return address <- its caller, offsets, share of "
+                 "Game:Main wall samples):{} | episodes by caller (0.5 ms samples):{} | win32u samples "
+                 "{:.1f}%, inside MasterSemaphore::Wait {:.1f}% of them",
+                 cs, es, 100.0 * w / double(n), 100.0 * wg / double(std::max<u64>(w, 1)));
+        std::vector<std::pair<u64, std::pair<std::array<u64, 4>, u64>>> paths;
+        {
+            std::scoped_lock lk{g_gm.gpu_mutex};
+            for (const auto& [k, p] : g_gm.gpu_paths) {
+                paths.push_back({p.ticks, {k, p.n}});
+            }
+            g_gm.gpu_paths.clear();
+        }
+        std::sort(paths.rbegin(), paths.rend());
+        std::string ps;
+        for (size_t i = 0; i < std::min<size_t>(paths.size(), 8); ++i) {
+            const auto& k = paths[i].second.first;
+            ps += fmt::format(" [{:#x} {:#x} {:#x} {:#x}] {:.1f} ms/s {:.0f}/s", k[0], k[1], k[2], k[3],
+                              double(paths[i].first) / 3.5e6 / sec, double(paths[i].second.second) / sec);
+        }
+        LOG_INFO(Render, "GameMain census GPU waits on Game:Main (MasterSemaphore::Wait, shadPS4.exe "
+                         "offsets of the 4 callers):{}", ps);
     }
 }
 

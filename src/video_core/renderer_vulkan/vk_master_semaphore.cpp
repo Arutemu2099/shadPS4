@@ -8,6 +8,8 @@
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 
 #include "common/assert.h"
+#include "common/fault_monitor.h"
+#include "common/scope_exit.h"
 
 namespace Vulkan {
 
@@ -58,6 +60,18 @@ void MasterSemaphore::Wait(u64 tick) {
     }
 
     // If none of the above is hit, fallback to a regular wait
+    // SHADPS4_GAME_MAIN_CENSUS (gmc3): Game:Main's GPU waits, timed with their call path.
+    const bool gm = Common::FaultMonitor::t_is_game_main && Common::FaultMonitor::GameMainCensus();
+    const u64 gm_t0 = gm ? Common::FaultMonitor::CensusTicks() : 0;
+    if (gm) {
+        Common::FaultMonitor::g_gm_in_gpu_wait.store(1, std::memory_order_relaxed);
+    }
+    SCOPE_EXIT {
+        if (gm) {
+            Common::FaultMonitor::g_gm_in_gpu_wait.store(0, std::memory_order_relaxed);
+            Common::FaultMonitor::NoteGameMainGpuWait(Common::FaultMonitor::CensusTicks() - gm_t0);
+        }
+    };
     const vk::SemaphoreWaitInfo wait_info = {
         .semaphoreCount = 1,
         .pSemaphores = &semaphore.get(),

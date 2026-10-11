@@ -58,7 +58,7 @@ void ApplyCommandProcessorPlacement();
 /// CP back); the rest of the process is kept off those cores. Measured 2026-10-01 without it: the
 /// recorder (80-87% busy) changes logical processor at ~20% of its chunk boundaries and spends
 /// 2-15% of them on efficiency cores. Windows only; call on the thread itself.
-enum class HotThread { Recorder, Front };
+enum class HotThread { Recorder, Front, GameMain };
 void ApplyHotThreadPlacement(HotThread which);
 /// SHADPS4_CP_CORE_STATS=1: sample the logical CPU this thread runs on (call often, it is cheap)
 /// and periodically log the share on performance vs efficiency cores. Diagnostic only.

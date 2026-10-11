@@ -165,6 +165,7 @@ void Linker::Execute(const std::vector<std::string>& args) {
     main_thread.Run([this, module, &args, has_libcinternal](std::stop_token) {
         Common::SetCurrentThreadName("Game:Main");
         Common::FaultMonitor::MarkGameMainThread();
+        Common::ApplyHotThreadPlacement(Common::HotThread::GameMain);
         std::set_terminate(Common::Log::Terminate);
 
 #ifndef _WIN32 // Clear any existing signal mask for game threads.

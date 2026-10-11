@@ -335,7 +335,7 @@ void ApplyHotThreadPlacement(HotThread which) {
         const char* value = std::getenv("SHADPS4_HOT_CORES");
         return value ? static_cast<unsigned>(std::strtoul(value, nullptr, 0)) : 0u;
     }();
-    const unsigned bit = which == HotThread::Recorder ? 1u : 2u;
+    const unsigned bit = which == HotThread::Recorder ? 1u : which == HotThread::Front ? 2u : 4u;
     if ((mask & bit) == 0) {
         return;
     }
@@ -347,9 +347,13 @@ void ApplyHotThreadPlacement(HotThread which) {
                          sizeof(throttling));
     int first = -1;
     size_t others = 0;
-    const bool ok = ReservePerformanceCore(which == HotThread::Recorder ? 1 : 2, first, others);
+    const int rank = which == HotThread::Recorder ? 1 : which == HotThread::Front ? 2 : 3;
+    const bool ok = ReservePerformanceCore(rank, first, others);
     LOG_INFO(Common, "SHADPS4_HOT_CORES={}: {} on logical {}, {} logical for the rest, ok {}", mask,
-             which == HotThread::Recorder ? "recorder" : "front", first, others, ok);
+             which == HotThread::Recorder ? "recorder"
+             : which == HotThread::Front  ? "front"
+                                          : "Game:Main",
+             first, others, ok);
 }
 
 void ApplyCommandProcessorPlacement() {

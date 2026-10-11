@@ -99,6 +99,9 @@ void GameMainCensusMaybeLog();
 /// sceGnmSubmitDone, 8 in a submit, 9 in DingDong.
 void SampleGuestPlacement();
 void NoteGnmWait(u32 kind, u64 ticks);
+/// gmc3: Game:Main inside a host GPU wait (MasterSemaphore::Wait), and its timed call path.
+extern std::atomic<u32> g_gm_in_gpu_wait;
+void NoteGameMainGpuWait(u64 ticks); // captures the caller's backtrace itself
 /// gmc2: the gnm idle waits, timed on every thread (Game:Main also into its own kinds).
 struct GnmWaitScope {
     u32 kind;
