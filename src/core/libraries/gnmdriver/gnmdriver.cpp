@@ -1186,6 +1186,7 @@ static_assert(NR::GpuRecHiOffset == Shader::NativeRecordHiOffset);
 /// 4 killed, 5 ok).
 std::array<std::atomic<u64>, 6> g_nr_ind{};
 thread_local u32 t_nr_gpu_why = 0; // q3b: NativeRecGpu's exit (1-4; 0 = ok / not reached)
+thread_local bool t_nr_indirect = false; // q4: the record being written is an indirect draw's
 
 void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
     auto& r = t_rec;
@@ -1205,7 +1206,8 @@ void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
         NR::g_gpu_recs[slot].store(r.gpu, std::memory_order_release);
         NR::g_unions[slot].store(r.unions, std::memory_order_release);
     }
-    if (!rec.derived || !r.it_known) {
+    // q4: an indirect record needs no known index type (the translator reads the mirror's).
+    if (!rec.derived || (!r.it_known && !t_nr_indirect)) {
         t_nr_gpu_why = !rec.derived ? 1 : 2;
         if (rec.run_k == 0) {
             r.run_union = ~0u;
@@ -1697,7 +1699,9 @@ s32 PS4_SYSV_ABI sceGnmDrawIndexIndirect(u32* cmdbuf, u32 size, u32 data_offset,
         }();
         if (NR::g_mode && a2_indirect && !predicate_on(flags)) [[unlikely]] {
             const u32 tag = DrawTagValue();
+            t_nr_indirect = true;
             const u32 idx = NativeRecDraw(packet, 0, 0, tag, 9, true);
+            t_nr_indirect = false;
             t_rec.wl = false;
             if (idx != ~0u) {
                 g_nr_ind[0].fetch_add(1, std::memory_order_relaxed);

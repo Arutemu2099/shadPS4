@@ -1210,6 +1210,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     for (u32 k = 0; k < vb_n; ++k) {
         const u32 loc = attribs[k].desc.location;
         if (colour && (attribs[k].desc.instanced || loc >= Shader::NativeMaxPulledLocations)) {
+            ++owner->sub[44]; // q4: instanced / location
             return refuse(RefuseColourVertex);
         }
         if (vaddr_vi[k] == 0) {
@@ -1224,6 +1225,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         voff[k] = vaddr_vi[k] - vcpu[k];
         if (colour) {
             if ((vbuf != 0 && vb_handle[k] != vbuf) || voff[k] > 0xffffffffull) {
+                ++owner->sub[vbuf != 0 && vb_handle[k] != vbuf ? 45 : 46]; // q4: 2nd buffer / offset
                 return refuse(RefuseColourVertex);
             }
             if (!vb->IsInBounds(vaddr_vi[k], attribs[k].size)) {
@@ -1234,6 +1236,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         }
     }
     if (colour && vbuf == 0) {
+        ++owner->sub[47]; // q4: every stream null
         return refuse(RefuseColourVertex);
     }
 

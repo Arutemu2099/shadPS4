@@ -5351,12 +5351,15 @@ bool Rasterizer::A2MaterialMemo(const GraphicsPipeline* base, u64 h1, u64 h2, u3
     if (native_batch.open) {
         NativeClose(15); // as A2ResolveMaterial
     }
+    std::array<VideoCore::ImageId, Shader::NativeBindlessMax> q4ids{};
     for (u32 i = 0; i < m.n_img; ++i) {
         if (touch) {
             texture_cache.TouchImageAccess(texture_cache.PeekImage(m.img[i].id));
         }
         ids.push_back(m.img[i].id);
+        q4ids[i] = m.img[i].id;
     }
+    Q4NoteMaterial(q4ids.data(), m.n_img);
     if (touch) {
         m.touch_gc = gc;
         m.touch_age = age;
@@ -5371,6 +5374,31 @@ bool Rasterizer::A2MaterialMemo(const GraphicsPipeline* base, u64 h1, u64 h2, u3
     ++st.mm_hit;
     st.c_mm_hit += __rdtsc() - t0;
     return true;
+}
+
+void Rasterizer::Q4NoteMaterial(const VideoCore::ImageId* ids, u32 n) {
+    // q4 census: is every image of this material table-eligible (sampled only, ever)?
+    static std::array<u64, 6> c{}; // materials, all eligible, images, rt/depth/storage, depth assoc, msaa
+    ++c[0];
+    bool all = true;
+    for (u32 i = 0; i < n; ++i) {
+        const auto& im = texture_cache.PeekImage(ids[i]);
+        ++c[2];
+        const bool used = im.usage.render_target || im.usage.depth_target || im.usage.storage;
+        const bool dep = static_cast<bool>(im.depth_id);
+        const bool ms = im.info.num_samples > 1;
+        c[3] += used;
+        c[4] += dep;
+        c[5] += ms;
+        all = all && !used && !dep && !ms;
+    }
+    c[1] += all;
+    if ((c[0] & 0x3ffff) == 0) {
+        LOG_INFO(Render_Vulkan,
+                 "q4 table eligibility (cumulative): materials {} all-eligible {} | images {} "
+                 "rt/depth/storage-used {} depth-associated {} msaa {}",
+                 c[0], c[1], c[2], c[3], c[4], c[5]);
+    }
 }
 
 bool Rasterizer::A2ResolveMaterial(const GraphicsPipeline* base, const Shader::BoundStage& fs,
@@ -5460,6 +5488,7 @@ bool Rasterizer::A2ResolveMaterial(const GraphicsPipeline* base, const Shader::B
         *mm = fill;
     }
     ids.insert(ids.end(), got.begin(), got.begin() + n_img);
+    Q4NoteMaterial(got.data(), n_img);
     return true;
 }
 

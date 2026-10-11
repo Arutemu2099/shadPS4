@@ -1354,6 +1354,7 @@ struct BackLeanCensus {
     u64 pub_cyc{}, pub_n{}, pc_cyc{}, pc_n{}, wait_cyc{}, follow_cyc{}, follows{};
     u64 pub_resolve{}, pub_begin{}, pub_record{}, pub_delta{};
     u64 pro_cyc{}, epi_cyc{}, loop_recs{}; ///< per follow: before / after the loop; records visited
+    std::array<u64, 256> pk_cyc{}, pk_n{}; ///< q4: main-ring Packet records by PM4 opcode
     u64 win_tsc{};
     Vulkan::BackCycleStats base{};
 };
@@ -1410,6 +1411,17 @@ void BackLeanMaybeLog() {
                              double(b.why_cyc[i]) / double(std::max<u64>(b.why_n[i], 1)));
     }
     LOG_INFO(Render, "BackLean old-path job draws by why (ms per s):{}", why_s);
+    {
+        std::string pk_s; // q4
+        for (u32 i = 0; i < 256; ++i) {
+            if (b.pk_cyc[i] != 0) {
+                pk_s += fmt::format(" {:#x}={:.1f}({:.1f}k/s,{:.0f}cyc)", i, ms(b.pk_cyc[i]),
+                                    ks(b.pk_n[i]),
+                                    double(b.pk_cyc[i]) / double(std::max<u64>(b.pk_n[i], 1)));
+            }
+        }
+        LOG_INFO(Render, "BackLean main-ring packets by opcode (ms per s):{}", pk_s);
+    }
     const u64 other_all = b.follow_cyc > job_all + b.pub_cyc + b.pc_cyc + b.wait_cyc
                               ? b.follow_cyc - job_all - b.pub_cyc - b.pc_cyc - b.wait_cyc
                               : 0;
@@ -2218,10 +2230,11 @@ void LeanLog() {
                      "claimed without variant {} not claimed, free slot {} not claimed, slots full {} | indirect: "
                      "with a variant {} without {} (q1 why: no vi {} instanced {} undecided {} eligible {} "
                      "untextured {} other ineligible {}; eligible by slot: refused (final) {} "
-                     "built {} building {} not claimed {})",
+                     "built {} building {} not claimed {}) | q4 colour vertex: instanced/location {} "
+                     "second VkBuffer {} offset > 4 GB {} all null {}",
                      sb[12], sb[13], sb[14], sb[15], sb[0], sb[1], sb[2], sb[3], sb[4], sb[5], sb[6],
                      sb[7], sb[8], sb[9], sb[10], sb[11], sb[16], sb[17], sb[18], sb[19], sb[20],
-                     sb[23], x.mat_cuts.exchange(0), sb[24], sb[25], sb[26], sb[27], sb[28], sb[29], sb[30], sb[31], sb[32], sb[33], sb[34], sb[35], sb[36], sb[37], sb[38], sb[39], sb[40], sb[41], sb[42], sb[43]);
+                     sb[23], x.mat_cuts.exchange(0), sb[24], sb[25], sb[26], sb[27], sb[28], sb[29], sb[30], sb[31], sb[32], sb[33], sb[34], sb[35], sb[36], sb[37], sb[38], sb[39], sb[40], sb[41], sb[42], sb[43], sb[44], sb[45], sb[46], sb[47]);
             LOG_INFO(Render,
                      "Lean L3 direct checks (A2=2): inherited-slot words {} BAD {} | user-data "
                      "words {} BAD {} | clip planes {} BAD {} | formatted + fallback table bases {} BAD {} | "
@@ -5356,8 +5369,16 @@ void Liverpool::ExecuteRecord(const CpSplit::RecordHeader& record) {
             const u64 t0 = __rdtsc();
             A2Execute(record);
             const u32 t = static_cast<u32>(record.type) & 31;
-            g_blc.main_cyc[t] += __rdtsc() - t0;
+            const u64 dt = __rdtsc() - t0;
+            g_blc.main_cyc[t] += dt;
             ++g_blc.main_n[t];
+            if (record.type == CpSplit::RecordType::Packet) {
+                // q4: by opcode (the record's payload starts with the PM4 header)
+                const auto* ph = reinterpret_cast<const PM4Header*>(&record + 1);
+                const u32 op = ph->type == 3 ? static_cast<u32>(ph->type3.opcode.Value()) & 0xff : 0;
+                g_blc.pk_cyc[op] += dt;
+                ++g_blc.pk_n[op];
+            }
             BackLeanMaybeLog();
             return;
         }
