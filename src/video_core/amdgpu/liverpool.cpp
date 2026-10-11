@@ -1277,6 +1277,7 @@ struct LeanXlStats {
     /// l3g: formatted slots - texel syncs at publish and rejected stretches; A2=2 base compares.
     std::atomic<u64> texel_syncs{}, rej_texel{}, fmt_cmp{}, fmt_bad{};
     std::atomic<u64> verify_skips{}; ///< A2=2: stretches A2=1 would reject (not compared)
+    std::atomic<u64> verify_mid{};   ///< A2=2: buffer checks skipped, generation moved mid-stretch
     std::atomic<u64> front_p{}, front_e{}, lean_p{}, lean_e{};
     std::array<std::atomic<Vulkan::A2::StretchTranslator*>, 8> tr{};
 };
@@ -1968,6 +1969,9 @@ void LeanLog() {
                      x.clip_cmp.exchange(0), x.clip_bad.load(), x.fmt_cmp.exchange(0),
                      x.fmt_bad.load(), sb[22], x.texel_syncs.exchange(0), x.rej_texel.exchange(0),
                      sb[21], x.verify_skips.exchange(0));
+            LOG_INFO(Render, "Lean L3 verify: buffer checks skipped (generation moved mid-stretch by "
+                             "the verify's own old path) {}",
+                     x.verify_mid.exchange(0));
             std::array<u32, 32> ord{};
             for (u32 i = 0; i < 32; ++i) {
                 ord[i] = i;
@@ -8356,11 +8360,17 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                         }
                     }
                     // l3e direct checks (the mirror = the registers at this draw).
+                    const bool gen_same =
+                        rasterizer->A2BufferCache().StructGeneration() == vs->buf_gen;
                     const auto& ic = vs->cmds->inh_checks;
                     bool ud_done = false;
                     for (; vs_inh < ic.size() && ic[vs_inh].seq <= r->seq; ++vs_inh) {
                         const auto& c = ic[vs_inh];
                         if (c.seq != r->seq) {
+                            continue;
+                        }
+                        if (!gen_same) {
+                            x.verify_mid.fetch_add(1, std::memory_order_relaxed);
                             continue;
                         }
                         const auto* buf = rasterizer->A2BufferCache().NativeBufferAt(c.addr);
@@ -8409,6 +8419,10 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                     for (; vs_fmt < fc.size() && fc[vs_fmt].seq <= r->seq; ++vs_fmt) {
                         const auto& c = fc[vs_fmt];
                         if (c.seq != r->seq) {
+                            continue;
+                        }
+                        if (!gen_same) {
+                            x.verify_mid.fetch_add(1, std::memory_order_relaxed);
                             continue;
                         }
                         const auto* buf = rasterizer->A2BufferCache().NativeBufferAt(c.addr);
