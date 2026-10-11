@@ -780,6 +780,8 @@ const bool g_asc_early = [] {
 struct AscEarlyStats {
     std::atomic<u64> dispatches{}, packets{}, in_order{}, blocked{}, skipped{};
     std::atomic<u64> forced_checks{}, upload_bytes{}, uploading_records{}, cross_waits{};
+    // l4f: early record cycles (dispatch / packet), service gaps with pending work, unpublished stops
+    std::atomic<u64> c_disp{}, c_pkt{}, gap_ticks{}, gap_max{}, unpublished{};
 } g_asc_early_stats;
 const bool g_xq = [] {
     const char* v = std::getenv("SHADPS4_XQ_CENSUS");
@@ -2260,7 +2262,10 @@ void LeanLog() {
                              "(gfx read, earlier in ring order, of a range an early ASC record wrote) "
                              "{:.0f}/s of {:.0f}/s checked, early writes {:.0f}/s (shader write "
                              "bindings vs old-path reads only) | ASC waits on another queue's label "
-                             "(ordering Call) {:.0f}/s | front waits for early-queue space {}",
+                             "(ordering Call) {:.0f}/s | front waits for early-queue space {} | l4f: "
+                             "early record time dispatches {:.1f} packets {:.1f} ms/s | service gap "
+                             "with work pending {:.1f} ms/s (largest {:.2f} ms) | stops at unpublished "
+                             "work {:.0f}/s",
                              double(tk2(e.dispatches)) * ps, double(tk2(e.packets)) * ps,
                              double(tk2(e.in_order)) * ps, double(tk2(e.blocked)) * ps,
                              double(tk2(e.skipped)) * ps, double(tk2(e.forced_checks)) * ps,
@@ -2270,7 +2275,10 @@ void LeanLog() {
                              double(VideoCore::g_early_inv_checks.exchange(0)) * ps,
                              double(VideoCore::g_early_inv_writes.exchange(0)) * ps,
                              double(tk2(e.cross_waits)) * ps,
-                             g_wrm.ch.load() ? g_wrm.ch.load()->early_full_waits : 0);
+                             g_wrm.ch.load() ? g_wrm.ch.load()->early_full_waits : 0,
+                             double(tk2(e.c_disp)) / 3.5e6 * ps, double(tk2(e.c_pkt)) / 3.5e6 * ps,
+                             double(tk2(e.gap_ticks)) / 3.5e6 * ps, double(tk2(e.gap_max)) / 3.5e6,
+                             double(tk2(e.unpublished)) * ps);
                 }
                 if (g_xq) {
                     std::string ws, as;
@@ -2961,10 +2969,23 @@ void Liverpool::BackLoop(std::stop_token stoken) {
     // SHADPS4_ASC_EARLY: seqs of records already run ahead, in ring order (back only).
     std::deque<u64> early_done;
     const bool asc_early = g_asc_early && split->early_items != nullptr && g_mtb_p3 == 0;
+    u64 early_last_tsc = 0;
     const auto early_service = [&] {
         auto& ch = *split;
         u64 head = ch.early_head.load(std::memory_order_relaxed);
         const u64 tail = ch.early_tail.load(std::memory_order_acquire);
+        {
+            // l4f: the time since the previous service, when something is waiting now
+            const u64 now = __rdtsc();
+            if (head != tail && early_last_tsc != 0) {
+                const u64 gap = now - early_last_tsc;
+                g_asc_early_stats.gap_ticks.fetch_add(gap, std::memory_order_relaxed);
+                if (gap > g_asc_early_stats.gap_max.load(std::memory_order_relaxed)) {
+                    g_asc_early_stats.gap_max.store(gap, std::memory_order_relaxed);
+                }
+            }
+            early_last_tsc = now;
+        }
         const u64 published = ch.PublishedEnd();
         const u64 read = ch.ReadPos();
         while (head != tail) {
@@ -2974,6 +2995,7 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                 continue;
             }
             if (it.pos >= published) {
+                g_asc_early_stats.unpublished.fetch_add(1, std::memory_order_relaxed);
                 break; // committed, not published yet
             }
             using RT = CpSplit::RecordType;
@@ -2993,7 +3015,10 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                 const u64 chk0 = VideoCore::t_forced_binding_checks;
                 VideoCore::t_force_binding_sync = true;
                 VideoCore::t_early_pos = it.pos;
+                const u64 tx0 = __rdtsc();
                 ExecuteRecordImpl(*r);
+                (it.type == RT::Dispatch ? g_asc_early_stats.c_disp : g_asc_early_stats.c_pkt)
+                    .fetch_add(__rdtsc() - tx0, std::memory_order_relaxed);
                 VideoCore::t_force_binding_sync = false;
                 // l4a6 (review #1): as the L3 path - the next stretch replay needs its barrier.
                 g_a2s.gpu_write = g_a2s.gpu_write || it.type == RT::Dispatch || !A2NoopDma(*r);
@@ -8900,6 +8925,11 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
         lap(g_blc.pub_resolve);
         if (verify) {
             v_pass = true;
+            return false;
+        }
+        // l4g: non-push sub-batches get their set now (before anything of the stretch is recorded)
+        if (!Vulkan::A2::CommitSets(*st.cmds)) [[unlikely]] {
+            x.rej_mat.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
         if (g.gpu_write) {

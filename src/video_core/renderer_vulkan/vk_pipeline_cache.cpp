@@ -504,6 +504,18 @@ private:
                 job->base->native_colour_why.store("no push descriptors", std::memory_order_relaxed);
                 slot.state.store(2, std::memory_order_release);
                 PipelineCache::g_nc_claims[6].fetch_add(1, std::memory_order_relaxed);
+                static const bool set_variants = [] {
+                    const char* e = std::getenv("SHADPS4_NATIVE_SET_VARIANTS");
+                    return e && e[0] == '1';
+                }();
+                if (set_variants) {
+                    // l4g: kept for the A2 translator only (descriptor set per sub-batch).
+                    variant->native_vertex_binding = job->vertex_binding;
+                    variant->native_table_binding = job->table_binding;
+                    variant->native_pt_debug_binding = job->pt_debug_binding;
+                    slot.set_variant.store(variant.get(), std::memory_order_release);
+                    PipelineCache::g_nc_claims[7].fetch_add(1, std::memory_order_relaxed);
+                }
             } else {
                 variant->native_vertex_binding = job->vertex_binding;
                 variant->native_table_binding = job->table_binding;

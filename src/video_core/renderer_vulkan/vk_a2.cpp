@@ -442,6 +442,34 @@ const char* RefusalName(u32 reason) {
     return reason < NumRefusals ? RefusalNames[reason] : "?";
 }
 
+bool CommitSets(StretchCmds& cmds) {
+    // l4g, the back's thread at publish: one set per non-push sub-batch.
+    for (auto& b : cmds.batches) {
+        if (!b.set_owner || !b.emit_descriptors || b.num_writes == 0) {
+            continue;
+        }
+        std::array<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS + 4> infos;
+        std::array<vk::WriteDescriptorSet, Shader::NUM_BUFFERS + 4> writes;
+        for (u32 i = 0; i < b.num_writes; ++i) {
+            const auto& w = b.writes[i];
+            infos[i] = vk::DescriptorBufferInfo{w.buffer, w.offset, w.range};
+            writes[i] = vk::WriteDescriptorSet{
+                .dstSet = VK_NULL_HANDLE,
+                .dstBinding = w.binding,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = vk::DescriptorType::eStorageBuffer,
+                .pBufferInfo = &infos[i],
+            };
+        }
+        b.set = b.set_owner->CommitSetWrites(std::span{writes.data(), b.num_writes});
+        if (!b.set) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void Replay(const StretchCmds& cmds, vk::CommandBuffer cmdbuf, const Instance& instance) {
     // Colour draws: the back resolved every material of the stretch (mat_slots, bindless_set)
     // before recording this closure; write each draw's slot words into its job ring record
@@ -461,7 +489,10 @@ void Replay(const StretchCmds& cmds, vk::CommandBuffer cmdbuf, const Instance& i
         if (b.emit_push) {
             cmdbuf.pushConstants(b.layout, AllGraphicsStageBits, 0u, sizeof(b.push), &b.push);
         }
-        if (b.emit_descriptors && b.num_writes != 0) {
+        if (b.emit_descriptors && b.num_writes != 0 && b.set_owner) {
+            // l4g: the set the back committed at publish
+            cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, b.layout, 0, b.set, {});
+        } else if (b.emit_descriptors && b.num_writes != 0) {
             std::array<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS + 4> infos;
             std::array<vk::WriteDescriptorSet, Shader::NUM_BUFFERS + 4> writes;
             for (u32 i = 0; i < b.num_writes; ++i) {
@@ -726,6 +757,9 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         const u64 vkey = VideoCore::NativeVertexKey(AmdGpu::CpSplit::VertexInputAttribs(*draw.vi),
                                                     draw.vi->count);
         native = base->NativeColourVariant(vkey);
+        if (!native) {
+            native = base->NativeColourSetVariant(vkey); // l4g: null unless SET_VARIANTS
+        }
         if (!native) {
             return no_variant(vkey);
         }
@@ -1360,6 +1394,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         sb.bindless = colour;
         sb.pipeline = native->Handle();
         sb.layout = native->GetLayout();
+        sb.set_owner = native->UsesPushDescriptors() ? nullptr : native; // l4g
         sb.push = push;
         writes[num_writes++] = {native->native_records_binding,
                                 vk::Buffer{std::bit_cast<VkBuffer>(ring_handle)}, 0, VK_WHOLE_SIZE};

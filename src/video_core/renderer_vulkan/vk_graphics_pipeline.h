@@ -179,6 +179,9 @@ public:
         std::atomic<const GraphicsPipeline*> variant{nullptr};
         /// SHADPS4_NATIVE_SEGB census: 2 = the claimed build was refused (no variant will come).
         std::atomic<u8> state{0};
+        /// l4g (SHADPS4_NATIVE_SET_VARIANTS): a variant without push descriptors (descriptor
+        /// set at set 0); only the A2 stretch translator uses it.
+        std::atomic<const GraphicsPipeline*> set_variant{nullptr};
     };
     static constexpr u32 NativeColourSlots = 4;
     mutable std::array<NativeColourSlot, NativeColourSlots> native_colour{};
@@ -189,6 +192,14 @@ public:
     u32 native_vertex_binding = NoNativeRecords; ///< a colour variant: its vertex SSBO binding
     u32 native_table_binding = NoNativeRecords;  ///< SHADPS4_NATIVE_GPU_DIRECT: the batch table
     u32 native_pt_debug_binding = NoNativeRecords;  ///< SHADPS4_NATIVE_PT=2: the compare SSBO
+    const GraphicsPipeline* NativeColourSetVariant(u64 key) const noexcept {
+        for (const auto& slot : native_colour) {
+            if (slot.key.load(std::memory_order_acquire) == key) {
+                return slot.set_variant.load(std::memory_order_acquire);
+            }
+        }
+        return nullptr;
+    }
     const GraphicsPipeline* NativeColourVariant(u64 key) const noexcept {
         for (const auto& slot : native_colour) {
             if (slot.key.load(std::memory_order_acquire) == key) {

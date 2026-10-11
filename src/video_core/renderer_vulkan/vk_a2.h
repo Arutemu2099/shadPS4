@@ -87,6 +87,10 @@ constexpr u32 MaxMaterials = 8;
 
 /// One material of a stretch: the draw's base pipeline (DrawIn::pipeline) and the Draw record the
 /// back re-reads (ReadStages -> BindlessResolve with its fragment stage) to get the slots.
+struct StretchCmds;
+/// l4g: the back, at publish: a descriptor set per non-push sub-batch. False: none (old path).
+bool CommitSets(StretchCmds& cmds);
+
 struct MaterialRef {
     const GraphicsPipeline* base{};
     u64 rec_pos{};
@@ -126,6 +130,9 @@ struct SubBatch {
     bool bindless{};
     vk::Pipeline pipeline{};
     vk::PipelineLayout layout{};
+    /// l4g: a non-push variant - the back commits `set` (set 0) from these writes at publish.
+    const GraphicsPipeline* set_owner{};
+    vk::DescriptorSet set{};
     Shader::PushData push{};
     /// Set-0 push-descriptor writes (storage buffers only), in binding order.
     struct Write {

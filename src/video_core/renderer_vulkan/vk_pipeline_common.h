@@ -64,6 +64,10 @@ public:
         return *pipeline_layout;
     }
 
+    /// l4g: a set-0 descriptor set of this (non-push) pipeline from the master-timeline heap,
+    /// with `writes` written into it (dstSet is filled here). The back's thread only.
+    vk::DescriptorSet CommitSetWrites(std::span<vk::WriteDescriptorSet> writes) const;
+
     /// Descriptors pushed per dispatch (no descriptor set from the master-timeline heap).
     [[nodiscard]] bool UsesPushDescriptors() const noexcept {
         return uses_push_descriptors && !uses_native_bindings;

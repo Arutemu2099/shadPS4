@@ -7177,9 +7177,10 @@ void Rasterizer::NativeLog() {
         const auto& cl = PipelineCache::g_nc_claims;
         LOG_INFO(Render_Vulkan,
                  "NativeColour claims (cumulative): claimed {} refused with a reason {} vertex format {} "
-                 "records binding {} pushed {} built {} built without push descriptors {}",
+                 "records binding {} pushed {} built {} built without push descriptors {} (kept as "
+                 "set variants {})",
                  cl[0].load(), cl[1].load(), cl[2].load(), cl[3].load(), cl[4].load(), cl[5].load(),
-                 cl[6].load());
+                 cl[6].load(), cl[7].load());
     }
     if (st.mm_hit + st.mm_miss + st.mm_stale + st.mm_vfy != 0) {
         LOG_INFO(Render_Vulkan,

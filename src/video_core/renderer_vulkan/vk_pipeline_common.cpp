@@ -121,6 +121,15 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
     });
 }
 
+vk::DescriptorSet Pipeline::CommitSetWrites(std::span<vk::WriteDescriptorSet> writes) const {
+    const auto desc_set = desc_heap.Commit(*desc_layout);
+    for (auto& w : writes) {
+        w.dstSet = desc_set;
+    }
+    instance.GetDevice().updateDescriptorSets(writes, {});
+    return desc_set;
+}
+
 void Pipeline::BindResourcesNative(NativeBindings& native, std::span<const u32> indices,
                                    const BufferBarriers& buffer_barriers,
                                    const Shader::PushData& push_data) const {
