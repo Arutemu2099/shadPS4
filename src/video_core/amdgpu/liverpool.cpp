@@ -3093,18 +3093,11 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                     const auto* h = reinterpret_cast<const PM4Header*>(r + 1);
                     lane_label = (r->flags & CpSplit::AscReleaseMem) != 0;
                     const auto op = h->type3.opcode.Value();
-                    t_lane_packet = h->type == 3 && !lane_label && op == PM4ItOpcode::DmaData;
+                    // p1f: ASC labels run on the lane too (their GDS store reads lane-written GDS).
+                    t_lane_packet = h->type == 3 && (lane_label || op == PM4ItOpcode::DmaData);
                     auto& sch = rasterizer->GetScheduler();
                     if (t_lane_packet) {
                         sch.LaneCount(7);
-                    } else if (lane_label) {
-                        // p1d: the label ends the open segment (never a forced main flush); only
-                        // a GDS store reads lane data on main.
-                        sch.LaneLabelCut();
-                        if (reinterpret_cast<const PM4CmdReleaseMem*>(h)->data_sel ==
-                            DataSelect::GdsMemStore) {
-                            sch.LaneFallbackMain();
-                        }
                     } else {
                         sch.LaneCount(8);
                         const bool quiet = h->type == 3 && (op == PM4ItOpcode::WriteData ||
@@ -3120,6 +3113,9 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                 if (t_lane_packet) [[unlikely]] {
                     t_lane_packet = false;
                     rasterizer->GetScheduler().SwitchStream(0);
+                    if (lane_label) {
+                        rasterizer->GetScheduler().LaneLabelCut(); // marks lane_label_value
+                    }
                 }
                 if (VideoCore::g_lane_census) [[unlikely]] {
                     auto& lc = VideoCore::g_lc;
@@ -6526,7 +6522,18 @@ static bool AscReleaseFlush() {
 
 void Liverpool::ExecuteAscReleaseMem(const PM4CmdReleaseMem* release_mem, u32 pipe_id) {
     if (rasterizer) {
+        // p1f: an ASC label on the lane - image downloads are main-only work (review B2).
+        auto& sch = rasterizer->GetScheduler();
+        const u32 prev = sch.ActiveStream();
+        const u64 lane_wait = sch.LaneWaitMain();
+        if (prev != 0 && sch.HasLane()) {
+            sch.SwitchStream(0);
+        }
         rasterizer->ProcessDownloadImages();
+        if (prev != 0 && sch.HasLane()) {
+            sch.SwitchStream(prev);
+            sch.LaneNeedMain(lane_wait, 4);
+        }
     }
     if (AscReleaseFlush() && rasterizer) {
         auto& sched = rasterizer->GetScheduler();
