@@ -343,6 +343,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
         });
         last_state = next_state(last_state);
         ++backing->state_serial;
+        VideoCore::TexTable::NoteImage(tab_gen); // q8
         Common::FaultMonitor::CountBarriers(false, 0, barriers.size());
         return barriers;
     }
@@ -355,6 +356,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
     if (!promoted) {
         runs.push_back(StateRun{0u, res_levels * res_layers, last_state});
         ++backing->state_serial;
+        VideoCore::TexTable::NoteImage(tab_gen); // q8
     }
 
     const u32 base_level = needs_partial_transition ? subres_range->base.level : 0u;
@@ -454,6 +456,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
         }
         runs.assign(rebuilt.begin(), rebuilt.end());
         ++backing->state_serial;
+        VideoCore::TexTable::NoteImage(tab_gen); // q8
     }
 
     // A full-resource transition leaves every subresource in one state, so drop back to the cheap
@@ -464,6 +467,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
         if (!runs.empty()) {
             runs.clear();
             ++backing->state_serial;
+        VideoCore::TexTable::NoteImage(tab_gen); // q8
         }
     } else if (!needs_partial_transition) {
         const bool uniform = std::ranges::all_of(
@@ -472,6 +476,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
             last_state = runs.empty() ? dst_state : runs.front().state;
             runs.clear();
             ++backing->state_serial;
+        VideoCore::TexTable::NoteImage(tab_gen); // q8
             Common::FaultMonitor::CountBarriers(true, seg_iters, barriers.size());
             return barriers;
         }
@@ -480,6 +485,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
     if (!(last_state == dst_state)) {
         last_state = dst_state;
         ++backing->state_serial;
+        VideoCore::TexTable::NoteImage(tab_gen); // q8
     }
     Common::FaultMonitor::CountBarriers(true, seg_iters, barriers.size());
     return barriers;
@@ -1082,7 +1088,8 @@ void Image::SetBackingSamples(u32 num_samples, bool copy_backing) {
         new_backing->state.layout = dst_layout;
         new_backing->state.access_mask = dst_access;
         new_backing->state.pl_stage = dst_stage;
-        ++new_backing->state_serial; // SHADPS4_TEX_TRANSIT_SKIP: a state write outside GetBarriers
+        ++new_backing->state_serial;
+        VideoCore::TexTable::NoteImage(tab_gen); // q8 // SHADPS4_TEX_TRANSIT_SKIP: a state write outside GetBarriers
         if (AmdGpu::MtbConflict::g_enabled) [[unlikely]] {
             AmdGpu::MtbConflict::Change(new_backing->cf, AmdGpu::MtbConflict::Image);
         }

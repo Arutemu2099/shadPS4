@@ -192,6 +192,10 @@ public:
     }
 
     /// SHADPS4_BIND_MEMO_STATS: the image without the LRU touch GetImage does.
+    /// q8: the table's bulk touch checks an id before PeekImage.
+    [[nodiscard]] bool IsImageAllocated(ImageId id) noexcept {
+        return id && slot_images.is_allocated(id);
+    }
     [[nodiscard]] Image& PeekImage(ImageId id) noexcept {
         return slot_images[id];
     }

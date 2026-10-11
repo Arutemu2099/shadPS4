@@ -289,6 +289,7 @@ public:
     [[nodiscard]] const Instance& A2Instance() const noexcept {
         return instance;
     }
+    void A2TexTableTouch(); // q8: LRU touches of the table's images / samplers (rate-limited)
     void MaybeEarlyCut(bool run_end = false);                  // q7 / q7b
     static int EarlyCutMode();                                 // q7b
     [[nodiscard]] VideoCore::BufferCache& A2BufferCache() noexcept {
@@ -780,6 +781,7 @@ private:
         /// when set (the material memo's fill).
         BindlessImgEntry* cap_img{};
         size_t* cap_lru{};
+        BindlessSmpEntry* cap_smp{}; // q8
         u64 img_gen{1}, smp_gen{1};
         u64 tex_gen{~0ull}, img_epoch{~0ull}, meta_epoch{~0ull}, sampler_gen{~0ull};
     } bindless;

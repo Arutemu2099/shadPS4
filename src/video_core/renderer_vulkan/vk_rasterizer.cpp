@@ -12,6 +12,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "video_core/texture_cache/tex_table.h"
 #include "common/thread.h"
 #include "common/debug.h"
 #include "common/buffer_sample_probe.h"
@@ -5316,7 +5317,8 @@ bool Rasterizer::A2MaterialMemoValid(const MatMemo& m) {
 bool Rasterizer::A2MaterialMemo(const GraphicsPipeline* base, u64 h1, u64 h2, u32 kn, u32* slots,
                                 u32& n_img, u32& n_smp, std::vector<VideoCore::ImageId>& ids) {
     const int mode = MatMemoMode();
-    if (mode == 0 || mode == 2 || !base || (h1 == 0 && h2 == 0) || mat_memo.empty()) {
+    if (mode == 0 || mode == 2 || !base || (h1 == 0 && h2 == 0) || mat_memo.empty() ||
+        VideoCore::TexTable::Mode() != 0) { // q8: the table replaces the memo
         return false; // =2: A2ResolveMaterial verifies every hit against the full resolve
     }
     auto& st = native_stats;
@@ -5440,16 +5442,46 @@ bool Rasterizer::A2ResolveMaterial(const GraphicsPipeline* base, const Shader::B
     std::array<VideoCore::ImageId, Shader::NativeBindlessMax> got{};
     MatMemo fill{};
     std::array<BindlessImgEntry, Shader::NativeBindlessMax> cap{};
-    if (memo) {
+    std::array<BindlessSmpEntry, Shader::NativeBindlessMax> cap_s{}; // q8
+    const bool tab = VideoCore::TexTable::Mode() != 0;
+    if (memo || tab) {
         bindless.cap_img = cap.data();
         bindless.cap_lru = fill.lru.data();
+        bindless.cap_smp = cap_s.data();
     }
     const bool ok =
         BindlessResolve(base, slots, nullptr, nullptr, n_img, n_smp, true, &fs, got.data(), vs);
     bindless.cap_img = nullptr;
     bindless.cap_lru = nullptr;
+    bindless.cap_smp = nullptr;
     if (!ok) {
         return false;
+    }
+    if (tab) {
+        // q8: insert what the workers may look up - sampled-only images (never a render / depth
+        // target or storage image, no depth association, one sample, not bound as a target).
+        namespace TT = VideoCore::TexTable;
+        const u64 tg = TT::Gen();
+        for (u32 i = 0; i < n_img; ++i) {
+            const auto& e = cap[i];
+            auto& im = texture_cache.GetImage(e.id);
+            const bool ok_img = !im.usage.render_target && !im.usage.depth_target &&
+                                !im.usage.storage && !im.depth_id && im.info.num_samples <= 1 &&
+                                !im.binding.is_target && !im.binding.force_general &&
+                                !im.binding.needs_rebind;
+            if (!ok_img) {
+                TT::g_c[7].fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            std::atomic_ref<u64>{im.tab_gen}.store(tg, std::memory_order_relaxed);
+            TT::InsertImg(static_cast<u32>(reinterpret_cast<uintptr_t>(e.desc)), e.words, e.slot,
+                          static_cast<u32>(e.id.index), tg);
+            TT::g_c[4].fetch_add(1, std::memory_order_relaxed);
+        }
+        for (u32 j = 0; j < n_smp; ++j) {
+            const auto& e = cap_s[j];
+            TT::InsertSmp(e.words, e.slot, e.lru, tg);
+        }
     }
     if (vfy) {
         auto& st = native_stats;
@@ -5490,6 +5522,38 @@ bool Rasterizer::A2ResolveMaterial(const GraphicsPipeline* base, const Shader::B
     ids.insert(ids.end(), got.begin(), got.begin() + n_img);
     Q4NoteMaterial(got.data(), n_img);
     return true;
+}
+
+void Rasterizer::A2TexTableTouch() {
+    // q8: the table's materials skip the per-material LRU touches; touch every current entry's
+    // image / sampler at most every 4 ms instead (an evicted image is unregistered: a kill).
+    namespace TT = VideoCore::TexTable;
+    static auto last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::milliseconds(4)) {
+        return;
+    }
+    last = now;
+    const u64 tg = TT::Gen();
+    for (const auto& e : TT::g_img) {
+        if (e.seq.load(std::memory_order_relaxed) != 0 && e.gen == tg) {
+            const VideoCore::ImageId id{e.id};
+            if (texture_cache.IsImageAllocated(id)) {
+                texture_cache.TouchImageAccess(texture_cache.PeekImage(id));
+            }
+        }
+    }
+    std::vector<size_t> lru;
+    lru.reserve(256);
+    for (const auto& e : TT::g_smp) {
+        if (e.seq.load(std::memory_order_relaxed) != 0 && e.gen == tg) {
+            lru.push_back(static_cast<size_t>(e.lru));
+        }
+    }
+    if (!lru.empty() &&
+        !texture_cache.TouchSamplers(std::span{lru.data(), lru.size()}, bindless.sampler_gen)) {
+        TT::Kill();
+    }
 }
 
 vk::DescriptorSet Rasterizer::A2BindlessCommit() {
@@ -5547,6 +5611,7 @@ bool Rasterizer::BindlessRotate() {
     ++bl.img_gen;
     ++bl.smp_gen;
     ++native_stats.bl_rot;
+    VideoCore::TexTable::Kill(); // q8: every slot is reassigned
     return true;
 }
 
@@ -5610,9 +5675,11 @@ bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::I
     if (me != bl.meta_epoch) {
         ++bl.img_gen;
         bl.meta_epoch = me;
+        VideoCore::TexTable::Kill(); // q8
     }
     bl.tex_gen = tg;
     if (sg != bl.sampler_gen) {
+        VideoCore::TexTable::Kill(); // q8
         bl.smp_slot.clear();
         ++bl.smp_gen;
         bl.sampler_gen = sg;
@@ -5817,6 +5884,9 @@ bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::I
             if (bl.cap_lru) {
                 bl.cap_lru[j] = e.lru;
             }
+            if (bl.cap_smp) {
+                bl.cap_smp[j] = e; // q8
+            }
             ++st.bl_smp_hit;
             continue;
         }
@@ -5847,6 +5917,9 @@ bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::I
         e = {words, bl.smp_gen, slot, texture_cache.SamplerLruId(ssharp), sh};
         if (bl.cap_lru) {
             bl.cap_lru[j] = e.lru;
+        }
+        if (bl.cap_smp) {
+            bl.cap_smp[j] = e; // q8
         }
         slots[Shader::NativeBindlessMax + j] = slot;
         if (samplers) {

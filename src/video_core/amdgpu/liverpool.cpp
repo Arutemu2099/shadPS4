@@ -17,6 +17,7 @@
 #include <unordered_set>
 #include <boost/preprocessor/stringize.hpp>
 
+#include "video_core/texture_cache/tex_table.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/decoder.h"
@@ -1411,6 +1412,17 @@ void BackLeanMaybeLog() {
                              double(b.why_cyc[i]) / double(std::max<u64>(b.why_n[i], 1)));
     }
     LOG_INFO(Render, "BackLean old-path job draws by why (ms per s):{}", why_s);
+    {
+        namespace TT = VideoCore::TexTable;
+        const auto tk = [](std::atomic<u64>& a) { return a.exchange(0); };
+        LOG_INFO(Render,
+                 "q8 texture table (window): worker materials looked up {} all hit {} | published "
+                 "pre-resolved {} rejected (generation moved) {} | back image inserts {} "
+                 "ineligible {} | kills {} | verify {} BAD {} (cumulative)",
+                 tk(TT::g_c[0]), tk(TT::g_c[1]), tk(TT::g_c[2]), tk(TT::g_c[3]),
+                 tk(TT::g_c[4]), tk(TT::g_c[7]), tk(TT::g_kills), tk(TT::g_c[5]),
+                 TT::g_c[6].load());
+    }
     {
         std::string pk_s; // q4
         for (u32 i = 0; i < 256; ++i) {
@@ -9051,8 +9063,47 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                     ok = ok && (off < bc0 || off >= bc1);
                 }
             }
+            // q8: materials the worker resolved from the texture table hold while its generation
+            // and the bindless set are unchanged - no per-material work here (=2: verified).
+            namespace TT = VideoCore::TexTable;
+            const int tab_mode = TT::Mode();
+            const bool tab_ok = st.mat_pre != 0 && st.tab_gen == TT::Gen() &&
+                                rasterizer->A2BindlessCur() == st.tab_set;
+            if (st.mat_pre != 0 && !tab_ok) {
+                TT::g_c[3].fetch_add(1, std::memory_order_relaxed);
+            }
             for (size_t m = 0; ok && m < st.materials.size(); ++m) {
                 const auto& mr = st.materials[m];
+                std::array<u32, 2 * Shader::NativeBindlessMax> pre_slots{};
+                const bool pre = tab_ok && ((st.mat_pre >> m) & 1) != 0;
+                if (pre) {
+                    TT::g_c[2].fetch_add(1, std::memory_order_relaxed);
+                    mat_n[m] = st.pre_n[m];
+                    if (tab_mode != 2) {
+                        continue;
+                    }
+                    pre_slots = st.cmds->mat_slots[m];
+                }
+                const auto tab_verify = [&] {
+                    if (!pre) {
+                        return;
+                    }
+                    TT::g_c[5].fetch_add(1, std::memory_order_relaxed);
+                    bool bad = mat_n[m] != st.pre_n[m];
+                    for (u32 i = 0; !bad && i < mat_n[m].first; ++i) {
+                        bad = pre_slots[i] != st.cmds->mat_slots[m][i];
+                    }
+                    for (u32 j = 0; !bad && j < mat_n[m].second; ++j) {
+                        bad = pre_slots[Shader::NativeBindlessMax + j] !=
+                              st.cmds->mat_slots[m][Shader::NativeBindlessMax + j];
+                    }
+                    if (bad && TT::g_c[6].fetch_add(1, std::memory_order_relaxed) < 8) {
+                        LOG_WARNING(Render, "q8 texture table VERIFY BAD: material {} ({} / {} "
+                                            "images, {} / {} samplers)",
+                                    m, st.pre_n[m].first, mat_n[m].first, st.pre_n[m].second,
+                                    mat_n[m].second);
+                    }
+                };
                 if (rasterizer->A2MaterialMemo(mr.base, mr.h1, mr.h2, mr.kn,
                                                st.cmds->mat_slots[m].data(), mat_n[m].first,
                                                mat_n[m].second, mat_ids)) {
@@ -9074,6 +9125,12 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                                                    st.cmds->mat_slots[m].data(), ni, ns, mat_ids,
                                                    mr.h1, mr.h2, mr.kn,
                                                    &mst[u32(Shader::LogicalStage::Vertex)]);
+                if (ok) {
+                    tab_verify();
+                }
+            }
+            if (tab_mode != 0) {
+                rasterizer->A2TexTableTouch(); // q8
             }
             // A rotation mid-loop invalidates the earlier materials' slots.
             ok = ok && rasterizer->A2BindlessCur() == set0;
@@ -9117,6 +9174,13 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
         }
         mirror->ctx_epoch = rec.ctx_epoch;
         rasterizer->A2BeginStretch(rec.draw.pipeline);
+        if (colour && st.mat_pre != 0 && VideoCore::TexTable::Mode() == 1 &&
+            st.tab_gen != VideoCore::TexTable::Gen()) {
+            // q8: an image of a table material changed (e.g. became a target of this pass).
+            VideoCore::TexTable::g_c[3].fetch_add(1, std::memory_order_relaxed);
+            x.rej_rt.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
         if (colour && !rasterizer->A2ImagesSafe(mat_ids)) {
             // A sampled image is a target of this pass: the old path (per-draw barriers) runs the
             // stretch; the pass it began is reused.

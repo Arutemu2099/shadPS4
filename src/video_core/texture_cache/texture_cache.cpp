@@ -309,6 +309,7 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
     }
     image.flags |= ImageFlagBits::MaybeCpuDirty;
     g_image_epoch.fetch_add(1, std::memory_order_release);
+    TexTable::NoteImage(image.tab_gen); // q8
     UntrackImage(image_id);
 }
 
@@ -407,6 +408,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             // Untrack the image, so that the range is unprotected and the guest can write freely.
             image.flags |= ImageFlagBits::CpuDirty;
             g_image_epoch.fetch_add(1, std::memory_order_release);
+            TexTable::NoteImage(image.tab_gen); // q8
             UntrackImage(image_id);
         } else if (pages_end < image_end) {
             // This page access may or may not modify the image.
@@ -448,6 +450,7 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
         }
         image.flags |= ImageFlagBits::GpuDirty;
         g_image_epoch.fetch_add(1, std::memory_order_release);
+        TexTable::NoteImage(image.tab_gen); // q8
     });
 }
 
@@ -1749,6 +1752,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
         for (const ImageId other : page_ids) {
             std::atomic_ref<u64>{slot_images[other].overlap_epoch}.fetch_add(
                 1, std::memory_order_relaxed);
+            TexTable::NoteImage(slot_images[other].tab_gen); // q8
         }
         page_ids.push_back(image_id);
         page_image_counts[page].fetch_add(1, std::memory_order_release);
@@ -1762,6 +1766,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
+    TexTable::NoteImage(image.tab_gen); // q8
     LogImageChurn("Unregister", image);
     lru_cache.Free(image.lru_id);
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
@@ -1781,6 +1786,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
         for (const ImageId other : image_ids) {
             std::atomic_ref<u64>{slot_images[other].overlap_epoch}.fetch_add(
                 1, std::memory_order_relaxed);
+            TexTable::NoteImage(slot_images[other].tab_gen); // q8
         }
         page_image_counts[page].fetch_sub(1, std::memory_order_release);
     });

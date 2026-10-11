@@ -10,6 +10,7 @@
 #include <mutex>
 #include <vector>
 
+#include "video_core/texture_cache/tex_table.h"
 #include "common/logging/log.h"
 #include "shader_recompiler/native_emit.h"
 #include "video_core/amdgpu/cp_split.h"
@@ -1049,6 +1050,10 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     ImageKey key{};
     u32 bi = 0;
     u32 tot_img = 0, tot_smp = 0; // q3
+    // q8: the material's images / samplers in slot order (FS then VS) for the table lookup.
+    std::array<std::pair<const Shader::ImageResource*, const Shader::BoundStage*>, 16> tl_img{};
+    std::array<std::pair<const Shader::SamplerResource*, const Shader::BoundStage*>, 16> tl_smp{};
+    u32 tl_ni = 0, tl_ns = 0;
     for (u32 s = 0; s < Shader::MaxStageTypes - 1; ++s) {
         const Shader::BoundStage& bound = (*draw.stages)[s];
         const Shader::Info* info = bound.info;
@@ -1151,8 +1156,14 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
                 }
                 std::memcpy(&key.w[key.n], &tsharp, sizeof(tsharp));
                 key.n += words;
+                if (tl_ni < tl_img.size()) {
+                    tl_img[tl_ni++] = {&desc, &bound}; // q8
+                }
             }
             for (const auto& desc : info->samplers) {
+                if (tl_ns < tl_smp.size()) {
+                    tl_smp[tl_ns++] = {&desc, &bound}; // q8
+                }
                 const auto ssharp = desc.GetSharp(bound);
                 constexpr u32 words = static_cast<u32>(sizeof(ssharp) / sizeof(u32));
                 if (key.n + words > key.w.size()) {
@@ -1675,6 +1686,53 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
             stretch->materials.push_back({base, draw.rec_pos, mh1, mh2, key.n});
             mat_keys[mat] = key;
             mat_base[mat] = base;
+            namespace TT = VideoCore::TexTable;
+            if (TT::Mode() != 0) {
+                // q8: the slots from the table (the back's BindlessResolve keys: T# words + desc
+                // bits, S# words after its anisotropy rule); all must hit at one generation.
+                TT::g_c[0].fetch_add(1, std::memory_order_relaxed);
+                const u64 tg = TT::Gen();
+                const u32 set = g_bindless_cur.load(std::memory_order_acquire);
+                bool all = (stretch->mat_pre == 0 || (stretch->tab_gen == tg &&
+                                                      stretch->tab_set == set));
+                auto& ms = cmds->mat_slots[mat];
+                for (u32 i = 0; all && i < tl_ni; ++i) {
+                    const auto& d = *tl_img[i].first;
+                    const auto ts = d.GetSharp(*tl_img[i].second);
+                    std::array<u32, 8> w;
+                    static_assert(sizeof(ts) == sizeof(w));
+                    std::memcpy(w.data(), &ts, sizeof(w));
+                    const u32 dk = u32(d.is_depth) | u32(d.is_array) << 1 | u32(d.is_r128) << 2 |
+                                   (1u << 8);
+                    u32 slot = 0;
+                    all = TT::LookupImg(dk, w, tg, slot);
+                    ms[i] = slot;
+                }
+                for (u32 j = 0; all && j < tl_ns; ++j) {
+                    const auto& sd = *tl_smp[j].first;
+                    const auto& sb = *tl_smp[j].second;
+                    auto ss = sd.GetSharp(sb);
+                    if (sd.disable_aniso) {
+                        const auto& at = sb.info->images[sd.associated_image].GetSharp(sb);
+                        if (at.base_level == 0 && at.last_level == 0) {
+                            ss.max_aniso.Assign(AmdGpu::AnisoRatio::One);
+                        }
+                    }
+                    std::array<u32, 4> w;
+                    static_assert(sizeof(ss) == sizeof(w));
+                    std::memcpy(w.data(), &ss, sizeof(w));
+                    u32 slot = 0;
+                    all = TT::LookupSmp(w, tg, slot);
+                    ms[Shader::NativeBindlessMax + j] = slot;
+                }
+                if (all) {
+                    TT::g_c[1].fetch_add(1, std::memory_order_relaxed);
+                    stretch->mat_pre |= 1u << mat;
+                    stretch->tab_gen = tg;
+                    stretch->tab_set = set;
+                    stretch->pre_n[mat] = {static_cast<u8>(tl_ni), static_cast<u8>(tl_ns)};
+                }
+            }
         }
         cmds->slot_writes.push_back({draw.job_tag, idx, static_cast<u32>(mat)});
     }

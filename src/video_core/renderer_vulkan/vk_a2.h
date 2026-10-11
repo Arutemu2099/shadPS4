@@ -244,6 +244,13 @@ struct Stretch {
     /// Formatted Guest slots' (V# address, V# size), distinct, at most 16: the back syncs each
     /// with its own typed lookup (A2SyncTexel) before the stretch's pass.
     std::vector<std::pair<VAddr, u64>> texel;
+    /// q8 (SHADPS4_TEX_TABLE): materials the worker resolved from the texture table (bit m: its
+    /// slot words are in cmds->mat_slots[m]), the table generation / bindless set they hold for,
+    /// and their image / sampler counts.
+    u32 mat_pre{};
+    u64 tab_gen{};
+    u32 tab_set{};
+    std::array<std::pair<u8, u8>, 8> pre_n{};
     /// p2 (SHADPS4_A2_SEC): the worker's secondary (null: the closure path), the bindless set
     /// index it binds, and its rendering inheritance.
     const GraphicsPipeline* rt_pipe{};
