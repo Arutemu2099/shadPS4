@@ -714,6 +714,14 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         return refuse(RefuseNotIndexed);
     }
     if (draw.is_indirect) {
+        // m3 census: would a variant exist for it (native shadow kind or colour by description)?
+        const GraphicsPipeline* b = draw.pipeline;
+        const bool has = b && (b->native_variant.load(std::memory_order_relaxed) != nullptr ||
+                               (draw.vi && draw.vi->count <= 16 &&
+                                b->NativeColourVariant(VideoCore::NativeVertexKey(
+                                    AmdGpu::CpSplit::VertexInputAttribs(*draw.vi),
+                                    draw.vi->count)) != nullptr));
+        ++owner->sub[has ? 32 : 33];
         return refuse(RefuseIndirect);
     }
     const GraphicsPipeline* base = draw.pipeline;

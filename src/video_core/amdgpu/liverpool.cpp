@@ -2193,13 +2193,13 @@ void LeanLog() {
             auto& x = g_lean_xl;
             const double ps = 1.0 / std::max(sec, 1e-9);
             std::array<u64, 32> rf{};
-            std::array<u64, 32> sb{};
+            std::array<u64, 34> sb{};
             for (const auto& t : x.tr) {
                 if (const auto* tr = t.load(std::memory_order_acquire)) {
                     for (u32 i = 0; i < 32; ++i) {
                         rf[i] += tr->refusals[i]; // cumulative (racy reads, as A2Log)
                     }
-                    for (u32 i = 0; i < 32; ++i) {
+                    for (u32 i = 0; i < 34; ++i) {
                         sb[i] += tr->sub[i];
                     }
                 }
@@ -2213,10 +2213,11 @@ void LeanLog() {
                      "slots {} with clip planes {} | guest-lookup fallback {} | stretches cut by a 9th "
                      "material {} | no variant: pipeline undecided {} eligible (no variant for this "
                      "vertex description yet) {} untextured {} other ineligible {} | eligible by slot: refused (final) {} "
-                     "claimed without variant {} not claimed, free slot {} not claimed, slots full {}",
+                     "claimed without variant {} not claimed, free slot {} not claimed, slots full {} | indirect: "
+                     "with a variant {} without {}",
                      sb[12], sb[13], sb[14], sb[15], sb[0], sb[1], sb[2], sb[3], sb[4], sb[5], sb[6],
                      sb[7], sb[8], sb[9], sb[10], sb[11], sb[16], sb[17], sb[18], sb[19], sb[20],
-                     sb[23], x.mat_cuts.exchange(0), sb[24], sb[25], sb[26], sb[27], sb[28], sb[29], sb[30], sb[31]);
+                     sb[23], x.mat_cuts.exchange(0), sb[24], sb[25], sb[26], sb[27], sb[28], sb[29], sb[30], sb[31], sb[32], sb[33]);
             LOG_INFO(Render,
                      "Lean L3 direct checks (A2=2): inherited-slot words {} BAD {} | user-data "
                      "words {} BAD {} | clip planes {} BAD {} | formatted + fallback table bases {} BAD {} | "
