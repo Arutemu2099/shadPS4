@@ -219,11 +219,14 @@ public:
     /// reading a GPU-modified page) must see what the draws it already posted write, so it drains
     /// the back before the download (inventory 4.6). Called by the rasterizer's fault entry
     /// points before any lock is taken; a no-op on every other thread and without run-ahead.
-    void DrainForFrontFault() {
+    void DrainForFrontFault(VAddr addr = 0, u64 size = 0, bool read = true) {
         if (split_run_ahead && CpSplit::t_is_front) [[unlikely]] {
+            NoteFrontFault(addr, size, read);
             split->Sync(CpSplit::DrainReason::FrontFault);
         }
     }
+    /// SHADPS4_CP_SPLIT_TASK_GUARD census (l3n): what the front's faults read.
+    void NoteFrontFault(VAddr addr, u64 size, bool read);
 
     struct AscQueueInfo {
         static constexpr size_t Pm4BufferSize = 1024;

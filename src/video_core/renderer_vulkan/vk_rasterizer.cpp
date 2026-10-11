@@ -12822,7 +12822,7 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, VideoCore::InvalidateOri
     }
     // CP split run-ahead: a fault on the front must not download or invalidate ahead of the
     // draws it has posted. No lock is held here. No-op on every other thread.
-    liverpool->DrainForFrontFault();
+    liverpool->DrainForFrontFault(addr, size, false);
     buffer_cache.InvalidateMemory(addr, size, origin);
     texture_cache.InvalidateMemory(addr, size);
     return true;
@@ -12847,7 +12847,7 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size) {
             LOG_CRITICAL(Render, "Lean L2: FRONT fault under the pipeline cache lock at {:#x}", addr);
         }
     }
-    liverpool->DrainForFrontFault();
+    liverpool->DrainForFrontFault(addr, size, true);
     buffer_cache.ReadMemory(addr, size);
     return true;
 }

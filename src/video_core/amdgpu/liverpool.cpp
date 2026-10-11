@@ -1911,6 +1911,24 @@ struct WrmCensus {
     std::atomic<CpSplit::Channel*> ch{}; ///< the front's channel, for the drain probe at log time
 } g_wrm;
 enum class WrmPre { Full, Passed, VoWait };
+bool WaitPassesWith(const PM4CmdWaitRegMem* w, u32 value); // defined with FENCE_FORWARD
+const bool g_post_order = [] {
+    const char* v = std::getenv("SHADPS4_CP_SPLIT_POST_ORDER");
+    return v && v[0] == '1';
+}();
+struct PostOrderStats {
+    std::atomic<u64> idle_posted{}, pfp_posted{}, zpass_posted{}, zpass_guarded{}, forwarded{},
+        fwd_cmp{}, fwd_bad{};
+    std::array<std::atomic<u64>, 8> fault{}; // read / invalidate x span, label, logged, other
+} g_po;
+thread_local VAddr t_wrm_label = 0; ///< the label the front's WAIT_REG_MEM tested last
+/// A verbatim copy of a gfx packet, committed (not posted yet).
+void CommitPacketCopy(CpSplit::Channel& ch, const PM4Header* header, u16 flags) {
+    const u32 dwords = header->type3.NumWords() + 1;
+    void* copy = ch.Reserve(CpSplit::RecordType::Packet, dwords * sizeof(u32), flags);
+    std::memcpy(copy, header, dwords * sizeof(u32));
+    ch.Commit();
+}
 const bool g_post_wdata = [] {
     const char* v = std::getenv("SHADPS4_CP_SPLIT_POST_WDATA");
     return v && v[0] == '1';
@@ -1938,6 +1956,7 @@ WrmPre WrmPartial(CpSplit::Channel& ch, const PM4CmdWaitRegMem* w, bool vo_label
         return WrmPre::Full;
     }
     const VAddr lo = reinterpret_cast<VAddr>(w->Address<u32*>());
+    t_wrm_label = lo;
     const u64 done0 = ch.DoneSeq();
     const u64 committed = ch.CommittedSeq();
     add(g_wrm.backlog, committed > done0 ? committed - done0 : 0);
@@ -1951,12 +1970,33 @@ WrmPre WrmPartial(CpSplit::Channel& ch, const PM4CmdWaitRegMem* w, bool vo_label
         add(g_wrm.fallback[k], 1);
         return WrmPre::Full;
     }
+    bool fwd = false;
+    u32 fwd_value = 0;
+    if (k == 0 && g_post_order) {
+        // SHADPS4_CP_SPLIT_POST_ORDER: the newest logged writer's value passes the test - an
+        // ordering point only; the back's stream order runs the write before what follows.
+        u64 fseq = 0;
+        fwd = ch.NewestWriteValue(lo, fseq, fwd_value) && fseq == seq && WaitPassesWith(w, fwd_value);
+        if (fwd && g_a2 != 2) {
+            add(g_po.forwarded, 1);
+            add(g_wrm.passed[0], 1);
+            return WrmPre::Passed;
+        }
+    }
     if (k == 0) {
         add(g_wrm.partial_records, seq > done0 ? seq - done0 : 0);
         add(g_wrm.partial_waits, 1);
         const u64 t0 = __rdtsc();
         ch.WaitThrough(seq, CpSplit::DrainReason::WaitRegMemPartial);
         add(g_wrm.partial_ticks, __rdtsc() - t0);
+        if (fwd) { // A2=2: the forwarded value against the label after the real wait
+            add(g_po.fwd_cmp, 1);
+            if (*w->Address<u32*>() != fwd_value &&
+                g_po.fwd_bad.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_WARNING(Render, "POST_ORDER verify: label {:#x} holds {:#x}, the log predicted {:#x}",
+                            lo, *w->Address<u32*>(), fwd_value);
+            }
+        }
     } else {
         ch.PublishNow(); // VO label: the back must be able to reach the flip it waits for
     }
@@ -2140,6 +2180,19 @@ void LeanLog() {
                          double(tk(w.partial_records)) / double(std::max<u64>(pw, 1)),
                          double(tk(w.partial_ticks)) / 3.5e6 / double(std::max<u64>(pw, 1)),
                          double(pt) / 3.5e6 / double(std::max<u64>(pn, 1)), pn);
+                const auto tk2 = [](std::atomic<u64>& a) { return a.exchange(0); };
+                LOG_INFO(Render,
+                         "POST_ORDER: idle tails posted {:.0f}/s | PFP_SYNC_ME posted {:.0f}/s | "
+                         "ZPASS_DONE posted {:.0f}/s (buffer-guarded {:.0f}/s) | waits forwarded "
+                         "{:.0f}/s | A2=2 forwarded-value compares {} BAD {} | front faults read: "
+                         "span {} label {} logged {} other {} | invalidate: span {} label {} logged "
+                         "{} other {}",
+                         double(tk2(g_po.idle_posted)) * ps, double(tk2(g_po.pfp_posted)) * ps,
+                         double(tk2(g_po.zpass_posted)) * ps, double(tk2(g_po.zpass_guarded)) * ps,
+                         double(tk2(g_po.forwarded)) * ps, tk2(g_po.fwd_cmp), g_po.fwd_bad.load(),
+                         tk2(g_po.fault[0]), tk2(g_po.fault[1]), tk2(g_po.fault[2]),
+                         tk2(g_po.fault[3]), tk2(g_po.fault[4]), tk2(g_po.fault[5]),
+                         tk2(g_po.fault[6]), tk2(g_po.fault[7]));
                 LOG_INFO(Render,
                          "Posted gfx WRITE_DATA {:.0f}/s (kept synchronous by the buffer guard "
                          "{:.0f}/s) | posted flips {:.0f}/s",
@@ -5565,6 +5618,30 @@ void Liverpool::RunGfxDma(const PM4Header* header, bool guest_markers_enabled,
     split->PostRunAhead(CpSplit::PostKind::GfxPacket);
 }
 
+void Liverpool::NoteFrontFault(VAddr addr, u64 size, bool read) {
+    if (!split_task_guard) {
+        return;
+    }
+    const u64 n = std::max<u64>(size, 1);
+    u32 cls = 3;
+    if (SplitSpansOverlap(addr, addr + n)) {
+        cls = 0;
+    } else if (t_wrm_label != 0 && (addr >> 12) <= (t_wrm_label >> 12) &&
+               (t_wrm_label >> 12) <= ((addr + n - 1) >> 12)) {
+        cls = 1;
+    } else if (split->OutstandingWriteSeq(addr, addr + n) != 0) {
+        cls = 2;
+    }
+    const u32 i = (read ? 0 : 4) + cls;
+    static std::atomic<u32> samples{0};
+    if (samples.fetch_add(1, std::memory_order_relaxed) < 16) {
+        LOG_INFO(Render, "POST_ORDER front fault sample: {} {:#x} size {:#x} class {} (0 span, 1 "
+                         "label, 2 logged, 3 other), last tested label {:#x}",
+                 read ? "read" : "invalidate", addr, size, cls, t_wrm_label);
+    }
+    g_po.fault[i].fetch_add(1, std::memory_order_relaxed);
+}
+
 void Liverpool::RunAscPacket(const PM4Header* header, std::span<const u32> rest, VAddr dst,
                              u64 bytes, CpSplit::DrainReason guard_reason) {
     // POST_ASC: the same argument as RunGfxDma. What the front reads after this packet:
@@ -5916,7 +5993,7 @@ void Liverpool::RunFence(const PM4Header* header, std::span<const u32> rest, VAd
                 WaitPassesWith(w, write->value)) {
                 g_fwd[key] = {next, label, write->value};
                 ++g_fwd_stats.posted;
-                split->NotePostedWrite(label, write->width);
+                split->NotePostedWrite(label, write->width, true, write->value);
                 split->PostRunAhead(CpSplit::PostKind::Fence);
                 split->MaybeLog();
                 return;
@@ -5947,7 +6024,11 @@ void Liverpool::RunFence(const PM4Header* header, std::span<const u32> rest, VAd
         split->Sync(sync_reason);
         return;
     }
-    split->NotePostedWrite(label, LabelBytes);
+    if (const auto fw = FenceValue(header); fw && FenceAtGpu() == 0) {
+        split->NotePostedWrite(label, LabelBytes, true, fw->value);
+    } else {
+        split->NotePostedWrite(label, LabelBytes);
+    }
     split->PostRunAhead(CpSplit::PostKind::Fence);
     split->MaybeLog();
 }
@@ -9732,6 +9813,33 @@ void Liverpool::ProcessLoop(std::stop_token stoken) {
             if (flush_submit) {
                 submit_done = false;
             }
+            if (g_post_order && split_task_guard) {
+                // SHADPS4_CP_SPLIT_POST_ORDER: the same work, posted; it runs (and the guest sees
+                // GPU idle) when the back reaches it. No stack captures: `this` | flush flag.
+                auto* call = split->Reserve<CpSplit::CallPayload>(CpSplit::RecordType::Call);
+                call->invoke = [](void* context) {
+                    const auto bits = reinterpret_cast<uintptr_t>(context);
+                    auto* lp = reinterpret_cast<Liverpool*>(bits & ~uintptr_t{1});
+                    if (FenceAtGpu() == 2 && lp->rasterizer) {
+                        lp->rasterizer->FlushLazyFences();
+                    }
+                    if ((bits & 1) != 0 && lp->rasterizer) {
+                        lp->rasterizer->OnSubmit();
+                        lp->rasterizer->Flush();
+                    }
+                    VideoCore::ProtectFence();
+                    Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
+                };
+                static_assert(alignof(Liverpool) >= 2);
+                call->context = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(this) |
+                                                        (flush_submit ? 1 : 0));
+                split->Commit();
+                split->PostRunAhead(CpSplit::PostKind::Fence);
+                split->PublishNow();
+                split->MaybeLog();
+                g_po.idle_posted.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
             OnBack(
                 [&] {
                     if (FenceAtGpu() == 2 && rasterizer) {
@@ -10597,6 +10705,24 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 } else if (event->event_index.Value() == EventIndex::ZpassDone &&
                            event->event_type.Value() == EventType::PixelPipeStatDump) {
                     // Occlusion counter write into guest memory: back work.
+                    if (g_post_order && split_task_guard) {
+                        // SHADPS4_CP_SPLIT_POST_ORDER: posted, its results noted in the write log.
+                        const VAddr dst = event->Address<VAddr>();
+                        const u64 bytes = u64{num_counter_pairs} * 16;
+                        const auto lo = reinterpret_cast<VAddr>(dcb.data());
+                        const VAddr hi = lo + dcb.size_bytes();
+                        if (!(dst < hi && lo < dst + bytes) && !SplitSpansOverlap(dst, dst + bytes)) {
+                            CommitPacketCopy(*split, header,
+                                             guest_markers_enabled ? u16{CpSplit::GuestMarkers}
+                                                                   : u16{0});
+                            split->NotePostedWrite(dst, bytes);
+                            split->PostRunAhead(CpSplit::PostKind::GfxPacket);
+                            split->MaybeLog();
+                            g_po.zpass_posted.fetch_add(1, std::memory_order_relaxed);
+                            break;
+                        }
+                        g_po.zpass_guarded.fetch_add(1, std::memory_order_relaxed);
+                    }
                     RunGfxPacket(header, guest_markers_enabled,
                                  CpSplit::DrainReason::PacketOther);
                 }
@@ -10650,7 +10776,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             guest_markers_enabled ? CpSplit::GuestMarkers : 0);
                         std::memcpy(copy, header, dwords * sizeof(u32));
                         split->Commit();
-                        split->NotePostedWrite(dst, bytes);
+                        split->NotePostedWrite(dst, bytes, true, wd->data[0]);
                         split->PostRunAhead(CpSplit::PostKind::GfxPacket);
                         split->MaybeLog();
                         g_pwf.wdata_posted.fetch_add(1, std::memory_order_relaxed);
@@ -10662,6 +10788,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::PfpSyncMe: {
+                if (g_post_order && split_task_guard) {
+                    // SHADPS4_CP_SPLIT_POST_ORDER: a barrier on the back; nothing for the front.
+                    CommitPacketCopy(*split, header,
+                                     guest_markers_enabled ? u16{CpSplit::GuestMarkers} : u16{0});
+                    split->PostRunAhead(CpSplit::PostKind::Fence);
+                    split->MaybeLog();
+                    g_po.pfp_posted.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                }
                 RunGfxPacket(header, guest_markers_enabled, CpSplit::DrainReason::PacketOther);
                 break;
             }
