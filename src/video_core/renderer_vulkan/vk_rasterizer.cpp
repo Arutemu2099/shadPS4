@@ -5375,7 +5375,8 @@ bool Rasterizer::A2MaterialMemo(const GraphicsPipeline* base, u64 h1, u64 h2, u3
 
 bool Rasterizer::A2ResolveMaterial(const GraphicsPipeline* base, const Shader::BoundStage& fs,
                                    u32* slots, u32& n_img, u32& n_smp,
-                                   std::vector<VideoCore::ImageId>& ids, u64 h1, u64 h2, u32 kn) {
+                                   std::vector<VideoCore::ImageId>& ids, u64 h1, u64 h2, u32 kn,
+                                   const Shader::BoundStage* vs) {
     if (!base || !fs.info) {
         return false;
     }
@@ -5416,7 +5417,7 @@ bool Rasterizer::A2ResolveMaterial(const GraphicsPipeline* base, const Shader::B
         bindless.cap_lru = fill.lru.data();
     }
     const bool ok =
-        BindlessResolve(base, slots, nullptr, nullptr, n_img, n_smp, true, &fs, got.data());
+        BindlessResolve(base, slots, nullptr, nullptr, n_img, n_smp, true, &fs, got.data(), vs);
     bindless.cap_img = nullptr;
     bindless.cap_lru = nullptr;
     if (!ok) {
@@ -5558,7 +5559,8 @@ void Rasterizer::BindlessRingWrite(u32 tag, u32 idx, const u32* slots) {
 
 bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::ImageView* views,
                                  vk::Sampler* samplers, u32& n_img, u32& n_smp, bool retry,
-                                 const Shader::BoundStage* fs_override, VideoCore::ImageId* ids) {
+                                 const Shader::BoundStage* fs_override, VideoCore::ImageId* ids,
+                                 const Shader::BoundStage* vs_override) {
     // SHADPS4_NATIVE_BINDLESS (sec. 12), back thread. Per fragment image: the cache entry for
     // (descriptor, raw T#) if every validity condition holds (then only the LRU touch), else
     // what BindTextures does for one sampled image - FindImage, FindTexture, the sampled-layout
@@ -5602,22 +5604,54 @@ bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::I
         ++st.bl_fail[0];
         return false;
     }
-    const auto& info = *fs->info;
-    n_img = static_cast<u32>(info.images.size());
-    n_smp = static_cast<u32>(info.samplers.size());
-    if (n_img > Shader::NativeBindlessMax || n_smp > Shader::NativeBindlessMax) {
-        ++st.bl_fail[0];
-        return false;
+    // q3 (SHADPS4_NATIVE_BINDLESS_VS): the VS's images / samplers after the FS's.
+    const Shader::BoundStage* vsb = nullptr;
+    if (Shader::g_native_bindless_vs) {
+        vsb = vs_override && vs_override->info ? vs_override : nullptr;
+        if (!vsb) {
+            for (const auto& bound : BoundStages(base)) {
+                if (bound.info && bound.info->l_stage == Shader::LogicalStage::Vertex) {
+                    vsb = &bound;
+                }
+            }
+        }
+        if (vsb && vsb->info->images.empty() && vsb->info->samplers.empty()) {
+            vsb = nullptr;
+        }
+    }
+    std::array<const Shader::ImageResource*, Shader::NativeBindlessMax> img_d{};
+    std::array<const Shader::BoundStage*, Shader::NativeBindlessMax> img_b{};
+    std::array<const Shader::SamplerResource*, Shader::NativeBindlessMax> smp_d{};
+    std::array<const Shader::BoundStage*, Shader::NativeBindlessMax> smp_b{};
+    n_img = 0;
+    n_smp = 0;
+    for (const Shader::BoundStage* sb : {fs, vsb}) {
+        if (!sb) {
+            continue;
+        }
+        if (n_img + sb->info->images.size() > Shader::NativeBindlessMax ||
+            n_smp + sb->info->samplers.size() > Shader::NativeBindlessMax) {
+            ++st.bl_fail[0];
+            return false;
+        }
+        for (const auto& d : sb->info->images) {
+            img_d[n_img] = &d;
+            img_b[n_img++] = sb;
+        }
+        for (const auto& d : sb->info->samplers) {
+            smp_d[n_smp] = &d;
+            smp_b[n_smp++] = sb;
+        }
     }
     const auto device = instance.GetDevice();
     const auto rotate_retry = [&] {
         return retry && BindlessRotate() &&
                BindlessResolve(base, slots, views, samplers, n_img, n_smp, false, fs_override,
-                               ids);
+                               ids, vs_override);
     };
     for (u32 i = 0; i < n_img; ++i) {
-        const auto& desc = info.images[i];
-        const auto tsharp = desc.GetSharp(*fs);
+        const auto& desc = *img_d[i];
+        const auto tsharp = desc.GetSharp(*img_b[i]);
         if (tsharp.Address() == 0 || tsharp.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid) {
             ++st.bl_fail[1];
             return false;
@@ -5728,10 +5762,11 @@ bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::I
     u32 n_lru = 0;
     const u64 ts0 = __rdtsc();
     for (u32 j = 0; j < n_smp; ++j) {
-        const auto& sdesc = info.samplers[j];
-        auto ssharp = sdesc.GetSharp(*fs);
+        const auto& sdesc = *smp_d[j];
+        const auto& sbound = *smp_b[j];
+        auto ssharp = sdesc.GetSharp(sbound);
         if (sdesc.disable_aniso) {
-            const auto& tsharp = info.images[sdesc.associated_image].GetSharp(*fs);
+            const auto& tsharp = sbound.info->images[sdesc.associated_image].GetSharp(sbound);
             if (tsharp.base_level == 0 && tsharp.last_level == 0) {
                 ssharp.max_aniso.Assign(AmdGpu::AnisoRatio::One);
             }
@@ -11200,7 +11235,11 @@ void Rasterizer::P1cCheckWrites(const Pipeline* pipeline) {
     if (binding_compute || set_writes.empty()) {
         return;
     }
-    const size_t n = pipeline->PacketBindings().size();
+    // q3: the table's extent by its highest binding (a sparse layout skips numbers).
+    size_t n = 0;
+    for (const auto& pb : pipeline->PacketBindings()) {
+        n = std::max<size_t>(n, size_t{pb.binding} + pb.count);
+    }
     if (n == 0) {
         return;
     }

@@ -1048,6 +1048,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     std::array<u32, 24> planes{};
     ImageKey key{};
     u32 bi = 0;
+    u32 tot_img = 0, tot_smp = 0; // q3
     for (u32 s = 0; s < Shader::MaxStageTypes - 1; ++s) {
         const Shader::BoundStage& bound = (*draw.stages)[s];
         const Shader::Info* info = bound.info;
@@ -1059,8 +1060,9 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
             return refuse(RefuseSlotKind);
         }
         if (colour && s != u32(Shader::LogicalStage::Fragment) &&
-            (!info->images.empty() || !info->samplers.empty())) {
-            return refuse(RefuseColourStages); // BindlessResolve resolves the FS only
+            (!info->images.empty() || !info->samplers.empty()) &&
+            !(s == u32(Shader::LogicalStage::Vertex) && native->native_bindless_vs)) {
+            return refuse(RefuseColourStages); // BindlessResolve resolves the FS (+ q3 VS)
         }
         if (bnd.user_data + info->ud_mask.NumRegs() > Shader::NUM_USER_DATA_REGS) {
             return refuse(RefuseLayout);
@@ -1128,8 +1130,9 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
             // BindlessResolve's own pure checks (bl_fail 0 / 1) and the numbering rule: the
             // variant counts one binding per image (Info::AddBindings), NativeDirectBind one per
             // mip level under the DynamicIndex fallback - refuse that mode rather than guess.
-            if (info->images.size() > Shader::NativeBindlessMax ||
-                info->samplers.size() > Shader::NativeBindlessMax) {
+            tot_img += static_cast<u32>(info->images.size()); // q3: FS + VS <= 16 each
+            tot_smp += static_cast<u32>(info->samplers.size());
+            if (tot_img > Shader::NativeBindlessMax || tot_smp > Shader::NativeBindlessMax) {
                 return refuse(RefuseColourImages);
             }
             for (const auto& desc : info->images) {

@@ -1182,8 +1182,14 @@ void NativeRecDerive(NR::Record& rec) {
 static_assert(NR::GpuRecDwords == Shader::NativeRecordDwords);
 static_assert(NR::GpuRecHiOffset == Shader::NativeRecordHiOffset);
 
+/// q3b: indirect records by outcome (0 total, 1 not derived, 2 index type unknown, 3 no union,
+/// 4 killed, 5 ok).
+std::array<std::atomic<u64>, 6> g_nr_ind{};
+thread_local u32 t_nr_gpu_why = 0; // q3b: NativeRecGpu's exit (1-4; 0 = ok / not reached)
+
 void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
     auto& r = t_rec;
+    t_nr_gpu_why = 0;
     rec.gpu_ok = 0;
     rec.union_idx = ~0u;
     rec.push_inh = 0;
@@ -1200,6 +1206,7 @@ void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
         NR::g_unions[slot].store(r.unions, std::memory_order_release);
     }
     if (!rec.derived || !r.it_known) {
+        t_nr_gpu_why = !rec.derived ? 1 : 2;
         if (rec.run_k == 0) {
             r.run_union = ~0u;
         } else if (r.run_union != ~0u) {
@@ -1229,16 +1236,19 @@ void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
         nu.stamp.store(idx + 1, std::memory_order_release);
     }
     if (r.run_union == ~0u) {
+        t_nr_gpu_why = 3;
         return;
     }
     auto& u = r.unions[r.run_union & NR::UnionMask];
     if (u.stamp.load(std::memory_order_relaxed) != rec.head_idx + 1) {
         r.run_union = ~0u;
+        t_nr_gpu_why = 3;
         return;
     }
     // A draw of the run without a GPU record: the union no longer covers the run (no later draw
     // may publish a count past it).
     const auto kill = [&] {
+        t_nr_gpu_why = 4;
         u.stamp.store(0, std::memory_order_release);
         r.run_union = ~0u;
     };
@@ -1487,6 +1497,11 @@ u32 NativeRecDraw(const u32* cmdbuf, u64 index_addr, u32 index_count, u32 tag,
                 }
             }
             LOG_INFO(Lib_GnmDriver,
+                     "q3b indirect records: total {} not derived {} index type unknown {} no union "
+                     "{} killed {} ok {}",
+                     g_nr_ind[0].load(), g_nr_ind[1].load(), g_nr_ind[2].load(),
+                     g_nr_ind[3].load(), g_nr_ind[4].load(), g_nr_ind[5].load());
+            LOG_INFO(Lib_GnmDriver,
                      "NativeRec job-side derive: ok={} user-data unknown={} VS not in table={} "
                      "no pipeline={} | runs ended by the vertex layout={}",
                      g_nr_d[0].exchange(0), g_nr_d[1].exchange(0), g_nr_d[2].exchange(0),
@@ -1684,6 +1699,11 @@ s32 PS4_SYSV_ABI sceGnmDrawIndexIndirect(u32* cmdbuf, u32 size, u32 data_offset,
             const u32 tag = DrawTagValue();
             const u32 idx = NativeRecDraw(packet, 0, 0, tag, 9, true);
             t_rec.wl = false;
+            if (idx != ~0u) {
+                g_nr_ind[0].fetch_add(1, std::memory_order_relaxed);
+                g_nr_ind[t_nr_gpu_why == 0 ? 5 : t_nr_gpu_why].fetch_add(1,
+                                                                        std::memory_order_relaxed);
+            }
             auto* nop = reinterpret_cast<PM4CmdNop*>(cmdbuf);
             nop->data_block[0] = idx == ~0u ? 0u : NR::Magic;
             nop->data_block[1] = tag;

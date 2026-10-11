@@ -255,6 +255,7 @@ public:
     Id NativeTableLoad(u32 dword);
     Id NativeTableLoad(Id dword);
     bool native_bindless{};
+    u32 bindless_smp_base{}; ///< q3: the VS's samplers follow the FS's slot words
     Id draw_index{};          // SHADPS4_NATIVE_PASS: DrawIndex built-in (native variant VS)
     Id native_records{};      // SHADPS4_NATIVE_PASS: records SSBO (uint data[])
     Id native_records_ptr{};  // pointer type to one u32 of it

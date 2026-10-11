@@ -5199,7 +5199,8 @@ void Liverpool::A2Execute(const CpSplit::RecordHeader& record) {
                             ni = ns = 0;
                             ok = rasterizer->A2ResolveMaterial(
                                 mr.base, mst[u32(Shader::LogicalStage::Fragment)],
-                                s.cmds->mat_slots[m].data(), ni, ns, mat_ids);
+                                s.cmds->mat_slots[m].data(), ni, ns, mat_ids, 0, 0, 0,
+                                &mst[u32(Shader::LogicalStage::Vertex)]);
                         }
                         // A rotation mid-loop invalidates the earlier materials' slots.
                         ok = ok && rasterizer->A2BindlessCur() == set0;
@@ -9038,7 +9039,8 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                 x.mat_resolves.fetch_add(1, std::memory_order_relaxed);
                 ok = rasterizer->A2ResolveMaterial(mr.base, mst[u32(Shader::LogicalStage::Fragment)],
                                                    st.cmds->mat_slots[m].data(), ni, ns, mat_ids,
-                                                   mr.h1, mr.h2, mr.kn);
+                                                   mr.h1, mr.h2, mr.kn,
+                                                   &mst[u32(Shader::LogicalStage::Vertex)]);
             }
             // A rotation mid-loop invalidates the earlier materials' slots.
             ok = ok && rasterizer->A2BindlessCur() == set0;

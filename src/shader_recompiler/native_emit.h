@@ -96,8 +96,18 @@ struct NativeEmit {
     /// way and mismatches go to the pt compare SSBO (dword 1 count, entries from dword 2048).
     bool seg{};
     bool seg_compare{};
+    /// q3 (SHADPS4_NATIVE_BINDLESS_VS): the VS samples bindless too; its image i / sampler j
+    /// use slot words vs_img_base + i / vs_smp_base + j (after the FS's).
+    bool bindless_vs{};
+    u32 vs_img_base{};
+    u32 vs_smp_base{};
 };
 inline thread_local NativeEmit t_native_emit{};
+/// q3: SHADPS4_NATIVE_BINDLESS_VS=1.
+inline const bool g_native_bindless_vs = [] {
+    const char* e = std::getenv("SHADPS4_NATIVE_BINDLESS_VS");
+    return e && e[0] == '1';
+}();
 
 constexpr u32 NativeRecordUdOffset = 0;
 constexpr u32 NativeRecordOffOffset = NUM_USER_DATA_REGS;

@@ -446,6 +446,8 @@ struct PipelineCache::NativeColourJob {
     u32 pt_debug_binding{GraphicsPipeline::NoNativeRecords}; // SHADPS4_NATIVE_PT=2
     bool bindless{};
     const char* bindless_why{}; // q1b census
+    u64 dead_mask{};            // q3: bindings the sparse layout dropped
+    bool bindless_vs{};         // q3
     std::string counts;         // q1b census: descriptor counts per stage
 };
 
@@ -497,6 +499,8 @@ private:
                 job->runtime_infos, job->fetch_shader, job->modules, job->sdata, false,
                 &job->bindings, job->records_binding, job->bindless);
             const double ms = MsSince(t0);
+            variant->sparse_dead_mask = job->dead_mask; // q3 (before the slot publishes it)
+            variant->native_bindless_vs = job->bindless_vs;
             auto& slot = job->base->native_colour[job->slot];
             if (!variant->UsesPushDescriptors()) {
                 // Too many descriptors for push descriptors (NVIDIA: 32): the slot stays claimed
@@ -1716,14 +1720,22 @@ void PipelineCache::PrepareNativeColourLocked(const GraphicsPipeline* base,
             bindless_why = "support / stages";
             return false;
         }
-        if (!vs->images.empty() || !vs->samplers.empty()) {
+        if ((!vs->images.empty() || !vs->samplers.empty()) && !Shader::g_native_bindless_vs) {
             bindless_why = "vs images / samplers";
             return false;
         }
-        if (fs->images.size() > Shader::NativeBindlessMax ||
-            fs->samplers.size() > Shader::NativeBindlessMax) {
+        // q3: the VS's after the FS's, <= 16 of each in all.
+        if (fs->images.size() + vs->images.size() > Shader::NativeBindlessMax ||
+            fs->samplers.size() + vs->samplers.size() > Shader::NativeBindlessMax) {
             bindless_why = "fs > 16 images / samplers";
             return false;
+        }
+        for (const auto& desc : vs->images) {
+            if (desc.is_written || desc.is_atomic ||
+                desc.mip_fallback_mode != Shader::MipStorageFallbackMode::None) {
+                bindless_why = "vs image written / atomic / mip fallback";
+                return false;
+            }
         }
         for (const auto& desc : fs->images) {
             if (desc.is_written || desc.is_atomic) {
@@ -1737,6 +1749,11 @@ void PipelineCache::PrepareNativeColourLocked(const GraphicsPipeline* base,
         }
         return true;
     }();
+    if (emit.bindless && vs && (!vs->images.empty() || !vs->samplers.empty())) {
+        emit.bindless_vs = true; // q3
+        emit.vs_img_base = static_cast<u32>(fs->images.size());
+        emit.vs_smp_base = static_cast<u32>(fs->samplers.size());
+    }
     auto native_modules = modules;
     struct NativeEmitScope {
         NativeEmitScope(const Shader::NativeEmit& e) {
@@ -1871,13 +1888,29 @@ void PipelineCache::PrepareNativeColourLocked(const GraphicsPipeline* base,
     }();
     if (sparse && emit.bindless) {
         auto& jb = job->bindings; // a static_vector: no std::erase_if
-        jb.erase(std::remove_if(jb.begin(), jb.end(),
-                                [](const vk::DescriptorSetLayoutBinding& b) {
-                                    return b.descriptorType == vk::DescriptorType::eSampledImage ||
-                                           b.descriptorType == vk::DescriptorType::eSampler;
-                                }),
-                 jb.end());
+        const auto dead = [](const vk::DescriptorSetLayoutBinding& b) {
+            return b.descriptorType == vk::DescriptorType::eSampledImage ||
+                   b.descriptorType == vk::DescriptorType::eSampler;
+        };
+        // q3: the dropped bindings' mask (BindResources filters writes to them); none above 63.
+        u64 mask = 0;
+        bool fits = true;
+        for (const auto& b : jb) {
+            if (dead(b)) {
+                for (u32 k = 0; k < b.descriptorCount; ++k) {
+                    fits = fits && b.binding + k < 64;
+                    if (b.binding + k < 64) {
+                        mask |= u64{1} << (b.binding + k);
+                    }
+                }
+            }
+        }
+        if (fits) {
+            jb.erase(std::remove_if(jb.begin(), jb.end(), dead), jb.end());
+            job->dead_mask = mask;
+        }
     }
+    job->bindless_vs = emit.bindless_vs;
     job->records_binding = emit.records_binding;
     job->vertex_binding = emit.vertex_binding;
     job->bindless = emit.bindless;

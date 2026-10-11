@@ -171,6 +171,7 @@ public:
     u32 native_records_binding = NoNativeRecords;
     /// SHADPS4_NATIVE_BINDLESS: a colour variant whose PS samples the global arrays (set 1).
     bool native_bindless = false;
+    bool native_bindless_vs = false; ///< q3: the VS samples bindless too (after the FS's slots)
     /// SHADPS4_NATIVE_COLOUR (notes/colour-pass-2026-10-09.md sec. 3): textured native variants
     /// by vertex description. The front claims a slot by storing its key (front-only writer);
     /// the compiler thread publishes the variant; the back reads key then variant (acquire).

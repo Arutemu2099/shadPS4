@@ -101,6 +101,12 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
     });
 
     // Bind descriptor set.
+    if (sparse_dead_mask != 0) {
+        // q3: no writes to the bindings the sparse layout dropped (VUID dstBinding-00316).
+        std::erase_if(set_writes, [this](const vk::WriteDescriptorSet& w) {
+            return w.dstBinding < 64 && ((sparse_dead_mask >> w.dstBinding) & 1) != 0;
+        });
+    }
     if (set_writes.empty()) {
         return;
     }

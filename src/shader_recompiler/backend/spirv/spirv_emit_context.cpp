@@ -78,7 +78,10 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     native_pull = native && Shader::t_native_emit.pull && info.l_stage == LogicalStage::Vertex;
     native_ring = native && Shader::t_native_emit.ring;
     native_bindless = native_colour && Shader::t_native_emit.bindless &&
-                      info.l_stage == LogicalStage::Fragment;
+                      (info.l_stage == LogicalStage::Fragment ||
+                       (info.l_stage == LogicalStage::Vertex && Shader::t_native_emit.bindless_vs));
+    bindless_smp_base =
+        info.l_stage == LogicalStage::Vertex ? Shader::t_native_emit.vs_smp_base : 0u; // q3
     native_pt = native_ring && Shader::t_native_emit.pt;
     native_pt_compare = native_pt && Shader::t_native_emit.pt_compare;
     native_seg = native_pt && Shader::t_native_emit.seg;
@@ -1459,8 +1462,10 @@ Id EmitContext::LoadSampler(u32 index) {
     if (!native_bindless) {
         return OpLoad(sampler_type, samplers[index]);
     }
-    const Id slot{native_seg ? NativeSegSlotLoad(Shader::NativeBindlessMax + index)
-                             : NativeRecordLoad(Shader::NativeRecordSmpOffset + index)};
+    const Id slot{native_seg
+                      ? NativeSegSlotLoad(Shader::NativeBindlessMax + bindless_smp_base + index)
+                      : NativeRecordLoad(Shader::NativeRecordSmpOffset + bindless_smp_base +
+                                         index)};
     const Id ptr{OpAccessChain(sampler_pointer_type, samplers[index], slot)};
     const Id value{OpLoad(sampler_type, ptr)};
     return value;
@@ -1603,7 +1608,8 @@ void EmitContext::DefineImagesAndSamplers() {
         if (profile.supported_spirv < 0x00010500) {
             AddExtension("SPV_EXT_descriptor_indexing");
         }
-        u32 index = 0;
+        u32 index = info.l_stage == LogicalStage::Vertex ? Shader::t_native_emit.vs_img_base
+                                                         : 0u; // q3
         for (const auto& image_desc : info.images) {
             const auto sharp = image_desc.GetSharp(info);
             const auto nfmt = sharp.GetNumberFmt();

@@ -171,6 +171,11 @@ protected:
     std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};
     bool uses_push_descriptors{};
     bool is_compute;
+public:
+    /// q3 (SHADPS4_NATIVE_SPARSE_LAYOUT): set-0 bindings dropped from this variant's layout
+    /// (bindless images / samplers); BindResources drops writes to them.
+    u64 sparse_dead_mask{};
+protected:
     bool uses_native_bindings{};
     bool uses_direct_push_index{};
     u32 native_binding_count{};

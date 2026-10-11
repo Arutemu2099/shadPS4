@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "shader_recompiler/native_emit.h"
 #include <array>
 #include <mutex>
 #include "common/logging/log.h"
@@ -49,11 +50,15 @@ inline bool Init(vk::Device device) {
             {.binding = 0,
              .descriptorType = vk::DescriptorType::eSampledImage,
              .descriptorCount = ImageSlots,
-             .stageFlags = vk::ShaderStageFlagBits::eFragment},
+             .stageFlags = Shader::g_native_bindless_vs
+                               ? vk::ShaderStageFlagBits::eFragment | vk::ShaderStageFlagBits::eVertex
+                               : vk::ShaderStageFlags{vk::ShaderStageFlagBits::eFragment}},
             {.binding = 1,
              .descriptorType = vk::DescriptorType::eSampler,
              .descriptorCount = SamplerSlots,
-             .stageFlags = vk::ShaderStageFlagBits::eFragment},
+             .stageFlags = Shader::g_native_bindless_vs
+                               ? vk::ShaderStageFlagBits::eFragment | vk::ShaderStageFlagBits::eVertex
+                               : vk::ShaderStageFlags{vk::ShaderStageFlagBits::eFragment}},
         }};
         const vk::DescriptorSetLayoutCreateInfo layout_info{
             .pNext = &flags_info,

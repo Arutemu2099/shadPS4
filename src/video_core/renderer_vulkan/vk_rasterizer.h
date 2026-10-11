@@ -255,7 +255,8 @@ public:
     /// stretch runs on the old path. May record sampled-layout barriers (outside any pass).
     bool A2ResolveMaterial(const GraphicsPipeline* base, const Shader::BoundStage& fs, u32* slots,
                            u32& n_img, u32& n_smp, std::vector<VideoCore::ImageId>& ids,
-                           u64 h1 = 0, u64 h2 = 0, u32 kn = 0);
+                           u64 h1 = 0, u64 h2 = 0, u32 kn = 0,
+                           const Shader::BoundStage* vs = nullptr);
     /// SHADPS4_A2_MAT_MEMO (l4d): the memo's result for this material key if every condition of
     /// an all-hit BindlessResolve holds (then the same LRU touches); false: resolve it.
     bool A2MaterialMemo(const GraphicsPipeline* base, u64 h1, u64 h2, u32 kn, u32* slots,
@@ -808,7 +809,8 @@ private:
     bool BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::ImageView* views,
                          vk::Sampler* samplers, u32& n_img, u32& n_smp, bool retry = true,
                          const Shader::BoundStage* fs_override = nullptr,
-                         VideoCore::ImageId* ids = nullptr);
+                         VideoCore::ImageId* ids = nullptr,
+                         const Shader::BoundStage* vs_override = nullptr);
     bool BindlessRotate();
     void BindlessRingWrite(u32 tag, u32 idx, const u32* slots);
     std::unique_ptr<VideoCore::Buffer> native_dbg; ///< SHADPS4_NATIVE_COLOUR_DIAG 4096
