@@ -2811,10 +2811,6 @@ Liverpool::Liverpool() {
         }
         split_post_task_done = split_run_ahead && CpSplit::PostTaskDone();
         split_task_guard = split_post_task_done ? CpSplit::TaskGuard() : 0u;
-        if (g_asc_early && split_run_ahead) {
-            split->EnableEarly();
-            LOG_INFO(Render, "SHADPS4_ASC_EARLY: ASC records run ahead of the graphics backlog");
-        }
         if (CpSplit::TaskGuard() != 0 && !split_post_task_done) {
             LOG_WARNING(Render, "CpSplit: TASK_GUARD ignored without run-ahead POST_TASK_DONE");
         }
@@ -2835,6 +2831,10 @@ Liverpool::Liverpool() {
         }
         split_verify_every = split_run_ahead ? CpSplit::VerifyEvery() : 1u;
         split = std::make_unique<CpSplit::Channel>();
+        if (g_asc_early && split_run_ahead) {
+            split->EnableEarly();
+            LOG_INFO(Render, "SHADPS4_ASC_EARLY: ASC records run ahead of the graphics backlog");
+        }
         mirror = std::make_unique<CpSplit::BackMirror>();
         std::memcpy(&mirror->regs, &regs, sizeof(Regs));
         mirror->cb_extent = last_cb_extent;
