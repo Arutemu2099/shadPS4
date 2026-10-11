@@ -5444,6 +5444,7 @@ bool Rasterizer::A2ResolveMaterial(const GraphicsPipeline* base, const Shader::B
     std::array<BindlessImgEntry, Shader::NativeBindlessMax> cap{};
     std::array<BindlessSmpEntry, Shader::NativeBindlessMax> cap_s{}; // q8
     const bool tab = VideoCore::TexTable::Mode() != 0;
+    const u64 tg0 = VideoCore::TexTable::Gen(); // q8b (D): before the resolve
     if (memo || tab) {
         bindless.cap_img = cap.data();
         bindless.cap_lru = fill.lru.data();
@@ -5461,19 +5462,36 @@ bool Rasterizer::A2ResolveMaterial(const GraphicsPipeline* base, const Shader::B
         // q8: insert what the workers may look up - sampled-only images (never a render / depth
         // target or storage image, no depth association, one sample, not bound as a target).
         namespace TT = VideoCore::TexTable;
-        const u64 tg = TT::Gen();
+        const u64 tg = tg0;
         for (u32 i = 0; i < n_img; ++i) {
             const auto& e = cap[i];
             auto& im = texture_cache.GetImage(e.id);
             const bool ok_img = !im.usage.render_target && !im.usage.depth_target &&
                                 !im.usage.storage && !im.depth_id && im.info.num_samples <= 1 &&
+                                !im.info.props.is_depth && e.local && // q8b (C) + depth
                                 !im.binding.is_target && !im.binding.force_general &&
                                 !im.binding.needs_rebind;
             if (!ok_img) {
                 TT::g_c[7].fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
+            // q8b (D): publish tab_gen, fence, then re-check what a concurrent mark could have
+            // changed - a dirty mark after this point sees tab_gen and kills.
             std::atomic_ref<u64>{im.tab_gen}.store(tg, std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            const auto flags = std::atomic_ref<VideoCore::ImageFlagBits>{im.flags}.load(
+                std::memory_order_relaxed);
+            const bool still =
+                True(flags & VideoCore::ImageFlagBits::Registered) &&
+                False(flags & VideoCore::ImageFlagBits::Dirty) && !im.depth_id &&
+                im.backing == e.backing && im.backing->state_serial == e.serial &&
+                std::atomic_ref<u64>{im.overlap_epoch}.load(std::memory_order_relaxed) ==
+                    e.overlap &&
+                TT::Gen() == tg;
+            if (!still) {
+                TT::g_c[7].fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
             TT::InsertImg(static_cast<u32>(reinterpret_cast<uintptr_t>(e.desc)), e.words, e.slot,
                           static_cast<u32>(e.id.index), tg);
             TT::g_c[4].fetch_add(1, std::memory_order_relaxed);

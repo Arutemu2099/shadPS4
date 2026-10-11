@@ -31,7 +31,7 @@ inline std::atomic<u64> g_gen{1};
 inline std::atomic<u64> g_kills{0};
 /// 0 worker materials looked up, 1 all hit, 2 published pre-resolved, 3 publish rejected (generation
 /// moved), 4 back inserts (images), 5 verify compares, 6 verify BAD, 7 ineligible images at insert.
-inline std::array<std::atomic<u64>, 8> g_c{};
+inline std::array<std::atomic<u64>, 9> g_c{}; ///< 8: verify stale (killed mid-compare)
 
 inline u64 Gen() noexcept {
     return g_gen.load(std::memory_order_acquire);
@@ -45,6 +45,7 @@ inline void NoteImage(const u64& image_tab_gen) noexcept {
     if (Mode() == 0) {
         return;
     }
+    std::atomic_thread_fence(std::memory_order_seq_cst); // q8b (D): after the caller's state write
     const u64 g = std::atomic_ref<u64>{const_cast<u64&>(image_tab_gen)}.load(
         std::memory_order_relaxed);
     if (g != 0 && g == g_gen.load(std::memory_order_relaxed)) {

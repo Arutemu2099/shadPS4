@@ -290,6 +290,12 @@ public:
         return instance;
     }
     void A2TexTableTouch(); // q8: LRU touches of the table's images / samplers (rate-limited)
+    /// q8b (A): the sampler generation and meta-clear epoch the bindless caches hold still match
+    /// the texture cache's (a sampler GC / meta clear since: no table hit may be used).
+    bool A2TexTableStateOk() const noexcept {
+        return texture_cache.SamplerGeneration() == bindless.sampler_gen &&
+               texture_cache.MetaClearEpoch() == bindless.meta_epoch;
+    }
     void MaybeEarlyCut(bool run_end = false);                  // q7 / q7b
     static int EarlyCutMode();                                 // q7b
     [[nodiscard]] VideoCore::BufferCache& A2BufferCache() noexcept {

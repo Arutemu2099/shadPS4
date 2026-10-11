@@ -1418,10 +1418,10 @@ void BackLeanMaybeLog() {
         LOG_INFO(Render,
                  "q8 texture table (window): worker materials looked up {} all hit {} | published "
                  "pre-resolved {} rejected (generation moved) {} | back image inserts {} "
-                 "ineligible {} | kills {} | verify {} BAD {} (cumulative)",
+                 "ineligible {} | kills {} | verify {} BAD {} (cumulative) stale {}",
                  tk(TT::g_c[0]), tk(TT::g_c[1]), tk(TT::g_c[2]), tk(TT::g_c[3]),
                  tk(TT::g_c[4]), tk(TT::g_c[7]), tk(TT::g_kills), tk(TT::g_c[5]),
-                 TT::g_c[6].load());
+                 TT::g_c[6].load(), tk(TT::g_c[8]));
     }
     {
         std::string pk_s; // q4
@@ -9047,6 +9047,7 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
         static thread_local std::vector<VideoCore::ImageId> mat_ids;
         mat_ids.clear();
         const bool colour = !st.materials.empty();
+        bool tab_used = false; // q8b (B): the table supplied materials of this stretch
         if (colour) {
             // Every distinct material once, before the pass (sec. 10); the representative Draw
             // records are in THIS job channel (not yet released: inside the stretch).
@@ -9068,7 +9069,9 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
             namespace TT = VideoCore::TexTable;
             const int tab_mode = TT::Mode();
             const bool tab_ok = st.mat_pre != 0 && st.tab_gen == TT::Gen() &&
-                                rasterizer->A2BindlessCur() == st.tab_set;
+                                rasterizer->A2BindlessCur() == st.tab_set &&
+                                rasterizer->A2TexTableStateOk(); // q8b (A)
+            tab_used = tab_ok;
             if (st.mat_pre != 0 && !tab_ok) {
                 TT::g_c[3].fetch_add(1, std::memory_order_relaxed);
             }
@@ -9086,6 +9089,10 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                 }
                 const auto tab_verify = [&] {
                     if (!pre) {
+                        return;
+                    }
+                    if (TT::Gen() != st.tab_gen) {
+                        TT::g_c[8].fetch_add(1, std::memory_order_relaxed); // q8b (E): stale
                         return;
                     }
                     TT::g_c[5].fetch_add(1, std::memory_order_relaxed);
@@ -9174,7 +9181,7 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
         }
         mirror->ctx_epoch = rec.ctx_epoch;
         rasterizer->A2BeginStretch(rec.draw.pipeline);
-        if (colour && st.mat_pre != 0 && VideoCore::TexTable::Mode() == 1 &&
+        if (tab_used && VideoCore::TexTable::Mode() == 1 &&
             st.tab_gen != VideoCore::TexTable::Gen()) {
             // q8: an image of a table material changed (e.g. became a target of this pass).
             VideoCore::TexTable::g_c[3].fetch_add(1, std::memory_order_relaxed);

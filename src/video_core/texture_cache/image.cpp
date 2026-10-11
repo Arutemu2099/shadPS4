@@ -1095,6 +1095,7 @@ void Image::SetBackingSamples(u32 num_samples, bool copy_backing) {
         }
     }
 
+    VideoCore::TexTable::NoteImage(tab_gen); // q8b: the backing changes
     backing = new_backing;
 }
 
