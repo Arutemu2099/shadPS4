@@ -1974,13 +1974,16 @@ void LeanLog() {
                      "Lean L2 phases: {} worker draws | us per worker draw: prewalk {:.2f} (header "
                      "{:.2f} info {:.2f} walk {:.2f} fetch {:.2f}; lock takes per draw: map {:.3f} info "
                      "{:.3f}) lookup "
-                     "{:.2f} derive {:.2f} emit {:.2f} other-parse {:.2f} | waits per draw: channel "
+                     "{:.2f} derive {:.2f} emit {:.2f} (record+commit incl. L3 translate {:.2f}, program "
+                     "table {:.2f}, table publishes skipped {:.1f}%) other-parse {:.2f} | waits per draw: "
+                     "channel "
                      "full {:.2f} depth {:.2f} fault {:.2f} | seed {:.2f} us per DCB | worker time: "
                      "claim wait {:.1f}%, busy (parse+seed) {:.1f}% | memo hits {:.1f}% (per worker:{}) "
                      "ineligible {} verify {} MISMATCH {} | header hits {:.1f}% fetch hits {:.1f}%",
                      u64(d), us(p.prewalk), us(p.pw_header), us(p.pw_info), us(p.pw_walk),
                      us(p.pw_fetch), double(p.map_lock.load()) / d, double(p.info_lock.load()) / d,
-                     us(p.lookup), us(p.derive), us(p.emit),
+                     us(p.lookup), us(p.derive), us(p.emit), us(p.emit_commit), us(p.emit_table),
+                     100.0 * double(p.table_skips.load()) / d,
                      other / 3500.0 / d, double(full) / 3500.0 / d, double(depth) / 3500.0 / d,
                      fw / 3500.0 / d,
                      double(p.seed.load()) / 3500.0 / std::max(1.0, double(s.l2_taken.load())),
@@ -1993,6 +1996,7 @@ void LeanLog() {
             p.claim_wait = p.seed = p.parse = p.prewalk = p.lookup = p.derive = p.emit = p.draws = 0;
             p.hdr_hit = p.hdr_miss = p.fetch_hit = p.fetch_miss = 0;
             p.pw_header = p.pw_info = p.pw_walk = p.pw_fetch = p.map_lock = p.info_lock = 0;
+            p.emit_commit = p.emit_table = p.table_skips = 0;
             p.memo_ineligible = 0;
         }
         if (g_lean_xl.on) {

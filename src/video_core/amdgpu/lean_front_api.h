@@ -81,6 +81,7 @@ inline LeanL2Stats g_lean_l2;
 /// Lean worker phases (TSC ticks, summed over the workers), cache hits, memo verify.
 struct LeanPhaseStats {
     std::atomic<u64> claim_wait{}, seed{}, parse{}, prewalk{}, lookup{}, derive{}, emit{}, draws{};
+    std::atomic<u64> emit_commit{}, emit_table{}, table_skips{};
     std::atomic<u64> hdr_hit{}, hdr_miss{}, fetch_hit{}, fetch_miss{};
     /// The prewalk split (ticks) and its lock takes (counts): mapped-interval lookups and
     /// ProgramInfoFor calls (both only on a per-worker cache miss).

@@ -222,6 +222,13 @@ struct Parser::Caches {
     u64 memo_hits_total{};
     // Phase ticks / counts since the last FlushPhases.
     u64 prewalk{}, lookup{}, derive{}, emit{}, draws{};
+    u64 emit_commit{}, emit_table{}, table_skips{};
+    // Program-table publishes this worker already made: (pipeline, fetch shader address).
+    struct PubMemo {
+        const void* pipeline{};
+        u64 fetch{};
+    };
+    std::array<PubMemo, 256> pub_memo{};
     u64 pw_header{}, pw_info{}, pw_walk{}, pw_fetch{}, map_lock{}, info_lock{};
     u64 memo_hit{}, memo_miss{}, hdr_hit{}, hdr_miss{}, fetch_hit{}, fetch_miss{}, inelig{};
 };
@@ -233,6 +240,9 @@ void Parser::FlushPhases(u32 w) {
     g.lookup += std::exchange(c.lookup, 0);
     g.derive += std::exchange(c.derive, 0);
     g.emit += std::exchange(c.emit, 0);
+    g.emit_commit += std::exchange(c.emit_commit, 0);
+    g.emit_table += std::exchange(c.emit_table, 0);
+    g.table_skips += std::exchange(c.table_skips, 0);
     g.draws += std::exchange(c.draws, 0);
     g.memo_hit[w & 7] += std::exchange(c.memo_hit, 0);
     g.memo_miss[w & 7] += std::exchange(c.memo_miss, 0);
@@ -635,13 +645,32 @@ void Parser::EmitDraw(const PM4Header* header, const DrawPlan& plan, ChainState&
         vi->header.desc_id = st.vi_desc_id;
         p = vi->Write(p);
     }
-    out.Commit();
+    const u64 tc0 = __rdtsc();
+    out.Commit(); // L3: the draw hook (walk + TakeDraw) runs inside
+    const u64 tc1 = __rdtsc();
+    caches->emit_commit += tc1 - tc0;
     // NativeRec stage a2, as the front's NativeRecFront: the job threads derive their records
     // from this table (in L2 the front sees only the tails).
     if (NativeRec::g_mode >= 2 && plan.has_stages && plan.job_tag != 0) {
-        (void)NativeRecPublishProgram(
-            plan.draw.pipeline,
-            scratch->stages[static_cast<u32>(Shader::LogicalStage::Vertex)].user_data);
+        const auto& vud = scratch->stages[static_cast<u32>(Shader::LogicalStage::Vertex)].user_data;
+        const Shader::Info* vsi =
+            plan.draw.pipeline->GetStages()[static_cast<u32>(Shader::LogicalStage::Vertex)];
+        u64 fetch = 0;
+        if (vsi && vsi->has_fetch_shader) {
+            const u32 b = vsi->fetch_shader_sgpr_base;
+            if (b + 1 < vud.size()) {
+                fetch = (u64(vud[b + 1]) << 32 | vud[b]) & 0xFFFFFFFFFFFFull;
+            }
+        }
+        const u64 h = (reinterpret_cast<u64>(plan.draw.pipeline) >> 4) ^ (fetch * 0x9E3779B97F4A7C15ull);
+        auto& m = caches->pub_memo[(h ^ (h >> 29)) & 255];
+        if (m.pipeline == plan.draw.pipeline && m.fetch == fetch) {
+            ++caches->table_skips;
+        } else {
+            (void)NativeRecPublishProgram(plan.draw.pipeline, vud);
+            m = {plan.draw.pipeline, fetch};
+        }
+        caches->emit_table += __rdtsc() - tc1;
     }
     out.PostRunAhead(CpSplit::PostKind::Draw);
     out.MaybeLog();
