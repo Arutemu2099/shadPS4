@@ -2308,9 +2308,9 @@ void LeanLog() {
                                  "on the open batch {:.0f}/s | main flushes waiting on the lane "
                                  "{:.0f}/s | fault pre-cuts {:.0f}/s | p1e: pinned segments cut "
                                  "{:.0f}/s, WAR / GDS capped {:.0f}/s, open-batch waits by source "
-                                 "exact {:.0f} window table {:.0f} WAR {:.0f} GDS {:.0f} carry {:.0f} "
-                                 "big list {:.0f} lost {:.0f} | big main notes {:.0f}/s, lost "
-                                 "unfinished {:.0f}/s",
+                                 "exact {:.0f} window table (huge) {:.0f} window confirmed {:.0f} GDS "
+                                 "{:.0f} carry {:.0f} big list {:.0f} lost {:.0f} | big main notes "
+                                 "{:.0f}/s, lost unfinished {:.0f}/s",
                                  v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[12], v[7], v[8], v[9],
                                  v[10], v[11], v[13], v[14], v[15], os[0], os[1], os[2], os[3],
                                  os[4], os[5], os[6],

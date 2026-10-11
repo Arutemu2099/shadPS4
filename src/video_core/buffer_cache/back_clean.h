@@ -142,7 +142,8 @@ inline u32 LaneWin(u64 w) noexcept {
 }
 inline u64 g_lc_main_newest = 0;
 inline bool g_lc_coarse = false; // p1d: the last LaneMainProducer answer came from a coarse source
-inline u32 g_lc_src = 0; // p1e: 0 exact, 1 window table, 5 big list, 6 lost (bucket / big list)
+inline u32 g_lc_src = 0; // 0 exact, 1 window table (> 1024 windows), 2 window confirmed exact (p1g),
+                         // 5 big list, 6 lost (bucket / big list)
 inline u64 g_lc_done = 0;     // main ticks complete (known semaphore value)
 inline u32 t_lc_rec_flags = 0; // bit 0: open-batch hit, bit 1: in-flight hit (current early record)
 /// 0 early reads checked, 1/2 newest producer main write open / in flight, 3/4 main upload open / in
@@ -232,12 +233,23 @@ inline u64 LaneMainProducer(u64 lo, u64 hi) noexcept {
         // p1e: more than the 64 windows LaneFind reads: the per-window newest ticks.
         if (w1 - w0 > 1023) {
             t = g_lc_main_newest;
+            g_lc_src = 1;
         } else {
+            // p1g: the window table pre-filters; a flagged window is confirmed against the notes
+            // of its bucket ring (exact range overlap). Bucket rings hold several windows' notes
+            // (hashed), so a note found there must overlap [lo, hi) itself.
             for (u64 w = w0; w <= w1; ++w) {
-                t = std::max(t, g_lc_win[LaneWin(w)]);
+                if (g_lc_win[LaneWin(w)] <= std::max(g_lc_done, t)) {
+                    continue;
+                }
+                for (const LaneNote& e : g_lc_main.b[LaneBucket(w)]) {
+                    if (e.seq != 0 && e.tick > g_lc_done && e.tick > t && e.lo < hi && lo < e.hi) {
+                        t = e.tick;
+                        g_lc_src = 2;
+                    }
+                }
             }
         }
-        g_lc_src = 1;
     } else if (const LaneNote* m = LaneFind(g_lc_main, lo, hi)) {
         t = m->tick;
     }
