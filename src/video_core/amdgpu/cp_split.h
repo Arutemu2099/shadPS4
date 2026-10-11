@@ -486,6 +486,11 @@ public:
     /// SHADPS4_CP_SPLIT_POST_ORDER: true when the newest outstanding noted write overlapping
     /// [lo, lo + 4) starts at lo, covers it and its first dword is known (`seq`, `value`).
     bool NewestWriteValue(VAddr lo, u64& seq, u32& value, bool& fence, u32* why = nullptr);
+    /// SHADPS4_XQ_CENSUS: the queue of the newest outstanding noted write overlapping [lo, lo + 4)
+    /// (0 gfx, vqid + 1 ASC), or -1 when none may be outstanding.
+    int NewestWriterQueue(VAddr lo);
+    /// SHADPS4_XQ_CENSUS: the queue the front is parsing (set at the top of its packet loops).
+    u8 note_queue{0};
     /// TASK_GUARD: counts a check under `reason`, forgets executed writes, and returns whether any
     /// noted write may still be outstanding (false: nothing to compare, no drain needed).
     bool BeginGuardCheck(DrainReason reason);
@@ -741,6 +746,7 @@ private:
         bool known;
         bool fence; ///< written by an end-of-pipe fence (EOP / EOS / RELEASE_MEM)
         u8 src;
+        u8 queue; ///< SHADPS4_XQ_CENSUS: the queue the front was parsing (0 gfx, vqid + 1 ASC)
     };
     /// Outstanding noted writes are posted records, so at most Depth() + 1 (the one being noted):
     /// with MaxDepth 1024 the log cannot overflow; the fallback stays as a guard.

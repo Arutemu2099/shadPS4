@@ -772,9 +772,44 @@ bool AscRingBack(const CpSplit::DiagPayload& diag) {
     return false;
 }
 
+const bool g_xq = [] {
+    const char* v = std::getenv("SHADPS4_XQ_CENSUS");
+    return v && v[0] == '1';
+}();
+constexpr u32 XqQueues = 9; // 0 gfx, 1..8 = vqid + 1
+struct XqCensus {
+    // waits[waiter][writer]: writer 0 gfx, 1 same ASC queue, 2 other ASC queue, 3 none (CPU /
+    // done), 4 FENCE_FORWARD skip (same queue)
+    std::array<std::array<std::atomic<u64>, 5>, XqQueues> waits{};
+    std::array<std::atomic<u64>, XqQueues> disp{}, disp_img{}, upload_bytes{}, segs{}, segs_img{},
+        segs_xwait{};
+    std::array<std::atomic<u8>, XqQueues> seg_img{}, seg_xwait{};
+    std::array<std::atomic<u64>, XqQueues> label_addr{};
+} g_xq_c;
+/// Front: a WAIT_REG_MEM of queue `waiter` (0 gfx, vqid + 1) on memory label `lo`.
+void XqNoteWait(CpSplit::Channel& ch, u32 waiter, VAddr lo, bool forwarded) {
+    if (!g_xq || waiter >= XqQueues) {
+        return;
+    }
+    u32 w = 4;
+    if (!forwarded) {
+        const int q = ch.NewestWriterQueue(lo);
+        w = q < 0 ? 3 : q == 0 ? 0 : u32(q) == waiter ? 1 : 2;
+    }
+    g_xq_c.waits[waiter][w].fetch_add(1, std::memory_order_relaxed);
+    if (waiter != 0 && (w == 0 || w == 3)) {
+        g_xq_c.seg_xwait[waiter].store(1, std::memory_order_relaxed);
+    }
+}
+
 /// Back: an ASC RELEASE_MEM (the queue's completion label) is being executed.
 void AscRingLabel(VAddr address, bool deferred_to_gpu) {
     const u32 q = g_asc_ring_clock.queue.load() % AscRingQueues;
+    if (g_xq) [[unlikely]] {
+        const u32 qi = std::min<u32>(q, XqQueues - 1);
+        g_xq_c.segs[qi].fetch_add(1, std::memory_order_relaxed);
+        g_xq_c.segs_img[qi].fetch_add(g_xq_c.seg_img[qi].exchange(0), std::memory_order_relaxed);
+    }
     auto& s = g_asc_ring.q[q];
     ++s.label_count;
     s.deferred_labels += deferred_to_gpu;
@@ -2204,6 +2239,40 @@ void LeanLog() {
                          double(tk(w.partial_ticks)) / 3.5e6 / double(std::max<u64>(pw, 1)),
                          double(pt) / 3.5e6 / double(std::max<u64>(pn, 1)), pn);
                 const auto tk2 = [](std::atomic<u64>& a) { return a.exchange(0); };
+                if (g_xq) {
+                    std::string ws, as;
+                    static constexpr const char* wn[] = {"gfx", "same", "otherASC", "none", "fwd"};
+                    for (u32 q = 0; q < XqQueues; ++q) {
+                        std::string row;
+                        u64 tot = 0;
+                        for (u32 w = 0; w < 5; ++w) {
+                            const u64 n = tk2(g_xq_c.waits[q][w]);
+                            tot += n;
+                            if (n) {
+                                row += fmt::format(" {} {:.0f}/s", wn[w], double(n) * ps);
+                            }
+                        }
+                        if (tot) {
+                            ws += fmt::format(" | {}:{}", q == 0 ? std::string("gfx") : fmt::format("asc{}", q), row);
+                        }
+                        const u64 d = tk2(g_xq_c.disp[q]);
+                        if (q != 0 && d) {
+                            const u64 di = tk2(g_xq_c.disp_img[q]), s = tk2(g_xq_c.segs[q]),
+                                      si = tk2(g_xq_c.segs_img[q]), sx = tk2(g_xq_c.segs_xwait[q]),
+                                      ub = tk2(g_xq_c.upload_bytes[q]);
+                            as += fmt::format(
+                                " | asc{} (label {:#x}): dispatches {:.0f}/s, binding images {:.1f}% | "
+                                "segments {:.0f}/s, with an image dispatch {:.1f}%, with a wait on a "
+                                "gfx / CPU label {:.1f}% | uploads for its dispatches {:.1f} MB/s",
+                                q, g_xq_c.label_addr[q].load(), double(d) * ps,
+                                100.0 * double(di) / double(d), double(s) * ps,
+                                s ? 100.0 * double(si) / double(s) : 0.0,
+                                s ? 100.0 * double(sx) / double(s) : 0.0, double(ub) * ps / 1e6);
+                        }
+                    }
+                    LOG_INFO(Render, "XQ census waits (waiter: writer){}", ws);
+                    LOG_INFO(Render, "XQ census ASC queues{}", as);
+                }
                 LOG_INFO(Render,
                          "POST_ORDER: idle tails posted {:.0f}/s | PFP_SYNC_ME posted {:.0f}/s | "
                          "ZPASS_DONE posted {:.0f}/s (buffer-guarded {:.0f}/s) | waits forwarded "
@@ -5427,6 +5496,27 @@ void Liverpool::ExecuteDispatchRecord(const CpSplit::RecordHeader& record) {
     if (rec.queue != GfxQueueId && AscRingLatency()) [[unlikely]] {
         ++g_asc_ring.q[rec.queue % AscRingQueues].dispatches;
     }
+    const u32 xq_qi = std::min<u32>(rec.queue, XqQueues - 1);
+    const u64 xq_up0 =
+        g_xq && rec.queue != GfxQueueId ? rasterizer->GetBufferCache().SyncUploadBytesTotal() : 0;
+    SCOPE_EXIT {
+        if (g_xq && rec.queue != GfxQueueId) [[unlikely]] {
+            g_xq_c.upload_bytes[xq_qi].fetch_add(
+                rasterizer->GetBufferCache().SyncUploadBytesTotal() - xq_up0,
+                std::memory_order_relaxed);
+            g_xq_c.disp[xq_qi].fetch_add(1, std::memory_order_relaxed);
+            bool img = false;
+            if (rec.pipeline) {
+                for (const auto* info : rec.pipeline->GetStages()) {
+                    img |= info && !info->images.empty();
+                }
+            }
+            if (img) {
+                g_xq_c.disp_img[xq_qi].fetch_add(1, std::memory_order_relaxed);
+                g_xq_c.seg_img[xq_qi].store(1, std::memory_order_relaxed);
+            }
+        }
+    };
     // BackCsRegs() returns the snapshot while this dispatch runs (HLE, IsCompute*, BindBuffers).
     back_cs = &rec.cs;
     // SHADPS4_MTB_P1: split dispatches (and their run / queue) go to the worker instance (P1d).
@@ -10194,6 +10284,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         if (g_lean_front.job != nullptr) [[unlikely]] {
             split->canon = nullptr; // nothing between packets (host commands, ASC) is recorded
         }
+        if (g_xq && split_enabled) [[unlikely]] {
+            split->note_queue = 0;
+        }
         ProcessCommands();
 
         if (asc_yield) {
@@ -10930,6 +11023,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // there are no other submits to yield to we can sleep the thread
                 // instead and allow other tasks to run.
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
+                if (g_xq && split_enabled && wait_reg_mem->mem_space.Value() ==
+                                                 PM4CmdWaitRegMem::MemSpace::Memory) [[unlikely]] {
+                    XqNoteWait(*split, 0, reinterpret_cast<VAddr>(wait_addr),
+                               g_fence_forward && g_fwd[0].next_packet ==
+                                                      reinterpret_cast<const u32*>(header));
+                }
                 if (g_fence_forward && split_enabled && ForwardedWait(0, header)) {
                     if (g_wait_barrier >= 2) {
                         PostWaitBarrier(1);
@@ -11198,6 +11297,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     size_t acb_size = acb.size_bytes();
     while (!acb.empty()) {
         ProcessCommands();
+        if (g_xq && split_enabled) [[unlikely]] {
+            split->note_queue = static_cast<u8>(std::min<u32>(vqid + 1, XqQueues - 1));
+        }
 
         auto* header = reinterpret_cast<const PM4Header*>(acb.data());
         u32 next_dw_off = header->type3.NumWords() + 1;
@@ -11546,6 +11648,12 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+            if (g_xq && split_enabled && wait_reg_mem->mem_space.Value() ==
+                                             PM4CmdWaitRegMem::MemSpace::Memory) [[unlikely]] {
+                XqNoteWait(*split, vqid + 1, reinterpret_cast<VAddr>(wait_reg_mem->Address<u32*>()),
+                           g_fence_forward && g_fwd[1 + (queue.pipe_id & 0xff)].next_packet ==
+                                                  reinterpret_cast<const u32*>(header));
+            }
             if (g_fence_forward && split_enabled && ForwardedWait(1 + (queue.pipe_id & 0xff), header)) {
                 if (g_wait_barrier >= 2) {
                     PostWaitBarrier(1);
@@ -11581,6 +11689,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::ReleaseMem: {
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
+            if (g_xq) [[unlikely]] {
+                const u32 qi = std::min<u32>(vqid + 1, XqQueues - 1);
+                g_xq_c.segs_xwait[qi].fetch_add(g_xq_c.seg_xwait[qi].exchange(0),
+                                                std::memory_order_relaxed);
+                g_xq_c.label_addr[qi].store(release_mem->Address<VAddr>(),
+                                            std::memory_order_relaxed);
+            }
             if (split_post_fence && release_mem->data_sel != DataSelect::GdsMemStore)
                 [[unlikely]] {
                 ASSERT(queue.pipe_id <= 0xff);

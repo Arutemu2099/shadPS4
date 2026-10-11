@@ -359,7 +359,8 @@ void Channel::NotePostedWrite(VAddr dst, u64 bytes, bool has_value, u32 value, b
         ++counters.write_log_overflows;
     }
     posted_writes[pw_tail & (PostedWriteSlots - 1)] =
-        PostedWrite{committed_seq, dst, dst + bytes, value, has_value && bytes >= 4, fence, src};
+        PostedWrite{committed_seq, dst, dst + bytes, value, has_value && bytes >= 4, fence, src,
+                    note_queue};
     ++pw_tail;
     counters.write_log_max = std::max(counters.write_log_max, pw_tail - pw_head);
 }
@@ -431,6 +432,18 @@ bool Channel::NewestWriteValue(VAddr lo, u64& seq, u32& value, bool& fence, u32*
     value = newest->value;
     fence = newest->fence;
     return true;
+}
+
+int Channel::NewestWriterQueue(VAddr lo) {
+    PrunePostedWrites(done_seq.load(std::memory_order_acquire));
+    int q = -1;
+    for (u64 i = pw_head; i != pw_tail; ++i) {
+        const PostedWrite& write = posted_writes[i & (PostedWriteSlots - 1)];
+        if (write.lo < lo + 4 && lo < write.hi) {
+            q = write.queue;
+        }
+    }
+    return q;
 }
 
 void Channel::WaitThrough(u64 seq, DrainReason reason) {
