@@ -566,6 +566,8 @@ struct StretchTranslator::Impl {
     std::array<u32, Shader::NUM_BUFFERS> b_ioff{}, b_isz{};
     bool b_clip{};
     std::array<u32, 24> b_planes{};
+    u64 b_fmt_mask{};
+    std::array<u32, Shader::NUM_BUFFERS> b_tbase{}; ///< the opener's table bases (checks)
 };
 
 StretchTranslator::Impl::Impl(StretchTranslator* owner_, const WorkerContext& ctx_)
@@ -834,6 +836,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     std::array<u64, Shader::NUM_BUFFERS> o_vsize{};
     bool clip_on = false;
     u32 clip_wi = 0;
+    u64 fmt_mask = 0;
     std::array<u32, 24> planes{};
     ImageKey key{};
     u32 bi = 0;
@@ -877,8 +880,12 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
                 ++bi;
                 continue;
             }
+            // Formatted (typed) reads on colour draws: lowered to raw loads in the variant (the
+            // pipeline cache allows them for colour only); the back syncs the range at publish.
+            const bool fmt_ok = colour && desc.is_formatted &&
+                                desc.buffer_type == Shader::BufferType::Guest && !desc.is_written;
             if (desc.buffer_type != Shader::BufferType::Guest || desc.is_written ||
-                desc.is_formatted) {
+                (desc.is_formatted && !fmt_ok)) {
                 ++owner->sub[desc.buffer_type != Shader::BufferType::Guest ? 6
                              : desc.is_written                             ? 7
                                                                            : 8];
@@ -892,6 +899,19 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
             o_addr[bi] = vsharp.base_address;
             o_vsize[bi] = vsharp.GetSize();
             guest_mask |= u64{1} << bi;
+            if (fmt_ok) {
+                fmt_mask |= u64{1} << bi;
+                bool known = false;
+                if (stretch) {
+                    for (const auto& [ta, ts] : stretch->texel) {
+                        known = known || (ta == o_addr[bi] && ts == o_vsize[bi]);
+                    }
+                }
+                if (!known && stretch && stretch->texel.size() >= 16) {
+                    ++owner->sub[21];
+                    return refuse(RefuseSlotKind);
+                }
+            }
             writes[num_writes++] = {bnd.unified++, dummy, 0, VK_WHOLE_SIZE};
             ++bnd.buffer;
             ++bi;
@@ -1048,7 +1068,12 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
                 vb_n == b_vb_n && draw.vi->desc_id == last_desc_id && PushKeySame(push, b_push) &&
                 guest_mask == b_guest_mask && !AnyDirty(cand) &&
                 (!colour || (vbuf == b_vbuf && vmask == b_vmask)) && inh_slots == b_inh_slots &&
-                clip_on == b_clip && (!clip_on || planes == b_planes);
+                clip_on == b_clip && (!clip_on || planes == b_planes) && fmt_mask == b_fmt_mask;
+    for (u64 m = fmt_mask; cont && m != 0; m &= m - 1) {
+        // The back's member rule: a formatted slot binds the opener's own V#.
+        const u32 b = static_cast<u32>(std::countr_zero(m));
+        cont = o_addr[b] == b_iaddr[b] && o_vsize[b] == b_isize[b];
+    }
     for (u64 m = inh_slots; cont && m != 0; m &= m - 1) {
         const u32 b = static_cast<u32>(std::countr_zero(m));
         cont = o_addr[b] == b_iaddr[b] && o_vsize[b] == b_isize[b];
@@ -1362,6 +1387,8 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         b_isz = i_size;
         b_clip = clip_on;
         b_planes = planes;
+        b_fmt_mask = fmt_mask;
+        b_tbase = base;
         last_desc_id = draw.vi->desc_id;
         ++owner->sub_batches;
     }
@@ -1392,6 +1419,22 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
             for (u64 m = inh_slots; m != 0; m &= m - 1) {
                 const u32 b = static_cast<u32>(std::countr_zero(m));
                 cmds->inh_checks.push_back({draw.seq, b_iaddr[b], b_isize[b], b_ioff[b], b_isz[b]});
+            }
+        }
+    }
+    if (fmt_mask != 0) {
+        ++owner->sub[22];
+        for (u64 m = fmt_mask; m != 0; m &= m - 1) {
+            const u32 b = static_cast<u32>(std::countr_zero(m));
+            bool known = false;
+            for (const auto& [ta, ts] : stretch->texel) {
+                known = known || (ta == o_addr[b] && ts == o_vsize[b]);
+            }
+            if (!known) {
+                stretch->texel.emplace_back(o_addr[b], o_vsize[b]);
+            }
+            if (Mode() == 2) {
+                cmds->fmt_checks.push_back({draw.seq, o_addr[b], b_tbase[b]});
             }
         }
     }

@@ -239,6 +239,11 @@ public:
     void A2EndStretch();
     /// Ends rendering and records one global memory barrier (writes -> any access).
     void A2GlobalBarrier();
+    /// SHADPS4_A2 formatted slots, back thread, before the stretch's pass: the typed lookup of
+    /// [addr, addr + V# size) as NativeDirectBind does it (ObtainBuffer is_texel: an image ->
+    /// buffer sync of overlapping image data) and its shader-read barrier. False: no buffer
+    /// starts at addr (the stretch runs on the old path).
+    bool A2SyncTexel(VAddr addr, u64 vsize);
     [[nodiscard]] bool A2OcclusionOpen() const;
     /// SHADPS4_LEAN worker pre-check (lock-free read-protection test).
     [[nodiscard]] const VideoCore::PageManager& LeanPageManager() const noexcept {

@@ -185,6 +185,12 @@ struct StretchCmds {
         std::array<u32, 24> planes{};
     };
     std::vector<ClipCheck> clip_checks;
+    struct FmtCheck {
+        u64 seq{};
+        VAddr addr{};
+        u32 base{};
+    };
+    std::vector<FmtCheck> fmt_checks;
 };
 
 /// Records `cmds` into `cmdbuf` exactly as the translator's closures would have, in order. Called
@@ -207,6 +213,9 @@ struct Stretch {
     u64 buf_gen{};
     /// Colour draws' materials in first-seen order (index = SlotWrite::mat / mat_slots row).
     std::vector<MaterialRef> materials; ///< empty: no colour draws
+    /// Formatted Guest slots' (V# address, V# size), distinct, at most 16: the back syncs each
+    /// with its own typed lookup (A2SyncTexel) before the stretch's pass.
+    std::vector<std::pair<VAddr, u64>> texel;
 };
 
 /// Context a translator gets (set up once per worker thread).
@@ -281,7 +290,8 @@ public:
     /// inline / null / empty V#), 10-11 guest lookup (no buffer, address outside it), 12-15 stamp
     /// (stamp below idx + 1, above it, gpu_ok 0, cmd differs), 16-18 inherited slot refused (size
     /// 0 or >= 1 GB, no cached buffer holding it, offset over 32 bits), 19 draws taken with an
-    /// inherited slot, 20 draws taken with user clip planes.
+    /// inherited slot, 20 draws taken with user clip planes, 21 a 17th texel range refused,
+    /// 22 draws taken with a formatted slot.
     std::array<u64, 24> sub{};
     /// Draws taken and sub-batches opened so far (logged by the caller).
     u64 taken{}, sub_batches{};

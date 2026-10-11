@@ -1274,6 +1274,8 @@ struct LeanXlStats {
     /// l3e direct checks: inherited-slot words (offset + size vs the back's locked lookup and
     /// clamp), the record's VS / PS user data vs the mirror (inherited-slot draws), clip planes.
     std::atomic<u64> inh_cmp{}, inh_bad{}, ud_cmp{}, ud_bad{}, clip_cmp{}, clip_bad{};
+    /// l3g: formatted slots - texel syncs at publish and rejected stretches; A2=2 base compares.
+    std::atomic<u64> texel_syncs{}, rej_texel{}, fmt_cmp{}, fmt_bad{};
     std::atomic<u64> front_p{}, front_e{}, lean_p{}, lean_e{};
     std::array<std::atomic<Vulkan::A2::StretchTranslator*>, 8> tr{};
 };
@@ -1942,9 +1944,13 @@ void LeanLog() {
                      sb[7], sb[8], sb[9], sb[10], sb[11], sb[16], sb[17], sb[18], sb[19], sb[20]);
             LOG_INFO(Render,
                      "Lean L3 direct checks (A2=2): inherited-slot words {} BAD {} | user-data "
-                     "words {} BAD {} | clip planes {} BAD {}",
+                     "words {} BAD {} | clip planes {} BAD {} | formatted table bases {} BAD {} | "
+                     "formatted: draws taken (cumulative) {}, texel syncs {} rejected stretches {}, "
+                     "17th range refused (cumulative) {}",
                      x.inh_cmp.exchange(0), x.inh_bad.load(), x.ud_cmp.exchange(0), x.ud_bad.load(),
-                     x.clip_cmp.exchange(0), x.clip_bad.load());
+                     x.clip_cmp.exchange(0), x.clip_bad.load(), x.fmt_cmp.exchange(0),
+                     x.fmt_bad.load(), sb[22], x.texel_syncs.exchange(0), x.rej_texel.exchange(0),
+                     sb[21]);
             std::array<u32, 32> ord{};
             for (u32 i = 0; i < 32; ++i) {
                 ord[i] = i;
@@ -8105,6 +8111,17 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
             x.rej_occl.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
+        if (!verify) {
+            // Formatted slots: the back's own typed lookup (image -> buffer sync) + barrier per
+            // range, before the generation check (a buffer it creates rejects the stretch).
+            for (const auto& [ta, ts] : st.texel) {
+                x.texel_syncs.fetch_add(1, std::memory_order_relaxed);
+                if (!rasterizer->A2SyncTexel(ta, ts)) {
+                    x.rej_texel.fetch_add(1, std::memory_order_relaxed);
+                    return false;
+                }
+            }
+        }
         // A buffer created / deleted / joined since the worker's lookups: its VkBuffer handles may
         // be stale (A2LookupBuffer reads slots without a lock).
         if (rasterizer->A2BufferCache().StructGeneration() != st.buf_gen) {
@@ -8246,7 +8263,7 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
     // SHADPS4_A2=2: the stretch whose draws run on the old path and are compared.
     const Vulkan::A2::Stretch* vs = nullptr;
     const A2Entry::Side* vsd = nullptr;
-    size_t vs_inh = 0, vs_clip = 0; // next direct-check entries of `vs`
+    size_t vs_inh = 0, vs_clip = 0, vs_fmt = 0; // next direct-check entries of `vs`
     u64 wait = 0;
     for (u32 spins = 0;;) {
         if (split->FrontHasExited() || s.stop.load(std::memory_order_relaxed)) [[unlikely]] {
@@ -8291,6 +8308,7 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                         vsd = &sd;
                         vs_inh = 0;
                         vs_clip = 0;
+                        vs_fmt = 0;
                     }
                 }
                 if (vs && r->seq >= vs->first_seq && r->seq <= vs->last_seq) {
@@ -8354,6 +8372,21 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                             if (psb.info) {
                                 cmp_ud(psb, mirror->regs.ps_program.user_data);
                             }
+                        }
+                    }
+                    const auto& fc = vs->cmds->fmt_checks;
+                    for (; vs_fmt < fc.size() && fc[vs_fmt].seq <= r->seq; ++vs_fmt) {
+                        const auto& c = fc[vs_fmt];
+                        if (c.seq != r->seq) {
+                            continue;
+                        }
+                        const auto* buf = rasterizer->A2BufferCache().NativeBufferAt(c.addr);
+                        const bool ok = buf && static_cast<u32>(buf->CpuAddr()) == c.base;
+                        x.fmt_cmp.fetch_add(1, std::memory_order_relaxed);
+                        if (!ok && x.fmt_bad.fetch_add(1, std::memory_order_relaxed) < 16) {
+                            LOG_WARNING(Render, "Lean L3 verify: formatted slot {:#x} worker base "
+                                                "{:#x}, back {:#x} (job draw seq {})",
+                                        c.addr, c.base, buf ? buf->CpuAddr() : ~u64{0}, r->seq);
                         }
                     }
                     const auto& cc = vs->cmds->clip_checks;

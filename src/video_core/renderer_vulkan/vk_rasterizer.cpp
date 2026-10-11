@@ -5219,6 +5219,31 @@ void Rasterizer::A2EndStretch() {
     }
 }
 
+bool Rasterizer::A2SyncTexel(VAddr addr, u64 vsize) {
+    const u64 size = memory->ClampRangeSize(addr, vsize);
+    if (size == 0 || size > 0xffffffffull) {
+        return false;
+    }
+    const auto [vb, vo] = buffer_cache.ObtainBuffer(addr, static_cast<u32>(size), false, true,
+                                                    VideoCore::BufferId{},
+                                                    Common::BufferSampleCaller::Storage);
+    if (!vb || vb->CpuAddr() + vo != addr) {
+        return false;
+    }
+    if (auto barrier = vb->GetBarrier(vk::AccessFlagBits2::eShaderRead,
+                                      vk::PipelineStageFlagBits2::eAllCommands, 0,
+                                      cur_dispatch_run)) {
+        scheduler.EndRendering();
+        scheduler.Record([b = *barrier](vk::CommandBuffer cmdbuf) {
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .bufferMemoryBarrierCount = 1,
+                .pBufferMemoryBarriers = &b,
+            });
+        });
+    }
+    return true;
+}
+
 void Rasterizer::A2GlobalBarrier() {
     scheduler.EndRendering();
     scheduler.Record([](vk::CommandBuffer cmdbuf) {
