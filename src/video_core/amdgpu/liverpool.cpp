@@ -1911,6 +1911,17 @@ struct WrmCensus {
     std::atomic<CpSplit::Channel*> ch{}; ///< the front's channel, for the drain probe at log time
 } g_wrm;
 enum class WrmPre { Full, Passed, VoWait };
+const bool g_post_wdata = [] {
+    const char* v = std::getenv("SHADPS4_CP_SPLIT_POST_WDATA");
+    return v && v[0] == '1';
+}();
+const bool g_post_flip = [] {
+    const char* v = std::getenv("SHADPS4_CP_SPLIT_POST_FLIP");
+    return v && v[0] == '1';
+}();
+struct PostWdFlipStats {
+    std::atomic<u64> wdata_posted{}, wdata_guarded{}, flips_posted{};
+} g_pwf;
 WrmPre WrmPartial(CpSplit::Channel& ch, const PM4CmdWaitRegMem* w, bool vo_label,
                   std::span<const u32> regs) {
     const auto add = [](std::atomic<u64>& a, u64 v) { a.fetch_add(v, std::memory_order_relaxed); };
@@ -2129,6 +2140,12 @@ void LeanLog() {
                          double(tk(w.partial_records)) / double(std::max<u64>(pw, 1)),
                          double(tk(w.partial_ticks)) / 3.5e6 / double(std::max<u64>(pw, 1)),
                          double(pt) / 3.5e6 / double(std::max<u64>(pn, 1)), pn);
+                LOG_INFO(Render,
+                         "Posted gfx WRITE_DATA {:.0f}/s (kept synchronous by the buffer guard "
+                         "{:.0f}/s) | posted flips {:.0f}/s",
+                         double(g_pwf.wdata_posted.exchange(0)) * ps,
+                         double(g_pwf.wdata_guarded.exchange(0)) * ps,
+                         double(g_pwf.flips_posted.exchange(0)) * ps);
             }
             LOG_INFO(Render,
                      "Lean L3 pre-delta: folds {:.0f}/s, register records folded {:.0f}/s | A2=2 "
@@ -10043,6 +10060,22 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // Flip IRQ and guest markers are back work; the body is in ExecuteGfxPacket.
                 if (split_enabled) {
                     if (NopHasBackEffect(header, guest_markers_enabled)) {
+                        const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
+                        if (g_post_flip && split_task_guard &&
+                            nop->data_block[0] == PM4CmdNop::PayloadType::PatchedFlip) {
+                            // SHADPS4_CP_SPLIT_POST_FLIP: no guest-memory write; the IRQ is
+                            // raised on the back in stream order, as before.
+                            const u32 dwords = header->type3.NumWords() + 1;
+                            void* copy = split->Reserve(
+                                CpSplit::RecordType::Packet, dwords * sizeof(u32),
+                                guest_markers_enabled ? CpSplit::GuestMarkers : 0);
+                            std::memcpy(copy, header, dwords * sizeof(u32));
+                            split->Commit();
+                            split->PostRunAhead(CpSplit::PostKind::Fence);
+                            split->MaybeLog();
+                            g_pwf.flips_posted.fetch_add(1, std::memory_order_relaxed);
+                            break;
+                        }
                         RunGfxPacket(header, guest_markers_enabled,
                                      CpSplit::DrainReason::PacketOther);
                     }
@@ -10598,6 +10631,32 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::WriteData: {
+                const auto* wd = reinterpret_cast<const PM4CmdWriteData*>(header);
+                if (g_post_wdata && split_task_guard &&
+                    (wd->dst_sel.Value() == 2 || wd->dst_sel.Value() == 5) &&
+                    !wd->wr_one_addr.Value() && header->type3.count.Value() > 2) {
+                    // SHADPS4_CP_SPLIT_POST_WDATA: posted like a POST_DMA write; synchronous
+                    // only when it writes into the rest of this buffer or an active span.
+                    const VAddr dst = wd->Address<VAddr>();
+                    const u64 bytes = (header->type3.count.Value() - 2) * 4ull;
+                    const auto lo = reinterpret_cast<VAddr>(dcb.data());
+                    const VAddr hi = lo + dcb.size_bytes();
+                    if ((dst < hi && lo < dst + bytes) || SplitSpansOverlap(dst, dst + bytes)) {
+                        g_pwf.wdata_guarded.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        const u32 dwords = header->type3.NumWords() + 1;
+                        void* copy = split->Reserve(
+                            CpSplit::RecordType::Packet, dwords * sizeof(u32),
+                            guest_markers_enabled ? CpSplit::GuestMarkers : 0);
+                        std::memcpy(copy, header, dwords * sizeof(u32));
+                        split->Commit();
+                        split->NotePostedWrite(dst, bytes);
+                        split->PostRunAhead(CpSplit::PostKind::GfxPacket);
+                        split->MaybeLog();
+                        g_pwf.wdata_posted.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    }
+                }
                 RunGfxPacket(header, guest_markers_enabled,
                              CpSplit::DrainReason::PacketWriteData);
                 break;
