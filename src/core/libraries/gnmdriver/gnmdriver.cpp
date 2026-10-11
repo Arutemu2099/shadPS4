@@ -1407,7 +1407,8 @@ void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
 std::array<std::atomic<u64>, 12> g_nr_why{};
 
 /// Returns the ring index written for this draw.
-u32 NativeRecDraw(const u32* cmdbuf, u64 index_addr, u32 index_count, u32 tag) {
+u32 NativeRecDraw(const u32* cmdbuf, u64 index_addr, u32 index_count, u32 tag,
+                  u32 packet_dwords = 10, bool indirect = false) {
     auto& r = t_rec;
     if ((tag >> 28) > NR::MaxRecordSlot) [[unlikely]] {
         return ~0u; // a shared overflow slot: no records (Opus review 6)
@@ -1424,7 +1425,7 @@ u32 NativeRecDraw(const u32* cmdbuf, u64 index_addr, u32 index_count, u32 tag) {
     const u32 gap = landed ? r.gap : 0;
     r.wl = true;
     r.gap = 0;
-    r.cursor = cmdbuf + 10;
+    r.cursor = cmdbuf + packet_dwords;
     const u32 run_id = tag & 0x0fffffffu;
     const u32 idx = r.next++;
     if (NR::g_gpu_mode != 0) {
@@ -1453,7 +1454,7 @@ u32 NativeRecDraw(const u32* cmdbuf, u64 index_addr, u32 index_count, u32 tag) {
     if (r.head && rec.derived && r.run_derived && !layout_same) {
         g_nr_d[4].fetch_add(1, std::memory_order_relaxed);
     }
-    const bool cont = layout_same && r.head && wl && !r.set_called && run_id == r.run_id &&
+    const bool cont = !indirect && layout_same && r.head && wl && !r.set_called && run_id == r.run_id &&
                       r.head->count.load(std::memory_order_relaxed) < NR::MaxRun && r.it_known && r.index_type == r.run_index_type &&
                       r.prim_known && r.prim == r.run_prim &&
                       r.head->stamp.load(std::memory_order_relaxed) == r.head_idx + 1;
@@ -1532,13 +1533,13 @@ u32 NativeRecDraw(const u32* cmdbuf, u64 index_addr, u32 index_count, u32 tag) {
         rec.head_idx = r.head_idx;
         rec.count.store(0, std::memory_order_relaxed);
         rec.end.store(nullptr, std::memory_order_relaxed);
-        r.head->end.store(cmdbuf + 10, std::memory_order_relaxed);
+        r.head->end.store(cmdbuf + packet_dwords, std::memory_order_relaxed);
         r.head->count.store(rec.run_k + 1, std::memory_order_release);
     } else {
         rec.run_k = 0;
         rec.head_idx = idx;
         rec.count.store(1, std::memory_order_relaxed);
-        rec.end.store(cmdbuf + 10, std::memory_order_relaxed);
+        rec.end.store(cmdbuf + packet_dwords, std::memory_order_relaxed);
         r.head = &rec;
         r.head_idx = idx;
         r.run_id = run_id;
@@ -1646,6 +1647,10 @@ s32 PS4_SYSV_ABI sceGnmDrawIndexAuto(u32* cmdbuf, u32 size, u32 index_count, u32
     return -1;
 }
 
+static inline bool predicate_on(u32 flags) {
+    return (flags & 1) != 0;
+}
+
 s32 PS4_SYSV_ABI sceGnmDrawIndexIndirect(u32* cmdbuf, u32 size, u32 data_offset, u32 shader_stage,
                                          u32 vertex_sgpr_offset, u32 instance_sgpr_offset,
                                          u32 flags) {
@@ -1655,6 +1660,7 @@ s32 PS4_SYSV_ABI sceGnmDrawIndexIndirect(u32* cmdbuf, u32 size, u32 data_offset,
         (vertex_sgpr_offset < 0x10u) && (instance_sgpr_offset < 0x10u)) {
 
         const auto predicate = flags & 1 ? PM4Predicate::PredEnable : PM4Predicate::PredDisable;
+        u32* const packet = cmdbuf;
         cmdbuf = WriteHeader<PM4ItOpcode::DrawIndexIndirect>(
             cmdbuf, 4, PM4ShaderType::ShaderGraphics, predicate);
 
@@ -1667,6 +1673,22 @@ s32 PS4_SYSV_ABI sceGnmDrawIndexIndirect(u32* cmdbuf, u32 size, u32 data_offset,
 
         cmdbuf += 4;
         WriteTrailingNop<3>(cmdbuf);
+        // q2 (SHADPS4_A2_INDIRECT=1): a job record for the indirect draw (index address / count
+        // live in INDEX_BASE / the GPU args), tagged in the trailing NOP as DrawIndex does. It
+        // neither continues a run nor lets the next draw continue it.
+        static const bool a2_indirect = [] {
+            const char* e = std::getenv("SHADPS4_A2_INDIRECT");
+            return e && e[0] == '1';
+        }();
+        if (NR::g_mode && a2_indirect && !predicate_on(flags)) [[unlikely]] {
+            const u32 tag = DrawTagValue();
+            const u32 idx = NativeRecDraw(packet, 0, 0, tag, 9, true);
+            t_rec.wl = false;
+            auto* nop = reinterpret_cast<PM4CmdNop*>(cmdbuf);
+            nop->data_block[0] = idx == ~0u ? 0u : NR::Magic;
+            nop->data_block[1] = tag;
+            nop->data_block[2] = idx;
+        }
         return ORBIS_OK;
     }
     return -1;

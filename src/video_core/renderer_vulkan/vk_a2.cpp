@@ -544,14 +544,19 @@ void RecordBatches(const StretchCmds& cmds, vk::DescriptorSet set1, vk::CommandB
                                                                                b.vi_attrs.data()});
         }
         if (b.emit_index) {
-            cmdbuf.bindIndexBuffer(b.ib, 0, b.ib_type);
+            cmdbuf.bindIndexBuffer(b.ib, b.ib_off, b.ib_type);
         }
         if (b.emit_vertex_buffers && b.vb_n != 0) {
             cmdbuf.bindVertexBuffers(0, b.vb_n, b.vb.data(), b.vb_off.data());
         }
         DynamicState dyn = b.dyn; // Commit clears dirty bits: work on a copy
         dyn.Commit(instance, cmdbuf);
-        cmdbuf.drawIndexedIndirectCount(b.arena, b.cmd_off, b.arena, b.count_off, b.n, CmdBytes);
+        if (b.ind_buf) {
+            cmdbuf.drawIndexedIndirect(b.ind_buf, b.ind_off, 1, CmdBytes); // q2: the game's args
+        } else {
+            cmdbuf.drawIndexedIndirectCount(b.arena, b.cmd_off, b.arena, b.count_off, b.n,
+                                            CmdBytes);
+        }
     }
 }
 
@@ -633,6 +638,7 @@ struct StretchTranslator::Impl {
     std::array<u32, 24> b_planes{};
     u64 b_fmt_mask{};
     u64 b_fb_mask{}; ///< slots resolved by the opener's own V# (guest-lookup fallback)
+    bool b_ind{};    ///< q2: the open sub-batch is a guest indirect draw (never continued)
     std::array<u32, Shader::NUM_BUFFERS> b_tbase{}; ///< the opener's table bases (checks)
 };
 
@@ -751,6 +757,15 @@ bool StretchTranslator::Impl::AllocRegion(u64 bytes, u64& start, u64& masked_off
     return true;
 }
 
+/// q2: SHADPS4_A2_INDIRECT=1 - indirect colour draws on the translator.
+bool A2IndirectOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("SHADPS4_A2_INDIRECT");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
 bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw) {
     const auto refuse = [&](u32 why) {
         ++owner->refusals[why];
@@ -763,7 +778,8 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     if (!draw.is_indexed) {
         return refuse(RefuseNotIndexed);
     }
-    if (draw.is_indirect) {
+    const bool ind = draw.is_indirect && A2IndirectOn();
+    if (draw.is_indirect && !ind) {
         // m3 census: would a variant exist for it (native shadow kind or colour by description)?
         const GraphicsPipeline* b = draw.pipeline;
         const bool has = b && (b->native_variant.load(std::memory_order_relaxed) != nullptr ||
@@ -876,6 +892,9 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
             return refuse(RefuseColourGates);
         }
     }
+    if (ind && !colour) {
+        return refuse(RefuseIndirect); // q2: colour variants only (no vertex rebase)
+    }
     if (native->native_records_binding == GraphicsPipeline::NoNativeRecords ||
         native->native_table_binding == GraphicsPipeline::NoNativeRecords ||
         native->native_pt_debug_binding != GraphicsPipeline::NoNativeRecords) {
@@ -949,7 +968,10 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         cmd_warned = true;
         ++owner->refusals[RefuseNoCmd];
     }
-    if (io_ud != 0 || index_count == 0 || (push_inh >> Shader::NUM_USER_DATA_REGS) != 0) {
+    // q2: an indirect record has no index count, and its instance-offset register is the
+    // CP's (the args' firstInstance, as DrawIndirectTail).
+    if ((!ind && (io_ud != 0 || index_count == 0)) ||
+        (push_inh >> Shader::NUM_USER_DATA_REGS) != 0) {
         ++owner->sub[io_ud != 0 ? 1 : index_count == 0 ? 2 : 3];
         return refuse(RefuseRecordFields);
     }
@@ -965,10 +987,24 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     const bool is_index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
     const u32 index_size = is_index16 ? 2u : 4u;
     const VAddr index_addr =
-        regs.index_base_address.Address<VAddr>() + u64(draw.index_offset) * index_size;
-    if (index_addr != index_addr_rec || regs.num_indices != index_count ||
-        regs.num_instances.NumInstances() != n_inst) {
+        regs.index_base_address.Address<VAddr>() +
+        (ind ? 0 : u64(draw.index_offset) * index_size);
+    if (!ind && (index_addr != index_addr_rec || regs.num_indices != index_count ||
+                 regs.num_instances.NumInstances() != n_inst)) {
         return refuse(RefuseRecordRegs);
+    }
+    // q2: the args (20-byte VkDrawIndexedIndirectCommand layout, 4-byte aligned) in one cached
+    // buffer; the index range = INDEX_BUFFER_SIZE indices from INDEX_BASE (as BindIndexBuffer).
+    u64 ind_handle = 0, ind_off = 0;
+    if (ind) {
+        const VAddr aa = draw.arg_address;
+        const VideoCore::Buffer* ab =
+            aa != 0 && (aa & 3) == 0 ? ctx.buffer_cache->A2LookupBuffer(aa) : nullptr;
+        if (!ab || !ab->IsInBounds(aa, CmdBytes) || regs.num_indices == 0) {
+            return refuse(RefuseIndirect);
+        }
+        ind_handle = std::bit_cast<u64>(static_cast<VkBuffer>(ab->Handle()));
+        ind_off = aa - ab->CpuAddr();
     }
     const auto* attribs = AmdGpu::CpSplit::VertexInputAttribs(*draw.vi);
     const u32 vb_n = draw.vi->count;
@@ -983,7 +1019,11 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
             return refuse(RefuseRecordRegs);
         }
     }
-    const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs, base->GetFetchShader());
+    auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs, base->GetFetchShader());
+    if (ind) {
+        vertex_offset = 0; // q2: from the args (Vulkan applies vertexOffset / firstInstance)
+        instance_offset = 0;
+    }
     if (instance_offset != 0) {
         return refuse(RefuseInstanceOffset); // Opus code review #2 (drawIndirectFirstInstance)
     }
@@ -1147,7 +1187,8 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
 
     // Index buffer: the whole index range in one cached buffer, bound at offset 0.
     const VideoCore::Buffer* ib = ctx.buffer_cache->A2LookupBuffer(index_addr);
-    if (!ib || !ib->IsInBounds(index_addr, u64(index_count) * index_size)) {
+    if (!ib || !ib->IsInBounds(index_addr,
+                               u64(ind ? regs.num_indices : index_count) * index_size)) {
         return refuse(RefuseIndexLookup);
     }
     const u64 ib_off = index_addr - ib->CpuAddr();
@@ -1229,7 +1270,8 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     // VkBuffer and the same set of non-null locations (NativeJoin's `had` rule); the material
     // may differ (each draw's record gets its own slot words).
     const u32 head = run_k == 0 ? idx : head_idx;
-    bool cont = batch_open && b_native == native && b_colour == colour && b_slot == slot &&
+    bool cont = !ind && !b_ind && batch_open && b_native == native && b_colour == colour &&
+                b_slot == slot &&
                 idx == b_next_idx && cmds->batches.back().n < MaxDraws && union_idx == b_union &&
                 head == b_head && push_inh == b_push_inh && inh_vs == b_inh_vs &&
                 inh_ps == b_inh_ps && ib_handle == b_ib && index_size == b_index_size &&
@@ -1488,7 +1530,8 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
 
         // The sub-batch record: what Replay emits before its indirect draw.
         SubBatch& sb = cmds->batches.emplace_back();
-        const bool ib_changed = first_batch || ib_handle != b_ib || index_size != b_index_size;
+        const bool ib_changed =
+            first_batch || ib_handle != b_ib || index_size != b_index_size || ind || b_ind;
         bool vb_changed = first_batch || vb_n != b_vb_n;
         for (u32 k = 0; !vb_changed && k < vb_n; ++k) {
             vb_changed = vb_handle[k] != b_vb[k] || bo[k] != b_vb_off[k];
@@ -1523,6 +1566,11 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         sb.writes = writes;
         BuildVertexInputArrays(*draw.vi, sb);
         sb.ib = vk::Buffer{std::bit_cast<VkBuffer>(ib_handle)};
+        if (ind) {
+            sb.ib_off = ib_off; // q2: firstIndex in the args is relative to INDEX_BASE
+            sb.ind_buf = vk::Buffer{std::bit_cast<VkBuffer>(ind_handle)};
+            sb.ind_off = ind_off;
+        }
         sb.ib_type = is_index16 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
         sb.vb_n = vb_n;
         for (u32 k = 0; k < vb_n; ++k) {
@@ -1595,6 +1643,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         b_fmt_mask = fmt_mask;
         b_tbase = base;
         b_fb_mask = fb_mask;
+        b_ind = ind;
         last_desc_id = draw.vi->desc_id;
         ++owner->sub_batches;
     }
@@ -1603,9 +1652,11 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     // at ring entry first + n).
     SubBatch& sb = cmds->batches.back();
     const u32 n = sb.n;
-    const u32 cmdw[5] = {index_count, n_inst, static_cast<u32>(ib_off / index_size),
-                         static_cast<u32>(s32(vo)), 0u};
-    std::memcpy(cmd_ptr + u64(n) * CmdBytes, cmdw, CmdBytes);
+    if (!ind) {
+        const u32 cmdw[5] = {index_count, n_inst, static_cast<u32>(ib_off / index_size),
+                             static_cast<u32>(s32(vo)), 0u};
+        std::memcpy(cmd_ptr + u64(n) * CmdBytes, cmdw, CmdBytes);
+    }
     sb.n = n + 1;
     *count_ptr = n + 1;
     if (colour) {

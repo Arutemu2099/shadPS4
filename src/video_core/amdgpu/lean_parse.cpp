@@ -598,6 +598,14 @@ Stop Parser::DecideDraw(const PM4Header* header, std::span<const u32> dcb, u32 o
             plan.job_tag = w[8];
             plan.job_idx = w[9];
         }
+    } else if (NativeRec::g_mode >= 2 &&
+               header->type3.opcode == PM4ItOpcode::DrawIndexIndirect && off + 9 <= dcb.size()) {
+        // q2: DRAW_INDEX_INDIRECT (5 dwords) + the HLE's tagged NOP (SHADPS4_A2_INDIRECT).
+        const u32* w = reinterpret_cast<const u32*>(header);
+        if (w[5] == 0xc0021000u && w[6] == NativeRec::Magic) {
+            plan.job_tag = w[7];
+            plan.job_idx = w[8];
+        }
     }
     return Stop::None;
 }

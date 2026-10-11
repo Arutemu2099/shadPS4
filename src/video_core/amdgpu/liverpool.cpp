@@ -4315,6 +4315,7 @@ void Liverpool::A2WorkerLoop(std::stop_token stoken, u32 index) {
                 in.job_cmd = rec.cmd_address;
                 in.seq = h->seq;
                 in.rec_pos = pos;
+                in.arg_address = rec.draw.args.arg_address + rec.draw.args.offset;
                 ++w_draws;
                 if (occlusion || !in.pipeline || rec.marker || rec.verify != 0) {
                     end_stretch();
@@ -4480,6 +4481,7 @@ void LeanXlDraw(LeanXl& x, const CpSplit::RecordHeader& h, u64 pos) {
     in.job_cmd = rec.cmd_address;
     in.seq = h.seq;
     in.rec_pos = pos;
+    in.arg_address = rec.draw.args.arg_address + rec.draw.args.offset;
     ++x.walked;
     // The back census's bucket for this draw if it runs on the old path (job_pad is unused; the
     // record is committed but not yet published).
@@ -9643,6 +9645,14 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
         if (w[6] == 0xc0021000u && w[7] == AmdGpu::NativeRec::Magic) {
             rec->job_tag = w[8];
             rec->job_idx = w[9];
+        }
+    } else if (AmdGpu::NativeRec::g_mode >= 2 &&
+               header->type3.opcode == PM4ItOpcode::DrawIndexIndirect) {
+        // q2: the HLE's tagged NOP after DRAW_INDEX_INDIRECT (the front parsed it: in bounds).
+        const auto* w = reinterpret_cast<const u32*>(header);
+        if (w[5] == 0xc0021000u && w[6] == AmdGpu::NativeRec::Magic) {
+            rec->job_tag = w[7];
+            rec->job_idx = w[8];
         }
     }
     // Copied now: the front's next lookup rewrites these Info fields (inventory 4.4). With

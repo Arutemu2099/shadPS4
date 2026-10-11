@@ -79,6 +79,7 @@ struct DrawIn {
     const void* job_cmd{};
     u64 seq{};                ///< the Draw record's CpSplit seq
     u64 rec_pos{}; ///< unmasked ring position of the Draw record (a material's representative)
+    u64 arg_address{}; ///< q2: an indirect draw's args (SET_BASE + data offset)
 };
 
 /// Colour draws: distinct materials (raw T# / S# keys) a stretch may carry; the back resolves
@@ -159,6 +160,11 @@ struct SubBatch {
     u64 cmd_off{};
     u64 count_off{};
     u32 n{}; ///< draws (maxDrawCount of the indirect count draw)
+    /// q2: a guest indirect draw - drawIndexedIndirect(ind_buf, ind_off, 1, 20) instead of the
+    /// count draw; the index buffer is bound at ib_off (the args' firstIndex is relative to it).
+    vk::Buffer ind_buf{};
+    u64 ind_off{};
+    u64 ib_off{};
 };
 
 struct StretchCmds {
