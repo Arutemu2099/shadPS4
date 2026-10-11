@@ -2983,6 +2983,9 @@ void Liverpool::BackLoop(std::stop_token stoken) {
             early_service();
         }
         if (const auto* record = split->Next()) {
+            while (asc_early && !early_done.empty() && early_done.front() < record->seq) {
+                early_done.pop_front(); // released without passing here (a DoneThrough range)
+            }
             if (asc_early && !early_done.empty() && record->seq == early_done.front()) [[unlikely]] {
                 early_done.pop_front();
                 g_asc_early_stats.skipped.fetch_add(1, std::memory_order_relaxed);
