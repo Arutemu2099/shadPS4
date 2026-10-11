@@ -1276,6 +1276,7 @@ struct LeanXlStats {
     std::atomic<u64> inh_cmp{}, inh_bad{}, ud_cmp{}, ud_bad{}, clip_cmp{}, clip_bad{};
     /// l3g: formatted slots - texel syncs at publish and rejected stretches; A2=2 base compares.
     std::atomic<u64> texel_syncs{}, rej_texel{}, fmt_cmp{}, fmt_bad{};
+    std::atomic<u64> verify_skips{}; ///< A2=2: stretches A2=1 would reject (not compared)
     std::atomic<u64> front_p{}, front_e{}, lean_p{}, lean_e{};
     std::array<std::atomic<Vulkan::A2::StretchTranslator*>, 8> tr{};
 };
@@ -1962,11 +1963,11 @@ void LeanLog() {
                      "Lean L3 direct checks (A2=2): inherited-slot words {} BAD {} | user-data "
                      "words {} BAD {} | clip planes {} BAD {} | formatted table bases {} BAD {} | "
                      "formatted: draws taken (cumulative) {}, texel syncs {} rejected stretches {}, "
-                     "17th range refused (cumulative) {}",
+                     "17th range refused (cumulative) {} | verify skipped (A2=1 would reject) {}",
                      x.inh_cmp.exchange(0), x.inh_bad.load(), x.ud_cmp.exchange(0), x.ud_bad.load(),
                      x.clip_cmp.exchange(0), x.clip_bad.load(), x.fmt_cmp.exchange(0),
                      x.fmt_bad.load(), sb[22], x.texel_syncs.exchange(0), x.rej_texel.exchange(0),
-                     sb[21]);
+                     sb[21], x.verify_skips.exchange(0));
             std::array<u32, 32> ord{};
             for (u32 i = 0; i < 32; ++i) {
                 ord[i] = i;
@@ -8122,8 +8123,10 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
     lean_following = true;
     // L3: replays the worker's stretch at its first draw (A2Execute's publish, mode 1) and returns
     // true; false = the old path runs the stretch's records (rejected, or A2=2 verify).
+    bool v_pass = false; // A2=2: the last stretch passed every check A2=1 makes before publishing
     const auto publish = [&](Vulkan::A2::Stretch& st, const A2Entry::Side& sd,
                              const CpSplit::RecordHeader& first) {
+        v_pass = false;
         const bool verify = g_a2 == 2;
         if (verify) {
             x.would.fetch_add(st.draws, std::memory_order_relaxed);
@@ -8210,6 +8213,7 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                 if (ex.size() > 200000) {
                     ex.clear(); // never written: stale
                 }
+                v_pass = true;
                 for (const auto& sw : st.cmds->slot_writes) {
                     if (sw.mat < st.materials.size()) {
                         auto& e2 = ex[u64{sw.tag} << 32 | sw.idx];
@@ -8225,6 +8229,7 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
         }
         lap(g_blc.pub_resolve);
         if (verify) {
+            v_pass = true;
             return false;
         }
         if (g.gpu_write) {
@@ -8326,7 +8331,10 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                         }
                         continue;
                     }
-                    if (g_a2 == 2) {
+                    if (g_a2 == 2 && !v_pass) {
+                        x.verify_skips.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    if (g_a2 == 2 && v_pass) {
                         vs = &st;
                         vsd = &sd;
                         vs_inh = 0;
