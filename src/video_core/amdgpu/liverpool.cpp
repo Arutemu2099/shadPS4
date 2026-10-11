@@ -777,6 +777,11 @@ const bool g_asc_early = [] {
     const char* v = std::getenv("SHADPS4_ASC_EARLY");
     return v && v[0] == '1';
 }();
+// m2: SHADPS4_ASC_SERVICE bits - 1 publish at ASC yields / submission end, 2 service inside follows.
+const int g_asc_service = [] {
+    const char* v = std::getenv("SHADPS4_ASC_SERVICE");
+    return v ? std::atoi(v) : 0;
+}();
 struct AscEarlyStats {
     std::atomic<u64> dispatches{}, packets{}, in_order{}, blocked{}, skipped{};
     std::atomic<u64> forced_checks{}, upload_bytes{}, uploading_records{}, cross_waits{};
@@ -2723,6 +2728,9 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 #define YIELD_ASC(id)                                                                              \
     if (split_enabled) {                                                                           \
         split->asc_tag = 0;                                                                        \
+        if (g_asc_early && (g_asc_service & 1)) {                                                  \
+            split->PublishNow(); /* m2: early service sees this ASC submission's records now */       \
+        }                                                                                          \
     }                                                                                              \
     YIELD(acb_task_name[id]);                                                                      \
     if (split_enabled && g_asc_early) {                                                            \
@@ -2970,7 +2978,7 @@ void Liverpool::BackLoop(std::stop_token stoken) {
     std::deque<u64> early_done;
     const bool asc_early = g_asc_early && split->early_items != nullptr && g_mtb_p3 == 0;
     u64 early_last_tsc = 0;
-    const auto early_service = [&] {
+    auto early_service = [&] {
         auto& ch = *split;
         u64 head = ch.early_head.load(std::memory_order_relaxed);
         const u64 tail = ch.early_tail.load(std::memory_order_acquire);
@@ -2984,7 +2992,6 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                     g_asc_early_stats.gap_max.store(gap, std::memory_order_relaxed);
                 }
             }
-            early_last_tsc = now;
         }
         const u64 published = ch.PublishedEnd();
         const u64 read = ch.ReadPos();
@@ -3043,7 +3050,12 @@ void Liverpool::BackLoop(std::stop_token stoken) {
             break; // wait until the back passes it in ring order
         }
         ch.early_head.store(head, std::memory_order_release);
+        early_last_tsc = __rdtsc(); // m2: gaps are measured from the end of a service
     };
+    if (asc_early && (g_asc_service & 2)) {
+        early_service_ctx = &early_service;
+        early_service_fn = [](void* p) { (*static_cast<decltype(early_service)*>(p))(); };
+    }
     for (;;) {
         if (asc_early) [[unlikely]] {
             early_service();
@@ -9247,7 +9259,13 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                     g_blc.pc_cyc += __rdtsc() - c0;
                 }
             }
+            if (early_service_fn) [[unlikely]] {
+                early_service_fn(early_service_ctx); // m2: particle work between job records
+            }
             continue;
+        }
+        if (early_service_fn) [[unlikely]] {
+            early_service_fn(early_service_ctx); // m2: and while the workers are behind
         }
         const u64 c0 = blc ? __rdtsc() : 0;
         ProcessCommands(); // guest commands run while the back waits for the worker
@@ -11925,6 +11943,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
 
     if (split_enabled) {
         split->asc_tag = asc_tag_saved;
+        if (g_asc_early && (g_asc_service & 1)) {
+            split->PublishNow(); // m2: the end of an ASC submission
+        }
     }
     FIBER_EXIT;
 }

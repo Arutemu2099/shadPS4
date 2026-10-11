@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <map>
+#include <mutex>
+#include <tuple>
 #include <algorithm>
 #include <bit>
 #include <chrono>
@@ -993,12 +996,14 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool of
     u32 passes = 0;
     const u64 spin_ns = Offload::SpinWaitNs();
     u32 early_hit = 0; // m1: the range overlaps an early ASC write (CP thread sets it)
+    u64 tick_at_fault = 0; // m2
     for (u32 veto_retries = 0;; ++veto_retries) {
     for (;;) {
         cp->SendCommand<true>([&] {
             if (latency && passes == 0) {
                 t_cp = Offload::NowNs();
             }
+            tick_at_fault = scheduler.CurrentTick();
             ticket = PrepareFaultDownload(device_addr, size, is_write);
             if (g_early_inv) {
                 // m1: early ASC writes ring order has not reached (back thread: this lambda)
@@ -1039,6 +1044,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool of
             t_wait = Offload::NowNs();
             free_at_wait = !ticket.on_readback_queue && semaphore->IsFree(ticket.tick);
         }
+        const u64 m2_t0 = ticket.m2_main && Common::FaultMonitor::t_is_game_main ? __rdtsc() : 0;
         {
             const Common::FaultMonitor::GpuWaitTag tag{
                 ticket.on_readback_queue ? (ticket.on_fast_lane ? 3u : 2u) : 1u, early_hit};
@@ -1052,6 +1058,9 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool of
         }
         if (latency) {
             t_woke = Offload::NowNs();
+        }
+        if (m2_t0 != 0) [[unlikely]] {
+            M2NoteMainWait(ticket, __rdtsc() - m2_t0, tick_at_fault);
         }
         Offload::AddSince(Offload::State().guest_wait_ns, wait_start);
         if (!ticket.retry) {
@@ -1956,8 +1965,39 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
                               staging_handle, {vk_copies.data() + first, count});
         });
     }
+    // m2: the newest writer of these bytes in the write history (the batch this copy waits for).
+    const auto m2_fill = [&](FaultTicket& t) {
+        t.m2_main = true;
+        t.m2_addr = job->copies.empty() ? 0 : job->copies.front().addr;
+        for (const FaultCopy& c : job->copies) {
+            t.m2_bytes += c.size;
+        }
+        for (u64 back = 0; back < WriteHistory && back < tick; ++back) {
+            const u64 wt = tick - back;
+            const u64 i = wt % WriteHistory;
+            if (write_hist_tick[i] != wt) {
+                continue;
+            }
+            const auto& hist = write_hist[i];
+            for (size_t k = hist.size(); k-- > 0;) {
+                bool hit = false;
+                for (const FaultCopy& c : job->copies) {
+                    hit = hit || (hist[k].first < c.addr + c.size && c.addr < hist[k].second);
+                }
+                if (hit) {
+                    t.m2_writer_tick = wt;
+                    if (k < write_hist_tag[i].size()) {
+                        t.m2_kind = write_hist_tag[i][k].first;
+                        t.m2_id = write_hist_tag[i][k].second;
+                    }
+                    return;
+                }
+            }
+        }
+    };
     if (Offload::LatencyEnabled()) {
         FaultTicket ticket{.id = id, .tick = tick};
+        m2_fill(ticket);
         ticket.producer = PreciseProducer(job->copies);
         scheduler.GetMasterSemaphore()->Refresh();
         ticket.done_tick = scheduler.GetMasterSemaphore()->KnownGpuTick();
@@ -1974,7 +2014,54 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
         return ticket;
     }
     scheduler.Flush();
-    return {id, tick};
+    FaultTicket main_ticket{id, tick};
+    m2_fill(main_ticket);
+    return main_ticket;
+}
+
+void BufferCache::M2NoteMainWait(const FaultTicket& t, u64 wait_tsc, u64 tick_at_fault) {
+    struct Agg {
+        u64 n{}, tsc{}, behind{};
+    };
+    static std::mutex mu;
+    static std::map<std::tuple<u64, u64, u8, u64>, Agg> agg;
+    static u64 t0 = __rdtsc();
+    static u64 total_n = 0, total_tsc = 0, no_writer = 0;
+    std::scoped_lock lk{mu};
+    auto& a = agg[{t.m2_addr, t.m2_bytes, t.m2_kind, t.m2_id}];
+    ++a.n;
+    a.tsc += wait_tsc;
+    a.behind += t.m2_writer_tick ? tick_at_fault - std::min(tick_at_fault, t.m2_writer_tick) : 0;
+    ++total_n;
+    total_tsc += wait_tsc;
+    no_writer += t.m2_writer_tick == 0;
+    const u64 now = __rdtsc();
+    if (now - t0 < 35'000'000'000ull) {
+        return;
+    }
+    const double sec = double(now - t0) / 3.5e9;
+    std::vector<std::pair<u64, std::tuple<u64, u64, u8, u64>>> v;
+    for (const auto& [k, x] : agg) {
+        v.push_back({x.tsc, k});
+    }
+    std::sort(v.rbegin(), v.rend());
+    std::string s;
+    for (size_t i = 0; i < std::min<size_t>(v.size(), 8); ++i) {
+        const auto& [addr, bytes, kind, id] = v[i].second;
+        const auto& x = agg[v[i].second];
+        s += fmt::format(" [{:#x} {} B, writer kind {} id {:#x}: {:.1f}/s, {:.2f} ms each, writer {:.1f} "
+                         "batches behind the fault]",
+                         addr, bytes, kind, id, double(x.n) / sec, double(x.tsc) / 3.5e6 / double(x.n),
+                         double(x.behind) / double(x.n));
+    }
+    LOG_INFO(Render_Vulkan,
+             "m2 main-semaphore fault downloads on Game:Main: {:.1f}/s, {:.1f} ms/s, no writer in "
+             "history {} | by window and writer (kind: 1 draw 2 gfx dispatch 3 async dispatch on main "
+             "4 DMA 5 WRITE_DATA 6 join 7 image->buffer 8 fill 255 untagged):{}",
+             double(total_n) / sec, double(total_tsc) / 3.5e6 / sec, no_writer, s);
+    agg.clear();
+    t0 = now;
+    total_n = total_tsc = no_writer = 0;
 }
 
 void BufferCache::RecordFaultCopiesOnReadbackQueue(vk::CommandBuffer cmdbuf, vk::Buffer source,

@@ -401,6 +401,9 @@ private:
     /// SHADPS4_LEAN=2 (back): run a DcbRef's job channel to its LeanEnd.
     void LeanBackFollow(const CpSplit::DcbRefPayload& ref);
     bool lean_following{}; ///< back: inside LeanBackFollow (NativePeekNextDraw: unknown)
+    /// m2 (SHADPS4_ASC_SERVICE & 2): the BackLoop's early ASC service, callable inside follows.
+    void (*early_service_fn)(void*) = nullptr;
+    void* early_service_ctx = nullptr;
     /// Starts the lean worker threads (part b).
     void LeanStart();
     void LeanWorkerLoop(std::stop_token stoken, u32 index);

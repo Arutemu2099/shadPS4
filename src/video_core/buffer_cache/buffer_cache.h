@@ -458,6 +458,9 @@ private:
     void CloseGuestSubmitsOver(VAddr device_addr, u64 size);
 
     /// Returned to the faulting thread by value. id 0 means the fault was resolved already.
+    struct FaultTicket;
+    /// m2: Game:Main's main-semaphore download waits by (window, writer), logged every ~10 s.
+    static void M2NoteMainWait(const FaultTicket& t, u64 wait_tsc, u64 tick_at_fault);
     struct FaultTicket {
         u64 id{};
         u64 tick{};
@@ -484,6 +487,11 @@ private:
         u64 producer{};
         u64 mix_flush_ns{};
         u64 label_tick{};
+        /// m2: a download waiting on the main semaphore for its batch - the copied window and
+        /// the newest writer of its bytes in the write history (tick, kind, id; kind 0xff none).
+        bool m2_main{};
+        u64 m2_addr{}, m2_bytes{}, m2_writer_tick{}, m2_id{};
+        u8 m2_kind{0xff};
         /// SHADPS4_FAULT_GUEST_COPY: the job created for this fault (null for a retry ticket).
         FaultJob* job{};
         /// SHADPS4_FAULT_GUEST_SUBMIT: `job` has a recorded lane copy the owner submits
