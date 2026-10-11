@@ -484,7 +484,7 @@ public:
                          bool fence = false);
     /// SHADPS4_CP_SPLIT_POST_ORDER: true when the newest outstanding noted write overlapping
     /// [lo, lo + 4) starts at lo, covers it and its first dword is known (`seq`, `value`).
-    bool NewestWriteValue(VAddr lo, u64& seq, u32& value, bool& fence);
+    bool NewestWriteValue(VAddr lo, u64& seq, u32& value, bool& fence, u32* why = nullptr);
     /// TASK_GUARD: counts a check under `reason`, forgets executed writes, and returns whether any
     /// noted write may still be outstanding (false: nothing to compare, no drain needed).
     bool BeginGuardCheck(DrainReason reason);

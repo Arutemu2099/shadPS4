@@ -220,13 +220,13 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
 
     if (sync) {
         scheduler.Finish();
-        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
-                                                  download, download_size);
+        Core::Memory::Instance()->TryWriteBackingDownload(
+            std::bit_cast<u8*>(image.info.guest_address), download, download_size);
     } else {
         scheduler.DeferPriorityOperation(
             [this, device_addr = image.info.guest_address, download, download_size] {
-                Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr), download,
-                                                          download_size);
+                Core::Memory::Instance()->TryWriteBackingDownload(std::bit_cast<u8*>(device_addr),
+                                                                  download, download_size);
             });
     }
 }

@@ -1911,6 +1911,13 @@ struct WrmCensus {
     std::atomic<CpSplit::Channel*> ch{}; ///< the front's channel, for the drain probe at log time
 } g_wrm;
 enum class WrmPre { Full, Passed, VoWait, PassedFwdFence };
+const bool g_rptr_backing = [] {
+    const char* v = std::getenv("SHADPS4_CP_SPLIT_RPTR_BACKING");
+    return v && v[0] == '1';
+}();
+std::atomic<u64> g_rptr_writes{0}, g_rptr_fallbacks{0}, g_rptr_changed{0};
+std::array<std::atomic<u64>, 4> g_fwd_why{}; // not forwarded: 0 unknown value, 1 not at the label
+                                             // start / partial, 2 value fails the test, 3 newer
 const int g_wait_barrier = [] {
     const char* v = std::getenv("SHADPS4_CP_SPLIT_WAIT_BARRIER");
     return v && v[0] >= '1' && v[0] <= '2' ? v[0] - '0' : 0;
@@ -1981,8 +1988,12 @@ WrmPre WrmPartial(CpSplit::Channel& ch, const PM4CmdWaitRegMem* w, bool vo_label
         // SHADPS4_CP_SPLIT_POST_ORDER: the newest logged writer's value passes the test - an
         // ordering point only; the back's stream order runs the write before what follows.
         u64 fseq = 0;
-        fwd = ch.NewestWriteValue(lo, fseq, fwd_value, fwd_fence) && fseq == seq &&
-              WaitPassesWith(w, fwd_value);
+        u32 why = 3;
+        const bool known = ch.NewestWriteValue(lo, fseq, fwd_value, fwd_fence, &why);
+        fwd = known && fseq == seq && WaitPassesWith(w, fwd_value);
+        if (!fwd) {
+            g_fwd_why[known ? (fseq == seq ? 2 : 3) : why].fetch_add(1, std::memory_order_relaxed);
+        }
         if (fwd && g_a2 != 2) {
             add(g_po.forwarded, 1);
             add(g_wrm.passed[0], 1);
@@ -2190,18 +2201,26 @@ void LeanLog() {
                 LOG_INFO(Render,
                          "POST_ORDER: idle tails posted {:.0f}/s | PFP_SYNC_ME posted {:.0f}/s | "
                          "ZPASS_DONE posted {:.0f}/s (buffer-guarded {:.0f}/s) | waits forwarded "
-                         "{:.0f}/s | wait barriers (mode {}) POST_ORDER {:.0f}/s FENCE_FORWARD "
+                         "{:.0f}/s (not forwarded: unknown value {} not at label start {} value "
+                         "fails {} newer {}) | wait barriers (mode {}) POST_ORDER {:.0f}/s FENCE_FORWARD "
                          "{:.0f}/s | A2=2 forwarded-value compares {} BAD {} | front faults read: "
                          "span {} label {} logged {} other {} | invalidate: span {} label {} logged "
                          "{} other {}",
                          double(tk2(g_po.idle_posted)) * ps, double(tk2(g_po.pfp_posted)) * ps,
                          double(tk2(g_po.zpass_posted)) * ps, double(tk2(g_po.zpass_guarded)) * ps,
-                         double(tk2(g_po.forwarded)) * ps, g_wait_barrier,
+                         double(tk2(g_po.forwarded)) * ps, tk2(g_fwd_why[0]), tk2(g_fwd_why[1]),
+                         tk2(g_fwd_why[2]), tk2(g_fwd_why[3]), g_wait_barrier,
                          double(tk2(g_wait_barriers[0])) * ps, double(tk2(g_wait_barriers[1])) * ps,
                          tk2(g_po.fwd_cmp), g_po.fwd_bad.load(),
                          tk2(g_po.fault[0]), tk2(g_po.fault[1]), tk2(g_po.fault[2]),
                          tk2(g_po.fault[3]), tk2(g_po.fault[4]), tk2(g_po.fault[5]),
                          tk2(g_po.fault[6]), tk2(g_po.fault[7]));
+                LOG_INFO(Render,
+                         "RPTR_BACKING ({}): read-pointer writes {:.0f}/s, backing fallbacks {}, "
+                         "changed under the front {} (gate 0), download words skipped {}",
+                         g_rptr_backing ? 1 : 0, double(tk2(g_rptr_writes)) * ps,
+                         tk2(g_rptr_fallbacks), g_rptr_changed.load(),
+                         Core::Memory::Instance()->download_exclusion_hits.load());
                 LOG_INFO(Render,
                          "Posted gfx WRITE_DATA {:.0f}/s (kept synchronous by the buffer guard "
                          "{:.0f}/s) | posted flips {:.0f}/s",
@@ -5625,6 +5644,32 @@ void Liverpool::RunGfxDma(const PM4Header* header, bool guest_markers_enabled,
         split->NotePostedWrite(write_dst, write_bytes);
     }
     split->PostRunAhead(CpSplit::PostKind::GfxPacket);
+}
+
+void Liverpool::AdvanceAscReadPtr(AscQueueInfo& queue, u32 dwords) {
+    if (!g_rptr_backing || !split_run_ahead) {
+        *queue.read_addr += dwords;
+        *queue.read_addr %= queue.ring_size_dw;
+        return;
+    }
+    const u32 cur = *queue.read_addr; // reads never fault here (s548/s549: write faults only)
+    if (queue.rptr_last != ~0u && cur != queue.rptr_last &&
+        g_rptr_changed.fetch_add(1, std::memory_order_relaxed) < 16) {
+        LOG_WARNING(Render, "RPTR_BACKING: read pointer {:#x} holds {:#x}, the front wrote {:#x}",
+                    reinterpret_cast<VAddr>(queue.read_addr), cur, queue.rptr_last);
+    }
+    const u32 next = (cur + dwords) % queue.ring_size_dw;
+    auto* memory = Core::Memory::Instance();
+    if (queue.rptr_last == ~0u) {
+        memory->ExcludeFromDownloads(reinterpret_cast<VAddr>(queue.read_addr));
+    }
+    if (memory->TryWriteBacking(queue.read_addr, &next, sizeof(next))) {
+        g_rptr_writes.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_rptr_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        *queue.read_addr = next;
+    }
+    queue.rptr_last = next;
 }
 
 void Liverpool::PostWaitBarrier(u32 kind) {
@@ -11155,8 +11200,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             std::memcpy(queue.tmp_packet.data(), acb.data(), acb.size_bytes());
             queue.tmp_dwords = acb.size();
             if constexpr (!is_indirect) {
-                *queue.read_addr += acb.size();
-                *queue.read_addr %= queue.ring_size_dw;
+                AdvanceAscReadPtr(queue, acb.size());
             }
             break;
         }
@@ -11166,8 +11210,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             next_dw_off = 1;
             acb = NextPacket(acb, next_dw_off);
             if constexpr (!is_indirect) {
-                *queue.read_addr += next_dw_off;
-                *queue.read_addr %= queue.ring_size_dw;
+                AdvanceAscReadPtr(queue, next_dw_off);
             }
             continue;
         }
@@ -11557,8 +11600,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 LOG_INFO(Render, "POST_ORDER: ASC vqid {} read pointer at {:#x}, ring {:#x}", vqid,
                          reinterpret_cast<VAddr>(queue.read_addr), queue.map_addr);
             }
-            *queue.read_addr += next_dw_off;
-            *queue.read_addr %= queue.ring_size_dw;
+            AdvanceAscReadPtr(queue, next_dw_off);
         }
     }
 

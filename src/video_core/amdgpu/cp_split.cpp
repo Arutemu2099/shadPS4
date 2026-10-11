@@ -406,7 +406,7 @@ u64 Channel::OutstandingWriteSeq(VAddr lo, VAddr hi) {
     return seq;
 }
 
-bool Channel::NewestWriteValue(VAddr lo, u64& seq, u32& value, bool& fence) {
+bool Channel::NewestWriteValue(VAddr lo, u64& seq, u32& value, bool& fence, u32* why) {
     const u64 done = done_seq.load(std::memory_order_acquire);
     PrunePostedWrites(done);
     if (pw_overflow_seq > done) {
@@ -420,6 +420,9 @@ bool Channel::NewestWriteValue(VAddr lo, u64& seq, u32& value, bool& fence) {
         }
     }
     if (!newest || !newest->known || newest->lo != lo || newest->hi < lo + 4) {
+        if (why) {
+            *why = newest && !newest->known ? 0 : 1;
+        }
         return false;
     }
     seq = newest->seq;

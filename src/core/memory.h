@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <string>
@@ -244,6 +246,15 @@ public:
     void CopySparseMemory(VAddr source, u8* dest, u64 size);
 
     bool TryWriteBacking(void* address, const void* data, u64 size);
+    /// SHADPS4_CP_SPLIT_RPTR_BACKING: TryWriteBacking for readback downloads - skips every word
+    /// registered with ExcludeFromDownloads (a CP read pointer the front owns).
+    bool TryWriteBackingDownload(void* address, const void* data, u64 size);
+    /// Registers [addr, addr + 4) as never written by downloads (idempotent, at most 16).
+    void ExcludeFromDownloads(VAddr addr);
+    static constexpr u32 MaxDownloadExclusions = 16;
+    std::array<std::atomic<VAddr>, MaxDownloadExclusions> download_exclusions{};
+    std::atomic<u32> num_download_exclusions{0};
+    std::atomic<u64> download_exclusion_hits{0};
 
     /// Reads guest bytes through the physical backing view, which carries no page protection.
     /// Returns false (dest partly written) if any byte lacks backing; callers then fall back to

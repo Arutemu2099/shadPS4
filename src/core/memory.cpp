@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <atomic>
 #include <boost/container/small_vector.hpp>
 #include "common/alignment.h"
@@ -171,6 +172,56 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
         dest += copy_size;
         ++vma;
     }
+}
+
+void MemoryManager::ExcludeFromDownloads(VAddr addr) {
+    static std::mutex m;
+    std::scoped_lock lk{m};
+    const u32 n = num_download_exclusions.load(std::memory_order_acquire);
+    for (u32 i = 0; i < n; ++i) {
+        if (download_exclusions[i].load(std::memory_order_relaxed) == addr) {
+            return;
+        }
+    }
+    if (n < MaxDownloadExclusions) {
+        download_exclusions[n].store(addr, std::memory_order_relaxed);
+        num_download_exclusions.store(n + 1, std::memory_order_release);
+    }
+}
+
+bool MemoryManager::TryWriteBackingDownload(void* address, const void* data, u64 size) {
+    const u32 n = num_download_exclusions.load(std::memory_order_acquire);
+    if (n == 0) [[likely]] {
+        return TryWriteBacking(address, data, size);
+    }
+    const VAddr lo = std::bit_cast<VAddr>(address);
+    const VAddr hi = lo + size;
+    std::array<VAddr, MaxDownloadExclusions> hits{};
+    u32 h = 0;
+    for (u32 i = 0; i < n; ++i) {
+        const VAddr e = download_exclusions[i].load(std::memory_order_relaxed);
+        if (e < hi && lo < e + 4) {
+            hits[h++] = e;
+        }
+    }
+    if (h == 0) {
+        return TryWriteBacking(address, data, size);
+    }
+    std::sort(hits.begin(), hits.begin() + h);
+    download_exclusion_hits.fetch_add(h, std::memory_order_relaxed);
+    bool ok = true;
+    VAddr cur = lo;
+    const auto* src = static_cast<const u8*>(data);
+    for (u32 i = 0; i <= h; ++i) {
+        const VAddr stop = i < h ? std::max(hits[i], lo) : hi;
+        if (stop > cur) {
+            ok &= TryWriteBacking(std::bit_cast<void*>(cur), src + (cur - lo), stop - cur);
+        }
+        if (i < h) {
+            cur = std::max(cur, std::min(hits[i] + 4, hi));
+        }
+    }
+    return ok;
 }
 
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {

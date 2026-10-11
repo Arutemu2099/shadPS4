@@ -230,6 +230,9 @@ public:
     /// SHADPS4_CP_SPLIT_WAIT_BARRIER (l3n2): posts a Call that records Rasterizer::WaitBarrier at
     /// this stream position. `kind` 0 = POST_ORDER forward, 1 = FENCE_FORWARD skip (counters).
     void PostWaitBarrier(u32 kind);
+    /// SHADPS4_CP_SPLIT_RPTR_BACKING (l3o): advances an ASC queue's read pointer by `dwords`.
+    struct AscQueueInfo;
+    void AdvanceAscReadPtr(AscQueueInfo& queue, u32 dwords);
 
     struct AscQueueInfo {
         static constexpr size_t Pm4BufferSize = 1024;
@@ -239,6 +242,7 @@ public:
         u32 pipe_id;
         std::array<u32, Pm4BufferSize> tmp_packet;
         u32 tmp_dwords;
+        u32 rptr_last{~0u}; ///< SHADPS4_CP_SPLIT_RPTR_BACKING: the value the front wrote last
     };
     Common::SlotVector<AscQueueInfo> asc_queues{};
 

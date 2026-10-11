@@ -1252,7 +1252,7 @@ bool BufferCache::DownloadWindowMultiBuffer(VAddr window_addr, u64 window_size) 
     scheduler.Finish();
     auto* memory = Core::Memory::Instance();
     for (const Part& part : parts) {
-        memory->TryWriteBacking(
+        memory->TryWriteBackingDownload(
             std::bit_cast<u8*>(part.buffer->CpuAddr() + part.copy.srcOffset),
             download + part.copy.dstOffset, part.copy.size);
     }
@@ -2792,8 +2792,8 @@ void BufferCache::GuestCopyFaultJob(FaultJob& job) {
     const u8* const download = job.staging->mapped_data.data();
     auto* memory = Core::Memory::Instance();
     for (const FaultCopy& copy : job.copies) {
-        memory->TryWriteBacking(std::bit_cast<u8*>(copy.addr), download + copy.staging_offset,
-                                copy.size);
+        memory->TryWriteBackingDownload(std::bit_cast<u8*>(copy.addr),
+                                        download + copy.staging_offset, copy.size);
     }
     job.guest_copy.store(2, std::memory_order_seq_cst);
     const u64 n = g_guest_copies.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -2989,8 +2989,8 @@ bool BufferCache::PublishFaultJob(FaultJob& job, bool guest_copied) {
     auto* memory = Core::Memory::Instance();
     if (!guest_copied) {
         for (const FaultCopy& copy : job.copies) {
-            memory->TryWriteBacking(std::bit_cast<u8*>(copy.addr),
-                                    download + copy.staging_offset, copy.size);
+            memory->TryWriteBackingDownload(std::bit_cast<u8*>(copy.addr),
+                                            download + copy.staging_offset, copy.size);
         }
     }
     // Only the buffer spans: for a write job the rest of the window may be GPU-modified image
@@ -3208,8 +3208,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         for (const auto& copy : copies) {
             const VAddr copy_device_addr = buffer.CpuAddr() + copy.srcOffset;
             const u64 dst_offset = copy.dstOffset - offset;
-            memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr), download + dst_offset,
-                                    copy.size);
+            memory->TryWriteBackingDownload(std::bit_cast<u8*>(copy_device_addr),
+                                            download + dst_offset, copy.size);
         }
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
         if (is_write) {
