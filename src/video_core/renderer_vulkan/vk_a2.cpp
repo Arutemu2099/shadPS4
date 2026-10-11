@@ -689,7 +689,9 @@ StretchTranslator::Impl::Impl(StretchTranslator* owner_, const WorkerContext& ct
         LOG_INFO(Render_Vulkan,
                  "A2 worker {}: translator on (arena {} MB, region {} B, align {}, colour {})",
                  ctx.worker_index, ArenaBytes >> 20, region_bytes, align, colour_on ? "on" : "off");
-        if (SecondaryMode() && ctx.instance->IsMaintenance7Supported()) {
+        // p2b (review #10): only the L3 lean translators (worker_index >= 16) - the older A2
+        // worker loop's publish never executes a secondary.
+        if (SecondaryMode() && ctx.instance->IsMaintenance7Supported() && ctx.worker_index >= 16) {
             const auto dev = ctx.instance->GetDevice();
             for (auto& p : sec_pools) {
                 p.pool = dev.createCommandPool(vk::CommandPoolCreateInfo{
@@ -1477,6 +1479,27 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
             sb.vb_off[k] = vb_handle[k] != 0 ? bo[k] : 0;
         }
         sb.dyn = cand; // dirty bits = what changed (everything for the first sub-batch)
+        {
+            // p2b (review #1): Commit skips a value while its enable is off but its dirty bit is
+            // cleared below anyway; when an enable changes, record its dependent values too (a
+            // secondary inherits nothing).
+            auto& d = sb.dyn.dirty_state;
+            if (d.depth_test_enabled) {
+                d.depth_compare_op = true;
+            }
+            if (d.stencil_test_enabled) {
+                d.stencil_front_ops = d.stencil_front_reference = true;
+                d.stencil_front_write_mask = d.stencil_front_compare_mask = true;
+                d.stencil_back_ops = d.stencil_back_reference = true;
+                d.stencil_back_write_mask = d.stencil_back_compare_mask = true;
+            }
+            if (d.depth_bias_enabled) {
+                d.depth_bias = true;
+            }
+            if (d.depth_bounds_test_enabled) {
+                d.depth_bounds = true;
+            }
+        }
         sb.arena = ctx.arena->buffer;
         sb.cmd_off = cmd_off;
         sb.count_off = count_off;
@@ -1680,6 +1703,9 @@ void StretchTranslator::Impl::RecordSecondary() {
     };
     const vk::CommandBufferInheritanceRenderingInfo rinfo = {
         .pNext = inst.IsMixedDepthSamplesSupported() ? &mixed : nullptr,
+        // p2b (review #2, VUID-vkCmdExecuteCommands-flags-06026): the pass's flags minus
+        // SECONDARY_COMMAND_BUFFERS.
+        .flags = static_cast<vk::RenderingFlags>(VK_RENDERING_CONTENTS_INLINE_BIT_KHR),
         .colorAttachmentCount = inh.n_color,
         .pColorAttachmentFormats = inh.color.data(),
         .depthAttachmentFormat = inh.depth,
@@ -1689,13 +1715,19 @@ void StretchTranslator::Impl::RecordSecondary() {
     };
     const vk::CommandBufferInheritanceInfo info = {.pNext = &rinfo};
     const u32 cur = g_bindless_cur.load(std::memory_order_acquire) % Bindless::NumSets;
-    (void)cb.begin(vk::CommandBufferBeginInfo{
-        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit |
-                 vk::CommandBufferUsageFlagBits::eRenderPassContinue,
-        .pInheritanceInfo = &info,
-    });
+    if (cb.begin(vk::CommandBufferBeginInfo{
+            .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit |
+                     vk::CommandBufferUsageFlagBits::eRenderPassContinue,
+            .pInheritanceInfo = &info,
+        }) != vk::Result::eSuccess) {
+        ++g_sec_c[1];
+        return; // p2b (review #11): no secondary (the pool keeps it until its tick passes)
+    }
     RecordBatches(*cmds, Bindless::G().sets[cur], cb, inst);
-    (void)cb.end();
+    if (cb.end() != vk::Result::eSuccess) {
+        ++g_sec_c[1];
+        return;
+    }
     stretch->secondary = cb;
     stretch->bl_idx = cur;
     stretch->inh = inh;
