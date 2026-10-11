@@ -219,7 +219,10 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
                              download_buffer.Handle(), image_download);
 
     if (sync) {
-        scheduler.Finish();
+        {
+            const Common::FaultMonitor::GpuWaitTag tag{7};
+            scheduler.Finish();
+        }
         Core::Memory::Instance()->TryWriteBackingDownload(
             std::bit_cast<u8*>(image.info.guest_address), download, download_size);
     } else {

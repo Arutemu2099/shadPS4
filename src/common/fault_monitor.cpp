@@ -765,6 +765,9 @@ void NoteGameMainGpuWait(u64 ticks) {
     for (u32 i = 0; i < n && i < 4; ++i) {
         key[i] = reinterpret_cast<u64>(frames[i]) - exe;
     }
+    if (n == 0) {
+        key = {0xA000u + t_gpu_wait_tag, t_gpu_wait_early, 0, 0}; // m1: the site tag
+    }
     std::scoped_lock lk{g_gm.gpu_mutex};
     auto& p = g_gm.gpu_paths[key];
     ++p.n;
@@ -1021,7 +1024,10 @@ void GameMainCensusMaybeLog() {
                               double(paths[i].first) / 3.5e6 / sec, double(paths[i].second.second) / sec);
         }
         LOG_INFO(Render, "GameMain census GPU waits on Game:Main (MasterSemaphore::Wait, shadPS4.exe "
-                         "offsets of the 4 callers):{}", ps);
+                         "offsets of the 4 callers; m1: [0xA000+site, early ASC overlap] - site 1 fault "
+                         "dl main sem, 2 fault dl readback queue, 3 fault dl fast lane, 4 buffer dl sync, 5 "
+                         "fault verify, 6 DownloadBufferMemory sync, 7 texture dl sync, 0 untagged):{}",
+                 ps);
     }
 }
 

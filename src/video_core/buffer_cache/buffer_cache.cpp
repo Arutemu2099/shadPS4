@@ -992,6 +992,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool of
     bool free_at_wait = false;
     u32 passes = 0;
     const u64 spin_ns = Offload::SpinWaitNs();
+    u32 early_hit = 0; // m1: the range overlaps an early ASC write (CP thread sets it)
     for (u32 veto_retries = 0;; ++veto_retries) {
     for (;;) {
         cp->SendCommand<true>([&] {
@@ -999,6 +1000,16 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool of
                 t_cp = Offload::NowNs();
             }
             ticket = PrepareFaultDownload(device_addr, size, is_write);
+            if (g_early_inv) {
+                // m1: early ASC writes ring order has not reached (back thread: this lambda)
+                for (u64 i = g_early_w_head; i != g_early_w_tail; ++i) {
+                    const auto& w = g_early_writes[i % g_early_writes.size()];
+                    if (w.lo < device_addr + size && device_addr < w.hi) {
+                        early_hit = 1;
+                        break;
+                    }
+                }
+            }
             if (g_fault_guest_copy && ticket.id != 0 && !ticket.retry && ticket.job == nullptr &&
                 !Offload::VerifyEnabled()) {
                 // The job created for this fault, if the command processor has not settled it
@@ -1028,12 +1039,16 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool of
             t_wait = Offload::NowNs();
             free_at_wait = !ticket.on_readback_queue && semaphore->IsFree(ticket.tick);
         }
-        if (ticket.on_readback_queue) {
-            JobSemaphore(ticket.on_fast_lane, ticket.on_asc).Wait(ticket.tick);
-        } else if (spin_ns != 0) {
-            semaphore->SpinWait(ticket.tick, spin_ns);
-        } else {
-            semaphore->Wait(ticket.tick);
+        {
+            const Common::FaultMonitor::GpuWaitTag tag{
+                ticket.on_readback_queue ? (ticket.on_fast_lane ? 3u : 2u) : 1u, early_hit};
+            if (ticket.on_readback_queue) {
+                JobSemaphore(ticket.on_fast_lane, ticket.on_asc).Wait(ticket.tick);
+            } else if (spin_ns != 0) {
+                semaphore->SpinWait(ticket.tick, spin_ns);
+            } else {
+                semaphore->Wait(ticket.tick);
+            }
         }
         if (latency) {
             t_woke = Offload::NowNs();
@@ -1251,7 +1266,10 @@ bool BufferCache::DownloadWindowMultiBuffer(VAddr window_addr, u64 window_size) 
             cmdbuf.copyBuffer(part.buffer->buffer, download_buffer.Handle(), copy);
         }
     }
-    scheduler.Finish();
+    {
+        const Common::FaultMonitor::GpuWaitTag tag{4};
+        scheduler.Finish();
+    }
     auto* memory = Core::Memory::Instance();
     for (const Part& part : parts) {
         memory->TryWriteBackingDownload(
@@ -3061,7 +3079,10 @@ BufferCache::VerifyResult BufferCache::VerifyFaultJob(FaultJob& job) {
                               second->Handle(), {vk_copies.data() + first, count});
         });
     }
-    scheduler.Finish();
+    {
+        const Common::FaultMonitor::GpuWaitTag tag{5};
+        scheduler.Finish();
+    }
     VerifyResult result = VerifyResult::Unverified;
     // Finish can reenter. A marking since then makes differing bytes legitimate; the job is
     // then vetoed by the same vote in PublishFaultJob's place.
@@ -3231,12 +3252,14 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
             const u64 presubmit_tick = scheduler.CurrentTick();
             scheduler.Flush();
             const u64 submitted = Offload::NowNs();
+            const Common::FaultMonitor::GpuWaitTag tag{6};
             scheduler.Wait(presubmit_tick);
             const u64 done = Offload::NowNs();
             timing->submit_ns += submitted - start;
             timing->gpu_wait_ns += done - submitted;
             timing->total_ns += done - start;
         } else {
+            const Common::FaultMonitor::GpuWaitTag tag{6};
             scheduler.Finish();
         }
         write_data();

@@ -102,6 +102,21 @@ void NoteGnmWait(u32 kind, u64 ticks);
 /// gmc3: Game:Main inside a host GPU wait (MasterSemaphore::Wait), and its timed call path.
 extern std::atomic<u32> g_gm_in_gpu_wait;
 void NoteGameMainGpuWait(u64 ticks); // captures the caller's backtrace itself
+/// m1: the wait site of the next host GPU wait on this thread (a tag, see m1_gpu_wait_tags.py) and,
+/// for a fault download, whether its range overlaps an early ASC write.
+inline thread_local u32 t_gpu_wait_tag = 0;
+inline thread_local u32 t_gpu_wait_early = 0;
+struct GpuWaitTag {
+    u32 prev, prev_early;
+    explicit GpuWaitTag(u32 tag, u32 early = 0) : prev(t_gpu_wait_tag), prev_early(t_gpu_wait_early) {
+        t_gpu_wait_tag = tag;
+        t_gpu_wait_early = early;
+    }
+    ~GpuWaitTag() {
+        t_gpu_wait_tag = prev;
+        t_gpu_wait_early = prev_early;
+    }
+};
 /// gmc2: the gnm idle waits, timed on every thread (Game:Main also into its own kinds).
 struct GnmWaitScope {
     u32 kind;
