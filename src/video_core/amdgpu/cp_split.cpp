@@ -343,7 +343,8 @@ void Channel::PrunePostedWrites(u64 done) {
     }
 }
 
-void Channel::NotePostedWrite(VAddr dst, u64 bytes, bool has_value, u32 value, bool fence) {
+void Channel::NotePostedWrite(VAddr dst, u64 bytes, bool has_value, u32 value, bool fence,
+                              u8 src) {
     ASSERT(!record_open);
     if (bytes == 0) {
         return;
@@ -358,7 +359,7 @@ void Channel::NotePostedWrite(VAddr dst, u64 bytes, bool has_value, u32 value, b
         ++counters.write_log_overflows;
     }
     posted_writes[pw_tail & (PostedWriteSlots - 1)] =
-        PostedWrite{committed_seq, dst, dst + bytes, value, has_value && bytes >= 4, fence};
+        PostedWrite{committed_seq, dst, dst + bytes, value, has_value && bytes >= 4, fence, src};
     ++pw_tail;
     counters.write_log_max = std::max(counters.write_log_max, pw_tail - pw_head);
 }
@@ -421,7 +422,8 @@ bool Channel::NewestWriteValue(VAddr lo, u64& seq, u32& value, bool& fence, u32*
     }
     if (!newest || !newest->known || newest->lo != lo || newest->hi < lo + 4) {
         if (why) {
-            *why = newest && !newest->known ? 0 : 1;
+            // 0 unknown value (+ 16 * source), 1 not at the label start / partial
+            *why = newest && !newest->known ? 0u + 16u * newest->src : 1u;
         }
         return false;
     }

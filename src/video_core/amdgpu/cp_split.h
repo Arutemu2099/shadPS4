@@ -480,8 +480,9 @@ public:
     /// Call it for every posted packet with a memory destination (GDS destinations cannot overlap
     /// guest memory). Entries are dropped once done_seq passes them; if PostedWriteSlots are
     /// outstanding the oldest is dropped and checks turn conservative until it is done.
+    /// `src` (census): 0 other, 1 fence, 2 gfx WRITE_DATA, 3 gfx DMA, 4 ASC packet, 5 ZPASS_DONE.
     void NotePostedWrite(VAddr dst, u64 bytes, bool has_value = false, u32 value = 0,
-                         bool fence = false);
+                         bool fence = false, u8 src = 0);
     /// SHADPS4_CP_SPLIT_POST_ORDER: true when the newest outstanding noted write overlapping
     /// [lo, lo + 4) starts at lo, covers it and its first dword is known (`seq`, `value`).
     bool NewestWriteValue(VAddr lo, u64& seq, u32& value, bool& fence, u32* why = nullptr);
@@ -739,6 +740,7 @@ private:
         u32 value;  ///< the dword written at lo, when known
         bool known;
         bool fence; ///< written by an end-of-pipe fence (EOP / EOS / RELEASE_MEM)
+        u8 src;
     };
     /// Outstanding noted writes are posted records, so at most Depth() + 1 (the one being noted):
     /// with MaxDepth 1024 the log cannot overflow; the fallback stays as a guard.

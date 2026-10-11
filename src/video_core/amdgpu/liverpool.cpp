@@ -1916,7 +1916,8 @@ const bool g_rptr_backing = [] {
     return v && v[0] == '1';
 }();
 std::atomic<u64> g_rptr_writes{0}, g_rptr_fallbacks{0}, g_rptr_changed{0};
-std::array<std::atomic<u64>, 4> g_fwd_why{}; // not forwarded: 0 unknown value, 1 not at the label
+std::array<std::atomic<u64>, 4> g_fwd_why{};
+std::array<std::atomic<u64>, 6> g_fwd_unknown_src{}; // unknown value by write-log source // not forwarded: 0 unknown value, 1 not at the label
                                              // start / partial, 2 value fails the test, 3 newer
 const int g_wait_barrier = [] {
     const char* v = std::getenv("SHADPS4_CP_SPLIT_WAIT_BARRIER");
@@ -1992,7 +1993,12 @@ WrmPre WrmPartial(CpSplit::Channel& ch, const PM4CmdWaitRegMem* w, bool vo_label
         const bool known = ch.NewestWriteValue(lo, fseq, fwd_value, fwd_fence, &why);
         fwd = known && fseq == seq && WaitPassesWith(w, fwd_value);
         if (!fwd) {
-            g_fwd_why[known ? (fseq == seq ? 2 : 3) : why].fetch_add(1, std::memory_order_relaxed);
+            g_fwd_why[known ? (fseq == seq ? 2 : 3) : (why & 15)].fetch_add(
+                1, std::memory_order_relaxed);
+            if (!known && (why & 15) == 0) {
+                g_fwd_unknown_src[std::min<u32>(why >> 4, 5)].fetch_add(1,
+                                                                       std::memory_order_relaxed);
+            }
         }
         if (fwd && g_a2 != 2) {
             add(g_po.forwarded, 1);
@@ -2201,14 +2207,18 @@ void LeanLog() {
                 LOG_INFO(Render,
                          "POST_ORDER: idle tails posted {:.0f}/s | PFP_SYNC_ME posted {:.0f}/s | "
                          "ZPASS_DONE posted {:.0f}/s (buffer-guarded {:.0f}/s) | waits forwarded "
-                         "{:.0f}/s (not forwarded: unknown value {} not at label start {} value "
-                         "fails {} newer {}) | wait barriers (mode {}) POST_ORDER {:.0f}/s FENCE_FORWARD "
+                         "{:.0f}/s (not forwarded: unknown value {} [other {} fence {} wdata {} "
+                         "dma {} asc {} zpass {}] not at label start {} value fails {} newer {}) | "
+                         "wait barriers (mode {}) POST_ORDER {:.0f}/s FENCE_FORWARD "
                          "{:.0f}/s | A2=2 forwarded-value compares {} BAD {} | front faults read: "
                          "span {} label {} logged {} other {} | invalidate: span {} label {} logged "
                          "{} other {}",
                          double(tk2(g_po.idle_posted)) * ps, double(tk2(g_po.pfp_posted)) * ps,
                          double(tk2(g_po.zpass_posted)) * ps, double(tk2(g_po.zpass_guarded)) * ps,
-                         double(tk2(g_po.forwarded)) * ps, tk2(g_fwd_why[0]), tk2(g_fwd_why[1]),
+                         double(tk2(g_po.forwarded)) * ps, tk2(g_fwd_why[0]),
+                         tk2(g_fwd_unknown_src[0]), tk2(g_fwd_unknown_src[1]),
+                         tk2(g_fwd_unknown_src[2]), tk2(g_fwd_unknown_src[3]),
+                         tk2(g_fwd_unknown_src[4]), tk2(g_fwd_unknown_src[5]), tk2(g_fwd_why[1]),
                          tk2(g_fwd_why[2]), tk2(g_fwd_why[3]), g_wait_barrier,
                          double(tk2(g_wait_barriers[0])) * ps, double(tk2(g_wait_barriers[1])) * ps,
                          tk2(g_po.fwd_cmp), g_po.fwd_bad.load(),
@@ -5641,7 +5651,9 @@ void Liverpool::RunGfxDma(const PM4Header* header, bool guest_markers_enabled,
     split->Commit();
     // The no-op DMA (destination 0x3022C) never writes: the back's ExecuteGfxPacket skips it.
     if (split_task_guard && dma->dst_addr_lo != 0x3022C) [[unlikely]] {
-        split->NotePostedWrite(write_dst, write_bytes);
+        // DMA_DATA from immediate data fills its destination with `data` (known value).
+        split->NotePostedWrite(write_dst, write_bytes, dma->src_sel == DmaDataSrc::Data, dma->data,
+                               false, 3);
     }
     split->PostRunAhead(CpSplit::PostKind::GfxPacket);
 }
@@ -5733,7 +5745,11 @@ void Liverpool::RunAscPacket(const PM4Header* header, std::span<const u32> rest,
         return;
     }
     if (split_task_guard) [[unlikely]] {
-        split->NotePostedWrite(dst, bytes); // bytes == 0 (GDS destination): nothing to note.
+        // bytes == 0 (GDS destination): nothing to note. DMA_DATA from immediate data: known value.
+        const auto* dma = reinterpret_cast<const PM4DmaData*>(header);
+        const bool imm = header->type3.opcode == PM4ItOpcode::DmaData &&
+                         dma->src_sel == DmaDataSrc::Data;
+        split->NotePostedWrite(dst, bytes, imm, imm ? dma->data : 0, false, 4);
     }
     split->PostRunAhead(CpSplit::PostKind::AscPacket);
     split->MaybeLog();
@@ -6061,7 +6077,7 @@ void Liverpool::RunFence(const PM4Header* header, std::span<const u32> rest, VAd
                 WaitPassesWith(w, write->value)) {
                 g_fwd[key] = {next, label, write->value};
                 ++g_fwd_stats.posted;
-                split->NotePostedWrite(label, write->width, true, write->value, true);
+                split->NotePostedWrite(label, write->width, true, write->value, true, 1);
                 split->PostRunAhead(CpSplit::PostKind::Fence);
                 split->MaybeLog();
                 return;
@@ -6093,9 +6109,9 @@ void Liverpool::RunFence(const PM4Header* header, std::span<const u32> rest, VAd
         return;
     }
     if (const auto fw = FenceValue(header); fw && FenceAtGpu() == 0) {
-        split->NotePostedWrite(label, LabelBytes, true, fw->value, true);
+        split->NotePostedWrite(label, LabelBytes, true, fw->value, true, 1);
     } else {
-        split->NotePostedWrite(label, LabelBytes);
+        split->NotePostedWrite(label, LabelBytes, false, 0, true, 1);
     }
     split->PostRunAhead(CpSplit::PostKind::Fence);
     split->MaybeLog();
@@ -10783,7 +10799,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             CommitPacketCopy(*split, header,
                                              guest_markers_enabled ? u16{CpSplit::GuestMarkers}
                                                                    : u16{0});
-                            split->NotePostedWrite(dst, bytes);
+                            split->NotePostedWrite(dst, bytes, false, 0, false, 5);
                             split->PostRunAhead(CpSplit::PostKind::GfxPacket);
                             split->MaybeLog();
                             g_po.zpass_posted.fetch_add(1, std::memory_order_relaxed);
@@ -10844,7 +10860,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             guest_markers_enabled ? CpSplit::GuestMarkers : 0);
                         std::memcpy(copy, header, dwords * sizeof(u32));
                         split->Commit();
-                        split->NotePostedWrite(dst, bytes, true, wd->data[0]);
+                        split->NotePostedWrite(dst, bytes, true, wd->data[0], false, 2);
                         split->PostRunAhead(CpSplit::PostKind::GfxPacket);
                         split->MaybeLog();
                         g_pwf.wdata_posted.fetch_add(1, std::memory_order_relaxed);
