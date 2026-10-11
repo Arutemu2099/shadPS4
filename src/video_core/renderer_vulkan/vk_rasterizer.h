@@ -254,7 +254,12 @@ public:
     /// representative draw's fragment stage; its images are appended to `ids`. False: the
     /// stretch runs on the old path. May record sampled-layout barriers (outside any pass).
     bool A2ResolveMaterial(const GraphicsPipeline* base, const Shader::BoundStage& fs, u32* slots,
-                           u32& n_img, u32& n_smp, std::vector<VideoCore::ImageId>& ids);
+                           u32& n_img, u32& n_smp, std::vector<VideoCore::ImageId>& ids,
+                           u64 h1 = 0, u64 h2 = 0, u32 kn = 0);
+    /// SHADPS4_A2_MAT_MEMO (l4d): the memo's result for this material key if every condition of
+    /// an all-hit BindlessResolve holds (then the same LRU touches); false: resolve it.
+    bool A2MaterialMemo(const GraphicsPipeline* base, u64 h1, u64 h2, u32 kn, u32* slots,
+                        u32& n_img, u32& n_smp, std::vector<VideoCore::ImageId>& ids);
     /// NativeColourGates (config + no pending stencil write-backs), once per colour stretch.
     [[nodiscard]] bool A2ColourGates() const {
         return NativeColourGates();
@@ -768,9 +773,26 @@ private:
         std::unordered_map<u64, u32> smp_slot;
         std::vector<BindlessImgEntry> img_cache;
         std::vector<BindlessSmpEntry> smp_cache;
+        /// l4d: BindlessResolve copies each image's cache entry / each sampler's LRU id here
+        /// when set (the material memo's fill).
+        BindlessImgEntry* cap_img{};
+        size_t* cap_lru{};
         u64 img_gen{1}, smp_gen{1};
         u64 tex_gen{~0ull}, img_epoch{~0ull}, meta_epoch{~0ull}, sampler_gen{~0ull};
     } bindless;
+    /// SHADPS4_A2_MAT_MEMO (l4d): one resolved stretch material.
+    struct MatMemo {
+        const GraphicsPipeline* base{};
+        u64 h1{}, h2{};
+        u32 kn{};
+        u64 img_gen{}, smp_gen{};
+        u32 n_img{}, n_smp{};
+        std::array<u32, 2 * Shader::NativeBindlessMax> slots{};
+        std::array<BindlessImgEntry, Shader::NativeBindlessMax> img{};
+        std::array<size_t, Shader::NativeBindlessMax> lru{};
+    };
+    std::vector<MatMemo> mat_memo;
+    bool A2MaterialMemoValid(const MatMemo& m);
     /// Back thread: the fragment stage's image / sampler slots of the draw `base` describes now
     /// (32 words: images then samplers). views / samplers (optional): what they hold.
     bool BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::ImageView* views,
@@ -892,6 +914,8 @@ private:
         u64 bl_vfy_ok{}, bl_vfy_bad{}, bl_vfy_none{}, bl_rot{};
         u64 c_bl_hit{}, c_bl_miss{}; ///< cycles in image hits / misses
         u64 c_bl_smp{}, c_bl_touch{}, n_bl_res{}; ///< sampler loop / LRU touch cycles, resolves
+        /// l4d material memo: hits, misses (no entry), stale entries, verify compares / BAD.
+        u64 mm_hit{}, mm_miss{}, mm_stale{}, mm_vfy{}, mm_bad{}, c_mm_hit{};
         /// Segment census (sec. 14): pipeline-change closes by bits 1 = fixed state equal (key
         /// minus shaders and vertex formats), 2 = vertex formats equal, 4 = next pipeline has a
         /// native variant, 8 = context registers moved; native -> non-native draw transitions.

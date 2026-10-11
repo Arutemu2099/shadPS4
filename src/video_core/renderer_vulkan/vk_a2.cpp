@@ -694,10 +694,25 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     bool colour = false;
     // l4b census: "no variant" by the pipeline's colour state - 24 undecided, 25 eligible (no
     // variant for this vertex description yet), 26 ineligible as untextured, 27 ineligible other.
-    const auto no_variant = [&] {
+    // l4c: an eligible pipeline's draw by the slot state of its vertex key (0: not computed).
+    const auto no_variant = [&](u64 vkey = 0) {
         if (base) {
             const u8 s = base->native_colour_static;
             ++owner->sub[s == 0 ? 24 : s == 1 ? 25 : base->native_colour_untextured ? 26 : 27];
+            if (s == 1 && vkey != 0) {
+                u32 r = 31;
+                for (const auto& slot : base->native_colour) {
+                    const u64 k = slot.key.load(std::memory_order_relaxed);
+                    if (k == vkey) {
+                        r = slot.state.load(std::memory_order_relaxed) == 2 ? 28 : 29;
+                        break;
+                    }
+                    if (k == 0) {
+                        r = 30;
+                    }
+                }
+                ++owner->sub[r];
+            }
         }
         return refuse(RefuseNoVariant);
     };
@@ -708,10 +723,11 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         if (!draw.vi || draw.vi->count > 16) {
             return refuse(RefuseNoVi);
         }
-        native = base->NativeColourVariant(VideoCore::NativeVertexKey(
-            AmdGpu::CpSplit::VertexInputAttribs(*draw.vi), draw.vi->count));
+        const u64 vkey = VideoCore::NativeVertexKey(AmdGpu::CpSplit::VertexInputAttribs(*draw.vi),
+                                                    draw.vi->count);
+        native = base->NativeColourVariant(vkey);
         if (!native) {
-            return no_variant();
+            return no_variant(vkey);
         }
         colour = true;
         if (!native->native_bindless ||
@@ -1433,7 +1449,9 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         // and its slot write (Replay fills record (tag, idx) from mat_slots[mat]).
         if (mat < 0) {
             mat = static_cast<s32>(stretch->materials.size());
-            stretch->materials.push_back({base, draw.rec_pos});
+            u64 mh1 = 0, mh2 = 0;
+            NR::ImageKeyHash(key.w.data(), key.n, mh1, mh2);
+            stretch->materials.push_back({base, draw.rec_pos, mh1, mh2, key.n});
             mat_keys[mat] = key;
             mat_base[mat] = base;
         }

@@ -701,7 +701,14 @@ void GraphicsPipeline::BuildDescSetLayout(
         BuildNativeMappings(bindings);
         return;
     }
-    uses_push_descriptors = binding < instance.MaxPushDescriptors();
+    // l4c: the total descriptor count (a sparse layout - SHADPS4_NATIVE_SPARSE_LAYOUT - has gaps);
+    // equal to `binding` for a contiguous one.
+    u32 total = 0;
+    for (const auto& b : bindings) {
+        total += b.descriptorCount;
+    }
+    uses_push_descriptors = total < instance.MaxPushDescriptors();
+    (void)binding;
     BuildPacketBindings(bindings);
     const auto flags = uses_push_descriptors
                            ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR

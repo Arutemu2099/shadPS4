@@ -2186,13 +2186,13 @@ void LeanLog() {
             auto& x = g_lean_xl;
             const double ps = 1.0 / std::max(sec, 1e-9);
             std::array<u64, 32> rf{};
-            std::array<u64, 28> sb{};
+            std::array<u64, 32> sb{};
             for (const auto& t : x.tr) {
                 if (const auto* tr = t.load(std::memory_order_acquire)) {
                     for (u32 i = 0; i < 32; ++i) {
                         rf[i] += tr->refusals[i]; // cumulative (racy reads, as A2Log)
                     }
-                    for (u32 i = 0; i < 28; ++i) {
+                    for (u32 i = 0; i < 32; ++i) {
                         sb[i] += tr->sub[i];
                     }
                 }
@@ -2205,10 +2205,11 @@ void LeanLog() {
                      "{} | inherited refused: size {} no buffer {} offset {} | taken with inherited "
                      "slots {} with clip planes {} | guest-lookup fallback {} | stretches cut by a 9th "
                      "material {} | no variant: pipeline undecided {} eligible (no variant for this "
-                     "vertex description yet) {} untextured {} other ineligible {}",
+                     "vertex description yet) {} untextured {} other ineligible {} | eligible by slot: refused (final) {} "
+                     "claimed without variant {} not claimed, free slot {} not claimed, slots full {}",
                      sb[12], sb[13], sb[14], sb[15], sb[0], sb[1], sb[2], sb[3], sb[4], sb[5], sb[6],
                      sb[7], sb[8], sb[9], sb[10], sb[11], sb[16], sb[17], sb[18], sb[19], sb[20],
-                     sb[23], x.mat_cuts.exchange(0), sb[24], sb[25], sb[26], sb[27]);
+                     sb[23], x.mat_cuts.exchange(0), sb[24], sb[25], sb[26], sb[27], sb[28], sb[29], sb[30], sb[31]);
             LOG_INFO(Render,
                      "Lean L3 direct checks (A2=2): inherited-slot words {} BAD {} | user-data "
                      "words {} BAD {} | clip planes {} BAD {} | formatted + fallback table bases {} BAD {} | "
@@ -8849,6 +8850,12 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
             }
             for (size_t m = 0; ok && m < st.materials.size(); ++m) {
                 const auto& mr = st.materials[m];
+                if (rasterizer->A2MaterialMemo(mr.base, mr.h1, mr.h2, mr.kn,
+                                               st.cmds->mat_slots[m].data(), mat_n[m].first,
+                                               mat_n[m].second, mat_ids)) {
+                    x.mat_resolves.fetch_add(1, std::memory_order_relaxed);
+                    continue; // l4d: no ReadStages, no per-image hashing
+                }
                 u64 mp = mr.rec_pos;
                 const auto* mh = ch.RecordAtPos(mp);
                 ok = mh->type == RT::Draw;
@@ -8861,7 +8868,8 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                 auto& [ni, ns] = mat_n[m];
                 x.mat_resolves.fetch_add(1, std::memory_order_relaxed);
                 ok = rasterizer->A2ResolveMaterial(mr.base, mst[u32(Shader::LogicalStage::Fragment)],
-                                                   st.cmds->mat_slots[m].data(), ni, ns, mat_ids);
+                                                   st.cmds->mat_slots[m].data(), ni, ns, mat_ids,
+                                                   mr.h1, mr.h2, mr.kn);
             }
             // A rotation mid-loop invalidates the earlier materials' slots.
             ok = ok && rasterizer->A2BindlessCur() == set0;

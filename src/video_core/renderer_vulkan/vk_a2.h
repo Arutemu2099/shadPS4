@@ -90,6 +90,8 @@ constexpr u32 MaxMaterials = 8;
 struct MaterialRef {
     const GraphicsPipeline* base{};
     u64 rec_pos{};
+    u64 h1{}, h2{}; ///< l4d: the worker's material key hash (NativeRec::ImageKeyHash)
+    u32 kn{};       ///< l4d: its length in words
 };
 
 /// Per-worker memory the GPU reads (tables, indirect commands, counts): a host-visible coherent
@@ -292,7 +294,7 @@ public:
     /// 0 or >= 1 GB, no cached buffer holding it, offset over 32 bits), 19 draws taken with an
     /// inherited slot, 20 draws taken with user clip planes, 21 a 17th texel range refused,
     /// 22 draws taken with a formatted slot, 23 guest slots resolved by the opener's own V#.
-    std::array<u64, 28> sub{}; ///< 24-27 (l4b): "no variant" by pipeline state
+    std::array<u64, 32> sub{}; ///< 24-27 (l4b): "no variant" by pipeline state; 28-31 (l4c) slots
     /// Draws taken and sub-batches opened so far (logged by the caller).
     u64 taken{}, sub_batches{};
     /// The reason of the last refusal (TakeDraw returned false).

@@ -1826,6 +1826,21 @@ void PipelineCache::PrepareNativeColourLocked(const GraphicsPipeline* base,
             job->pt_debug_binding = emit.pt_debug_binding;
         }
     }
+    // SHADPS4_NATIVE_SPARSE_LAYOUT (l4c): the bindless PS samples set 1; set 0's image / sampler
+    // bindings are dead (numbers kept: the bindings after them keep their indices).
+    static const bool sparse = [] {
+        const char* e = std::getenv("SHADPS4_NATIVE_SPARSE_LAYOUT");
+        return e && e[0] == '1';
+    }();
+    if (sparse && emit.bindless) {
+        auto& jb = job->bindings; // a static_vector: no std::erase_if
+        jb.erase(std::remove_if(jb.begin(), jb.end(),
+                                [](const vk::DescriptorSetLayoutBinding& b) {
+                                    return b.descriptorType == vk::DescriptorType::eSampledImage ||
+                                           b.descriptorType == vk::DescriptorType::eSampler;
+                                }),
+                 jb.end());
+    }
     job->records_binding = emit.records_binding;
     job->vertex_binding = emit.vertex_binding;
     job->bindless = emit.bindless;
