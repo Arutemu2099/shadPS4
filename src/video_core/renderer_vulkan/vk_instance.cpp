@@ -434,6 +434,11 @@ bool Instance::CreateDevice() {
         const char* value = std::getenv("SHADPS4_ASC_STREAM");
         return value && (value[0] == '1' || value[0] == '2');
     }() && readback_family_concurrent && family_properties[readback_queue_family].queueCount >= 2;
+    // SHADPS4_ASC_LANE=1 (sec. 21): the same queue for the back's compute lane (no ASC_STREAM routing).
+    has_asc_lane = !has_asc_queue && [] {
+        const char* value = std::getenv("SHADPS4_ASC_LANE");
+        return value && value[0] == '1';
+    }() && readback_family_concurrent && family_properties[readback_queue_family].queueCount >= 2;
     const std::array queue_infos = {
         vk::DeviceQueueCreateInfo{
             .queueFamilyIndex = queue_family_index,
@@ -442,7 +447,7 @@ bool Instance::CreateDevice() {
         },
         vk::DeviceQueueCreateInfo{
             .queueFamilyIndex = readback_queue_family,
-            .queueCount = has_asc_queue ? 2u : 1u,
+            .queueCount = has_asc_queue || has_asc_lane ? 2u : 1u,
             .pQueuePriorities = queue_priorities.data(),
         },
     };
@@ -724,7 +729,7 @@ bool Instance::CreateDevice() {
     if (has_readback_queue) {
         const u32 index = readback_queue_family == queue_family_index ? 1u : 0u;
         readback_queue = device->getQueue(readback_queue_family, index);
-        if (has_asc_queue) {
+        if (has_asc_queue || has_asc_lane) {
             asc_queue = device->getQueue(readback_queue_family, 1);
             LOG_INFO(Render_Vulkan, "AscStream: guest async compute on queue 1 of family {}",
                      readback_queue_family);

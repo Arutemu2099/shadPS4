@@ -120,6 +120,18 @@ struct LaneTable {
 };
 inline LaneTable g_lc_main{}, g_lc_early{};
 inline u64 g_lc_seq = 0;
+/// SHADPS4_ASC_LANE (p1): the n1 notes are the lane's producer index; the main batch of the newest
+/// gfx EOP label the back wrote (labels are written at record time: WAR rule); big main notes.
+inline bool g_lane_on = false;
+inline std::array<u64, 16>* g_lane_counters = nullptr; // Scheduler::lane_c (back thread)
+inline u64 g_gfx_label_tick = 0;
+struct LaneBig {
+    u64 lo, hi, tick;
+};
+inline std::array<LaneBig, 64> g_lc_big{};
+inline u64 g_lc_big_pos = 0;
+inline u64 g_lc_big_evicted = 0; // newest tick of an unfinished big note overwritten
+inline std::atomic<u64> g_lc_big_lost{0};
 inline u64 g_lc_done = 0;     // main ticks complete (known semaphore value)
 inline u32 t_lc_rec_flags = 0; // bit 0: open-batch hit, bit 1: in-flight hit (current early record)
 /// 0 early reads checked, 1/2 newest producer main write open / in flight, 3/4 main upload open / in
@@ -143,6 +155,16 @@ inline void LaneNoteRange(u64 lo, u64 hi, u64 tick, u32 kind) noexcept {
     if (w1 - w0 > 63) {
         w1 = w0 + 63;
         g_lc[12].fetch_add(1, std::memory_order_relaxed);
+        if (kind < 2) {
+            // p1: a big main note is kept whole in a small list (the windows hold its first 4 MB).
+            g_lc[19].fetch_add(1, std::memory_order_relaxed);
+            auto& slot = g_lc_big[g_lc_big_pos++ % g_lc_big.size()];
+            if (slot.tick > g_lc_done) {
+                g_lc_big_evicted = std::max(g_lc_big_evicted, slot.tick);
+                g_lc_big_lost.fetch_add(1, std::memory_order_relaxed);
+            }
+            slot = {lo, hi, tick};
+        }
     }
     g_lc[14].fetch_add(1, std::memory_order_relaxed);
     for (u64 w = w0; w <= w1; ++w) {
@@ -173,6 +195,22 @@ inline const LaneNote* LaneFind(const LaneTable& t, u64 lo, u64 hi) noexcept {
         }
     }
     return best;
+}
+/// p1: the newest unfinished main tick that wrote or uploaded [lo, hi) (0: none known).
+inline u64 LaneMainProducer(u64 lo, u64 hi) noexcept {
+    u64 t = 0;
+    if (const LaneNote* m = LaneFind(g_lc_main, lo, hi)) {
+        t = m->tick;
+    }
+    for (const LaneBig& b : g_lc_big) {
+        if (b.tick > g_lc_done && b.tick > t && b.lo < hi && lo < b.hi) {
+            t = b.tick;
+        }
+    }
+    if (g_lc_big_evicted > g_lc_done) {
+        t = std::max(t, g_lc_big_evicted); // a big note was lost: assume it covered this range
+    }
+    return t;
 }
 inline void EarlyInvPrune(u64 read_pos) noexcept {
     while (g_early_w_head != g_early_w_tail &&

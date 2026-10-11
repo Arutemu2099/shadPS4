@@ -25,6 +25,7 @@
 #include "core/memory.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/split_hazard.h"
+#include "video_core/buffer_cache/back_clean.h"
 #include "video_core/buffer_cache/dirty_epoch.h"
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/pb_census.h"
@@ -7302,7 +7303,9 @@ void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
             }
         }
     };
-    const bool asc_stream = scheduler.HasAscStream();
+    // SHADPS4_ASC_LANE: an early ASC dispatch takes the ASC stream's routing onto the lane.
+    const bool lane_disp = scheduler.HasLane() && VideoCore::t_force_binding_sync;
+    const bool asc_stream = scheduler.HasAscStream() || lane_disp;
     if (asc_stream) {
         // Pending operations, HLE shaders, stencil writebacks and buffer creation/joins (pass 1)
         // record on the main stream; BindBuffers moves an eligible dispatch to the ASC stream.
@@ -7317,6 +7320,9 @@ void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
     }
     bound_stages = stages;
     dispatch_target = asc_stream && dispatch_queue != 0 && AscCandidate(pipeline) ? 1u : 0u;
+    if (lane_disp && dispatch_target == 0) {
+        scheduler.LaneFallbackMain(); // not eligible: on main, after the lane's work so far
+    }
     if (VideoCore::BufferCache::CensusEnabled()) [[unlikely]] {
         u64 id = 0;
         for (const auto* stage : pipeline->GetStages()) {
@@ -7375,6 +7381,14 @@ void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
     const bool flushed = scheduler.CurrentTick() != tick_before_tail;
     if (asc_stream) {
         // dispatch_on_asc: BindBuffers really moved it (HLE / skipped dispatches never get there).
+        if (lane_disp) {
+            if (dispatch_on_asc) {
+                scheduler.LaneCount(5);
+            } else if (ts == 1) {
+                scheduler.LaneCount(12);
+                scheduler.LaneFallbackMain();
+            }
+        }
         const u32 s = dispatch_on_asc ? 1u : 0u;
         s_prev_run[s] = (cur_dispatch_run != 0 && !flushed) ? dispatch_run : 0;
         s_prev_effective[s] = cur_dispatch_run;
@@ -11618,6 +11632,30 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
             }
         }
     }
+    if (binding_compute && dispatch_target == 1 && scheduler.HasLane() &&
+        VideoCore::t_force_binding_sync) {
+        // SHADPS4_ASC_LANE: an early ASC dispatch records pass 2 and the dispatch on the lane;
+        // its waits on main are taken per binding range (ObtainBuffer, rule A). A read texel
+        // binding over a cached image needs an image->buffer copy (images are main only).
+        bool texel_block = false;
+        for (u32 i = 0; i < buffer_bindings.size(); ++i) {
+            const auto& desc = stage.buffers[i];
+            const auto& [buffer_id, vsharp, size] = buffer_bindings[i];
+            if (desc.is_formatted && !desc.is_written && buffer_id && size != 0 &&
+                texture_cache.FindImageFromRange(vsharp.base_address, size)) {
+                texel_block = true;
+                break;
+            }
+        }
+        if (texel_block) {
+            dispatch_target = 0;
+            cur_dispatch_run = 0;
+            scheduler.LaneFallbackMain();
+        } else {
+            scheduler.SwitchStream(1);
+            dispatch_on_asc = true;
+        }
+    }
     if (binding_compute && scheduler.HasAscStream()) {
         // SHADPS4_ASC_STREAM: the buffers are known now. A candidate goes to the ASC stream only if
         // no buffer it binds was touched by the main batch still being recorded (an ASC segment
@@ -11766,7 +11804,9 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
     const u64 bb_find_each = buffer_bindings.empty() ? 0 : bb_find_cyc / buffer_bindings.size();
 
     // SHADPS4_LEAN_BIND: plain read bindings take BufferCache::ObtainReadLean.
-    const bool lean_read = lean_bind && buffer_cache.LeanReadOk();
+    // SHADPS4_ASC_LANE: lane bindings take ObtainBuffer (its rule-A lookup).
+    const bool lean_read =
+        lean_bind && buffer_cache.LeanReadOk() && !Vulkan::Scheduler::t_lane_mode;
     // Second pass to re-bind buffers that were updated after binding
     for (u32 i = 0; i < buffer_bindings.size(); i++) {
         const auto& [buffer_id, vsharp, size] = buffer_bindings[i];

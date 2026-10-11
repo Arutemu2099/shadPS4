@@ -91,6 +91,10 @@ public:
     bool HasAscQueue() const {
         return has_asc_queue;
     }
+    /// SHADPS4_ASC_LANE: queue 1 of the compute-only family for the back's compute lane.
+    bool HasAscLaneQueue() const {
+        return has_asc_lane;
+    }
     vk::Queue GetAscQueue() const {
         return asc_queue;
     }
@@ -571,6 +575,7 @@ private:
     bool has_readback_queue{};
     bool readback_family_concurrent{};
     bool has_asc_queue{};
+    bool has_asc_lane{};
     vk::Queue asc_queue{};
     u32 readback_queue_family{};
     std::vector<vk::PhysicalDevice> physical_devices;

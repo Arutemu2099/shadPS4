@@ -174,6 +174,8 @@ namespace AmdGpu {
 
 /// SHADPS4_DRAW_COST=1: cycles the CP back spent in WaitForWork (read and reset by NoteDrawCost).
 thread_local u64 g_back_idle_cyc = 0;
+/// SHADPS4_ASC_LANE: the early packet being executed records on the lane (back thread).
+thread_local bool t_lane_packet = false;
 
 /// SHADPS4_MTB_P1_BREAK=1 (multi-threaded back P1d, notes/parrec-build-2026-10-08.md sec. 14):
 /// prices option (b) - every in-batch sequence point (packet record) ends an open render pass, as
@@ -2285,6 +2287,27 @@ void LeanLog() {
                              double(tk2(e.c_disp)) / 3.5e6 * ps, double(tk2(e.c_pkt)) / 3.5e6 * ps,
                              double(tk2(e.gap_ticks)) / 3.5e6 * ps, double(tk2(e.gap_max)) / 3.5e6,
                              double(tk2(e.unpublished)) * ps);
+                    if (VideoCore::g_lane_on && VideoCore::g_lane_counters) {
+                        auto& c = *VideoCore::g_lane_counters;
+                        std::array<double, 16> v{};
+                        for (u32 i = 0; i < 16; ++i) {
+                            v[i] = double(c[i]) * ps;
+                            c[i] = 0;
+                        }
+                        LOG_INFO(Render,
+                                 "ASC_LANE: submits {:.0f}/s (deferred behind the open batch {:.0f}, "
+                                 "main flushes for a deferred cut {:.0f}, waiting on an unsubmitted "
+                                 "main tick {:.0f}) | label cuts {:.0f}/s | dispatches on the lane "
+                                 "{:.0f}/s, early records kept on main {:.0f}/s (unrouted {:.0f}) | "
+                                 "packets lane {:.0f} main {:.0f} | rule A waits in flight {:.0f}/s, "
+                                 "on the open batch {:.0f}/s | main flushes waiting on the lane "
+                                 "{:.0f}/s | fault pre-cuts {:.0f}/s | big main notes {:.0f}/s, lost "
+                                 "unfinished {:.0f}/s",
+                                 v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[12], v[7], v[8], v[9],
+                                 v[10], v[11], v[13],
+                                 double(VideoCore::g_lc[19].exchange(0)) * ps,
+                                 double(VideoCore::g_lc_big_lost.exchange(0)) * ps);
+                    }
                     if (VideoCore::g_lane_census) {
                         auto& lc = VideoCore::g_lc;
                         std::array<double, 20> v{};
@@ -2940,10 +2963,15 @@ void Liverpool::ProcessCommands() {
             command_queue.pop();
             --num_commands;
         }
+        u32 prev_stream = 0;
         if (rasterizer) {
+            prev_stream = rasterizer->GetScheduler().ActiveStream();
             rasterizer->GetScheduler().SwitchStream(0);
         }
         callback();
+        if (rasterizer && prev_stream != 0 && rasterizer->GetScheduler().HasLane()) {
+            rasterizer->GetScheduler().SwitchStream(prev_stream); // SHADPS4_ASC_LANE
+        }
     }
 }
 
@@ -3046,8 +3074,35 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                     VideoCore::g_lc_done = ms->KnownGpuTick();
                     VideoCore::t_lc_rec_flags = 0;
                 }
+                // SHADPS4_ASC_LANE: DMA / WRITE_DATA / ACQUIRE_MEM / NOP / ASC labels run on the
+                // lane; any other early packet runs on main after the lane's work so far.
+                bool lane_label = false;
+                if (VideoCore::g_lane_on && it.type == RT::Packet) [[unlikely]] {
+                    const auto* h = reinterpret_cast<const PM4Header*>(r + 1);
+                    lane_label = (r->flags & CpSplit::AscReleaseMem) != 0;
+                    const auto op = h->type3.opcode.Value();
+                    t_lane_packet = h->type == 3 &&
+                                    (lane_label || op == PM4ItOpcode::DmaData ||
+                                     op == PM4ItOpcode::WriteData ||
+                                     op == PM4ItOpcode::AcquireMem || op == PM4ItOpcode::Nop);
+                    auto& sch = rasterizer->GetScheduler();
+                    if (t_lane_packet) {
+                        sch.LaneCount(7);
+                    } else {
+                        sch.LaneCount(8);
+                        sch.LaneFallbackMain();
+                    }
+                }
                 const u64 tx0 = __rdtsc();
                 ExecuteRecordImpl(*r);
+                if (t_lane_packet) [[unlikely]] {
+                    t_lane_packet = false;
+                    auto& sch = rasterizer->GetScheduler();
+                    sch.SwitchStream(0);
+                    if (lane_label) {
+                        sch.LaneLabelCut();
+                    }
+                }
                 if (VideoCore::g_lane_census) [[unlikely]] {
                     auto& lc = VideoCore::g_lc;
                     lc[18].fetch_add(1, std::memory_order_relaxed);
@@ -5488,8 +5543,26 @@ void Liverpool::ExecuteRecordImpl(const CpSplit::RecordHeader& record) {
         break;
     case CpSplit::RecordType::Packet:
         // SHADPS4_ASC_STREAM: packets (DMA, WRITE_DATA, fences, flips) record on the main stream.
+        // SHADPS4_ASC_LANE: an early lane packet records on the lane (t_lane_packet).
         if (rasterizer) {
-            rasterizer->GetScheduler().SwitchStream(0);
+            auto& sch = rasterizer->GetScheduler();
+            sch.SwitchStream(t_lane_packet ? 1 : 0);
+            if (t_lane_packet) {
+                const auto op = reinterpret_cast<const PM4Header*>(payload)->type3.opcode.Value();
+                if (op == PM4ItOpcode::DmaData || op == PM4ItOpcode::WriteData) {
+                    sch.LaneNeedMain(VideoCore::g_gfx_label_tick); // WAR (see ObtainBuffer)
+                }
+            } else if (VideoCore::g_lane_on && !VideoCore::t_force_binding_sync &&
+                       !(record.flags & CpSplit::AscReleaseMem)) {
+                // A gfx EOP label: the game may act on it before the GPU ran this batch.
+                const auto* h = reinterpret_cast<const PM4Header*>(payload);
+                const auto op = h->type3.opcode.Value();
+                if (h->type == 3 && (op == PM4ItOpcode::ReleaseMem ||
+                                     op == PM4ItOpcode::EventWriteEop ||
+                                     op == PM4ItOpcode::EventWriteEos)) {
+                    VideoCore::g_gfx_label_tick = sch.CurrentTick();
+                }
+            }
         }
         if (g_mtb_break && rasterizer) [[unlikely]] {
             MtbBreakAtPacket(reinterpret_cast<const PM4Header*>(payload));

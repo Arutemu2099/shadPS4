@@ -649,6 +649,8 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       bda_pagetable_buffer{instance, scheduler, MemoryUsage::DeviceLocal,
                            0,        AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress,
                            BDA_PAGETABLE_SIZE} {
+    g_lane_on = scheduler.HasLane();
+    g_lane_counters = &scheduler.lane_c;
     if (const char* mirror = std::getenv("SHADPS4_HOST_MIRROR"); mirror && mirror[0] == '1') {
         host_mirror = instance.IsExternalMemoryHostEnabled();
         host_mirror_max = static_cast<u32>(256_MB);
@@ -1516,6 +1518,9 @@ static void NoteReadBurst(VAddr addr, u64 bytes) {
 
 BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u64 size,
                                                            bool is_write) {
+    // SHADPS4_ASC_LANE: a lane segment deferred behind the open main batch is submitted (main
+    // flushed first) before the copy list and the tick are taken.
+    scheduler.LaneFlushIfDeferred();
     if (!is_write) {
         NoteDiagRead(device_addr);
     }
@@ -1726,7 +1731,7 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
     // SHADPS4_ASC_STREAM: the newest ASC-stream writer of the window and whether it completed.
     u64 asc_producer = 0;
     bool asc_done = true;
-    if (scheduler.HasAscStream()) {
+    if (scheduler.HasAscStream() || scheduler.HasLane()) {
         auto* asc_sem = scheduler.GetAscSemaphore();
         asc_producer = NewestAscWriter(job->copies);
         if (asc_hist_evicted != 0 && !asc_sem->IsFree(asc_hist_evicted)) {
@@ -1780,6 +1785,11 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
             }
             return asc_ticket;
         }
+    }
+    if (!asc_done && scheduler.HasLane()) {
+        // The lane producer is unfinished and the copy stays on main: the main batch that holds
+        // it waits on the producer's segment (submitted first at that flush; never deferred here).
+        VideoCore::g_main_wait_asc = std::max(VideoCore::g_main_wait_asc, asc_producer + 1);
     }
     if (fast_lane && asc_done) {
         // The newest batch that GPU-wrote any copied byte; batches before it completed first
@@ -2256,9 +2266,11 @@ void BufferCache::NoteBatchWrite(VAddr addr, u64 size) {
     if (size == 0) {
         return;
     }
-    if (g_lane_census) [[unlikely]] {
+    if (g_lane_census || g_lane_on) [[unlikely]] {
         if (Common::FaultMonitor::t_is_cp_thread) {
-            LaneNoteRange(addr, addr + size, scheduler.CurrentTick(), t_force_binding_sync ? 2 : 0);
+            const bool lane_side =
+                g_lane_on ? Vulkan::Scheduler::t_lane_mode : t_force_binding_sync;
+            LaneNoteRange(addr, addr + size, scheduler.CurrentTick(), lane_side ? 2 : 0);
         } else {
             g_lc[13].fetch_add(1, std::memory_order_relaxed);
         }
@@ -4308,6 +4320,13 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     // share no code: the early exit below (a tracker query plus a guest-memory memcpy) and the
     // SynchronizeBuffer fall-through. Time them separately - the split decides which is worth
     // cutting, and it has never actually been measured.
+    if (g_lane_on && Vulkan::Scheduler::t_lane_mode) [[unlikely]] {
+        g_lc_done = scheduler.GetMasterSemaphore()->KnownGpuTick();
+        scheduler.LaneNeedMain(LaneMainProducer(device_addr, device_addr + size));
+        if (is_written) {
+            scheduler.LaneNeedMain(g_gfx_label_tick); // WAR vs gfx reads behind the newest label
+        }
+    }
     if (g_lane_census && Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
         const u64 lo = device_addr, hi = device_addr + size;
         if (t_force_binding_sync) {
@@ -5541,12 +5560,13 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     if (g_upload_ahead_stats && src_buffer) [[unlikely]] {
         NoteUploadAhead(buffer, device_addr, size, total_size_bytes);
     }
-    if (g_lane_census && total_size_bytes != 0) [[unlikely]] {
+    if ((g_lane_census || g_lane_on) && total_size_bytes != 0) [[unlikely]] {
         if (Common::FaultMonitor::t_is_cp_thread) {
+            const bool lane_side =
+                g_lane_on ? Vulkan::Scheduler::t_lane_mode : t_force_binding_sync;
             for (const auto& copy : copies) {
                 const VAddr lo = buffer_start + copy.dstOffset;
-                LaneNoteRange(lo, lo + copy.size, scheduler.CurrentTick(),
-                              t_force_binding_sync ? 3 : 1);
+                LaneNoteRange(lo, lo + copy.size, scheduler.CurrentTick(), lane_side ? 3 : 1);
             }
         } else {
             g_lc[13].fetch_add(1, std::memory_order_relaxed);

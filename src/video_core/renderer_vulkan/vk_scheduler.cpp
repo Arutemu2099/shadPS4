@@ -148,6 +148,16 @@ Scheduler::Scheduler(const Instance& instance, bool allow_recording_worker)
         }
         LOG_INFO(Render_Vulkan, "AscStream: enabled");
     }
+    if (async_submit && !asc_enabled && instance.HasAscLaneQueue()) {
+        lane_enabled = true;
+        asc_semaphore = std::make_unique<MasterSemaphore>(instance);
+        asc_pool = std::make_unique<CommandPool>(instance, asc_semaphore.get(),
+                                                 instance.GetReadbackQueueFamilyIndex());
+        LOG_INFO(Render_Vulkan,
+                 "AscLane: on (early ASC records inline on the back, queue 1 of family {}, no I1, "
+                 "{} recording lanes)",
+                 instance.GetReadbackQueueFamilyIndex(), par_rec);
+    }
     AllocateWorkerCommandBuffers();
     priority_pending_ops_thread =
         std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
@@ -660,7 +670,7 @@ void Scheduler::PushDescriptors(vk::PipelineBindPoint bind_point, vk::PipelineLa
     Rc().native_heaps_bound = false;
     Rc().dynamic_state.packet_state_unknown = true; // a push outside the draw packets
     if (!IsAsyncRecording()) {
-        current_cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, writes);
+        InlineCmdbuf().pushDescriptorSetKHR(bind_point, layout, 0, writes);
         return;
     }
     size_t bytes = AlignedPayloadSize(writes.size_bytes());
@@ -783,6 +793,9 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
 }
 
 void Scheduler::EndRendering(std::source_location loc) {
+    if (t_lane_mode) [[unlikely]] {
+        return; // the main batch's render pass stays open; the lane never renders
+    }
     if (!Rc().is_rendering) {
         return;
     }
@@ -886,7 +899,7 @@ u64 Scheduler::AscMainWaitValue(bool no_i1) {
     if (no_i1) {
         return 0;
     }
-    return mode == '0' ? precise : last;
+    return (mode == '0' || lane_enabled) ? precise : last; // the lane: never I1
 }
 
 void Scheduler::WaitMain(u64 tick) {
@@ -1002,6 +1015,8 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
             info.AddWait(asc_semaphore->Handle(), need);
             asc_waited_by_main = need;
         }
+    } else if (lane_enabled) {
+        LaneCutForFlush(info);
     }
     const u64 signal_value = AdvanceTick();
     NoteAscAtFlush(signal_value);
@@ -1174,6 +1189,18 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
 }
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
+    // SHADPS4_ASC_LANE: a main flush from inside lane mode (a nested service, ring space, a
+    // deferred cut) records and submits main work: leave lane mode around it.
+    if (!t_lane_mode) [[likely]] {
+        SubmitExecutionImpl(info);
+        return;
+    }
+    LaneSwitch(0);
+    SubmitExecutionImpl(info);
+    LaneSwitch(1);
+}
+
+void Scheduler::SubmitExecutionImpl(SubmitInfo& info) {
     if (async_submit && synchronous_scopes == 0) {
         SubmitExecutionAsync(info);
         return;
@@ -1209,6 +1236,8 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
             info.AddWait(asc_semaphore->Handle(), need);
             asc_waited_by_main = need;
         }
+    } else if (lane_enabled) {
+        LaneCutForFlush(info);
     }
     if (recording_worker && ++recording_submits % 1000 == 0) {
         const auto counts = recording_worker->GetCounters();
@@ -1389,6 +1418,9 @@ void Scheduler::SubmitExecutionLaneSync(SubmitInfo& info) {
     Common::FaultMonitor::CountGpuSubmit();
     EndRendering();
     DrainRecording();
+    if (lane_enabled) {
+        LaneCutForFlush(info);
+    }
     const u64 signal_value = AdvanceTick();
     NoteAscAtFlush(signal_value);
     last_batch_draws = Rc().batch_draws;
@@ -1523,7 +1555,107 @@ void Scheduler::AscTimerCollect() {
     }
 }
 
+void Scheduler::LaneSwitch(u32 stream) {
+    if (stream == active_stream) {
+        return;
+    }
+    if (stream == 1) {
+        if (!asc_dirty) {
+            open_asc_value = asc_semaphore->NextTick();
+            asc_dirty = true;
+            asc_wait_main = 0;
+        }
+        if (!asc_cmdbuf) {
+            BeginAscCmdbufOnWorker(); // the back's: lane mode records inline
+        }
+    }
+    active_stream = stream;
+    t_lane_mode = stream == 1;
+    Rc().native_heaps_bound = false;
+    VideoCore::g_record_stream = stream;
+}
+
+void Scheduler::LaneSubmit() {
+    const u64 value = open_asc_value;
+    const u64 wait_main = asc_wait_main;
+    asc_dirty = false;
+    if (async_submit &&
+        wait_main > async_submitted_tick.load(std::memory_order_acquire)) [[unlikely]] {
+        ++lane_c[3]; // wait-before-signal on the main timeline (never a cycle: see LaneCutForFlush)
+    }
+    AscSubmitOnWorker(value, wait_main); // inline: the back owns asc_cmdbuf in lane mode
+    asc_last_submitted.store(value, std::memory_order_release);
+    ++lane_c[0];
+    if (t_lane_mode) {
+        // Still recording lane work: continue in a new segment with the same main wait (the rest
+        // of the record depends on the same main batches).
+        open_asc_value = asc_semaphore->NextTick();
+        asc_dirty = true;
+        asc_wait_main = wait_main;
+        BeginAscCmdbufOnWorker();
+    }
+}
+
+void Scheduler::LaneCutForFlush(SubmitInfo& info) {
+    // The batch being flushed is CurrentTick(). A segment that does not wait on it is submitted
+    // first (its value <= AscAt(this tick): R0), then this batch's lane wait is chosen, then a
+    // segment deferred behind this batch is submitted - after the wait is chosen, so this batch
+    // never waits on a segment that waits on it.
+    const u64 tick = master_semaphore.CurrentTick();
+    const bool deferred = asc_dirty && asc_wait_main >= tick;
+    if (asc_dirty && !deferred) {
+        LaneSubmit();
+    }
+    // Rule B: the game consumes ASC output after an ASC label; main waits on the newest segment
+    // that ended at one (plus explicit raises in g_main_wait_asc).
+    VideoCore::g_main_wait_asc = std::max(VideoCore::g_main_wait_asc, lane_label_value);
+    const u64 need = AscMainWaitValue(false);
+    if (need > asc_waited_by_main) {
+        ASSERT(info.num_wait_semas != 1);
+        info.AddWait(asc_semaphore->Handle(), need);
+        asc_waited_by_main = need;
+        ++lane_c[11];
+    }
+    if (deferred) {
+        ++lane_c[1];
+        LaneSubmit();
+    }
+}
+
+u64 Scheduler::LaneCutNow() {
+    if (!lane_enabled || !asc_dirty) {
+        return 0;
+    }
+    const u64 value = open_asc_value;
+    if (asc_wait_main >= master_semaphore.CurrentTick()) {
+        ++lane_c[2];
+        Flush(); // submits the open main batch, then this segment (LaneCutForFlush)
+        return value;
+    }
+    LaneSubmit();
+    return value;
+}
+
+void Scheduler::LaneLabelCut() {
+    ++lane_c[4];
+    lane_label_value = asc_dirty ? open_asc_value : asc_last_submitted.load();
+    LaneCutNow();
+}
+
+void Scheduler::LaneFallbackMain() {
+    ++lane_c[6];
+    if (!lane_enabled) {
+        return;
+    }
+    const u64 newest = asc_dirty ? LaneCutNow() : asc_last_submitted.load();
+    VideoCore::g_main_wait_asc = std::max(VideoCore::g_main_wait_asc, newest);
+}
+
 void Scheduler::SwitchStream(u32 stream) {
+    if (lane_enabled) {
+        LaneSwitch(stream);
+        return;
+    }
     if (!asc_enabled || stream == active_stream) {
         return;
     }
@@ -1554,6 +1686,9 @@ void Scheduler::SwitchStream(u32 stream) {
 }
 
 u64 Scheduler::SubmitAscSegment() {
+    if (lane_enabled) {
+        return LaneCutNow();
+    }
     if (!asc_enabled || !asc_dirty) {
         return 0;
     }

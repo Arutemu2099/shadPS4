@@ -584,8 +584,8 @@ private:
     u64 asc_hist_evicted{};
     Vulkan::MasterSemaphore& JobSemaphore(bool on_fast_lane, bool on_asc);
     /// SHADPS4_ASC_STREAM: GPU write ranges recorded in the last WriteHistory ASC segments.
-    std::array<std::vector<std::pair<VAddr, VAddr>>, 64> asc_write_hist;
-    std::array<u64, 64> asc_write_hist_value{};
+    std::array<std::vector<std::pair<VAddr, VAddr>>, 512> asc_write_hist;
+    std::array<u64, 512> asc_write_hist_value{};
     /// Newest ASC segment value that wrote any copied byte (0 = none in the history).
     u64 NewestAscWriter(std::span<const FaultCopy> copies) const;
     u64 producer_floor = 0; ///< Tick of the newest write too large to record per slot.

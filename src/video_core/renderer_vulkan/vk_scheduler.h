@@ -501,7 +501,7 @@ public:
     public:
         explicit CommandBufferAccess(Scheduler& scheduler, std::source_location location)
             : scheduler{scheduler} {
-            if (scheduler.synchronous_scopes == 0) {
+            if (scheduler.synchronous_scopes == 0 && !t_lane_mode) {
                 scheduler.DrainRecording();
                 if (scheduler.par_rec != 0) {
                     // Every lane is idle: borrow the open batch's command buffer.
@@ -510,7 +510,7 @@ public:
             }
             // The worker is idle: a coalesced transfer group left open by it is closed before the
             // borrower records directly (SHADPS4_TRANSFER_COALESCE).
-            scheduler.CloseTransferGroup(scheduler.current_cmdbuf);
+            scheduler.CloseTransferGroup(scheduler.InlineCmdbuf());
             // A borrower may bind legacy descriptor state behind the scheduler's back.
             RecordContext& rc = scheduler.Rc();
             rc.native_heaps_bound = false;
@@ -531,7 +531,7 @@ public:
         CommandBufferAccess(const CommandBufferAccess&) = delete;
         CommandBufferAccess& operator=(const CommandBufferAccess&) = delete;
         vk::CommandBuffer Handle() const {
-            return scheduler.current_cmdbuf;
+            return scheduler.InlineCmdbuf();
         }
 
     private:
@@ -611,7 +611,11 @@ public:
     }
 
     bool IsAsyncRecording() const {
-        return recording_worker && synchronous_scopes == 0;
+        return recording_worker && synchronous_scopes == 0 && !t_lane_mode;
+    }
+    /// The command buffer an inline record writes into: the lane's in lane mode.
+    vk::CommandBuffer InlineCmdbuf() const noexcept {
+        return t_lane_mode ? asc_cmdbuf : current_cmdbuf;
     }
     /// Command-processor thread: moves whenever anything is recorded (worker commands) or the
     /// command buffer is borrowed directly. Equal values = nothing recorded in between.
@@ -642,9 +646,10 @@ public:
     void Record(F&& command) {
         ++Rc().stream_seq[active_stream];
         if (!IsAsyncRecording()) {
-            CloseTransferGroup(current_cmdbuf);
-            command(current_cmdbuf);
-            CloseTransferGroup(current_cmdbuf); // no group survives a synchronous record
+            const vk::CommandBuffer cmdbuf = InlineCmdbuf();
+            CloseTransferGroup(cmdbuf);
+            command(cmdbuf);
+            CloseTransferGroup(cmdbuf); // no group survives a synchronous record
             return;
         }
         // The handle is read when the worker runs the command: with SHADPS4_ASYNC_SUBMIT the
@@ -701,9 +706,10 @@ public:
         static_assert((std::is_trivially_copyable_v<T> && ...));
         ++Rc().stream_seq[active_stream];
         if (!IsAsyncRecording()) {
-            CloseTransferGroup(current_cmdbuf);
-            command(current_cmdbuf, arrays...);
-            CloseTransferGroup(current_cmdbuf);
+            const vk::CommandBuffer cmdbuf = InlineCmdbuf();
+            CloseTransferGroup(cmdbuf);
+            command(cmdbuf, arrays...);
+            CloseTransferGroup(cmdbuf);
             return;
         }
         const size_t bytes = (size_t{} + ... + AlignedPayloadSize(arrays.size_bytes()));
@@ -778,7 +784,7 @@ public:
     /// The last ASC value submitted before main tick `tick` was flushed (0: none / ASC off).
     /// Evicted entries answer the newest submitted value (conservative).
     [[nodiscard]] u64 AscAt(u64 tick) const noexcept {
-        if (!asc_enabled || tick == 0) {
+        if ((!asc_enabled && !lane_enabled) || tick == 0) {
             return 0;
         }
         const u64 i = tick % AscAtSlots;
@@ -853,6 +859,47 @@ public:
     bool HasAscStream() const noexcept {
         return asc_enabled;
     }
+    /// SHADPS4_ASC_LANE=1 (sec. 21, p1_asc_lane.py): the back records its early ASC records into a
+    /// lane command buffer on queue 1 of the compute-only family (own timeline: the ASC semaphore).
+    bool HasLane() const noexcept {
+        return lane_enabled;
+    }
+    /// Back thread: recording into the lane (SwitchStream(1) with the lane on).
+    static inline thread_local bool t_lane_mode = false;
+    /// Rule A: the open lane segment must run after main tick `tick` (deferred if it is the open
+    /// batch: submitted right after that batch's flush).
+    void LaneNeedMain(u64 tick) noexcept {
+        if (tick == 0 || !asc_dirty) {
+            return;
+        }
+        if (tick > asc_wait_main) {
+            asc_wait_main = tick;
+            ++lane_c[tick >= master_semaphore.CurrentTick() ? 10 : 9];
+        }
+    }
+    /// Submits the open lane segment now (a deferred one: flushes main first). Returns its value.
+    u64 LaneCutNow();
+    /// An ASC label was written: the open segment ends there; main batches flushed later wait it.
+    void LaneLabelCut();
+    /// An early record runs on main instead of the lane: main must see the lane's work so far.
+    void LaneFallbackMain();
+    /// A deferred open segment is submitted (flushing main) before a fault download is prepared.
+    void LaneFlushIfDeferred() {
+        if (lane_enabled && asc_dirty && asc_wait_main >= master_semaphore.CurrentTick()) {
+            ++lane_c[13];
+            LaneCutNow();
+        }
+    }
+    void LaneCount(u32 i) noexcept {
+        ++lane_c[i];
+    }
+    /// Counters (back thread): 0 submits, 1 deferred submits, 2 main flushes for a deferred cut,
+    /// 3 submits waiting on an unsubmitted main tick, 4 label cuts, 5 lane dispatches, 6 early
+    /// records kept on main, 7 lane packets, 8 main packets, 9 rule-A waits (in flight), 10 rule-A
+    /// waits on the open batch, 11 main flushes waiting on the lane, 12 lane-routed dispatches
+    /// that never reached BindBuffers, 13 fault-download pre-cuts (14 / 15 unused: the big-note
+    /// counters live in VideoCore::g_lc[19] / g_lc_big_lost).
+    std::array<u64, 16> lane_c{};
     u32 ActiveStream() const noexcept {
         return active_stream;
     }
@@ -948,6 +995,15 @@ private:
     void ExecuteDrawPacket(const DrawPacketHeader& header);
 
     void SubmitExecution(SubmitInfo& info);
+    void SubmitExecutionImpl(SubmitInfo& info);
+    /// SHADPS4_ASC_LANE: enters / leaves lane mode (back thread).
+    void LaneSwitch(u32 stream);
+    /// SHADPS4_ASC_LANE: submits the open lane segment inline on the back.
+    void LaneSubmit();
+    /// SHADPS4_ASC_LANE: the lane cut and the main wait of a main flush (before AdvanceTick).
+    void LaneCutForFlush(SubmitInfo& info);
+    /// The newest lane segment that ended at an ASC label (rule B).
+    u64 lane_label_value = 0;
 
     void PriorityPendingOpsThread(std::stop_token stoken);
 
@@ -965,6 +1021,7 @@ private:
     // SHADPS4_ASC_STREAM state. Worker side (or the CP while drained): main_cmdbuf, asc_cmdbuf,
     // worker_stream. CP side: the rest.
     bool asc_enabled = false;
+    bool lane_enabled = false;
     std::unique_ptr<MasterSemaphore> asc_semaphore;
     std::unique_ptr<CommandPool> asc_pool;
     static constexpr u64 AscAtSlots = 4096;
@@ -976,7 +1033,7 @@ private:
     std::atomic<u64> asc_retired_refreshes{0};
     std::atomic<u64> asc_retired_blocked{0};
     void NoteAscAtFlush(u64 main_tick) noexcept {
-        if (!asc_enabled) {
+        if (!asc_enabled && !lane_enabled) {
             return;
         }
         const u64 i = main_tick % AscAtSlots;
@@ -1077,6 +1134,9 @@ private:
     }
     /// The transfer group of the command buffer being recorded (SHADPS4_TRANSFER_COALESCE).
     TransferGroup& RecorderTransferGroup() noexcept {
+        if (t_lane_mode) [[unlikely]] {
+            return transfer_group[1]; // the lane's (back thread only)
+        }
         if (par_rec != 0) [[unlikely]] {
             RecLane* const lane = t_rec_lane;
             return lane ? lane->transfer_group : OpenLane().transfer_group;
