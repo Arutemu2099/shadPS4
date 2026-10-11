@@ -4191,6 +4191,27 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     // share no code: the early exit below (a tracker query plus a guest-memory memcpy) and the
     // SynchronizeBuffer fall-through. Time them separately - the split decides which is worth
     // cutting, and it has never actually been measured.
+    if (g_early_inv && Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
+        if (t_force_binding_sync) {
+            if (is_written) {
+                if (g_early_w_tail - g_early_w_head >= g_early_writes.size()) {
+                    ++g_early_w_head; // oldest dropped (coverage loss, not counted as inverted)
+                }
+                g_early_writes[g_early_w_tail++ % g_early_writes.size()] = {
+                    device_addr, device_addr + size, t_early_pos};
+                g_early_inv_writes.fetch_add(1, std::memory_order_relaxed);
+            }
+        } else if (!is_written) {
+            g_early_inv_checks.fetch_add(1, std::memory_order_relaxed);
+            for (u64 i = g_early_w_head; i != g_early_w_tail; ++i) {
+                const auto& w = g_early_writes[i % g_early_writes.size()];
+                if (w.pos > t_inorder_pos && w.lo < device_addr + size && device_addr < w.hi) {
+                    g_early_inv_reads.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                }
+            }
+        }
+    }
     // SHADPS4_NATIVE_COHERENT: memory was made coherent at the submission's start (CoherenceSync;
     // a buffer created since was synced whole in CreateBuffer). A read is the lookup only.
     if (CoherentSkip(is_written, is_texel_buffer)) {

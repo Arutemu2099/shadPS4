@@ -2254,12 +2254,17 @@ void LeanLog() {
                              "ASC_EARLY: ran ahead dispatches {:.0f}/s packets {:.0f}/s | in ring "
                              "order (registers / epoch / diag) {:.0f}/s | early service blocked {:.0f}/s "
                              "| skipped in ring order {:.0f}/s | early per-binding sync: checks "
-                             "{:.0f}/s, records that uploaded {:.0f}/s, {:.2f} MB/s",
+                             "{:.0f}/s, records that uploaded {:.0f}/s, {:.2f} MB/s | inverted reads "
+                             "(gfx read, earlier in ring order, of a range an early ASC record wrote) "
+                             "{:.0f}/s of {:.0f}/s checked, early writes {:.0f}/s",
                              double(tk2(e.dispatches)) * ps, double(tk2(e.packets)) * ps,
                              double(tk2(e.in_order)) * ps, double(tk2(e.blocked)) * ps,
                              double(tk2(e.skipped)) * ps, double(tk2(e.forced_checks)) * ps,
                              double(tk2(e.uploading_records)) * ps,
-                             double(tk2(e.upload_bytes)) * ps / 1e6);
+                             double(tk2(e.upload_bytes)) * ps / 1e6,
+                             double(VideoCore::g_early_inv_reads.exchange(0)) * ps,
+                             double(VideoCore::g_early_inv_checks.exchange(0)) * ps,
+                             double(VideoCore::g_early_inv_writes.exchange(0)) * ps);
                 }
                 if (g_xq) {
                     std::string ws, as;
@@ -2971,6 +2976,7 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                     rasterizer ? rasterizer->GetBufferCache().SyncUploadBytesTotal() : 0;
                 const u64 chk0 = VideoCore::t_forced_binding_checks;
                 VideoCore::t_force_binding_sync = true;
+                VideoCore::t_early_pos = it.pos;
                 ExecuteRecordImpl(*r);
                 VideoCore::t_force_binding_sync = false;
                 const u64 up =
@@ -3026,6 +3032,10 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                 continue;
             }
             Common::SampleThreadPlacement("back", 8);
+            if (VideoCore::g_early_inv) [[unlikely]] {
+                VideoCore::t_inorder_pos = split->ReadPos();
+                VideoCore::EarlyInvPrune(split->ReadPos());
+            }
             ExecuteRecord(*record);
             if (g_a2s.skip_pos != 0) [[unlikely]] {
                 // SHADPS4_A2: a worker stretch - every record through its last draw at once.

@@ -91,6 +91,26 @@ inline const int g_read_sync_fast = [] {
 /// its read bindings take the per-binding validity sync instead of the coherence skip.
 inline thread_local bool t_force_binding_sync = false;
 inline thread_local u64 t_forced_binding_checks = 0;
+/// SHADPS4_ASC_EARLY_INV=1 (l4a4 census, back thread only): ring position of the record the back runs
+/// (in order: t_inorder_pos; early: t_early_pos) and the ranges early records wrote.
+inline const bool g_early_inv = [] {
+    const char* env = std::getenv("SHADPS4_ASC_EARLY_INV");
+    return env && env[0] == '1';
+}();
+inline thread_local u64 t_inorder_pos = 0;
+inline thread_local u64 t_early_pos = 0;
+struct EarlyWrite {
+    u64 lo, hi, pos;
+};
+inline std::array<EarlyWrite, 512> g_early_writes{};
+inline u64 g_early_w_head = 0, g_early_w_tail = 0; // back only
+inline std::atomic<u64> g_early_inv_reads{0}, g_early_inv_checks{0}, g_early_inv_writes{0};
+inline void EarlyInvPrune(u64 read_pos) noexcept {
+    while (g_early_w_head != g_early_w_tail &&
+           g_early_writes[g_early_w_head % g_early_writes.size()].pos < read_pos) {
+        ++g_early_w_head;
+    }
+}
 
 inline const int g_native_coherent = [] {
     const char* env = std::getenv("SHADPS4_NATIVE_COHERENT");
