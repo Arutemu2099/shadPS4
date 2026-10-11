@@ -8211,9 +8211,27 @@ void Rasterizer::DrawIndirectTail(const GraphicsPipeline* pipeline, bool is_inde
         std::tie(count_buffer, count_base) = buffer_cache.ObtainBuffer(count_address, 4, false);
     }
 
+    bool q1_barrier = false;
     if (auto barrier = buffer->GetBarrier(vk::AccessFlagBits2::eIndirectCommandRead,
                                           vk::PipelineStageFlagBits2::eDrawIndirect)) {
         buffer_barriers.emplace_back(*barrier);
+        q1_barrier = true;
+    }
+    {
+        // q1 census: indirect draws on the old path, of which the args buffer needed a barrier
+        // (GPU-written since its last barrier), indexed, with a count buffer, max_count > 1.
+        static std::array<u64, 5> q1{};
+        ++q1[0];
+        q1[1] += q1_barrier;
+        q1[2] += is_indexed;
+        q1[3] += count_address != 0;
+        q1[4] += max_count > 1;
+        if ((q1[0] & 0xffff) == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "q1 indirect (old path, cumulative): draws {} args barrier {} indexed {} "
+                     "count buffer {} max_count>1 {}",
+                     q1[0], q1[1], q1[2], q1[3], q1[4]);
+        }
     }
     if (count_buffer) {
         if (auto barrier = count_buffer->GetBarrier(vk::AccessFlagBits2::eIndirectCommandRead,

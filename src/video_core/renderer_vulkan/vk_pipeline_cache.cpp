@@ -445,6 +445,8 @@ struct PipelineCache::NativeColourJob {
     u32 table_binding{GraphicsPipeline::NoNativeRecords};
     u32 pt_debug_binding{GraphicsPipeline::NoNativeRecords}; // SHADPS4_NATIVE_PT=2
     bool bindless{};
+    const char* bindless_why{}; // q1b census
+    std::string counts;         // q1b census: descriptor counts per stage
 };
 
 struct PipelineCache::NativeColourCompiler {
@@ -499,8 +501,12 @@ private:
             if (!variant->UsesPushDescriptors()) {
                 // Too many descriptors for push descriptors (NVIDIA: 32): the slot stays claimed
                 // with no variant, so the back keeps the generic path for this description.
-                LOG_INFO(Render_Vulkan, "NativeColour: variant of {:#x} has no push descriptors",
-                         std::hash<GraphicsPipelineKey>{}(job->key));
+                LOG_INFO(Render_Vulkan,
+                         "NativeColour: variant of {:#x} has no push descriptors (q1b: bindless {} "
+                         "why-not '{}' bindings {} | {})",
+                         std::hash<GraphicsPipelineKey>{}(job->key), job->bindless,
+                         job->bindless_why ? job->bindless_why : "-", job->bindings.size(),
+                         job->counts);
                 job->base->native_colour_why.store("no push descriptors", std::memory_order_relaxed);
                 slot.state.store(2, std::memory_order_release);
                 PipelineCache::g_nc_claims[6].fetch_add(1, std::memory_order_relaxed);
@@ -1703,16 +1709,29 @@ void PipelineCache::PrepareNativeColourLocked(const GraphicsPipeline* base,
     emit.seg_compare = Shader::g_native_seg_compare && emit.pt;
     // SHADPS4_NATIVE_BINDLESS (sec. 12): the PS samples the global arrays; the VS has no image
     // or sampler, the PS at most 16 of each, all sampled (no storage, no mip fallback).
+    const char* bindless_why = nullptr; // q1b census
     emit.bindless = [&] {
         if (!instance.IsBindlessSupported() || !Bindless::Init(instance.GetDevice()) || !vs ||
-            !fs || !vs->images.empty() || !vs->samplers.empty() ||
-            fs->images.size() > Shader::NativeBindlessMax ||
+            !fs) {
+            bindless_why = "support / stages";
+            return false;
+        }
+        if (!vs->images.empty() || !vs->samplers.empty()) {
+            bindless_why = "vs images / samplers";
+            return false;
+        }
+        if (fs->images.size() > Shader::NativeBindlessMax ||
             fs->samplers.size() > Shader::NativeBindlessMax) {
+            bindless_why = "fs > 16 images / samplers";
             return false;
         }
         for (const auto& desc : fs->images) {
-            if (desc.is_written || desc.is_atomic ||
-                desc.mip_fallback_mode != Shader::MipStorageFallbackMode::None) {
+            if (desc.is_written || desc.is_atomic) {
+                bindless_why = "fs image written / atomic";
+                return false;
+            }
+            if (desc.mip_fallback_mode != Shader::MipStorageFallbackMode::None) {
+                bindless_why = "fs mip fallback";
                 return false;
             }
         }
@@ -1862,6 +1881,11 @@ void PipelineCache::PrepareNativeColourLocked(const GraphicsPipeline* base,
     job->records_binding = emit.records_binding;
     job->vertex_binding = emit.vertex_binding;
     job->bindless = emit.bindless;
+    job->bindless_why = bindless_why;
+    job->counts = fmt::format("vs img {} smp {} buf {} | fs img {} smp {} buf {}",
+                              vs ? vs->images.size() : 0, vs ? vs->samplers.size() : 0,
+                              vs ? vs->buffers.size() : 0, fs ? fs->images.size() : 0,
+                              fs ? fs->samplers.size() : 0, fs ? fs->buffers.size() : 0);
     if (!native_colour_compiler) {
         native_colour_compiler = std::make_unique<NativeColourCompiler>(
             instance, scheduler, desc_heap, profile, *pipeline_cache);

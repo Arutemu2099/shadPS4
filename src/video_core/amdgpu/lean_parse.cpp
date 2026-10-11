@@ -525,7 +525,10 @@ Stop Parser::DecideDraw(const PM4Header* header, std::span<const u32> dcb, u32 o
     SCOPE_EXIT {
         caches->derive += __rdtsc() - td0;
     };
-    if (env.split_front_derive != 0 && plan.has_stages && !args.is_indirect) {
+    // q1: SHADPS4_DERIVE_INDIRECT=1 derives indirect draws too (the back ignores the block for
+    // them; the colour-variant preparation below then runs for their pipelines).
+    static const bool derive_indirect = EnvFlag("SHADPS4_DERIVE_INDIRECT");
+    if (env.split_front_derive != 0 && plan.has_stages && (!args.is_indirect || derive_indirect)) {
         const auto& vslot = scratch->stages[static_cast<u32>(Shader::LogicalStage::Vertex)];
         Shader::BoundStage vs{};
         vs.info = vslot.info;

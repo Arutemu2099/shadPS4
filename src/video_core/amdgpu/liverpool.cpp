@@ -2195,13 +2195,13 @@ void LeanLog() {
             auto& x = g_lean_xl;
             const double ps = 1.0 / std::max(sec, 1e-9);
             std::array<u64, 32> rf{};
-            std::array<u64, 34> sb{};
+            std::array<u64, 48> sb{};
             for (const auto& t : x.tr) {
                 if (const auto* tr = t.load(std::memory_order_acquire)) {
                     for (u32 i = 0; i < 32; ++i) {
                         rf[i] += tr->refusals[i]; // cumulative (racy reads, as A2Log)
                     }
-                    for (u32 i = 0; i < 34; ++i) {
+                    for (u32 i = 0; i < 48; ++i) {
                         sb[i] += tr->sub[i];
                     }
                 }
@@ -2216,10 +2216,12 @@ void LeanLog() {
                      "material {} | no variant: pipeline undecided {} eligible (no variant for this "
                      "vertex description yet) {} untextured {} other ineligible {} | eligible by slot: refused (final) {} "
                      "claimed without variant {} not claimed, free slot {} not claimed, slots full {} | indirect: "
-                     "with a variant {} without {}",
+                     "with a variant {} without {} (q1 why: no vi {} instanced {} undecided {} eligible {} "
+                     "untextured {} other ineligible {}; eligible by slot: refused (final) {} "
+                     "built {} building {} not claimed {})",
                      sb[12], sb[13], sb[14], sb[15], sb[0], sb[1], sb[2], sb[3], sb[4], sb[5], sb[6],
                      sb[7], sb[8], sb[9], sb[10], sb[11], sb[16], sb[17], sb[18], sb[19], sb[20],
-                     sb[23], x.mat_cuts.exchange(0), sb[24], sb[25], sb[26], sb[27], sb[28], sb[29], sb[30], sb[31], sb[32], sb[33]);
+                     sb[23], x.mat_cuts.exchange(0), sb[24], sb[25], sb[26], sb[27], sb[28], sb[29], sb[30], sb[31], sb[32], sb[33], sb[34], sb[35], sb[36], sb[37], sb[38], sb[39], sb[40], sb[41], sb[42], sb[43]);
             LOG_INFO(Render,
                      "Lean L3 direct checks (A2=2): inherited-slot words {} BAD {} | user-data "
                      "words {} BAD {} | clip planes {} BAD {} | formatted + fallback table bases {} BAD {} | "
@@ -9556,7 +9558,12 @@ void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_ma
     // read at execute time is what mode 2 measures). Not for indirect draws: DrawIndirectTail
     // keeps the back-side derivation.
     u32 vi_bytes = 0;
-    if (split_front_derive != 0 && has_stages && !args.is_indirect) {
+    // q1: SHADPS4_DERIVE_INDIRECT=1 (as the lean parser).
+    static const bool derive_indirect = [] {
+        const char* e = std::getenv("SHADPS4_DERIVE_INDIRECT");
+        return e && e[0] == '1';
+    }();
+    if (split_front_derive != 0 && has_stages && (!args.is_indirect || derive_indirect)) {
         const auto stages = draw.pipeline->GetStages();
         Shader::BoundStage vs{stages[static_cast<u32>(Shader::LogicalStage::Vertex)]};
         if (cap) {

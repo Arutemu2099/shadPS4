@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <vector>
 
 #include "common/logging/log.h"
 #include "shader_recompiler/native_emit.h"
@@ -770,6 +772,55 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
                                     AmdGpu::CpSplit::VertexInputAttribs(*draw.vi),
                                     draw.vi->count)) != nullptr));
         ++owner->sub[has ? 32 : 33];
+        if (!has) {
+            // q1: why no variant - no vi / instanced attribute / the pipeline's colour state /
+            // the slot of this vertex description.
+            u32 r = 34;
+            if (draw.vi && b) {
+                const auto* at = AmdGpu::CpSplit::VertexInputAttribs(*draw.vi);
+                bool inst = false;
+                for (u32 k = 0; k < draw.vi->count && k < 16; ++k) {
+                    inst = inst || at[k].desc.instanced;
+                }
+                const u8 s = b->native_colour_static;
+                r = inst ? 35 : s == 0 ? 36 : s == 1 ? 37 : b->native_colour_untextured ? 38 : 39;
+                if (s == 1 && draw.vi->count <= 16) {
+                    const u64 vkey = VideoCore::NativeVertexKey(at, draw.vi->count);
+                    u32 q = 43;
+                    for (const auto& slot : b->native_colour) {
+                        if (slot.key.load(std::memory_order_relaxed) == vkey) {
+                            const u32 st = slot.state.load(std::memory_order_relaxed);
+                            q = st == 2 ? 40
+                                : slot.variant.load(std::memory_order_relaxed) ? 41
+                                                                               : 42;
+                            break;
+                        }
+                    }
+                    ++owner->sub[q];
+                }
+            } else if (!b) {
+                r = 39;
+            }
+            ++owner->sub[r];
+            static std::atomic<u32> logged{0};
+            if (b && logged.load(std::memory_order_relaxed) < 24) {
+                static std::mutex mu;
+                static std::vector<const void*> seen;
+                std::scoped_lock lk{mu};
+                if (std::find(seen.begin(), seen.end(), b) == seen.end() && seen.size() < 24) {
+                    seen.push_back(b);
+                    logged.fetch_add(1, std::memory_order_relaxed);
+                    const char* why = b->native_colour_why.load(std::memory_order_relaxed);
+                    LOG_INFO(Render_Vulkan,
+                             "A2 q1 indirect pipeline {:#x}: vi {} attribs {} colour state {} "
+                             "untextured {} why '{}' cause {}",
+                             std::hash<GraphicsPipelineKey>{}(b->GetGraphicsKey()),
+                             draw.vi ? 1 : 0, draw.vi ? draw.vi->count : 0u,
+                             u32(b->native_colour_static), u32(b->native_colour_untextured),
+                             why ? why : "-", r);
+                }
+            }
+        }
         return refuse(RefuseIndirect);
     }
     const GraphicsPipeline* base = draw.pipeline;
