@@ -2256,6 +2256,13 @@ void BufferCache::NoteBatchWrite(VAddr addr, u64 size) {
     if (size == 0) {
         return;
     }
+    if (g_lane_census) [[unlikely]] {
+        if (Common::FaultMonitor::t_is_cp_thread) {
+            LaneNoteRange(addr, addr + size, scheduler.CurrentTick(), t_force_binding_sync ? 2 : 0);
+        } else {
+            g_lc[13].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     if (g_record_stream == 1) {
         // SHADPS4_ASC_STREAM: keyed by the open ASC segment's value, not a main tick.
         const u64 value = scheduler.OpenAscValue();
@@ -4301,6 +4308,29 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     // share no code: the early exit below (a tracker query plus a guest-memory memcpy) and the
     // SynchronizeBuffer fall-through. Time them separately - the split decides which is worth
     // cutting, and it has never actually been measured.
+    if (g_lane_census && Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
+        const u64 lo = device_addr, hi = device_addr + size;
+        if (t_force_binding_sync) {
+            const LaneNote* m = LaneFind(g_lc_main, lo, hi);
+            const LaneNote* e = is_written ? nullptr : LaneFind(g_lc_early, lo, hi);
+            g_lc[is_written ? 5 : 0].fetch_add(1, std::memory_order_relaxed);
+            if (m && (!e || m->seq > e->seq)) {
+                const bool open = m->tick >= scheduler.CurrentTick();
+                const u32 idx = is_written ? (open ? 6 : 7) : (m->kind == 1 ? (open ? 3 : 4)
+                                                                            : (open ? 1 : 2));
+                g_lc[idx].fetch_add(1, std::memory_order_relaxed);
+                t_lc_rec_flags |= open ? 1u : 2u;
+            } else if (e) {
+                g_lc[15].fetch_add(1, std::memory_order_relaxed);
+            }
+        } else if (!is_written) {
+            g_lc[8].fetch_add(1, std::memory_order_relaxed);
+            if (LaneFind(g_lc_early, lo, hi)) {
+                const bool skip = g_native_coherent != 0 && coherent_live && !is_texel_buffer;
+                g_lc[skip ? 9 : 10].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
     if (g_early_inv && Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
         if (t_force_binding_sync) {
             if (is_written) {
@@ -5062,6 +5092,13 @@ std::pair<Buffer*, u32> BufferCache::ObtainReadLean(VAddr device_addr, u32 size,
         return {};
     }
     Buffer& buffer = slot_buffers[buffer_id];
+    if (g_lane_census && Common::FaultMonitor::t_is_cp_thread && !t_force_binding_sync)
+        [[unlikely]] {
+        g_lc[8].fetch_add(1, std::memory_order_relaxed);
+        if (LaneFind(g_lc_early, device_addr, device_addr + size)) {
+            g_lc[11].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     // As ObtainBuffer: NoteMainAccess, then the memo probe with the epoch and guard read first.
     buffer.NoteMainAccess(scheduler.CurrentTick(), false);
     if (CoherentSkip(false, false)) {
@@ -5503,6 +5540,17 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     }
     if (g_upload_ahead_stats && src_buffer) [[unlikely]] {
         NoteUploadAhead(buffer, device_addr, size, total_size_bytes);
+    }
+    if (g_lane_census && total_size_bytes != 0) [[unlikely]] {
+        if (Common::FaultMonitor::t_is_cp_thread) {
+            for (const auto& copy : copies) {
+                const VAddr lo = buffer_start + copy.dstOffset;
+                LaneNoteRange(lo, lo + copy.size, scheduler.CurrentTick(),
+                              t_force_binding_sync ? 3 : 1);
+            }
+        } else {
+            g_lc[13].fetch_add(1, std::memory_order_relaxed);
+        }
     }
     if (total_size_bytes != 0) {
         // An upload is a main write of the Buffer (SynchronizeBuffersInRange reaches here without

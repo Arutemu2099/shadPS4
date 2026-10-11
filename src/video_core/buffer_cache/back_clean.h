@@ -105,6 +105,75 @@ struct EarlyWrite {
 inline std::array<EarlyWrite, 512> g_early_writes{};
 inline u64 g_early_w_head = 0, g_early_w_tail = 0; // back only
 inline std::atomic<u64> g_early_inv_reads{0}, g_early_inv_checks{0}, g_early_inv_writes{0};
+/// SHADPS4_LANE_CENSUS=1 (n1, sec. 21 step 0, back thread only): see n1_lane_census.py.
+inline const bool g_lane_census = [] {
+    const char* env = std::getenv("SHADPS4_LANE_CENSUS");
+    return env && env[0] == '1';
+}();
+struct LaneNote {
+    u64 lo, hi, tick, seq;
+    u32 kind; // 0 main write, 1 main upload, 2 early write, 3 early upload
+};
+struct LaneTable {
+    std::array<std::array<LaneNote, 8>, 4096> b{};
+    std::array<u8, 4096> pos{};
+};
+inline LaneTable g_lc_main{}, g_lc_early{};
+inline u64 g_lc_seq = 0;
+inline u64 g_lc_done = 0;     // main ticks complete (known semaphore value)
+inline u32 t_lc_rec_flags = 0; // bit 0: open-batch hit, bit 1: in-flight hit (current early record)
+/// 0 early reads checked, 1/2 newest producer main write open / in flight, 3/4 main upload open / in
+/// flight, 5 early writes checked, 6/7 over main write-or-upload open / in flight, 8 in-order reads
+/// checked, 9/10/11 in-order reads over unfinished early writes via coherent skip / full / lean,
+/// 12 notes truncated to 64 windows, 13 notes off the back thread, 14 notes, 15 early reads whose
+/// newest producer is an early record (lane-internal), 16 early records with an open-batch hit,
+/// 17 early records with an in-flight hit only, 18 early records.
+inline std::array<std::atomic<u64>, 20> g_lc{};
+inline u32 LaneBucket(u64 w) noexcept {
+    return u32((w * 0x9E3779B97F4A7C15ull) >> 52) & 4095;
+}
+inline void LaneNoteRange(u64 lo, u64 hi, u64 tick, u32 kind) noexcept {
+    if (hi <= lo) {
+        return;
+    }
+    LaneTable& t = kind >= 2 ? g_lc_early : g_lc_main;
+    const u64 seq = ++g_lc_seq;
+    const u64 w0 = lo >> 16;
+    u64 w1 = (hi - 1) >> 16;
+    if (w1 - w0 > 63) {
+        w1 = w0 + 63;
+        g_lc[12].fetch_add(1, std::memory_order_relaxed);
+    }
+    g_lc[14].fetch_add(1, std::memory_order_relaxed);
+    for (u64 w = w0; w <= w1; ++w) {
+        const u32 k = LaneBucket(w);
+        auto& last = t.b[k][(t.pos[k] - 1) & 7];
+        if (last.seq != 0 && last.lo == lo && last.hi == hi && last.kind == kind) {
+            last.tick = tick;
+            last.seq = seq;
+            continue;
+        }
+        t.b[k][t.pos[k]++ & 7] = {lo, hi, tick, seq, kind};
+    }
+}
+/// The newest note overlapping [lo, hi) whose main tick is not complete.
+inline const LaneNote* LaneFind(const LaneTable& t, u64 lo, u64 hi) noexcept {
+    const LaneNote* best = nullptr;
+    if (hi <= lo) {
+        return best;
+    }
+    const u64 w0 = lo >> 16;
+    const u64 w1 = std::min((hi - 1) >> 16, w0 + 63);
+    for (u64 w = w0; w <= w1; ++w) {
+        for (const LaneNote& e : t.b[LaneBucket(w)]) {
+            if (e.seq != 0 && e.tick > g_lc_done && e.lo < hi && lo < e.hi &&
+                (!best || e.seq > best->seq)) {
+                best = &e;
+            }
+        }
+    }
+    return best;
+}
 inline void EarlyInvPrune(u64 read_pos) noexcept {
     while (g_early_w_head != g_early_w_tail &&
            g_early_writes[g_early_w_head % g_early_writes.size()].pos < read_pos) {

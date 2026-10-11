@@ -2285,6 +2285,23 @@ void LeanLog() {
                              double(tk2(e.c_disp)) / 3.5e6 * ps, double(tk2(e.c_pkt)) / 3.5e6 * ps,
                              double(tk2(e.gap_ticks)) / 3.5e6 * ps, double(tk2(e.gap_max)) / 3.5e6,
                              double(tk2(e.unpublished)) * ps);
+                    if (VideoCore::g_lane_census) {
+                        auto& lc = VideoCore::g_lc;
+                        std::array<double, 20> v{};
+                        for (u32 i = 0; i < 20; ++i) {
+                            v[i] = double(lc[i].exchange(0)) * ps;
+                        }
+                        LOG_INFO(Render,
+                                 "LANE census (n1): early records {:.0f}/s, with an open-batch main "
+                                 "producer {:.0f}/s, in-flight only {:.0f}/s | early reads {:.0f}/s: "
+                                 "newest producer main write open {:.0f} in flight {:.0f}, main upload "
+                                 "open {:.0f} in flight {:.0f}, early record {:.0f} | early writes "
+                                 "{:.0f}/s over main open {:.0f} in flight {:.0f} | in-order reads "
+                                 "{:.0f}/s over unfinished early writes: coherent skip {:.0f} full {:.0f} "
+                                 "lean {:.0f} | notes {:.0f}/s, truncated {:.0f}, off the back {:.0f}",
+                                 v[18], v[16], v[17], v[0], v[1], v[2], v[3], v[4], v[15], v[5], v[6],
+                                 v[7], v[8], v[9], v[10], v[11], v[14], v[12], v[13]);
+                    }
                 }
                 if (g_xq) {
                     std::string ws, as;
@@ -3023,8 +3040,23 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                 const u64 chk0 = VideoCore::t_forced_binding_checks;
                 VideoCore::t_force_binding_sync = true;
                 VideoCore::t_early_pos = it.pos;
+                if (VideoCore::g_lane_census && rasterizer) [[unlikely]] {
+                    auto* ms = rasterizer->GetScheduler().GetMasterSemaphore();
+                    ms->Refresh();
+                    VideoCore::g_lc_done = ms->KnownGpuTick();
+                    VideoCore::t_lc_rec_flags = 0;
+                }
                 const u64 tx0 = __rdtsc();
                 ExecuteRecordImpl(*r);
+                if (VideoCore::g_lane_census) [[unlikely]] {
+                    auto& lc = VideoCore::g_lc;
+                    lc[18].fetch_add(1, std::memory_order_relaxed);
+                    if (VideoCore::t_lc_rec_flags & 1) {
+                        lc[16].fetch_add(1, std::memory_order_relaxed);
+                    } else if (VideoCore::t_lc_rec_flags & 2) {
+                        lc[17].fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
                 (it.type == RT::Dispatch ? g_asc_early_stats.c_disp : g_asc_early_stats.c_pkt)
                     .fetch_add(__rdtsc() - tx0, std::memory_order_relaxed);
                 VideoCore::t_force_binding_sync = false;
