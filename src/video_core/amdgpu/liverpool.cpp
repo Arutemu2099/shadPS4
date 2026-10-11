@@ -235,6 +235,11 @@ struct A2Entry {
         u64 ctx_epoch{};
         std::vector<std::pair<u32, u32>> delta;
         u64 render_key{}; ///< full A2RenderKey at the stretch's first draw (A2=2 verify)
+        /// Lean L3 pre-delta: the RegWrite run right before the first draw (its first record's
+        /// position, ~0 none), the first draw's position, the run's words at the first draw.
+        u64 pre_pos{~u64{0}};
+        u64 first_pos{};
+        std::vector<std::pair<u32, u32>> pre_delta;
     };
     std::vector<Side> side;
 };
@@ -1222,6 +1227,8 @@ struct LeanJob {
     std::vector<std::unique_ptr<Vulkan::A2::Stretch>> xl;
     std::vector<A2Entry::Side> xl_side;
     std::atomic<u32> xl_ready{0};
+    /// L3: the back found this job's channel empty; the worker publishes at its next draw.
+    std::atomic<u32> back_waiting{0};
 };
 struct LeanCounters {
     std::atomic<u64> dcbs{}, eligible{}, skipped{}, cmp{}, bad{}, events{}, pkts{}, pkts_span{},
@@ -1270,6 +1277,7 @@ struct LeanXlStats {
     std::atomic<u64> taken{}, stretches{}, cap{}, cut_pub{}, walked{}, mat_cuts{};
     std::atomic<u64> published{}, pub_draws{}, rej_occl{}, rej_gen{}, rej_mat{}, rej_rt{},
         would{}, back_draws{}, seq_skips{};
+    std::atomic<u64> pre_folds{}, pre_records{}, pre_cmp{}, pre_bad{}, wait_pubs{};
     /// SHADPS4_A2=2 field compares (gate 0 bad): render key per draw, delta words per stretch.
     std::atomic<u64> rk_cmp{}, rk_bad{}, delta_cmp{}, delta_bad{}, expect_filed{};
     /// l3e direct checks: inherited-slot words (offset + size vs the back's locked lookup and
@@ -2024,6 +2032,11 @@ void LeanLog() {
             LOG_INFO(Render, "Lean L3 verify: buffer checks skipped (generation moved mid-stretch by "
                              "the verify's own old path) {}",
                      x.verify_mid.exchange(0));
+            LOG_INFO(Render,
+                     "Lean L3 pre-delta: folds {:.0f}/s, register records folded {:.0f}/s | A2=2 "
+                     "pre-delta words {} BAD {} | publishes on back wait {:.0f}/s",
+                     double(x.pre_folds.exchange(0)) * ps, double(x.pre_records.exchange(0)) * ps,
+                     x.pre_cmp.exchange(0), x.pre_bad.load(), double(x.wait_pubs.exchange(0)) * ps);
             std::array<u32, 32> ord{};
             for (u32 i = 0; i < 32; ++i) {
                 ord[i] = i;
@@ -3877,6 +3890,12 @@ struct LeanXl {
     std::array<Shader::BoundStage, Shader::MaxStageTypes> stages{};
     u32 since_pub{};
     u64 open_key{}; ///< SHADPS4_A2=2: A2RenderKey at the open stretch's first draw
+    // The run of RegWrite records right before the current record (pre-delta) and the open
+    // stretch's own pre-run.
+    u64 pre_start{~u64{0}};
+    std::vector<u32> pre_offs;
+    u64 s_pre_pos{~u64{0}}, s_first_pos{};
+    std::vector<std::pair<u32, u32>> s_pre_delta;
     u64 taken{}, stretches{}, cap{}, cut_pub{}, walked{}, mat_cuts{};
 };
 
@@ -3884,7 +3903,13 @@ void LeanXlEnd(LeanXl& x) {
     if (x.open) {
         if (auto s = x.tr->EndStretch()) {
             x.job->xl[x.n] = std::move(s);
-            x.job->xl_side[x.n] = {x.last_end, x.last_epoch, std::move(x.delta), x.open_key};
+            auto& sd = x.job->xl_side[x.n];
+            sd = {x.last_end, x.last_epoch, std::move(x.delta), x.open_key};
+            sd.pre_pos = x.s_pre_pos;
+            sd.first_pos = x.s_first_pos;
+            sd.pre_delta = std::move(x.s_pre_delta);
+            x.s_pre_delta.clear();
+            x.s_pre_pos = ~u64{0};
             x.job->xl_ready.store(++x.n, std::memory_order_release);
             ++x.stretches;
         }
@@ -3960,6 +3985,15 @@ void LeanXlDraw(LeanXl& x, const CpSplit::RecordHeader& h, u64 pos) {
             x.rt_pkey.emplace(in.pipeline);
             A2CopyRenderWindows(regs, x.rt_win);
             x.open_key = g_a2 == 2 ? A2RenderKey(regs, in.pipeline) : 0;
+            // The RegWrite run right before this first draw rides with the stretch.
+            x.s_first_pos = pos;
+            x.s_pre_delta.clear();
+            x.s_pre_pos = x.pre_start;
+            if (x.pre_start != ~u64{0}) {
+                for (const u32 off : x.pre_offs) {
+                    x.s_pre_delta.emplace_back(off, regs.reg_array[off]);
+                }
+            }
             x.pending.clear();
             x.delta.clear();
         }
@@ -3987,6 +4021,22 @@ void LeanXlWalk(LeanXl& x, u64 end) {
             break; // only a Wrap before `end`
         }
         const auto* payload = reinterpret_cast<const u8*>(h + 1);
+        if (h->type == CpSplit::RecordType::RegWrite) {
+            if (x.pre_start == ~u64{0}) {
+                x.pre_start = pos;
+            }
+            const u8* pend = reinterpret_cast<const u8*>(h) + h->size;
+            for (const u8* q = payload; q + sizeof(CpSplit::RegWritePayload) <= pend;) {
+                const auto* w = reinterpret_cast<const CpSplit::RegWritePayload*>(q);
+                if (w->count == 0) {
+                    break;
+                }
+                for (u32 i = 0; i < w->count; ++i) {
+                    x.pre_offs.push_back(w->word_offset + i);
+                }
+                q += sizeof(CpSplit::RegWritePayload) + size_t{w->count} * sizeof(u32);
+            }
+        }
         switch (h->type) {
         case CpSplit::RecordType::RegWrite:
             if (x.open) {
@@ -4021,6 +4071,10 @@ void LeanXlWalk(LeanXl& x, u64 end) {
             LeanXlEnd(x);
             break;
         }
+        if (h->type != CpSplit::RecordType::RegWrite) {
+            x.pre_start = ~u64{0}; // the run must end right at the first draw
+            x.pre_offs.clear();
+        }
         x.walk_pos = pos + h->size;
     }
 }
@@ -4029,10 +4083,16 @@ void LeanXlWalk(LeanXl& x, u64 end) {
 void LeanXlDrawHook(void* p, u64 draw_pos) {
     auto& x = *static_cast<LeanXl*>(p);
     LeanXlWalk(x, draw_pos + 1);
-    // Lean channels publish by count never: when the back already follows this job, hand over
-    // every 8 draws (each publish ends the open stretch).
-    if (++x.since_pub >= 8 &&
-        g_lean_s.back_cur.load(std::memory_order_relaxed) == x.idx) {
+    // Lean channels publish by count never: right away when the back waits on this channel,
+    // and every 8 draws while it follows this job (each publish ends the open stretch).
+    ++x.since_pub;
+    const bool waiting = x.job->back_waiting.load(std::memory_order_relaxed) != 0;
+    if (waiting ||
+        (x.since_pub >= 8 && g_lean_s.back_cur.load(std::memory_order_relaxed) == x.idx)) {
+        if (waiting) {
+            x.job->back_waiting.store(0, std::memory_order_relaxed);
+            g_lean_xl.wait_pubs.fetch_add(1, std::memory_order_relaxed);
+        }
         x.ch->PublishNow();
     }
 }
@@ -4046,6 +4106,8 @@ void LeanXlPrePublish(void* p) {
     x.cut_pub += x.open ? 1 : 0;
     LeanXlEnd(x);
     x.since_pub = 0;
+    x.pre_start = ~u64{0}; // published records are never folded into a later stretch
+    x.pre_offs.clear();
 }
 
 void Liverpool::LeanStart() {
@@ -4235,6 +4297,11 @@ void Liverpool::LeanWorkerLoop(std::stop_token stoken, u32 index) {
                 xl.pending.clear();
                 xl.delta.clear();
                 xl.since_pub = 0;
+                xl.pre_start = ~u64{0};
+                xl.pre_offs.clear();
+                xl.s_pre_pos = ~u64{0};
+                xl.s_pre_delta.clear();
+                j.back_waiting.store(0, std::memory_order_relaxed);
                 out.hook_ctx = &xl;
                 out.draw_hook = &LeanXlDrawHook;
                 out.pre_publish = &LeanXlPrePublish;
@@ -8405,6 +8472,22 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                 ch.Done(r);
                 break;
             }
+            if (r->type == RT::RegWrite && x.on && g_a2 == 1) {
+                // A stretch's pre-run starts here: its words into the mirror (a RegWrite record
+                // is a plain copy into it), the run released up to the stretch's first draw.
+                const u32 ready = job.xl_ready.load(std::memory_order_acquire);
+                if (si < ready && job.xl_side[si].pre_pos == ch.ReadPos()) {
+                    const auto& sd = job.xl_side[si];
+                    for (const auto& [off, val] : sd.pre_delta) {
+                        mirror->regs.reg_array[off] = val;
+                    }
+                    const u64 last = job.xl[si]->first_seq - 1;
+                    x.pre_folds.fetch_add(1, std::memory_order_relaxed);
+                    x.pre_records.fetch_add(last + 1 - r->seq, std::memory_order_relaxed);
+                    ch.DoneThrough(sd.first_pos, last);
+                    continue;
+                }
+            }
             if (r->type == RT::Draw && x.on) {
                 const u32 ready = job.xl_ready.load(std::memory_order_acquire);
                 while (si < ready && job.xl[si]->first_seq < r->seq) {
@@ -8442,6 +8525,23 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                         vs_inh = 0;
                         vs_clip = 0;
                         vs_fmt = 0;
+                    }
+                }
+                if (vs && r->seq == vs->first_seq && vsd->pre_pos != ~u64{0}) {
+                    // The pre-delta = the back's mirror at the first draw (last value per offset).
+                    static thread_local std::unordered_set<u32> pseen;
+                    pseen.clear();
+                    u32 bad = 0;
+                    for (auto it = vsd->pre_delta.rbegin(); it != vsd->pre_delta.rend(); ++it) {
+                        if (pseen.insert(it->first).second) {
+                            bad += mirror->regs.reg_array[it->first] != it->second ? 1 : 0;
+                        }
+                    }
+                    x.pre_cmp.fetch_add(pseen.size(), std::memory_order_relaxed);
+                    if (bad != 0 && x.pre_bad.fetch_add(bad, std::memory_order_relaxed) < 16) {
+                        LOG_WARNING(Render, "Lean L3 verify: {} pre-delta words differ at job draw "
+                                            "seq {}",
+                                    bad, r->seq);
                     }
                 }
                 if (vs && r->seq >= vs->first_seq && r->seq <= vs->last_seq) {
@@ -8614,6 +8714,9 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
             }
             continue;
         }
+        if (x.on && job.back_waiting.load(std::memory_order_relaxed) == 0) {
+            job.back_waiting.store(1, std::memory_order_relaxed); // publish at your next draw
+        }
         const u64 c0 = blc ? __rdtsc() : 0;
         ProcessCommands(); // guest commands run while the back waits for the worker
         if (blc) [[unlikely]] {
@@ -8636,6 +8739,7 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
             st.reset();
         }
         job.xl_ready.store(0, std::memory_order_relaxed);
+        job.back_waiting.store(0, std::memory_order_relaxed);
     }
     job.state.store(0, std::memory_order_release); // the slot is free again
     if (blc) [[unlikely]] {
