@@ -124,6 +124,7 @@ inline u64 g_lc_seq = 0;
 /// gfx EOP label the back wrote (labels are written at record time: WAR rule); big main notes.
 inline bool g_lane_on = false;
 inline std::array<u64, 16>* g_lane_counters = nullptr; // Scheduler::lane_c (back thread)
+inline std::array<u64, 5>* g_lane_open_src = nullptr;  // Scheduler::lane_open_src (p1d)
 inline u64 g_gfx_label_tick = 0;
 struct LaneBig {
     u64 lo, hi, tick;
@@ -137,6 +138,7 @@ inline std::atomic<u64> g_lc_big_lost{0};
 inline std::array<u64, 4096> g_lc_mb{};
 inline std::array<u64, 4096> g_lc_lost_mb{};
 inline u64 g_lc_main_newest = 0;
+inline bool g_lc_coarse = false; // p1d: the last LaneMainProducer answer came from a coarse source
 inline u64 g_lc_done = 0;     // main ticks complete (known semaphore value)
 inline u32 t_lc_rec_flags = 0; // bit 0: open-batch hit, bit 1: in-flight hit (current early record)
 /// 0 early reads checked, 1/2 newest producer main write open / in flight, 3/4 main upload open / in
@@ -233,6 +235,7 @@ inline u64 LaneMainProducer(u64 lo, u64 hi) noexcept {
     } else if (const LaneNote* m = LaneFind(g_lc_main, lo, hi)) {
         t = m->tick;
     }
+    const u64 exact = (((hi - 1) >> 16) - (lo >> 16) > 63) ? 0 : t;
     for (u64 m = m0; m <= m1 && m <= m0 + 1023; ++m) {
         t = std::max(t, g_lc_lost_mb[m & 4095]); // a lost unfinished note in this MB
     }
@@ -247,6 +250,7 @@ inline u64 LaneMainProducer(u64 lo, u64 hi) noexcept {
     if (g_lc_big_evicted > g_lc_done) {
         t = std::max(t, g_lc_big_evicted); // a big note was lost: assume it covered this range
     }
+    g_lc_coarse = t > exact;
     return t;
 }
 inline void EarlyInvPrune(u64 read_pos) noexcept {

@@ -868,15 +868,27 @@ public:
     static inline thread_local bool t_lane_mode = false;
     /// Rule A: the open lane segment must run after main tick `tick` (deferred if it is the open
     /// batch: submitted right after that batch's flush).
-    void LaneNeedMain(u64 tick) noexcept {
+    /// p1d: `src` 0 exact producer, 1 coarse, 2 WAR (gfx label), 3 GDS, 4 carry; `cap`: never
+    /// defer (an open-batch tick becomes the newest submitted batch).
+    void LaneNeedMain(u64 tick, u32 src = 0, bool cap = false) noexcept {
         if (tick == 0 || !asc_dirty) {
             return;
         }
+        const u64 open = master_semaphore.CurrentTick();
+        if (cap && tick >= open) {
+            ++lane_c[15];
+            tick = open - 1;
+        }
         if (tick > asc_wait_main) {
             asc_wait_main = tick;
-            ++lane_c[tick >= master_semaphore.CurrentTick() ? 10 : 9];
+            const bool on_open = tick >= open;
+            ++lane_c[on_open ? 10 : 9];
+            if (on_open) {
+                ++lane_open_src[std::min<u32>(src, 4)];
+            }
         }
     }
+    std::array<u64, 5> lane_open_src{};
     /// Submits the open lane segment now (a deferred one: flushes main first). Returns its value.
     u64 LaneCutNow();
     /// An ASC label was written: the open segment ends there; main batches flushed later wait it.
@@ -912,8 +924,8 @@ public:
     /// 3 submits waiting on an unsubmitted main tick, 4 label cuts, 5 lane dispatches, 6 early
     /// records kept on main, 7 lane packets, 8 main packets, 9 rule-A waits (in flight), 10 rule-A
     /// waits on the open batch, 11 main flushes waiting on the lane, 12 lane-routed dispatches
-    /// that never reached BindBuffers, 13 fault-download pre-cuts (14 / 15 unused: the big-note
-    /// counters live in VideoCore::g_lc[19] / g_lc_big_lost).
+    /// that never reached BindBuffers, 13 fault-download pre-cuts, 14 cuts left open because
+    /// deferred (p1d), 15 WAR / GDS waits capped to the newest submitted batch (p1d).
     std::array<u64, 16> lane_c{};
     u32 ActiveStream() const noexcept {
         return active_stream;

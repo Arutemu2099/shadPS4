@@ -1205,7 +1205,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     }
     SubmitExecutionImpl(info);
     LaneSwitch(1);
-    LaneNeedMain(carry);
+    LaneNeedMain(carry, 4);
 }
 
 void Scheduler::SubmitExecutionImpl(SubmitInfo& info) {
@@ -1647,7 +1647,7 @@ u64 Scheduler::LaneCutNow() {
 void Scheduler::LaneLabelCut() {
     ++lane_c[4];
     lane_label_value = asc_dirty ? open_asc_value : asc_last_submitted.load();
-    LaneCutNow();
+    LaneSubmitIfOpen(); // p1d: a deferred segment goes out right after the open batch's flush
 }
 
 void Scheduler::LaneFallbackMain() {

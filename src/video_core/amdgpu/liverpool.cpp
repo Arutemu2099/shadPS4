@@ -2294,6 +2294,11 @@ void LeanLog() {
                             v[i] = double(c[i]) * ps;
                             c[i] = 0;
                         }
+                        std::array<double, 5> os{};
+                        for (u32 i = 0; i < 5; ++i) {
+                            os[i] = double((*VideoCore::g_lane_open_src)[i]) * ps;
+                            (*VideoCore::g_lane_open_src)[i] = 0;
+                        }
                         LOG_INFO(Render,
                                  "ASC_LANE: submits {:.0f}/s (deferred behind the open batch {:.0f}, "
                                  "main flushes for a deferred cut {:.0f}, waiting on an unsubmitted "
@@ -2301,10 +2306,13 @@ void LeanLog() {
                                  "{:.0f}/s, early records kept on main {:.0f}/s (unrouted {:.0f}) | "
                                  "packets lane {:.0f} main {:.0f} | rule A waits in flight {:.0f}/s, "
                                  "on the open batch {:.0f}/s | main flushes waiting on the lane "
-                                 "{:.0f}/s | fault pre-cuts {:.0f}/s | big main notes {:.0f}/s, lost "
-                                 "unfinished {:.0f}/s",
+                                 "{:.0f}/s | fault pre-cuts {:.0f}/s | p1d: cuts left open (deferred) "
+                                 "{:.0f}/s, WAR / GDS capped {:.0f}/s, open-batch waits by source "
+                                 "exact {:.0f} coarse {:.0f} WAR {:.0f} GDS {:.0f} carry {:.0f} | big "
+                                 "main notes {:.0f}/s, lost unfinished {:.0f}/s",
                                  v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[12], v[7], v[8], v[9],
-                                 v[10], v[11], v[13],
+                                 v[10], v[11], v[13], v[14], v[15], os[0], os[1], os[2], os[3],
+                                 os[4],
                                  double(VideoCore::g_lc[19].exchange(0)) * ps,
                                  double(VideoCore::g_lc_big_lost.exchange(0)) * ps);
                     }
@@ -2973,7 +2981,7 @@ void Liverpool::ProcessCommands() {
         callback();
         if (rasterizer && prev_stream != 0 && rasterizer->GetScheduler().HasLane()) {
             rasterizer->GetScheduler().SwitchStream(prev_stream); // SHADPS4_ASC_LANE
-            rasterizer->GetScheduler().LaneNeedMain(lane_wait);
+            rasterizer->GetScheduler().LaneNeedMain(lane_wait, 4);
         }
     }
 }
@@ -3089,8 +3097,13 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                     if (t_lane_packet) {
                         sch.LaneCount(7);
                     } else if (lane_label) {
+                        // p1d: the label ends the open segment (never a forced main flush); only
+                        // a GDS store reads lane data on main.
                         sch.LaneLabelCut();
-                        sch.LaneFallbackMain(); // the label's GDS store / image downloads: main
+                        if (reinterpret_cast<const PM4CmdReleaseMem*>(h)->data_sel ==
+                            DataSelect::GdsMemStore) {
+                            sch.LaneFallbackMain();
+                        }
                     } else {
                         sch.LaneCount(8);
                         const bool quiet = h->type == 3 && (op == PM4ItOpcode::WriteData ||

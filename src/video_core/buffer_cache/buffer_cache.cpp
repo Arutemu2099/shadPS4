@@ -651,6 +651,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                            BDA_PAGETABLE_SIZE} {
     g_lane_on = scheduler.HasLane();
     g_lane_counters = &scheduler.lane_c;
+    g_lane_open_src = &scheduler.lane_open_src;
     if (const char* mirror = std::getenv("SHADPS4_HOST_MIRROR"); mirror && mirror[0] == '1') {
         host_mirror = instance.IsExternalMemoryHostEnabled();
         host_mirror_max = static_cast<u32>(256_MB);
@@ -1348,7 +1349,7 @@ void BufferCache::ResolveFaultSync(VAddr device_addr, u64 size, bool is_write,
     SCOPE_EXIT {
         scheduler.SwitchStream(prev_stream);
         if (prev_stream == 1 && scheduler.HasLane()) {
-            scheduler.LaneNeedMain(lane_wait); // review S1: the record continues in a new segment
+            scheduler.LaneNeedMain(lane_wait, 4); // review S1: the record continues in a new segment
         }
     };
     if (g_lane_on) [[unlikely]] {
@@ -4067,8 +4068,8 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
         }
     }
     if (is_gds && g_lane_on && Vulkan::Scheduler::t_lane_mode) [[unlikely]] {
-        scheduler.LaneNeedMain(gds_buffer.main_access_tick); // review S2
-        scheduler.LaneNeedMain(g_gfx_label_tick);
+        scheduler.LaneNeedMain(gds_buffer.main_access_tick, 3, true); // review S2
+        scheduler.LaneNeedMain(g_gfx_label_tick, 2, true);
     }
     Buffer* buffer = [&] {
         if (is_gds) {
@@ -4109,15 +4110,17 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         } else {
             g_lc_done = scheduler.GetMasterSemaphore()->KnownGpuTick();
             if (!src_gds) {
-                scheduler.LaneNeedMain(LaneMainProducer(src, src + num_bytes));
+                const u64 t = LaneMainProducer(src, src + num_bytes);
+                scheduler.LaneNeedMain(t, g_lc_coarse ? 1 : 0);
             }
             if (!dst_gds) {
-                scheduler.LaneNeedMain(LaneMainProducer(dst, dst + num_bytes));
+                const u64 t = LaneMainProducer(dst, dst + num_bytes);
+                scheduler.LaneNeedMain(t, g_lc_coarse ? 1 : 0);
             }
             if (src_gds || dst_gds) {
-                scheduler.LaneNeedMain(gds_buffer.main_access_tick);
+                scheduler.LaneNeedMain(gds_buffer.main_access_tick, 3, true);
             }
-            scheduler.LaneNeedMain(g_gfx_label_tick); // WAR: the copy writes
+            scheduler.LaneNeedMain(g_gfx_label_tick, 2, true); // WAR: the copy writes
         }
     }
     auto& src_buffer = [&] -> const Buffer& {
@@ -4357,9 +4360,10 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     // cutting, and it has never actually been measured.
     if (g_lane_on && Vulkan::Scheduler::t_lane_mode) [[unlikely]] {
         g_lc_done = scheduler.GetMasterSemaphore()->KnownGpuTick();
-        scheduler.LaneNeedMain(LaneMainProducer(device_addr, device_addr + size));
+        const u64 t = LaneMainProducer(device_addr, device_addr + size);
+        scheduler.LaneNeedMain(t, g_lc_coarse ? 1 : 0);
         if (is_written) {
-            scheduler.LaneNeedMain(g_gfx_label_tick); // WAR vs gfx reads behind the newest label
+            scheduler.LaneNeedMain(g_gfx_label_tick, 2, true); // WAR, never the open batch (p1d)
         }
     }
     if (g_lane_census && Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
@@ -5603,7 +5607,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             const bool lane_side =
                 g_lane_on ? Vulkan::Scheduler::t_lane_mode : t_force_binding_sync;
             if (g_lane_on && lane_side) {
-                scheduler.LaneNeedMain(g_gfx_label_tick);
+                scheduler.LaneNeedMain(g_gfx_label_tick, 2, true);
             }
             for (const auto& copy : copies) {
                 const VAddr lo = buffer_start + copy.dstOffset;

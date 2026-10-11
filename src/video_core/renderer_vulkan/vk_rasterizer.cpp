@@ -11694,7 +11694,7 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
             dispatch_on_asc = true;
             for (const auto& desc : stage.buffers) {
                 if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
-                    scheduler.LaneNeedMain(buffer_cache.GetGdsBuffer()->main_access_tick);
+                    scheduler.LaneNeedMain(buffer_cache.GetGdsBuffer()->main_access_tick, 3, true);
                 }
             }
         }
