@@ -1260,6 +1260,7 @@ struct LeanState {
     alignas(64) std::atomic<u32> back_cur{0};                    ///< DCB index the back follows
     std::atomic<u64> l2_taken{}, l2_skipped{}, l2_early{}, head_draws{}, back_records{},
         back_wait_ticks{};
+    u64 split_spans{}; ///< extra jobs made by head splitting (front-owned)
     std::unique_ptr<Lean::Parser> toucher; ///< front: L2 Pretouch before the exclusive lookup
 };
 LeanState g_lean_s;
@@ -1277,6 +1278,7 @@ struct LeanXlStats {
     /// l3g: formatted slots - texel syncs at publish and rejected stretches; A2=2 base compares.
     std::atomic<u64> texel_syncs{}, rej_texel{}, fmt_cmp{}, fmt_bad{};
     std::atomic<u64> verify_skips{}; ///< A2=2: stretches A2=1 would reject (not compared)
+    std::atomic<u64> mat_resolves{}; ///< materials resolved at publish (A2ResolveMaterial calls)
     std::atomic<u64> verify_mid{};   ///< A2=2: buffer checks skipped, generation moved mid-stretch
     std::atomic<u64> front_p{}, front_e{}, lean_p{}, lean_e{};
     std::array<std::atomic<Vulkan::A2::StretchTranslator*>, 8> tr{};
@@ -1523,13 +1525,27 @@ bool LeanRunNeutral(PM4ItOpcode op) {
 }
 void LeanChainScan(std::span<const u32> dcb, LeanScanRefs s, bool guest_markers, bool post_dma,
                    u32& cut_dw, u32& pkts, u32& draws, bool stop_at_cut = false,
-                   u32* run_bumps = nullptr) {
+                   u32* run_bumps = nullptr, u32 max_draws = 0, bool* split = nullptr) {
     const u32* base = dcb.data();
     const std::span<const u32> full = dcb;
     const Lean::StaticEnv senv{.guest_markers = guest_markers, .split_post_dma = post_dma};
     auto& r = s.r;
     cut_dw = static_cast<u32>(dcb.size());
     bool cut = false;
+    // Head splitting cuts only where a stretch ends anyway: a real change of the render windows
+    // (A2RenderWindows: CB / DB / scissor / blend context registers) or a CLEAR_STATE since the
+    // last draw.
+    bool rt_changed = false;
+    const auto touches_rt = [](u32 ctx_off, u32 n) {
+        constexpr std::array<std::pair<u32, u32>, 4> win{
+            {{0x000, 0x020}, {0x080, 0x0A0}, {0x200, 0x210}, {0x318, 0x390}}};
+        for (const auto& [lo, hi] : win) {
+            if (ctx_off < hi && ctx_off + n > lo) {
+                return true;
+            }
+        }
+        return false;
+    };
     while (!dcb.empty()) {
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         if (header->type == 2) {
@@ -1553,11 +1569,28 @@ void LeanChainScan(std::span<const u32> dcb, LeanScanRefs s, bool guest_markers,
                     return; // L2 head pass: the cut packet and the rest are the front's
                 }
             }
+            // Head splitting: after max_draws draws, end this span right before the next draw
+            // packet; the live state here is the next span's entry state.
+            if (!cut && stop_at_cut && max_draws != 0 && draws >= max_draws && rt_changed &&
+                (op == PM4ItOpcode::DrawIndex2 || op == PM4ItOpcode::DrawIndexOffset2 ||
+                 op == PM4ItOpcode::DrawIndexAuto)) {
+                cut_dw = static_cast<u32>(dcb.data() - base);
+                --pkts;
+                if (split) {
+                    *split = true;
+                }
+                return;
+            }
+        }
+        if (op == PM4ItOpcode::DrawIndex2 || op == PM4ItOpcode::DrawIndexOffset2 ||
+            op == PM4ItOpcode::DrawIndexAuto) {
+            rt_changed = false;
         }
         switch (op) {
         case PM4ItOpcode::ClearState:
             r.SetDefaults();
             ++s.epoch;
+            rt_changed = true;
             break;
         case PM4ItOpcode::SetConfigReg:
             std::memcpy(&r.reg_array[Regs::ConfigRegWordOffset + (w[1] & 0xffff)], w + 2,
@@ -1567,6 +1600,10 @@ void LeanChainScan(std::span<const u32> dcb, LeanScanRefs s, bool guest_markers,
             const u32 reg_addr = Regs::ContextRegWordOffset + (w[1] & 0xffff);
             const u32* payload = w + 2;
             const size_t sz = size_t{count - 1} * 4;
+            if (max_draws != 0 && !rt_changed && touches_rt(w[1] & 0xffff, count - 1) &&
+                std::memcmp(&r.reg_array[reg_addr], payload, sz) != 0) {
+                rt_changed = true;
+            }
             if (LeanViewportMemoEnabled() && std::memcmp(&r.reg_array[reg_addr], payload, sz) != 0) {
                 ++s.epoch;
             }
@@ -1876,13 +1913,15 @@ void LeanLog() {
     if (g_lean == 2) {
         const double hd = double(s.head_draws.load()), fd = double(c.front_draws.load());
         LOG_INFO(Render,
-                 "Lean L2: window {:.1f}s | DCBs {} taken {} not taken {} | head draws {} front draws {} "
+                 "Lean L2: window {:.1f}s | DCBs {} taken {} not taken {} (extra split spans {}) | head "
+                 "draws {} front draws {} "
                  "(workers {:.1f}%) | EARLY STOPS {} (gate 0) | back: worker-channel records {:.0f}/s, "
                  "waiting for workers {:.2f} ms/s | worker: fault waits {} ({:.2f} ms/s), faults in lock {} "
                  "(first {:#x}), touches {}, builds {} (refresh failed {}), null builds {}, native preps {}, "
                  "colour preps {} | head pass {:.2f} ms/s | front faults in lock {}, register-only "
                  "completions {} (draws dropped {}), back lock-service waits {}",
-                 sec, c.dcbs.load(), s.l2_taken.load(), s.l2_skipped.load(), s.head_draws.load(),
+                 sec, c.dcbs.load(), s.l2_taken.load(), s.l2_skipped.load(),
+                 std::exchange(s.split_spans, 0), s.head_draws.load(),
                  c.front_draws.load(), hd + fd > 0 ? 100.0 * hd / (hd + fd) : 0.0, s.l2_early.load(),
                  double(s.back_records.load()) / std::max(sec, 1e-9),
                  double(s.back_wait_ticks.load()) / 3.5e6 / std::max(sec, 1e-9),
@@ -2011,7 +2050,8 @@ void LeanLog() {
             prev_bd = bd_now;
             LOG_INFO(Render,
                      "Lean L3: worker draws walked {:.0f}/s taken {:.0f}/s ({:.1f}%) in {:.0f} "
-                     "stretches/s ({:.1f} draws each; cut by publish {:.0f}/s, cap hits {}) | back: "
+                     "stretches/s ({:.1f} draws each; cut by publish {:.0f}/s, cap hits {}; material "
+                     "resolves {:.0f}/s) | back: "
                      "published {:.0f}/s ({:.0f} draws/s), rejected occlusion {} buffer-gen {} "
                      "material {} target {} | A2=2 would {:.0f}/s, render key {} BAD {}, delta words {} "
                      "BAD {}, slot words filed {} | back old-path draw records in job "
@@ -2019,6 +2059,7 @@ void LeanLog() {
                      double(wk) * ps, double(tk) * ps,
                      100.0 * double(tk) / double(std::max<u64>(wk, 1)), double(st_) * ps, double(tk) / double(std::max<u64>(st_, 1)),
                      double(x.cut_pub.exchange(0)) * ps, x.cap.exchange(0),
+                     double(x.mat_resolves.exchange(0)) * ps,
                      double(d_pub) * ps, double(d_pd) * ps,
                      x.rej_occl.exchange(0), x.rej_gen.exchange(0), x.rej_mat.exchange(0),
                      x.rej_rt.exchange(0), double(x.would.exchange(0)) * ps, x.rk_cmp.exchange(0),
@@ -8090,47 +8131,76 @@ Liverpool::LeanL2Begin Liverpool::LeanFrontBeginL2(std::span<const u32> dcb,
         return res;
     }
     const u64 t0 = __rdtsc();
-    // The worker's entry state = the front's live state here (it is caught up at a DCB start).
     auto& gfx_cs = mapped_queues[GfxQueueId].cs_state;
-    j.index.store(idx, std::memory_order_relaxed);
-    j.dcb = dcb;
-    j.win.resize(CpSplit::DcbSnapWords);
-    u32* out = j.win.data();
-    for (const auto& [off, n] : CpSplit::DcbSnapWindows) {
-        std::memcpy(out, &regs.reg_array[off], size_t{n} * 4);
-        out += n;
+    // Heads longer than LeanSplitDraws draws are cut (head splitting) at the first render-target
+    // change after each LeanSplitDraws draws - where the worker's stretch ends anyway: each span
+    // is one job (own slot, channel, DcbRef), its entry state the front's live state at its start.
+    constexpr u32 LeanSplitDraws = 256; // heads above it split, at a render-target change
+    u32 start = 0, cur = idx, total_bumps = 0, spans = 0;
+    for (;;) {
+        auto& jj = s.jobs[cur % LeanSlots];
+        const auto span = dcb.subspan(start);
+        jj.index.store(cur, std::memory_order_relaxed);
+        jj.dcb = span;
+        jj.win.resize(CpSplit::DcbSnapWords);
+        u32* out = jj.win.data();
+        for (const auto& [off, n] : CpSplit::DcbSnapWindows) {
+            std::memcpy(out, &regs.reg_array[off], size_t{n} * 4);
+            out += n;
+        }
+        jj.cb = last_cb_extent;
+        jj.db = last_db_extent;
+        jj.epoch = context_change_epoch;
+        jj.cs = gfx_cs;
+        jj.iaa = indirect_args_addr;
+        // The head pass ON the live state, to the StaticCheck cut or the split point.
+        u32 cut = 0, pkts = 0, draws = 0, bumps = 0;
+        bool split_here = false;
+        LeanChainScan(span,
+                      LeanScanRefs{regs, last_cb_extent, last_db_extent, context_change_epoch,
+                                   gfx_cs, indirect_args_addr},
+                      guest_markers, split_post_dma, cut, pkts, draws, true, &bumps,
+                      LeanSplitDraws, &split_here);
+        if (cut == 0) {
+            // Nothing for a worker from here (the first packet is the front's).
+            ++s.l2_skipped;
+            s.queued.store(cur, std::memory_order_release); // the workers' claims stay in step
+            s.queued.notify_all();
+            break;
+        }
+        c.pkts_span += pkts;
+        s.head_draws += draws;
+        ++s.l2_taken;
+        ++spans;
+        jj.cut_dw = cut;
+        jj.state.store(1, std::memory_order_release);
+        s.queued.store(cur, std::memory_order_release);
+        s.queued.notify_all();
+        // The back runs the span from the job's channel when it reaches this record.
+        auto* ref = split->Reserve<CpSplit::DcbRefPayload>(CpSplit::RecordType::DcbRef);
+        ref->slot = cur % LeanSlots;
+        ref->index = cur;
+        split->Commit();
+        split->PublishNow();
+        total_bumps += bumps;
+        start += cut;
+        if (!split_here || start >= dcb.size()) {
+            break;
+        }
+        const u32 next = ++s.index;
+        if (s.jobs[next % LeanSlots].state.load(std::memory_order_acquire) != 0) {
+            // Slot busy: the rest of the head is the front's.
+            ++s.l2_skipped;
+            s.queued.store(next, std::memory_order_release);
+            s.queued.notify_all();
+            break;
+        }
+        cur = next;
     }
-    j.cb = last_cb_extent;
-    j.db = last_db_extent;
-    j.epoch = context_change_epoch;
-    j.cs = gfx_cs;
-    j.iaa = indirect_args_addr;
-    // The head pass ON the live state, to the StaticCheck cut.
-    u32 cut = 0, pkts = 0, draws = 0, bumps = 0;
-    LeanChainScan(dcb,
-                  LeanScanRefs{regs, last_cb_extent, last_db_extent, context_change_epoch, gfx_cs,
-                               indirect_args_addr},
-                  guest_markers, split_post_dma, cut, pkts, draws, true, &bumps);
     s.chain_cyc += __rdtsc() - t0;
-    if (cut == 0) {
-        not_taken(); // the first packet is the front's: nothing for a worker
-        return res;
-    }
-    c.pkts_span += pkts;
-    s.head_draws += draws;
-    ++s.l2_taken;
-    j.cut_dw = cut;
-    j.state.store(1, std::memory_order_release);
-    s.queued.store(idx, std::memory_order_release);
-    s.queued.notify_all();
-    // The back runs the head from the job's channel when it reaches this record.
-    auto* ref = split->Reserve<CpSplit::DcbRefPayload>(CpSplit::RecordType::DcbRef);
-    ref->slot = idx % LeanSlots;
-    ref->index = idx;
-    split->Commit();
-    split->PublishNow();
-    res.cut = cut;
-    res.run_bumps = bumps;
+    s.split_spans += spans > 1 ? spans - 1 : 0;
+    res.cut = start;
+    res.run_bumps = total_bumps;
     if (c.dcbs >= 65536) {
         LeanLog();
     }
@@ -8225,6 +8295,7 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                 std::array<Shader::BoundStage, Shader::MaxStageTypes> mst{};
                 ReadStages(reinterpret_cast<const u8*>(&mrec + 1), mrec.stage_count, mst);
                 auto& [ni, ns] = mat_n[m];
+                x.mat_resolves.fetch_add(1, std::memory_order_relaxed);
                 ok = rasterizer->A2ResolveMaterial(mr.base, mst[u32(Shader::LogicalStage::Fragment)],
                                                    st.cmds->mat_slots[m].data(), ni, ns, mat_ids);
             }
