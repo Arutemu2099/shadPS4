@@ -672,6 +672,7 @@ bool StretchTranslator::Impl::AllocRegion(u64 bytes, u64& start, u64& masked_off
 bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw) {
     const auto refuse = [&](u32 why) {
         ++owner->refusals[why];
+        owner->last_refusal = why;
         return false;
     };
     if (!enabled) {

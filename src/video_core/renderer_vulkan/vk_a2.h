@@ -295,6 +295,8 @@ public:
     std::array<u64, 24> sub{};
     /// Draws taken and sub-batches opened so far (logged by the caller).
     u64 taken{}, sub_batches{};
+    /// The reason of the last refusal (TakeDraw returned false).
+    u32 last_refusal{};
 
 private:
     struct Impl;

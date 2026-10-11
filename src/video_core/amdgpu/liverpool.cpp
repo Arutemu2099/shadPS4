@@ -1285,6 +1285,7 @@ LeanXlStats g_lean_xl;
 /// guest commands run inside LeanBackFollow, its wait for workers.
 struct BackLeanCensus {
     std::array<u64, 32> main_cyc{}, main_n{}, job_cyc{}, job_n{};
+    std::array<u64, 64> why_cyc{}, why_n{}; ///< old-path job-channel draws by job_pad
     u64 pub_cyc{}, pub_n{}, pc_cyc{}, pc_n{}, wait_cyc{}, follow_cyc{}, follows{};
     u64 pub_resolve{}, pub_begin{}, pub_record{}, pub_delta{};
     u64 win_tsc{};
@@ -1328,6 +1329,21 @@ void BackLeanMaybeLog() {
                                  double(b.job_cyc[t]) / double(std::max<u64>(b.job_n[t], 1)));
         }
     }
+    std::string why_s;
+    for (u32 i = 0; i < 64; ++i) {
+        if (b.why_cyc[i] == 0) {
+            continue;
+        }
+        const std::string name = i == 0    ? std::string{"taken(stretch rejected / verify)"}
+                                 : i == 40 ? std::string{"not offered"}
+                                 : i == 41 ? std::string{"stretch cap"}
+                                 : i <= 32 ? std::string{Vulkan::A2::RefusalName(i - 1)}
+                                           : fmt::format("?{}", i);
+        why_s += fmt::format(" {}={:.1f}({:.0f}k/s,{:.0f}cyc)", name, ms(b.why_cyc[i]),
+                             ks(b.why_n[i]),
+                             double(b.why_cyc[i]) / double(std::max<u64>(b.why_n[i], 1)));
+    }
+    LOG_INFO(Render, "BackLean old-path job draws by why (ms per s):{}", why_s);
     const auto& n = Vulkan::t_back_cycles;
     LOG_INFO(Render,
              "BackLean: window {:.1f}s | ms per s: main ring {:.1f}:{} | job channels {:.1f}:{} | "
@@ -3837,7 +3853,11 @@ void LeanXlDraw(LeanXl& x, const CpSplit::RecordHeader& h, u64 pos) {
     in.seq = h.seq;
     in.rec_pos = pos;
     ++x.walked;
+    // The back census's bucket for this draw if it runs on the old path (job_pad is unused; the
+    // record is committed but not yet published).
+    auto& why = const_cast<SplitDrawRecord&>(rec).job_pad;
     if (x.occlusion || !in.pipeline || rec.marker || rec.verify != 0) {
+        why = 40;
         LeanXlEnd(x);
         return;
     }
@@ -3862,8 +3882,10 @@ void LeanXlDraw(LeanXl& x, const CpSplit::RecordHeader& h, u64 pos) {
     }
     if (!x.open && x.n >= A2MaxStretches) {
         ++x.cap;
+        why = 41;
         return;
     }
+    why = 0;
     if (x.tr->TakeDraw(regs, in)) {
         if (!x.open) {
             x.open = true;
@@ -3885,6 +3907,7 @@ void LeanXlDraw(LeanXl& x, const CpSplit::RecordHeader& h, u64 pos) {
         x.last_epoch = rec.ctx_epoch;
         ++x.taken;
     } else {
+        why = 1 + x.tr->last_refusal;
         LeanXlEnd(x);
     }
 }
@@ -8430,8 +8453,15 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
             ExecuteRecordImpl(*r); // the plain path for everything not in a published stretch
             if (blc) [[unlikely]] {
                 const u32 t = static_cast<u32>(r->type) & 31;
-                g_blc.job_cyc[t] += __rdtsc() - e0;
+                const u64 dt = __rdtsc() - e0;
+                g_blc.job_cyc[t] += dt;
                 ++g_blc.job_n[t];
+                if (r->type == RT::Draw) {
+                    const u32 w =
+                        reinterpret_cast<const SplitDrawRecord*>(r + 1)->job_pad & 63;
+                    g_blc.why_cyc[w] += dt;
+                    ++g_blc.why_n[w];
+                }
             }
             if (vs && r->type == RT::Draw && r->seq == vs->last_seq) {
                 // The delta the back would have applied = its mirror after the stretch's last draw
