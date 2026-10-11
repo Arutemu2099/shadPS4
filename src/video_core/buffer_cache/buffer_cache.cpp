@@ -1343,10 +1343,22 @@ void BufferCache::ResolveFaultSync(VAddr device_addr, u64 size, bool is_write,
         // The dispatch's ASC accesses so far must be visible to this fault's main accesses.
         StampPendingAsc(scheduler.OpenAscValue());
     }
+    const u64 lane_wait = scheduler.LaneWaitMain();
     scheduler.SwitchStream(0);
     SCOPE_EXIT {
         scheduler.SwitchStream(prev_stream);
+        if (prev_stream == 1 && scheduler.HasLane()) {
+            scheduler.LaneNeedMain(lane_wait); // review S1: the record continues in a new segment
+        }
     };
+    if (g_lane_on) [[unlikely]] {
+        // Review S5: this download runs on main; a lane segment that wrote the range comes first.
+        const FaultCopy fc{device_addr, 0, size};
+        const u64 w = NewestAscWriter({&fc, 1});
+        if (w != 0 && !scheduler.GetAscSemaphore()->IsFree(w + 2)) {
+            scheduler.LaneFallbackMain();
+        }
+    }
     if (is_write) {
         NoteWriteFaultOverlap(device_addr, size);
     } else {
@@ -1741,7 +1753,7 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
         if (asc_producer != 0) {
             // +1: a flush inside a dispatch's pass 2 reopens the segment, so the dispatch can land
             // one segment later than its history stamp (Opus review 2026-09-28).
-            const u64 need = asc_producer + 1;
+            const u64 need = asc_producer + (scheduler.HasLane() ? 2 : 1); // lane: two cuts
             asc_done = asc_sem->IsFree(need);
             if (!asc_done) {
                 asc_sem->Refresh();
@@ -1787,9 +1799,10 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
         }
     }
     if (!asc_done && scheduler.HasLane()) {
-        // The lane producer is unfinished and the copy stays on main: the main batch that holds
-        // it waits on the producer's segment (submitted first at that flush; never deferred here).
-        VideoCore::g_main_wait_asc = std::max(VideoCore::g_main_wait_asc, asc_producer + 1);
+        // The lane producer is unfinished and the copy stays on main: submit the open segment now
+        // (not deferred: LaneFlushIfDeferred ran first) and let the copy's batch wait on it.
+        scheduler.LaneSubmitIfOpen();
+        VideoCore::g_main_wait_asc = std::max(VideoCore::g_main_wait_asc, asc_producer + 2);
     }
     if (fast_lane && asc_done) {
         // The newest batch that GPU-wrote any copied byte; batches before it completed first
@@ -4053,6 +4066,10 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
             return;
         }
     }
+    if (is_gds && g_lane_on && Vulkan::Scheduler::t_lane_mode) [[unlikely]] {
+        scheduler.LaneNeedMain(gds_buffer.main_access_tick); // review S2
+        scheduler.LaneNeedMain(g_gfx_label_tick);
+    }
     Buffer* buffer = [&] {
         if (is_gds) {
             return &gds_buffer;
@@ -4085,6 +4102,24 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         // Fallback to creating dst buffer on GPU to at least have this data there
     }
     texture_cache.InvalidateMemoryFromGPU(dst, num_bytes);
+    if (g_lane_on && Vulkan::Scheduler::t_lane_mode) [[unlikely]] {
+        if (!src_gds && texture_cache.FindImageFromRange(src, num_bytes)) {
+            scheduler.SwitchStream(0); // the packet finishes on main, after the lane so far
+            scheduler.LaneFallbackMain();
+        } else {
+            g_lc_done = scheduler.GetMasterSemaphore()->KnownGpuTick();
+            if (!src_gds) {
+                scheduler.LaneNeedMain(LaneMainProducer(src, src + num_bytes));
+            }
+            if (!dst_gds) {
+                scheduler.LaneNeedMain(LaneMainProducer(dst, dst + num_bytes));
+            }
+            if (src_gds || dst_gds) {
+                scheduler.LaneNeedMain(gds_buffer.main_access_tick);
+            }
+            scheduler.LaneNeedMain(g_gfx_label_tick); // WAR: the copy writes
+        }
+    }
     auto& src_buffer = [&] -> const Buffer& {
         if (src_gds) {
             return gds_buffer;
@@ -5256,6 +5291,9 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
 void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
                               bool accumulate_stream_score) {
     WriterTagScope census_tag{*this, 6};
+    if (g_lane_on) [[unlikely]] {
+        scheduler.LaneFallbackMain(); // the join's copies read what lane segments may have written
+    }
     Buffer& new_buffer = slot_buffers[new_buffer_id];
     Buffer& overlap = slot_buffers[overlap_id];
     NoteBatchWrite(overlap.CpuAddr(), overlap.SizeBytes());
@@ -5564,6 +5602,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
         if (Common::FaultMonitor::t_is_cp_thread) {
             const bool lane_side =
                 g_lane_on ? Vulkan::Scheduler::t_lane_mode : t_force_binding_sync;
+            if (g_lane_on && lane_side) {
+                scheduler.LaneNeedMain(g_gfx_label_tick);
+            }
             for (const auto& copy : copies) {
                 const VAddr lo = buffer_start + copy.dstOffset;
                 LaneNoteRange(lo, lo + copy.size, scheduler.CurrentTick(), lane_side ? 3 : 1);

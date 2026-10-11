@@ -132,6 +132,11 @@ inline std::array<LaneBig, 64> g_lc_big{};
 inline u64 g_lc_big_pos = 0;
 inline u64 g_lc_big_evicted = 0; // newest tick of an unfinished big note overwritten
 inline std::atomic<u64> g_lc_big_lost{0};
+/// p1b: newest main tick noted per 1 MB (hashed; a big query reads these) and newest unfinished main
+/// tick lost to a bucket overwrite per 1 MB.
+inline std::array<u64, 4096> g_lc_mb{};
+inline std::array<u64, 4096> g_lc_lost_mb{};
+inline u64 g_lc_main_newest = 0;
 inline u64 g_lc_done = 0;     // main ticks complete (known semaphore value)
 inline u32 t_lc_rec_flags = 0; // bit 0: open-batch hit, bit 1: in-flight hit (current early record)
 /// 0 early reads checked, 1/2 newest producer main write open / in flight, 3/4 main upload open / in
@@ -167,6 +172,14 @@ inline void LaneNoteRange(u64 lo, u64 hi, u64 tick, u32 kind) noexcept {
         }
     }
     g_lc[14].fetch_add(1, std::memory_order_relaxed);
+    if (kind < 2 && g_lane_on) {
+        g_lc_main_newest = std::max(g_lc_main_newest, tick);
+        const u64 m1 = std::min((hi - 1) >> 20, (lo >> 20) + 255);
+        for (u64 m = lo >> 20; m <= m1; ++m) {
+            u64& e = g_lc_mb[m & 4095];
+            e = std::max(e, tick);
+        }
+    }
     for (u64 w = w0; w <= w1; ++w) {
         const u32 k = LaneBucket(w);
         auto& last = t.b[k][(t.pos[k] - 1) & 7];
@@ -175,7 +188,12 @@ inline void LaneNoteRange(u64 lo, u64 hi, u64 tick, u32 kind) noexcept {
             last.seq = seq;
             continue;
         }
-        t.b[k][t.pos[k]++ & 7] = {lo, hi, tick, seq, kind};
+        auto& slot = t.b[k][t.pos[k]++ & 7];
+        if (kind < 2 && g_lane_on && slot.seq != 0 && slot.tick > g_lc_done) {
+            u64& e = g_lc_lost_mb[(w >> 4) & 4095];
+            e = std::max(e, slot.tick);
+        }
+        slot = {lo, hi, tick, seq, kind};
     }
 }
 /// The newest note overlapping [lo, hi) whose main tick is not complete.
@@ -199,8 +217,27 @@ inline const LaneNote* LaneFind(const LaneTable& t, u64 lo, u64 hi) noexcept {
 /// p1: the newest unfinished main tick that wrote or uploaded [lo, hi) (0: none known).
 inline u64 LaneMainProducer(u64 lo, u64 hi) noexcept {
     u64 t = 0;
-    if (const LaneNote* m = LaneFind(g_lc_main, lo, hi)) {
+    if (hi <= lo) {
+        return 0;
+    }
+    const u64 m0 = lo >> 20, m1 = (hi - 1) >> 20;
+    if (((hi - 1) >> 16) - (lo >> 16) > 63) {
+        // p1b: more than the 64 windows LaneFind reads: the per-MB newest ticks (conservative).
+        if (m1 - m0 > 1023) {
+            t = g_lc_main_newest;
+        } else {
+            for (u64 m = m0; m <= m1; ++m) {
+                t = std::max(t, g_lc_mb[m & 4095]);
+            }
+        }
+    } else if (const LaneNote* m = LaneFind(g_lc_main, lo, hi)) {
         t = m->tick;
+    }
+    for (u64 m = m0; m <= m1 && m <= m0 + 1023; ++m) {
+        t = std::max(t, g_lc_lost_mb[m & 4095]); // a lost unfinished note in this MB
+    }
+    if (t <= g_lc_done) {
+        t = 0;
     }
     for (const LaneBig& b : g_lc_big) {
         if (b.tick > g_lc_done && b.tick > t && b.lo < hi && lo < b.hi) {

@@ -5,6 +5,7 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
+#include "video_core/buffer_cache/back_clean.h"
 
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
@@ -125,6 +126,9 @@ bool ExecuteShaderHLE(const Shader::BoundStage& stage, const AmdGpu::Regs& regs,
                       const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer) {
     switch (stage.info->pgm_hash) {
     case COPY_SHADER_HASH:
+        if (rasterizer.GetScheduler().HasLane() && VideoCore::t_force_binding_sync) {
+            rasterizer.GetScheduler().LaneFallbackMain(); // SHADPS4_ASC_LANE (review S6)
+        }
         return ExecuteCopyShaderHLE(stage, cs_program, rasterizer);
     default:
         return false;

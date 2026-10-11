@@ -893,6 +893,21 @@ public:
     void LaneCount(u32 i) noexcept {
         ++lane_c[i];
     }
+    /// The open lane segment's main wait (carried across a nested leave / re-enter of lane mode).
+    u64 LaneWaitMain() const noexcept {
+        return asc_dirty ? asc_wait_main : 0;
+    }
+    /// Submits the open lane segment if it is not deferred (no main flush); else counts (14).
+    void LaneSubmitIfOpen() {
+        if (!lane_enabled || !asc_dirty) {
+            return;
+        }
+        if (asc_wait_main >= master_semaphore.CurrentTick()) {
+            ++lane_c[14];
+            return;
+        }
+        LaneSubmit();
+    }
     /// Counters (back thread): 0 submits, 1 deferred submits, 2 main flushes for a deferred cut,
     /// 3 submits waiting on an unsubmitted main tick, 4 label cuts, 5 lane dispatches, 6 early
     /// records kept on main, 7 lane packets, 8 main packets, 9 rule-A waits (in flight), 10 rule-A

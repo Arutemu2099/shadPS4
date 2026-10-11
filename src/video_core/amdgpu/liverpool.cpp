@@ -2964,13 +2964,16 @@ void Liverpool::ProcessCommands() {
             --num_commands;
         }
         u32 prev_stream = 0;
+        u64 lane_wait = 0;
         if (rasterizer) {
             prev_stream = rasterizer->GetScheduler().ActiveStream();
+            lane_wait = rasterizer->GetScheduler().LaneWaitMain();
             rasterizer->GetScheduler().SwitchStream(0);
         }
         callback();
         if (rasterizer && prev_stream != 0 && rasterizer->GetScheduler().HasLane()) {
             rasterizer->GetScheduler().SwitchStream(prev_stream); // SHADPS4_ASC_LANE
+            rasterizer->GetScheduler().LaneNeedMain(lane_wait);
         }
     }
 }
@@ -3081,27 +3084,28 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                     const auto* h = reinterpret_cast<const PM4Header*>(r + 1);
                     lane_label = (r->flags & CpSplit::AscReleaseMem) != 0;
                     const auto op = h->type3.opcode.Value();
-                    t_lane_packet = h->type == 3 &&
-                                    (lane_label || op == PM4ItOpcode::DmaData ||
-                                     op == PM4ItOpcode::WriteData ||
-                                     op == PM4ItOpcode::AcquireMem || op == PM4ItOpcode::Nop);
+                    t_lane_packet = h->type == 3 && !lane_label && op == PM4ItOpcode::DmaData;
                     auto& sch = rasterizer->GetScheduler();
                     if (t_lane_packet) {
                         sch.LaneCount(7);
+                    } else if (lane_label) {
+                        sch.LaneLabelCut();
+                        sch.LaneFallbackMain(); // the label's GDS store / image downloads: main
                     } else {
                         sch.LaneCount(8);
-                        sch.LaneFallbackMain();
+                        const bool quiet = h->type == 3 && (op == PM4ItOpcode::WriteData ||
+                                                            op == PM4ItOpcode::AcquireMem ||
+                                                            op == PM4ItOpcode::Nop);
+                        if (!quiet) {
+                            sch.LaneFallbackMain();
+                        }
                     }
                 }
                 const u64 tx0 = __rdtsc();
                 ExecuteRecordImpl(*r);
                 if (t_lane_packet) [[unlikely]] {
                     t_lane_packet = false;
-                    auto& sch = rasterizer->GetScheduler();
-                    sch.SwitchStream(0);
-                    if (lane_label) {
-                        sch.LaneLabelCut();
-                    }
+                    rasterizer->GetScheduler().SwitchStream(0);
                 }
                 if (VideoCore::g_lane_census) [[unlikely]] {
                     auto& lc = VideoCore::g_lc;
@@ -5548,10 +5552,7 @@ void Liverpool::ExecuteRecordImpl(const CpSplit::RecordHeader& record) {
             auto& sch = rasterizer->GetScheduler();
             sch.SwitchStream(t_lane_packet ? 1 : 0);
             if (t_lane_packet) {
-                const auto op = reinterpret_cast<const PM4Header*>(payload)->type3.opcode.Value();
-                if (op == PM4ItOpcode::DmaData || op == PM4ItOpcode::WriteData) {
-                    sch.LaneNeedMain(VideoCore::g_gfx_label_tick); // WAR (see ObtainBuffer)
-                }
+                // DMA_DATA: rule A and the WAR wait are taken in CopyBuffer / FillBuffer.
             } else if (VideoCore::g_lane_on && !VideoCore::t_force_binding_sync &&
                        !(record.flags & CpSplit::AscReleaseMem)) {
                 // A gfx EOP label: the game may act on it before the GPU ran this batch.

@@ -1195,9 +1195,17 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         SubmitExecutionImpl(info);
         return;
     }
+    const u64 carry = asc_wait_main;
     LaneSwitch(0);
+    if (synchronous_scopes != 0) {
+        DrainRecording();
+        if (par_rec != 0) {
+            current_cmdbuf = OpenLane().cmdbuf;
+        }
+    }
     SubmitExecutionImpl(info);
     LaneSwitch(1);
+    LaneNeedMain(carry);
 }
 
 void Scheduler::SubmitExecutionImpl(SubmitInfo& info) {
