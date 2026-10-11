@@ -781,19 +781,23 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         const char* e = std::getenv("SHADPS4_PRESENT_ASYNC");
         return e && e[0] == '1';
     }();
-    if (present_async && capture_game_only_count == 0) {
+    if (present_async && capture_game_only_count == 0 &&
+        GuestLayout(vk::ImageLayout::eShaderReadOnlyOptimal) ==
+            vk::ImageLayout::eShaderReadOnlyOptimal) { // q6b (3)
         image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead,
                       {});
         draw_scheduler.EndRendering();
-        draw_scheduler.Record([this, pre_barrier, image_view, image_size, frame,
-                               fsr = fsr_settings, pp = pp_settings](vk::CommandBuffer cb) {
+        // q6b (2): ordered (FsrPass keeps state across flips); the Frame by value.
+        draw_scheduler.RecordOrdered([this, pre_barrier, image_view, image_size, fc = *frame,
+                                      fsr = fsr_settings,
+                                      pp = pp_settings](vk::CommandBuffer cb) mutable {
             cb.pipelineBarrier2(vk::DependencyInfo{
                 .imageMemoryBarrierCount = 1,
                 .pImageMemoryBarriers = &pre_barrier,
             });
-            const auto view = fsr_pass.Render(cb, image_view, image_size,
-                                              {frame->width, frame->height}, fsr, frame->is_hdr);
-            pp_pass.Render(cb, view, image_size, *frame, pp);
+            const auto view =
+                fsr_pass.Render(cb, image_view, image_size, {fc.width, fc.height}, fsr, fc.is_hdr);
+            pp_pass.Render(cb, view, image_size, fc, pp);
         });
         DebugState.game_resolution = {image_size.width, image_size.height};
         DebugState.output_resolution = {frame->width, frame->height};
