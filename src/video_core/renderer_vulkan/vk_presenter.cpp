@@ -761,12 +761,6 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     };
 
     draw_scheduler.EndRendering();
-    auto command_access = draw_scheduler.AcquireCommandBuffer();
-    const auto cmdbuf = command_access.Handle();
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .imageMemoryBarrierCount = 1,
-        .pImageMemoryBarriers = &pre_barrier,
-    });
 
     VideoCore::ImageViewInfo view_info{};
     view_info.format = GetFrameViewFormat(attribute.attrib.pixel_format);
@@ -779,6 +773,42 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
 
     const u32 capture_game_only_count = VideoCore::ConsumeGameOnlyScreenshotRequests();
+    // q6 (SHADPS4_PRESENT_ASYNC=1): no synchronous borrow - AcquireCommandBuffer drains the
+    // recording lanes (s620: ~1.5 ms per flip on the back). The display image's Transit goes
+    // through the scheduler (its state on this thread), the passes are one closure recorded in
+    // stream order; the flush below hands it on as before.
+    static const bool present_async = [] {
+        const char* e = std::getenv("SHADPS4_PRESENT_ASYNC");
+        return e && e[0] == '1';
+    }();
+    if (present_async && capture_game_only_count == 0) {
+        image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead,
+                      {});
+        draw_scheduler.EndRendering();
+        draw_scheduler.Record([this, pre_barrier, image_view, image_size, frame,
+                               fsr = fsr_settings, pp = pp_settings](vk::CommandBuffer cb) {
+            cb.pipelineBarrier2(vk::DependencyInfo{
+                .imageMemoryBarrierCount = 1,
+                .pImageMemoryBarriers = &pre_barrier,
+            });
+            const auto view = fsr_pass.Render(cb, image_view, image_size,
+                                              {frame->width, frame->height}, fsr, frame->is_hdr);
+            pp_pass.Render(cb, view, image_size, *frame, pp);
+        });
+        DebugState.game_resolution = {image_size.width, image_size.height};
+        DebugState.output_resolution = {frame->width, frame->height};
+        frame->ready_semaphore = draw_scheduler.GetMasterSemaphore()->Handle();
+        frame->ready_tick = draw_scheduler.CurrentTick();
+        SubmitInfo info{};
+        draw_scheduler.Flush(info);
+        return frame;
+    }
+    auto command_access = draw_scheduler.AcquireCommandBuffer();
+    const auto cmdbuf = command_access.Handle();
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &pre_barrier,
+    });
     std::vector<ScreenshotReadback> pending_screenshots;
     if (capture_game_only_count > 0) {
         pending_screenshots.reserve(1);
