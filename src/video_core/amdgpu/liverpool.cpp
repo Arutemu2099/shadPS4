@@ -6,6 +6,7 @@
 #include <bit>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <chrono>
@@ -772,6 +773,13 @@ bool AscRingBack(const CpSplit::DiagPayload& diag) {
     return false;
 }
 
+const bool g_asc_early = [] {
+    const char* v = std::getenv("SHADPS4_ASC_EARLY");
+    return v && v[0] == '1';
+}();
+struct AscEarlyStats {
+    std::atomic<u64> dispatches{}, packets{}, in_order{}, blocked{}, skipped{};
+} g_asc_early_stats;
 const bool g_xq = [] {
     const char* v = std::getenv("SHADPS4_XQ_CENSUS");
     return v && v[0] == '1';
@@ -2239,6 +2247,16 @@ void LeanLog() {
                          double(tk(w.partial_ticks)) / 3.5e6 / double(std::max<u64>(pw, 1)),
                          double(pt) / 3.5e6 / double(std::max<u64>(pn, 1)), pn);
                 const auto tk2 = [](std::atomic<u64>& a) { return a.exchange(0); };
+                if (g_asc_early) {
+                    auto& e = g_asc_early_stats;
+                    LOG_INFO(Render,
+                             "ASC_EARLY: ran ahead dispatches {:.0f}/s packets {:.0f}/s | in ring "
+                             "order (registers / epoch / diag) {:.0f}/s | early service blocked {:.0f}/s "
+                             "| skipped in ring order {:.0f}/s",
+                             double(tk2(e.dispatches)) * ps, double(tk2(e.packets)) * ps,
+                             double(tk2(e.in_order)) * ps, double(tk2(e.blocked)) * ps,
+                             double(tk2(e.skipped)) * ps);
+                }
                 if (g_xq) {
                     std::string ws, as;
                     static constexpr const char* wn[] = {"gfx", "same", "otherASC", "none", "fwd"};
@@ -2677,7 +2695,16 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 
 #define YIELD_CE() YIELD(ccb_task_name)
 #define YIELD_GFX() YIELD(dcb_task_name)
-#define YIELD_ASC(id) YIELD(acb_task_name[id])
+// SHADPS4_ASC_EARLY: records committed outside ASC parsing (ProcessLoop, other queues) are never
+// tagged as ASC records, so the tag is dropped around every ASC yield.
+#define YIELD_ASC(id)                                                                              \
+    if (split_enabled) {                                                                           \
+        split->asc_tag = 0;                                                                        \
+    }                                                                                              \
+    YIELD(acb_task_name[id]);                                                                      \
+    if (split_enabled && g_asc_early) {                                                            \
+        split->asc_tag = 1;                                                                        \
+    }
 
 #define RESUME(task, name)                                                                         \
     FIBER_EXIT;                                                                                    \
@@ -2775,6 +2802,10 @@ Liverpool::Liverpool() {
         }
         split_post_task_done = split_run_ahead && CpSplit::PostTaskDone();
         split_task_guard = split_post_task_done ? CpSplit::TaskGuard() : 0u;
+        if (g_asc_early && split_run_ahead) {
+            split->EnableEarly();
+            LOG_INFO(Render, "SHADPS4_ASC_EARLY: ASC records run ahead of the graphics backlog");
+        }
         if (CpSplit::TaskGuard() != 0 && !split_post_task_done) {
             LOG_WARNING(Render, "CpSplit: TASK_GUARD ignored without run-ahead POST_TASK_DONE");
         }
@@ -2908,8 +2939,57 @@ void Liverpool::BackLoop(std::stop_token stoken) {
     // installed before the first record that can record a command (a rasterizer is bound).
     bool mtb_install = Vulkan::MtbP1Requested();
     bool mtb_p3 = false;
+    // SHADPS4_ASC_EARLY: seqs of records already run ahead, in ring order (back only).
+    std::deque<u64> early_done;
+    const bool asc_early = g_asc_early && split->early_items != nullptr;
+    const auto early_service = [&] {
+        auto& ch = *split;
+        u64 head = ch.early_head.load(std::memory_order_relaxed);
+        const u64 tail = ch.early_tail.load(std::memory_order_acquire);
+        const u64 published = ch.PublishedEnd();
+        const u64 read = ch.ReadPos();
+        while (head != tail) {
+            const auto& it = ch.early_items[head & (CpSplit::Channel::EarlySlots - 1)];
+            if (it.pos < read) {
+                ++head; // already reached in ring order
+                continue;
+            }
+            if (it.pos >= published) {
+                break; // committed, not published yet
+            }
+            using RT = CpSplit::RecordType;
+            if (it.type == RT::Dispatch || it.type == RT::Packet) {
+                u64 p = it.pos;
+                const auto* r = ch.RecordAtPos(p);
+                ExecuteRecordImpl(*r);
+                early_done.push_back(r->seq);
+                (it.type == RT::Dispatch ? g_asc_early_stats.dispatches : g_asc_early_stats.packets)
+                    .fetch_add(1, std::memory_order_relaxed);
+                ++head;
+                continue;
+            }
+            if (it.type == RT::RegWrite || it.type == RT::EpochBump || it.type == RT::Diag) {
+                g_asc_early_stats.in_order.fetch_add(1, std::memory_order_relaxed);
+                ++head; // runs in ring order, as before
+                continue;
+            }
+            g_asc_early_stats.blocked.fetch_add(1, std::memory_order_relaxed);
+            break; // wait until the back passes it in ring order
+        }
+        ch.early_head.store(head, std::memory_order_release);
+    };
     for (;;) {
+        if (asc_early) [[unlikely]] {
+            early_service();
+        }
         if (const auto* record = split->Next()) {
+            if (asc_early && !early_done.empty() && record->seq == early_done.front()) [[unlikely]] {
+                early_done.pop_front();
+                g_asc_early_stats.skipped.fetch_add(1, std::memory_order_relaxed);
+                split->Done(record); // ran ahead already
+                ProcessCommands();
+                continue;
+            }
             if (mtb_install && rasterizer) [[unlikely]] {
                 mtb_install = false;
                 // SHADPS4_MTB_P3 (P3.0, sec. 14d): the committer keeps the real tick; the
@@ -10287,6 +10367,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         if (g_xq && split_enabled) [[unlikely]] {
             split->note_queue = 0;
         }
+        if (g_asc_early && split_enabled) [[unlikely]] {
+            split->asc_tag = 0;
+        }
         ProcessCommands();
 
         if (asc_yield) {
@@ -11240,6 +11323,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 template <bool is_indirect>
 Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
+    // SHADPS4_ASC_EARLY: this level's caller state, restored when it ends (a nested IB level
+    // returns into its parent's tagged parse; the top level returns to ProcessLoop untagged).
+    const u8 asc_tag_saved = split_enabled ? split->asc_tag : u8{0};
     // CP split: ASC packets are parsed on the front like the DCB. Their back work runs through
     // Call records (OnBack), including the pipeline lookup inside DispatchDirect/Indirect. A
     // Call is a full drain at every depth (the front stays parked until it returns), so this
@@ -11297,6 +11383,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     size_t acb_size = acb.size_bytes();
     while (!acb.empty()) {
         ProcessCommands();
+        if (g_asc_early && split_enabled) [[unlikely]] {
+            split->asc_tag = 1;
+        }
         if (g_xq && split_enabled) [[unlikely]] {
             split->note_queue = static_cast<u8>(std::min<u32>(vqid + 1, XqQueues - 1));
         }
@@ -11735,6 +11824,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
     }
 
+    if (split_enabled) {
+        split->asc_tag = asc_tag_saved;
+    }
     FIBER_EXIT;
 }
 

@@ -268,6 +268,18 @@ void Channel::Commit() {
     committed_pos = reserve_pos;
     committed_seq = emitted;
     record_open = false;
+    if (asc_tag != 0 && early_items) [[unlikely]] {
+        const auto* rh = reinterpret_cast<const RecordHeader*>(storage + (last_record_pos & mask));
+        const u64 tail = early_tail.load(std::memory_order_relaxed);
+        while (tail - early_head.load(std::memory_order_acquire) >= EarlySlots) {
+            // The back consumes the early queue at every record boundary; publish so it can.
+            ++early_full_waits;
+            Publish();
+            _mm_pause();
+        }
+        early_items[tail & (EarlySlots - 1)] = {last_record_pos, rh->seq, rh->type};
+        early_tail.store(tail + 1, std::memory_order_release);
+    }
     if (canon && canon_fn) [[unlikely]] {
         const auto* rh = reinterpret_cast<const RecordHeader*>(storage + (last_record_pos & mask));
         if (rh->type != RecordType::RegWrite) {

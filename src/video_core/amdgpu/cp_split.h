@@ -491,6 +491,23 @@ public:
     int NewestWriterQueue(VAddr lo);
     /// SHADPS4_XQ_CENSUS: the queue the front is parsing (set at the top of its packet loops).
     u8 note_queue{0};
+    /// SHADPS4_ASC_EARLY (compute lane step 0): records committed while the front parses an ASC
+    /// queue (asc_tag != 0) are pushed here in commit order; the back runs the eligible ones ahead
+    /// of the graphics backlog. Front: early_tail; back: early_head.
+    struct EarlyItem {
+        u64 pos;
+        u64 seq;
+        RecordType type;
+    };
+    static constexpr u64 EarlySlots = 16384;
+    std::unique_ptr<EarlyItem[]> early_items; ///< allocated by EnableEarly()
+    alignas(64) std::atomic<u64> early_tail{0};
+    alignas(64) std::atomic<u64> early_head{0};
+    u8 asc_tag{0};
+    u64 early_full_waits{0};
+    void EnableEarly() {
+        early_items = std::make_unique<EarlyItem[]>(EarlySlots);
+    }
     /// TASK_GUARD: counts a check under `reason`, forgets executed writes, and returns whether any
     /// noted write may still be outstanding (false: nothing to compare, no drain needed).
     bool BeginGuardCheck(DrainReason reason);
