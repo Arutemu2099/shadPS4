@@ -9112,8 +9112,12 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
             }
         }
         if (sec) {
-            Vulkan::A2::WriteSlots(*st.cmds); // the back's write, before the execute is submitted
-            sched.Record([sec](vk::CommandBuffer cmdbuf) { cmdbuf.executeCommands(sec); });
+            // p2c: the lane writes the slot words and drops the last StretchCmds reference (as
+            // Replay did) - on the back they cost ~0.3 ms per frame (s603).
+            sched.Record([cmds = st.cmds, sec](vk::CommandBuffer cmdbuf) {
+                Vulkan::A2::WriteSlots(*cmds);
+                cmdbuf.executeCommands(sec);
+            });
             const u64 n = sc[3].fetch_add(1, std::memory_order_relaxed) + 1;
             if ((n & 0xffff) == 0) {
                 LOG_INFO(Render, "A2 secondaries: recorded {} skipped (no pool {} l4g set {}) "
