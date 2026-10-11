@@ -1,6 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#ifdef _MSC_VER
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
+#include "common/scope_exit.h"
+#include <cstdlib>
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "common/fault_monitor.h"
@@ -502,7 +509,15 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
       swapchain{instance, window},
       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, liverpool)},
       texture_cache{rasterizer->GetTextureCache()} {
-    const u32 num_images = swapchain.GetImageCount();
+    // q5 (SHADPS4_PRESENT_FRAMES=N): more presentation frames than swapchain images, so the
+    // back's flip (PrepareFrame -> GetRenderFrame) does not wait for an older frame's GPU work.
+    const u32 num_images = [&] {
+        const char* e = std::getenv("SHADPS4_PRESENT_FRAMES");
+        const u32 want = e ? static_cast<u32>(std::atoi(e)) : 0u;
+        return std::clamp(want, swapchain.GetImageCount(), 8u);
+    }();
+    LOG_INFO(Render_Vulkan, "Presenter: {} presentation frames (swapchain images {})", num_images,
+             swapchain.GetImageCount());
     const vk::Device device = instance.GetDevice();
 
     // Create presentation frames.
@@ -698,11 +713,33 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
 
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
+    // q5: phase timers (find / update the display image, GetRenderFrame, the rest).
+    static std::array<u64, 5> q5{}; // frames, find, getframe, rest, max getframe
+    const u64 q5_t0 = __rdtsc();
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
     const auto image_id = texture_cache.FindImage(desc);
     texture_cache.UpdateImage(image_id);
+    const u64 q5_t1 = __rdtsc();
 
     Frame* frame = GetRenderFrame();
+    const u64 q5_t2 = __rdtsc();
+    SCOPE_EXIT {
+        const u64 t3 = __rdtsc();
+        ++q5[0];
+        q5[1] += q5_t1 - q5_t0;
+        q5[2] += q5_t2 - q5_t1;
+        q5[3] += t3 - q5_t2;
+        q5[4] = std::max(q5[4], q5_t2 - q5_t1);
+        if ((q5[0] & 1023) == 0) {
+            const double n = 1024.0 * 3.5e3; // cycles -> us at ~3.5 GHz, per frame
+            LOG_INFO(Render_Vulkan,
+                     "q5 PrepareFrame per flip (us, last 1024): find/update image {:.0f} "
+                     "GetRenderFrame {:.0f} (max {:.0f}) rest {:.0f}",
+                     double(q5[1]) / n, double(q5[2]) / n, double(q5[4]) / 3.5e3,
+                     double(q5[3]) / n);
+            q5[1] = q5[2] = q5[3] = q5[4] = 0;
+        }
+    };
 
     const auto frame_subresources = vk::ImageSubresourceRange{
         .aspectMask = vk::ImageAspectFlagBits::eColor,
