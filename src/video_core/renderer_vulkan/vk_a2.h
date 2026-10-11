@@ -206,6 +206,19 @@ struct StretchCmds {
 /// by the recording lane inside the stretch's render pass; after it the recorder's tracked
 /// pipeline / dynamic state / vertex input / descriptor state is unknown (the back invalidates).
 void Replay(const StretchCmds& cmds, vk::CommandBuffer cmdbuf, const Instance& instance);
+/// p2: Replay's two halves - the slot words into the job ring (host memory), and the commands
+/// with `set1` as the bindless set.
+void WriteSlots(const StretchCmds& cmds);
+void RecordBatches(const StretchCmds& cmds, vk::DescriptorSet set1, vk::CommandBuffer cmdbuf,
+                   const Instance& instance);
+/// SHADPS4_A2_SEC=1 (sec. 20 v1): workers record each stretch into a secondary command buffer.
+bool SecondaryMode();
+/// The back's current bindless set index (mirrored by Rasterizer for the workers).
+inline std::atomic<u32> g_bindless_cur{0};
+/// Counters: 0 secondaries recorded, 1 skipped (no free pool), 2 skipped (l4g committed set),
+/// 3 executed at publish, 4 closure (no secondary), 5 closure (set 1 moved), 6 closure
+/// (inheritance differs from the pass), 7 pool resets.
+inline std::array<std::atomic<u64>, 8> g_sec_c{};
 
 /// One stretch's output: what the back publishes at the stretch's first draw.
 struct Stretch {
@@ -225,6 +238,17 @@ struct Stretch {
     /// Formatted Guest slots' (V# address, V# size), distinct, at most 16: the back syncs each
     /// with its own typed lookup (A2SyncTexel) before the stretch's pass.
     std::vector<std::pair<VAddr, u64>> texel;
+    /// p2 (SHADPS4_A2_SEC): the worker's secondary (null: the closure path), the bindless set
+    /// index it binds, and its rendering inheritance.
+    const GraphicsPipeline* rt_pipe{};
+    vk::CommandBuffer secondary{};
+    u32 bl_idx{};
+    struct Inh {
+        u32 n_color{};
+        std::array<vk::Format, 8> color{};
+        vk::Format depth{vk::Format::eUndefined};
+        vk::Format stencil{vk::Format::eUndefined};
+    } inh{};
 };
 
 /// Context a translator gets (set up once per worker thread).

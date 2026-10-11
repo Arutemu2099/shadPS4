@@ -38,10 +38,12 @@ const bool g_pop_fastpath = [] {
 
 std::mutex Scheduler::submit_mutex;
 std::atomic<VkSemaphore> Scheduler::async_timeline{VK_NULL_HANDLE};
+static bool g_maintenance7 = false; // p2: set once in the constructor
 std::atomic<u64> Scheduler::async_submitted_tick{0};
 
 Scheduler::Scheduler(const Instance& instance, bool allow_recording_worker)
     : instance{instance}, master_semaphore{instance}, command_pool{instance, &master_semaphore} {
+    g_maintenance7 = instance.IsMaintenance7Supported();
 #if TRACY_GPU_ENABLED
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
 #endif
@@ -775,7 +777,17 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
                                    vk::ClearDepthStencilValue{.stencil = db.clear_value[1]}},
         };
 
+        // p2 (SHADPS4_A2_SEC + maintenance7): worker secondaries and inline draws in one pass.
+        static const bool sec_pass = [] {
+            const char* e = std::getenv("SHADPS4_A2_SEC");
+            return e && e[0] == '1';
+        }();
         const vk::RenderingInfo rendering_info = {
+            .flags = sec_pass && g_maintenance7
+                         ? static_cast<vk::RenderingFlags>(
+                               VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT |
+                               VK_RENDERING_CONTENTS_INLINE_BIT_KHR)
+                         : vk::RenderingFlags{},
             .renderArea =
                 {
                     .offset = {0, 0},

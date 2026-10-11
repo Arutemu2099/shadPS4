@@ -9086,9 +9086,46 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
         }
         lap(g_blc.pub_begin);
         auto& sched = rasterizer->GetScheduler();
-        sched.Record([cmds = st.cmds, inst = &rasterizer->A2Instance()](vk::CommandBuffer cmdbuf) {
-            Vulkan::A2::Replay(*cmds, cmdbuf, *inst);
-        });
+        // p2 (SHADPS4_A2_SEC): execute the worker's secondary when it fits this pass and set 1.
+        vk::CommandBuffer sec = st.secondary;
+        auto& sc = Vulkan::A2::g_sec_c;
+        if (!sec) {
+            if (Vulkan::A2::SecondaryMode()) {
+                sc[4].fetch_add(1, std::memory_order_relaxed);
+            }
+        } else if (colour && rasterizer->A2BindlessCur() != st.bl_idx) {
+            sc[5].fetch_add(1, std::memory_order_relaxed);
+            sec = vk::CommandBuffer{};
+        } else {
+            const auto& rs = sched.GetRenderState();
+            bool fits = rs.num_color_attachments == st.inh.n_color;
+            for (u32 i = 0; fits && i < st.inh.n_color; ++i) {
+                fits = bool(rs.color_attachments[i].image_view) ==
+                       (st.inh.color[i] != vk::Format::eUndefined);
+            }
+            const auto& db = rs.depth_stencil_attachment;
+            fits = fits && bool(db.has_depth) == (st.inh.depth != vk::Format::eUndefined) &&
+                   bool(db.has_stencil) == (st.inh.stencil != vk::Format::eUndefined);
+            if (!fits) {
+                sc[6].fetch_add(1, std::memory_order_relaxed);
+                sec = vk::CommandBuffer{};
+            }
+        }
+        if (sec) {
+            Vulkan::A2::WriteSlots(*st.cmds); // the back's write, before the execute is submitted
+            sched.Record([sec](vk::CommandBuffer cmdbuf) { cmdbuf.executeCommands(sec); });
+            const u64 n = sc[3].fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((n & 0xffff) == 0) {
+                LOG_INFO(Render, "A2 secondaries: recorded {} skipped (no pool {} l4g set {}) "
+                                 "executed {} closure (none {} set moved {} pass differs {}) "
+                                 "pool resets {}",
+                         sc[0].load(), sc[1].load(), sc[2].load(), sc[3].load(), sc[4].load(),
+                         sc[5].load(), sc[6].load(), sc[7].load());
+            }
+        } else {
+            sched.Record([cmds = st.cmds, inst = &rasterizer->A2Instance()](
+                             vk::CommandBuffer cmdbuf) { Vulkan::A2::Replay(*cmds, cmdbuf, *inst); });
+        }
         st.tick->store(sched.CurrentTick(), std::memory_order_release);
         rasterizer->A2EndStretch();
         lap(g_blc.pub_record);

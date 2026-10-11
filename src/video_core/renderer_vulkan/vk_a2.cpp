@@ -16,6 +16,7 @@
 #include "video_core/native_census.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_a2.h"
+#include "video_core/renderer_vulkan/vk_bindless.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
@@ -470,7 +471,20 @@ bool CommitSets(StretchCmds& cmds) {
     return true;
 }
 
+bool SecondaryMode() {
+    static const bool on = [] {
+        const char* e = std::getenv("SHADPS4_A2_SEC");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
 void Replay(const StretchCmds& cmds, vk::CommandBuffer cmdbuf, const Instance& instance) {
+    WriteSlots(cmds);
+    RecordBatches(cmds, cmds.bindless_set, cmdbuf, instance);
+}
+
+void WriteSlots(const StretchCmds& cmds) {
     // Colour draws: the back resolved every material of the stretch (mat_slots, bindless_set)
     // before recording this closure; write each draw's slot words into its job ring record
     // exactly as Rasterizer::BindlessRingWrite does (write-combined ring memory, 128-159).
@@ -482,6 +496,10 @@ void Replay(const StretchCmds& cmds, vk::CommandBuffer cmdbuf, const Instance& i
                         cmds.mat_slots[sw.mat].data(), sizeof(u32) * 2 * Shader::NativeBindlessMax);
         }
     }
+}
+
+void RecordBatches(const StretchCmds& cmds, vk::DescriptorSet set1, vk::CommandBuffer cmdbuf,
+                   const Instance& instance) {
     for (const auto& b : cmds.batches) {
         if (b.emit_pipeline) {
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, b.pipeline);
@@ -511,11 +529,10 @@ void Replay(const StretchCmds& cmds, vk::CommandBuffer cmdbuf, const Instance& i
                                         vk::ArrayProxy<const vk::WriteDescriptorSet>{
                                             b.num_writes, writes.data()});
         }
-        if (b.bindless && cmds.bindless_set) {
+        if (b.bindless && set1) {
             // The global image / sampler arrays (set 1) with the variant's layout, as the
             // back's native colour batch binds them (vk_rasterizer DrawTail, bl_set).
-            cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, b.layout, 1,
-                                      cmds.bindless_set, {});
+            cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, b.layout, 1, set1, {});
         }
         if (b.emit_vertex_input) {
             cmdbuf.setVertexInputEXT(
@@ -545,6 +562,21 @@ struct StretchTranslator::Impl {
     /// A region of `bytes` from the arena ring at `align`; never waits. False = none free.
     /// `start` = its unmasked start (the fence bookkeeping), `masked_off` its buffer offset.
     bool AllocRegion(u64 bytes, u64& start, u64& masked_off, u8*& ptr);
+
+    /// p2 (SHADPS4_A2_SEC): records the open stretch into a secondary (End()).
+    void RecordSecondary();
+    /// A secondary from this worker's pools, tied to `tick` for reuse; null if none is free.
+    vk::CommandBuffer AcquireSecondary(const std::shared_ptr<std::atomic<u64>>& tick);
+    struct SecPool {
+        vk::CommandPool pool{};
+        std::vector<vk::CommandBuffer> cbs;
+        u32 used{};
+        std::vector<std::shared_ptr<std::atomic<u64>>> ticks;
+    };
+    static constexpr u32 SecPools = 8, SecPerPool = 64;
+    std::array<SecPool, SecPools> sec_pools{};
+    u32 sec_cur{};
+    bool sec_on{};
 
     StretchTranslator* owner;
     WorkerContext ctx;
@@ -657,6 +689,20 @@ StretchTranslator::Impl::Impl(StretchTranslator* owner_, const WorkerContext& ct
         LOG_INFO(Render_Vulkan,
                  "A2 worker {}: translator on (arena {} MB, region {} B, align {}, colour {})",
                  ctx.worker_index, ArenaBytes >> 20, region_bytes, align, colour_on ? "on" : "off");
+        if (SecondaryMode() && ctx.instance->IsMaintenance7Supported()) {
+            const auto dev = ctx.instance->GetDevice();
+            for (auto& p : sec_pools) {
+                p.pool = dev.createCommandPool(vk::CommandPoolCreateInfo{
+                                                   .flags = vk::CommandPoolCreateFlagBits::eTransient,
+                                                   .queueFamilyIndex =
+                                                       ctx.instance->GetGraphicsQueueFamilyIndex(),
+                                               })
+                             .value;
+            }
+            sec_on = true;
+            LOG_INFO(Render_Vulkan, "A2 worker {}: secondaries on ({} pools x {})",
+                     ctx.worker_index, SecPools, SecPerPool);
+        }
     } else {
         LOG_INFO(Render_Vulkan, "A2 worker {}: translator off ({})", ctx.worker_index, why);
     }
@@ -1331,6 +1377,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         if (first_batch) {
             stretch = std::make_unique<Stretch>();
             stretch->first_seq = draw.seq;
+            stretch->rt_pipe = native; // p2: the pass formats of the secondary's inheritance
             stretch->tick = std::make_shared<std::atomic<u64>>(0);
             stretch->buf_gen = ctx.buffer_cache->StructGeneration();
             cmds = std::make_shared<StretchCmds>();
@@ -1547,10 +1594,119 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     return true;
 }
 
+vk::CommandBuffer StretchTranslator::Impl::AcquireSecondary(
+    const std::shared_ptr<std::atomic<u64>>& tick) {
+    SecPool* p = &sec_pools[sec_cur];
+    if (p->used >= SecPerPool) {
+        // The next pool: reusable once every stretch recorded from it is past its batch.
+        const u32 next = (sec_cur + 1) % SecPools;
+        SecPool& np = sec_pools[next];
+        if (!np.ticks.empty()) {
+            const u64 known = ctx.scheduler->GetMasterSemaphore()->KnownGpuTick();
+            for (const auto& t : np.ticks) {
+                const u64 v = t->load(std::memory_order_acquire);
+                if (v == 0 || v > known) {
+                    return {}; // busy: the closure path (never wait)
+                }
+            }
+            ctx.instance->GetDevice().resetCommandPool(np.pool);
+            np.ticks.clear();
+            ++g_sec_c[7];
+        }
+        np.used = 0;
+        sec_cur = next;
+        p = &np;
+    }
+    if (p->used == p->cbs.size()) {
+        auto [r, cbs] = ctx.instance->GetDevice().allocateCommandBuffers(
+            vk::CommandBufferAllocateInfo{
+                .commandPool = p->pool,
+                .level = vk::CommandBufferLevel::eSecondary,
+                .commandBufferCount = 1,
+            });
+        if (r != vk::Result::eSuccess || cbs.empty()) {
+            return {};
+        }
+        p->cbs.push_back(cbs[0]);
+    }
+    p->ticks.push_back(tick);
+    return p->cbs[p->used++];
+}
+
+void StretchTranslator::Impl::RecordSecondary() {
+    if (!sec_on || !stretch || !cmds || !stretch->rt_pipe || cmds->batches.empty()) {
+        return;
+    }
+    for (const auto& b : cmds->batches) {
+        if (b.set_owner) {
+            ++g_sec_c[2]; // l4g: the back commits that set at publish
+            return;
+        }
+    }
+    const vk::CommandBuffer cb = AcquireSecondary(stretch->tick);
+    if (!cb) {
+        ++g_sec_c[1];
+        return;
+    }
+    // The pass's formats from the pipeline key (as GraphicsPipeline's PipelineRenderingCreateInfo).
+    const Instance& inst = *ctx.instance;
+    const auto& key = stretch->rt_pipe->GetGraphicsKey();
+    Stretch::Inh inh{};
+    inh.n_color = std::min<u32>(key.num_color_attachments, 8);
+    for (u32 i = 0; i < inh.n_color; ++i) {
+        const auto& col = key.color_buffers[i];
+        inh.color[i] = inst.GetSupportedFormat(
+            LiverpoolToVK::SurfaceFormat(col.data_format, col.num_format),
+            vk::FormatFeatureFlagBits2::eColorAttachment);
+    }
+    const auto depth_format =
+        inst.GetSupportedFormat(LiverpoolToVK::DepthFormat(key.z_format, key.stencil_format),
+                                vk::FormatFeatureFlagBits2::eDepthStencilAttachment);
+    inh.depth = key.z_format != AmdGpu::DepthBuffer::ZFormat::Invalid ? depth_format
+                                                                       : vk::Format::eUndefined;
+    inh.stencil = key.stencil_format != AmdGpu::DepthBuffer::StencilFormat::Invalid
+                      ? depth_format
+                      : vk::Format::eUndefined;
+    std::array<vk::SampleCountFlagBits, AmdGpu::NUM_COLOR_BUFFERS> color_samples;
+    std::ranges::transform(key.color_samples, color_samples.begin(), [&inst](u8 n) {
+        return n ? LiverpoolToVK::NumSamples(n, inst.GetColorSampleCounts())
+                 : vk::SampleCountFlagBits::e1;
+    });
+    const vk::AttachmentSampleCountInfoAMD mixed = {
+        .colorAttachmentCount = inh.n_color,
+        .pColorAttachmentSamples = color_samples.data(),
+        .depthStencilAttachmentSamples =
+            LiverpoolToVK::NumSamples(key.depth_samples, inst.GetDepthSampleCounts()),
+    };
+    const vk::CommandBufferInheritanceRenderingInfo rinfo = {
+        .pNext = inst.IsMixedDepthSamplesSupported() ? &mixed : nullptr,
+        .colorAttachmentCount = inh.n_color,
+        .pColorAttachmentFormats = inh.color.data(),
+        .depthAttachmentFormat = inh.depth,
+        .stencilAttachmentFormat = inh.stencil,
+        .rasterizationSamples = LiverpoolToVK::NumSamples(
+            key.num_samples, inst.GetColorSampleCounts() & inst.GetDepthSampleCounts()),
+    };
+    const vk::CommandBufferInheritanceInfo info = {.pNext = &rinfo};
+    const u32 cur = g_bindless_cur.load(std::memory_order_acquire) % Bindless::NumSets;
+    (void)cb.begin(vk::CommandBufferBeginInfo{
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit |
+                 vk::CommandBufferUsageFlagBits::eRenderPassContinue,
+        .pInheritanceInfo = &info,
+    });
+    RecordBatches(*cmds, Bindless::G().sets[cur], cb, inst);
+    (void)cb.end();
+    stretch->secondary = cb;
+    stretch->bl_idx = cur;
+    stretch->inh = inh;
+    ++g_sec_c[0];
+}
+
 std::unique_ptr<Stretch> StretchTranslator::Impl::End() {
     if (!stretch) {
         return nullptr;
     }
+    RecordSecondary();
     stretch->arena_end = ctx.arena->head;
     ctx.arena->fences.push_back({stretch_start, ctx.arena->head, stretch->tick});
     batch_open = false;

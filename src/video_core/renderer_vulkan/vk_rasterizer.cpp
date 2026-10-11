@@ -5510,6 +5510,7 @@ bool Rasterizer::BindlessRotate() {
         return false;
     }
     bl.cur = next;
+    A2::g_bindless_cur.store(next, std::memory_order_release); // p2: the workers' secondaries
     bl.img_next = bl.smp_next = 0;
     bl.view_slot.clear();
     bl.smp_slot.clear();
