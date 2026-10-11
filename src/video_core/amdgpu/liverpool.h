@@ -227,6 +227,9 @@ public:
     }
     /// SHADPS4_CP_SPLIT_TASK_GUARD census (l3n): what the front's faults read.
     void NoteFrontFault(VAddr addr, u64 size, bool read);
+    /// SHADPS4_CP_SPLIT_WAIT_BARRIER (l3n2): posts a Call that records Rasterizer::WaitBarrier at
+    /// this stream position. `kind` 0 = POST_ORDER forward, 1 = FENCE_FORWARD skip (counters).
+    void PostWaitBarrier(u32 kind);
 
     struct AscQueueInfo {
         static constexpr size_t Pm4BufferSize = 1024;

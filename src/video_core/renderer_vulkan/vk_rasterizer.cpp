@@ -1546,6 +1546,18 @@ void Rasterizer::CpSync() {
                            vk::DependencyFlagBits::eByRegion, ib_barrier, {}, {});
 }
 
+void Rasterizer::WaitBarrier() {
+    scheduler.EndRendering();
+    auto command_access = scheduler.AcquireCommandBuffer();
+    auto cmdbuf = command_access.Handle();
+    const vk::MemoryBarrier barrier{
+        .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
+        .dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+    };
+    cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                           vk::PipelineStageFlagBits::eAllCommands, {}, barrier, {}, {});
+}
+
 Rasterizer::DrawClass Rasterizer::ClassifyDraw(const AmdGpu::Regs& regs) {
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::EliminateFastClear) {
         return DrawClass::EliminateFastClear;

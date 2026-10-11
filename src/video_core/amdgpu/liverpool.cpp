@@ -1910,7 +1910,12 @@ struct WrmCensus {
         partial_waits{};
     std::atomic<CpSplit::Channel*> ch{}; ///< the front's channel, for the drain probe at log time
 } g_wrm;
-enum class WrmPre { Full, Passed, VoWait };
+enum class WrmPre { Full, Passed, VoWait, PassedFwdFence };
+const int g_wait_barrier = [] {
+    const char* v = std::getenv("SHADPS4_CP_SPLIT_WAIT_BARRIER");
+    return v && v[0] >= '1' && v[0] <= '2' ? v[0] - '0' : 0;
+}();
+std::array<std::atomic<u64>, 2> g_wait_barriers{};
 bool WaitPassesWith(const PM4CmdWaitRegMem* w, u32 value); // defined with FENCE_FORWARD
 const bool g_post_order = [] {
     const char* v = std::getenv("SHADPS4_CP_SPLIT_POST_ORDER");
@@ -1970,17 +1975,18 @@ WrmPre WrmPartial(CpSplit::Channel& ch, const PM4CmdWaitRegMem* w, bool vo_label
         add(g_wrm.fallback[k], 1);
         return WrmPre::Full;
     }
-    bool fwd = false;
+    bool fwd = false, fwd_fence = false;
     u32 fwd_value = 0;
     if (k == 0 && g_post_order) {
         // SHADPS4_CP_SPLIT_POST_ORDER: the newest logged writer's value passes the test - an
         // ordering point only; the back's stream order runs the write before what follows.
         u64 fseq = 0;
-        fwd = ch.NewestWriteValue(lo, fseq, fwd_value) && fseq == seq && WaitPassesWith(w, fwd_value);
+        fwd = ch.NewestWriteValue(lo, fseq, fwd_value, fwd_fence) && fseq == seq &&
+              WaitPassesWith(w, fwd_value);
         if (fwd && g_a2 != 2) {
             add(g_po.forwarded, 1);
             add(g_wrm.passed[0], 1);
-            return WrmPre::Passed;
+            return fwd_fence ? WrmPre::PassedFwdFence : WrmPre::Passed;
         }
     }
     if (k == 0) {
@@ -2002,7 +2008,7 @@ WrmPre WrmPartial(CpSplit::Channel& ch, const PM4CmdWaitRegMem* w, bool vo_label
     }
     if (w->Test(regs)) {
         add(g_wrm.passed[k], 1);
-        return WrmPre::Passed;
+        return fwd && fwd_fence ? WrmPre::PassedFwdFence : WrmPre::Passed; // A2=2 keeps the barrier
     }
     if (vo_label) {
         add(g_wrm.vo_waits, 1);
@@ -2184,12 +2190,15 @@ void LeanLog() {
                 LOG_INFO(Render,
                          "POST_ORDER: idle tails posted {:.0f}/s | PFP_SYNC_ME posted {:.0f}/s | "
                          "ZPASS_DONE posted {:.0f}/s (buffer-guarded {:.0f}/s) | waits forwarded "
+                         "{:.0f}/s | wait barriers (mode {}) POST_ORDER {:.0f}/s FENCE_FORWARD "
                          "{:.0f}/s | A2=2 forwarded-value compares {} BAD {} | front faults read: "
                          "span {} label {} logged {} other {} | invalidate: span {} label {} logged "
                          "{} other {}",
                          double(tk2(g_po.idle_posted)) * ps, double(tk2(g_po.pfp_posted)) * ps,
                          double(tk2(g_po.zpass_posted)) * ps, double(tk2(g_po.zpass_guarded)) * ps,
-                         double(tk2(g_po.forwarded)) * ps, tk2(g_po.fwd_cmp), g_po.fwd_bad.load(),
+                         double(tk2(g_po.forwarded)) * ps, g_wait_barrier,
+                         double(tk2(g_wait_barriers[0])) * ps, double(tk2(g_wait_barriers[1])) * ps,
+                         tk2(g_po.fwd_cmp), g_po.fwd_bad.load(),
                          tk2(g_po.fault[0]), tk2(g_po.fault[1]), tk2(g_po.fault[2]),
                          tk2(g_po.fault[3]), tk2(g_po.fault[4]), tk2(g_po.fault[5]),
                          tk2(g_po.fault[6]), tk2(g_po.fault[7]));
@@ -5618,6 +5627,20 @@ void Liverpool::RunGfxDma(const PM4Header* header, bool guest_markers_enabled,
     split->PostRunAhead(CpSplit::PostKind::GfxPacket);
 }
 
+void Liverpool::PostWaitBarrier(u32 kind) {
+    auto* call = split->Reserve<CpSplit::CallPayload>(CpSplit::RecordType::Call);
+    call->invoke = [](void* context) {
+        auto* lp = static_cast<Liverpool*>(context);
+        if (lp->rasterizer) {
+            lp->rasterizer->WaitBarrier();
+        }
+    };
+    call->context = this;
+    split->Commit();
+    split->PostRunAhead(CpSplit::PostKind::Fence);
+    g_wait_barriers[kind].fetch_add(1, std::memory_order_relaxed);
+}
+
 void Liverpool::NoteFrontFault(VAddr addr, u64 size, bool read) {
     if (!split_task_guard) {
         return;
@@ -5993,7 +6016,7 @@ void Liverpool::RunFence(const PM4Header* header, std::span<const u32> rest, VAd
                 WaitPassesWith(w, write->value)) {
                 g_fwd[key] = {next, label, write->value};
                 ++g_fwd_stats.posted;
-                split->NotePostedWrite(label, write->width, true, write->value);
+                split->NotePostedWrite(label, write->width, true, write->value, true);
                 split->PostRunAhead(CpSplit::PostKind::Fence);
                 split->MaybeLog();
                 return;
@@ -6025,7 +6048,7 @@ void Liverpool::RunFence(const PM4Header* header, std::span<const u32> rest, VAd
         return;
     }
     if (const auto fw = FenceValue(header); fw && FenceAtGpu() == 0) {
-        split->NotePostedWrite(label, LabelBytes, true, fw->value);
+        split->NotePostedWrite(label, LabelBytes, true, fw->value, true);
     } else {
         split->NotePostedWrite(label, LabelBytes);
     }
@@ -10847,6 +10870,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // instead and allow other tasks to run.
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
                 if (g_fence_forward && split_enabled && ForwardedWait(0, header)) {
+                    if (g_wait_barrier >= 2) {
+                        PostWaitBarrier(1);
+                    }
                     break; // SHADPS4_FENCE_FORWARD: passes in stream order on the fence's value
                 }
                 const bool vo_wait = vo_port->IsVoLabel(wait_addr) &&
@@ -10854,6 +10880,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const WrmPre pre = split_enabled && split_task_guard
                                        ? WrmPartial(*split, wait_reg_mem, vo_wait, regs.reg_array)
                                        : WrmPre::Full;
+                if (pre == WrmPre::PassedFwdFence) {
+                    if (g_wait_barrier >= 1) {
+                        PostWaitBarrier(0);
+                    }
+                    break; // SHADPS4_CP_SPLIT_POST_ORDER: forwarded on an end-of-pipe label
+                }
                 if (pre == WrmPre::Passed) {
                     break; // SHADPS4_WRM_PARTIAL: passed after the label's own last write
                 }
@@ -11456,11 +11488,19 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
             if (g_fence_forward && split_enabled && ForwardedWait(1 + (queue.pipe_id & 0xff), header)) {
+                if (g_wait_barrier >= 2) {
+                    PostWaitBarrier(1);
+                }
                 break; // SHADPS4_FENCE_FORWARD (ASC)
             }
-            if (split_enabled && split_task_guard &&
-                WrmPartial(*split, wait_reg_mem, false, regs.reg_array) == WrmPre::Passed) {
-                break; // SHADPS4_WRM_PARTIAL (ASC)
+            if (split_enabled && split_task_guard) {
+                const WrmPre pre = WrmPartial(*split, wait_reg_mem, false, regs.reg_array);
+                if (pre == WrmPre::PassedFwdFence && g_wait_barrier >= 1) {
+                    PostWaitBarrier(0);
+                }
+                if (pre == WrmPre::Passed || pre == WrmPre::PassedFwdFence) {
+                    break; // SHADPS4_WRM_PARTIAL / POST_ORDER (ASC)
+                }
             }
             const auto wrm_start = Common::FaultMonitor::Now();
             const u64 wrm_ns0 = g_cp_wait.enabled ? CpWaitStats::Now() : 0;

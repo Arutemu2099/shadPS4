@@ -343,7 +343,7 @@ void Channel::PrunePostedWrites(u64 done) {
     }
 }
 
-void Channel::NotePostedWrite(VAddr dst, u64 bytes, bool has_value, u32 value) {
+void Channel::NotePostedWrite(VAddr dst, u64 bytes, bool has_value, u32 value, bool fence) {
     ASSERT(!record_open);
     if (bytes == 0) {
         return;
@@ -358,7 +358,7 @@ void Channel::NotePostedWrite(VAddr dst, u64 bytes, bool has_value, u32 value) {
         ++counters.write_log_overflows;
     }
     posted_writes[pw_tail & (PostedWriteSlots - 1)] =
-        PostedWrite{committed_seq, dst, dst + bytes, value, has_value && bytes >= 4};
+        PostedWrite{committed_seq, dst, dst + bytes, value, has_value && bytes >= 4, fence};
     ++pw_tail;
     counters.write_log_max = std::max(counters.write_log_max, pw_tail - pw_head);
 }
@@ -406,7 +406,7 @@ u64 Channel::OutstandingWriteSeq(VAddr lo, VAddr hi) {
     return seq;
 }
 
-bool Channel::NewestWriteValue(VAddr lo, u64& seq, u32& value) {
+bool Channel::NewestWriteValue(VAddr lo, u64& seq, u32& value, bool& fence) {
     const u64 done = done_seq.load(std::memory_order_acquire);
     PrunePostedWrites(done);
     if (pw_overflow_seq > done) {
@@ -424,6 +424,7 @@ bool Channel::NewestWriteValue(VAddr lo, u64& seq, u32& value) {
     }
     seq = newest->seq;
     value = newest->value;
+    fence = newest->fence;
     return true;
 }
 

@@ -353,6 +353,9 @@ public:
     }
 
     void CpSync();
+    /// SHADPS4_CP_SPLIT_WAIT_BARRIER: a skipped guest wait on an end-of-pipe label - every earlier
+    /// command's memory writes are visible to every later command.
+    void WaitBarrier();
     u64 Flush();
     void Finish();
     /// SHADPS4_FENCE_AT_GPU: run `func` on the scheduler's priority thread once the host GPU has
