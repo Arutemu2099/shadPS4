@@ -778,6 +778,7 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, InvalidateOrigin
     if (!IsRegionRegistered(device_addr, size)) {
         return;
     }
+    Common::FaultMonitor::t_fault_class |= 1; // SHADPS4_GAME_MAIN_CENSUS
     // SHADPS4_HEAP_WRITE_BLOCK=<bytes> (2026-10-08, notes/zero-copy-build-2026-10-07.md sec. 5-6):
     // a guest write fault inside the game's per-frame heap span (SHADPS4_HEAP_WRITE_RANGE=lo-hi
     // hex, default 248000000-269e00000) unprotects and dirties its whole block, not one 4 KB
@@ -856,6 +857,7 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, InvalidateOrigin
     const bool widened = memory_tracker->InvalidateRegion(
         device_addr, size, from_guest_fault,
         [this, device_addr, size, offload_write] {
+            Common::FaultMonitor::t_fault_class |= 2; // SHADPS4_GAME_MAIN_CENSUS: readback
             ReadMemory(device_addr, size, true, offload_write);
         },
         block_bytes);

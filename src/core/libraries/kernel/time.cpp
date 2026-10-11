@@ -4,6 +4,7 @@
 #include <ctime>
 #include <thread>
 
+#include "common/fault_monitor.h"
 #include "common/assert.h"
 #include "common/native_clock.h"
 #include "common/thread.h"
@@ -73,10 +74,12 @@ static s32 posix_nanosleep_impl(const OrbisKernelTimespec* rqtp, OrbisKernelTime
 }
 
 s32 PS4_SYSV_ABI posix_nanosleep(const OrbisKernelTimespec* rqtp, OrbisKernelTimespec* rmtp) {
+    Common::FaultMonitor::GameMainWaitScope gm_wait{4};
     return posix_nanosleep_impl(rqtp, rmtp, true);
 }
 
 s32 PS4_SYSV_ABI sceKernelNanosleep(const OrbisKernelTimespec* rqtp, OrbisKernelTimespec* rmtp) {
+    Common::FaultMonitor::GameMainWaitScope gm_wait{4};
     if (const auto ret = posix_nanosleep_impl(rqtp, rmtp, false); ret < 0) {
         return ErrnoToSceKernelError(*__Error());
     }

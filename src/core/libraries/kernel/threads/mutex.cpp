@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <thread>
+#include "common/fault_monitor.h"
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/types.h"
@@ -259,6 +260,7 @@ s32 PS4_SYSV_ABI posix_pthread_mutex_trylock(PthreadMutexT* mutex) {
 }
 
 s32 PS4_SYSV_ABI posix_pthread_mutex_lock(PthreadMutexT* mutex) {
+    Common::FaultMonitor::GameMainWaitScope gm_wait{5};
     CHECK_AND_INIT_MUTEX
     return (*mutex)->Lock(nullptr);
 }

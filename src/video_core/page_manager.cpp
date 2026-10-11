@@ -385,11 +385,19 @@ struct PageManager::Impl {
             }
             // A fault taken by the CP itself is part of the command stream it is executing, so
             // only guest threads' faults may be deferred (submit_epoch.h).
+            const bool census = Common::FaultMonitor::GameMainCensus();
+            const u64 c0 = census ? Common::FaultMonitor::CensusTicks() : 0;
+            Common::FaultMonitor::t_fault_class = 0;
             const bool handled = rasterizer->InvalidateMemory(
                 addr, 8,
                 Common::FaultMonitor::t_is_cp_thread || Common::FaultMonitor::t_acting_cp
                     ? VideoCore::InvalidateOrigin::CpWriteFault
                     : VideoCore::InvalidateOrigin::GuestWriteFault);
+            if (census) {
+                Common::FaultMonitor::NoteWriteFaultCensus(
+                    addr, Common::FaultMonitor::CensusTicks() - c0,
+                    Common::FaultMonitor::t_fault_class);
+            }
             Common::ReadbackOffload::t_read_fault_rip = 0;
             Common::FaultMonitor::CountGuestWriteFault(handled,
                                                        Common::FaultMonitor::SinceNs(start));

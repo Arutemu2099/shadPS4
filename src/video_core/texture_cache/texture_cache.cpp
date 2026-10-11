@@ -328,6 +328,18 @@ static bool UntrackOutsideEnabled() {
 void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     const auto pages_start = PageManager::GetPageAddr(addr);
     const auto pages_end = PageManager::GetNextPageAddr(addr + size - 1);
+    if (Common::FaultMonitor::GameMainCensus()) {
+        const u64 first = pages_start >> Traits::PageBits;
+        const u64 last = (pages_end - 1) >> Traits::PageBits;
+        if (last < (1ULL << (Traits::AddressSpaceBits - Traits::PageBits))) {
+            for (u64 page = first; page <= last; ++page) {
+                if (page_image_counts[page].load(std::memory_order_acquire) != 0) {
+                    Common::FaultMonitor::t_fault_class |= 4;
+                    break;
+                }
+            }
+        }
+    }
     // Every guest write fault lands here and used to take the mutex FindImage takes ~30k times
     // a frame on the CP, even for pages no image touches. Reading a zero count is equivalent to
     // having taken the mutex just before a concurrent registration, which the locked path

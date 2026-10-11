@@ -84,6 +84,28 @@ extern std::atomic<u64> cp_write_faults;
 extern std::atomic<u64> cp_write_ns;
 
 inline thread_local bool t_is_cp_thread = false;
+
+/// SHADPS4_GAME_MAIN_CENSUS=1 (gmc, 2026-10-10 night): Game:Main's time split.
+bool GameMainCensus();
+inline thread_local bool t_is_game_main = false;
+/// Owner bits of the write fault being handled: 1 buffer cache, 2 readback download, 4 texture.
+inline thread_local u8 t_fault_class = 0;
+void MarkGameMainThread();
+u64 CensusTicks();
+void NoteWriteFaultCensus(u64 addr, u64 ticks, u8 cls);
+void NoteGameMainWait(u32 kind, u64 ticks);
+void GameMainCensusMaybeLog();
+/// 0 equeue, 1 cond var, 2 event flag, 3 semaphore, 4 sleep, 5 mutex, 6 join.
+struct GameMainWaitScope {
+    u32 kind;
+    u64 t0;
+    explicit GameMainWaitScope(u32 k) : kind(k), t0(t_is_game_main && GameMainCensus() ? CensusTicks() : 0) {}
+    ~GameMainWaitScope() {
+        if (t0 != 0) {
+            NoteGameMainWait(kind, CensusTicks() - t0);
+        }
+    }
+};
 inline void MarkCpThread() {
     t_is_cp_thread = true;
 }

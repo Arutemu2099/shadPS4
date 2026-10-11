@@ -21,6 +21,12 @@
 #endif
 
 #include <immintrin.h>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include "common/fault_monitor.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
@@ -594,6 +600,152 @@ std::ofstream OpenCsv() {
     return csv;
 }
 
+} // namespace (ReportLoop helpers; gmc census below is public)
+
+namespace {
+struct GmCensus {
+    std::array<std::atomic<u64>, 8> wait_ticks{}, wait_n{};
+    std::array<std::atomic<u64>, 8> gm_fault_n{}, gm_fault_ticks{}, all_fault_n{}, all_fault_ticks{};
+    std::mutex page_mutex;
+    u64 frame{~0ULL};
+    std::unordered_set<u64> gm_pages, all_pages;
+    u64 gm_pages_sum{}, all_pages_sum{}, frames{};
+    void* thread{};
+} g_gm;
+} // namespace
+
+bool GameMainCensus() {
+    static const bool on = [] {
+        const char* v = std::getenv("SHADPS4_GAME_MAIN_CENSUS");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+
+u64 CensusTicks() {
+    return __rdtsc();
+}
+
+void MarkGameMainThread() {
+    t_is_game_main = true;
+#ifdef _WIN32
+    HANDLE h{};
+    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h,
+                    THREAD_QUERY_LIMITED_INFORMATION, FALSE, 0);
+    g_gm.thread = h;
+#endif
+}
+
+void NoteGameMainWait(u32 kind, u64 ticks) {
+    g_gm.wait_ticks[kind & 7].fetch_add(ticks, std::memory_order_relaxed);
+    g_gm.wait_n[kind & 7].fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteWriteFaultCensus(u64 addr, u64 ticks, u8 cls) {
+    const u32 c = cls & 7;
+    g_gm.all_fault_n[c].fetch_add(1, std::memory_order_relaxed);
+    g_gm.all_fault_ticks[c].fetch_add(ticks, std::memory_order_relaxed);
+    if (t_is_game_main) {
+        g_gm.gm_fault_n[c].fetch_add(1, std::memory_order_relaxed);
+        g_gm.gm_fault_ticks[c].fetch_add(ticks, std::memory_order_relaxed);
+    }
+    const u64 frame = presented_frames.load(std::memory_order_relaxed);
+    std::scoped_lock lk{g_gm.page_mutex};
+    if (frame != g_gm.frame) {
+        if (g_gm.frame != ~0ULL) {
+            g_gm.gm_pages_sum += g_gm.gm_pages.size();
+            g_gm.all_pages_sum += g_gm.all_pages.size();
+            ++g_gm.frames;
+        }
+        g_gm.frame = frame;
+        g_gm.gm_pages.clear();
+        g_gm.all_pages.clear();
+    }
+    g_gm.all_pages.insert(addr >> 12);
+    if (t_is_game_main) {
+        g_gm.gm_pages.insert(addr >> 12);
+    }
+}
+
+void GameMainCensusMaybeLog() {
+    if (!GameMainCensus()) {
+        return;
+    }
+    static u64 last_tsc = 0, last_cpu_100ns = 0;
+    const u64 now = __rdtsc();
+    if (last_tsc == 0) {
+        last_tsc = now;
+        return;
+    }
+    const double sec = double(now - last_tsc) / 3.5e9;
+    if (sec < 10.0) {
+        return;
+    }
+    last_tsc = now;
+    double cpu_ms = -1.0;
+#ifdef _WIN32
+    if (g_gm.thread) {
+        FILETIME c, e, k, u;
+        if (GetThreadTimes(static_cast<HANDLE>(g_gm.thread), &c, &e, &k, &u)) {
+            const u64 t = ((u64(k.dwHighDateTime) << 32) | k.dwLowDateTime) +
+                          ((u64(u.dwHighDateTime) << 32) | u.dwLowDateTime);
+            if (last_cpu_100ns != 0) {
+                cpu_ms = double(t - last_cpu_100ns) / 1e4 / sec;
+            }
+            last_cpu_100ns = t;
+        }
+    }
+#endif
+    const auto ms = [&](std::atomic<u64>& a) { return double(a.exchange(0)) / 3.5e6 / sec; };
+    const auto per = [&](std::atomic<u64>& a) { return double(a.exchange(0)) / sec; };
+    std::string waits;
+    static constexpr const char* names[] = {"equeue", "cond", "evflag", "sema", "sleep", "mutex", "join", "-"};
+    double wait_total = 0.0;
+    for (u32 i = 0; i < 7; ++i) {
+        const double n = per(g_gm.wait_n[i]);
+        const double m = ms(g_gm.wait_ticks[i]);
+        wait_total += m;
+        waits += fmt::format(" {} {:.1f} ms/s ({:.0f}/s)", names[i], m, n);
+    }
+    std::string gm_cls, all_cls;
+    double gm_fault_ms = 0.0, gm_fault_n = 0.0, all_fault_ms = 0.0, all_fault_n = 0.0;
+    static constexpr const char* cls_names[] = {"none", "buffer", "readback", "buffer+readback",
+                                                "texture", "buffer+texture", "readback+texture",
+                                                "all"};
+    for (u32 i = 0; i < 8; ++i) {
+        const double gn = per(g_gm.gm_fault_n[i]), gm = ms(g_gm.gm_fault_ticks[i]);
+        const double an = per(g_gm.all_fault_n[i]), am = ms(g_gm.all_fault_ticks[i]);
+        gm_fault_ms += gm;
+        gm_fault_n += gn;
+        all_fault_ms += am;
+        all_fault_n += an;
+        if (an > 0.0) {
+            gm_cls += fmt::format(" {} {:.0f}/s {:.1f}us", cls_names[i], gn, gn > 0 ? gm * 1e3 / gn : 0.0);
+            all_cls += fmt::format(" {} {:.0f}/s {:.1f}us", cls_names[i], an, an > 0 ? am * 1e3 / an : 0.0);
+        }
+    }
+    double gm_pages = 0.0, all_pages = 0.0;
+    {
+        std::scoped_lock lk{g_gm.page_mutex};
+        if (g_gm.frames != 0) {
+            gm_pages = double(g_gm.gm_pages_sum) / double(g_gm.frames);
+            all_pages = double(g_gm.all_pages_sum) / double(g_gm.frames);
+        }
+        g_gm.gm_pages_sum = g_gm.all_pages_sum = g_gm.frames = 0;
+    }
+    LOG_INFO(Render,
+             "GameMain census: window {:.1f}s | Game:Main CPU {:.0f} ms/s, blocked {:.0f} ms/s | "
+             "waits{} | total timed waits {:.0f} ms/s | write faults on Game:Main {:.0f}/s = "
+             "{:.1f} ms/s ({:.1f} us each), by owner:{} | all guest threads {:.0f}/s = {:.1f} ms/s "
+             "({:.1f} us each), by owner:{} | distinct faulting pages per frame: Game:Main {:.0f}, "
+             "all {:.0f} | Game:Main rest (CPU - write faults) {:.0f} ms/s",
+             sec, cpu_ms, cpu_ms >= 0 ? 1000.0 - cpu_ms : -1.0, waits, wait_total, gm_fault_n,
+             gm_fault_ms, gm_fault_n > 0 ? gm_fault_ms * 1e3 / gm_fault_n : 0.0, gm_cls,
+             all_fault_n, all_fault_ms, all_fault_n > 0 ? all_fault_ms * 1e3 / all_fault_n : 0.0,
+             all_cls, gm_pages, all_pages, cpu_ms >= 0 ? cpu_ms - gm_fault_ms : -1.0);
+}
+
+namespace {
 #if defined(__clang__)
 // Keep this collection hook out of profiles in both training and profile-use builds.
 __attribute__((no_profile_instrument_function))
@@ -933,6 +1085,7 @@ void ReportLoop() {
         if (d_read > 0) {
             LOG_INFO(Render, "FaultPages: {}", TopReadFaultPages(6));
         }
+        GameMainCensusMaybeLog();
         if (VideoCore::g_epoch_defer_upload && d_frames > 0) {
             static u64 prev_epoch = 0, prev_syncs = 0, prev_pages = 0;
             const u64 epoch = VideoCore::g_submit_epoch.load(std::memory_order_relaxed);

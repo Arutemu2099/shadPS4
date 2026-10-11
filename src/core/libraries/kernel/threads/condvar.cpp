@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include "common/fault_monitor.h"
 #include "common/assert.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/posix_error.h"
@@ -197,6 +198,7 @@ int PthreadCond::Wait(PthreadMutexT* mutex, const OrbisKernelTimespec* abstime, 
 }
 
 int PS4_SYSV_ABI posix_pthread_cond_wait(PthreadCondT* cond, PthreadMutexT* mutex) {
+    Common::FaultMonitor::GameMainWaitScope gm_wait{1};
     PthreadCond* cvp{};
     CHECK_AND_INIT_COND
     return cvp->Wait(mutex, nullptr);
@@ -209,6 +211,7 @@ int PS4_SYSV_ABI posix_pthread_cond_timedwait(PthreadCondT* cond, PthreadMutexT*
         return POSIX_EINVAL;
     }
 
+    Common::FaultMonitor::GameMainWaitScope gm_wait{1};
     PthreadCond* cvp{};
     CHECK_AND_INIT_COND
     return cvp->Wait(mutex, abstime);

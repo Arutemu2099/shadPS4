@@ -6,6 +6,7 @@
 #include <mutex>
 #include <semaphore>
 
+#include "common/fault_monitor.h"
 #include "core/libraries/kernel/sync/semaphore.h"
 
 #include "common/logging/log.h"
@@ -325,6 +326,7 @@ s32 PS4_SYSV_ABI sceKernelCreateSema(OrbisKernelSema* sem, const char* pName, u3
 }
 
 s32 PS4_SYSV_ABI sceKernelWaitSema(OrbisKernelSema sem, s32 needCount, u32* pTimeout) {
+    Common::FaultMonitor::GameMainWaitScope gm_wait{3};
     if (!orbis_sems.is_allocated(sem)) {
         return ORBIS_KERNEL_ERROR_ESRCH;
     }
@@ -386,6 +388,7 @@ s32 PS4_SYSV_ABI posix_sem_destroy(PthreadSem** sem) {
 }
 
 s32 PS4_SYSV_ABI posix_sem_wait(PthreadSem** sem) {
+    Common::FaultMonitor::GameMainWaitScope gm_wait{3};
     if (sem == nullptr || *sem == nullptr) {
         *__Error() = POSIX_EINVAL;
         return -1;
