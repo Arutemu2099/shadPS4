@@ -796,6 +796,7 @@ Stop StaticCheck(std::span<const u32> dcb, u32 off, const Regs& regs, const Stat
     case PM4ItOpcode::DrawIndex2:
     case PM4ItOpcode::DrawIndexOffset2:
     case PM4ItOpcode::DrawIndexAuto:
+    case PM4ItOpcode::DrawIndexIndirect:
         if (regs.stage_enable.raw != AmdGpu::ShaderStageEnable::VgtStages::Vs) {
             return Stop::NonVsDraw;
         }
@@ -1176,6 +1177,33 @@ SpanResult Parser::Parse(std::span<const u32> dcb, u32 cut_dw, ChainState& st,
             JournalField(out, regs, regs.max_index_size);
             JournalField(out, regs, regs.num_indices);
             JournalField(out, regs, regs.draw_initiator);
+            if (regs_only) {
+                ++r.dropped;
+            } else {
+                const u64 te0 = __rdtsc();
+                EmitDraw(header, plan, st, out);
+                caches->emit += __rdtsc() - te0;
+                ++caches->draws;
+                ++r.draws;
+            }
+            break;
+        }
+        case PM4ItOpcode::DrawIndexIndirect: {
+            // As ProcessGraphics: EmitDraw with the indirect args at SET_BASE's address, no
+            // register writes.
+            const auto* d = reinterpret_cast<const PM4CmdDrawIndexIndirect*>(header);
+            DrawPlan plan;
+            stop = DecideDraw(header, dcb, off, "DrawIndexIndirect",
+                              {.is_indexed = true,
+                               .is_indirect = true,
+                               .arg_address = st.indirect_args_addr,
+                               .offset = d->data_offset,
+                               .stride = u32(sizeof(DrawIndexedIndirectArgs)),
+                               .max_count = 1},
+                              st, plan);
+            if (stop != Stop::None) {
+                break;
+            }
             if (regs_only) {
                 ++r.dropped;
             } else {

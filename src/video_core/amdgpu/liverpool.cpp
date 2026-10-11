@@ -1495,6 +1495,7 @@ bool LeanSupported(const PM4Header* header, bool guest_markers) {
     case PM4ItOpcode::DrawIndex2:
     case PM4ItOpcode::DrawIndexOffset2:
     case PM4ItOpcode::DrawIndexAuto:
+    case PM4ItOpcode::DrawIndexIndirect:
         return true;
     case PM4ItOpcode::DmaData:
         return reinterpret_cast<const PM4DmaData*>(header)->dst_addr_lo == 0x3022C;
@@ -8713,9 +8714,6 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                 }
             }
             continue;
-        }
-        if (x.on && job.back_waiting.load(std::memory_order_relaxed) == 0) {
-            job.back_waiting.store(1, std::memory_order_relaxed); // publish at your next draw
         }
         const u64 c0 = blc ? __rdtsc() : 0;
         ProcessCommands(); // guest commands run while the back waits for the worker
