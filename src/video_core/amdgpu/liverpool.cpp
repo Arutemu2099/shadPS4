@@ -11551,6 +11551,12 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         acb = NextPacket(acb, next_dw_off);
 
         if constexpr (!is_indirect) {
+            static std::atomic<u32> rp_logged{0};
+            if (rp_logged.load(std::memory_order_relaxed) < 8 &&
+                rp_logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_INFO(Render, "POST_ORDER: ASC vqid {} read pointer at {:#x}, ring {:#x}", vqid,
+                         reinterpret_cast<VAddr>(queue.read_addr), queue.map_addr);
+            }
             *queue.read_addr += next_dw_off;
             *queue.read_addr %= queue.ring_size_dw;
         }
