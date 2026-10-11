@@ -1278,6 +1278,76 @@ struct LeanXlStats {
     std::array<std::atomic<Vulkan::A2::StretchTranslator*>, 8> tr{};
 };
 LeanXlStats g_lean_xl;
+/// SHADPS4_BACK_CYCLES=1 on the A2 / lean path (back thread only): cycles by record type on the
+/// main ring (A2Execute, DcbRef excluded) and in the job channels, the stretch publishes, the
+/// guest commands run inside LeanBackFollow, its wait for workers.
+struct BackLeanCensus {
+    std::array<u64, 32> main_cyc{}, main_n{}, job_cyc{}, job_n{};
+    u64 pub_cyc{}, pub_n{}, pc_cyc{}, pc_n{}, wait_cyc{}, follow_cyc{}, follows{};
+    u64 pub_resolve{}, pub_begin{}, pub_record{}, pub_delta{};
+    u64 win_tsc{};
+    Vulkan::BackCycleStats base{};
+};
+BackLeanCensus g_blc;
+const char* RecordTypeName(u32 t) {
+    static constexpr const char* names[] = {"wrap",  "regwrite", "clearstate", "extent",
+                                            "epoch", "draw",     "dispatch",   "packet",
+                                            "call",  "retire",   "diag",       "segment",
+                                            "dcbbegin", "dcbend", "dcbref",    "leanend"};
+    return t < std::size(names) ? names[t] : "?";
+}
+void BackLeanMaybeLog() {
+    auto& b = g_blc;
+    const u64 now = __rdtsc();
+    if (b.win_tsc == 0) {
+        b.win_tsc = now;
+        b.base = Vulkan::t_back_cycles;
+        return;
+    }
+    if (now - b.win_tsc < 35'000'000'000ull) {
+        return;
+    }
+    const double s = double(now - b.win_tsc) / 3.5e9;
+    const auto ms = [&](u64 c) { return double(c) / 3.5e6 / s; };
+    const auto ks = [&](u64 n) { return double(n) / 1e3 / s; };
+    std::string main_s, job_s;
+    u64 main_all = 0, job_all = 0;
+    for (u32 t = 0; t < 32; ++t) {
+        main_all += b.main_cyc[t];
+        job_all += b.job_cyc[t];
+        if (b.main_cyc[t] != 0) {
+            main_s += fmt::format(" {}={:.1f}({:.0f}k/s,{:.0f}cyc)", RecordTypeName(t),
+                                  ms(b.main_cyc[t]), ks(b.main_n[t]),
+                                  double(b.main_cyc[t]) / double(std::max<u64>(b.main_n[t], 1)));
+        }
+        if (b.job_cyc[t] != 0) {
+            job_s += fmt::format(" {}={:.1f}({:.0f}k/s,{:.0f}cyc)", RecordTypeName(t),
+                                 ms(b.job_cyc[t]), ks(b.job_n[t]),
+                                 double(b.job_cyc[t]) / double(std::max<u64>(b.job_n[t], 1)));
+        }
+    }
+    const auto& n = Vulkan::t_back_cycles;
+    LOG_INFO(Render,
+             "BackLean: window {:.1f}s | ms per s: main ring {:.1f}:{} | job channels {:.1f}:{} | "
+             "stretch publish {:.1f} ({:.0f}k/s, {:.0f}cyc) | guest commands in follow {:.1f} | "
+             "wait for workers {:.1f} | follow total {:.1f} ({:.1f}k/s), other (switching / Next / "
+             "Done) {:.1f} | publish split: material resolve {:.1f} pass begin {:.1f} record {:.1f} "
+             "delta {:.1f} | inside all: flush {:.1f} "
+             "({:.0f}/s) gpu wait {:.1f} stream waits {:.2f}",
+             s, ms(main_all), main_s, ms(job_all), job_s, ms(b.pub_cyc), ks(b.pub_n),
+             double(b.pub_cyc) / double(std::max<u64>(b.pub_n, 1)), ms(b.pc_cyc), ms(b.wait_cyc),
+             ms(b.follow_cyc), ks(b.follows),
+             ms(b.follow_cyc > job_all + b.pub_cyc + b.pc_cyc + b.wait_cyc
+                    ? b.follow_cyc - job_all - b.pub_cyc - b.pc_cyc - b.wait_cyc
+                    : 0),
+             ms(b.pub_resolve), ms(b.pub_begin), ms(b.pub_record), ms(b.pub_delta), ms(n.flush_cyc - b.base.flush_cyc),
+             double(n.flush_calls - b.base.flush_calls) / s, ms(n.wait_cyc - b.base.wait_cyc),
+             ms(n.stream_wait_cyc - b.base.stream_wait_cyc));
+    const u64 keep = now;
+    b = {};
+    b.win_tsc = keep;
+    b.base = Vulkan::t_back_cycles;
+}
 inline void LeanPlaceSample(std::atomic<u64>& p, std::atomic<u64>& e) {
     (Common::IsPerformanceProcessor(Common::CurrentProcessor()) ? p : e)
         .fetch_add(1, std::memory_order_relaxed);
@@ -4571,6 +4641,16 @@ void Liverpool::A2Execute(const CpSplit::RecordHeader& record) {
 
 void Liverpool::ExecuteRecord(const CpSplit::RecordHeader& record) {
     if (g_a2 != 0) [[unlikely]] {
+        static const bool blc = Vulkan::BackCyclesEnabled();
+        if (blc && record.type != CpSplit::RecordType::DcbRef) [[unlikely]] {
+            const u64 t0 = __rdtsc();
+            A2Execute(record);
+            const u32 t = static_cast<u32>(record.type) & 31;
+            g_blc.main_cyc[t] += __rdtsc() - t0;
+            ++g_blc.main_n[t];
+            BackLeanMaybeLog();
+            return;
+        }
         A2Execute(record);
         return;
     }
@@ -8035,6 +8115,15 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
             rasterizer->GetScheduler().SwitchStream(0);
         }
         std::array<std::pair<u32, u32>, Vulkan::A2::MaxMaterials> mat_n{};
+        const bool bl = Vulkan::BackCyclesEnabled();
+        u64 tq = bl ? __rdtsc() : 0;
+        const auto lap = [&](u64& acc) {
+            if (bl) [[unlikely]] {
+                const u64 n = __rdtsc();
+                acc += n - tq;
+                tq = n;
+            }
+        };
         static thread_local std::vector<VideoCore::ImageId> mat_ids;
         mat_ids.clear();
         const bool colour = !st.materials.empty();
@@ -8094,6 +8183,7 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
             }
             st.cmds->bindless_set = rasterizer->A2BindlessCommit();
         }
+        lap(g_blc.pub_resolve);
         if (verify) {
             return false;
         }
@@ -8109,18 +8199,21 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
             x.rej_rt.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
+        lap(g_blc.pub_begin);
         auto& sched = rasterizer->GetScheduler();
         sched.Record([cmds = st.cmds, inst = &rasterizer->A2Instance()](vk::CommandBuffer cmdbuf) {
             Vulkan::A2::Replay(*cmds, cmdbuf, *inst);
         });
         st.tick->store(sched.CurrentTick(), std::memory_order_release);
         rasterizer->A2EndStretch();
+        lap(g_blc.pub_record);
         // The stretch's register writes (its records are never visited), after the pass was
         // resolved from the mirror at its first draw.
         for (const auto& [off, val] : sd.delta) {
             mirror->regs.reg_array[off] = val;
         }
         mirror->ctx_epoch = sd.ctx_epoch;
+        lap(g_blc.pub_delta);
         x.published.fetch_add(1, std::memory_order_relaxed);
         x.pub_draws.fetch_add(st.draws, std::memory_order_relaxed);
         return true;
@@ -8147,6 +8240,8 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
             sec_pub = pb;
         }
     }
+    static const bool blc = Vulkan::BackCyclesEnabled();
+    const u64 follow_t0 = blc ? __rdtsc() : 0;
     u32 si = 0; // next stretch of this job
     // SHADPS4_A2=2: the stretch whose draws run on the old path and are compared.
     const Vulkan::A2::Stretch* vs = nullptr;
@@ -8173,11 +8268,21 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                     auto& st = *job.xl[si];
                     const auto& sd = job.xl_side[si];
                     ++si;
-                    if (publish(st, sd, *r)) {
+                    const u64 p0 = blc ? __rdtsc() : 0;
+                    const bool pubd = publish(st, sd, *r);
+                    if (blc) [[unlikely]] {
+                        g_blc.pub_cyc += __rdtsc() - p0;
+                        ++g_blc.pub_n;
+                    }
+                    if (pubd) {
                         ch.DoneThrough(sd.end_pos, st.last_seq);
                         ++s.back_records;
                         if (num_commands.load(std::memory_order_relaxed) != 0) {
+                            const u64 c0 = blc ? __rdtsc() : 0;
                             ProcessCommands();
+                            if (blc) [[unlikely]] {
+                                g_blc.pc_cyc += __rdtsc() - c0;
+                            }
                         }
                         continue;
                     }
@@ -8288,7 +8393,13 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
             default:
                 break;
             }
+            const u64 e0 = blc ? __rdtsc() : 0;
             ExecuteRecordImpl(*r); // the plain path for everything not in a published stretch
+            if (blc) [[unlikely]] {
+                const u32 t = static_cast<u32>(r->type) & 31;
+                g_blc.job_cyc[t] += __rdtsc() - e0;
+                ++g_blc.job_n[t];
+            }
             if (vs && r->type == RT::Draw && r->seq == vs->last_seq) {
                 // The delta the back would have applied = its mirror after the stretch's last draw
                 // (the last value per offset).
@@ -8312,17 +8423,30 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
             ch.Done(r);
             ++s.back_records;
             if (num_commands.load(std::memory_order_relaxed) != 0) {
+                const u64 c0 = blc ? __rdtsc() : 0;
                 ProcessCommands();
+                if (blc) [[unlikely]] {
+                    g_blc.pc_cyc += __rdtsc() - c0;
+                }
             }
             continue;
         }
+        const u64 c0 = blc ? __rdtsc() : 0;
         ProcessCommands(); // guest commands run while the back waits for the worker
+        if (blc) [[unlikely]] {
+            g_blc.pc_cyc += __rdtsc() - c0;
+        }
         const u64 w0 = __rdtsc();
         ++spins < 4096 ? _mm_pause() : std::this_thread::yield();
         wait += __rdtsc() - w0;
     }
     lean_following = false;
     s.back_wait_ticks += wait;
+    if (blc) [[unlikely]] {
+        g_blc.wait_cyc += wait;
+        g_blc.follow_cyc += __rdtsc() - follow_t0;
+        ++g_blc.follows;
+    }
     if (x.on) {
         const u32 n = job.xl_ready.load(std::memory_order_acquire);
         for (u32 i = 0; i < n; ++i) {
