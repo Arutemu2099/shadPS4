@@ -95,7 +95,21 @@ u64 CensusTicks();
 void NoteWriteFaultCensus(u64 addr, u64 ticks, u8 cls);
 void NoteGameMainWait(u32 kind, u64 ticks);
 void GameMainCensusMaybeLog();
-/// 0 equeue, 1 cond var, 2 event flag, 3 semaphore, 4 sleep, 5 mutex, 6 join.
+/// 0 equeue, 1 cond var, 2 event flag, 3 semaphore, 4 sleep, 5 mutex, 6 join, 7 gnm WaitGpuIdle in
+/// sceGnmSubmitDone, 8 in a submit, 9 in DingDong.
+void SampleGuestPlacement();
+void NoteGnmWait(u32 kind, u64 ticks);
+/// gmc2: the gnm idle waits, timed on every thread (Game:Main also into its own kinds).
+struct GnmWaitScope {
+    u32 kind;
+    u64 t0;
+    explicit GnmWaitScope(u32 k) : kind(k), t0(GameMainCensus() ? CensusTicks() : 0) {}
+    ~GnmWaitScope() {
+        if (t0 != 0) {
+            NoteGnmWait(kind, CensusTicks() - t0);
+        }
+    }
+};
 struct GameMainWaitScope {
     u32 kind;
     u64 t0;

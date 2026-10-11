@@ -260,6 +260,7 @@ s32 PS4_SYSV_ABI posix_pthread_mutex_trylock(PthreadMutexT* mutex) {
 }
 
 s32 PS4_SYSV_ABI posix_pthread_mutex_lock(PthreadMutexT* mutex) {
+    Common::FaultMonitor::SampleGuestPlacement();
     Common::FaultMonitor::GameMainWaitScope gm_wait{5};
     CHECK_AND_INIT_MUTEX
     return (*mutex)->Lock(nullptr);

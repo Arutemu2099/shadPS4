@@ -13,6 +13,7 @@
 #include "gnmdriver.h"
 
 #include "common/fence_watch.h"
+#include "common/fault_monitor.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
@@ -334,7 +335,10 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
         return;
     }
 
-    WaitGpuIdle();
+    {
+        Common::FaultMonitor::GnmWaitScope gm_wait{9};
+        WaitGpuIdle();
+    }
 
     if (DebugState.ShouldPauseInSubmit()) {
         DebugState.PauseGuestThreads();
@@ -3415,7 +3419,10 @@ int PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
         }
     }
 
-    WaitGpuIdle();
+    {
+        Common::FaultMonitor::GnmWaitScope gm_wait{8};
+        WaitGpuIdle();
+    }
 
     if (DebugState.ShouldPauseInSubmit()) {
         DebugState.PauseGuestThreads();
@@ -3501,7 +3508,10 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffers(u32 count, const u32* dcb_gpu_addrs[
 int PS4_SYSV_ABI sceGnmSubmitDone() {
     HLE_TRACE;
     LOG_DEBUG(Lib_GnmDriver, "called");
-    WaitGpuIdle();
+    {
+        Common::FaultMonitor::GnmWaitScope gm_wait{7};
+        WaitGpuIdle();
+    }
     if (SubmitLockFix()) {
         std::unique_lock lock{m_submission};
         if (!liverpool->IsGpuIdle()) {

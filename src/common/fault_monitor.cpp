@@ -21,11 +21,14 @@
 #endif
 
 #include <immintrin.h>
+#include <cstring>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <timeapi.h>
+#pragma comment(lib, "winmm.lib")
 #endif
 #include "common/fault_monitor.h"
 #include "common/logging/log.h"
@@ -604,7 +607,14 @@ std::ofstream OpenCsv() {
 
 namespace {
 struct GmCensus {
-    std::array<std::atomic<u64>, 8> wait_ticks{}, wait_n{};
+    std::array<std::atomic<u64>, 16> wait_ticks{}, wait_n{};
+    std::array<std::atomic<u64>, 4> place{}; // [game main P, game main E, other P, other E]
+    std::array<std::atomic<u64>, 16> gnm_all_ticks{}, gnm_all_n{}; // gnm waits, every thread
+    std::mutex rip_mutex;
+    std::unordered_map<u64, u32> rip_eboot; // 64 B buckets of the eboot offset
+    u64 rip_samples{}, rip_eboot_n{}, rip_guest_other{}, rip_host{};
+    std::unordered_map<u64, u32> rip_host_buckets; // 4 KB buckets of host addresses
+    bool sampler_started{};
     std::array<std::atomic<u64>, 8> gm_fault_n{}, gm_fault_ticks{}, all_fault_n{}, all_fault_ticks{};
     std::mutex page_mutex;
     u64 frame{~0ULL};
@@ -631,14 +641,70 @@ void MarkGameMainThread() {
 #ifdef _WIN32
     HANDLE h{};
     DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h,
-                    THREAD_QUERY_LIMITED_INFORMATION, FALSE, 0);
+                    THREAD_QUERY_LIMITED_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
+                    FALSE, 0);
     g_gm.thread = h;
+    if (GameMainCensus() && h && !g_gm.sampler_started) {
+        g_gm.sampler_started = true;
+        // ~1 kHz RIP sampler: the thread is suspended only between SuspendThread and
+        // ResumeThread; nothing here takes a lock or allocates while it is suspended.
+        std::thread([h] {
+            timeBeginPeriod(1);
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                if (SuspendThread(h) == DWORD(-1)) {
+                    continue;
+                }
+                CONTEXT ctx{};
+                ctx.ContextFlags = CONTEXT_CONTROL;
+                const BOOL ok = GetThreadContext(h, &ctx);
+                ResumeThread(h);
+                if (!ok) {
+                    continue;
+                }
+                const u64 rip = ctx.Rip;
+                std::scoped_lock lk{g_gm.rip_mutex};
+                ++g_gm.rip_samples;
+                if (rip >= 0x800000000ULL && rip < 0x8087a8000ULL) {
+                    ++g_gm.rip_eboot_n;
+                    ++g_gm.rip_eboot[(rip - 0x800000000ULL) >> 6];
+                } else if (rip >= 0x8087a8000ULL && rip < 0x1000000000ULL) {
+                    ++g_gm.rip_guest_other;
+                } else {
+                    ++g_gm.rip_host;
+                    ++g_gm.rip_host_buckets[rip >> 12];
+                }
+            }
+        }).detach();
+    }
+#endif
+}
+
+void NoteGnmWait(u32 kind, u64 ticks) {
+    g_gm.gnm_all_ticks[kind & 15].fetch_add(ticks, std::memory_order_relaxed);
+    g_gm.gnm_all_n[kind & 15].fetch_add(1, std::memory_order_relaxed);
+    if (t_is_game_main) {
+        NoteGameMainWait(kind, ticks);
+    }
+}
+
+void SampleGuestPlacement() {
+    if (!GameMainCensus()) {
+        return;
+    }
+    thread_local u32 calls = 0;
+    if ((++calls & 63) != 0) {
+        return;
+    }
+#ifdef _WIN32
+    const bool p = Common::IsPerformanceProcessor(Common::CurrentProcessor());
+    g_gm.place[(t_is_game_main ? 0 : 2) + (p ? 0 : 1)].fetch_add(1, std::memory_order_relaxed);
 #endif
 }
 
 void NoteGameMainWait(u32 kind, u64 ticks) {
-    g_gm.wait_ticks[kind & 7].fetch_add(ticks, std::memory_order_relaxed);
-    g_gm.wait_n[kind & 7].fetch_add(1, std::memory_order_relaxed);
+    g_gm.wait_ticks[kind & 15].fetch_add(ticks, std::memory_order_relaxed);
+    g_gm.wait_n[kind & 15].fetch_add(1, std::memory_order_relaxed);
 }
 
 void NoteWriteFaultCensus(u64 addr, u64 ticks, u8 cls) {
@@ -699,9 +765,11 @@ void GameMainCensusMaybeLog() {
     const auto ms = [&](std::atomic<u64>& a) { return double(a.exchange(0)) / 3.5e6 / sec; };
     const auto per = [&](std::atomic<u64>& a) { return double(a.exchange(0)) / sec; };
     std::string waits;
-    static constexpr const char* names[] = {"equeue", "cond", "evflag", "sema", "sleep", "mutex", "join", "-"};
+    static constexpr const char* names[] = {"equeue", "cond", "evflag", "sema", "sleep", "mutex", "join",
+                                            "gnm SubmitDone idle-wait", "gnm submit idle-wait",
+                                            "gnm DingDong idle-wait"};
     double wait_total = 0.0;
-    for (u32 i = 0; i < 7; ++i) {
+    for (u32 i = 0; i < 10; ++i) {
         const double n = per(g_gm.wait_n[i]);
         const double m = ms(g_gm.wait_ticks[i]);
         wait_total += m;
@@ -743,6 +811,71 @@ void GameMainCensusMaybeLog() {
              gm_fault_ms, gm_fault_n > 0 ? gm_fault_ms * 1e3 / gm_fault_n : 0.0, gm_cls,
              all_fault_n, all_fault_ms, all_fault_n > 0 ? all_fault_ms * 1e3 / all_fault_n : 0.0,
              all_cls, gm_pages, all_pages, cpu_ms >= 0 ? cpu_ms - gm_fault_ms : -1.0);
+    {
+        std::string g;
+        for (u32 i = 7; i < 10; ++i) {
+            const double n = per(g_gm.gnm_all_n[i]);
+            g += fmt::format(" {} {:.1f} ms/s ({:.0f}/s)", names[i], ms(g_gm.gnm_all_ticks[i]), n);
+        }
+        LOG_INFO(Render, "GameMain census gnm idle waits, all threads:{}", g);
+    }
+    {
+        const double gp = double(g_gm.place[0].exchange(0)), ge = double(g_gm.place[1].exchange(0));
+        const double op = double(g_gm.place[2].exchange(0)), oe = double(g_gm.place[3].exchange(0));
+        LOG_INFO(Render,
+                 "GameMain census placement (every 64th guest mutex lock): Game:Main P {:.1f}% E "
+                 "{:.1f}% (n {:.0f}) | other guest threads P {:.1f}% E {:.1f}% (n {:.0f})",
+                 100.0 * gp / std::max(gp + ge, 1.0), 100.0 * ge / std::max(gp + ge, 1.0), gp + ge,
+                 100.0 * op / std::max(op + oe, 1.0), 100.0 * oe / std::max(op + oe, 1.0), op + oe);
+    }
+    {
+        std::vector<std::pair<u32, u64>> top, host;
+        u64 n = 0, eb = 0, go = 0, ho = 0;
+        {
+            std::scoped_lock lk{g_gm.rip_mutex};
+            n = g_gm.rip_samples;
+            eb = g_gm.rip_eboot_n;
+            go = g_gm.rip_guest_other;
+            ho = g_gm.rip_host;
+            for (const auto& [b, c] : g_gm.rip_eboot) {
+                top.emplace_back(c, b);
+            }
+            for (const auto& [b, c] : g_gm.rip_host_buckets) {
+                host.emplace_back(c, b);
+            }
+            g_gm.rip_eboot.clear();
+            g_gm.rip_host_buckets.clear();
+            g_gm.rip_samples = g_gm.rip_eboot_n = g_gm.rip_guest_other = g_gm.rip_host = 0;
+        }
+        std::sort(top.rbegin(), top.rend());
+        std::sort(host.rbegin(), host.rend());
+        std::string s, hs;
+        for (size_t i = 0; i < std::min<size_t>(top.size(), 40); ++i) {
+            s += fmt::format(" {:#x}:{:.1f}%", top[i].second << 6, 100.0 * top[i].first / std::max<u64>(n, 1));
+        }
+        for (size_t i = 0; i < std::min<size_t>(host.size(), 12); ++i) {
+            HMODULE mod{};
+            char name[64] = "?";
+            const u64 addr = host[i].second << 12;
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   reinterpret_cast<LPCSTR>(addr), &mod)) {
+                char path[MAX_PATH];
+                if (GetModuleFileNameA(mod, path, MAX_PATH)) {
+                    const char* base = std::strrchr(path, '\\');
+                    std::snprintf(name, sizeof(name), "%s", base ? base + 1 : path);
+                }
+            }
+            hs += fmt::format(" {}+{:#x}:{:.1f}%", name,
+                              addr - reinterpret_cast<u64>(mod), 100.0 * host[i].first / std::max<u64>(n, 1));
+        }
+        LOG_INFO(Render,
+                 "GameMain census RIP: samples {} | eboot {:.1f}% other guest modules {:.1f}% host "
+                 "{:.1f}% | eboot top 64-byte buckets (offset from 0x800000000):{}",
+                 n, 100.0 * eb / std::max<u64>(n, 1), 100.0 * go / std::max<u64>(n, 1),
+                 100.0 * ho / std::max<u64>(n, 1), s);
+        LOG_INFO(Render, "GameMain census RIP host top 4 KB pages:{}", hs);
+    }
 }
 
 namespace {
