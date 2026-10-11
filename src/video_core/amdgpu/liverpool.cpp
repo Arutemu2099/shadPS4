@@ -1290,6 +1290,7 @@ struct BackLeanCensus {
     std::array<u64, 64> why_cyc{}, why_n{}; ///< old-path job-channel draws by job_pad
     u64 pub_cyc{}, pub_n{}, pc_cyc{}, pc_n{}, wait_cyc{}, follow_cyc{}, follows{};
     u64 pub_resolve{}, pub_begin{}, pub_record{}, pub_delta{};
+    u64 pro_cyc{}, epi_cyc{}, loop_recs{}; ///< per follow: before / after the loop; records visited
     u64 win_tsc{};
     Vulkan::BackCycleStats base{};
 };
@@ -1346,12 +1347,18 @@ void BackLeanMaybeLog() {
                              double(b.why_cyc[i]) / double(std::max<u64>(b.why_n[i], 1)));
     }
     LOG_INFO(Render, "BackLean old-path job draws by why (ms per s):{}", why_s);
+    const u64 other_all = b.follow_cyc > job_all + b.pub_cyc + b.pc_cyc + b.wait_cyc
+                              ? b.follow_cyc - job_all - b.pub_cyc - b.pc_cyc - b.wait_cyc
+                              : 0;
+    const u64 loop_other =
+        other_all > b.pro_cyc + b.epi_cyc ? other_all - b.pro_cyc - b.epi_cyc : 0;
     const auto& n = Vulkan::t_back_cycles;
     LOG_INFO(Render,
              "BackLean: window {:.1f}s | ms per s: main ring {:.1f}:{} | job channels {:.1f}:{} | "
              "stretch publish {:.1f} ({:.0f}k/s, {:.0f}cyc) | guest commands in follow {:.1f} | "
              "wait for workers {:.1f} | follow total {:.1f} ({:.1f}k/s), other (switching / Next / "
-             "Done) {:.1f} | publish split: material resolve {:.1f} pass begin {:.1f} record {:.1f} "
+             "Done) {:.1f} [per switch: prologue {:.1f} epilogue {:.1f} = {:.0f} cyc per follow | per "
+             "record: {:.1f} = {:.0f} cyc over {:.0f}k records/s] | publish split: material resolve {:.1f} pass begin {:.1f} record {:.1f} "
              "delta {:.1f} | inside all: flush {:.1f} "
              "({:.0f}/s) gpu wait {:.1f} stream waits {:.2f}",
              s, ms(main_all), main_s, ms(job_all), job_s, ms(b.pub_cyc), ks(b.pub_n),
@@ -1360,6 +1367,10 @@ void BackLeanMaybeLog() {
              ms(b.follow_cyc > job_all + b.pub_cyc + b.pc_cyc + b.wait_cyc
                     ? b.follow_cyc - job_all - b.pub_cyc - b.pc_cyc - b.wait_cyc
                     : 0),
+             ms(b.pro_cyc), ms(b.epi_cyc),
+             double(b.pro_cyc + b.epi_cyc) / double(std::max<u64>(b.follows, 1)),
+             ms(loop_other), double(loop_other) / double(std::max<u64>(b.loop_recs, 1)),
+             ks(b.loop_recs),
              ms(b.pub_resolve), ms(b.pub_begin), ms(b.pub_record), ms(b.pub_delta), ms(n.flush_cyc - b.base.flush_cyc),
              double(n.flush_calls - b.base.flush_calls) / s, ms(n.wait_cyc - b.base.wait_cyc),
              ms(n.stream_wait_cyc - b.base.stream_wait_cyc));
@@ -8128,6 +8139,8 @@ Liverpool::LeanL2Begin Liverpool::LeanFrontBeginL2(std::span<const u32> dcb,
 
 void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
     using RT = CpSplit::RecordType;
+    static const bool blc = Vulkan::BackCyclesEnabled();
+    const u64 follow_t0 = blc ? __rdtsc() : 0;
     auto& s = g_lean_s;
     auto& ch = *s.ch[ref.slot];
     auto& job = s.jobs[ref.slot];
@@ -8299,20 +8312,24 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
             sec_pub = pb;
         }
     }
-    static const bool blc = Vulkan::BackCyclesEnabled();
-    const u64 follow_t0 = blc ? __rdtsc() : 0;
     u32 si = 0; // next stretch of this job
     // SHADPS4_A2=2: the stretch whose draws run on the old path and are compared.
     const Vulkan::A2::Stretch* vs = nullptr;
     const A2Entry::Side* vsd = nullptr;
     size_t vs_inh = 0, vs_clip = 0, vs_fmt = 0; // next direct-check entries of `vs`
     u64 wait = 0;
+    if (blc) [[unlikely]] {
+        g_blc.pro_cyc += __rdtsc() - follow_t0;
+    }
     for (u32 spins = 0;;) {
         if (split->FrontHasExited() || s.stop.load(std::memory_order_relaxed)) [[unlikely]] {
             break;
         }
         if (const auto* r = ch.Next()) {
             spins = 0;
+            if (blc) [[unlikely]] {
+                ++g_blc.loop_recs;
+            }
             if (r->type == RT::LeanEnd) {
                 ch.Done(r);
                 break;
@@ -8537,11 +8554,7 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
     }
     lean_following = false;
     s.back_wait_ticks += wait;
-    if (blc) [[unlikely]] {
-        g_blc.wait_cyc += wait;
-        g_blc.follow_cyc += __rdtsc() - follow_t0;
-        ++g_blc.follows;
-    }
+    const u64 epi_t0 = blc ? __rdtsc() : 0;
     if (x.on) {
         const u32 n = job.xl_ready.load(std::memory_order_acquire);
         for (u32 i = 0; i < n; ++i) {
@@ -8554,6 +8567,13 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
         job.xl_ready.store(0, std::memory_order_relaxed);
     }
     job.state.store(0, std::memory_order_release); // the slot is free again
+    if (blc) [[unlikely]] {
+        const u64 t1 = __rdtsc();
+        g_blc.epi_cyc += t1 - epi_t0;
+        g_blc.wait_cyc += wait;
+        g_blc.follow_cyc += t1 - follow_t0;
+        ++g_blc.follows;
+    }
 }
 
 void Liverpool::EmitDraw(const PM4Header* header, const char* name, bool host_marker,
