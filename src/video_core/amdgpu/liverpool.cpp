@@ -1266,7 +1266,7 @@ LeanState g_lean_s;
 /// L3 counters (workers add theirs per job; the back its own) and the per-second placement samples.
 struct LeanXlStats {
     bool on{}; ///< L2 + SHADPS4_A2 != 0: workers translate
-    std::atomic<u64> taken{}, stretches{}, cap{}, cut_pub{}, walked{};
+    std::atomic<u64> taken{}, stretches{}, cap{}, cut_pub{}, walked{}, mat_cuts{};
     std::atomic<u64> published{}, pub_draws{}, rej_occl{}, rej_gen{}, rej_mat{}, rej_rt{},
         would{}, back_draws{}, seq_skips{};
     /// SHADPS4_A2=2 field compares (gate 0 bad): render key per draw, delta words per stretch.
@@ -1957,12 +1957,14 @@ void LeanLog() {
                      "push_inh {} | slot kind: shadow+images {} clip {} not Guest {} written {} "
                      "formatted {} colour inline/null/empty {} | guest lookup: no buffer {} outside "
                      "{} | inherited refused: size {} no buffer {} offset {} | taken with inherited "
-                     "slots {} with clip planes {}",
+                     "slots {} with clip planes {} | guest-lookup fallback {} | stretches cut by a 9th "
+                     "material {}",
                      sb[12], sb[13], sb[14], sb[15], sb[0], sb[1], sb[2], sb[3], sb[4], sb[5], sb[6],
-                     sb[7], sb[8], sb[9], sb[10], sb[11], sb[16], sb[17], sb[18], sb[19], sb[20]);
+                     sb[7], sb[8], sb[9], sb[10], sb[11], sb[16], sb[17], sb[18], sb[19], sb[20],
+                     sb[23], x.mat_cuts.exchange(0));
             LOG_INFO(Render,
                      "Lean L3 direct checks (A2=2): inherited-slot words {} BAD {} | user-data "
-                     "words {} BAD {} | clip planes {} BAD {} | formatted table bases {} BAD {} | "
+                     "words {} BAD {} | clip planes {} BAD {} | formatted + fallback table bases {} BAD {} | "
                      "formatted: draws taken (cumulative) {}, texel syncs {} rejected stretches {}, "
                      "17th range refused (cumulative) {} | verify skipped (A2=1 would reject) {}",
                      x.inh_cmp.exchange(0), x.inh_bad.load(), x.ud_cmp.exchange(0), x.ud_bad.load(),
@@ -3823,7 +3825,7 @@ struct LeanXl {
     std::array<Shader::BoundStage, Shader::MaxStageTypes> stages{};
     u32 since_pub{};
     u64 open_key{}; ///< SHADPS4_A2=2: A2RenderKey at the open stretch's first draw
-    u64 taken{}, stretches{}, cap{}, cut_pub{}, walked{};
+    u64 taken{}, stretches{}, cap{}, cut_pub{}, walked{}, mat_cuts{};
 };
 
 void LeanXlEnd(LeanXl& x) {
@@ -3891,7 +3893,14 @@ void LeanXlDraw(LeanXl& x, const CpSplit::RecordHeader& h, u64 pos) {
         return;
     }
     why = 0;
-    if (x.tr->TakeDraw(regs, in)) {
+    bool took = x.tr->TakeDraw(regs, in);
+    if (!took && x.open && x.tr->last_refusal == Vulkan::A2::RefuseMaterials) {
+        // A 9th distinct material: end the stretch here, the draw opens the next one.
+        LeanXlEnd(x);
+        ++x.mat_cuts;
+        took = x.tr->TakeDraw(regs, in);
+    }
+    if (took) {
         if (!x.open) {
             x.open = true;
             x.rt_dirty = false;
@@ -4216,6 +4225,7 @@ void Liverpool::LeanWorkerLoop(std::stop_token stoken, u32 index) {
                 gx.cap.fetch_add(std::exchange(xl.cap, 0), std::memory_order_relaxed);
                 gx.cut_pub.fetch_add(std::exchange(xl.cut_pub, 0), std::memory_order_relaxed);
                 gx.walked.fetch_add(std::exchange(xl.walked, 0), std::memory_order_relaxed);
+                gx.mat_cuts.fetch_add(std::exchange(xl.mat_cuts, 0), std::memory_order_relaxed);
             }
             out.Reserve(CpSplit::RecordType::LeanEnd, 0);
             out.Commit();

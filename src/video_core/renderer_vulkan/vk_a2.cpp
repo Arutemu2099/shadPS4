@@ -567,6 +567,7 @@ struct StretchTranslator::Impl {
     bool b_clip{};
     std::array<u32, 24> b_planes{};
     u64 b_fmt_mask{};
+    u64 b_fb_mask{}; ///< slots resolved by the opener's own V# (guest-lookup fallback)
     std::array<u32, Shader::NUM_BUFFERS> b_tbase{}; ///< the opener's table bases (checks)
 };
 
@@ -1093,7 +1094,8 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     }
     for (u64 m = guest_mask; cont && m != 0; m &= m - 1) {
         const u32 b = static_cast<u32>(std::countr_zero(m));
-        cont = o_addr[b] >= b_glo[b] && o_addr[b] < b_ghi[b];
+        cont = o_addr[b] >= b_glo[b] && o_addr[b] < b_ghi[b] &&
+               (!(b_fb_mask & (u64{1} << b)) || o_addr[b] + o_vsize[b] <= b_ghi[b]);
     }
     // The member's vertexOffset against the opener's rebased bindings (NativeRingPrepare's
     // d / q loop): one common quotient over the per-vertex streams; instance-rate and
@@ -1192,6 +1194,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         std::array<u32, Shader::NUM_BUFFERS> base{};
         std::array<VAddr, Shader::NUM_BUFFERS> glo{}, ghi{};
         std::array<u32, Shader::NUM_BUFFERS> i_off{}, i_size{};
+        u64 fb_mask = 0;
         for (u64 m = guest_mask; m != 0; m &= m - 1) {
             const u32 b = static_cast<u32>(std::countr_zero(m));
             if (inh_slots & (u64{1} << b)) {
@@ -1231,8 +1234,20 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
             }
             if (!buf || o_addr[b] < buf->CpuAddr() ||
                 o_addr[b] - buf->CpuAddr() >= buf->SizeBytes()) {
-                ++owner->sub[!buf ? 10 : 11];
-                return refuse(RefuseGuestLookup);
+                // Fallback: the opener's own V# inside one cached buffer (members must then fit
+                // that buffer whole: the continuation check below).
+                const VideoCore::Buffer* fb =
+                    o_vsize[b] != 0 && o_vsize[b] <= MaxSpan
+                        ? ctx.buffer_cache->A2LookupBuffer(o_addr[b])
+                        : nullptr;
+                if (fb && fb->IsInBounds(o_addr[b], o_vsize[b])) {
+                    buf = fb;
+                    fb_mask |= u64{1} << b;
+                    ++owner->sub[23];
+                } else {
+                    ++owner->sub[!buf ? 10 : 11];
+                    return refuse(RefuseGuestLookup);
+                }
             }
             base[b] = static_cast<u32>(buf->CpuAddr());
             glo[b] = buf->CpuAddr();
@@ -1390,6 +1405,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         b_planes = planes;
         b_fmt_mask = fmt_mask;
         b_tbase = base;
+        b_fb_mask = fb_mask;
         last_desc_id = draw.vi->desc_id;
         ++owner->sub_batches;
     }
@@ -1437,6 +1453,13 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
             if (Mode() == 2) {
                 cmds->fmt_checks.push_back({draw.seq, o_addr[b], b_tbase[b]});
             }
+        }
+    }
+    if (b_fb_mask != 0 && Mode() == 2) {
+        // Guest-lookup fallback slots: their table base is checked like a formatted slot's.
+        for (u64 m = b_fb_mask; m != 0; m &= m - 1) {
+            const u32 b = static_cast<u32>(std::countr_zero(m));
+            cmds->fmt_checks.push_back({draw.seq, o_addr[b], b_tbase[b]});
         }
     }
     if (clip_on) {

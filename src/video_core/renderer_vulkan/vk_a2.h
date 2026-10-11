@@ -291,7 +291,7 @@ public:
     /// (stamp below idx + 1, above it, gpu_ok 0, cmd differs), 16-18 inherited slot refused (size
     /// 0 or >= 1 GB, no cached buffer holding it, offset over 32 bits), 19 draws taken with an
     /// inherited slot, 20 draws taken with user clip planes, 21 a 17th texel range refused,
-    /// 22 draws taken with a formatted slot.
+    /// 22 draws taken with a formatted slot, 23 guest slots resolved by the opener's own V#.
     std::array<u64, 24> sub{};
     /// Draws taken and sub-batches opened so far (logged by the caller).
     u64 taken{}, sub_batches{};
