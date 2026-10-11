@@ -2285,6 +2285,7 @@ static bool ProducerStatsEnabled() {
 namespace {
 /// q7: recently read-back windows, packed (first page << 24 | pages), 0 = empty.
 std::array<std::atomic<u64>, 16> g_rb_hot{};
+std::array<std::atomic<bool>, 16> g_rb_armed{}; // q7c: a read-back since the last cut
 std::atomic<u32> g_rb_hot_next{0};
 bool EarlyCutOn() {
     static const bool on = [] {
@@ -2300,36 +2301,55 @@ void NoteReadbackWindow(VAddr addr, u64 size) {
     const u64 first = addr >> 12;
     const u64 pages = std::min<u64>(((addr + size + 4095) >> 12) - first, (u64{1} << 24) - 1);
     const u64 packed = (first << 24) | pages;
-    for (const auto& e : g_rb_hot) {
-        if (e.load(std::memory_order_relaxed) == packed) {
+    for (u32 i = 0; i < g_rb_hot.size(); ++i) {
+        if (g_rb_hot[i].load(std::memory_order_relaxed) == packed) {
+            g_rb_armed[i].store(true, std::memory_order_relaxed); // q7c: re-armed
             return;
         }
     }
-    g_rb_hot[g_rb_hot_next.fetch_add(1, std::memory_order_relaxed) & 15].store(
-        packed, std::memory_order_relaxed);
+    const u32 i = g_rb_hot_next.fetch_add(1, std::memory_order_relaxed) & 15;
+    g_rb_hot[i].store(packed, std::memory_order_relaxed);
+    g_rb_armed[i].store(true, std::memory_order_relaxed);
 }
-bool HitsReadbackWindow(VAddr addr, u64 size) {
+/// q7c: the armed entries the range hits, as a mask (0: none).
+u32 HitsReadbackWindow(VAddr addr, u64 size) {
     const u64 lo = addr >> 12, hi = (addr + size + 4095) >> 12;
-    for (const auto& e : g_rb_hot) {
-        const u64 v = e.load(std::memory_order_relaxed);
+    u32 mask = 0;
+    for (u32 i = 0; i < g_rb_hot.size(); ++i) {
+        if (!g_rb_armed[i].load(std::memory_order_relaxed)) {
+            continue;
+        }
+        const u64 v = g_rb_hot[i].load(std::memory_order_relaxed);
         if (v != 0) {
             const u64 first = v >> 24, end = first + (v & 0xffffff);
             if (lo < end && first < hi) {
-                return true;
+                mask |= 1u << i;
             }
         }
     }
-    return false;
+    return mask;
 }
 } // namespace
+
+void BufferCache::DisarmEarlyCut(u32 mask) {
+    for (u32 i = 0; i < g_rb_armed.size(); ++i) {
+        if ((mask >> i) & 1) {
+            g_rb_armed[i].store(false, std::memory_order_relaxed);
+        }
+    }
+}
+
+thread_local bool t_in_dispatch = false;
 
 void BufferCache::NoteBatchWrite(VAddr addr, u64 size) {
     if (size == 0) {
         return;
     }
-    if (EarlyCutOn() && Common::FaultMonitor::t_is_cp_thread && !early_cut_pending &&
-        HitsReadbackWindow(addr, size)) [[unlikely]] {
-        early_cut_pending = true; // q7
+    if (EarlyCutOn() && Common::FaultMonitor::t_is_cp_thread && t_in_dispatch) [[unlikely]] {
+        if (const u32 m = HitsReadbackWindow(addr, size)) {
+            early_cut_pending = true; // q7; q7c: dispatch writes only, armed windows only
+            early_cut_mask |= m;
+        }
     }
     if (g_lane_census || g_lane_on) [[unlikely]] {
         if (Common::FaultMonitor::t_is_cp_thread) {

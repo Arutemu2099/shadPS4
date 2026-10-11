@@ -88,6 +88,9 @@ class ReadbackQueue;
 
 enum class NativeRunAccess : u32 { Storage, Vertex, Index };
 
+/// q7c: set by the rasterizer while a dispatch executes (CP thread).
+extern thread_local bool t_in_dispatch;
+
 class BufferCache {
 public:
     /// q7 (SHADPS4_READBACK_EARLY_CUT): true once after a GPU write into a recently read-back
@@ -95,8 +98,17 @@ public:
     bool TakeEarlyCut() noexcept {
         const bool c = early_cut_pending;
         early_cut_pending = false;
+        if (c) {
+            DisarmEarlyCut(early_cut_mask); // q7c: one cut per readback
+            early_cut_mask = 0;
+        }
         return c;
     }
+    bool EarlyCutPending() const noexcept {
+        return early_cut_pending;
+    }
+    void DisarmEarlyCut(u32 mask);
+    u32 early_cut_mask{};
 
     static constexpr u32 CACHING_PAGEBITS = 14;
     static constexpr u64 CACHING_PAGESIZE = u64{1} << CACHING_PAGEBITS;

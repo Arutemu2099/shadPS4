@@ -8395,12 +8395,17 @@ void Rasterizer::MaybeEarlyCut(bool run_end) {
     // batch now so the readback waits for the GPU only up to here, not for the rest of the frame.
     // q7b: mode 2 cuts once, at the end of the dispatch run (A2Execute, the next non-dispatch
     // record); mode 1 after every such dispatch.
-    if ((EarlyCutMode() == 2) != run_end) {
+    if ((EarlyCutMode() == 2) != run_end || !buffer_cache.EarlyCutPending()) {
         return;
     }
-    if (!buffer_cache.TakeEarlyCut() || Scheduler::t_lane_mode || scheduler.ActiveStream() != 0) {
+    if (Scheduler::t_lane_mode || scheduler.ActiveStream() != 0) {
+        static std::atomic<u64> blocked{0}; // q7c (1): kept pending, counted
+        if ((blocked.fetch_add(1, std::memory_order_relaxed) & 0xfff) == 0) {
+            LOG_INFO(Render_Vulkan, "q7c early cut deferred (lane / stream): {}", blocked.load());
+        }
         return;
     }
+    (void)buffer_cache.TakeEarlyCut();
     scheduler.EndRendering();
     scheduler.Flush();
     static std::atomic<u64> cuts{0};
@@ -8414,7 +8419,9 @@ void Rasterizer::MaybeEarlyCut(bool run_end) {
 }
 
 void Rasterizer::DispatchDirectTail(const ComputePipeline* pipeline) {
+    VideoCore::t_in_dispatch = true; // q7c
     SCOPE_EXIT {
+        VideoCore::t_in_dispatch = false;
         MaybeEarlyCut();
     };
     if (native_batch.open) [[unlikely]] {
@@ -8490,7 +8497,9 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 
 void Rasterizer::DispatchIndirectTail(const ComputePipeline* pipeline, VAddr address, u32 offset,
                                       u32 size) {
+    VideoCore::t_in_dispatch = true; // q7c
     SCOPE_EXIT {
+        VideoCore::t_in_dispatch = false;
         MaybeEarlyCut(); // q7
     };
     if (!BindResources(pipeline)) {

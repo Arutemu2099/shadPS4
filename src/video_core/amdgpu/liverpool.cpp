@@ -3125,6 +3125,14 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                 }
                 const u64 tx0 = __rdtsc();
                 ExecuteRecordImpl(*r);
+                if (it.type == RT::Packet && (r->flags & CpSplit::AscReleaseMem) && rasterizer &&
+                    Vulkan::Rasterizer::EarlyCutMode() == 2) [[unlikely]] {
+                    // q7c (2): the ASC submission's end label - the chain that wrote a
+                    // read-back window ended; cut here, not at the next main record.
+                    VideoCore::t_force_binding_sync = false;
+                    rasterizer->MaybeEarlyCut(true);
+                    VideoCore::t_force_binding_sync = true;
+                }
                 if (t_lane_packet) [[unlikely]] {
                     t_lane_packet = false;
                     rasterizer->GetScheduler().SwitchStream(0);
