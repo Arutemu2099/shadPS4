@@ -1103,6 +1103,10 @@ private:
     bool build_set_writes{true};
 
     u32 set_write_index{};
+    /// p1c tripwire: dispatches executed, and their count when the current BindResources began.
+    u64 p1c_dispatch_serial{};
+    u64 p1c_bind_serial{};
+    void P1cCheckWrites(const Pipeline* pipeline);
     Pipeline::DescriptorWrites set_writes;
     Pipeline::BufferBarriers buffer_barriers;
     Shader::PushData push_data;

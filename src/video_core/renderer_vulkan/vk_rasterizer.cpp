@@ -5950,6 +5950,7 @@ bool Rasterizer::NativeDirectBind(const GraphicsPipeline* base, const GraphicsPi
     }
     set_write_index = 0;
     set_writes.clear();
+    p1c_bind_serial = p1c_dispatch_serial;
     buffer_barriers.clear();
     if (!native_carry.empty()) [[unlikely]] {
         buffer_barriers.insert(buffer_barriers.end(), native_carry.begin(), native_carry.end());
@@ -7280,6 +7281,7 @@ void Rasterizer::NativeLog() {
 void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
                                  const std::array<Shader::BoundStage, Shader::MaxStageTypes>& stages,
                                  bool is_indirect, VAddr address, u32 offset, u32 size) {
+    ++p1c_dispatch_serial;
     if (native_batch.open) [[unlikely]] {
         NativeClose(13);
     }
@@ -9654,6 +9656,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 
     set_write_index = 0;
     set_writes.clear();
+    p1c_bind_serial = p1c_dispatch_serial;
     buffer_barriers.clear();
     if (!native_carry.empty()) [[unlikely]] {
         // SHADPS4_NATIVE_PASS: barriers a failed join already took from the hazard state.
@@ -11174,7 +11177,41 @@ void Rasterizer::RecordTexMemo(TexMemoRecord& rec, const Shader::Info& stage, u6
     }
 }
 
+void Rasterizer::P1cCheckWrites(const Pipeline* pipeline) {
+    if (binding_compute || set_writes.empty()) {
+        return;
+    }
+    const size_t n = pipeline->PacketBindings().size();
+    if (n == 0) {
+        return;
+    }
+    u32 bad = 0, max_b = 0;
+    for (const auto& w : set_writes) {
+        bad += w.dstBinding >= n ? 1 : 0;
+        max_b = std::max(max_b, w.dstBinding);
+    }
+    if (bad == 0) {
+        return;
+    }
+    static std::atomic<u32> logged{0};
+    if (logged.fetch_add(1) < 16) {
+        LOG_CRITICAL(Render_Vulkan,
+                     "p1c: graphics push with {} writes outside the {}-binding table (writes {}, max "
+                     "binding {}) | dispatches since BindResources began {} | lane mode {} stream {} "
+                     "early record {}",
+                     bad, n, set_writes.size(), max_b, p1c_dispatch_serial - p1c_bind_serial,
+                     Scheduler::t_lane_mode, scheduler.ActiveStream(),
+                     VideoCore::t_force_binding_sync);
+    }
+    set_writes.erase(std::remove_if(set_writes.begin(), set_writes.end(),
+                                    [n](const vk::WriteDescriptorSet& w) {
+                                        return w.dstBinding >= n;
+                                    }),
+                     set_writes.end());
+}
+
 void Rasterizer::EmitPipelineResources(const Pipeline* pipeline) {
+    P1cCheckWrites(pipeline);
     // SHADPS4_DRAW_PACKET_DELTA: the legacy records push descriptors outside the draw packets.
     scheduler.GetDynamicState().packet_state_unknown = true;
     if (!native_bindings) {
@@ -11195,6 +11232,7 @@ void Rasterizer::EmitPipelineResources(const Pipeline* pipeline) {
 }
 
 bool Rasterizer::EmitPipelineResourcesOrPacket(const Pipeline* pipeline, bool occlusion_draw) {
+    P1cCheckWrites(pipeline);
     const int mode = g_draw_packet;
     if (mode == 0) {
         EmitPipelineResources(pipeline);
