@@ -87,6 +87,11 @@ inline const int g_read_sync_fast = [] {
 /// is the buffer lookup and the access barrier. A page the guest writes after its submission
 /// started is not legally visible to that submission (submit_epoch.h) and is uploaded at the next
 /// point. Needs SHADPS4_BACK_CLEAN=1 (the log) and the CP split (the points arrive as records).
+/// SHADPS4_ASC_EARLY (l4a3): set while the back runs a record ahead of the graphics backlog -
+/// its read bindings take the per-binding validity sync instead of the coherence skip.
+inline thread_local bool t_force_binding_sync = false;
+inline thread_local u64 t_forced_binding_checks = 0;
+
 inline const int g_native_coherent = [] {
     const char* env = std::getenv("SHADPS4_NATIVE_COHERENT");
     const int mode = env ? env[0] - '0' : 0;

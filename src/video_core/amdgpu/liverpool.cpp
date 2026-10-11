@@ -779,6 +779,7 @@ const bool g_asc_early = [] {
 }();
 struct AscEarlyStats {
     std::atomic<u64> dispatches{}, packets{}, in_order{}, blocked{}, skipped{};
+    std::atomic<u64> forced_checks{}, upload_bytes{}, uploading_records{};
 } g_asc_early_stats;
 const bool g_xq = [] {
     const char* v = std::getenv("SHADPS4_XQ_CENSUS");
@@ -2252,10 +2253,13 @@ void LeanLog() {
                     LOG_INFO(Render,
                              "ASC_EARLY: ran ahead dispatches {:.0f}/s packets {:.0f}/s | in ring "
                              "order (registers / epoch / diag) {:.0f}/s | early service blocked {:.0f}/s "
-                             "| skipped in ring order {:.0f}/s",
+                             "| skipped in ring order {:.0f}/s | early per-binding sync: checks "
+                             "{:.0f}/s, records that uploaded {:.0f}/s, {:.2f} MB/s",
                              double(tk2(e.dispatches)) * ps, double(tk2(e.packets)) * ps,
                              double(tk2(e.in_order)) * ps, double(tk2(e.blocked)) * ps,
-                             double(tk2(e.skipped)) * ps);
+                             double(tk2(e.skipped)) * ps, double(tk2(e.forced_checks)) * ps,
+                             double(tk2(e.uploading_records)) * ps,
+                             double(tk2(e.upload_bytes)) * ps / 1e6);
                 }
                 if (g_xq) {
                     std::string ws, as;
@@ -2961,7 +2965,20 @@ void Liverpool::BackLoop(std::stop_token stoken) {
             if (it.type == RT::Dispatch || it.type == RT::Packet) {
                 u64 p = it.pos;
                 const auto* r = ch.RecordAtPos(p);
+                // l4a3: per-binding validity for this early record (NATIVE_COHERENT's
+                // submission-start upload for it has not run yet).
+                const u64 up0 =
+                    rasterizer ? rasterizer->GetBufferCache().SyncUploadBytesTotal() : 0;
+                const u64 chk0 = VideoCore::t_forced_binding_checks;
+                VideoCore::t_force_binding_sync = true;
                 ExecuteRecordImpl(*r);
+                VideoCore::t_force_binding_sync = false;
+                const u64 up =
+                    rasterizer ? rasterizer->GetBufferCache().SyncUploadBytesTotal() - up0 : 0;
+                g_asc_early_stats.forced_checks.fetch_add(VideoCore::t_forced_binding_checks - chk0,
+                                                         std::memory_order_relaxed);
+                g_asc_early_stats.upload_bytes.fetch_add(up, std::memory_order_relaxed);
+                g_asc_early_stats.uploading_records.fetch_add(up != 0, std::memory_order_relaxed);
                 early_done.push_back(r->seq);
                 (it.type == RT::Dispatch ? g_asc_early_stats.dispatches : g_asc_early_stats.packets)
                     .fetch_add(1, std::memory_order_relaxed);

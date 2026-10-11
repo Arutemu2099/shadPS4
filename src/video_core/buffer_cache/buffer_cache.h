@@ -311,6 +311,10 @@ public:
     /// True when a binding of this kind needs no validity work (memory is coherent for the
     /// submission): reads that are not texel buffers, on the CP thread, after the first point.
     [[nodiscard]] bool CoherentSkip(bool is_written, bool is_texel) const noexcept {
+        if (t_force_binding_sync) [[unlikely]] {
+            ++t_forced_binding_checks;
+            return false;
+        }
         return g_native_coherent != 0 && coherent_live && !is_written && !is_texel &&
                Common::FaultMonitor::t_is_cp_thread;
     }
