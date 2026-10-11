@@ -90,6 +90,14 @@ enum class NativeRunAccess : u32 { Storage, Vertex, Index };
 
 class BufferCache {
 public:
+    /// q7 (SHADPS4_READBACK_EARLY_CUT): true once after a GPU write into a recently read-back
+    /// window was noted on the CP thread (the dispatch then ends its batch).
+    bool TakeEarlyCut() noexcept {
+        const bool c = early_cut_pending;
+        early_cut_pending = false;
+        return c;
+    }
+
     static constexpr u32 CACHING_PAGEBITS = 14;
     static constexpr u64 CACHING_PAGESIZE = u64{1} << CACHING_PAGEBITS;
     static constexpr u64 DEVICE_PAGESIZE = 16_KB;
@@ -904,6 +912,7 @@ private:
     /// SHADPS4_READBACK_FAST_LANE: true if a batch in [first, last] GPU-wrote any copied byte.
     bool BatchesWriteAny(std::span<const FaultCopy> copies, u64 first, u64 last) const;
     void NoteBatchWrite(VAddr addr, u64 size);
+    bool early_cut_pending{};
     bool BatchWritesAny(std::span<const FaultCopy> copies);
     void NoteReadbackProducer(VAddr addr, u64 size);
     FaultManager fault_manager;

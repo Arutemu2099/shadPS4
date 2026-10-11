@@ -41,6 +41,9 @@
 #include "video_core/buffer_cache/protect_queue.h"
 
 namespace VideoCore {
+namespace {
+void NoteReadbackWindow(VAddr addr, u64 size); // q7, defined below
+}
 
 const bool g_native_census = [] {
     const char* e = std::getenv("SHADPS4_NATIVE_CENSUS");
@@ -1702,6 +1705,9 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
         job->addr = addr;
         job->size = bytes;
         job->tick = tick;
+        if (!is_write) {
+            NoteReadbackWindow(addr, bytes); // q7
+        }
         job->total_bytes = total_size_bytes;
         job->copies = std::move(copies);
         job->spans = std::move(spans);
@@ -2276,9 +2282,54 @@ static bool ProducerStatsEnabled() {
     return g_readback_producer_stats;
 }
 
+namespace {
+/// q7: recently read-back windows, packed (first page << 24 | pages), 0 = empty.
+std::array<std::atomic<u64>, 16> g_rb_hot{};
+std::atomic<u32> g_rb_hot_next{0};
+bool EarlyCutOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("SHADPS4_READBACK_EARLY_CUT");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+void NoteReadbackWindow(VAddr addr, u64 size) {
+    if (!EarlyCutOn() || size == 0) {
+        return;
+    }
+    const u64 first = addr >> 12;
+    const u64 pages = std::min<u64>(((addr + size + 4095) >> 12) - first, (u64{1} << 24) - 1);
+    const u64 packed = (first << 24) | pages;
+    for (const auto& e : g_rb_hot) {
+        if (e.load(std::memory_order_relaxed) == packed) {
+            return;
+        }
+    }
+    g_rb_hot[g_rb_hot_next.fetch_add(1, std::memory_order_relaxed) & 15].store(
+        packed, std::memory_order_relaxed);
+}
+bool HitsReadbackWindow(VAddr addr, u64 size) {
+    const u64 lo = addr >> 12, hi = (addr + size + 4095) >> 12;
+    for (const auto& e : g_rb_hot) {
+        const u64 v = e.load(std::memory_order_relaxed);
+        if (v != 0) {
+            const u64 first = v >> 24, end = first + (v & 0xffffff);
+            if (lo < end && first < hi) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+} // namespace
+
 void BufferCache::NoteBatchWrite(VAddr addr, u64 size) {
     if (size == 0) {
         return;
+    }
+    if (EarlyCutOn() && Common::FaultMonitor::t_is_cp_thread && !early_cut_pending &&
+        HitsReadbackWindow(addr, size)) [[unlikely]] {
+        early_cut_pending = true; // q7
     }
     if (g_lane_census || g_lane_on) [[unlikely]] {
         if (Common::FaultMonitor::t_is_cp_thread) {

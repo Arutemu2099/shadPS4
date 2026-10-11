@@ -807,6 +807,7 @@ private:
     /// Back thread: the fragment stage's image / sampler slots of the draw `base` describes now
     /// (32 words: images then samplers). views / samplers (optional): what they hold.
     void Q4NoteMaterial(const VideoCore::ImageId* ids, u32 n); // q4 census
+    void MaybeEarlyCut();                                      // q7
     bool BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::ImageView* views,
                          vk::Sampler* samplers, u32& n_img, u32& n_smp, bool retry = true,
                          const Shader::BoundStage* fs_override = nullptr,

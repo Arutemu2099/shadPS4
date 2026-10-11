@@ -8382,7 +8382,28 @@ void Rasterizer::DispatchDirect() {
     DispatchDirectTail(pipeline);
 }
 
+void Rasterizer::MaybeEarlyCut() {
+    // q7 (SHADPS4_READBACK_EARLY_CUT): this dispatch wrote a recently read-back window - end the
+    // batch now so the readback waits for the GPU only up to here, not for the rest of the frame.
+    if (!buffer_cache.TakeEarlyCut() || Scheduler::t_lane_mode || scheduler.ActiveStream() != 0) {
+        return;
+    }
+    scheduler.EndRendering();
+    scheduler.Flush();
+    static std::atomic<u64> cuts{0};
+    static std::atomic<s64> last{0};
+    const u64 n = cuts.fetch_add(1, std::memory_order_relaxed) + 1;
+    const s64 now = std::chrono::steady_clock::now().time_since_epoch().count();
+    if (now - last.load(std::memory_order_relaxed) > 10'000'000'000ll) {
+        last.store(now, std::memory_order_relaxed);
+        LOG_INFO(Render_Vulkan, "q7 readback early cuts (cumulative): {}", n);
+    }
+}
+
 void Rasterizer::DispatchDirectTail(const ComputePipeline* pipeline) {
+    SCOPE_EXIT {
+        MaybeEarlyCut();
+    };
     if (native_batch.open) [[unlikely]] {
         NativeClose(15);
     }
@@ -8456,6 +8477,9 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 
 void Rasterizer::DispatchIndirectTail(const ComputePipeline* pipeline, VAddr address, u32 offset,
                                       u32 size) {
+    SCOPE_EXIT {
+        MaybeEarlyCut(); // q7
+    };
     if (!BindResources(pipeline)) {
         return;
     }
