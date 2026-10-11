@@ -59,7 +59,7 @@ constexpr std::array<const char*, static_cast<size_t>(DrainReason::Count)> Drain
     "call_asc_disp", "call_asc_disp_ind", "call_asc_disp_patch", "call_asc_dma",
     "call_asc_wdata", "call_asc_release", "call_asc_sem", "call_ce_dump",
     "ib_end", "disp_after_pkt", "task_guard", "task_guard_ib", "task_guard_resume",
-    "task_guard_ovf",
+    "task_guard_ovf", "wrm_partial",
 };
 static_assert(DrainNames.back() != nullptr, "DrainNames must name every DrainReason");
 } // namespace
@@ -390,6 +390,42 @@ bool Channel::GuardSpan(VAddr lo, VAddr hi, DrainReason reason) {
     return false;
 }
 
+u64 Channel::OutstandingWriteSeq(VAddr lo, VAddr hi) {
+    const u64 done = done_seq.load(std::memory_order_acquire);
+    PrunePostedWrites(done);
+    if (pw_overflow_seq > done) {
+        return ~0ull;
+    }
+    u64 seq = 0;
+    for (u64 i = pw_head; i != pw_tail; ++i) {
+        const PostedWrite& write = posted_writes[i & (PostedWriteSlots - 1)];
+        if (write.lo < hi && lo < write.hi) {
+            seq = write.seq; // seqs grow along the log: the last match is the newest
+        }
+    }
+    return seq;
+}
+
+void Channel::WaitThrough(u64 seq, DrainReason reason) {
+    const auto r = static_cast<u32>(reason);
+    ++counters.drains[r];
+    Publish();
+    const u64 ticks = WaitDone(seq);
+    if (ticks != 0) {
+        ++counters.drain_waits[r];
+        counters.drain_ticks[r] += ticks;
+    }
+}
+
+void Channel::ArmDrainProbe() {
+    if (probe_seq.load(std::memory_order_relaxed) != ~0ull ||
+        done_seq.load(std::memory_order_acquire) >= committed_seq) {
+        return;
+    }
+    probe_t0.store(Ticks(), std::memory_order_relaxed);
+    probe_seq.store(committed_seq, std::memory_order_release);
+}
+
 void Channel::EmitRegWrite(u32 word_offset, const u32* data, u32 count) {
     ASSERT(u64{word_offset} + count <= Regs::NumRegs);
     if (count == 0) {
@@ -675,6 +711,14 @@ void Channel::PublishDone(u64 seq) {
     done_seq.store(seq, std::memory_order_seq_cst);
     if (front_parked.load(std::memory_order_seq_cst)) {
         done_seq.notify_one();
+    }
+    if (seq >= probe_seq.load(std::memory_order_relaxed)) [[unlikely]] {
+        // Only the back clears a probe and the front arms only a cleared one: no lost update.
+        if (probe_seq.exchange(~0ull, std::memory_order_acq_rel) != ~0ull) {
+            probe_ticks.fetch_add(Ticks() - probe_t0.load(std::memory_order_relaxed),
+                                  std::memory_order_relaxed);
+            probe_n.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 }
 

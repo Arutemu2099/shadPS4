@@ -222,6 +222,7 @@ enum class DrainReason : u8 {
     TaskGuardIb,       ///< At the entry of a nested IB (gfx, CE, ASC).
     TaskGuardResume,   ///< An active buffer's unparsed rest, before ProcessLoop resumes a task.
     TaskGuardOverflow, ///< The write log (or span registry) overflowed: conservative drain.
+    WaitRegMemPartial, ///< SHADPS4_WRM_PARTIAL: WAIT_REG_MEM waits through its label's last posted write.
     Count,
 };
 
@@ -486,6 +487,19 @@ public:
     /// After BeginGuardCheck returned true: if an outstanding write overlaps [lo, hi), Sync(reason)
     /// (Sync(TaskGuardOverflow) if the log overflowed) and return true.
     bool GuardSpan(VAddr lo, VAddr hi, DrainReason reason);
+    /// SHADPS4_WRM_PARTIAL: the seq of the newest outstanding noted write overlapping [lo, hi);
+    /// 0 when none may be outstanding, ~0 when the log overflowed and a dropped one may be.
+    u64 OutstandingWriteSeq(VAddr lo, VAddr hi);
+    /// Publishes and waits until done_seq >= seq (counted under `reason` like a drain).
+    void WaitThrough(u64 seq, DrainReason reason);
+    /// WAIT_REG_MEM census: the back measures how long it takes from now until it is done with
+    /// everything committed now (what a full drain would wait). One probe at a time.
+    void ArmDrainProbe();
+    /// {probes completed, their ticks} since the last call.
+    std::pair<u64, u64> TakeDrainProbe() {
+        return {probe_n.exchange(0, std::memory_order_relaxed),
+                probe_ticks.exchange(0, std::memory_order_relaxed)};
+    }
 
     void EmitRegWrite(u32 word_offset, const u32* data, u32 count);
     void EmitClearState();
@@ -744,6 +758,9 @@ private:
     std::atomic<u64> back_idle_ticks{0}; ///< Written by the back, read and reset by MaybeLog.
 
     alignas(64) std::atomic<u64> done_seq{0};
+    // ArmDrainProbe: armed by the front (~0 = none), completed and cleared by the back.
+    alignas(64) std::atomic<u64> probe_seq{~0ull};
+    std::atomic<u64> probe_t0{0}, probe_ticks{0}, probe_n{0};
     alignas(64) std::atomic<bool> front_parked{false};
     alignas(64) std::atomic<bool> back_parked{false};
     std::atomic<u32> doorbell{0};

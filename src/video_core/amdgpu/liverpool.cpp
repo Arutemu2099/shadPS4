@@ -1896,6 +1896,71 @@ void LeanCompare(LeanJob& j) {
     j.state.store(0, std::memory_order_release);
 }
 
+// SHADPS4_WRM_PARTIAL=1 (l3l): a WAIT_REG_MEM waits only through the last outstanding posted write to
+// its label (TASK_GUARD write log), not for the whole backlog; VO labels without any drain. Census
+// (front-written, logged by LeanLog): kinds 0 posted write in the log, 1 VO label, 2 none,
+// 3 register, 4 log overflow.
+const bool g_wrm_partial = [] {
+    const char* v = std::getenv("SHADPS4_WRM_PARTIAL");
+    return v && v[0] == '1';
+}();
+struct WrmCensus {
+    std::array<std::atomic<u64>, 5> kind{}, passed{}, fallback{};
+    std::atomic<u64> waits{}, vo_waits{}, backlog{}, partial_records{}, partial_ticks{},
+        partial_waits{};
+    std::atomic<CpSplit::Channel*> ch{}; ///< the front's channel, for the drain probe at log time
+} g_wrm;
+enum class WrmPre { Full, Passed, VoWait };
+WrmPre WrmPartial(CpSplit::Channel& ch, const PM4CmdWaitRegMem* w, bool vo_label,
+                  std::span<const u32> regs) {
+    const auto add = [](std::atomic<u64>& a, u64 v) { a.fetch_add(v, std::memory_order_relaxed); };
+    add(g_wrm.waits, 1);
+    g_wrm.ch.store(&ch, std::memory_order_relaxed);
+    if (w->mem_space.Value() != PM4CmdWaitRegMem::MemSpace::Memory) {
+        // The front's own register file: the back owes it nothing.
+        add(g_wrm.kind[3], 1);
+        if (g_wrm_partial && w->Test(regs)) {
+            add(g_wrm.passed[3], 1);
+            return WrmPre::Passed;
+        }
+        add(g_wrm.fallback[3], 1);
+        return WrmPre::Full;
+    }
+    const VAddr lo = reinterpret_cast<VAddr>(w->Address<u32*>());
+    const u64 done0 = ch.DoneSeq();
+    const u64 committed = ch.CommittedSeq();
+    add(g_wrm.backlog, committed > done0 ? committed - done0 : 0);
+    ch.ArmDrainProbe();
+    const u64 seq = ch.OutstandingWriteSeq(lo, lo + sizeof(u32));
+    const u32 k = seq == ~0ull ? 4 : seq != 0 ? 0 : vo_label ? 1 : 2;
+    add(g_wrm.kind[k], 1);
+    // No logged writer (2): the label may be written by something the log does not cover (a
+    // shader result read back, another queue): the old path, counted (advisor 2026-10-10).
+    if (!g_wrm_partial || k == 4 || k == 2) {
+        add(g_wrm.fallback[k], 1);
+        return WrmPre::Full;
+    }
+    if (k == 0) {
+        add(g_wrm.partial_records, seq > done0 ? seq - done0 : 0);
+        add(g_wrm.partial_waits, 1);
+        const u64 t0 = __rdtsc();
+        ch.WaitThrough(seq, CpSplit::DrainReason::WaitRegMemPartial);
+        add(g_wrm.partial_ticks, __rdtsc() - t0);
+    } else {
+        ch.PublishNow(); // VO label: the back must be able to reach the flip it waits for
+    }
+    if (w->Test(regs)) {
+        add(g_wrm.passed[k], 1);
+        return WrmPre::Passed;
+    }
+    if (vo_label) {
+        add(g_wrm.vo_waits, 1);
+        return WrmPre::VoWait;
+    }
+    add(g_wrm.fallback[k], 1);
+    return WrmPre::Full;
+}
+
 void LeanLog() {
     auto& s = g_lean_s;
     auto& c = s.c;
@@ -2037,6 +2102,34 @@ void LeanLog() {
             LOG_INFO(Render, "Lean L3 verify: buffer checks skipped (generation moved mid-stretch by "
                              "the verify's own old path) {}",
                      x.verify_mid.exchange(0));
+            {
+                auto& w = g_wrm;
+                const auto tk = [](std::atomic<u64>& a) { return a.exchange(0); };
+                const u64 n = tk(w.waits);
+                std::array<u64, 5> kd{}, ps_{}, fb{};
+                for (u32 i = 0; i < 5; ++i) {
+                    kd[i] = tk(w.kind[i]);
+                    ps_[i] = tk(w.passed[i]);
+                    fb[i] = tk(w.fallback[i]);
+                }
+                const u64 mem = kd[0] + kd[1] + kd[2] + kd[4];
+                const u64 pw = tk(w.partial_waits);
+                auto* wch = w.ch.load(std::memory_order_relaxed);
+                const auto [pn, pt] = wch ? wch->TakeDrainProbe() : std::pair<u64, u64>{};
+                LOG_INFO(Render,
+                         "WRM census (partial {}): waits {:.0f}/s | writer: posted write in log {} VO "
+                         "label {} none {} register {} log overflow {} | passed after the partial "
+                         "wait: log {} VO {} none {} register {} | VO waits without drain {} | old "
+                         "path (full drain): log {} VO {} none {} register {} overflow {} | backlog at "
+                         "a memory wait {:.0f} records avg | partial waits {} for {:.0f} records avg, "
+                         "{:.3f} ms avg | a full drain of that backlog takes {:.3f} ms avg (probes {})",
+                         g_wrm_partial ? 1 : 0, double(n) * ps, kd[0], kd[1], kd[2], kd[3], kd[4],
+                         ps_[0], ps_[1], ps_[2], ps_[3], tk(w.vo_waits), fb[0], fb[1], fb[2], fb[3],
+                         fb[4], double(tk(w.backlog)) / double(std::max<u64>(mem, 1)), pw,
+                         double(tk(w.partial_records)) / double(std::max<u64>(pw, 1)),
+                         double(tk(w.partial_ticks)) / 3.5e6 / double(std::max<u64>(pw, 1)),
+                         double(pt) / 3.5e6 / double(std::max<u64>(pn, 1)), pn);
+            }
             LOG_INFO(Render,
                      "Lean L3 pre-delta: folds {:.0f}/s, register records folded {:.0f}/s | A2=2 "
                      "pre-delta words {} BAD {} | publishes on back wait {:.0f}/s",
@@ -10562,6 +10655,22 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (g_fence_forward && split_enabled && ForwardedWait(0, header)) {
                     break; // SHADPS4_FENCE_FORWARD: passes in stream order on the fence's value
                 }
+                const bool vo_wait = vo_port->IsVoLabel(wait_addr) &&
+                                     num_submits == mapped_queues[GfxQueueId].submits.size();
+                const WrmPre pre = split_enabled && split_task_guard
+                                       ? WrmPartial(*split, wait_reg_mem, vo_wait, regs.reg_array)
+                                       : WrmPre::Full;
+                if (pre == WrmPre::Passed) {
+                    break; // SHADPS4_WRM_PARTIAL: passed after the label's own last write
+                }
+                if (pre == WrmPre::VoWait) {
+                    // SHADPS4_WRM_PARTIAL: the presenter writes it; the backlog is not drained.
+                    const auto vo_start = Common::FaultMonitor::Now();
+                    vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
+                    Common::FaultMonitor::CountVoLabelWait(
+                        Common::FaultMonitor::SinceNs(vo_start));
+                    break;
+                }
                 // CP split: the back may still owe writes this wait reads (inventory 0.6), so
                 // drain before testing. At depth 0 this only flushes register records.
                 FrontDrain(CpSplit::DrainReason::WaitRegMem);
@@ -11154,6 +11263,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
             if (g_fence_forward && split_enabled && ForwardedWait(1 + (queue.pipe_id & 0xff), header)) {
                 break; // SHADPS4_FENCE_FORWARD (ASC)
+            }
+            if (split_enabled && split_task_guard &&
+                WrmPartial(*split, wait_reg_mem, false, regs.reg_array) == WrmPre::Passed) {
+                break; // SHADPS4_WRM_PARTIAL (ASC)
             }
             const auto wrm_start = Common::FaultMonitor::Now();
             const u64 wrm_ns0 = g_cp_wait.enabled ? CpWaitStats::Now() : 0;
