@@ -1487,7 +1487,19 @@ void PipelineCache::PrepareNativeColourLocked(const GraphicsPipeline* base,
                 }
             }
             if (fs->images.empty()) {
-                return "untextured"; // the shadow kind (SHADPS4_NATIVE_PASS) or nothing
+                // SHADPS4_NATIVE_COLOUR_UNTEXTURED (l4b): an fs with buffers / samplers / user
+                // data / dma but no image is what NativePass refuses ("fs resources"): without
+                // this it has no variant at all. Plain untextured stays the shadow kind.
+                static const bool untextured = [] {
+                    const char* e = std::getenv("SHADPS4_NATIVE_COLOUR_UNTEXTURED");
+                    return e && e[0] == '1';
+                }();
+                const bool fs_resources = !fs->buffers.empty() || !fs->samplers.empty() ||
+                                          fs->ud_mask.mask != 0 || fs->uses_dma;
+                if (!untextured || !fs_resources) {
+                    base->native_colour_untextured = 1;
+                    return "untextured"; // the shadow kind (SHADPS4_NATIVE_PASS) or nothing
+                }
             }
             // Diag 32 / 64: narrow loads ineligible in the VS / PS only.
             if (const char* w = NativeBufferWhyNot(*vs, 32)) {

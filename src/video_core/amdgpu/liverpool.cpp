@@ -779,7 +779,7 @@ const bool g_asc_early = [] {
 }();
 struct AscEarlyStats {
     std::atomic<u64> dispatches{}, packets{}, in_order{}, blocked{}, skipped{};
-    std::atomic<u64> forced_checks{}, upload_bytes{}, uploading_records{};
+    std::atomic<u64> forced_checks{}, upload_bytes{}, uploading_records{}, cross_waits{};
 } g_asc_early_stats;
 const bool g_xq = [] {
     const char* v = std::getenv("SHADPS4_XQ_CENSUS");
@@ -2186,13 +2186,13 @@ void LeanLog() {
             auto& x = g_lean_xl;
             const double ps = 1.0 / std::max(sec, 1e-9);
             std::array<u64, 32> rf{};
-            std::array<u64, 24> sb{};
+            std::array<u64, 28> sb{};
             for (const auto& t : x.tr) {
                 if (const auto* tr = t.load(std::memory_order_acquire)) {
                     for (u32 i = 0; i < 32; ++i) {
                         rf[i] += tr->refusals[i]; // cumulative (racy reads, as A2Log)
                     }
-                    for (u32 i = 0; i < 24; ++i) {
+                    for (u32 i = 0; i < 28; ++i) {
                         sb[i] += tr->sub[i];
                     }
                 }
@@ -2204,10 +2204,11 @@ void LeanLog() {
                      "formatted {} colour inline/null/empty {} | guest lookup: no buffer {} outside "
                      "{} | inherited refused: size {} no buffer {} offset {} | taken with inherited "
                      "slots {} with clip planes {} | guest-lookup fallback {} | stretches cut by a 9th "
-                     "material {}",
+                     "material {} | no variant: pipeline undecided {} eligible (no variant for this "
+                     "vertex description yet) {} untextured {} other ineligible {}",
                      sb[12], sb[13], sb[14], sb[15], sb[0], sb[1], sb[2], sb[3], sb[4], sb[5], sb[6],
                      sb[7], sb[8], sb[9], sb[10], sb[11], sb[16], sb[17], sb[18], sb[19], sb[20],
-                     sb[23], x.mat_cuts.exchange(0));
+                     sb[23], x.mat_cuts.exchange(0), sb[24], sb[25], sb[26], sb[27]);
             LOG_INFO(Render,
                      "Lean L3 direct checks (A2=2): inherited-slot words {} BAD {} | user-data "
                      "words {} BAD {} | clip planes {} BAD {} | formatted + fallback table bases {} BAD {} | "
@@ -2256,7 +2257,9 @@ void LeanLog() {
                              "| skipped in ring order {:.0f}/s | early per-binding sync: checks "
                              "{:.0f}/s, records that uploaded {:.0f}/s, {:.2f} MB/s | inverted reads "
                              "(gfx read, earlier in ring order, of a range an early ASC record wrote) "
-                             "{:.0f}/s of {:.0f}/s checked, early writes {:.0f}/s",
+                             "{:.0f}/s of {:.0f}/s checked, early writes {:.0f}/s (shader write "
+                             "bindings vs old-path reads only) | ASC waits on another queue's label "
+                             "(ordering Call) {:.0f}/s | front waits for early-queue space {}",
                              double(tk2(e.dispatches)) * ps, double(tk2(e.packets)) * ps,
                              double(tk2(e.in_order)) * ps, double(tk2(e.blocked)) * ps,
                              double(tk2(e.skipped)) * ps, double(tk2(e.forced_checks)) * ps,
@@ -2264,7 +2267,9 @@ void LeanLog() {
                              double(tk2(e.upload_bytes)) * ps / 1e6,
                              double(VideoCore::g_early_inv_reads.exchange(0)) * ps,
                              double(VideoCore::g_early_inv_checks.exchange(0)) * ps,
-                             double(VideoCore::g_early_inv_writes.exchange(0)) * ps);
+                             double(VideoCore::g_early_inv_writes.exchange(0)) * ps,
+                             double(tk2(e.cross_waits)) * ps,
+                             g_wrm.ch.load() ? g_wrm.ch.load()->early_full_waits : 0);
                 }
                 if (g_xq) {
                     std::string ws, as;
@@ -2935,6 +2940,10 @@ void Liverpool::FrontProcess(std::stop_token stoken) {
     split->FrontExited();
 }
 
+namespace {
+bool A2NoopDma(const CpSplit::RecordHeader& record); // l4a6: used by the ASC early service
+} // namespace
+
 void Liverpool::BackLoop(std::stop_token stoken) {
     std::stop_callback wake_on_stop{stoken, [this] { split->WakeBack(); }};
     if (g_lean == 2) {
@@ -2950,7 +2959,7 @@ void Liverpool::BackLoop(std::stop_token stoken) {
     bool mtb_p3 = false;
     // SHADPS4_ASC_EARLY: seqs of records already run ahead, in ring order (back only).
     std::deque<u64> early_done;
-    const bool asc_early = g_asc_early && split->early_items != nullptr;
+    const bool asc_early = g_asc_early && split->early_items != nullptr && g_mtb_p3 == 0;
     const auto early_service = [&] {
         auto& ch = *split;
         u64 head = ch.early_head.load(std::memory_order_relaxed);
@@ -2970,6 +2979,12 @@ void Liverpool::BackLoop(std::stop_token stoken) {
             if (it.type == RT::Dispatch || it.type == RT::Packet) {
                 u64 p = it.pos;
                 const auto* r = ch.RecordAtPos(p);
+                if (it.type == RT::Dispatch &&
+                    reinterpret_cast<const SplitDispatchRecord*>(r + 1)->verify != 0) {
+                    // l4a6 (review #4): VerifyMirror assumes the front is parked on it.
+                    g_asc_early_stats.blocked.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                }
                 // l4a3: per-binding validity for this early record (NATIVE_COHERENT's
                 // submission-start upload for it has not run yet).
                 const u64 up0 =
@@ -2979,6 +2994,8 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                 VideoCore::t_early_pos = it.pos;
                 ExecuteRecordImpl(*r);
                 VideoCore::t_force_binding_sync = false;
+                // l4a6 (review #1): as the L3 path - the next stretch replay needs its barrier.
+                g_a2s.gpu_write = g_a2s.gpu_write || it.type == RT::Dispatch || !A2NoopDma(*r);
                 const u64 up =
                     rasterizer ? rasterizer->GetBufferCache().SyncUploadBytesTotal() - up0 : 0;
                 g_asc_early_stats.forced_checks.fetch_add(VideoCore::t_forced_binding_checks - chk0,
@@ -10394,7 +10411,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         if (g_lean_front.job != nullptr) [[unlikely]] {
             split->canon = nullptr; // nothing between packets (host commands, ASC) is recorded
         }
-        if (g_xq && split_enabled) [[unlikely]] {
+        if ((g_xq || g_asc_early) && split_enabled) [[unlikely]] {
             split->note_queue = 0;
         }
         if (g_asc_early && split_enabled) [[unlikely]] {
@@ -11416,7 +11433,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         if (g_asc_early && split_enabled) [[unlikely]] {
             split->asc_tag = 1;
         }
-        if (g_xq && split_enabled) [[unlikely]] {
+        if ((g_xq || g_asc_early) && split_enabled) [[unlikely]] {
             split->note_queue = static_cast<u8>(std::min<u32>(vqid + 1, XqQueues - 1));
         }
 
@@ -11780,8 +11797,22 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 break; // SHADPS4_FENCE_FORWARD (ASC)
             }
             if (split_enabled && split_task_guard) {
+                // l4a6 (review #2): the label's newest logged writer, before WrmPartial prunes.
+                const int writer_q =
+                    g_asc_early && split->early_items
+                        ? split->NewestWriterQueue(
+                              reinterpret_cast<VAddr>(wait_reg_mem->Address<u32*>()))
+                        : -1;
                 const WrmPre pre = WrmPartial(*split, wait_reg_mem, false, regs.reg_array);
-                if (pre == WrmPre::PassedFwdFence && g_wait_barrier >= 1) {
+                const bool fwd_barrier = pre == WrmPre::PassedFwdFence && g_wait_barrier >= 1;
+                if (fwd_barrier) {
+                    PostWaitBarrier(0);
+                }
+                if (!fwd_barrier && writer_q >= 0 && u32(writer_q) != std::min<u32>(vqid + 1, XqQueues - 1) &&
+                    (pre == WrmPre::Passed || pre == WrmPre::PassedFwdFence)) [[unlikely]] {
+                    // Another queue wrote the label: a tagged Call keeps the ASC records after
+                    // this wait behind that writer in ring order (early service blocks on it).
+                    g_asc_early_stats.cross_waits.fetch_add(1, std::memory_order_relaxed);
                     PostWaitBarrier(0);
                 }
                 if (pre == WrmPre::Passed || pre == WrmPre::PassedFwdFence) {

@@ -692,9 +692,18 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     // variant per vertex description (NativeColourVariant by NativeVertexKey); it must be the
     // bindless + pulled-vertex kind (NativeDirectCandidate).
     bool colour = false;
+    // l4b census: "no variant" by the pipeline's colour state - 24 undecided, 25 eligible (no
+    // variant for this vertex description yet), 26 ineligible as untextured, 27 ineligible other.
+    const auto no_variant = [&] {
+        if (base) {
+            const u8 s = base->native_colour_static;
+            ++owner->sub[s == 0 ? 24 : s == 1 ? 25 : base->native_colour_untextured ? 26 : 27];
+        }
+        return refuse(RefuseNoVariant);
+    };
     if (!native) {
         if (!base || !colour_on) {
-            return refuse(RefuseNoVariant);
+            return no_variant();
         }
         if (!draw.vi || draw.vi->count > 16) {
             return refuse(RefuseNoVi);
@@ -702,7 +711,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         native = base->NativeColourVariant(VideoCore::NativeVertexKey(
             AmdGpu::CpSplit::VertexInputAttribs(*draw.vi), draw.vi->count));
         if (!native) {
-            return refuse(RefuseNoVariant);
+            return no_variant();
         }
         colour = true;
         if (!native->native_bindless ||

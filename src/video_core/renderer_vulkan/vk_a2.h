@@ -292,7 +292,7 @@ public:
     /// 0 or >= 1 GB, no cached buffer holding it, offset over 32 bits), 19 draws taken with an
     /// inherited slot, 20 draws taken with user clip planes, 21 a 17th texel range refused,
     /// 22 draws taken with a formatted slot, 23 guest slots resolved by the opener's own V#.
-    std::array<u64, 24> sub{};
+    std::array<u64, 28> sub{}; ///< 24-27 (l4b): "no variant" by pipeline state
     /// Draws taken and sub-batches opened so far (logged by the caller).
     u64 taken{}, sub_batches{};
     /// The reason of the last refusal (TakeDraw returned false).
