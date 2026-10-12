@@ -255,6 +255,10 @@ struct Stretch {
     u32 mat_pre{};
     u64 tab_gen{};
     u32 tab_set{};
+    /// q10: the kill sequence read before the first table material's lookups, and the (image id,
+    /// epoch) of every image the stretch took from the table (ImgsCurrent at publish).
+    u64 tab_kseq{};
+    std::vector<std::pair<u32, u32>> tab_imgs;
     std::array<std::pair<u8, u8>, 8> pre_n{};
     /// p2 (SHADPS4_A2_SEC): the worker's secondary (null: the closure path), the bindless set
     /// index it binds, and its rendering inheritance.

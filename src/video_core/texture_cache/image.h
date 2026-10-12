@@ -119,7 +119,7 @@ struct Image {
         depth_id = depth_image_id;
         depth_uid = depth_image_uid;
         if (changed) {
-            VideoCore::TexTable::NoteImage(tab_gen); // q8
+            VideoCore::TexTable::NoteImage(tab_gen, tab_id); // q8
             // SHADPS4_DRAW_REPEAT: a full bind would now redirect this image (review 2026-10-02).
             g_image_epoch.fetch_add(1, std::memory_order_release);
         }
@@ -213,6 +213,7 @@ public:
     u64 overlap_epoch{};
     /// q8: the texture-table generation this image was inserted at (0: never; atomic_ref).
     u64 tab_gen{};
+    u32 tab_id{}; ///< q10: its ImageId index, stored with tab_gen at insert (per-image kills)
     u64 lru_id{};
     u64 tick_accessed_last{};
     u64 hash{};

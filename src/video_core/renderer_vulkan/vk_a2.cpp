@@ -1692,7 +1692,9 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
                 // q8: the slots from the table (the back's BindlessResolve keys: T# words + desc
                 // bits, S# words after its anisotropy rule); all must hit at one generation.
                 TT::g_c[0].fetch_add(1, std::memory_order_relaxed);
+                const u64 ks = TT::g_kill_seq.load(std::memory_order_acquire); // q10: first
                 const u64 tg = TT::Gen();
+                const size_t imgs0 = stretch->tab_imgs.size();
                 const u32 set = g_bindless_cur.load(std::memory_order_acquire);
                 bool all = (stretch->mat_pre == 0 || (stretch->tab_gen == tg &&
                                                       stretch->tab_set == set));
@@ -1705,9 +1707,12 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
                     std::memcpy(w.data(), &ts, sizeof(w));
                     const u32 dk = u32(d.is_depth) | u32(d.is_array) << 1 | u32(d.is_r128) << 2 |
                                    (1u << 8);
-                    u32 slot = 0;
-                    all = TT::LookupImg(dk, w, tg, slot);
+                    u32 slot = 0, iid = 0, iep = 0;
+                    all = TT::LookupImg(dk, w, tg, slot, &iid, &iep);
                     ms[i] = slot;
+                    if (all && TT::V2()) {
+                        stretch->tab_imgs.emplace_back(iid, iep);
+                    }
                 }
                 for (u32 j = 0; all && j < tl_ns; ++j) {
                     const auto& sd = *tl_smp[j].first;
@@ -1726,8 +1731,14 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
                     all = TT::LookupSmp(w, tg, slot);
                     ms[Shader::NativeBindlessMax + j] = slot;
                 }
+                if (!all) {
+                    stretch->tab_imgs.resize(imgs0); // q10: only taken materials' images
+                }
                 if (all) {
                     TT::g_c[1].fetch_add(1, std::memory_order_relaxed);
+                    if (stretch->mat_pre == 0) {
+                        stretch->tab_kseq = ks;
+                    }
                     stretch->mat_pre |= 1u << mat;
                     stretch->tab_gen = tg;
                     stretch->tab_set = set;

@@ -1418,10 +1418,10 @@ void BackLeanMaybeLog() {
         LOG_INFO(Render,
                  "q8 texture table (window): worker materials looked up {} all hit {} | published "
                  "pre-resolved {} rejected (generation moved) {} | back image inserts {} "
-                 "ineligible {} | kills {} | verify {} BAD {} (cumulative) stale {}",
+                 "ineligible {} | kills {} image kills {} | verify {} BAD {} (cumulative) stale {}",
                  tk(TT::g_c[0]), tk(TT::g_c[1]), tk(TT::g_c[2]), tk(TT::g_c[3]),
-                 tk(TT::g_c[4]), tk(TT::g_c[7]), tk(TT::g_kills), tk(TT::g_c[5]),
-                 TT::g_c[6].load(), tk(TT::g_c[8]));
+                 tk(TT::g_c[4]), tk(TT::g_c[7]), tk(TT::g_kills), tk(TT::g_img_kills),
+                 tk(TT::g_c[5]), TT::g_c[6].load(), tk(TT::g_c[8]));
     }
     {
         std::string pk_s; // q4
@@ -9080,7 +9080,8 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
             const int tab_mode = TT::Mode();
             const bool tab_ok = st.mat_pre != 0 && st.tab_gen == TT::Gen() &&
                                 rasterizer->A2BindlessCur() == st.tab_set &&
-                                rasterizer->A2TexTableStateOk(); // q8b (A)
+                                rasterizer->A2TexTableStateOk() && // q8b (A)
+                                TT::ImgsCurrent(st.tab_kseq, st.tab_imgs); // q10
             tab_used = tab_ok;
             if (st.mat_pre != 0 && !tab_ok) {
                 TT::g_c[3].fetch_add(1, std::memory_order_relaxed);
@@ -9101,7 +9102,7 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                     if (!pre) {
                         return;
                     }
-                    if (TT::Gen() != st.tab_gen) {
+                    if (TT::Gen() != st.tab_gen || !TT::ImgsCurrent(st.tab_kseq, st.tab_imgs)) {
                         TT::g_c[8].fetch_add(1, std::memory_order_relaxed); // q8b (E): stale
                         return;
                     }
@@ -9191,8 +9192,9 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
         }
         mirror->ctx_epoch = rec.ctx_epoch;
         rasterizer->A2BeginStretch(rec.draw.pipeline);
-        if (tab_used && VideoCore::TexTable::Mode() == 1 &&
-            st.tab_gen != VideoCore::TexTable::Gen()) {
+        if (tab_used && VideoCore::TexTable::Mode() != 2 &&
+            (st.tab_gen != VideoCore::TexTable::Gen() ||
+             !VideoCore::TexTable::ImgsCurrent(st.tab_kseq, st.tab_imgs))) { // q10
             // q8: an image of a table material changed (e.g. became a target of this pass).
             VideoCore::TexTable::g_c[3].fetch_add(1, std::memory_order_relaxed);
             x.rej_rt.fetch_add(1, std::memory_order_relaxed);

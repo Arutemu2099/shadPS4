@@ -5318,7 +5318,8 @@ bool Rasterizer::A2MaterialMemo(const GraphicsPipeline* base, u64 h1, u64 h2, u3
                                 u32& n_img, u32& n_smp, std::vector<VideoCore::ImageId>& ids) {
     const int mode = MatMemoMode();
     if (mode == 0 || mode == 2 || !base || (h1 == 0 && h2 == 0) || mat_memo.empty() ||
-        VideoCore::TexTable::Mode() != 0) { // q8: the table replaces the memo
+        (VideoCore::TexTable::Mode() != 0 && VideoCore::TexTable::Mode() != 3)) {
+        // q8: the table replaces the memo (q10: =3 keeps the memo for table misses)
         return false; // =2: A2ResolveMaterial verifies every hit against the full resolve
     }
     auto& st = native_stats;
@@ -5477,6 +5478,10 @@ bool Rasterizer::A2ResolveMaterial(const GraphicsPipeline* base, const Shader::B
             }
             // q8b (D): publish tab_gen, fence, then re-check what a concurrent mark could have
             // changed - a dirty mark after this point sees tab_gen and kills.
+            // q10: the epoch is read first; a kill after it moves the epoch (entry stale).
+            const u32 iid = static_cast<u32>(e.id.index);
+            const u32 ep0 = TT::Ep(iid);
+            std::atomic_ref<u32>{im.tab_id}.store(iid, std::memory_order_relaxed);
             std::atomic_ref<u64>{im.tab_gen}.store(tg, std::memory_order_relaxed);
             std::atomic_thread_fence(std::memory_order_seq_cst);
             const auto flags = std::atomic_ref<VideoCore::ImageFlagBits>{im.flags}.load(
@@ -5487,13 +5492,13 @@ bool Rasterizer::A2ResolveMaterial(const GraphicsPipeline* base, const Shader::B
                 im.backing == e.backing && im.backing->state_serial == e.serial &&
                 std::atomic_ref<u64>{im.overlap_epoch}.load(std::memory_order_relaxed) ==
                     e.overlap &&
-                TT::Gen() == tg;
+                TT::Gen() == tg && TT::Ep(iid) == ep0;
             if (!still) {
                 TT::g_c[7].fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
             TT::InsertImg(static_cast<u32>(reinterpret_cast<uintptr_t>(e.desc)), e.words, e.slot,
-                          static_cast<u32>(e.id.index), tg);
+                          iid, tg, ep0);
             TT::g_c[4].fetch_add(1, std::memory_order_relaxed);
         }
         for (u32 j = 0; j < n_smp; ++j) {
