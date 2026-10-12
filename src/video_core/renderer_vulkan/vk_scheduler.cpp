@@ -156,6 +156,11 @@ Scheduler::Scheduler(const Instance& instance, bool allow_recording_worker)
         asc_semaphore = std::make_unique<MasterSemaphore>(instance);
         asc_pool = std::make_unique<CommandPool>(instance, asc_semaphore.get(),
                                                  instance.GetReadbackQueueFamilyIndex());
+        if (const char* e = std::getenv("SHADPS4_LANE_RECORDER"); e && e[0] == '1') {
+            lane_rec = true; // q12
+            lane_rec_thread = std::thread([this] { LaneRecLoop(); });
+            LOG_INFO(Render_Vulkan, "AscLane: q12 lane recorder thread on (recording and submits off the back)");
+        }
         LOG_INFO(Render_Vulkan,
                  "AscLane: on (early ASC records inline on the back, queue 1 of family {}, no I1, "
                  "{} recording lanes)",
@@ -167,6 +172,14 @@ Scheduler::Scheduler(const Instance& instance, bool allow_recording_worker)
 }
 
 Scheduler::~Scheduler() {
+    if (lane_rec_thread.joinable()) { // q12
+        {
+            std::scoped_lock lk{lane_rec_mu};
+            lane_rec_stop = true;
+        }
+        lane_rec_cv.notify_all();
+        lane_rec_thread.join();
+    }
     mtb.reset(); // its sink returns worker chunks
     recording_worker.reset();
 #if TRACY_GPU_ENABLED
@@ -672,6 +685,52 @@ void Scheduler::PushDescriptors(vk::PipelineBindPoint bind_point, vk::PipelineLa
                                 std::span<const vk::WriteDescriptorSet> writes) {
     Rc().native_heaps_bound = false;
     Rc().dynamic_state.packet_state_unknown = true; // a push outside the draw packets
+    if (LaneRecQueues()) [[unlikely]] {
+        // q12: deep copy (buffer / image infos); anything else drains and pushes inline.
+        bool plain = true;
+        size_t nb = 0, ni = 0;
+        for (const auto& w : writes) {
+            plain = plain && !w.pNext && !w.pTexelBufferView;
+            nb += w.pBufferInfo ? w.descriptorCount : 0;
+            ni += w.pImageInfo ? w.descriptorCount : 0;
+        }
+        if (plain) {
+            std::vector<vk::WriteDescriptorSet> ws(writes.begin(), writes.end());
+            std::vector<vk::DescriptorBufferInfo> bi;
+            std::vector<vk::DescriptorImageInfo> ii;
+            bi.reserve(nb);
+            ii.reserve(ni);
+            for (auto& w : ws) {
+                if (w.pBufferInfo) {
+                    const size_t at = bi.size();
+                    bi.insert(bi.end(), w.pBufferInfo, w.pBufferInfo + w.descriptorCount);
+                    w.pBufferInfo = reinterpret_cast<const vk::DescriptorBufferInfo*>(at + 1);
+                }
+                if (w.pImageInfo) {
+                    const size_t at = ii.size();
+                    ii.insert(ii.end(), w.pImageInfo, w.pImageInfo + w.descriptorCount);
+                    w.pImageInfo = reinterpret_cast<const vk::DescriptorImageInfo*>(at + 1);
+                }
+            }
+            LaneRecPush([this, bind_point, layout, ws = std::move(ws), bi = std::move(bi),
+                         ii = std::move(ii)]() mutable {
+                for (auto& w : ws) { // indices + 1 -> pointers into the job's own copies
+                    if (w.pBufferInfo) {
+                        w.pBufferInfo = bi.data() + (reinterpret_cast<size_t>(w.pBufferInfo) - 1);
+                    }
+                    if (w.pImageInfo) {
+                        w.pImageInfo = ii.data() + (reinterpret_cast<size_t>(w.pImageInfo) - 1);
+                    }
+                }
+                CloseTransferGroup(asc_cmdbuf);
+                asc_cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, ws);
+            });
+            return;
+        }
+        LaneRecDrainForBorrow();
+        InlineCmdbuf().pushDescriptorSetKHR(bind_point, layout, 0, writes);
+        return;
+    }
     if (!IsAsyncRecording()) {
         InlineCmdbuf().pushDescriptorSetKHR(bind_point, layout, 0, writes);
         return;
@@ -1576,6 +1635,64 @@ void Scheduler::AscTimerCollect() {
     }
 }
 
+void Scheduler::LaneRecPush(Common::UniqueFunction<void>&& job) {
+    bool wake;
+    {
+        std::scoped_lock lk{lane_rec_mu};
+        lane_rec_q.push_back(std::move(job));
+        wake = lane_rec_sleeping;
+    }
+    ++lane_rec_jobs;
+    if (wake) {
+        lane_rec_cv.notify_one();
+    }
+}
+
+void Scheduler::LaneRecDrain() {
+    std::unique_lock lk{lane_rec_mu};
+    if (lane_rec_sleeping && !lane_rec_q.empty()) {
+        lane_rec_cv.notify_one();
+    }
+    lane_rec_idle_cv.wait(lk, [this] { return lane_rec_q.empty() && !lane_rec_busy; });
+}
+
+void Scheduler::LaneRecDrainForBorrow() {
+    ++lane_rec_drains;
+    LaneRecDrain();
+    // The worker is idle (and stays so: only this thread pushes): the back records directly.
+    if (!asc_cmdbuf) {
+        BeginAscCmdbufOnWorker();
+    }
+}
+
+void Scheduler::LaneRecLoop() {
+    Common::SetCurrentThreadName("shadPS4:LaneRecorder");
+    t_lane_mode = true; // InlineCmdbuf / RecorderTransferGroup pick the lane's on this thread
+    std::unique_lock lk{lane_rec_mu};
+    for (;;) {
+        if (lane_rec_q.empty()) {
+            lane_rec_busy = false;
+            lane_rec_idle_cv.notify_all();
+            if (lane_rec_stop) {
+                return;
+            }
+            lane_rec_sleeping = true;
+            lane_rec_cv.wait(lk, [this] { return !lane_rec_q.empty() || lane_rec_stop; });
+            lane_rec_sleeping = false;
+            continue;
+        }
+        auto job = std::move(lane_rec_q.front());
+        lane_rec_q.pop_front();
+        lane_rec_busy = true;
+        lk.unlock();
+        if (!asc_cmdbuf) {
+            BeginAscCmdbufOnWorker(); // a submit job begins its own if none is open
+        }
+        job();
+        lk.lock();
+    }
+}
+
 void Scheduler::LaneSwitch(u32 stream) {
     if (stream == active_stream) {
         return;
@@ -1586,8 +1703,8 @@ void Scheduler::LaneSwitch(u32 stream) {
             asc_dirty = true;
             asc_wait_main = 0;
         }
-        if (!asc_cmdbuf) {
-            BeginAscCmdbufOnWorker(); // the back's: lane mode records inline
+        if (!lane_rec && !asc_cmdbuf) {
+            BeginAscCmdbufOnWorker(); // the back's: lane mode records inline (q12: the worker's)
         }
     }
     active_stream = stream;
@@ -1611,7 +1728,12 @@ void Scheduler::LaneSubmit() {
         wait_main > async_submitted_tick.load(std::memory_order_acquire)) [[unlikely]] {
         ++lane_c[3]; // wait-before-signal on the main timeline (never a cycle: see LaneCutForFlush)
     }
-    AscSubmitOnWorker(value, wait_main); // inline: the back owns asc_cmdbuf in lane mode
+    if (lane_rec) {
+        // q12: the lane recorder ends and submits it after the segment's queued commands.
+        LaneRecPush([this, value, wait_main] { AscSubmitOnWorker(value, wait_main); });
+    } else {
+        AscSubmitOnWorker(value, wait_main); // inline: the back owns asc_cmdbuf in lane mode
+    }
     asc_last_submitted.store(value, std::memory_order_release);
     ++lane_c[0];
     if (t_lane_mode) {

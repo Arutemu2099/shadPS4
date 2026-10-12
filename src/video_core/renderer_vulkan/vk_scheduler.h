@@ -12,6 +12,8 @@
 #include <tuple>
 #include <unordered_map>
 #include <queue>
+#include <deque>
+#include <vector>
 
 #include "common/command_recording_worker.h"
 #include "common/logging/log.h"
@@ -508,6 +510,9 @@ public:
                     scheduler.current_cmdbuf = scheduler.OpenLane().cmdbuf;
                 }
             }
+            if (scheduler.synchronous_scopes == 0 && t_lane_mode && scheduler.lane_rec) [[unlikely]] {
+                scheduler.LaneRecDrainForBorrow(); // q12: the lane recorder idle, asc_cmdbuf begun
+            }
             // The worker is idle: a coalesced transfer group left open by it is closed before the
             // borrower records directly (SHADPS4_TRANSFER_COALESCE).
             scheduler.CloseTransferGroup(scheduler.InlineCmdbuf());
@@ -645,6 +650,16 @@ public:
     template <bool IsTransfer = false, typename F>
     void Record(F&& command) {
         ++Rc().stream_seq[active_stream];
+        if (LaneRecQueues()) [[unlikely]] {
+            // q12: the lane recorder records it (closes the lane's transfer group around it).
+            LaneRecPush([this, command = std::forward<F>(command)]() mutable {
+                const vk::CommandBuffer cmdbuf = asc_cmdbuf;
+                CloseTransferGroup(cmdbuf);
+                command(cmdbuf);
+                CloseTransferGroup(cmdbuf);
+            });
+            return;
+        }
         if (!IsAsyncRecording()) {
             const vk::CommandBuffer cmdbuf = InlineCmdbuf();
             CloseTransferGroup(cmdbuf);
@@ -705,6 +720,17 @@ public:
     void RecordArrays(F&& command, std::span<const T>... arrays) {
         static_assert((std::is_trivially_copyable_v<T> && ...));
         ++Rc().stream_seq[active_stream];
+        if (LaneRecQueues()) [[unlikely]] {
+            // q12: the arrays are copied into the job.
+            LaneRecPush([this, command = std::forward<F>(command),
+                         copies = std::tuple{std::vector<T>(arrays.begin(), arrays.end())...}]() mutable {
+                const vk::CommandBuffer cmdbuf = asc_cmdbuf;
+                CloseTransferGroup(cmdbuf);
+                std::apply([&](auto&... v) { command(cmdbuf, std::span<const T>{v}...); }, copies);
+                CloseTransferGroup(cmdbuf);
+            });
+            return;
+        }
         if (!IsAsyncRecording()) {
             const vk::CommandBuffer cmdbuf = InlineCmdbuf();
             CloseTransferGroup(cmdbuf);
@@ -1095,6 +1121,24 @@ private:
     }
     vk::CommandBuffer main_cmdbuf;
     vk::CommandBuffer asc_cmdbuf;
+    // q12 (SHADPS4_LANE_RECORDER=1): the lane recorder. Back: pushes jobs; worker: runs them in order (owns
+    // asc_cmdbuf / asc_pool / transfer_group[1] / the ASC queue while it runs).
+    bool lane_rec = false;
+    std::mutex lane_rec_mu;
+    std::condition_variable lane_rec_cv, lane_rec_idle_cv;
+    std::deque<Common::UniqueFunction<void>> lane_rec_q;
+    bool lane_rec_busy = false;
+    bool lane_rec_sleeping = false;
+    bool lane_rec_stop = false;
+    std::thread lane_rec_thread;
+    u64 lane_rec_jobs = 0, lane_rec_drains = 0;
+    bool LaneRecQueues() const noexcept {
+        return lane_rec && t_lane_mode && synchronous_scopes == 0;
+    }
+    void LaneRecPush(Common::UniqueFunction<void>&& job);
+    void LaneRecDrain();
+    void LaneRecDrainForBorrow();
+    void LaneRecLoop();
     u32 worker_stream = 0;
     u32 active_stream = 0;
     bool asc_dirty = false;
