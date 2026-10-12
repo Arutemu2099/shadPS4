@@ -1703,8 +1703,12 @@ void Scheduler::LaneSwitch(u32 stream) {
             asc_dirty = true;
             asc_wait_main = 0;
         }
-        if (!lane_rec && !asc_cmdbuf) {
-            BeginAscCmdbufOnWorker(); // the back's: lane mode records inline (q12: the worker's)
+        if (!lane_rec) {
+            if (!asc_cmdbuf) {
+                BeginAscCmdbufOnWorker(); // the back's: lane mode records inline
+            }
+        } else if (synchronous_scopes != 0) {
+            LaneRecDrainForBorrow(); // q12c: inside a borrow lane records run inline: drain + begin
         }
     }
     active_stream = stream;
