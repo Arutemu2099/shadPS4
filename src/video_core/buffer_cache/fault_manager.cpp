@@ -136,6 +136,51 @@ void FaultManager::ProcessFaultBuffer() {
         },
     }};
     scheduler.EndRendering();
+    // 1 bit per page, 32 pages per workgroup
+    const u32 num_threads = caching_num_pages / 32;
+    const u32 num_workgroups = Common::DivCeil(num_threads, 64u);
+    static const bool recorded = [] {
+        const char* e = std::getenv("SHADPS4_FAULT_BUFFER_RECORDED");
+        return e && e[0] == '1';
+    }();
+    if (recorded) {
+        // q21 (design-back C1): ordered in the open batch like the borrow, without draining the recording lanes.
+        scheduler.Record([pre_barrier, post_barrier, fb = fault_buffer.Handle(), fb_size = fault_buffer_size,
+                          db = download_buffer.Handle(), offset, pipe = *fault_process_pipeline,
+                          layout = *fault_process_pipeline_layout,
+                          wg = num_workgroups](vk::CommandBuffer cmdbuf) {
+            const vk::DescriptorBufferInfo fb_info{.buffer = fb, .offset = 0, .range = fb_size};
+            const vk::DescriptorBufferInfo db_info{.buffer = db, .offset = offset, .range = PageFaultAreaSize};
+            const std::array<vk::WriteDescriptorSet, 2> ws = {{
+                {.dstSet = VK_NULL_HANDLE,
+                 .dstBinding = 0,
+                 .dstArrayElement = 0,
+                 .descriptorCount = 1,
+                 .descriptorType = vk::DescriptorType::eStorageBuffer,
+                 .pBufferInfo = &fb_info},
+                {.dstSet = VK_NULL_HANDLE,
+                 .dstBinding = 1,
+                 .dstArrayElement = 0,
+                 .descriptorCount = 1,
+                 .descriptorType = vk::DescriptorType::eStorageBuffer,
+                 .pBufferInfo = &db_info},
+            }};
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                .bufferMemoryBarrierCount = 1,
+                .pBufferMemoryBarriers = &pre_barrier,
+            });
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipe);
+            cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, ws);
+            cmdbuf.dispatch(wg, 1, 1);
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                .bufferMemoryBarrierCount = 1,
+                .pBufferMemoryBarriers = &post_barrier,
+            });
+        });
+        scheduler.InvalidateNativeHeaps(); // a push descriptor set replaces descriptor heap binds (as a borrow)
+    } else {
     auto command_access = scheduler.AcquireCommandBuffer();
     const auto cmdbuf = command_access.Handle();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
@@ -146,9 +191,6 @@ void FaultManager::ProcessFaultBuffer() {
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *fault_process_pipeline);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *fault_process_pipeline_layout, 0,
                                 writes);
-    // 1 bit per page, 32 pages per workgroup
-    const u32 num_threads = caching_num_pages / 32;
-    const u32 num_workgroups = Common::DivCeil(num_threads, 64u);
     cmdbuf.dispatch(num_workgroups, 1, 1);
 
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
@@ -156,6 +198,7 @@ void FaultManager::ProcessFaultBuffer() {
         .bufferMemoryBarrierCount = 1,
         .pBufferMemoryBarriers = &post_barrier,
     });
+    }
 
     scheduler.DeferOperation([this, mapped, area = current_area] {
         fault_ranges.Clear();
