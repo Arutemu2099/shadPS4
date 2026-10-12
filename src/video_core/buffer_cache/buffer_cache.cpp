@@ -6276,6 +6276,11 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             sync_upload_log_tsc = now;
             LOG_INFO(Render, "SyncUploads: total={} MB uploads={} coherent={}",
                      sync_upload_bytes_total >> 20, sync_upload_calls, g_native_coherent);
+            if (const volatile u32* g = g_sort_guard_words) {
+                // q36: the sort replacement's invalid-width exits (0 = never; the hang guard did not fire).
+                LOG_INFO(Render, "q36 SortGuard: invalid-width exits {} (last first {} last {}), overflow exits {}",
+                         g[0], g[1], g[2], g[3]);
+            }
         }
     }
     if (total_size_bytes != 0) {

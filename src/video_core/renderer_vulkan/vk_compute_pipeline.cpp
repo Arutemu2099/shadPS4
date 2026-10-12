@@ -3,10 +3,13 @@
 
 #include <boost/container/small_vector.hpp>
 #include <cstdlib>
+#include <cstring>
 #include <string_view>
 
 #include "common/scope_exit.h"
 #include "shader_recompiler/info.h"
+#include "video_core/buffer_cache/back_clean.h"
+#include "video_core/buffer_cache/buffer.h"
 #include "video_core/host_shaders/infamous_particle_sort_comp.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -15,6 +18,30 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 namespace Vulkan {
+
+namespace {
+/// q36 (design-game-main D2 round 3): the sort replacement's guard counter {hits, first, last, overflow}, host-visible,
+/// read by pointer from the shader. One per process; never freed (lives as long as the pipelines that point at it).
+VideoCore::Buffer* SortGuardBuffer(const Instance& instance, Scheduler& scheduler) {
+    static VideoCore::Buffer* const buffer = [&]() -> VideoCore::Buffer* {
+        if (!instance.GetDevice() || !instance.GetPhysicalDevice()) {
+            return nullptr;
+        }
+        auto* b = new VideoCore::Buffer(instance, scheduler, VideoCore::MemoryUsage::Download, 0,
+                                        vk::BufferUsageFlagBits::eStorageBuffer |
+                                            vk::BufferUsageFlagBits::eShaderDeviceAddress,
+                                        256);
+        if (b->mapped_data.size() < 16) {
+            LOG_WARNING(Render_Vulkan, "q36: sort guard buffer not host-mapped; guard counts off");
+            return nullptr;
+        }
+        std::memset(b->mapped_data.data(), 0, 16);
+        VideoCore::g_sort_guard_words = reinterpret_cast<volatile u32*>(b->mapped_data.data());
+        return b;
+    }();
+    return buffer;
+}
+} // namespace
 
 ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
                                  DescriptorHeap& desc_heap, const Shader::Profile& profile,
@@ -45,8 +72,14 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     if (synchronize_smoke_sort && info->pgm_hash == 0xa16fa93a) {
         ASSERT_MSG(info->buffers.size() == 5 && info->images.empty() && info->samplers.empty(),
                    "Unexpected particle sort binding contract");
+        std::vector<std::string> defines;
+        if (auto* guard = SortGuardBuffer(instance, scheduler)) {
+            const u64 addr = guard->BufferDeviceAddress(); // q36: invalid-width guard counter
+            defines.push_back(fmt::format("SORT_GUARD_LO={}u", static_cast<u32>(addr)));
+            defines.push_back(fmt::format("SORT_GUARD_HI={}u", static_cast<u32>(addr >> 32)));
+        }
         synchronized_module = Compile(HostShaders::INFAMOUS_PARTICLE_SORT_COMP,
-                                      vk::ShaderStageFlagBits::eCompute, device);
+                                      vk::ShaderStageFlagBits::eCompute, device, defines);
         module = synchronized_module;
         SetObjectName(device, module, "Synchronized infamous particle sort");
         LOG_INFO(Render_Vulkan, "Smoke sort synchronization enabled for {:#x}, preloading={}",

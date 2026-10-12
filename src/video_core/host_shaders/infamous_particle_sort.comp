@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
 // Optional replacement for captured cs_a16fa93a. Preserve the merge algorithm,
 // buffer bindings, push offsets, tie rule, and indirect vertex-count write.
 // All invocations participate in synchronization, including a partial last group.
@@ -12,6 +14,23 @@ layout(set=0, binding=2, std430) readonly buffer Params { uint data[]; } params;
 layout(set=0, binding=3, std430) coherent buffer A { uint data[]; } a_buf;
 layout(set=0, binding=4, std430) coherent buffer B { uint data[]; } b_buf;
 layout(push_constant, std430) uniform Push { uint words[30]; } pc;
+
+// q36 (design-game-main D2 round 3): invalid widths (first 0, first > last, or a width that would overflow) never end the
+// pass loop below (TDR -> device lost when the lane reads fresh zero bytes at boot). The guard exits and counts them in a
+// host-visible buffer by pointer (SORT_GUARD_LO / HI defines; 0 = no counter). Valid params run the loop unchanged.
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer SortGuard { uint hits; uint first; uint last; uint overflow; };
+#ifndef SORT_GUARD_LO
+#define SORT_GUARD_LO 0u
+#define SORT_GUARD_HI 0u
+#endif
+void guard_hit(uint first, uint last, bool overflow) {
+    if (gl_LocalInvocationIndex != 0 || (SORT_GUARD_LO == 0u && SORT_GUARD_HI == 0u)) return;
+    SortGuard g = SortGuard(uvec2(SORT_GUARD_LO, SORT_GUARD_HI));
+    atomicAdd(g.hits, 1u);
+    g.first = first;
+    g.last = last;
+    if (overflow) atomicAdd(g.overflow, 1u);
+}
 
 uint offset_words(uint binding) {
     return ((pc.words[20 + binding / 4] >> ((binding % 4) * 8)) & 255u) / 4;
@@ -68,6 +87,10 @@ void main() {
     uint last_width = params.data[offset_words(2) + 1];
     if (index == 0 && pc.words[4] > 0) indirect_buf.data[offset_words(1)] = count * 4;
 
+    if (first_width == 0u || first_width > last_width) {
+        guard_hit(first_width, last_width, false); // uniform over the group: no barrier is skipped by part of it
+        return;
+    }
     bool from_a = true;
     // Captured contract: multiple steps fit within one64-lane group (2..64);
     // every larger merge has one step and an external dispatch barrier.
@@ -76,6 +99,10 @@ void main() {
         memoryBarrierBuffer();
         barrier();
         if (width >= last_width) break;
+        if (width >= 0x80000000u) {
+            guard_hit(first_width, last_width, true); // last_width > 2^31: the doubling would wrap to 0
+            break;
+        }
         from_a = !from_a;
     }
 }
