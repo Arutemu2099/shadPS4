@@ -12128,9 +12128,14 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
     const u64 bb_find_each = buffer_bindings.empty() ? 0 : bb_find_cyc / buffer_bindings.size();
 
     // SHADPS4_LEAN_BIND: plain read bindings take BufferCache::ObtainReadLean.
-    // SHADPS4_ASC_LANE: lane bindings take ObtainBuffer (its rule-A lookup).
-    const bool lean_read =
-        lean_bind && buffer_cache.LeanReadOk() && !Vulkan::Scheduler::t_lane_mode;
+    // SHADPS4_ASC_LANE: lane bindings take ObtainBuffer (its rule-A lookup); q11c: ObtainReadLean runs the
+    // same lookup, so lane read bindings take the lean path too (SHADPS4_LANE_LEAN_READ=0: the old way).
+    static const bool lane_lean = [] {
+        const char* env = std::getenv("SHADPS4_LANE_LEAN_READ");
+        return !env || env[0] != '0';
+    }();
+    const bool lean_read = lean_bind && buffer_cache.LeanReadOk() &&
+                           (lane_lean || !Vulkan::Scheduler::t_lane_mode);
     // Second pass to re-bind buffers that were updated after binding
     for (u32 i = 0; i < buffer_bindings.size(); i++) {
         const auto& [buffer_id, vsharp, size] = buffer_bindings[i];

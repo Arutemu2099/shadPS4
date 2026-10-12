@@ -5401,8 +5401,16 @@ std::pair<Buffer*, u32> BufferCache::ObtainReadLean(VAddr device_addr, u32 size,
         return {};
     }
     Buffer& buffer = slot_buffers[buffer_id];
-    if (g_lane_probe && Common::FaultMonitor::t_is_cp_thread && !Vulkan::Scheduler::t_lane_mode)
-        [[unlikely]] {
+    if (g_lane_on && Vulkan::Scheduler::t_lane_mode) [[unlikely]] {
+        // q11c: as ObtainBuffer's lane block for a read (rule A only).
+        LbScope lb_scope{6};
+        g_lc_done = scheduler.GetMasterSemaphore()->KnownGpuTick();
+        const u64 t = LaneMainProducer(device_addr, device_addr + size);
+        if (g_lane_who) [[unlikely]] {
+            LaneWhoNote(t, scheduler.CurrentTick(), false, 0, false);
+        }
+        scheduler.LaneNeedMain(t, g_lc_src);
+    } else if (g_lane_probe && Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
         LaneProbeRead(device_addr, device_addr + size, scheduler.CurrentTick(), 10); // q9 census
     }
     if (g_lane_census && Common::FaultMonitor::t_is_cp_thread && !t_force_binding_sync)
