@@ -181,6 +181,20 @@ inline std::array<u64, 65536> g_lc_lost_win{}; // p1e: newest unfinished main ti
 inline u32 LaneWin(u64 w) noexcept {
     return u32((w * 0x9E3779B97F4A7C15ull) >> 48);
 }
+/// q39: newest main tick per 4 MiB block (64 windows of 64 KB; hashed) - a filter in front of g_lc_win.
+inline std::array<u64, 4096> g_lc_super{};
+inline u32 LaneSuper(u64 s) noexcept {
+    return u32((s * 0x9E3779B97F4A7C15ull) >> 52);
+}
+inline const bool g_lane_lean_notes = [] {
+    const char* e = std::getenv("SHADPS4_LANE_LEAN_NOTES");
+    return e && e[0] == '1';
+}();
+inline const int g_lane_producer_super = [] {
+    const char* e = std::getenv("SHADPS4_LANE_PRODUCER_SUPER");
+    return e && (e[0] == '1' || e[0] == '2') ? e[0] - '0' : 0;
+}();
+inline std::array<u64, 3> g_lc_super_c{}; // q39: super blocks skipped, verify compares, verify mismatches
 inline u64 g_lc_main_newest = 0;
 inline bool g_lc_coarse = false; // p1d: the last LaneMainProducer answer came from a coarse source
 inline u32 g_lc_src = 0; // 0 exact, 1 window table (> 1024 windows), 2 window confirmed exact (p1g),
@@ -200,6 +214,9 @@ inline u32 LaneBucket(u64 w) noexcept {
 inline void LaneNoteRange(u64 lo, u64 hi, u64 tick, u32 kind, u32 wk = 0, u64 wid = 0) noexcept {
     if (hi <= lo) {
         return;
+    }
+    if (kind >= 2 && g_lane_lean_notes && !g_lane_census) {
+        return; // q39: the early table is read only by SHADPS4_LANE_CENSUS
     }
     LbScope lb_scope{7}; // q11a
     LaneTable& t = kind >= 2 ? g_lc_early : g_lc_main;
@@ -230,6 +247,10 @@ inline void LaneNoteRange(u64 lo, u64 hi, u64 tick, u32 kind, u32 wk = 0, u64 wi
         const u64 wl = std::min((hi - 1) >> 16, w0 + 1023);
         for (u64 w = w0; w <= wl; ++w) {
             u64& e = g_lc_win[LaneWin(w)];
+            e = std::max(e, tick);
+        }
+        for (u64 s = w0 >> 6; s <= (wl >> 6); ++s) { // q39 (always kept: the filter must see every note)
+            u64& e = g_lc_super[LaneSuper(s)];
             e = std::max(e, tick);
         }
     }
@@ -751,6 +772,14 @@ inline u64 LaneMainProducerFull(u64 lo, u64 hi) noexcept {
             // of its bucket ring (exact range overlap). Bucket rings hold several windows' notes
             // (hashed), so a note found there must overlap [lo, hi) itself.
             for (u64 w = w0; w <= w1; ++w) {
+                if (g_lane_producer_super == 1 && ((w & 63) == 0 || w == w0)) {
+                    // q39: a whole 4 MiB block with no unfinished main note above the answer so far.
+                    if (g_lc_super[LaneSuper(w >> 6)] <= std::max(g_lc_done, t)) {
+                        ++g_lc_super_c[0];
+                        w |= 63; // the loop's ++w moves to the next block
+                        continue;
+                    }
+                }
                 if (g_lc_win[LaneWin(w)] <= std::max(g_lc_done, t)) {
                     continue;
                 }
@@ -807,7 +836,44 @@ struct LaneProdMemo {
 };
 inline std::array<LaneProdMemo, 16> g_lc_memo{};
 inline std::array<u64, 4> g_lc_memo_c{}; // hits, misses, verified, mismatches
+inline u64 LaneMainProducerSuperCheck(u64 lo, u64 hi) noexcept {
+    // q39 =2: the p1g answer with the super filter must equal the plain one (same tick).
+    const u64 w0 = lo >> 16, w1 = (hi - 1) >> 16;
+    if (hi > lo && w1 - w0 > 63 && w1 - w0 <= 1023) {
+        u64 a = 0, b = 0;
+        for (u64 w = w0; w <= w1; ++w) {
+            if (((w & 63) == 0 || w == w0) && g_lc_super[LaneSuper(w >> 6)] <= std::max(g_lc_done, a)) {
+                w |= 63;
+                continue;
+            }
+            if (g_lc_win[LaneWin(w)] <= std::max(g_lc_done, a)) {
+                continue;
+            }
+            for (const LaneNote& e : g_lc_main.b[LaneBucket(w)]) {
+                if (e.seq != 0 && e.tick > g_lc_done && e.tick > a && e.lo < hi && lo < e.hi) {
+                    a = e.tick;
+                }
+            }
+        }
+        for (u64 w = w0; w <= w1; ++w) {
+            if (g_lc_win[LaneWin(w)] <= std::max(g_lc_done, b)) {
+                continue;
+            }
+            for (const LaneNote& e : g_lc_main.b[LaneBucket(w)]) {
+                if (e.seq != 0 && e.tick > g_lc_done && e.tick > b && e.lo < hi && lo < e.hi) {
+                    b = e.tick;
+                }
+            }
+        }
+        ++g_lc_super_c[1];
+        g_lc_super_c[2] += a != b ? 1 : 0;
+    }
+    return LaneMainProducerFull(lo, hi);
+}
 inline u64 LaneMainProducer(u64 lo, u64 hi) noexcept {
+    if (g_lane_producer_super == 2) [[unlikely]] {
+        return LaneMainProducerSuperCheck(lo, hi);
+    }
     if (g_lc_memo_mode == 0 || hi <= lo) {
         return LaneMainProducerFull(lo, hi);
     }

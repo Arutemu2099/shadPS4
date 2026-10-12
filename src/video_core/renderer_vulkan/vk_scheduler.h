@@ -923,6 +923,9 @@ public:
     void LaneUploadPush(Common::UniqueFunction<void>&& job);
     /// Blocks until every queued job ran (back thread; teardown).
     void LaneUploadDrain();
+    /// q39: SHADPS4_LANE_UP_BATCH=1 - collect upload CPU halves; pushed as one job at the next submit (or every 32).
+    void LaneUploadDefer(Common::UniqueFunction<void>&& job);
+    void LaneUploadFlushBatch();
     /// q24: SHADPS4_CHAIN_TIMING=1 - GPU timestamps around each early ASC service run in the main batch (lane off).
     bool ChainTiming() const noexcept {
         return chain_timer != nullptr;
@@ -1198,6 +1201,7 @@ private:
     std::condition_variable lane_up_cv, lane_up_idle_cv;
     std::deque<std::pair<u64, Common::UniqueFunction<void>>> lane_up_q; // {push tsc, job}
     std::atomic<u64> lane_up_pushed{0}, lane_up_done{0};
+    std::vector<Common::UniqueFunction<void>> lane_up_batch; // q39 (back thread)
     std::atomic<u64> lane_up_max_lag{0}, lane_up_lag_sum{0}, lane_up_busy_cyc{0};
     u64 lane_up_jobs = 0, lane_up_submits = 0, lane_up_inline = 0, lane_up_log_tsc = 0;
     std::thread lane_up_thread;

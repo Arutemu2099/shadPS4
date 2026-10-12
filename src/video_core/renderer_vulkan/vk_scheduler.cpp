@@ -1673,7 +1673,37 @@ void Scheduler::LaneUploadPush(Common::UniqueFunction<void>&& job) {
     }
 }
 
+void Scheduler::LaneUploadDefer(Common::UniqueFunction<void>&& job) {
+    static const bool batch = [] {
+        const char* e = std::getenv("SHADPS4_LANE_UP_BATCH");
+        return e && e[0] == '1';
+    }();
+    if (!batch) {
+        LaneUploadPush(std::move(job));
+        return;
+    }
+    lane_up_batch.push_back(std::move(job));
+    if (lane_up_batch.size() >= 32) {
+        LaneUploadFlushBatch();
+    }
+}
+
+void Scheduler::LaneUploadFlushBatch() {
+    if (lane_up_batch.empty()) {
+        return;
+    }
+    std::vector<Common::UniqueFunction<void>> jobs;
+    jobs.swap(lane_up_batch);
+    lane_up_batch.reserve(32);
+    LaneUploadPush([jobs = std::move(jobs)]() mutable {
+        for (auto& j : jobs) {
+            j(); // q39: in push order (protect, then copy, per upload)
+        }
+    });
+}
+
 void Scheduler::LaneUploadDrain() {
+    LaneUploadFlushBatch(); // q39
     std::unique_lock lk{lane_up_mu};
     if (lane_up_sleeping && !lane_up_q.empty()) {
         lane_up_cv.notify_one();
@@ -2093,6 +2123,10 @@ void Scheduler::LaneCopyCensus(u64 copy_value) {
                  "reads lowered by the extent check {}",
                  h5(lane_copy_h5), h5(lane_seg_h5), VideoCore::g_lane_ext_saved);
         VideoCore::g_lane_ext_saved = 0;
+        LOG_INFO(Render_Vulkan, "q39 LaneProducerSuper (~5 s): 4 MiB blocks skipped {} | verify compares {} mismatches {} "
+                 "(mode {})", VideoCore::g_lc_super_c[0], VideoCore::g_lc_super_c[1], VideoCore::g_lc_super_c[2],
+                 VideoCore::g_lane_producer_super);
+        VideoCore::g_lc_super_c[0] = VideoCore::g_lc_super_c[1] = 0;
         lane_copy_h5.fill(0);
         lane_seg_h5.fill(0);
     }
@@ -2353,6 +2387,7 @@ void Scheduler::AscSubmitOnWorker(u64 value, u64 wait_main) {
     }
     Check(asc_cmdbuf.end());
     if (lane_up_on) {
+        LaneUploadFlushBatch(); // q39: this segment's collected CPU halves go first (I2)
         // q36: behind every queued upload CPU half (I2) and any queued submit (one queue user, in order). With the
         // FIFO idle (done == pushed, acquire) every pushed fill already happened before this inline submit.
         if (lane_up_done.load(std::memory_order_acquire) != lane_up_pushed.load(std::memory_order_relaxed)) {

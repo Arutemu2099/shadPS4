@@ -6543,7 +6543,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                 }
             }
             if (q36_backed && !(deferred_copies.empty() && deferred_protects.empty())) // review 8: no empty jobs
-            scheduler.LaneUploadPush(
+            scheduler.LaneUploadDefer(
                 [pm = &page_manager, memory = memory,
                  protects = std::vector<PageManager::ProtectRange>(deferred_protects.begin(), deferred_protects.end()),
                  cpu = std::vector<DeferredCopy>(deferred_copies.begin(), deferred_copies.end()),
