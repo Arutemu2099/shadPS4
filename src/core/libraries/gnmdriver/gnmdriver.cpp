@@ -13,6 +13,7 @@
 #include "gnmdriver.h"
 
 #include "common/fence_watch.h"
+#include "common/scope_exit.h"
 #include "common/fault_monitor.h"
 #include "common/assert.h"
 #include "common/debug.h"
@@ -1186,12 +1187,21 @@ static_assert(NR::GpuRecHiOffset == Shader::NativeRecordHiOffset);
 /// 4 killed, 5 ok).
 std::array<std::atomic<u64>, 6> g_nr_ind{};
 thread_local u32 t_nr_gpu_why = 0; // q3b: NativeRecGpu's exit (1-4; 0 = ok / not reached)
+/// q15: every record's NativeRecGpu exit (see q15_nr_gpu_why.py): 0 ok, 1-3 as q3b, 4 kill other, 5 stage,
+/// 6 slots, 7 unmapped V#.
+std::array<std::atomic<u64>, 8> g_q15_why{};
+thread_local u32 t_nr_kill = 0;
 thread_local bool t_nr_indirect = false; // q4: the record being written is an indirect draw's
 
 void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
     auto& r = t_rec;
     t_nr_gpu_why = 0;
+    t_nr_kill = 0;
     rec.gpu_ok = 0;
+    SCOPE_EXIT {
+        const u32 w = rec.gpu_ok ? 0u : t_nr_gpu_why == 4 && t_nr_kill != 0 ? t_nr_kill : t_nr_gpu_why;
+        g_q15_why[w & 7].fetch_add(1, std::memory_order_relaxed);
+    };
     rec.union_idx = ~0u;
     rec.push_inh = 0;
     rec.inh_slots = 0;
@@ -1281,6 +1291,7 @@ void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
             continue;
         }
         if (i != vs_i && i != ps_i) {
+            t_nr_kill = 5;
             return kill();
         }
         Shader::BoundStage bs{};
@@ -1304,6 +1315,7 @@ void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
         bs.PushUd(bnd, push);
         for (const auto& desc : info->buffers) {
             if (bi >= NR::UnionSlots) {
+                t_nr_kill = 6;
                 return kill();
             }
             if (desc.buffer_type == Shader::BufferType::Guest && !desc.inline_cbuf &&
@@ -1320,6 +1332,7 @@ void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
                                      ? 0
                                      : memory->TryClampRangeSize(addr, vsharp.GetSize());
                 if (size == 0 && addr != 0 && vsharp.GetSize() != 0) {
+                    t_nr_kill = 7;
                     return kill(); // Opus G2 #6: unmapped huge V# (no assert on a game thread)
                 }
                 g[Shader::NativeRecordOffOffset + bi] = static_cast<u32>(addr);
@@ -1498,6 +1511,12 @@ u32 NativeRecDraw(const u32* cmdbuf, u64 index_addr, u32 index_count, u32 tag,
                     off += fmt::format(" {:#x}={}", i, c);
                 }
             }
+            LOG_INFO(Lib_GnmDriver,
+                     "q15 all records' gpu exit: ok {} not derived {} index type unknown {} no union {} "
+                     "kill other {} kill stage {} kill slots {} kill unmapped V# {}",
+                     g_q15_why[0].exchange(0), g_q15_why[1].exchange(0), g_q15_why[2].exchange(0),
+                     g_q15_why[3].exchange(0), g_q15_why[4].exchange(0), g_q15_why[5].exchange(0),
+                     g_q15_why[6].exchange(0), g_q15_why[7].exchange(0));
             LOG_INFO(Lib_GnmDriver,
                      "q3b indirect records: total {} not derived {} index type unknown {} no union "
                      "{} killed {} ok {}",
