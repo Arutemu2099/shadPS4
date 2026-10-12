@@ -66,8 +66,8 @@ inline void NoteImage(const u64& image_tab_gen, const u32& image_tab_id) noexcep
     }
     std::atomic_thread_fence(std::memory_order_seq_cst); // q8b (D): after the caller's state write
     const u64 g = std::atomic_ref<u64>{const_cast<u64&>(image_tab_gen)}.load(
-        std::memory_order_relaxed);
-    if (g != 0 && g == g_gen.load(std::memory_order_relaxed)) {
+        std::memory_order_acquire); // q10b: pairs with the insert's release (tab_id first)
+    if (g != 0 && g == g_gen.load(std::memory_order_acquire)) {
         if (V2()) {
             const u32 id = std::atomic_ref<u32>{const_cast<u32&>(image_tab_id)}.load(
                 std::memory_order_relaxed);

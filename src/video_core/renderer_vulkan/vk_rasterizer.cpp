@@ -5482,7 +5482,7 @@ bool Rasterizer::A2ResolveMaterial(const GraphicsPipeline* base, const Shader::B
             const u32 iid = static_cast<u32>(e.id.index);
             const u32 ep0 = TT::Ep(iid);
             std::atomic_ref<u32>{im.tab_id}.store(iid, std::memory_order_relaxed);
-            std::atomic_ref<u64>{im.tab_gen}.store(tg, std::memory_order_relaxed);
+            std::atomic_ref<u64>{im.tab_gen}.store(tg, std::memory_order_release); // q10b
             std::atomic_thread_fence(std::memory_order_seq_cst);
             const auto flags = std::atomic_ref<VideoCore::ImageFlagBits>{im.flags}.load(
                 std::memory_order_relaxed);
@@ -5559,7 +5559,8 @@ void Rasterizer::A2TexTableTouch() {
     last = now;
     const u64 tg = TT::Gen();
     for (const auto& e : TT::g_img) {
-        if (e.seq.load(std::memory_order_relaxed) != 0 && e.gen == tg) {
+        if (e.seq.load(std::memory_order_relaxed) != 0 && e.gen == tg &&
+            (!TT::V2() || TT::Ep(e.id) == e.ep)) { // q10b: not a killed entry
             const VideoCore::ImageId id{e.id};
             if (texture_cache.IsImageAllocated(id)) {
                 texture_cache.TouchImageAccess(texture_cache.PeekImage(id));
@@ -8471,6 +8472,21 @@ void Rasterizer::DrawIndirectTail(const GraphicsPipeline* pipeline, bool is_inde
 
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
+    // q11a: dispatches on the CP thread (and those inside the early ASC service).
+    const bool lb_cp = VideoCore::g_lb_on && Common::FaultMonitor::t_is_cp_thread;
+    const bool lb_srv = lb_cp && VideoCore::g_lb_in_service;
+    const u64 lb_t0 = lb_cp ? __rdtsc() : 0;
+    SCOPE_EXIT {
+        if (lb_cp) {
+            const u64 d = __rdtsc() - lb_t0;
+            VideoCore::g_lb[2] += d;
+            ++VideoCore::g_lb[3];
+            if (lb_srv) {
+                VideoCore::g_lb[4] += d;
+                ++VideoCore::g_lb[5];
+            }
+        }
+    };
 
     // 526 dispatches per forest frame, and they sit in the 27% of the frame that Draw's timers do
     // not cover. SCOPE_EXIT so the several early returns below are still counted.
@@ -8586,6 +8602,21 @@ void Rasterizer::DispatchDirectTail(const ComputePipeline* pipeline) {
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     RENDERER_TRACE;
+    // q11a: dispatches on the CP thread (and those inside the early ASC service).
+    const bool lb_cp = VideoCore::g_lb_on && Common::FaultMonitor::t_is_cp_thread;
+    const bool lb_srv = lb_cp && VideoCore::g_lb_in_service;
+    const u64 lb_t0 = lb_cp ? __rdtsc() : 0;
+    SCOPE_EXIT {
+        if (lb_cp) {
+            const u64 d = __rdtsc() - lb_t0;
+            VideoCore::g_lb[2] += d;
+            ++VideoCore::g_lb[3];
+            if (lb_srv) {
+                VideoCore::g_lb[4] += d;
+                ++VideoCore::g_lb[5];
+            }
+        }
+    };
 
     const auto t_dispatch = Common::FaultMonitor::Now();
     SCOPE_EXIT {

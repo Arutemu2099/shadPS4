@@ -106,6 +106,25 @@ inline std::array<EarlyWrite, 512> g_early_writes{};
 inline u64 g_early_w_head = 0, g_early_w_tail = 0; // back only
 inline std::atomic<u64> g_early_inv_reads{0}, g_early_inv_checks{0}, g_early_inv_writes{0};
 /// SHADPS4_LANE_CENSUS=1 (n1, sec. 21 step 0, back thread only): see n1_lane_census.py.
+/// q11a (SHADPS4_BACK_CYCLES=1, back thread): 0/1 early ASC service cycles / services, 2/3 dispatches on
+/// the CP thread (cycles / n), 4/5 dispatches inside the early service, 6 lane dependency work per binding
+/// (ObtainBuffer lane block), 7 lane notes (LaneNoteRange), 8/9 lane submits (cycles / n).
+inline const bool g_lb_on = [] {
+    const char* env = std::getenv("SHADPS4_BACK_CYCLES");
+    return env && env[0] == '1';
+}();
+inline std::array<u64, 10> g_lb{};
+inline bool g_lb_in_service = false;
+struct LbScope {
+    u32 i;
+    u64 t0;
+    explicit LbScope(u32 i_) noexcept : i{i_}, t0{g_lb_on ? __rdtsc() : 0} {}
+    ~LbScope() {
+        if (g_lb_on) {
+            g_lb[i] += __rdtsc() - t0;
+        }
+    }
+};
 inline const bool g_lane_census = [] {
     const char* env = std::getenv("SHADPS4_LANE_CENSUS");
     return env && env[0] == '1';
@@ -162,6 +181,7 @@ inline void LaneNoteRange(u64 lo, u64 hi, u64 tick, u32 kind, u32 wk = 0, u64 wi
     if (hi <= lo) {
         return;
     }
+    LbScope lb_scope{7}; // q11a
     LaneTable& t = kind >= 2 ? g_lc_early : g_lc_main;
     const u64 seq = ++g_lc_seq;
     const u64 w0 = lo >> 16;

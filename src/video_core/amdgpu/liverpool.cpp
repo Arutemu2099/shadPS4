@@ -1434,6 +1434,18 @@ void BackLeanMaybeLog() {
         }
         LOG_INFO(Render, "BackLean main-ring packets by opcode (ms per s):{}", pk_s);
     }
+    {
+        auto& lb = VideoCore::g_lb;
+        const auto per = [](u64 c, u64 n) { return double(c) / double(std::max<u64>(n, 1)); };
+        LOG_INFO(Render,
+                 "BackLean lane split (ms per s): early ASC service {:.1f} ({:.1f}k/s) | dispatches on "
+                 "the CP {:.1f} ({:.1f}k/s, {:.0f} cyc), of which in the early service {:.1f} ({:.1f}k/s, "
+                 "{:.0f} cyc) | lane dependency work per binding {:.1f} | lane notes {:.1f} | lane "
+                 "submits {:.1f} ({:.1f}k/s)",
+                 ms(lb[0]), ks(lb[1]), ms(lb[2]), ks(lb[3]), per(lb[2], lb[3]), ms(lb[4]), ks(lb[5]),
+                 per(lb[4], lb[5]), ms(lb[6]), ms(lb[7]), ms(lb[8]), ks(lb[9]));
+        lb.fill(0);
+    }
     const u64 other_all = b.follow_cyc > job_all + b.pub_cyc + b.pc_cyc + b.wait_cyc
                               ? b.follow_cyc - job_all - b.pub_cyc - b.pc_cyc - b.wait_cyc
                               : 0;
@@ -3064,6 +3076,9 @@ void Liverpool::BackLoop(std::stop_token stoken) {
     const bool asc_early = g_asc_early && split->early_items != nullptr && g_mtb_p3 == 0;
     u64 early_last_tsc = 0;
     auto early_service = [&] {
+        VideoCore::LbScope lb_scope{0}; // q11a
+        VideoCore::g_lb_in_service = true;
+        ++VideoCore::g_lb[1];
         auto& ch = *split;
         u64 head = ch.early_head.load(std::memory_order_relaxed);
         const u64 tail = ch.early_tail.load(std::memory_order_acquire);
@@ -3188,6 +3203,7 @@ void Liverpool::BackLoop(std::stop_token stoken) {
         }
         ch.early_head.store(head, std::memory_order_release);
         early_last_tsc = __rdtsc(); // m2: gaps are measured from the end of a service
+        VideoCore::g_lb_in_service = false;
     };
     if (asc_early && (g_asc_service & 2)) {
         early_service_ctx = &early_service;
@@ -9199,6 +9215,11 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
             VideoCore::TexTable::g_c[3].fetch_add(1, std::memory_order_relaxed);
             x.rej_rt.fetch_add(1, std::memory_order_relaxed);
             return false;
+        }
+        if (tab_used && VideoCore::TexTable::V2()) {
+            for (const auto& [tid, tep] : st.tab_imgs) { // q10b: the table's images too
+                mat_ids.push_back(VideoCore::ImageId{tid});
+            }
         }
         if (colour && !rasterizer->A2ImagesSafe(mat_ids)) {
             // A sampled image is a target of this pass: the old path (per-draw barriers) runs the

@@ -4582,6 +4582,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     // SynchronizeBuffer fall-through. Time them separately - the split decides which is worth
     // cutting, and it has never actually been measured.
     if (g_lane_on && Vulkan::Scheduler::t_lane_mode) [[unlikely]] {
+        LbScope lb_scope{6}; // q11a
         g_lc_done = scheduler.GetMasterSemaphore()->KnownGpuTick();
         const u64 t = LaneMainProducer(device_addr, device_addr + size);
         const u64 open = scheduler.CurrentTick();

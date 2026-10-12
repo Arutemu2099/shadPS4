@@ -19,6 +19,7 @@
 #include <immintrin.h>
 #endif
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/buffer_cache/back_clean.h"
 #include "video_core/renderer_vulkan/vk_gpu_batch_timer.h"
 
 namespace Vulkan {
@@ -1601,6 +1602,8 @@ void Scheduler::LaneSwitch(u32 stream) {
 }
 
 void Scheduler::LaneSubmit() {
+    VideoCore::LbScope lb_scope{8}; // q11a
+    ++VideoCore::g_lb[9];
     const u64 value = open_asc_value;
     const u64 wait_main = asc_wait_main;
     asc_dirty = false;
