@@ -1986,6 +1986,9 @@ void Scheduler::AscSubmitOnWorker(u64 value, u64 wait_main) {
         .pSignalSemaphores = &signal_sema,
     };
     const auto result = instance.GetAscQueue().submit(submit_info);
+    if (result == vk::Result::eErrorDeviceLost) {
+        instance.LogDeviceFault(); // q12g
+    }
     ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
                "Device lost during ASC submit (q12f: value {} wait_main {} main gpu {} asc gpu {} "
                "recorder thread {})",

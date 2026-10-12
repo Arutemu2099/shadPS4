@@ -166,6 +166,12 @@ TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset
     if (!info.props.is_tiled) {
         return {in_buffer, in_offset};
     }
+    if (Vulkan::Scheduler::t_lane_mode) [[unlikely]] {
+        static u64 n = 0; // q12g: a detile recorded while the back is in lane mode
+        if (++n <= 8 || (n & (n - 1)) == 0) {
+            LOG_WARNING(Render_Vulkan, "q12g: DetileImage in lane mode #{} ({} B)", n, info.guest_size);
+        }
+    }
 
     TilingInfo params{};
     params.bank_swizzle = info.bank_swizzle;

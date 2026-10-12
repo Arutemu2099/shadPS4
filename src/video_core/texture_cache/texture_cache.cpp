@@ -1473,6 +1473,14 @@ void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
     }
+    if (Vulkan::Scheduler::t_lane_mode) [[unlikely]] {
+        // q12g: an image upload recorded while the back is in lane mode.
+        static u64 n = 0;
+        if (++n <= 8 || (n & (n - 1)) == 0) {
+            LOG_WARNING(Render_Vulkan, "q12g: RefreshImage in lane mode #{} ({:#x}, {} B, tiled {})", n,
+                        image.info.guest_address, image.info.guest_size, bool(image.info.props.is_tiled));
+        }
+    }
 
     RENDERER_TRACE;
     TRACE_HINT(fmt::format("{:x}:{:x}", image.info.guest_address, image.info.guest_size));
