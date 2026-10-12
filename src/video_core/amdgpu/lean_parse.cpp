@@ -502,6 +502,10 @@ Stop Parser::DecideDraw(const PM4Header* header, std::span<const u32> dcb, u32 o
             }
         }
     }
+    if (!plan.draw.skip && plan.draw.draw_class == Rasterizer::DrawClass::Draw &&
+        Rasterizer::NoParticlesSkip(plan.draw.pipeline)) [[unlikely]] {
+        plan.draw.skip = true; // q40
+    }
     plan.has_stages = plan.draw.pipeline &&
                       plan.draw.draw_class == Rasterizer::DrawClass::Draw && !plan.draw.skip;
 

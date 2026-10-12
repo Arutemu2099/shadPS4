@@ -2088,6 +2088,25 @@ bool Rasterizer::NativeColourVariantReady(const GraphicsPipeline* pipeline,
     return !free_slot;
 }
 
+bool Rasterizer::NoParticlesSkip(const GraphicsPipeline* pipeline) {
+    if (!VideoCore::g_no_particles || !pipeline) {
+        return false;
+    }
+    bool vs = false, fs = false;
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        vs |= stage->l_stage == Shader::LogicalStage::Vertex && stage->pgm_hash == 0xbbd2d927;
+        fs |= stage->l_stage == Shader::LogicalStage::Fragment && stage->pgm_hash == 0x24dad4be;
+    }
+    if (vs && fs) {
+        VideoCore::NoParticlesNote(true);
+        return true;
+    }
+    return false;
+}
+
 void Rasterizer::PrepareDrawFront(SplitDraw& draw) {
     // CP split, front thread: the part of Draw/DrawIndirect before PopPendingOperations that
     // reads only the front's registers and the pipeline cache, in the same order as the inline
@@ -2119,6 +2138,7 @@ void Rasterizer::PrepareDrawFront(SplitDraw& draw) {
         pipeline_cache.CaptureFront(front_capture, draw.pipeline);
         AmdGpu::t_front_in_lock = false;
         front_capture_valid = true;
+        draw.skip = NoParticlesSkip(draw.pipeline); // q40
         return;
     }
     draw.pipeline = pipeline_cache.GetGraphicsPipeline();
@@ -2126,6 +2146,7 @@ void Rasterizer::PrepareDrawFront(SplitDraw& draw) {
         [[unlikely]] {
         pipeline_cache.PrepareNativeVariant(draw.pipeline);
     }
+    draw.skip = NoParticlesSkip(draw.pipeline); // q40
 }
 
 bool Rasterizer::PrepareMemberFront(SplitDraw& draw, const GraphicsPipeline* pipeline) {
@@ -2136,7 +2157,7 @@ bool Rasterizer::PrepareMemberFront(SplitDraw& draw, const GraphicsPipeline* pip
         return false;
     }
     AmdGpu::SplitHazard::NoteDraw(liverpool->regs.ps_program, liverpool->regs.vs_program);
-    draw.skip = SkipEmptyDraw(liverpool->regs);
+    draw.skip = SkipEmptyDraw(liverpool->regs) || NoParticlesSkip(pipeline); // q40
     draw.pipeline = pipeline;
     return true;
 }

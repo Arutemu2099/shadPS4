@@ -788,6 +788,11 @@ int Q36Mode() {
 }
 } // namespace
 
+void NoParticlesLog() {
+    LOG_INFO(Render, "q40 NO_PARTICLES (diagnostic): skipped ASC dispatches {} card draws {}", g_np_disp.load(),
+             g_np_draw.load());
+}
+
 void BufferCache::BeginGpuUnmap(VAddr device_addr, u64 size) {
     if (Q36Mode() == 3) [[unlikely]] {
         Q36Drop(device_addr, size); // q36 verify: the range's bytes change without a fault

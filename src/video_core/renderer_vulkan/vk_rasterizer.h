@@ -123,6 +123,8 @@ public:
     /// SkipEmptyDraw's decision for `regs` (SHADPS4_EMPTY_DRAWS=2 and zero indices / instances)
     /// without the front's EMPTY_DRAWS counters.
     static bool SkipEmptyDrawRegs(const AmdGpu::Regs& regs);
+    /// q40 (diagnostic): SHADPS4_NO_PARTICLES=1 and this is the particle card pipeline (vs_bbd2d927 + fs_24dad4be).
+    static bool NoParticlesSkip(const GraphicsPipeline* pipeline);
     /// The lean memo is exact only with dynamic vertex input (else the key specializes on V#
     /// formats, which the front's prepared path checks separately).
     bool LeanVertexInputDynamic() const {

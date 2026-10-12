@@ -385,6 +385,19 @@ inline bool Q35Fs(u64 h) noexcept {
 inline u64 g_census_args = 0;                  // q35: the current draw's indirect args (rasterizer, census only)
 inline u64 g_census_vs = 0;                    // q35: the current draw's vertex shader hash (census only)
 inline u64 g_back_flip_seq = 0;                // q35 H5: PatchedFlip packets the back executed
+/// q40 (DIAGNOSTIC, never for release): SHADPS4_NO_PARTICLES=1 - no ASC dispatches, no particle card draw.
+inline const bool g_no_particles = [] {
+    const char* e = std::getenv("SHADPS4_NO_PARTICLES");
+    return e && e[0] == '1';
+}();
+inline std::atomic<u64> g_np_disp{0}, g_np_draw{0}; // q40: skipped ASC dispatches / card draws
+void NoParticlesLog(); // buffer_cache.cpp
+inline void NoParticlesNote(bool draw) noexcept {
+    const u64 n = (draw ? g_np_draw : g_np_disp).fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((n & (n - 1)) == 0 || (n & 0x3ffff) == 0) {
+        NoParticlesLog();
+    }
+}
 /// q36: the particle sort replacement's guard counter {hits, first, last, overflow} (host-visible; null = none).
 inline volatile u32* g_sort_guard_words = nullptr;
 /// q35 H1: SHADPS4_LANE_COPY_NOSTAMP=1 - a fault copy recorded on the lane is not stamped as a main read.

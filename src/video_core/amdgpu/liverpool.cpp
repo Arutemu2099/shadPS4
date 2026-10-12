@@ -5947,7 +5947,9 @@ void Liverpool::ExecuteDispatchRecord(const CpSplit::RecordHeader& record) {
     translating.SetDispatchRun(rec.run);
     translating.SetDispatchQueue(rec.queue);
     Common::ReadbackOffload::AscSpan().in_asc_dispatch = rec.queue != GfxQueueId;
-    if (rec.marker && rec.queue != GfxQueueId) {
+    if (VideoCore::g_no_particles && rec.queue != GfxQueueId) [[unlikely]] {
+        VideoCore::NoParticlesNote(false); // q40: an ASC dispatch record, not executed
+    } else if (rec.marker && rec.queue != GfxQueueId) {
         translating.ScopeMarkerBegin(
             fmt::format("asc[{}]:{}:{}", rec.queue - 1, rec.cmd_address, rec.marker));
         translating.ExecuteDispatch(rec.pipeline, stages, rec.is_indirect != 0, rec.address,
@@ -12136,8 +12138,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                                  u32(size), vqid + 1);
                     break;
                 }
-                OnBack([&] { rasterizer->DispatchIndirect(it->indirect_addr, 0, size); },
-                       CpSplit::DrainReason::CallAscDispatchPatched);
+                OnBack([&] {
+                    if (VideoCore::g_no_particles) {
+                        VideoCore::NoParticlesNote(false); // q40
+                    } else {
+                        rasterizer->DispatchIndirect(it->indirect_addr, 0, size);
+                    }
+                }, CpSplit::DrainReason::CallAscDispatchPatched);
                 break;
             }
             auto& cs_program = GetCsRegs();
@@ -12163,6 +12170,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                                 fmt::format("asc[{}]:{}:DispatchDirect", vqid, cmd_address));
                             rasterizer->DispatchDirect();
                             rasterizer->ScopeMarkerEnd();
+                        } else if (VideoCore::g_no_particles) {
+                            VideoCore::NoParticlesNote(false); // q40
                         } else {
                             rasterizer->DispatchDirect();
                         }
@@ -12195,6 +12204,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                                 fmt::format("asc[{}]:{}:DispatchIndirect", vqid, cmd_address));
                             rasterizer->DispatchIndirect(ib_address, 0, size);
                             rasterizer->ScopeMarkerEnd();
+                        } else if (VideoCore::g_no_particles) {
+                            VideoCore::NoParticlesNote(false); // q40
                         } else {
                             rasterizer->DispatchIndirect(ib_address, 0, size);
                         }
