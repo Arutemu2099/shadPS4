@@ -114,6 +114,20 @@ inline const bool g_lb_on = [] {
     return env && env[0] == '1';
 }();
 inline std::array<u64, 10> g_lb{};
+/// q19 (SHADPS4_BACK_CYCLES=1): Call-record phases, cycles - 0 lazy fences, 1 OnSubmit, 2 fault buffer, 3 image
+/// downloads, 4 texture GC, 5 buffer GC, 6 Flush, 7 ProtectFence, 8 GpuIdle IRQ, 9 WaitBarrier; counts 10 idle
+/// tails, 11 wait barriers. Back thread only.
+inline std::array<u64, 12> g_g1{};
+struct G1Scope {
+    u32 i;
+    u64 t0;
+    explicit G1Scope(u32 i_) noexcept : i{i_}, t0{g_lb_on ? __rdtsc() : 0} {}
+    ~G1Scope() {
+        if (t0 != 0) {
+            g_g1[i] += __rdtsc() - t0;
+        }
+    }
+};
 inline bool g_lb_in_service = false;
 struct LbScope {
     u32 i;

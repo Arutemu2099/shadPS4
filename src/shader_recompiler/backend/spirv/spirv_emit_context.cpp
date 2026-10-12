@@ -1345,7 +1345,8 @@ Id EmitContext::NativePullAttribute(u32 loc, Id vindex) {
             const Id a{OpIAdd(U64, guest,
                               OpUConvert(U64, OpSelect(U32[1], in_bounds, rel, u32_zero_value)))};
             const Id a4{OpBitwiseAnd(U64, a, Constant(U64, ~u64{3}))};
-            const Id last{OpIAdd(U64, a4, Constant(U64, u64{(ndw + 1) * 4 - 1}))};
+            // q18b: the attribute's real extent (the funnel's padding dword is not part of it).
+            const Id last{OpIAdd(U64, a, Constant(U64, u64{bytes} - 1))};
             const Id fallback{u64_of(NativeTableLoad(Shader::NativeTablePtFallback),
                                      NativeTableLoad(Shader::NativeTablePtFallback + 1))};
             const Id page{OpShiftRightLogical(U64, a4, ConstU32(VideoCore::BufferCache::CACHING_PAGEBITS))};
@@ -1378,9 +1379,16 @@ Id EmitContext::NativePullAttribute(u32 loc, Id vindex) {
             const Id pinv{OpISub(U32[1], ConstU32(32u), psh)};
             std::array<Id, 5> w{};
             for (u32 j = 0; j <= ndw; ++j) {
-                const Id ptr{OpConvertUToPtr(physical_pointer_type_u32,
-                                             OpIAdd(U64, dev, Constant(U64, u64{j} * 4)))};
-                w[j] = OpSelect(U32[1], miss, u32_zero_value,
+                Id daddr{OpIAdd(U64, dev, Constant(U64, u64{j} * 4))};
+                Id zero_it{miss};
+                if (j == ndw) {
+                    // q18b: the padding dword only inside the checked span (else a safe address, value 0).
+                    const Id inside{OpULessThanEqual(U1[1], OpIAdd(U64, a4, Constant(U64, u64{j} * 4)), last)};
+                    daddr = OpSelect(U64, inside, daddr, dev);
+                    zero_it = OpLogicalOr(U1[1], miss, OpLogicalNot(U1[1], inside));
+                }
+                const Id ptr{OpConvertUToPtr(physical_pointer_type_u32, daddr)};
+                w[j] = OpSelect(U32[1], zero_it, u32_zero_value,
                                 OpLoad(U32[1], ptr, spv::MemoryAccessMask::Aligned, 4u));
             }
             std::array<Id, 4> r{};

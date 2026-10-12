@@ -1451,6 +1451,14 @@ void BackLeanMaybeLog() {
                  ms(lb[0]), ks(lb[1]), ms(lb[2]), ks(lb[3]), per(lb[2], lb[3]), ms(lb[4]), ks(lb[5]),
                  per(lb[4], lb[5]), ms(lb[6]), ms(lb[7]), ms(lb[8]), ks(lb[9]));
         lb.fill(0);
+        auto& g = VideoCore::g_g1;
+        LOG_INFO(Render,
+                 "q19 BackLean Call phases (ms per s): idle tails {:.1f}k/s, wait barriers {:.1f}k/s | lazy fences "
+                 "{:.1f} | OnSubmit {:.1f} (fault buffer {:.1f}, image downloads {:.1f}, texture GC {:.1f}, buffer "
+                 "GC {:.1f}) | Flush {:.1f} | ProtectFence {:.1f} | GpuIdle IRQ {:.1f} | WaitBarrier {:.1f}",
+                 ks(g[10]), ks(g[11]), ms(g[0]), ms(g[1]), ms(g[2]), ms(g[3]), ms(g[4]), ms(g[5]), ms(g[6]),
+                 ms(g[7]), ms(g[8]), ms(g[9]));
+        g.fill(0);
     }
     const u64 other_all = b.follow_cyc > job_all + b.pub_cyc + b.pc_cyc + b.wait_cyc
                               ? b.follow_cyc - job_all - b.pub_cyc - b.pc_cyc - b.wait_cyc
@@ -6170,7 +6178,9 @@ void Liverpool::PostWaitBarrier(u32 kind) {
     auto* call = split->Reserve<CpSplit::CallPayload>(CpSplit::RecordType::Call);
     call->invoke = [](void* context) {
         auto* lp = static_cast<Liverpool*>(context);
+        ++VideoCore::g_g1[11]; // q19
         if (lp->rasterizer) {
+            VideoCore::G1Scope g1{9};
             lp->rasterizer->WaitBarrier();
         }
     };
@@ -10547,14 +10557,24 @@ void Liverpool::ProcessLoop(std::stop_token stoken) {
                 call->invoke = [](void* context) {
                     const auto bits = reinterpret_cast<uintptr_t>(context);
                     auto* lp = reinterpret_cast<Liverpool*>(bits & ~uintptr_t{1});
+                    ++VideoCore::g_g1[10]; // q19
                     if (FenceAtGpu() == 2 && lp->rasterizer) {
+                        VideoCore::G1Scope g1{0};
                         lp->rasterizer->FlushLazyFences();
                     }
                     if ((bits & 1) != 0 && lp->rasterizer) {
-                        lp->rasterizer->OnSubmit();
+                        {
+                            VideoCore::G1Scope g1{1};
+                            lp->rasterizer->OnSubmit();
+                        }
+                        VideoCore::G1Scope g1{6};
                         lp->rasterizer->Flush();
                     }
-                    VideoCore::ProtectFence();
+                    {
+                        VideoCore::G1Scope g1{7};
+                        VideoCore::ProtectFence();
+                    }
+                    VideoCore::G1Scope g1{8};
                     Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
                 };
                 static_assert(alignof(Liverpool) >= 2);

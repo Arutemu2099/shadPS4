@@ -4983,6 +4983,12 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
             push_data.buf_offsets[i] = 0;
         }
     }
+    if (Shader::g_pt_vertex != 0) {
+        // q18b: the colour VS reads its page-table vertex mask from buf_offsets[0..1]; the back pulls from its bound
+        // vertex buffer only.
+        push_data.buf_offsets[0] = 0;
+        push_data.buf_offsets[1] = 0;
+    }
     if (b.ring) {
         buffer_infos.emplace_back(vk::Buffer{std::bit_cast<VkBuffer>(native_ring_handle)}, 0,
                                   VK_WHOLE_SIZE);
@@ -8730,6 +8736,7 @@ void Rasterizer::OnSubmit() {
         }
     }
     if (fault_process_pending) {
+        VideoCore::G1Scope g1{2}; // q19
         fault_process_pending = false;
         buffer_cache.ProcessFaultBuffer();
         if (native_pt_on) [[unlikely]] {
@@ -8745,8 +8752,15 @@ void Rasterizer::OnSubmit() {
             }
         }
     }
-    texture_cache.ProcessDownloadImages();
-    texture_cache.RunGarbageCollector();
+    {
+        VideoCore::G1Scope g1{3}; // q19
+        texture_cache.ProcessDownloadImages();
+    }
+    {
+        VideoCore::G1Scope g1{4};
+        texture_cache.RunGarbageCollector();
+    }
+    VideoCore::G1Scope g1{5};
     buffer_cache.RunGarbageCollector();
 }
 
