@@ -6142,7 +6142,17 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     // the meantime (readbacks) cannot fault on the recording thread.
     // Measured 2026-09-23: VirtualProtect was 10.2% and this copy ~2% of CP wall time.
     const bool deferred_protect = g_deferred_protect;
-    const bool defer = deferred_protect && scheduler.IsAsyncRecording();
+    // q27: SHADPS4_LANE_DEFER_UPLOAD=1 - lane-mode uploads defer to the lane recorder thread (q12) the same way.
+    static const bool lane_defer = [] {
+        const char* e = std::getenv("SHADPS4_LANE_DEFER_UPLOAD");
+        const bool on = e && e[0] == '1';
+        if (on) {
+            LOG_INFO(Render, "q27: SHADPS4_LANE_DEFER_UPLOAD=1 (lane uploads: protect + copy on the lane recorder)");
+        }
+        return on;
+    }();
+    const bool lane_deferred = lane_defer && deferred_protect && scheduler.LaneRecordsQueued();
+    const bool defer = deferred_protect && (scheduler.IsAsyncRecording() || lane_deferred);
     if (g_deferred_copy_census) [[unlikely]] {
         census_lo = device_addr;
         census_hi = device_addr + size;
@@ -6293,7 +6303,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                 NoteTransferEnd();
             }
         };
-        if (defer && g_transfer_coalesce) {
+        if (defer && g_transfer_coalesce && !lane_deferred) {
             // SHADPS4_TRANSFER_COALESCE: the barriers come from the scheduler's transfer group.
             Vulkan::Scheduler::TransferRange write{static_cast<VkBuffer>(buffer.Handle()), ~0ULL, 0};
             for (const auto& copy : copies) {

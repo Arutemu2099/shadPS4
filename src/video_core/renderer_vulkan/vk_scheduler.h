@@ -911,6 +911,10 @@ public:
     bool HasLane() const noexcept {
         return lane_enabled;
     }
+    /// q27: lane-mode recording goes to the q12 lane recorder thread right now (public view of LaneRecQueues).
+    bool LaneRecordsQueued() const noexcept {
+        return LaneRecQueues();
+    }
     /// q24: SHADPS4_CHAIN_TIMING=1 - GPU timestamps around each early ASC service run in the main batch (lane off).
     bool ChainTiming() const noexcept {
         return chain_timer != nullptr;
