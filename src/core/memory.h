@@ -267,6 +267,8 @@ public:
     /// q36: TryReadBacking, else CopySparseMemory's copy - but false (no assert) when the range is not mapped any more
     /// (a deferred lane upload racing a guest unmap; the unmapped range's buffers are invalidated and re-uploaded).
     bool TryReadGuest(VAddr virtual_addr, u8* dest, u64 size);
+    /// q36d: every byte of the range has a physical backing (TryReadBacking would succeed now).
+    bool FullyBacked(VAddr virtual_addr, u64 size);
 
     /// SHADPS4_HOST_MIRROR: offset of [virtual_addr, virtual_addr + size) in the physical backing
     /// view when one contiguous physical area backs the whole range; false otherwise.

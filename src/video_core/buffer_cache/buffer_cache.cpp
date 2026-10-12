@@ -738,6 +738,9 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 }
 
 BufferCache::~BufferCache() {
+    if (scheduler.LaneUploadOn()) {
+        scheduler.LaneUploadDrain(); // q36d (review 7): FIFO jobs use page_manager / memory
+    }
     scheduler.DrainRecording();
     // Not reached in the supported lifecycle. The presenter that owns this cache is a global
     // that is never reset (gnmdriver.cpp), and every exit once it exists is std::quick_exit
@@ -761,7 +764,7 @@ struct Q36Page {
 std::mutex q36_mu;
 std::map<VAddr, Q36Page> q36_pages;
 u64 q36_seq = 0;
-std::atomic<u64> q36_compares{0}, q36_lost{0}, q36_dropped{0}, q36_unmapped{0};
+std::atomic<u64> q36_compares{0}, q36_lost{0}, q36_dropped{0}, q36_unmapped{0}, q36_unbacked{0}, q36_raced{0};
 void Q36Drop(VAddr lo, u64 size) {
     std::scoped_lock lk{q36_mu};
     auto it = q36_pages.lower_bound(lo & ~u64{0xfff});
@@ -6312,7 +6315,11 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             std::array<u8, 0x1000> page;
             if (memory->TryReadBacking(it->first, page.data(), page.size())) {
                 q36_compares.fetch_add(1, std::memory_order_relaxed);
-                if (XXH3_64bits(page.data(), page.size()) != it->second.hash) {
+                if (XXH3_64bits(page.data(), page.size()) != it->second.hash &&
+                    (memory_tracker->IsRegionCpuModified(it->first, 0x1000) ||
+                     memory_tracker->IsRegionGpuModified(it->first, 0x1000))) {
+                    q36_raced.fetch_add(1, std::memory_order_relaxed); // review 5a: a fault / GPU mark during the read
+                } else if (XXH3_64bits(page.data(), page.size()) != it->second.hash) {
                     const u64 n = q36_lost.fetch_add(1, std::memory_order_relaxed) + 1;
                     if ((n & (n - 1)) == 0) {
                         LOG_CRITICAL(Render, "q36 verify: LOST CPU WRITE? clean page {:#x} differs from its deferred "
@@ -6372,8 +6379,10 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                     std::scoped_lock lk{q36_mu};
                     tracked = q36_pages.size();
                 }
-                LOG_INFO(Render, "q36 verify: compares {} lost_write {} dropped {} unmapped_skips {} tracked {}",
-                         q36_compares.load(), q36_lost.load(), q36_dropped.load(), q36_unmapped.load(), tracked);
+                LOG_INFO(Render, "q36 verify: compares {} lost_write {} raced {} dropped {} unbacked_at_fifo {} "
+                         "unbacked_inline {} tracked {} (cap 8192: at the cap verification stops)",
+                         q36_compares.load(), q36_lost.load(), q36_raced.load(), q36_dropped.load(),
+                         q36_unmapped.load(), q36_unbacked.load(), tracked);
             }
             if (const volatile u32* g = g_sort_guard_words) {
                 // q36: the sort replacement's invalid-width exits (0 = never; the hang guard did not fire).
@@ -6492,12 +6501,28 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                 NoteTransferEnd();
             }
         };
+        bool q36_backed = lane_deferred2;
+        if (lane_deferred2) {
+            // q36d (review 1): a range without physical backing gets its CPU half inline (the main path's order).
+            for (const DeferredCopy& c : deferred_copies) {
+                q36_backed = q36_backed && memory->FullyBacked(c.addr, c.size);
+            }
+            if (!q36_backed) {
+                q36_unbacked.fetch_add(1, std::memory_order_relaxed);
+                page_manager.ReconcileProtection(deferred_protects);
+                for (const DeferredCopy& c : deferred_copies) {
+                    if (!memory->TryReadBacking(c.addr, c.dest, c.size)) {
+                        memory->CopySparseMemory(c.addr, c.dest, c.size);
+                    }
+                }
+            }
+        }
         if (lane_deferred2) {
             // q36: the CPU half (protect, then copy - the main path's order) on the LaneUpload FIFO; the lane
             // segment's submit is queued behind it (AscSubmitOnWorker). The GPU half is recorded now, as inline.
             // (=3: this upload's older page entries were dropped above, with every upload's.)
             std::vector<std::tuple<VAddr, u64, u8*>> verify_pages;
-            if (Q36Mode() == 3) [[unlikely]] {
+            if (Q36Mode() == 3 && q36_backed) [[unlikely]] {
                 std::scoped_lock lk{q36_mu};
                 for (const DeferredCopy& c : deferred_copies) {
                     for (VAddr pg = (c.addr + 0xfff) & ~u64{0xfff}; pg + 0x1000 <= c.addr + c.size; pg += 0x1000) {
@@ -6508,18 +6533,21 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                     }
                 }
             }
+            if (q36_backed && !(deferred_copies.empty() && deferred_protects.empty())) // review 8: no empty jobs
             scheduler.LaneUploadPush(
                 [pm = &page_manager, memory = memory,
                  protects = std::vector<PageManager::ProtectRange>(deferred_protects.begin(), deferred_protects.end()),
                  cpu = std::vector<DeferredCopy>(deferred_copies.begin(), deferred_copies.end()),
                  verify_pages = std::move(verify_pages)]() {
                     pm->ReconcileProtection(protects);
+                    bool all_ok = true;
                     for (const DeferredCopy& copy : cpu) {
                         if (!memory->TryReadGuest(copy.addr, copy.dest, copy.size)) {
-                            q36_unmapped.fetch_add(1, std::memory_order_relaxed); // I3: unmapped meanwhile
+                            q36_unmapped.fetch_add(1, std::memory_order_relaxed); // I3: unbacked since the push
+                            all_ok = false;
                         }
                     }
-                    if (!verify_pages.empty()) {
+                    if (!verify_pages.empty() && all_ok) { // review 5b: never arm a page filled with zeros
                         std::scoped_lock lk{q36_mu};
                         for (const auto& [pg, seq, src] : verify_pages) {
                             if (auto it = q36_pages.find(pg); it != q36_pages.end() && it->second.seq == seq) {

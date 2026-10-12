@@ -1645,6 +1645,9 @@ void Scheduler::LogParRec() {
 }
 
 void Scheduler::LaneUploadPush(Common::UniqueFunction<void>&& job) {
+    // q36d (review 4): done / pushed reasoning needs one pushing thread.
+    static const std::thread::id pusher = std::this_thread::get_id();
+    ASSERT_MSG(std::this_thread::get_id() == pusher, "q36: LaneUploadPush from a second thread");
     bool wake;
     {
         std::scoped_lock lk{lane_up_mu};

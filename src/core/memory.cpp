@@ -342,25 +342,25 @@ bool MemoryManager::BackingSpan(VAddr virtual_addr, VAddr& span_start, VAddr& sp
 }
 
 bool MemoryManager::TryReadGuest(VAddr virtual_addr, u8* dest, u64 size) {
+    // q36d (review 1): backing only - a virtual-address read could fault on a read-protected page and wait for the back.
+    // The caller checked FullyBacked at push time; false here means the range changed since (unmapped / remapped: its
+    // buffers are invalidated and re-uploaded), so the bytes are zero-filled.
     if (TryReadBacking(virtual_addr, dest, size)) {
         return true;
     }
-    std::shared_lock lk{mutex};
-    if (!IsValidMapping(virtual_addr, size)) {
-        return false;
-    }
-    auto vma = FindVMA(virtual_addr);
-    while (size) {
-        u64 copy_size = std::min<u64>(vma->second.size - (virtual_addr - vma->first), size);
-        if (vma->second.IsMapped()) {
-            std::memcpy(dest, std::bit_cast<const u8*>(virtual_addr), copy_size);
-        } else {
-            std::memset(dest, 0, copy_size);
+    std::memset(dest, 0, size);
+    return false;
+}
+
+bool MemoryManager::FullyBacked(VAddr virtual_addr, u64 size) {
+    const VAddr end = virtual_addr + size;
+    for (VAddr a = virtual_addr; a < end;) {
+        VAddr s{}, e{};
+        u64 b{};
+        if (!BackingSpan(a, s, e, b) || e <= a) {
+            return false;
         }
-        size -= copy_size;
-        virtual_addr += copy_size;
-        dest += copy_size;
-        ++vma;
+        a = e;
     }
     return true;
 }
