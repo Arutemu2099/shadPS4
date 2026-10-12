@@ -606,8 +606,13 @@ private:
     /// SHADPS4_ASC_STREAM: GPU write ranges recorded in the last WriteHistory ASC segments.
     std::array<std::vector<std::pair<VAddr, VAddr>>, 512> asc_write_hist;
     std::array<u64, 512> asc_write_hist_value{};
-    /// Newest ASC segment value that wrote any copied byte (0 = none in the history).
-    u64 NewestAscWriter(std::span<const FaultCopy> copies) const;
+    /// q11e: per-slot [min begin, max end) of its ranges.
+    std::array<std::pair<VAddr, VAddr>, 512> asc_write_bbox{};
+    /// Newest ASC segment value that wrote any copied byte (0 = none in the history). q11e: values
+    /// <= `done_below` (finished segments) are not searched.
+    u64 NewestAscWriter(std::span<const FaultCopy> copies, u64 done_below = 0) const;
+    /// q11e: the done_below for a caller that treats writer w as finished when IsFree(w + margin).
+    u64 AscDoneBelow(u64 margin);
     u64 producer_floor = 0; ///< Tick of the newest write too large to record per slot.
     /// SHADPS4_READBACK_EARLY_FLUSH: main tick of the last readback job per 1 MB slot, and a
     /// request raised when a GPU write lands in a recently read-back slot.

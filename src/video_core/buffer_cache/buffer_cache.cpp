@@ -1358,7 +1358,7 @@ void BufferCache::ResolveFaultSync(VAddr device_addr, u64 size, bool is_write,
     if (g_lane_on) [[unlikely]] {
         // Review S5: this download runs on main; a lane segment that wrote the range comes first.
         const FaultCopy fc{device_addr, 0, size};
-        const u64 w = NewestAscWriter({&fc, 1});
+        const u64 w = NewestAscWriter({&fc, 1}, AscDoneBelow(2)); // q11e: only unfinished writers act
         if (w != 0 && !scheduler.GetAscSemaphore()->IsFree(w + 2)) {
             scheduler.LaneFallbackMain();
         }
@@ -1752,7 +1752,7 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
     bool asc_done = true;
     if (scheduler.HasAscStream() || scheduler.HasLane()) {
         auto* asc_sem = scheduler.GetAscSemaphore();
-        asc_producer = NewestAscWriter(job->copies);
+        asc_producer = NewestAscWriter(job->copies, AscDoneBelow(scheduler.HasLane() ? 2 : 1)); // q11e
         if (asc_hist_evicted != 0 && !asc_sem->IsFree(asc_hist_evicted)) {
             // A history slot of an unfinished segment was overwritten: assume it wrote here.
             asc_producer = std::max(asc_producer, asc_hist_evicted);
@@ -2496,6 +2496,7 @@ void BufferCache::NoteBatchWrite(VAddr addr, u64 size) {
             asc_hist_evicted = std::max(asc_hist_evicted, asc_write_hist_value[i]);
             asc_write_hist[i].clear();
             asc_write_hist_value[i] = value;
+            asc_write_bbox[i] = {~VAddr{0}, 0}; // q11e
         }
         // The particle chain rebinds the same written windows dispatch after dispatch: skip a
         // range the last few entries already cover (the history is scanned on every fault).
@@ -2507,6 +2508,8 @@ void BufferCache::NoteBatchWrite(VAddr addr, u64 size) {
             }
         }
         hist.emplace_back(addr, end);
+        asc_write_bbox[i].first = std::min(asc_write_bbox[i].first, addr); // q11e
+        asc_write_bbox[i].second = std::max(asc_write_bbox[i].second, end);
         return;
     }
     if (PreciseProducerEnabled() || Offload::LatencyEnabled() || FastLaneEnabled()) {
@@ -2537,7 +2540,19 @@ Vulkan::MasterSemaphore& BufferCache::JobSemaphore(bool on_fast_lane, bool on_as
     return on_asc ? *scheduler.GetAscSemaphore() : LaneOf(on_fast_lane).Semaphore();
 }
 
-u64 BufferCache::NewestAscWriter(std::span<const FaultCopy> copies) const {
+u64 BufferCache::AscDoneBelow(u64 margin) {
+    static const bool fast = [] {
+        const char* env = std::getenv("SHADPS4_ASC_HIST_FAST");
+        return !env || env[0] != '0';
+    }();
+    if (!fast || g_asc_census) {
+        return 0;
+    }
+    const u64 known = scheduler.GetAscSemaphore()->KnownGpuTick();
+    return known > margin ? known - margin : 0;
+}
+
+u64 BufferCache::NewestAscWriter(std::span<const FaultCopy> copies, u64 done_below) const {
     // Slots hold consecutive ASC values (value % size): walk from the newest value down and
     // return the first writer (was a scan of all 64 slots: 11% of the CP back with ASC_TEXEL,
     // run threads-stack-fire-ascrange-on-20260928-a).
@@ -2545,10 +2560,19 @@ u64 BufferCache::NewestAscWriter(std::span<const FaultCopy> copies) const {
     for (size_t i = 0; i < asc_write_hist.size(); ++i) {
         top = std::max(top, asc_write_hist_value[i]);
     }
-    for (u64 v = top; v != 0 && top - v < asc_write_hist.size(); --v) {
+    VAddr clo = ~VAddr{0}, chi = 0; // q11e: the copies' bounding box
+    for (const FaultCopy& copy : copies) {
+        clo = std::min(clo, copy.addr);
+        chi = std::max(chi, copy.addr + copy.size);
+    }
+    for (u64 v = top; v != 0 && v > done_below && top - v < asc_write_hist.size(); --v) {
         const size_t i = v % asc_write_hist.size();
         if (asc_write_hist_value[i] != v) {
             continue;
+        }
+        if (done_below != 0 &&
+            (asc_write_bbox[i].first >= chi || clo >= asc_write_bbox[i].second)) {
+            continue; // q11e: no copy can overlap this slot's ranges
         }
         for (const auto& [begin, end] : asc_write_hist[i]) {
             for (const FaultCopy& copy : copies) {
