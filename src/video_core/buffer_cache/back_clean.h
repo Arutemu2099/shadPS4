@@ -288,8 +288,55 @@ inline std::atomic<u64> g_war_scoped{0}, g_war_label{0}, g_war_open{0};
 struct LaneProbe {
     std::atomic<u64> lo{0}, hi{0};
     u64 rd{0};
+    // q26 E1 (back thread only): read tick per 256 KB window from lo, a floor from ReadAll / registration, and the
+    // stamping site of each (E0).
+    u64 all{0};
+    u8 all_site{0};
+    std::array<u64, 256> wrd{};
+    std::array<u8, 256> wsite{};
 };
-inline std::array<LaneProbe, 16> g_lprobe{};
+inline std::array<LaneProbe, 64> g_lprobe{};
+/// q26 flags (see q26_lane_exact_waits.py).
+inline const int g_lane_win = [] {
+    const char* e = std::getenv("SHADPS4_LANE_WIN");
+    return e && (e[0] == '1' || e[0] == '2') ? e[0] - '0' : 0;
+}();
+inline const bool g_lane_seg_census = [] {
+    const char* e = std::getenv("SHADPS4_LANE_SEG_CENSUS");
+    return e && e[0] == '1';
+}();
+inline const bool g_lane_native_exact = [] {
+    const char* e = std::getenv("SHADPS4_LANE_NATIVE_EXACT");
+    return e && e[0] == '1';
+}();
+inline const bool g_lane_small_probes = [] {
+    const char* e = std::getenv("SHADPS4_LANE_SMALL_PROBES");
+    return e && e[0] == '1';
+}();
+inline u32 g_lane_war_site = 0;                      // q26 E0: stamping site of the window that set LaneProbeWrite's rd
+inline std::array<u64, 32> g_lprobe_all_c{};        // q26 E0: LaneProbeReadAll calls by site
+/// q26 E0: compact wait-site codes for Scheduler::LaneNeedMain.
+constexpr u32 LaneSiteRaw(u32 wk) {
+    return wk & 255;
+}
+constexpr u32 LaneSiteWar(u32 stamp_site) {
+    return 256 + (stamp_site & 63);
+}
+inline void LaneProbeWindows(LaneProbe& p, u64 lo, u64 hi, u64 v, u32 site) noexcept {
+    const u64 plo = p.lo.load(std::memory_order_relaxed);
+    const u64 phi = p.hi.load(std::memory_order_relaxed);
+    const u64 a = std::max(lo, plo), b = std::min(hi, phi);
+    if (b <= a) {
+        return;
+    }
+    const u64 i0 = std::min<u64>((a - plo) >> 18, 255), i1 = std::min<u64>((b - 1 - plo) >> 18, 255);
+    for (u64 i = i0; i <= i1; ++i) {
+        if (v > p.wrd[i]) {
+            p.wrd[i] = v;
+            p.wsite[i] = static_cast<u8>(site);
+        }
+    }
+}
 inline std::atomic<u32> g_lprobe_n{0};
 /// 0..4 open - newest read (4 = 4+), 5 read done, 6 never read, 7 newest read after the newest gfx label,
 /// 8 written lane bindings over a probe, 9 A2 stamps, 10 old-path / copy stamps, 11 registered.
@@ -306,21 +353,31 @@ inline bool LaneProbeAny(u64 lo, u64 hi) noexcept {
     }
     return false;
 }
-inline void LaneProbeRead(u64 lo, u64 hi, u64 tick, u32 ctr) noexcept {
+inline void LaneProbeRead(u64 lo, u64 hi, u64 tick, u32 ctr, u32 site = 10) noexcept {
     const u32 n = g_lprobe_n.load(std::memory_order_relaxed);
     for (u32 i = 0; i < n; ++i) {
         auto& p = g_lprobe[i];
         if (p.lo.load(std::memory_order_relaxed) < hi && lo < p.hi.load(std::memory_order_relaxed)) {
             p.rd = std::max(p.rd, tick);
             ++g_lprobe_dist[ctr];
+            if (g_lane_win != 0) {
+                // q26 E1 / E3-lite: =2 stores lookup stamps pre-adjusted (+1); A2 publish stamps (9) are exact.
+                LaneProbeWindows(p, lo, hi, (g_lane_win == 2 && site != 9) ? tick + 1 : tick, site);
+            }
         }
     }
 }
 /// Stamps every probe (a read whose range is unknown: a stretch begun before a probe change).
-inline void LaneProbeReadAll(u64 tick) noexcept {
+inline void LaneProbeReadAll(u64 tick, u32 site = 18) noexcept {
     const u32 n = g_lprobe_n.load(std::memory_order_relaxed);
+    ++g_lprobe_all_c[site & 31];
+    const u64 v = g_lane_win == 2 ? tick + 1 : tick;
     for (u32 i = 0; i < n; ++i) {
         g_lprobe[i].rd = std::max(g_lprobe[i].rd, tick);
+        if (g_lane_win != 0 && v > g_lprobe[i].all) {
+            g_lprobe[i].all = v;
+            g_lprobe[i].all_site = static_cast<u8>(site);
+        }
     }
 }
 /// A written lane binding (back): the newest main read tick over the probes it overlaps. A big binding
@@ -340,15 +397,37 @@ inline bool LaneProbeWrite(u64 lo, u64 hi, u64 open, u64& rd, bool& hit) noexcep
         const u64 phi = p.hi.load(std::memory_order_relaxed);
         if (plo < hi && lo < phi) {
             hit = true;
-            rd = std::max(rd, p.rd);
+            u64 r = p.rd;
+            u32 s = 10;
+            if (g_lane_win != 0) {
+                // q26 E1: the newest read over this write's windows only (+ the probe's floor).
+                r = p.all;
+                s = p.all_site;
+                const u64 a = std::max(lo, plo), b = std::min(hi, phi);
+                const u64 i0 = std::min<u64>((a - plo) >> 18, 255), i1 = std::min<u64>((b - 1 - plo) >> 18, 255);
+                for (u64 k = i0; k <= i1; ++k) {
+                    if (p.wrd[k] > r) {
+                        r = p.wrd[k];
+                        s = p.wsite[k];
+                    }
+                }
+            }
+            if (r > rd) {
+                rd = r;
+                g_lane_war_site = s;
+            }
             first = std::min(first, i);
             covered = covered || (plo <= lo && hi <= phi);
         }
     }
-    if (!hit && hi - lo >= (u64{1} << 20) && n < g_lprobe.size()) {
+    if (!hit && hi - lo >= (g_lane_small_probes ? u64{4096} : (u64{1} << 20)) &&
+        n < (g_lane_small_probes ? g_lprobe.size() : 16)) {
         g_lprobe[n].lo.store(lo, std::memory_order_relaxed);
         g_lprobe[n].hi.store(hi, std::memory_order_relaxed);
         g_lprobe[n].rd = open;
+        g_lprobe[n].all = open; // q26 E1: unknown history
+        g_lprobe[n].all_site = 21;
+        g_lane_war_site = 21;
         g_lprobe_n.store(n + 1, std::memory_order_release);
         g_lprobe_gen.fetch_add(1, std::memory_order_release);
         ++g_lprobe_dist[11];
@@ -363,6 +442,14 @@ inline bool LaneProbeWrite(u64 lo, u64 hi, u64 open, u64& rd, bool& hit) noexcep
             p.lo.store(nlo, std::memory_order_relaxed);
             p.hi.store(nhi, std::memory_order_relaxed);
             p.rd = std::max(p.rd, open);
+            if (g_lane_win != 0) {
+                // q26 E1: re-based windows; open covers every earlier stamp (conservative, as rd).
+                p.all = std::max(p.all, open);
+                p.all_site = 22;
+                p.wrd.fill(0);
+                p.wsite.fill(0);
+            }
+            g_lane_war_site = 22;
             g_lprobe_gen.fetch_add(1, std::memory_order_release);
             rd = std::max(rd, open);
             covered = true;
@@ -371,10 +458,10 @@ inline bool LaneProbeWrite(u64 lo, u64 hi, u64 open, u64& rd, bool& hit) noexcep
     return covered;
 }
 /// q9c: stamps every probe (a main read of unknown range) - back thread, outside lane mode.
-inline void LaneProbeReadAllMain(u64 tick) noexcept {
+inline void LaneProbeReadAllMain(u64 tick, u32 site = 19) noexcept {
     if (g_lane_war_mode == 1 && g_lprobe_n.load(std::memory_order_relaxed) != 0) {
         g_war_dma_all.fetch_add(1, std::memory_order_relaxed);
-        LaneProbeReadAll(tick);
+        LaneProbeReadAll(tick, site);
     }
 }
 /// Defined in buffer_cache.cpp (back thread): tallies one lane binding's producer answer / probe.

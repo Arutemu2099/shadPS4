@@ -923,9 +923,13 @@ public:
     /// batch: submitted right after that batch's flush).
     /// p1d: `src` 0 exact producer, 1 coarse, 2 WAR (gfx label), 3 GDS, 4 carry; `cap`: never
     /// defer (an open-batch tick becomes the newest submitted batch).
-    void LaneNeedMain(u64 tick, u32 src = 0, bool cap = false) {
+    void LaneNeedMain(u64 tick, u32 src = 0, bool cap = false, u32 site = ~0u) {
         if (tick == 0 || !asc_dirty) {
             return;
+        }
+        if (site == ~0u) {
+            // q26 E0: compact site code (callers with better information pass it).
+            site = src == 2 ? (cap ? 320u : 256u) : src == 3 ? 321u : src == 4 ? 322u : 255u;
         }
         const u64 open = master_semaphore.CurrentTick();
         if (cap && tick >= open) {
@@ -943,6 +947,7 @@ public:
         }
         if (tick > asc_wait_main) {
             asc_wait_main = tick;
+            asc_wait_site = site; // q26 E0
             const bool on_open = tick >= open;
             ++lane_c[on_open ? 10 : 9];
             if (on_open) {
@@ -996,6 +1001,9 @@ public:
     }
     void SwitchStream(u32 stream);
     void AddAscWaitMain(u64 main_tick) noexcept {
+        if (main_tick > asc_wait_main) {
+            asc_wait_site = 323; // q26 E0: other
+        }
         asc_wait_main = std::max(asc_wait_main, main_tick);
     }
     /// Submits the open ASC segment (if any) and returns its timeline value, else 0.
@@ -1175,6 +1183,10 @@ private:
     bool asc_dirty = false;
     u64 open_asc_value = 0;
     u64 asc_wait_main = 0;
+    u32 asc_wait_site = 0; // q26 E0: the site that set asc_wait_main
+    std::array<u64, 324> lane_site_c{};
+    u64 lane_seg_n = 0, lane_seg_unf = 0, lane_seg_behind = 0, lane_seg_log_tsc = 0;
+    void LaneSegCensus(u64 wait_main);
     std::atomic<u64> asc_last_submitted{0};
     std::array<u64, 4> asc_wait_dist{};
     /// SHADPS4_ASC_TIMING=1 (diagnostic): GPU time of each ASC segment on the compute queue.

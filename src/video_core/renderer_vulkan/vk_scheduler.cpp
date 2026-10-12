@@ -1898,6 +1898,7 @@ void Scheduler::LaneSwitch(u32 stream) {
             open_asc_value = asc_semaphore->NextTick();
             asc_dirty = true;
             asc_wait_main = 0;
+            asc_wait_site = 0;
         }
         if (!lane_rec) {
             if (!asc_cmdbuf) {
@@ -1918,11 +1919,60 @@ void Scheduler::LaneSwitch(u32 stream) {
     }
 }
 
+void Scheduler::LaneSegCensus(u64 wait_main) {
+    // q26 E0: which site set each segment's final main wait, and whether that batch is still unfinished.
+    ++lane_seg_n;
+    master_semaphore.Refresh();
+    const u64 known = master_semaphore.KnownGpuTick();
+    if (wait_main > known) {
+        ++lane_seg_unf;
+        lane_seg_behind += wait_main - known;
+        ++lane_site_c[std::min<u32>(asc_wait_site, 323)];
+    }
+    const u64 now = __rdtsc();
+    if (now - lane_seg_log_tsc < 17'500'000'000ULL) {
+        return;
+    }
+    lane_seg_log_tsc = now;
+    std::vector<std::pair<u64, u32>> top;
+    for (u32 i = 0; i < lane_site_c.size(); ++i) {
+        if (lane_site_c[i] != 0) {
+            top.emplace_back(lane_site_c[i], i);
+        }
+    }
+    std::sort(top.begin(), top.end(), std::greater<>());
+    std::string s;
+    for (size_t k = 0; k < std::min<size_t>(top.size(), 10); ++k) {
+        const u32 c = top[k].second;
+        s += c < 256 ? fmt::format(" [raw k{} {}]", c, top[k].first)
+             : c < 320 ? fmt::format(" [war s{} {}]", c - 256, top[k].first)
+                       : fmt::format(" [{} {}]", c == 320 ? "label" : c == 321 ? "gds" : c == 322 ? "carry" : "other",
+                                     top[k].first);
+    }
+    std::string ra;
+    for (u32 i = 0; i < VideoCore::g_lprobe_all_c.size(); ++i) {
+        if (VideoCore::g_lprobe_all_c[i] != 0) {
+            ra += fmt::format(" s{}={}", i, VideoCore::g_lprobe_all_c[i]);
+        }
+    }
+    LOG_INFO(Render_Vulkan,
+             "q26 LaneSegCensus (~5 s): segments {} waiting on an unfinished main batch {} (mean {:.2f} batches "
+             "behind) | by site:{} | probe ReadAll by site:{} | probes {}",
+             lane_seg_n, lane_seg_unf, lane_seg_unf ? double(lane_seg_behind) / double(lane_seg_unf) : 0.0, s, ra,
+             VideoCore::g_lprobe_n.load(std::memory_order_relaxed));
+    lane_seg_n = lane_seg_unf = lane_seg_behind = 0;
+    lane_site_c.fill(0);
+    VideoCore::g_lprobe_all_c.fill(0);
+}
+
 void Scheduler::LaneSubmit() {
     VideoCore::LbScope lb_scope{8}; // q11a
     ++VideoCore::g_lb[9];
     const u64 value = open_asc_value;
     const u64 wait_main = asc_wait_main;
+    if (VideoCore::g_lane_seg_census) [[unlikely]] {
+        LaneSegCensus(wait_main);
+    }
     asc_dirty = false;
     if (async_submit &&
         wait_main > async_submitted_tick.load(std::memory_order_acquire)) [[unlikely]] {

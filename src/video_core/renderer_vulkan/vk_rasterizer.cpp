@@ -2836,7 +2836,7 @@ void Rasterizer::NativePrepare(const GraphicsPipeline* base,
                 return true;
             }
         }
-        const VideoCore::Buffer* buf = buffer_cache.NativeBufferAt(a);
+        const VideoCore::Buffer* buf = buffer_cache.NativeBufferAt(a, size);
         if (!buf || !buf->IsInBounds(a, size)) {
             return false;
         }
@@ -3539,7 +3539,7 @@ bool Rasterizer::NativeRingPrepare(const GraphicsPipeline* base,
                 return true;
             }
         }
-        const VideoCore::Buffer* buf = buffer_cache.NativeBufferAt(a_lo);
+        const VideoCore::Buffer* buf = buffer_cache.NativeBufferAt(a_lo, a_hi - a_lo);
         if (!buf || !buf->IsInBounds(a_lo, a_hi - a_lo) ||
             std::bit_cast<u64>(static_cast<VkBuffer>(buf->Handle())) != want_handle) {
             return false;
@@ -3940,7 +3940,7 @@ bool Rasterizer::NativeSegPrepare(const GraphicsPipeline* base,
         if (a_lo == 0 || a_hi <= a_lo || a_hi - a_lo > (u64{64} << 20)) {
             return false;
         }
-        const VideoCore::Buffer* buf = buffer_cache.NativeBufferAt(a_lo);
+        const VideoCore::Buffer* buf = buffer_cache.NativeBufferAt(a_lo, a_hi - a_lo);
         if (!buf || !buf->IsInBounds(a_lo, a_hi - a_lo) ||
             std::bit_cast<u64>(static_cast<VkBuffer>(buf->Handle())) != want_handle) {
             return false;
@@ -5976,7 +5976,7 @@ const VideoCore::Buffer* Rasterizer::NativeSpanSync(VAddr lo, VAddr hi,
     // superset validated since its granules last changed -> no sync walk; else the lean sync.
     // The access barrier always. Null: not inside one cached buffer (the generic path creates /
     // joins buffers).
-    const VideoCore::Buffer* b0 = buffer_cache.NativeBufferAt(lo);
+    const VideoCore::Buffer* b0 = buffer_cache.NativeBufferAt(lo, hi - lo);
     if (!b0 || !b0->IsInBounds(lo, hi - lo)) {
         return nullptr;
     }
@@ -6067,7 +6067,7 @@ const GraphicsPipeline* Rasterizer::NativeDirectCandidate(
         if (attribs[k].base_address == 0 || attribs[k].size == 0) {
             continue;
         }
-        const VideoCore::Buffer* vb = buffer_cache.NativeBufferAt(attribs[k].base_address);
+        const VideoCore::Buffer* vb = buffer_cache.NativeBufferAt(attribs[k].base_address, attribs[k].size);
         if (!vb || (vb0 && vb != vb0)) {
             ++native_stats.nd_fail[11];
             return nullptr;
@@ -7078,7 +7078,7 @@ bool Rasterizer::NativeSegEvaluate(const AmdGpu::CpSplit::SplitSegmentRecord& se
         if (lo == 0 || hi <= lo || hi - lo > (u64{64} << 20)) {
             return false;
         }
-        buf = buffer_cache.NativeBufferAt(lo);
+        buf = buffer_cache.NativeBufferAt(lo, hi - lo);
         return buf != nullptr && buf->IsInBounds(lo, hi - lo);
     };
     const VideoCore::Buffer* buf = nullptr;
@@ -10159,7 +10159,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 
     if (uses_dma && VideoCore::g_lane_war && Common::FaultMonitor::t_is_cp_thread &&
         !Scheduler::t_lane_mode) [[unlikely]] {
-        VideoCore::LaneProbeReadAllMain(scheduler.CurrentTick()); // q9c (2a): BDA reads any address
+        VideoCore::LaneProbeReadAllMain(scheduler.CurrentTick(), 20); // q9c (2a): BDA reads any address
     }
     if (uses_dma) {
         // We only use fault buffer for DMA right now.

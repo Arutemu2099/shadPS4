@@ -2176,7 +2176,7 @@ void BufferCache::RecordFaultCopies(vk::CommandBuffer cmdbuf, Buffer& source, vk
     if (g_lane_probe && Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
         for (const auto& copy : copies) {
             const VAddr lo = source.CpuAddr() + copy.srcOffset;
-            LaneProbeRead(lo, lo + copy.size, scheduler.CurrentTick(), 10); // q9 census
+            LaneProbeRead(lo, lo + copy.size, scheduler.CurrentTick(), 10, 11); // q9 census
         }
     }
     if (g_range_notes) {
@@ -2248,7 +2248,7 @@ void BufferCache::RecordFaultCopiesAsync(Buffer& source, vk::Buffer staging,
     if (g_lane_probe && Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
         for (const auto& copy : copies) {
             const VAddr lo = source.CpuAddr() + copy.srcOffset;
-            LaneProbeRead(lo, lo + copy.size, scheduler.CurrentTick(), 10); // q9 census
+            LaneProbeRead(lo, lo + copy.size, scheduler.CurrentTick(), 10, 11); // q9 census
         }
     }
     if (g_range_notes) {
@@ -2482,11 +2482,11 @@ void LaneWarWait(Vulkan::Scheduler& sch, u64 lo, u64 hi) {
     bool hit = false;
     if (g_lane_war && hi > lo && LaneProbeWrite(lo, hi, open, rd, hit)) {
         g_war_scoped.fetch_add(1, std::memory_order_relaxed);
-        const u64 w = rd != 0 ? std::min(rd + 1, open) : 0;
+        const u64 w = rd != 0 ? std::min(rd + (g_lane_win == 2 ? 0 : 1), open) : 0; // q26 E3-lite
         if (w >= open) {
             g_war_open.fetch_add(1, std::memory_order_relaxed);
         }
-        sch.LaneNeedMain(w, 2, false);
+        sch.LaneNeedMain(w, 2, false, LaneSiteWar(g_lane_war_site));
         return;
     }
     g_war_label.fetch_add(g_lane_war ? 1 : 0, std::memory_order_relaxed);
@@ -3813,7 +3813,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     if (g_lane_probe && Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
         for (const auto& copy : copies) {
             const VAddr lo = buffer.CpuAddr() + copy.srcOffset;
-            LaneProbeRead(lo, lo + copy.size, scheduler.CurrentTick(), 10); // q9 census
+            LaneProbeRead(lo, lo + copy.size, scheduler.CurrentTick(), 10, 11); // q9 census
         }
     }
     if (g_range_notes) {
@@ -4380,7 +4380,7 @@ void BufferCache::BindVertexBuffersDerived(
         std::span<const vk::DeviceSize>{host_sizes}, std::span<const vk::DeviceSize>{host_strides});
 }
 
-const Buffer* BufferCache::NativeBufferAt(VAddr addr) {
+const Buffer* BufferCache::NativeBufferAt(VAddr addr, u64 size) {
     if (addr == 0) {
         return nullptr;
     }
@@ -4392,8 +4392,12 @@ const Buffer* BufferCache::NativeBufferAt(VAddr addr) {
     if (g_lane_probe && !found.is_deleted && Common::FaultMonitor::t_is_cp_thread &&
         !Vulkan::Scheduler::t_lane_mode) [[unlikely]] {
         // q9b: the native back paths read through the page table (segment members); the whole
-        // cached buffer counts as read (conservative).
-        LaneProbeRead(found.CpuAddr(), found.CpuAddr() + found.SizeBytes(), scheduler.CurrentTick(), 10);
+        // cached buffer counts as read (conservative). q26 E2: the caller's range when it has one.
+        if (g_lane_native_exact && size != 0) {
+            LaneProbeRead(addr, addr + size, scheduler.CurrentTick(), 10, 12);
+        } else {
+            LaneProbeRead(found.CpuAddr(), found.CpuAddr() + found.SizeBytes(), scheduler.CurrentTick(), 10, 23);
+        }
     }
     return found.is_deleted ? nullptr : &found;
 }
@@ -4407,7 +4411,7 @@ const Buffer* BufferCache::NativeRunSpan(
     }
     if (g_lane_probe && Common::FaultMonitor::t_is_cp_thread && !Vulkan::Scheduler::t_lane_mode)
         [[unlikely]] {
-        LaneProbeRead(lo, hi, scheduler.CurrentTick(), 10); // q9 census
+        LaneProbeRead(lo, hi, scheduler.CurrentTick(), 10, 13); // q9 census
     }
     const BufferId id = page_table[lo >> CACHING_PAGEBITS].buffer_id;
     if (!id) {
@@ -4669,7 +4673,7 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
     dst_buffer.NoteMainAccess(scheduler.CurrentTick(), true);
     if (g_lane_probe && !src_gds && Common::FaultMonitor::t_is_cp_thread &&
         !Vulkan::Scheduler::t_lane_mode) [[unlikely]] {
-        LaneProbeRead(src, src + num_bytes, scheduler.CurrentTick(), 10); // q9 census
+        LaneProbeRead(src, src + num_bytes, scheduler.CurrentTick(), 10, 14); // q9 census
     }
     if (g_range_notes) {
         if (!src_gds) {
@@ -4900,24 +4904,24 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         if (g_lane_who) [[unlikely]] {
             LaneWhoNote(t, open, is_written, war_rd, war_hit);
         }
-        scheduler.LaneNeedMain(t, g_lc_src);
+        scheduler.LaneNeedMain(t, g_lc_src, false, LaneSiteRaw(g_lc_hit_wk));
         if (is_written) {
             if (g_lane_war && war_cov) {
                 // q9b: WAR scoped to the newest main batch that read this pool range (deferred
                 // if it is the open batch: a read recorded there is a real hazard); q9c: + 1.
                 g_war_scoped.fetch_add(1, std::memory_order_relaxed);
-                const u64 w = war_rd != 0 ? std::min(war_rd + 1, open) : 0;
+                const u64 w = war_rd != 0 ? std::min(war_rd + (g_lane_win == 2 ? 0 : 1), open) : 0; // q26 E3-lite
                 if (w >= open) {
                     g_war_open.fetch_add(1, std::memory_order_relaxed);
                 }
-                scheduler.LaneNeedMain(w, 2, false);
+                scheduler.LaneNeedMain(w, 2, false, LaneSiteWar(g_lane_war_site));
             } else {
                 g_war_label.fetch_add(g_lane_war ? 1 : 0, std::memory_order_relaxed);
                 scheduler.LaneNeedMain(g_gfx_label_tick, 2, true); // WAR, never the open batch (p1d)
             }
         }
     } else if (g_lane_probe && !is_written && Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
-        LaneProbeRead(device_addr, device_addr + size, scheduler.CurrentTick(), 10); // q9 census
+        LaneProbeRead(device_addr, device_addr + size, scheduler.CurrentTick(), 10, 15); // q9 census
     }
     if (g_lane_census && Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
         const u64 lo = device_addr, hi = device_addr + size;
@@ -5567,7 +5571,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 si
             }
             if (g_lane_probe && Common::FaultMonitor::t_is_cp_thread &&
                 !Vulkan::Scheduler::t_lane_mode) [[unlikely]] {
-                LaneProbeRead(gpu_addr, gpu_addr + size, scheduler.CurrentTick(), 10); // q9c
+                LaneProbeRead(gpu_addr, gpu_addr + size, scheduler.CurrentTick(), 10, 16); // q9c
             }
             SynchronizeBuffer(buffer, gpu_addr, size, false, false, nullptr);
             note("cached", &buffer);
@@ -5717,7 +5721,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainReadLean(VAddr device_addr, u32 size,
         }
         scheduler.LaneNeedMain(t, g_lc_src);
     } else if (g_lane_probe && Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
-        LaneProbeRead(device_addr, device_addr + size, scheduler.CurrentTick(), 10); // q9 census
+        LaneProbeRead(device_addr, device_addr + size, scheduler.CurrentTick(), 10, 17); // q9 census
     }
     if (g_lane_census && Common::FaultMonitor::t_is_cp_thread && !t_force_binding_sync)
         [[unlikely]] {

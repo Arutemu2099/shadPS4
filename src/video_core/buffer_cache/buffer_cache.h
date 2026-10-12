@@ -217,7 +217,7 @@ public:
     /// appended to `barriers`. nullptr when the span is not inside one buffer or over 64 MB.
     /// SHADPS4_NATIVE_REC_PREP: the existing buffer holding `addr` (page table only: no
     /// creation, merge or sync), or nullptr.
-    const Buffer* NativeBufferAt(VAddr addr);
+    const Buffer* NativeBufferAt(VAddr addr, u64 size = 0); // q26 E2: size != 0 = the caller's range
     /// A2: lock-free, read-only lookup for the A2 worker threads (vk_a2.cpp): the cached buffer
     /// holding `addr`, or null. Reads the page table's second-level page with an acquire load
     /// (the CP publishes it with release), the entry's id as a plain word (the CP's page-table
