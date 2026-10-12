@@ -4921,6 +4921,13 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             }
         }
     } else if (g_lane_probe && !is_written && Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
+        if (g_lane_bind_uploads) {
+            // q31b: quiet-ness before this draw's own stamp (its read is ordered after a lane upload by the pin).
+            g_q31_pre_lo = device_addr;
+            g_q31_pre_hi = device_addr + size;
+            g_q31_pre_tick = scheduler.CurrentTick();
+            g_q31_pre = LaneProbeQuiet(device_addr, device_addr + size, g_q31_pre_tick);
+        }
         LaneProbeRead(device_addr, device_addr + size, scheduler.CurrentTick(), 10, 15); // q9 census
     }
     if (g_lane_census && Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
@@ -6126,23 +6133,30 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                                     bool is_texel_buffer,
                                     Common::BufferSampleProbe* sample_probe) {
     // q31 (Study A E8): SHADPS4_LANE_BIND_UPLOADS=1 - a main-stream upload into a quiet probe range goes to the lane.
-    static const bool bind_uploads = [] {
-        const char* e = std::getenv("SHADPS4_LANE_BIND_UPLOADS");
-        const bool on = e && e[0] == '1';
-        if (on) {
-            LOG_INFO(Render, "q31: SHADPS4_LANE_BIND_UPLOADS=1 (quiet probe-range uploads at draw binds go to the lane)");
-        }
-        return on;
-    }();
-    if (bind_uploads && g_lane_on && !Vulkan::Scheduler::t_lane_mode && Common::FaultMonitor::t_is_cp_thread &&
-        scheduler.HasLane() && scheduler.ActiveStream() == 0 && size != 0) [[unlikely]] {
+    if (g_lane_bind_uploads && g_lane_on && !Vulkan::Scheduler::t_lane_mode &&
+        Common::FaultMonitor::t_is_cp_thread && scheduler.HasLane() && scheduler.ActiveStream() == 0 &&
+        size != 0) [[unlikely]] {
         const u64 open = scheduler.CurrentTick();
-        if (memory_tracker->IsRegionCpuModified(device_addr, size) &&
-            LaneProbeQuiet(device_addr, device_addr + size, open) &&
-            !memory_tracker->IsRegionGpuModified(device_addr, size)) {
+        // q31b: the quiet answer captured before the bind's own stamp, for exactly this range.
+        const bool pre = g_q31_pre && g_q31_pre_tick == open && g_q31_pre_lo == device_addr &&
+                         g_q31_pre_hi == device_addr + size;
+        g_q31_pre = false;
+        u64 prod = 0;
+        bool route = memory_tracker->IsRegionCpuModified(device_addr, size) &&
+                     (pre || LaneProbeQuiet(device_addr, device_addr + size, open)) &&
+                     !memory_tracker->IsRegionGpuModified(device_addr, size);
+        if (route) {
+            // q31b (review blocker, WAW): no main write / upload of the range in the open batch; an older unfinished
+            // one is waited for by the lane segment.
+            g_lc_done = scheduler.GetMasterSemaphore()->KnownGpuTick();
+            prod = LaneMainProducer(device_addr, device_addr + size);
+            route = prod < open;
+        }
+        if (route) {
             static u64 q31_routed = 0;
             const u64 b0 = sync_upload_bytes_total;
             scheduler.SwitchStream(1);
+            scheduler.LaneNeedMain(prod, 0, false, LaneSiteRaw(g_lc_hit_wk));
             const bool r = SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer, sample_probe);
             scheduler.SwitchStream(0);
             if (sync_upload_bytes_total != b0) {
@@ -6763,6 +6777,9 @@ void BufferCache::CoherenceSync(bool bounded, u32 bound_lo) {
                     scheduler.SwitchStream(1);
                     continue;
                 }
+                // q31b (review, WAW): an older unfinished main write / upload of the range comes first.
+                g_lc_done = scheduler.GetMasterSemaphore()->KnownGpuTick();
+                scheduler.LaneNeedMain(LaneMainProducer(start, end), 0, false, LaneSiteRaw(g_lc_hit_wk));
                 SynchronizeBuffer(slot_buffers[id], start, static_cast<u32>(end - start), false, false,
                                   nullptr);
                 ++cs.lane_bufs;

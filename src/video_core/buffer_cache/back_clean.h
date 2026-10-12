@@ -561,29 +561,40 @@ inline bool LaneProbeWrite(u64 lo, u64 hi, u64 open, u64& rd, bool& hit) noexcep
 }
 /// q31 E8: one probe contains [lo, hi) and nothing at or after `open` read it (window ticks / floor < open).
 inline bool LaneProbeQuiet(u64 lo, u64 hi, u64 open) noexcept {
-    if (g_lane_win == 0 || hi <= lo) {
+    if (g_lane_win != 2 || hi <= lo) { // q31b: stored values are the required wait only under =2
         return false;
     }
+    bool contained = false;
     const u32 n = g_lprobe_n.load(std::memory_order_relaxed);
     for (u32 i = 0; i < n; ++i) {
         const auto& p = g_lprobe[i];
         const u64 plo = p.lo.load(std::memory_order_relaxed);
         const u64 phi = p.hi.load(std::memory_order_relaxed);
-        if (plo <= lo && hi <= phi) {
-            if (p.all >= open) {
+        if (!(plo < hi && lo < phi)) {
+            continue;
+        }
+        // q31b: every overlapping probe (LaneProbeWrite takes the max over all of them).
+        contained = contained || (plo <= lo && hi <= phi);
+        if (p.all >= open) {
+            return false;
+        }
+        const u64 a = std::max(lo, plo), b = std::min(hi, phi);
+        const u64 i0 = std::min<u64>((a - plo) >> 18, 255), i1 = std::min<u64>((b - 1 - plo) >> 18, 255);
+        for (u64 k = i0; k <= i1; ++k) {
+            if (p.wrd[k] >= open) {
                 return false;
             }
-            const u64 i0 = std::min<u64>((lo - plo) >> 18, 255), i1 = std::min<u64>((hi - 1 - plo) >> 18, 255);
-            for (u64 k = i0; k <= i1; ++k) {
-                if (p.wrd[k] >= open) {
-                    return false;
-                }
-            }
-            return true;
         }
     }
-    return false;
+    return contained;
 }
+/// q31b: SHADPS4_LANE_BIND_UPLOADS and ObtainBuffer's quiet-before-stamp capture (back thread).
+inline const bool g_lane_bind_uploads = [] {
+    const char* e = std::getenv("SHADPS4_LANE_BIND_UPLOADS");
+    return e && e[0] == '1';
+}();
+inline bool g_q31_pre = false;
+inline u64 g_q31_pre_lo = 0, g_q31_pre_hi = 0, g_q31_pre_tick = 0;
 /// q9c: stamps every probe (a main read of unknown range) - back thread, outside lane mode.
 inline void LaneProbeReadAllMain(u64 tick, u32 site = 19) noexcept {
     if (g_lane_war_mode == 1 && g_lprobe_n.load(std::memory_order_relaxed) != 0) {
