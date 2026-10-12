@@ -1728,10 +1728,16 @@ void Scheduler::LaneSubmit() {
         wait_main > async_submitted_tick.load(std::memory_order_acquire)) [[unlikely]] {
         ++lane_c[3]; // wait-before-signal on the main timeline (never a cycle: see LaneCutForFlush)
     }
-    if (lane_rec) {
+    // q12b: queued only outside a borrow; inside one (lane or main borrow -> nested flush) the
+    // recorder is drained and the segment is submitted inline.
+    const bool queued = lane_rec && synchronous_scopes == 0;
+    if (queued) {
         // q12: the lane recorder ends and submits it after the segment's queued commands.
         LaneRecPush([this, value, wait_main] { AscSubmitOnWorker(value, wait_main); });
     } else {
+        if (lane_rec) {
+            LaneRecDrain(); // the worker idle: the back owns asc_cmdbuf now
+        }
         AscSubmitOnWorker(value, wait_main); // inline: the back owns asc_cmdbuf in lane mode
     }
     asc_last_submitted.store(value, std::memory_order_release);
@@ -1742,7 +1748,9 @@ void Scheduler::LaneSubmit() {
         open_asc_value = asc_semaphore->NextTick();
         asc_dirty = true;
         asc_wait_main = wait_main;
-        BeginAscCmdbufOnWorker();
+        if (!queued) {
+            BeginAscCmdbufOnWorker(); // q12b: with the submit queued the recorder begins it
+        }
     }
 }
 
