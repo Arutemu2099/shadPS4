@@ -188,6 +188,20 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
         }
     }
 
+    // q9b (SHADPS4_ASC_NODMA=1): an all-Immediate compute program reads its constants from the
+    // flatbuf (the SRT walk at bind) - unless its program is pinned to DMA.
+    if (NoDmaMode() && info.uses_dma && info.stage == Stage::Compute &&
+        info.readconst_types == Info::ReadConstType::Immediate &&
+        !(info.pinned_uses_dma && *info.pinned_uses_dma)) {
+        info.uses_dma = false;
+        info.readconst_types = Info::ReadConstType::None;
+        info.nodma_pinned = true;
+        NoteNoDmaPinned(info.pgm_hash);
+    } else if (NoDmaMode() && info.stage == Stage::Compute && info.pinned_uses_dma &&
+               !*info.pinned_uses_dma && True(info.readconst_types & Info::ReadConstType::Dynamic)) {
+        LOG_ERROR(Render_Recompiler, "AscNoDma: cs_{:08x} permutation has dynamic ReadConst under a "
+                                     "non-DMA program (reads 0)", info.pgm_hash);
+    }
     // A later permutation is pinned to its program's DMA state: every permutation shares the
     // first one's Info for the pipeline layout, and the DMA buffers shift every image binding.
     if (!EmulatorSettings.IsDirectMemoryAccessEnabled() ||
@@ -213,3 +227,24 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
 }
 
 } // namespace Shader::Optimization
+
+namespace Shader {
+namespace {
+std::mutex g_nodma_mu;
+std::unordered_set<u64> g_nodma_hashes;
+} // namespace
+bool NoDmaPinnedHash(u64 pgm_hash) {
+    if (!NoDmaMode()) {
+        return false;
+    }
+    std::scoped_lock lk{g_nodma_mu};
+    return g_nodma_hashes.contains(pgm_hash);
+}
+void NoteNoDmaPinned(u64 pgm_hash) {
+    std::scoped_lock lk{g_nodma_mu};
+    if (g_nodma_hashes.insert(pgm_hash).second) {
+        LOG_INFO(Render_Recompiler, "AscNoDma: cs_{:08x} translated without DMA (flatbuf ReadConsts)",
+                 pgm_hash);
+    }
+}
+} // namespace Shader

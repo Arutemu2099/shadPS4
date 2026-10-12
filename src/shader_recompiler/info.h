@@ -88,6 +88,18 @@ struct InfoPersistent {
 /// pointers in user data. Set only by WarmUp on the main thread, before the game runs.
 inline const std::vector<u32>* g_synthetic_flat = nullptr;
 
+/// q9b: SHADPS4_ASC_NODMA=1 (see Info::nodma_pinned).
+inline bool NoDmaMode() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADPS4_ASC_NODMA");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+/// q9b: program hashes translated with the pin (RegisterShaderBinary skips them).
+bool NoDmaPinnedHash(u64 pgm_hash);
+void NoteNoDmaPinned(u64 pgm_hash);
+
 struct Info : InfoPersistent {
     struct AttributeFlags {
         bool Get(IR::Attribute attrib, u32 comp = 0) const {
@@ -132,6 +144,9 @@ struct Info : InfoPersistent {
     AttributeFlags stores{};
 
     ReadConstType readconst_types{};
+    /// q9b (SHADPS4_ASC_NODMA=1): a compute program whose ReadConsts are all Immediate was translated
+    /// without DMA (flatbuf reads); its meta / binary are never written to the shader cache.
+    bool nodma_pinned{};
     CopyShaderData gs_copy_data;
     u32 uses_patches{};
 

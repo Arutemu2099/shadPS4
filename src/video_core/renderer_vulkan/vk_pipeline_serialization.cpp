@@ -80,6 +80,9 @@ void RegisterShaderMeta(const Shader::Info& info,
     if (!Storage::DataBase::Instance().IsOpened()) {
         return;
     }
+    if (info.nodma_pinned || Shader::NoDmaPinnedHash(info.pgm_hash)) {
+        return; // q9b: a NODMA module never enters the shader cache
+    }
 
     Serialization::Archive ar;
     Serialization::Writer meta{ar};
@@ -101,6 +104,9 @@ void RegisterShaderMeta(const Shader::Info& info,
 void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx) {
     if (!Storage::DataBase::Instance().IsOpened()) {
         return;
+    }
+    if (Shader::NoDmaPinnedHash(pgm_hash)) {
+        return; // q9b
     }
 
     Storage::DataBase::Instance().Save(Storage::BlobType::ShaderBinary,
@@ -158,6 +164,9 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     spec.Deserialize(ar);
     info.Deserialize(ar);
+    if (Shader::NoDmaMode() && info.stage == Shader::Stage::Compute && info.uses_dma) {
+        return false; // q9b: translate it (the NODMA rule may apply)
+    }
     if (binary_version != Serialization::ShaderBinaryVersion) {
         for (const auto& buffer : info.buffers) {
             if (buffer.buffer_type == Shader::BufferType::GdsBuffer) {

@@ -233,13 +233,23 @@ inline const bool g_lane_who = [] {
 }();
 inline u32 g_lc_hit_wk = 0;
 inline u64 g_lc_hit_wid = 0;
+/// q9b: SHADPS4_LANE_WAR=1 - scoped WAR waits from the probes' newest main reads.
+inline const bool g_lane_war = [] {
+    const char* env = std::getenv("SHADPS4_LANE_WAR");
+    return env && env[0] == '1';
+}();
+inline const bool g_lane_probe = g_lane_who || g_lane_war;
+/// q9b: bumped (release) after every probe registration / extension; a stretch begun under an older
+/// value stamps every probe at publish.
+inline std::atomic<u64> g_lprobe_gen{0};
+inline std::atomic<u64> g_war_scoped{0}, g_war_label{0}, g_war_open{0};
 /// q9 census: large written lane bindings (>= 8 MiB: the particle pools / arenas) and the newest main
 /// batch that READ each. Registered and stamped by the back; workers only test overlap.
 struct LaneProbe {
     std::atomic<u64> lo{0}, hi{0};
     u64 rd{0};
 };
-inline std::array<LaneProbe, 8> g_lprobe{};
+inline std::array<LaneProbe, 16> g_lprobe{};
 inline std::atomic<u32> g_lprobe_n{0};
 /// 0..4 open - newest read (4 = 4+), 5 read done, 6 never read, 7 newest read after the newest gfx label,
 /// 8 written lane bindings over a probe, 9 A2 stamps, 10 old-path / copy stamps, 11 registered.
@@ -266,12 +276,24 @@ inline void LaneProbeRead(u64 lo, u64 hi, u64 tick, u32 ctr) noexcept {
         }
     }
 }
-/// A written lane binding: the newest read tick over the probes it overlaps (registers a big one).
-/// Returns false when no probe overlapped before this call.
-inline bool LaneProbeWrite(u64 lo, u64 hi, u64& rd) noexcept {
-    rd = 0;
-    bool hit = false;
+/// Stamps every probe (a read whose range is unknown: a stretch begun before a probe change).
+inline void LaneProbeReadAll(u64 tick) noexcept {
     const u32 n = g_lprobe_n.load(std::memory_order_relaxed);
+    for (u32 i = 0; i < n; ++i) {
+        g_lprobe[i].rd = std::max(g_lprobe[i].rd, tick);
+    }
+}
+/// A written lane binding (back): the newest main read tick over the probes it overlaps. A big binding
+/// over no probe registers one; one that sticks out of the probe it overlaps extends it (<= 64 MiB).
+/// A new or extended range has unknown history: its newest read becomes `open` (conservative).
+/// `hit`: a probe overlapped before this call (census). Returns true when one probe contains
+/// [lo, hi) after the call (the WAR wait may be scoped to `rd`).
+inline bool LaneProbeWrite(u64 lo, u64 hi, u64 open, u64& rd, bool& hit) noexcept {
+    rd = 0;
+    hit = false;
+    bool covered = false;
+    const u32 n = g_lprobe_n.load(std::memory_order_relaxed);
+    u32 first = n;
     for (u32 i = 0; i < n; ++i) {
         auto& p = g_lprobe[i];
         const u64 plo = p.lo.load(std::memory_order_relaxed);
@@ -279,19 +301,37 @@ inline bool LaneProbeWrite(u64 lo, u64 hi, u64& rd) noexcept {
         if (plo < hi && lo < phi) {
             hit = true;
             rd = std::max(rd, p.rd);
+            first = std::min(first, i);
+            covered = covered || (plo <= lo && hi <= phi);
         }
     }
-    if (!hit && hi - lo >= (u64{8} << 20) && n < g_lprobe.size()) {
+    if (!hit && hi - lo >= (u64{1} << 20) && n < g_lprobe.size()) {
         g_lprobe[n].lo.store(lo, std::memory_order_relaxed);
         g_lprobe[n].hi.store(hi, std::memory_order_relaxed);
-        g_lprobe[n].rd = 0;
+        g_lprobe[n].rd = open;
         g_lprobe_n.store(n + 1, std::memory_order_release);
+        g_lprobe_gen.fetch_add(1, std::memory_order_release);
         ++g_lprobe_dist[11];
+        rd = open;
+        return true;
     }
-    return hit;
+    if (hit && !covered) {
+        auto& p = g_lprobe[first];
+        const u64 nlo = std::min(lo, p.lo.load(std::memory_order_relaxed));
+        const u64 nhi = std::max(hi, p.hi.load(std::memory_order_relaxed));
+        if (nhi - nlo <= (u64{64} << 20)) {
+            p.lo.store(nlo, std::memory_order_relaxed);
+            p.hi.store(nhi, std::memory_order_relaxed);
+            p.rd = std::max(p.rd, open);
+            g_lprobe_gen.fetch_add(1, std::memory_order_release);
+            rd = std::max(rd, open);
+            covered = true;
+        }
+    }
+    return covered;
 }
 /// Defined in buffer_cache.cpp (back thread): tallies one lane binding's producer answer / probe.
-void LaneWhoNote(u64 t, u64 open, bool written, u64 lo, u64 hi);
+void LaneWhoNote(u64 t, u64 open, bool written, u64 rd, bool hit);
 void LaneWhoKept(u32 reason, u64 hash);
 
 /// p1: the newest unfinished main tick that wrote or uploaded [lo, hi) (0: none known).

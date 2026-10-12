@@ -1492,6 +1492,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
             stretch->rt_pipe = native; // p2: the pass formats of the secondary's inheritance
             stretch->tick = std::make_shared<std::atomic<u64>>(0);
             stretch->buf_gen = ctx.buffer_cache->StructGeneration();
+            stretch->probe_gen = VideoCore::g_lprobe_gen.load(std::memory_order_acquire); // q9b
             cmds = std::make_shared<StretchCmds>();
             cmds->batches.reserve(8);
             stretch->cmds = cmds;
@@ -1780,13 +1781,17 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     stretch->last_seq = draw.seq;
     ++stretch->draws;
     ++owner->taken;
-    if (VideoCore::g_lane_who &&
-        VideoCore::g_lprobe_n.load(std::memory_order_relaxed) != 0) [[unlikely]] {
+    if (VideoCore::g_lane_probe &&
+        VideoCore::g_lprobe_n.load(std::memory_order_acquire) != 0) [[unlikely]] {
         // q9 census: this draw's reads over a lane pool probe (guest slots, vertex streams, the
         // index range, the indirect args).
         auto& pr = stretch->probe_reads;
         const auto add = [&](VAddr lo, u64 size) {
-            if (lo == 0 || size == 0 || pr.size() >= 256 || !VideoCore::LaneProbeAny(lo, lo + size)) {
+            if (lo == 0 || size == 0 || !VideoCore::LaneProbeAny(lo, lo + size)) {
+                return;
+            }
+            if (pr.size() >= 256) {
+                stretch->probe_over = true; // q9b
                 return;
             }
             for (const auto& [a, b] : pr) {

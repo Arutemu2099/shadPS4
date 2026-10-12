@@ -246,6 +246,9 @@ struct Stretch {
     std::vector<std::pair<VAddr, u64>> texel;
     /// q9 census (SHADPS4_LANE_WHO=1): reads over a lane pool probe ([lo, hi)), stamped at publish.
     std::vector<std::pair<VAddr, VAddr>> probe_reads;
+    /// q9b: g_lprobe_gen when the stretch began (a newer one at publish: every probe is stamped).
+    u64 probe_gen{};
+    bool probe_over{}; ///< more than 256 probed ranges: every probe is stamped
     /// q8 (SHADPS4_TEX_TABLE): materials the worker resolved from the texture table (bit m: its
     /// slot words are in cmds->mat_slots[m]), the table generation / bindless set they hold for,
     /// and their image / sampler counts.

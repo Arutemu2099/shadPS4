@@ -5289,8 +5289,15 @@ void Liverpool::A2Execute(const CpSplit::RecordHeader& record) {
                             Vulkan::A2::Replay(*cmds, cmdbuf, *inst);
                         });
                         s.tick->store(sched.CurrentTick(), std::memory_order_release);
-                        for (const auto& [plo, phi] : s.probe_reads) {
-                            VideoCore::LaneProbeRead(plo, phi, sched.CurrentTick(), 9); // q9
+                        if (VideoCore::g_lane_probe) [[unlikely]] {
+                            if (s.probe_over || s.probe_gen != VideoCore::g_lprobe_gen.load(
+                                                                  std::memory_order_relaxed)) {
+                                VideoCore::LaneProbeReadAll(sched.CurrentTick()); // q9b
+                            } else {
+                                for (const auto& [plo, phi] : s.probe_reads) {
+                                    VideoCore::LaneProbeRead(plo, phi, sched.CurrentTick(), 9);
+                                }
+                            }
                         }
                         rasterizer->A2EndStretch();
                         // The stretch's register writes (its records are never visited), after the
@@ -9244,8 +9251,15 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                              vk::CommandBuffer cmdbuf) { Vulkan::A2::Replay(*cmds, cmdbuf, *inst); });
         }
         st.tick->store(sched.CurrentTick(), std::memory_order_release);
-        for (const auto& [plo, phi] : st.probe_reads) {
-            VideoCore::LaneProbeRead(plo, phi, sched.CurrentTick(), 9); // q9 census
+        if (VideoCore::g_lane_probe) [[unlikely]] {
+            if (st.probe_over ||
+                st.probe_gen != VideoCore::g_lprobe_gen.load(std::memory_order_relaxed)) {
+                VideoCore::LaneProbeReadAll(sched.CurrentTick()); // q9b
+            } else {
+                for (const auto& [plo, phi] : st.probe_reads) {
+                    VideoCore::LaneProbeRead(plo, phi, sched.CurrentTick(), 9);
+                }
+            }
         }
         rasterizer->A2EndStretch();
         lap(g_blc.pub_record);
