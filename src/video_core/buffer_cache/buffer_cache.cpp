@@ -4883,6 +4883,9 @@ void BufferCache::RmemoCensusCount(int cls, const Buffer& buffer, bool epoch_sam
 std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
                                                   bool is_texel_buffer, BufferId buffer_id,
                                                   Common::BufferSampleCaller sample_caller) {
+    SCOPE_EXIT {
+        g_q31_pre = false; // q31c: the pre-stamp capture is valid only inside this call
+    };
     // This function is 4.93 us/draw, 61% of all per-draw CPU cost, and it has two halves that
     // share no code: the early exit below (a tracker query plus a guest-memory memcpy) and the
     // SynchronizeBuffer fall-through. Time them separately - the split decides which is worth
@@ -6135,7 +6138,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     // q31 (Study A E8): SHADPS4_LANE_BIND_UPLOADS=1 - a main-stream upload into a quiet probe range goes to the lane.
     if (g_lane_bind_uploads && g_lane_on && !Vulkan::Scheduler::t_lane_mode &&
         Common::FaultMonitor::t_is_cp_thread && scheduler.HasLane() && scheduler.ActiveStream() == 0 &&
-        size != 0) [[unlikely]] {
+        size != 0 && !is_texel_buffer && scheduler.LaneWaitMain() < scheduler.CurrentTick()) [[unlikely]] {
+        // q31c: no texel binds; no routing while the open segment is deferred behind the open batch.
         const u64 open = scheduler.CurrentTick();
         // q31b: the quiet answer captured before the bind's own stamp, for exactly this range.
         const bool pre = g_q31_pre && g_q31_pre_tick == open && g_q31_pre_lo == device_addr &&
@@ -6617,7 +6621,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, 
         sfi_report();
         return false;
     }
-    if (PrebatchEnabled() || PreciseProducerEnabled()) {
+    if (PrebatchEnabled() || PreciseProducerEnabled() || g_lane_on) { // q31c: the lane's producer lookup too
         NoteBatchWrite(image.info.guest_address,
                        std::min<u64>(std::max<u64>(copy_size, image.info.guest_size),
                                      buffer.SizeBytes() - buf_offset));
