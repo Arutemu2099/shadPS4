@@ -9208,6 +9208,9 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
 }
 
 void Rasterizer::DrawRepeatApply(const GraphicsPipeline* pipeline, bool patch_infos) {
+    if (VideoCore::g_lane_war && !Scheduler::t_lane_mode) [[unlikely]] {
+        VideoCore::LaneProbeReadAllMain(scheduler.CurrentTick()); // q9c (2b): no bindings resolved
+    }
     // What BindResources leaves besides the resolved infos (still those of the previous draw):
     // push_data. The viewport transform and the pushed registers come from this draw, the
     // buffer offsets from the bindings, which are the previous draw's.
@@ -10109,6 +10112,10 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         BindMemoEndDraw(pipeline->IsCompute(), memo_draw_bits);
     }
 
+    if (uses_dma && VideoCore::g_lane_war && Common::FaultMonitor::t_is_cp_thread &&
+        !Scheduler::t_lane_mode) [[unlikely]] {
+        VideoCore::LaneProbeReadAllMain(scheduler.CurrentTick()); // q9c (2a): BDA reads any address
+    }
     if (uses_dma) {
         // We only use fault buffer for DMA right now.
         Common::RecursiveSharedLock lock{mapped_ranges_mutex};

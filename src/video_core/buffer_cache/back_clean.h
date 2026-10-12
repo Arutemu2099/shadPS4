@@ -234,10 +234,12 @@ inline const bool g_lane_who = [] {
 inline u32 g_lc_hit_wk = 0;
 inline u64 g_lc_hit_wid = 0;
 /// q9b: SHADPS4_LANE_WAR=1 - scoped WAR waits from the probes' newest main reads.
-inline const bool g_lane_war = [] {
+inline const int g_lane_war_mode = [] {
     const char* env = std::getenv("SHADPS4_LANE_WAR");
-    return env && env[0] == '1';
+    return env && (env[0] == '1' || env[0] == '2') ? env[0] - '0' : 0;
 }();
+inline const bool g_lane_war = g_lane_war_mode != 0;
+inline std::atomic<u64> g_war_dma_all{0}; // q9c: probes stamped whole by a main DMA bind / draw repeat
 inline const bool g_lane_probe = g_lane_who || g_lane_war;
 /// q9b: bumped (release) after every probe registration / extension; a stretch begun under an older
 /// value stamps every probe at publish.
@@ -329,6 +331,13 @@ inline bool LaneProbeWrite(u64 lo, u64 hi, u64 open, u64& rd, bool& hit) noexcep
         }
     }
     return covered;
+}
+/// q9c: stamps every probe (a main read of unknown range) - back thread, outside lane mode.
+inline void LaneProbeReadAllMain(u64 tick) noexcept {
+    if (g_lane_war_mode == 1 && g_lprobe_n.load(std::memory_order_relaxed) != 0) {
+        g_war_dma_all.fetch_add(1, std::memory_order_relaxed);
+        LaneProbeReadAll(tick);
+    }
 }
 /// Defined in buffer_cache.cpp (back thread): tallies one lane binding's producer answer / probe.
 void LaneWhoNote(u64 t, u64 open, bool written, u64 rd, bool hit);

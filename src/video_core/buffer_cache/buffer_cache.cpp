@@ -2404,9 +2404,10 @@ void LaneWhoLog() {
              "LaneWho pool probe (~5 s): written lane bindings over a probe {} | open - newest read "
              "0:{} 1:{} 2:{} 3:{} 4+:{} done:{} never:{} | read after newest gfx label {} | label "
              "distance 0:{} 1:{} 2:{} 3:{} 4+:{} done:{} | stamps A2 {} other {} | probes{} | WAR "
-             "scoped {} label {} scoped-open {} (cumulative)",
+             "scoped {} label {} scoped-open {} stamp-all {} (cumulative)",
              d[8], d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], l[0], l[1], l[2], l[3], l[4], l[5],
-             d[9], d[10], pr, g_war_scoped.load(), g_war_label.load(), g_war_open.load());
+             d[9], d[10], pr, g_war_scoped.load(), g_war_label.load(), g_war_open.load(),
+             g_war_dma_all.load());
     g_who_hits.clear();
     g_who_kept.clear();
     g_lprobe_dist.fill(0);
@@ -2445,6 +2446,26 @@ void LaneWhoNote(u64 t, u64 open, bool written, u64 rd, bool hit) {
 
 void LaneWhoKept(u32 reason, u64 hash) {
     ++g_who_kept[WhoKey(reason, hash)];
+}
+
+/// q9c: the WAR wait of a lane write of [lo, hi): scoped to the newest main read of its probe + 1 (a read
+/// stamped at lookup may be recorded into the next batch), deferred if that is the open batch; the newest
+/// gfx label batch (capped) when no probe covers the range.
+void LaneWarWait(Vulkan::Scheduler& sch, u64 lo, u64 hi) {
+    const u64 open = sch.CurrentTick();
+    u64 rd = 0;
+    bool hit = false;
+    if (g_lane_war && hi > lo && LaneProbeWrite(lo, hi, open, rd, hit)) {
+        g_war_scoped.fetch_add(1, std::memory_order_relaxed);
+        const u64 w = rd != 0 ? std::min(rd + 1, open) : 0;
+        if (w >= open) {
+            g_war_open.fetch_add(1, std::memory_order_relaxed);
+        }
+        sch.LaneNeedMain(w, 2, false);
+        return;
+    }
+    g_war_label.fetch_add(g_lane_war ? 1 : 0, std::memory_order_relaxed);
+    sch.LaneNeedMain(g_gfx_label_tick, 2, true);
 }
 
 void BufferCache::NoteBatchWrite(VAddr addr, u64 size) {
@@ -4314,7 +4335,11 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
             if (src_gds || dst_gds) {
                 scheduler.LaneNeedMain(gds_buffer.main_access_tick, 3, true);
             }
-            scheduler.LaneNeedMain(g_gfx_label_tick, 2, true); // WAR: the copy writes
+            if (dst_gds) {
+                scheduler.LaneNeedMain(g_gfx_label_tick, 2, true); // WAR: the copy writes
+            } else {
+                LaneWarWait(scheduler, dst, dst + num_bytes); // q9c
+            }
         }
     }
     auto& src_buffer = [&] -> const Buffer& {
@@ -4572,12 +4597,13 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         if (is_written) {
             if (g_lane_war && war_cov) {
                 // q9b: WAR scoped to the newest main batch that read this pool range (deferred
-                // if it is the open batch: a read recorded there is a real hazard).
+                // if it is the open batch: a read recorded there is a real hazard); q9c: + 1.
                 g_war_scoped.fetch_add(1, std::memory_order_relaxed);
-                if (war_rd >= open) {
+                const u64 w = war_rd != 0 ? std::min(war_rd + 1, open) : 0;
+                if (w >= open) {
                     g_war_open.fetch_add(1, std::memory_order_relaxed);
                 }
-                scheduler.LaneNeedMain(war_rd, 2, false);
+                scheduler.LaneNeedMain(w, 2, false);
             } else {
                 g_war_label.fetch_add(g_lane_war ? 1 : 0, std::memory_order_relaxed);
                 scheduler.LaneNeedMain(g_gfx_label_tick, 2, true); // WAR, never the open batch (p1d)
@@ -5232,6 +5258,10 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 si
             if (g_range_notes) {
                 buffer.NoteMainRange(scheduler.CurrentTick(), true, gpu_addr, size, 11, 0);
             }
+            if (g_lane_probe && Common::FaultMonitor::t_is_cp_thread &&
+                !Vulkan::Scheduler::t_lane_mode) [[unlikely]] {
+                LaneProbeRead(gpu_addr, gpu_addr + size, scheduler.CurrentTick(), 10); // q9c
+            }
             SynchronizeBuffer(buffer, gpu_addr, size, false, false, nullptr);
             note("cached", &buffer);
             return {&buffer, buffer.Offset(gpu_addr)};
@@ -5831,7 +5861,10 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             const bool lane_side =
                 g_lane_on ? Vulkan::Scheduler::t_lane_mode : t_force_binding_sync;
             if (g_lane_on && lane_side) {
-                scheduler.LaneNeedMain(g_gfx_label_tick, 2, true);
+                for (const auto& copy : copies) { // q9c: the upload's own ranges
+                    const VAddr lo = buffer_start + copy.dstOffset;
+                    LaneWarWait(scheduler, lo, lo + copy.size);
+                }
             }
             for (const auto& copy : copies) {
                 const VAddr lo = buffer_start + copy.dstOffset;
