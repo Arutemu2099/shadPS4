@@ -88,6 +88,18 @@ inline thread_local bool t_is_cp_thread = false;
 /// SHADPS4_GAME_MAIN_CENSUS=1 (gmc, 2026-10-10 night): Game:Main's time split.
 bool GameMainCensus();
 inline thread_local bool t_is_game_main = false;
+/// f2: caller of a blocking SendCommand on Game:Main (census kinds 10 + this: 0 fault prepare, 1 retry settle,
+/// 2 fault finish, 3 other).
+inline thread_local u32 t_sendcmd_kind = 3;
+struct SendCmdKind {
+    u32 prev;
+    explicit SendCmdKind(u32 k) : prev(t_sendcmd_kind) {
+        t_sendcmd_kind = k;
+    }
+    ~SendCmdKind() {
+        t_sendcmd_kind = prev;
+    }
+};
 /// Owner bits of the write fault being handled: 1 buffer cache, 2 readback download, 4 texture.
 inline thread_local u8 t_fault_class = 0;
 void MarkGameMainThread();

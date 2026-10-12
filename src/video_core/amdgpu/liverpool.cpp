@@ -3166,9 +3166,16 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                 }
                 if (t_lane_packet) [[unlikely]] {
                     t_lane_packet = false;
+                    // f2 (H12): prefetch copies of the windows this label ends, while the lane is active.
+                    const u64 pf = lane_label && VideoCore::BufferCache::PrefetchMode() != 0
+                                       ? rasterizer->GetBufferCache().PrefetchAfterLabel(VideoCore::g_pf_label_addr)
+                                       : 0;
                     rasterizer->GetScheduler().SwitchStream(0);
                     if (lane_label) {
                         rasterizer->GetScheduler().LaneLabelCut(); // marks lane_label_value
+                    }
+                    if (pf != 0) {
+                        rasterizer->GetScheduler().LaneCutNow(); // submit the segment now
                     }
                 }
                 if (VideoCore::g_lane_census) [[unlikely]] {
@@ -6601,6 +6608,7 @@ static bool AscReleaseFlush() {
 }
 
 void Liverpool::ExecuteAscReleaseMem(const PM4CmdReleaseMem* release_mem, u32 pipe_id) {
+    VideoCore::g_pf_label_addr = release_mem->Address<VAddr>(); // f2: the label the guest polls
     if (rasterizer) {
         // p1f: an ASC label on the lane - image downloads are main-only work (review B2).
         auto& sch = rasterizer->GetScheduler();

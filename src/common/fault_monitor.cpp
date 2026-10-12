@@ -861,9 +861,11 @@ void GameMainCensusMaybeLog() {
     std::string waits;
     static constexpr const char* names[] = {"equeue", "cond", "evflag", "sema", "sleep", "mutex", "join",
                                             "gnm SubmitDone idle-wait", "gnm submit idle-wait",
-                                            "gnm DingDong idle-wait"};
+                                            "gnm DingDong idle-wait", "SendCommand fault-prepare",
+                                            "SendCommand retry-settle", "SendCommand fault-finish",
+                                            "SendCommand other"};
     double wait_total = 0.0;
-    for (u32 i = 0; i < 10; ++i) {
+    for (u32 i = 0; i < 14; ++i) {
         const double n = per(g_gm.wait_n[i]);
         const double m = ms(g_gm.wait_ticks[i]);
         wait_total += m;

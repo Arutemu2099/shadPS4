@@ -152,6 +152,7 @@ public:
             if (split_enabled) [[unlikely]] {
                 split->WakeBackIfParked();
             }
+            Common::FaultMonitor::GameMainWaitScope gm_wait{10 + Common::FaultMonitor::t_sendcmd_kind}; // f2
             sem.acquire();
         } else {
             {

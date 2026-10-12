@@ -17,6 +17,9 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
+#include <stop_token>
+#include <thread>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -458,6 +461,10 @@ private:
         /// command processor reads it through CloseGuestSubmit. See GuestSubmitFaultJob.
         std::atomic<u32> guest_submit{4};
         u32 submit_slot{};
+        /// f2 (SHADPS4_LANE_PREFETCH): a lane prefetch job (no owner thread; abandoned from the start).
+        bool prefetch{};
+        /// f2: the slot is held for the prefetch waiter until the back's publish has run (never reused before).
+        std::atomic<bool> pf_hold{false};
     };
     /// The vote of a fault job: true if no GPU write marking touched it since its snapshot
     /// (region sequences; with SHADPS4_FAULT_VETO_EXACT=1 a moved sequence is refined by the
@@ -613,6 +620,41 @@ private:
     u64 NewestAscWriter(std::span<const FaultCopy> copies, u64 done_below = 0) const;
     /// q11e: the done_below for a caller that treats writer w as finished when IsFree(w + margin).
     u64 AscDoneBelow(u64 margin);
+
+public:
+    /// f2 (SHADPS4_LANE_PREFETCH=1 run, =2 verify; needs the lane): 0 off.
+    static int PrefetchMode();
+    /// f2: back, lane stream active, right after the ASC label at `label` was recorded on the lane.
+    /// Records the prefetch copies of the armed windows whose learned label it is; returns the number recorded
+    /// (the caller then submits the segment: LaneCutNow).
+    u64 PrefetchAfterLabel(VAddr label);
+
+private:
+    /// f2: back; the waiter posts it after the job's lane value completed (and its guest copy).
+    void PublishPrefetch(u64 id, u32 slot);
+    void PrefetchNoteWindow(VAddr addr, u64 size);
+    void PrefetchWaiterLoop(std::stop_token stop);
+    void PrefetchMaybeLog();
+    struct PrefetchItem {
+        u64 id;
+        u32 slot;
+        u64 value;
+    };
+    std::mutex pf_mutex;
+    std::condition_variable_any pf_cv;
+    std::vector<PrefetchItem> pf_queue;
+    /// f2: back-thread state. Hot windows: first page << 24 | pages, the learned label, idle triggers.
+    struct PrefetchWindow {
+        u64 packed{};
+        VAddr label{};
+        u32 idle{};
+    };
+    std::array<PrefetchWindow, 16> pf_win{};
+    u32 pf_win_next = 0;
+    u32 pf_pending = 0; ///< prefetch jobs admitted and not yet published (back)
+    bool pf_last_ok = false;
+    std::array<u64, 20> pf_c{};
+    std::chrono::steady_clock::time_point pf_log_t{};
     u64 producer_floor = 0; ///< Tick of the newest write too large to record per slot.
     /// SHADPS4_READBACK_EARLY_FLUSH: main tick of the last readback job per 1 MB slot, and a
     /// request raised when a GPU write lands in a recently read-back slot.
@@ -1007,6 +1049,11 @@ private:
     Common::ReadbackUnmapGate fault_mapping_gate;
     /// Guest threads between entering the offload path and consuming their result.
     std::atomic<u32> fault_guest_waiters{0};
+    /// f2: the prefetch waiter (last member: stopped and joined first).
+    std::jthread pf_thread;
 };
+
+/// f2: the guest address of the last ASC RELEASE_MEM the back executed (back thread only).
+inline VAddr g_pf_label_addr = 0;
 
 } // namespace VideoCore

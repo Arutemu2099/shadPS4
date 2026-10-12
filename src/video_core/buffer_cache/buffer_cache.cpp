@@ -1005,6 +1005,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool of
     u64 tick_at_fault = 0; // m2
     for (u32 veto_retries = 0;; ++veto_retries) {
     for (;;) {
+        const Common::FaultMonitor::SendCmdKind sc_kind{0}; // f2
         cp->SendCommand<true>([&] {
             if (latency && passes == 0) {
                 t_cp = Offload::NowNs();
@@ -1073,6 +1074,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool of
             break;
         }
         // Another fault's job covered this window; publish it, then look again.
+        const Common::FaultMonitor::SendCmdKind sc_kind_settle{1}; // f2
         cp->SendCommand<true>([&] { SettlePendingJob(ticket.id); });
     }
     if (g_fault_guest_copy && ticket.job != nullptr) {
@@ -1080,6 +1082,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool of
     }
     // No teardown check: the cache outlives every guest thread (see ~BufferCache).
     bool retry = false;
+    const Common::FaultMonitor::SendCmdKind sc_kind_finish{2}; // f2
     cp->SendCommand<true>([&] {
         retry = FinishFaultDownload(ticket.id, device_addr, size, is_write,
                                     !is_write && veto_retries < g_fault_veto_retry);
@@ -1558,6 +1561,23 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
         const char* value = std::getenv("SHADPS4_FAULT_OVERLAP_RETRY");
         return value && value[0] == '1';
     }();
+    if (pf_pending != 0) {
+        // f2 (H7): never settle a prefetch on the back (a GPU wait): the faulting thread waits its
+        // lane value, has it settled and retries.
+        const auto [begin, end] = TrackerPageSpan(settle_addr, settle_size);
+        for (FaultJob& job : fault_jobs) {
+            if (job.state != FaultJobState::Pending || !job.prefetch) {
+                continue;
+            }
+            const auto [job_begin, job_end] = TrackerPageSpan(job.addr, job.size);
+            if (job_begin < end && begin < job_end) {
+                ++pf_c[8]; // guest early
+                FaultTicket retry_ticket{job.id, job.tick, true, true};
+                retry_ticket.on_asc = true;
+                return retry_ticket;
+            }
+        }
+    }
     if (overlap_retry) {
         if (pending_fault_jobs.load(std::memory_order_relaxed) != 0) {
             const auto [begin, end] = TrackerPageSpan(settle_addr, settle_size);
@@ -1633,7 +1653,8 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
 
     FaultJob* job = nullptr;
     for (FaultJob& candidate : fault_jobs) {
-        if (candidate.state == FaultJobState::Free) {
+        if (candidate.state == FaultJobState::Free &&
+            !candidate.pf_hold.load(std::memory_order_acquire)) { // f2
             job = &candidate;
             break;
         }
@@ -1701,12 +1722,16 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
         job->guest_submit.store(4, std::memory_order_seq_cst); // nothing deferred until recorded
         job->state = FaultJobState::Pending;
         job->abandoned = false;
+        job->prefetch = false; // f2
         job->is_write = is_write;
         job->addr = addr;
         job->size = bytes;
         job->tick = tick;
         if (!is_write) {
             NoteReadbackWindow(addr, bytes); // q7
+            if (PrefetchMode() != 0) {
+                PrefetchNoteWindow(addr, bytes); // f2
+            }
         }
         job->total_bytes = total_size_bytes;
         job->copies = std::move(copies);
@@ -3108,6 +3133,13 @@ void BufferCache::FinalizeFaultJob(FaultJob& job) {
     // Before anything reads or releases the staging: wait for or forestall the owner's copy.
     const bool guest_copied = g_fault_guest_copy && CloseGuestCopy(job);
     bool ok = true;
+    if (job.prefetch && PrefetchMode() == 2 && !Offload::VerifyEnabled()) {
+        // f2 =2: a prefetch publishes only if a fresh readback equals its bytes (the waiter did
+        // not copy; PublishFaultJob copies after the compare).
+        const auto r = VerifyFaultJob(job);
+        ++pf_c[r == VerifyResult::Matched ? 9 : r == VerifyResult::Mismatch ? 10 : 11];
+        ok = r == VerifyResult::Matched;
+    }
     if (Offload::VerifyEnabled()) {
         // Only a completed comparison lets a job through. Anything else is a veto, which
         // leaves the dirty state for the synchronous fallback, so a verified run contains no
@@ -3130,6 +3162,10 @@ void BufferCache::FinalizeFaultJob(FaultJob& job) {
     }
     if (ok) {
         Offload::Add(Offload::State().successes);
+    }
+    if (job.prefetch) {
+        pf_last_ok = ok; // f2
+        --pf_pending;
     }
     if (job.abandoned) {
         job.state = FaultJobState::Free;
@@ -3313,6 +3349,254 @@ void BufferCache::CloseGuestSubmitsOver(VAddr device_addr, u64 size) {
             CloseGuestSubmit(job);
         }
     }
+}
+
+int BufferCache::PrefetchMode() {
+    static const int mode = [] {
+        const char* e = std::getenv("SHADPS4_LANE_PREFETCH");
+        const char* lane = std::getenv("SHADPS4_ASC_LANE");
+        const int m = e ? std::atoi(e) : 0;
+        if (m != 0 && !(lane && lane[0] == '1')) {
+            LOG_WARNING(Render, "f2: SHADPS4_LANE_PREFETCH needs SHADPS4_ASC_LANE=1; off");
+            return 0;
+        }
+        if (m != 0) {
+            LOG_INFO(Render, "f2: lane prefetch of read-back windows on (mode {})", m);
+        }
+        return m;
+    }();
+    return mode;
+}
+
+void BufferCache::PrefetchNoteWindow(VAddr addr, u64 size) {
+    // H3 / H3b (back, at a guest read job's admission): the window and the last ASC label recorded
+    // before the fault (the label the guest polls).
+    if (size == 0) {
+        return;
+    }
+    const u64 first = addr >> 12;
+    const u64 pages = std::min<u64>(((addr + size + 4095) >> 12) - first, (u64{1} << 24) - 1);
+    const u64 packed = (first << 24) | pages;
+    for (auto& w : pf_win) {
+        if (w.packed == packed) {
+            w.label = g_pf_label_addr;
+            return;
+        }
+    }
+    auto& w = pf_win[pf_win_next++ & 15];
+    w = PrefetchWindow{packed, g_pf_label_addr, 0};
+    ++pf_c[12]; // windows learned
+}
+
+u64 BufferCache::PrefetchAfterLabel(VAddr label) {
+    // H4 (back; lane stream active, the chain's dispatches of this label are in the open segment).
+    if (PrefetchMode() == 0 || label == 0 || !scheduler.HasLane() || scheduler.ActiveStream() != 1 ||
+        !(PreciseProducerEnabled() || Offload::LatencyEnabled() || FastLaneEnabled())) {
+        return 0;
+    }
+    u64 recorded = 0;
+    for (auto& w : pf_win) {
+        if (w.packed == 0 || w.label != label) {
+            continue;
+        }
+        ++pf_c[0]; // triggers
+        const VAddr lo = (w.packed >> 24) << 12;
+        const u64 bytes = (w.packed & 0xffffff) << 12;
+        const auto age = [&] {
+            if (++w.idle >= 8) {
+                w = PrefetchWindow{};
+                ++pf_c[13]; // windows aged out
+            }
+        };
+        std::vector<FaultCopy> copies;
+        const u64 total = CollectFaultCopies(lo, bytes, copies);
+        if (total == 0) {
+            ++pf_c[2]; // nothing GPU-modified
+            age();
+            continue;
+        }
+        const u64 asc = NewestAscWriter(copies, AscDoneBelow(2));
+        if (asc == 0) {
+            ++pf_c[3]; // the lane is not writing it
+            age();
+            continue;
+        }
+        w.idle = 0;
+        // One source buffer, looked up without creating or joining anything.
+        const BufferId buffer_id = page_table[lo >> CACHING_PAGEBITS].buffer_id;
+        if (IsBufferInvalid(buffer_id) || !slot_buffers[buffer_id].IsInBounds(lo, bytes)) {
+            ++pf_c[4]; // not one buffer
+            continue;
+        }
+        if (pf_pending >= 2 || total > FaultStagingSize()) {
+            ++pf_c[5]; // cap / size
+            continue;
+        }
+        bool overlap = false;
+        {
+            const auto [begin, end] = TrackerPageSpan(lo, bytes);
+            std::scoped_lock lk{fault_window_mutex};
+            for (const auto& fw : fault_windows) {
+                overlap = overlap || (fw.begin < end && begin < fw.end);
+            }
+        }
+        if (overlap) {
+            ++pf_c[6]; // a pending job overlaps
+            continue;
+        }
+        FaultJob* job = nullptr;
+        for (FaultJob& candidate : fault_jobs) {
+            if (candidate.state == FaultJobState::Free &&
+                !candidate.pf_hold.load(std::memory_order_acquire)) {
+                job = &candidate;
+                break;
+            }
+        }
+        std::unique_ptr<Buffer> staging = job ? AcquireFaultStaging() : nullptr;
+        if (!staging) {
+            ++pf_c[5];
+            continue;
+        }
+        // Main writers still unfinished: the segment waits on them (rule A; an open-batch writer
+        // defers it and the caller's LaneCutNow flushes main first).
+        auto* master = scheduler.GetMasterSemaphore();
+        const u64 pm = PreciseProducer(copies);
+        if (pm > master->KnownGpuTick()) {
+            master->Refresh();
+            if (pm > master->KnownGpuTick()) {
+                scheduler.LaneNeedMain(pm, 0);
+                ++pf_c[7]; // main waits added
+            }
+        }
+        const u64 id = next_fault_job_id++;
+        job->seqs.clear();
+        memory_tracker->SnapshotGpuWriteSeq(lo, bytes, job->seqs);
+        job->write_log_pos = GpuWriteLog::Position();
+        const u64 value = scheduler.OpenAscValue();
+        const bool admitted = fault_mapping_gate.TryAdmit(lo, bytes, [&] {
+            job->id = id;
+            job->guest_copy.store(0, std::memory_order_seq_cst);
+            job->guest_submit.store(4, std::memory_order_seq_cst);
+            job->state = FaultJobState::Pending;
+            job->abandoned = true; // no owner: finalization frees the slot
+            job->prefetch = true;
+            job->pf_hold.store(true, std::memory_order_release);
+            job->is_write = false;
+            job->addr = lo;
+            job->size = bytes;
+            job->tick = value;
+            job->on_readback_queue = true;
+            job->on_fast_lane = false;
+            job->on_asc = true;
+            job->total_bytes = total;
+            job->copies = std::move(copies);
+            job->spans.clear();
+            job->spans.emplace_back(lo, lo + bytes);
+            job->mark_addr = lo;
+            job->mark_size = bytes;
+            job->staging = std::move(staging);
+            std::scoped_lock lk{fault_window_mutex};
+            const auto [window_begin, window_end] = TrackerPageSpan(lo, bytes);
+            fault_windows[job - fault_jobs.data()] = {window_begin, window_end};
+            pending_fault_jobs.fetch_add(1);
+            fault_jobs_admitted.fetch_add(1, std::memory_order_acq_rel);
+        });
+        if (!admitted) {
+            job->seqs.clear();
+            ReleaseFaultStaging(std::move(staging));
+            ++pf_c[6];
+            continue;
+        }
+        ++pf_pending;
+        boost::container::small_vector<vk::BufferCopy, 8> vk_copies;
+        Buffer& source = slot_buffers[buffer_id];
+        for (const FaultCopy& c : job->copies) {
+            vk_copies.push_back(vk::BufferCopy{
+                .srcOffset = c.addr - source.CpuAddr(),
+                .dstOffset = c.staging_offset,
+                .size = c.size,
+            });
+        }
+        // Recorded on the lane, after the chain's dispatches (inline lane / queued recorder).
+        RecordFaultCopiesAsync(source, job->staging->Handle(), {vk_copies.data(), vk_copies.size()});
+        ++pf_c[1]; // jobs recorded
+        pf_c[14] += total;
+        {
+            std::scoped_lock lk{pf_mutex};
+            pf_queue.push_back({id, static_cast<u32>(job - fault_jobs.data()), value});
+        }
+        pf_cv.notify_one();
+        ++recorded;
+    }
+    if (recorded != 0 && !pf_thread.joinable()) {
+        pf_thread = std::jthread([this](std::stop_token st) { PrefetchWaiterLoop(st); });
+    }
+    PrefetchMaybeLog();
+    return recorded;
+}
+
+void BufferCache::PrefetchWaiterLoop(std::stop_token stop) {
+    // H5: wait the lane value, copy staging -> guest memory (FAULT_GUEST_COPY CAS 0 -> 1 -> 2; fails
+    // when the back already closed it), then a non-blocking publish on the back.
+    Common::SetCurrentThreadName("shadPS4:LanePrefetch");
+    for (;;) {
+        PrefetchItem it{};
+        {
+            std::unique_lock lk{pf_mutex};
+            if (!pf_cv.wait(lk, stop, [this] { return !pf_queue.empty(); })) {
+                return;
+            }
+            it = pf_queue.front();
+            pf_queue.erase(pf_queue.begin());
+        }
+        scheduler.GetAscSemaphore()->Wait(it.value);
+        if (PrefetchMode() == 1 && g_fault_guest_copy) {
+            GuestCopyFaultJob(fault_jobs[it.slot]); // slot held: never another job's
+        }
+        liverpool->SendCommand<false>([this, id = it.id, slot = it.slot] { PublishPrefetch(id, slot); });
+    }
+}
+
+void BufferCache::PublishPrefetch(u64 id, u32 slot) {
+    // H6 (back). A guest's retry or an overlapping settle may have finalized the job already.
+    FaultJob& job = fault_jobs[slot];
+    if (job.state == FaultJobState::Pending && job.id == id && job.prefetch) {
+        job.state = FaultJobState::Settling;
+        const u32 stream = scheduler.ActiveStream();
+        if (stream != 0) {
+            scheduler.SwitchStream(0); // =2 verify records on main
+        }
+        FinalizeFaultJob(job); // the lane value is complete: no GPU wait
+        if (stream != 0) {
+            scheduler.SwitchStream(stream);
+        }
+        ++pf_c[pf_last_ok ? 15 : 16]; // published / vetoed
+    } else {
+        ++pf_c[17]; // settled before the waiter (guest early or an overlap settle)
+    }
+    job.pf_hold.store(false, std::memory_order_release);
+    PrefetchMaybeLog();
+}
+
+void BufferCache::PrefetchMaybeLog() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - pf_log_t < std::chrono::seconds(5)) {
+        return;
+    }
+    const double s = pf_log_t.time_since_epoch().count() == 0
+                         ? 5.0
+                         : std::chrono::duration<double>(now - pf_log_t).count();
+    pf_log_t = now;
+    const auto per = [&](u32 i) { return double(pf_c[i]) / s; };
+    LOG_INFO(Render,
+             "f2 LanePrefetch (per s): triggers {:.0f} recorded {:.0f} ({:.0f} KB) | skipped: clean {:.0f}, "
+             "no lane writer {:.0f}, not one buffer {:.0f}, cap/staging {:.0f}, overlap {:.0f} | main waits "
+             "added {:.0f} | published by the waiter {:.0f} vetoed {:.0f} settled before the waiter {:.0f} | "
+             "guest early {:.0f} | verify matched {:.0f} MISMATCH {:.0f} unverified {:.0f} | windows learned "
+             "{:.0f} aged {:.0f}",
+             per(0), per(1), per(14) / 1024.0, per(2), per(3), per(4), per(5), per(6), per(7), per(15),
+             per(16), per(17), per(8), per(9), per(10), per(11), per(12), per(13));
+    pf_c.fill(0);
 }
 
 bool BufferCache::PublishFaultJob(FaultJob& job, bool guest_copied) {
