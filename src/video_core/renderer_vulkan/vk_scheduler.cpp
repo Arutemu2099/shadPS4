@@ -156,6 +156,18 @@ Scheduler::Scheduler(const Instance& instance, bool allow_recording_worker)
         asc_semaphore = std::make_unique<MasterSemaphore>(instance);
         asc_pool = std::make_unique<CommandPool>(instance, asc_semaphore.get(),
                                                  instance.GetReadbackQueueFamilyIndex());
+        if (const char* t = std::getenv("SHADPS4_ASC_TIMING"); t && t[0] == '1') {
+            // q16: the lane's segments timed like the ASC stream's.
+            asc_timer = std::make_unique<AscTimer>();
+            asc_timer->pool = instance.GetDevice()
+                                  .createQueryPoolUnique(vk::QueryPoolCreateInfo{
+                                      .queryType = vk::QueryType::eTimestamp,
+                                      .queryCount = AscTimer::Slots * 2,
+                                  })
+                                  .value;
+            asc_timer->period_ns = instance.GetPhysicalDevice().getProperties().limits.timestampPeriod;
+            asc_timer->window = std::chrono::steady_clock::now();
+        }
         if (const char* e = std::getenv("SHADPS4_LANE_RECORDER"); e && e[0] == '1') {
             lane_rec = true; // q12
             lane_rec_thread = std::thread([this] { LaneRecLoop(); });
