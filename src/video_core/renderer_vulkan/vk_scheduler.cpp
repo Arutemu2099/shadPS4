@@ -1011,8 +1011,13 @@ void Scheduler::PopPendingOperations() {
     std::unique_lock lk(priority_pending_ops_mutex);
     master_semaphore.Refresh();
     // R0: an operation retires when its main tick and the ASC segments before it are done.
+    bool lane_synced = false;
     while (!pending_ops.empty() && master_semaphore.IsFree(pending_ops.front().gpu_tick) &&
            AscRetired(pending_ops.front().gpu_tick)) {
+        if (lane_rec && !lane_synced) {
+            LaneRecSync(); // q12d: queued lane closures name objects these operations destroy
+            lane_synced = true;
+        }
         pending_ops.front().callback();
         pending_ops.pop();
     }
@@ -1640,6 +1645,7 @@ void Scheduler::LaneRecPush(Common::UniqueFunction<void>&& job) {
     {
         std::scoped_lock lk{lane_rec_mu};
         lane_rec_q.push_back(std::move(job));
+        ++lane_rec_pushed;
         wake = lane_rec_sleeping;
     }
     ++lane_rec_jobs;
@@ -1690,7 +1696,28 @@ void Scheduler::LaneRecLoop() {
         }
         job();
         lk.lock();
+        ++lane_rec_done;
+        if (lane_rec_waiters != 0) {
+            lane_rec_idle_cv.notify_all(); // q12d
+        }
     }
+}
+
+void Scheduler::LaneRecSync() {
+    if (!lane_rec) {
+        return;
+    }
+    std::unique_lock lk{lane_rec_mu};
+    const u64 target = lane_rec_pushed;
+    if (lane_rec_done >= target) {
+        return;
+    }
+    ++lane_rec_waiters;
+    if (lane_rec_sleeping) {
+        lane_rec_cv.notify_one();
+    }
+    lane_rec_idle_cv.wait(lk, [this, target] { return lane_rec_done >= target; });
+    --lane_rec_waiters;
 }
 
 void Scheduler::LaneSwitch(u32 stream) {
@@ -1955,6 +1982,7 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
             break;
         }
 
+        LaneRecSync(); // q12d
         op.callback();
     }
 }

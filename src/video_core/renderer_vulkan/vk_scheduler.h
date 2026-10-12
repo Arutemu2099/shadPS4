@@ -1132,6 +1132,10 @@ private:
     bool lane_rec_stop = false;
     std::thread lane_rec_thread;
     u64 lane_rec_jobs = 0, lane_rec_drains = 0;
+    u64 lane_rec_pushed = 0, lane_rec_done = 0; // q12d: under lane_rec_mu
+    u32 lane_rec_waiters = 0;                   // q12d: LaneRecSync callers waiting
+    /// q12d: blocks until every job queued before the call has run (any thread but the recorder).
+    void LaneRecSync();
     bool LaneRecQueues() const noexcept {
         return lane_rec && t_lane_mode && synchronous_scopes == 0;
     }
