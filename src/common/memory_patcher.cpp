@@ -215,7 +215,85 @@ void ApplyPatchesFromXML(std::filesystem::path path) {
     }
 }
 
+// SHADPS4_PARTICLE_LATE_READ=1 (2026-10-12, notes/one-frame-late-particles-2026-10-12.md sec. 3.1, V1):
+// inFAMOUS Second Son (CUSA00004 / 01.07) reads its particle control blocks (survivor counts, light
+// counts, CPU collision) at the start of the next frame, just before 0x3ee7d0 consumes them, instead
+// of right after kicking this frame's particle chain. Game:Main then no longer waits for that chain's
+// GPU work mid-frame. Three writes (eboot offsets): a cave in the unreferenced 0x3ee160 that calls
+// 0x3edef0 (readback) and 0x3ee470 (collision join + label wait), then sets up 0x3ee7d0's arguments
+// and jumps back; the main loop jumps to it at 0x29cc89; the old 0x3edef0 call at 0x29cd1e becomes a
+// 5-byte NOP. The end-of-frame 0x3ee470 call at 0x29cd56 stays. Refused unless every byte matches.
+static void ApplyParticleLateRead() {
+    const char* env = std::getenv("SHADPS4_PARTICLE_LATE_READ");
+    if (!env || env[0] != '1') {
+        return;
+    }
+    const auto app_version =
+        std::string(Common::Singleton<PSF>::Instance()->GetString("APP_VER").value_or(""));
+    if (g_game_serial != "CUSA00004" || app_version != "01.07") {
+        LOG_ERROR(Loader, "SHADPS4_PARTICLE_LATE_READ: refused, game {} version {} (needs CUSA00004 01.07)",
+                  g_game_serial, app_version);
+        return;
+    }
+    struct Bytes {
+        u64 offset;
+        std::vector<u8> bytes;
+    };
+    // Original bytes: the patched ranges plus the instructions around them the cave relies on.
+    const std::vector<Bytes> original = {
+        // FUN_8003ee160 (no references): 43 code bytes + 5 pad
+        {0x3ee160, {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x8b, 0x5f, 0x58, 0xeb, 0x13,
+                    0x0f, 0x1f, 0x40, 0x00, 0x48, 0x89, 0xdf, 0xe8, 0x58, 0x5d, 0x00, 0x00,
+                    0x48, 0x8b, 0x9b, 0xb0, 0x00, 0x00, 0x00, 0x48, 0x85, 0xdb, 0x75, 0xec,
+                    0x48, 0x83, 0xc4, 0x08, 0x5b, 0x5d, 0xc3, 0x90, 0x90, 0x90, 0x90, 0x90}},
+        // call 0x41b8d0; lea rax,[0x800f1bcd0]; lea rdi,[0x807d3eb10]; mov rsi,[rax+0x1dca0];
+        // call 0x3ee7d0
+        {0x29cc84, {0xe8, 0x47, 0xec, 0x17, 0x00, 0x48, 0x8d, 0x05, 0x40, 0xf0, 0xc7,
+                    0x00, 0x48, 0x8d, 0x3d, 0x79, 0x1e, 0xaa, 0x07, 0x48, 0x8b, 0xb0,
+                    0xa0, 0xdc, 0x01, 0x00, 0xe8, 0x2d, 0x1b, 0x15, 0x00}},
+        // lea rbx,[0x807d3eb10]; mov rdi,rbx; call 0x3edef0
+        {0x29cd14, {0x48, 0x8d, 0x1d, 0xf5, 0x1d, 0xaa, 0x07, 0x48, 0x89, 0xdf, 0xe8, 0xcd, 0x11,
+                    0x15, 0x00}},
+        // mov rdi,rbx; call 0x3ee470 (kept)
+        {0x29cd53, {0x48, 0x89, 0xdf, 0xe8, 0x15, 0x17, 0x15, 0x00}},
+    };
+    const std::vector<Bytes> patched = {
+        // lea rbx,[0x807d3eb10]; mov rdi,rbx; call 0x3edef0; mov rdi,rbx; call 0x3ee470;
+        // lea rax,[0x800f1bcd0]; mov rdi,rbx; mov rsi,[rax+0x1dca0]; jmp 0x29cc9e
+        {0x3ee160, {0x48, 0x8d, 0x1d, 0xa9, 0x09, 0x95, 0x07, 0x48, 0x89, 0xdf, 0xe8, 0x81,
+                    0xfd, 0xff, 0xff, 0x48, 0x89, 0xdf, 0xe8, 0xf9, 0x02, 0x00, 0x00, 0x48,
+                    0x8d, 0x05, 0x52, 0xdb, 0xb2, 0x00, 0x48, 0x89, 0xdf, 0x48, 0x8b, 0xb0,
+                    0xa0, 0xdc, 0x01, 0x00, 0xe9, 0x11, 0xeb, 0xea, 0xff}},
+        // jmp 0x3ee160 + 16 NOPs up to the call 0x3ee7d0 at 0x29cc9e
+        {0x29cc89, {0xe9, 0xd2, 0x14, 0x15, 0x00, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+                    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90}},
+        // nopl 0x0(rax,rax,1) in place of call 0x3edef0
+        {0x29cd1e, {0x0f, 0x1f, 0x44, 0x00, 0x00}},
+    };
+    for (const auto& o : original) {
+        const auto* live = reinterpret_cast<const u8*>(g_eboot_address + o.offset);
+        if (std::memcmp(live, o.bytes.data(), o.bytes.size()) != 0) {
+            std::string found;
+            for (size_t i = 0; i < o.bytes.size(); ++i) {
+                found += fmt::format("{:02x}", live[i]);
+            }
+            LOG_ERROR(Loader, "SHADPS4_PARTICLE_LATE_READ: refused, eboot+{:#x} holds {}", o.offset,
+                      found);
+            return;
+        }
+    }
+    for (const auto& p : patched) {
+        std::memcpy(reinterpret_cast<void*>(g_eboot_address + p.offset), p.bytes.data(),
+                    p.bytes.size());
+    }
+    LOG_INFO(Loader,
+             "SHADPS4_PARTICLE_LATE_READ: applied V1 (particle readback one frame later): cave "
+             "{:#x}, jump {:#x}, nop {:#x}",
+             g_eboot_address + 0x3ee160, g_eboot_address + 0x29cc89, g_eboot_address + 0x29cd1e);
+}
+
 void OnGameLoaded() {
+    ApplyParticleLateRead();
     std::filesystem::path patch_dir = Common::FS::GetUserPath(Common::FS::PathType::PatchesDir);
     if (!patch_file.empty()) {
 

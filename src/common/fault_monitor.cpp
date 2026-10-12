@@ -837,8 +837,13 @@ void GameMainCensusMaybeLog() {
         last_tsc = now;
         return;
     }
+    // SHADPS4_GAME_MAIN_CENSUS_WINDOW_S (2026-10-12, play telemetry): window length, default 10 s.
+    static const double window = [] {
+        const char* v = std::getenv("SHADPS4_GAME_MAIN_CENSUS_WINDOW_S");
+        return v ? std::clamp(std::atof(v), 1.0, 600.0) : 10.0;
+    }();
     const double sec = double(now - last_tsc) / 3.5e9;
-    if (sec < 10.0) {
+    if (sec < window) {
         return;
     }
     last_tsc = now;
