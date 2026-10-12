@@ -6125,6 +6125,35 @@ void BufferCache::NoteUploadAhead(const Buffer& buffer, VAddr device_addr, u32 s
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
                                     bool is_texel_buffer,
                                     Common::BufferSampleProbe* sample_probe) {
+    // q31 (Study A E8): SHADPS4_LANE_BIND_UPLOADS=1 - a main-stream upload into a quiet probe range goes to the lane.
+    static const bool bind_uploads = [] {
+        const char* e = std::getenv("SHADPS4_LANE_BIND_UPLOADS");
+        const bool on = e && e[0] == '1';
+        if (on) {
+            LOG_INFO(Render, "q31: SHADPS4_LANE_BIND_UPLOADS=1 (quiet probe-range uploads at draw binds go to the lane)");
+        }
+        return on;
+    }();
+    if (bind_uploads && g_lane_on && !Vulkan::Scheduler::t_lane_mode && Common::FaultMonitor::t_is_cp_thread &&
+        scheduler.HasLane() && scheduler.ActiveStream() == 0 && size != 0) [[unlikely]] {
+        const u64 open = scheduler.CurrentTick();
+        if (memory_tracker->IsRegionCpuModified(device_addr, size) &&
+            LaneProbeQuiet(device_addr, device_addr + size, open) &&
+            !memory_tracker->IsRegionGpuModified(device_addr, size)) {
+            static u64 q31_routed = 0;
+            const u64 b0 = sync_upload_bytes_total;
+            scheduler.SwitchStream(1);
+            const bool r = SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer, sample_probe);
+            scheduler.SwitchStream(0);
+            if (sync_upload_bytes_total != b0) {
+                scheduler.LaneFallbackMain(); // the open main batch (the draw that bound it) reads after the upload
+                if ((++q31_routed & 0x3fff) == 0) {
+                    LOG_INFO(Render, "q31: {} bind-time uploads routed to the lane", q31_routed);
+                }
+            }
+            return r;
+        }
+    }
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes = 0;
     VAddr buffer_start = buffer.CpuAddr();
