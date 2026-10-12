@@ -1834,8 +1834,27 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
                 return;
             }
             if (pr.size() >= 256) {
-                stretch->probe_over = true; // q9b
-                return;
+                // q32: SHADPS4_A2_PROBE_COALESCE=1 - merge ranges closer than one probe window, then go on.
+                static const bool coalesce = [] {
+                    const char* e = std::getenv("SHADPS4_A2_PROBE_COALESCE");
+                    return e && e[0] == '1';
+                }();
+                if (coalesce) {
+                    std::sort(pr.begin(), pr.end());
+                    size_t w = 0;
+                    for (size_t r = 1; r < pr.size(); ++r) {
+                        if (pr[r].first <= pr[w].second + (VAddr{1} << 18)) {
+                            pr[w].second = std::max(pr[w].second, pr[r].second);
+                        } else {
+                            pr[++w] = pr[r];
+                        }
+                    }
+                    pr.resize(w + 1);
+                }
+                if (pr.size() >= 256) {
+                    stretch->probe_over = true; // q9b
+                    return;
+                }
             }
             for (const auto& [a, b] : pr) {
                 if (a == lo && b == lo + size) {

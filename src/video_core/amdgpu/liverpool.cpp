@@ -5369,7 +5369,7 @@ void Liverpool::A2Execute(const CpSplit::RecordHeader& record) {
                         if (VideoCore::g_lane_probe) [[unlikely]] {
                             if (s.probe_over || s.probe_gen != VideoCore::g_lprobe_gen.load(
                                                                   std::memory_order_relaxed)) {
-                                VideoCore::LaneProbeReadAll(sched.CurrentTick(), 18); // q9b
+                                VideoCore::LaneProbeReadAll(sched.CurrentTick(), s.probe_over ? 26u : 18u); // q9b; q32 site
                             } else {
                                 for (const auto& [plo, phi] : s.probe_reads) {
                                     VideoCore::LaneProbeRead(plo, phi, sched.CurrentTick(), 9, 9);
@@ -9341,7 +9341,7 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
         if (VideoCore::g_lane_probe) [[unlikely]] {
             if (st.probe_over ||
                 st.probe_gen != VideoCore::g_lprobe_gen.load(std::memory_order_relaxed)) {
-                VideoCore::LaneProbeReadAll(sched.CurrentTick(), 18); // q9b
+                VideoCore::LaneProbeReadAll(sched.CurrentTick(), st.probe_over ? 26u : 18u); // q9b; q32 site
             } else {
                 for (const auto& [plo, phi] : st.probe_reads) {
                     VideoCore::LaneProbeRead(plo, phi, sched.CurrentTick(), 9, 9);
