@@ -425,6 +425,8 @@ public:
     bool is_picked{};
     bool is_coherent{};
     bool is_deleted{};
+    /// q22: a lane-mode record synced (bound) this buffer; CoherenceSync uploads it on the lane (LANE_UPLOADS).
+    bool lane_bound{};
     /// SHADPS4_ASC_SPAN_STATS: newest main-timeline tick that accessed / wrote this buffer from
     /// a graphics-queue binding (diagnostic).
     u64 diag_main_access_tick{};

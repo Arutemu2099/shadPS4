@@ -1793,7 +1793,7 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
             }
         }
     }
-    if (g_asc_census && scheduler.HasAscStream()) {
+    if (g_asc_census && (scheduler.HasAscStream() || scheduler.HasLane())) { // q22: lane too
         CensusCtrlJob(job->copies, tick, asc_producer, asc_done);
     }
     if (!asc_done && fast_lane) {
@@ -6121,6 +6121,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     size_t total_size_bytes = 0;
     VAddr buffer_start = buffer.CpuAddr();
     vk::Buffer src_buffer = VK_NULL_HANDLE;
+    if (g_lane_on && Vulkan::Scheduler::t_lane_mode) [[unlikely]] {
+        buffer.lane_bound = true; // q22
+    }
     const auto t_upload = sample_probe ? sample_probe->Now()
                                        : Common::BufferSampleProbe::Clock::time_point{};
     // SHADPS4_DEFERRED_PROTECT=1: the re-protect syscalls and the guest-to-staging copy of this
@@ -6605,6 +6608,21 @@ void BufferCache::CoherenceSync(bool bounded, u32 bound_lo) {
         return;
     }
     auto& cs = coherent_stats;
+    WriterTagScope census_tag{*this, 9}; // q22: its uploads are not the last draw's
+    // q22 (design-game-main D2 blocker 1): SHADPS4_LANE_UPLOADS=1 - dirty runs of lane-bound buffers upload on the lane.
+    static const bool lane_uploads = [] {
+        const char* e = std::getenv("SHADPS4_LANE_UPLOADS");
+        const bool on = e && e[0] == '1';
+        if (on) {
+            LOG_INFO(Render, "q22: SHADPS4_LANE_UPLOADS=1 (CoherenceSync uploads lane-bound buffers on the lane)");
+        }
+        return on;
+    }();
+    const bool lane_up = lane_uploads && g_lane_on && g_lane_war && scheduler.HasLane();
+    const u32 stream0 = scheduler.ActiveStream();
+    if (lane_up && stream0 != 0) {
+        scheduler.SwitchStream(0); // review q22 #2: the sweep and non-routed runs upload on main
+    }
     const u64 c0 = __rdtsc();
     const u64 tail = DirtyLog::Start();
     u64 end = tail;
@@ -6644,7 +6662,35 @@ void BufferCache::CoherenceSync(bool bounded, u32 bound_lo) {
         u64 hi = lo + coherent_runs[0].second;
         const auto flush = [&] {
             ++cs.runs;
-            SynchronizeBuffersInRange(lo << TRACKER_PAGE_BITS, (hi - lo) << TRACKER_PAGE_BITS);
+            if (!lane_up) {
+                SynchronizeBuffersInRange(lo << TRACKER_PAGE_BITS, (hi - lo) << TRACKER_PAGE_BITS);
+                return;
+            }
+            // q22: SynchronizeBuffersInRange per buffer; a lane-bound buffer goes to the lane pass only where the
+            // lane's WAR wait is exact (one pool probe contains the range: LaneWarWait scopes to the probe's newest
+            // main read, deferred behind the open batch if that read is in it), main has not touched the buffer in
+            // the open batch, and something is dirty (review q22 #1, #4). Everything else uploads here, on main.
+            const VAddr a = lo << TRACKER_PAGE_BITS;
+            const VAddr a_end = hi << TRACKER_PAGE_BITS;
+            ForEachBufferInRange(a, a_end - a, [&](BufferId id, Buffer& buffer) {
+                const VAddr start = std::max(buffer.CpuAddr(), a);
+                const VAddr end = std::min(buffer.CpuAddr() + buffer.SizeBytes(), a_end);
+                if (buffer.lane_bound) {
+                    bool probe = false;
+                    const u32 np = g_lprobe_n.load(std::memory_order_acquire);
+                    for (u32 k = 0; k < np && !probe; ++k) {
+                        probe = g_lprobe[k].lo.load(std::memory_order_relaxed) <= start &&
+                                end <= g_lprobe[k].hi.load(std::memory_order_relaxed);
+                    }
+                    if (probe && buffer.main_access_tick < scheduler.CurrentTick() &&
+                        memory_tracker->IsRegionCpuModified(start, end - start)) {
+                        coherent_lane.emplace_back(id, start, end);
+                        return;
+                    }
+                    ++cs.lane_kept;
+                }
+                SynchronizeBuffer(buffer, start, static_cast<u32>(end - start), false, false, nullptr);
+            });
         };
         for (size_t i = 1; i < coherent_runs.size(); ++i) {
             const auto [first, count] = coherent_runs[i];
@@ -6658,6 +6704,35 @@ void BufferCache::CoherenceSync(bool bounded, u32 bound_lo) {
         }
         flush();
     }
+    if (lane_up) {
+        if (!coherent_lane.empty()) {
+            // q22: one lane pass (one switch) after the main uploads.
+            const u64 b0 = sync_upload_bytes_total;
+            scheduler.SwitchStream(1);
+            for (const auto& [id, start, end] : coherent_lane) {
+                if (IsBufferInvalid(id)) {
+                    scheduler.SwitchStream(0);
+                    SynchronizeBuffersInRange(start, end - start);
+                    scheduler.SwitchStream(1);
+                    continue;
+                }
+                SynchronizeBuffer(slot_buffers[id], start, static_cast<u32>(end - start), false, false,
+                                  nullptr);
+                ++cs.lane_bufs;
+            }
+            scheduler.SwitchStream(0);
+            coherent_lane.clear();
+            if (sync_upload_bytes_total != b0) {
+                // q22: graphics reading the uploaded bytes runs after them (the main batch waits the segment).
+                cs.lane_bytes += sync_upload_bytes_total - b0;
+                ++cs.lane_points;
+                scheduler.LaneFallbackMain();
+            }
+        }
+        if (scheduler.ActiveStream() != stream0) {
+            scheduler.SwitchStream(stream0);
+        }
+    }
     memory_tracker->BackCleanSync();
     coherent_live = true;
     ++cs.points;
@@ -6669,11 +6744,12 @@ void BufferCache::CoherenceSync(bool bounded, u32 bound_lo) {
         LOG_INFO(Render,
                  "NativeCoherent: mode={} points={} (bounded {}) sweeps={} runs={} uploaded={} KB "
                  "cycles/point={:.0f} (max {}) dma_syncs={} created={} cp_peeked={} | skips={} span_skips={} | "
-                 "verify: checked={} late={} cp={} BAD={} raced={} bytes={} KB",
+                 "verify: checked={} late={} cp={} BAD={} raced={} bytes={} KB | q22 lane: points={} buffers={} "
+                 "uploaded={} KB kept on main={}",
                  g_native_coherent, cs.points, cs.bounded, cs.sweeps, cs.runs, cs.bytes >> 10,
                  double(cs.cyc) / double(cs.points), cs.max_cyc, cs.dma_syncs, cs.created,
                  cs.cp_peeked, cs.skips, cs.span_skips, cs.verified, cs.v_late, cs.v_cp, cs.v_bad, cs.v_raced,
-                 cs.v_bytes >> 10);
+                 cs.v_bytes >> 10, cs.lane_points, cs.lane_bufs, cs.lane_bytes >> 10, cs.lane_kept);
         cs.max_cyc = 0;
     }
 }

@@ -902,7 +902,9 @@ private:
             cp_peeked{};
         u64 skips{}, span_skips{}, created{}, verified{}, v_late{}, v_cp{}, v_bad{}, v_raced{},
             v_bytes{};
+        u64 lane_bufs{}, lane_bytes{}, lane_points{}, lane_kept{}; // q22
     } coherent_stats;
+    std::vector<std::tuple<BufferId, VAddr, VAddr>> coherent_lane; // q22: the lane pass of one point
     /// [0] BindBuffers (uniform/storage) [1] other callers: calls, hits, key miss, epoch miss,
     /// guard (generation or serial) miss.
     std::array<std::array<u64, 5>, 2> read_memo_stats{};
