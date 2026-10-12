@@ -471,7 +471,7 @@ inline bool LaneProbeWrite(u64 lo, u64 hi, u64 open, u64& rd, bool& hit) noexcep
             const u64 plo = p.lo.load(std::memory_order_relaxed);
             const u64 phi = p.hi.load(std::memory_order_relaxed);
             const u64 nlo = std::min(alo, plo), nhi = std::max(ahi, phi);
-            if (nhi - nlo <= MaxSpan && (plo & (W - 1)) == 0) {
+            if (nhi - nlo <= MaxSpan && (plo & (W - 1)) == 0 && (phi & (W - 1)) == 0) { // q30b: aligned both ends
                 const u64 shift = (plo - nlo) >> 18;
                 const u64 oldn = std::min<u64>((phi - plo + W - 1) >> 18, 256);
                 if (shift != 0) {
