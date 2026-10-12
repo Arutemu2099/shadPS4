@@ -398,8 +398,8 @@ inline void LaneProbeWindows(LaneProbe& p, u64 lo, u64 hi, u64 v, u32 site) noex
     }
     const u64 i0 = std::min<u64>((a - plo) >> 18, 255), i1 = std::min<u64>((b - 1 - plo) >> 18, 255);
     for (u64 i = i0; i <= i1; ++i) {
-        if (g_lane_win_extent) {
-            // q38: this stamp's bytes inside window i.
+        if (g_lane_win_extent && !(i == 255 && phi - plo > (u64{64} << 20))) {
+            // q38: this stamp's bytes inside window i (q38b: not in a clamped window 255).
             const u64 wb = plo + (i << 18);
             const u32 xlo = static_cast<u32>(std::max(a, wb) - wb);
             const u32 xhi = static_cast<u32>(std::min(b, wb + (u64{1} << 18)) - wb);
@@ -427,6 +427,9 @@ inline void LaneProbeWindows(LaneProbe& p, u64 lo, u64 hi, u64 v, u32 site) noex
 inline u64 LaneWinRead(const LaneProbe& p, u64 k, u64 plo, u64 lo, u64 hi) noexcept {
     if (!g_lane_win_extent) {
         return p.wrd[k];
+    }
+    if (k == 255 && p.hi.load(std::memory_order_relaxed) - plo > (u64{64} << 20)) {
+        return p.wrd[k]; // q38b (review 1): window 255 also collects everything past 64 MiB - no extent there
     }
     const u64 wb = plo + (k << 18);
     const bool over = p.wxlo[k] < p.wxhi[k] && wb + p.wxlo[k] < hi && lo < wb + p.wxhi[k];
