@@ -915,6 +915,14 @@ public:
     bool LaneRecordsQueued() const noexcept {
         return LaneRecQueues();
     }
+    /// q36 (D2 R2): SHADPS4_LANE_DEFER_UPLOAD=2/3 - lane uploads' CPU halves and the lane submits on the LaneUpload FIFO.
+    bool LaneUploadOn() const noexcept {
+        return lane_up_on;
+    }
+    /// Back thread only: queue a lane upload's CPU half (protect, then copy); the segment's submit follows it.
+    void LaneUploadPush(Common::UniqueFunction<void>&& job);
+    /// Blocks until every queued job ran (back thread; teardown).
+    void LaneUploadDrain();
     /// q24: SHADPS4_CHAIN_TIMING=1 - GPU timestamps around each early ASC service run in the main batch (lane off).
     bool ChainTiming() const noexcept {
         return chain_timer != nullptr;
@@ -1181,6 +1189,20 @@ private:
     }
     void LaneRecPush(Common::UniqueFunction<void>&& job);
     void LaneRecDrain();
+    // q36: the LaneUpload FIFO (see LaneUploadPush). pushed / done: only the back pushes; done == pushed = idle.
+    bool lane_up_on = false;
+    bool lane_up_stop = false;         // under lane_up_mu
+    bool lane_up_sleeping = false;     // under lane_up_mu
+    std::mutex lane_up_mu;
+    std::mutex asc_pool_mu; // q36: asc_pool Commit / begin (back) vs the FIFO's vkQueueSubmit
+    std::condition_variable lane_up_cv, lane_up_idle_cv;
+    std::deque<std::pair<u64, Common::UniqueFunction<void>>> lane_up_q; // {push tsc, job}
+    std::atomic<u64> lane_up_pushed{0}, lane_up_done{0};
+    std::atomic<u64> lane_up_max_lag{0}, lane_up_lag_sum{0}, lane_up_busy_cyc{0};
+    u64 lane_up_jobs = 0, lane_up_submits = 0, lane_up_inline = 0, lane_up_log_tsc = 0;
+    std::thread lane_up_thread;
+    void LaneUploadLoop();
+    void AscQueueSubmit(vk::CommandBuffer cmdbuf, u64 value, u64 wait_main);
     void LaneRecDrainForBorrow();
     void LaneRecLoop();
     u32 worker_stream = 0;

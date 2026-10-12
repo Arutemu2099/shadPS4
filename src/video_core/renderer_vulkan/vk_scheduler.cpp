@@ -173,6 +173,12 @@ Scheduler::Scheduler(const Instance& instance, bool allow_recording_worker)
             lane_rec_thread = std::thread([this] { LaneRecLoop(); });
             LOG_INFO(Render_Vulkan, "AscLane: q12 lane recorder thread on (recording and submits off the back)");
         }
+        if (const char* e = std::getenv("SHADPS4_LANE_DEFER_UPLOAD"); e && (e[0] == '2' || e[0] == '3') && !lane_rec) {
+            lane_up_on = true; // q36
+            lane_up_thread = std::thread([this] { LaneUploadLoop(); });
+            LOG_INFO(Render_Vulkan, "q36: SHADPS4_LANE_DEFER_UPLOAD={} (lane uploads: protect + copy and the lane "
+                     "submit on the LaneUpload FIFO; recording stays on the back)", e[0]);
+        }
         LOG_INFO(Render_Vulkan,
                  "AscLane: on (early ASC records inline on the back, queue 1 of family {}, no I1, "
                  "{} recording lanes)",
@@ -197,6 +203,15 @@ Scheduler::Scheduler(const Instance& instance, bool allow_recording_worker)
 }
 
 Scheduler::~Scheduler() {
+    if (lane_up_thread.joinable()) { // q36: every queued protect / copy / submit runs before the pools go
+        LaneUploadDrain();
+        {
+            std::scoped_lock lk{lane_up_mu};
+            lane_up_stop = true;
+        }
+        lane_up_cv.notify_all();
+        lane_up_thread.join();
+    }
     if (lane_rec_thread.joinable()) { // q12
         {
             std::scoped_lock lk{lane_rec_mu};
@@ -1629,7 +1644,77 @@ void Scheduler::LogParRec() {
     prev_time = now;
 }
 
+void Scheduler::LaneUploadPush(Common::UniqueFunction<void>&& job) {
+    bool wake;
+    {
+        std::scoped_lock lk{lane_up_mu};
+        lane_up_q.emplace_back(__rdtsc(), std::move(job));
+        wake = lane_up_sleeping;
+    }
+    lane_up_pushed.fetch_add(1, std::memory_order_release);
+    ++lane_up_jobs;
+    if (wake) {
+        lane_up_cv.notify_one();
+    }
+    const u64 now = __rdtsc();
+    if (now - lane_up_log_tsc > 17'500'000'000ULL) [[unlikely]] {
+        const u64 done = lane_up_done.load(std::memory_order_acquire);
+        LOG_INFO(Render_Vulkan,
+                 "q36 LaneUpload (~5 s): jobs {} (submits {}, inline submits {}), queued now {}, lag mean {:.1f} us "
+                 "max {:.1f} us, FIFO busy {:.1f} ms",
+                 lane_up_jobs, lane_up_submits, lane_up_inline, lane_up_pushed.load() - done,
+                 done ? double(lane_up_lag_sum.exchange(0)) / 3500.0 / double(std::max<u64>(lane_up_jobs, 1)) : 0.0,
+                 double(lane_up_max_lag.exchange(0)) / 3500.0, double(lane_up_busy_cyc.exchange(0)) / 3.5e6);
+        lane_up_log_tsc = now;
+        lane_up_jobs = lane_up_submits = lane_up_inline = 0;
+    }
+}
+
+void Scheduler::LaneUploadDrain() {
+    std::unique_lock lk{lane_up_mu};
+    if (lane_up_sleeping && !lane_up_q.empty()) {
+        lane_up_cv.notify_one();
+    }
+    lane_up_idle_cv.wait(lk, [this] {
+        return lane_up_done.load(std::memory_order_acquire) == lane_up_pushed.load(std::memory_order_acquire);
+    });
+}
+
+void Scheduler::LaneUploadLoop() {
+    Common::SetCurrentThreadName("shadPS4:LaneUpload");
+    std::unique_lock lk{lane_up_mu};
+    for (;;) {
+        if (lane_up_q.empty()) {
+            lane_up_idle_cv.notify_all();
+            if (lane_up_stop) {
+                return;
+            }
+            lane_up_sleeping = true;
+            lane_up_cv.wait(lk, [this] { return !lane_up_q.empty() || lane_up_stop; });
+            lane_up_sleeping = false;
+            continue;
+        }
+        auto [tsc, job] = std::move(lane_up_q.front());
+        lane_up_q.pop_front();
+        lk.unlock();
+        const u64 t0 = __rdtsc();
+        const u64 lag = t0 - tsc;
+        lane_up_lag_sum.fetch_add(lag, std::memory_order_relaxed);
+        if (lag > lane_up_max_lag.load(std::memory_order_relaxed)) {
+            lane_up_max_lag.store(lag, std::memory_order_relaxed);
+        }
+        job();
+        lane_up_busy_cyc.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
+        lk.lock();
+        lane_up_done.fetch_add(1, std::memory_order_release);
+    }
+}
+
 void Scheduler::BeginAscCmdbufOnWorker() {
+    std::unique_lock pool_lk{asc_pool_mu, std::defer_lock}; // q36: vs the FIFO's submit of an older slot
+    if (lane_up_on) {
+        pool_lk.lock();
+    }
     asc_cmdbuf = asc_pool->Commit();
     Check(asc_cmdbuf.begin(vk::CommandBufferBeginInfo{
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
@@ -2262,6 +2347,31 @@ void Scheduler::AscSubmitOnWorker(u64 value, u64 wait_main) {
         AscTimerEnd(value);
     }
     Check(asc_cmdbuf.end());
+    if (lane_up_on) {
+        // q36: behind every queued upload CPU half (I2) and any queued submit (one queue user, in order). With the
+        // FIFO idle (done == pushed, acquire) every pushed fill already happened before this inline submit.
+        if (lane_up_done.load(std::memory_order_acquire) != lane_up_pushed.load(std::memory_order_relaxed)) {
+            ++lane_up_submits;
+            LaneUploadPush([this, cmdbuf = asc_cmdbuf, value, wait_main] { AscQueueSubmit(cmdbuf, value, wait_main); });
+        } else {
+            ++lane_up_inline;
+            AscQueueSubmit(asc_cmdbuf, value, wait_main);
+        }
+    } else {
+        AscQueueSubmit(asc_cmdbuf, value, wait_main);
+    }
+    asc_cmdbuf = nullptr;
+    if (worker_stream == 1) {
+        BeginAscCmdbufOnWorker();
+        current_cmdbuf = asc_cmdbuf;
+    }
+}
+
+void Scheduler::AscQueueSubmit(vk::CommandBuffer cmdbuf, u64 value, u64 wait_main) {
+    std::unique_lock pool_lk{asc_pool_mu, std::defer_lock}; // q36
+    if (lane_up_on) {
+        pool_lk.lock();
+    }
     const vk::Semaphore wait_sema = master_semaphore.Handle();
     const vk::Semaphore signal_sema = asc_semaphore->Handle();
     const vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eAllCommands;
@@ -2278,7 +2388,7 @@ void Scheduler::AscSubmitOnWorker(u64 value, u64 wait_main) {
         .pWaitSemaphores = &wait_sema,
         .pWaitDstStageMask = &wait_stage,
         .commandBufferCount = 1U,
-        .pCommandBuffers = &asc_cmdbuf,
+        .pCommandBuffers = &cmdbuf,
         .signalSemaphoreCount = 1,
         .pSignalSemaphores = &signal_sema,
     };
@@ -2291,11 +2401,6 @@ void Scheduler::AscSubmitOnWorker(u64 value, u64 wait_main) {
                "recorder thread {})",
                value, wait_main, master_semaphore.KnownGpuTick(), asc_semaphore->KnownGpuTick(),
                t_lane_mode && lane_rec);
-    asc_cmdbuf = nullptr;
-    if (worker_stream == 1) {
-        BeginAscCmdbufOnWorker();
-        current_cmdbuf = asc_cmdbuf;
-    }
 }
 
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {

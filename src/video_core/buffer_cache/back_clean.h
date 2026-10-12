@@ -331,6 +331,27 @@ inline u32 g_lane_war_site = 0;
 inline u64 g_lane_war_wid = 0;                 // q34: pipeline id of the window that set LaneProbeWrite's rd
 inline u64 g_lane_stamp_id = 0;                // q34: set by the stamping caller (ObtainBuffer: census_id)
 inline u64 g_lane_stamp_args = 0;              // q35 H5: the stamping draw's indirect args address
+inline u64 g_lane_war_win = 0, g_lane_war_args = 0; // q36c: the window (and its stamp's args) that set the WAR rd
+/// q36c census: SHADPS4_Q35_FS=hash[,hash...] (hex fs hashes) - log those draws' s15 stamps over probes and the lane
+/// writes their stamps hold.
+inline const std::array<u64, 4> g_q35_fs = [] {
+    std::array<u64, 4> a{};
+    if (const char* e = std::getenv("SHADPS4_Q35_FS")) {
+        u32 n = 0;
+        for (const char* s = e; *s && n < a.size();) {
+            char* end = nullptr;
+            a[n++] = std::strtoull(s, &end, 16);
+            s = (end && *end == ',') ? end + 1 : (end ? end : s + 1);
+            if (end && *end == 0) {
+                break;
+            }
+        }
+    }
+    return a;
+}();
+inline bool Q35Fs(u64 h) noexcept {
+    return h != 0 && (g_q35_fs[0] == h || g_q35_fs[1] == h || g_q35_fs[2] == h || g_q35_fs[3] == h);
+}
 inline u64 g_census_args = 0;                  // q35: the current draw's indirect args (rasterizer, census only)
 inline u64 g_census_vs = 0;                    // q35: the current draw's vertex shader hash (census only)
 inline u64 g_back_flip_seq = 0;                // q35 H5: PatchedFlip packets the back executed
@@ -476,6 +497,7 @@ inline bool LaneProbeWrite(u64 lo, u64 hi, u64 open, u64& rd, bool& hit) noexcep
                         wid = p.wid[k];
                         wargs = p.wargs[k];
                         wflip = p.wflip[k];
+                        g_lane_war_win = plo + (k << 18); // q36c census
                     }
                 }
             }
@@ -483,6 +505,7 @@ inline bool LaneProbeWrite(u64 lo, u64 hi, u64 open, u64& rd, bool& hit) noexcep
                 rd = r;
                 g_lane_war_site = s;
                 g_lane_war_wid = g_lane_seg_census ? LaneH5Meta(wid, wargs, wflip, lo) : wid;
+                g_lane_war_args = wargs; // q36c census
             }
             first = std::min(first, i);
             covered = covered || (plo <= lo && hi <= phi);

@@ -752,7 +752,43 @@ BufferCache::~BufferCache() {
                fault_guest_waiters.load());
 }
 
+namespace {
+// q36 =3 verify: deferred lane-upload pages {page -> (hash, seq, ready)}; see q36b_lane_upload_thread.py.
+struct Q36Page {
+    u64 hash = 0, seq = 0;
+    bool ready = false;
+};
+std::mutex q36_mu;
+std::map<VAddr, Q36Page> q36_pages;
+u64 q36_seq = 0;
+std::atomic<u64> q36_compares{0}, q36_lost{0}, q36_dropped{0}, q36_unmapped{0};
+void Q36Drop(VAddr lo, u64 size) {
+    std::scoped_lock lk{q36_mu};
+    auto it = q36_pages.lower_bound(lo & ~u64{0xfff});
+    u64 n = 0;
+    while (it != q36_pages.end() && it->first < lo + size) {
+        it = q36_pages.erase(it);
+        ++n;
+    }
+    q36_dropped.fetch_add(n, std::memory_order_relaxed);
+}
+int Q36Mode() {
+    static const int m = [] {
+        const char* e = std::getenv("SHADPS4_LANE_DEFER_UPLOAD");
+        const int v = e && (e[0] == '2' || e[0] == '3') ? e[0] - '0' : 0;
+        if (v == 3) {
+            Core::g_backing_write_hook.store(&Q36Drop, std::memory_order_relaxed);
+        }
+        return v;
+    }();
+    return m;
+}
+} // namespace
+
 void BufferCache::BeginGpuUnmap(VAddr device_addr, u64 size) {
+    if (Q36Mode() == 3) [[unlikely]] {
+        Q36Drop(device_addr, size); // q36 verify: the range's bytes change without a fault
+    }
     backing_span_generation.fetch_add(1, std::memory_order_release);
     // SHADPS4_BIND_MEMO_STATS: an unmap can change ClampRangeSize and the buffers found there.
     // Rasterizer::UnmapMemory bumps again once the unmap is complete.
@@ -4908,6 +4944,15 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         bool war_hit = false, war_cov = false;
         if (g_lane_probe && is_written) [[unlikely]] {
             war_cov = LaneProbeWrite(device_addr, device_addr + size, open, war_rd, war_hit);
+            if (g_lane_seg_census && war_rd > g_lc_done + 1 && Q35Fs(g_lane_war_wid & 0xffffffffULL)) [[unlikely]] {
+                static u32 n36 = 0; // q36c: lane writes held by a named draw's stamp (unfinished reader batch)
+                if (n36++ < 96) {
+                    LOG_INFO(Render_Vulkan, "q36c Held: lane write {:#x} size {:#x} (pipeline {:08x}) by fs {:08x} "
+                             "window {:#x} stamp args {:#x} meta {:#x} rd {} open {} known {}", device_addr, size,
+                             census_id, g_lane_war_wid & 0xffffffffULL, g_lane_war_win, g_lane_war_args,
+                             g_lane_war_wid >> 56, war_rd, open, g_lc_done);
+                }
+            }
         }
         if (g_lane_who) [[unlikely]] {
             LaneWhoNote(t, open, is_written, war_rd, war_hit);
@@ -4938,6 +4983,16 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         }
         g_lane_stamp_id = census_id; // q34
         g_lane_stamp_args = g_census_args; // q35 H5
+        if (g_lane_seg_census && Q35Fs(census_id) && LaneProbeAny(device_addr, device_addr + size)) [[unlikely]] {
+            static std::vector<std::array<u64, 3>> seen36; // q36c: the named draws' stamps over probes
+            const std::array<u64, 3> key{census_id, device_addr, size};
+            if (seen36.size() < 96 && std::find(seen36.begin(), seen36.end(), key) == seen36.end()) {
+                seen36.push_back(key);
+                LOG_INFO(Render_Vulkan, "q36c Stamp: fs {:08x} vs {:08x} {:#x} size {:#x} texel {} args {:#x} flip {}",
+                         census_id, g_census_vs, device_addr, size, is_texel_buffer, g_census_args,
+                         g_back_flip_seq);
+            }
+        }
         if (g_lane_seg_census && LaneProbeAny(device_addr, device_addr + size)) [[unlikely]] {
             // q35: the read bindings behind the copy-holding stamps (big windows first, then those draws' small ones).
             static std::vector<std::array<u64, 5>> seen;
@@ -6237,7 +6292,37 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
         return on;
     }();
     const bool lane_deferred = lane_defer && deferred_protect && scheduler.LaneRecordsQueued();
-    const bool defer = deferred_protect && (scheduler.IsAsyncRecording() || lane_deferred);
+    // q36 (D2 R2): SHADPS4_LANE_DEFER_UPLOAD=2/3 - without the recorder: the CPU half on the LaneUpload FIFO.
+    const bool lane_deferred2 = !lane_deferred && deferred_protect && g_lane_on && Vulkan::Scheduler::t_lane_mode &&
+                                Common::FaultMonitor::t_is_cp_thread && scheduler.LaneUploadOn();
+    const bool defer = deferred_protect && (scheduler.IsAsyncRecording() || lane_deferred || lane_deferred2);
+    if (Q36Mode() == 3 && Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
+        // q36 verify: deferred pages in this range that are clean now must still hold the bytes uploaded.
+        std::scoped_lock lk{q36_mu};
+        auto it = q36_pages.lower_bound(device_addr & ~u64{0xfff});
+        while (it != q36_pages.end() && it->first < device_addr + size) {
+            if (!it->second.ready || memory_tracker->IsRegionCpuModified(it->first, 0x1000)) {
+                ++it; // not hashed yet / re-dirtied (its next upload drops it)
+                continue;
+            }
+            if (memory_tracker->IsRegionGpuModified(it->first, 0x1000)) {
+                it = q36_pages.erase(it);
+                continue;
+            }
+            std::array<u8, 0x1000> page;
+            if (memory->TryReadBacking(it->first, page.data(), page.size())) {
+                q36_compares.fetch_add(1, std::memory_order_relaxed);
+                if (XXH3_64bits(page.data(), page.size()) != it->second.hash) {
+                    const u64 n = q36_lost.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if ((n & (n - 1)) == 0) {
+                        LOG_CRITICAL(Render, "q36 verify: LOST CPU WRITE? clean page {:#x} differs from its deferred "
+                                     "lane upload (n={})", it->first, n);
+                    }
+                }
+            }
+            it = q36_pages.erase(it);
+        }
+    }
     if (g_deferred_copy_census) [[unlikely]] {
         census_lo = device_addr;
         census_hi = device_addr + size;
@@ -6268,6 +6353,11 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     }
     last_sync_upload_bytes = total_size_bytes;
     sync_upload_bytes_total += total_size_bytes;
+    if (Q36Mode() == 3 && total_size_bytes != 0) [[unlikely]] {
+        for (const auto& copy : copies) {
+            Q36Drop(buffer_start + copy.dstOffset, copy.size); // q36 verify: re-uploaded, older entries void
+        }
+    }
     if (total_size_bytes != 0) {
         // Upload volume, every ~5 s, only from calls that upload (NATIVE_COHERENT pair check).
         ++sync_upload_calls;
@@ -6276,6 +6366,15 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             sync_upload_log_tsc = now;
             LOG_INFO(Render, "SyncUploads: total={} MB uploads={} coherent={}",
                      sync_upload_bytes_total >> 20, sync_upload_calls, g_native_coherent);
+            if (Q36Mode() == 3) {
+                size_t tracked = 0;
+                {
+                    std::scoped_lock lk{q36_mu};
+                    tracked = q36_pages.size();
+                }
+                LOG_INFO(Render, "q36 verify: compares {} lost_write {} dropped {} unmapped_skips {} tracked {}",
+                         q36_compares.load(), q36_lost.load(), q36_dropped.load(), q36_unmapped.load(), tracked);
+            }
             if (const volatile u32* g = g_sort_guard_words) {
                 // q36: the sort replacement's invalid-width exits (0 = never; the hang guard did not fire).
                 LOG_INFO(Render, "q36 SortGuard: invalid-width exits {} (last first {} last {}), overflow exits {}",
@@ -6393,7 +6492,61 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                 NoteTransferEnd();
             }
         };
-        if (defer && g_transfer_coalesce && !lane_deferred) {
+        if (lane_deferred2) {
+            // q36: the CPU half (protect, then copy - the main path's order) on the LaneUpload FIFO; the lane
+            // segment's submit is queued behind it (AscSubmitOnWorker). The GPU half is recorded now, as inline.
+            // (=3: this upload's older page entries were dropped above, with every upload's.)
+            std::vector<std::tuple<VAddr, u64, u8*>> verify_pages;
+            if (Q36Mode() == 3) [[unlikely]] {
+                std::scoped_lock lk{q36_mu};
+                for (const DeferredCopy& c : deferred_copies) {
+                    for (VAddr pg = (c.addr + 0xfff) & ~u64{0xfff}; pg + 0x1000 <= c.addr + c.size; pg += 0x1000) {
+                        if (q36_pages.size() < 8192) {
+                            q36_pages[pg] = {0, ++q36_seq, false};
+                            verify_pages.emplace_back(pg, q36_seq, c.dest + (pg - c.addr));
+                        }
+                    }
+                }
+            }
+            scheduler.LaneUploadPush(
+                [pm = &page_manager, memory = memory,
+                 protects = std::vector<PageManager::ProtectRange>(deferred_protects.begin(), deferred_protects.end()),
+                 cpu = std::vector<DeferredCopy>(deferred_copies.begin(), deferred_copies.end()),
+                 verify_pages = std::move(verify_pages)]() {
+                    pm->ReconcileProtection(protects);
+                    for (const DeferredCopy& copy : cpu) {
+                        if (!memory->TryReadGuest(copy.addr, copy.dest, copy.size)) {
+                            q36_unmapped.fetch_add(1, std::memory_order_relaxed); // I3: unmapped meanwhile
+                        }
+                    }
+                    if (!verify_pages.empty()) {
+                        std::scoped_lock lk{q36_mu};
+                        for (const auto& [pg, seq, src] : verify_pages) {
+                            if (auto it = q36_pages.find(pg); it != q36_pages.end() && it->second.seq == seq) {
+                                it->second.hash = XXH3_64bits(src, 0x1000);
+                                it->second.ready = true;
+                            }
+                        }
+                    }
+                });
+            scheduler.RecordArrays(
+                [src_buffer, destination = buffer.Handle(), pre_barrier,
+                 post_barrier](vk::CommandBuffer cmdbuf, auto owned_copies) {
+                    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                        .bufferMemoryBarrierCount = 1,
+                        .pBufferMemoryBarriers = &pre_barrier,
+                    });
+                    cmdbuf.copyBuffer(src_buffer, destination, owned_copies);
+                    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                        .bufferMemoryBarrierCount = 1,
+                        .pBufferMemoryBarriers = &post_barrier,
+                    });
+                },
+                std::span<const vk::BufferCopy>{copies});
+            TouchBuffer(buffer);
+        } else if (defer && g_transfer_coalesce && !lane_deferred) {
             // SHADPS4_TRANSFER_COALESCE: the barriers come from the scheduler's transfer group.
             Vulkan::Scheduler::TransferRange write{static_cast<VkBuffer>(buffer.Handle()), ~0ULL, 0};
             for (const auto& copy : copies) {
