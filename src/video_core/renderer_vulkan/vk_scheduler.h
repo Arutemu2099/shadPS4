@@ -1190,7 +1190,21 @@ private:
     u32 asc_wait_site = 0; // q26 E0: the site that set asc_wait_main
     std::array<u64, 324> lane_site_c{};
     u64 lane_seg_n = 0, lane_seg_unf = 0, lane_seg_behind = 0, lane_seg_log_tsc = 0;
-    void LaneSegCensus(u64 wait_main);
+    void LaneSegCensus(u64 wait_main, u64 value);
+    // q33: submitted lane segments (value, final main wait, site) and the lane fault copies' census.
+    struct LaneSegRec {
+        u64 value = 0, wait = 0;
+        u32 site = 0;
+    };
+    std::array<LaneSegRec, 128> lane_seg_ring{};
+    u64 lane_seg_ring_pos = 0;
+    std::array<u64, 324> lane_copy_site_c{};
+    u64 lane_copy_n = 0, lane_copy_blocked = 0, lane_copy_behind = 0, lane_copy_ahead = 0, lane_copy_log_tsc = 0;
+
+public:
+    void LaneCopyCensus(u64 copy_value);
+
+private:
     std::atomic<u64> asc_last_submitted{0};
     std::array<u64, 4> asc_wait_dist{};
     /// SHADPS4_ASC_TIMING=1 (diagnostic): GPU time of each ASC segment on the compute queue.

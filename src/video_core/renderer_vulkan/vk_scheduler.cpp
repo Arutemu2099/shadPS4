@@ -1919,8 +1919,63 @@ void Scheduler::LaneSwitch(u32 stream) {
     }
 }
 
-void Scheduler::LaneSegCensus(u64 wait_main) {
+void Scheduler::LaneCopyCensus(u64 copy_value) {
+    // q33: what holds this lane fault copy - the unfinished lane segments queued ahead of it and their main waits.
+    asc_semaphore->Refresh();
+    const u64 lane_known = asc_semaphore->KnownGpuTick();
+    master_semaphore.Refresh();
+    const u64 main_known = master_semaphore.KnownGpuTick();
+    u64 max_wait = 0, ahead = 0;
+    u32 site = 0;
+    for (const auto& r : lane_seg_ring) {
+        if (r.value > lane_known && r.value <= copy_value) {
+            ++ahead;
+            if (r.wait > max_wait) {
+                max_wait = r.wait;
+                site = r.site;
+            }
+        }
+    }
+    ++lane_copy_n;
+    lane_copy_ahead += ahead;
+    if (max_wait > main_known) {
+        ++lane_copy_blocked;
+        lane_copy_behind += max_wait - main_known;
+        ++lane_copy_site_c[std::min<u32>(site, 323)];
+    }
+    const u64 now = __rdtsc();
+    if (now - lane_copy_log_tsc < 17'500'000'000ULL) {
+        return;
+    }
+    lane_copy_log_tsc = now;
+    std::vector<std::pair<u64, u32>> top;
+    for (u32 i = 0; i < lane_copy_site_c.size(); ++i) {
+        if (lane_copy_site_c[i] != 0) {
+            top.emplace_back(lane_copy_site_c[i], i);
+        }
+    }
+    std::sort(top.begin(), top.end(), std::greater<>());
+    std::string s;
+    for (size_t k = 0; k < std::min<size_t>(top.size(), 10); ++k) {
+        const u32 c = top[k].second;
+        s += c < 256 ? fmt::format(" [raw k{} {}]", c, top[k].first)
+             : c < 320 ? fmt::format(" [war s{} {}]", c - 256, top[k].first)
+                       : fmt::format(" [{} {}]", c == 320 ? "label" : c == 321 ? "gds" : c == 322 ? "carry" : "other",
+                                     top[k].first);
+    }
+    LOG_INFO(Render_Vulkan,
+             "q33 LaneCopyCensus (~5 s): lane fault copies {} held behind an unfinished main batch {} (mean {:.2f} "
+             "batches behind) | lane segments queued ahead {:.1f} per copy | holding site:{}",
+             lane_copy_n, lane_copy_blocked,
+             lane_copy_blocked ? double(lane_copy_behind) / double(lane_copy_blocked) : 0.0,
+             lane_copy_n ? double(lane_copy_ahead) / double(lane_copy_n) : 0.0, s);
+    lane_copy_n = lane_copy_blocked = lane_copy_behind = lane_copy_ahead = 0;
+    lane_copy_site_c.fill(0);
+}
+
+void Scheduler::LaneSegCensus(u64 wait_main, u64 value) {
     // q26 E0: which site set each segment's final main wait, and whether that batch is still unfinished.
+    lane_seg_ring[lane_seg_ring_pos++ % lane_seg_ring.size()] = {value, wait_main, asc_wait_site}; // q33
     ++lane_seg_n;
     master_semaphore.Refresh();
     const u64 known = master_semaphore.KnownGpuTick();
@@ -1971,7 +2026,7 @@ void Scheduler::LaneSubmit() {
     const u64 value = open_asc_value;
     const u64 wait_main = asc_wait_main;
     if (VideoCore::g_lane_seg_census) [[unlikely]] {
-        LaneSegCensus(wait_main);
+        LaneSegCensus(wait_main, value);
     }
     asc_dirty = false;
     if (async_submit &&

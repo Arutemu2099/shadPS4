@@ -1811,6 +1811,9 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
             });
             scheduler.SwitchStream(0);
             const u64 asc_value = scheduler.SubmitAscSegment();
+            if (g_lane_seg_census && scheduler.HasLane()) [[unlikely]] {
+                scheduler.LaneCopyCensus(asc_value); // q33
+            }
             if (g_asc_deps) {
                 for (size_t k = 0; k < job->copies.size() && k < sources.size(); ++k) {
                     slot_buffers[sources[k]].NoteAscAccess(job->copies[k].addr,
