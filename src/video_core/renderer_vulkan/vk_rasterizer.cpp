@@ -7480,6 +7480,10 @@ void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
     dispatch_target = asc_stream && dispatch_queue != 0 && AscCandidate(pipeline) ? 1u : 0u;
     if (lane_disp && dispatch_target == 0) {
         scheduler.LaneFallbackMain(); // not eligible: on main, after the lane's work so far
+        if (VideoCore::g_lane_who) [[unlikely]] {
+            const auto* ci = bound_stages[static_cast<u32>(Shader::LogicalStage::Compute)].info;
+            VideoCore::LaneWhoKept(dispatch_queue == 0 ? 8u : asc_why, ci ? ci->pgm_hash : 0);
+        }
     }
     if (VideoCore::BufferCache::CensusEnabled()) [[unlikely]] {
         u64 id = 0;
@@ -7545,6 +7549,11 @@ void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
             } else if (ts == 1) {
                 scheduler.LaneCount(12);
                 scheduler.LaneFallbackMain();
+                if (VideoCore::g_lane_who) [[unlikely]] {
+                    const auto* ci =
+                        bound_stages[static_cast<u32>(Shader::LogicalStage::Compute)].info;
+                    VideoCore::LaneWhoKept(20, ci ? ci->pgm_hash : 0); // demoted in BindBuffers
+                }
             }
         }
         const u32 s = dispatch_on_asc ? 1u : 0u;
@@ -7591,7 +7600,9 @@ bool Rasterizer::AscCandidate(const ComputePipeline* pipeline) const {
     // buffers. HLE shaders and image copy / clear shaders never reach BindResources.
     // Descriptor sets from the heap are recycled by the main timeline (asc-i1-relax design R0
     // table): ASC pipelines must push their descriptors.
+    asc_why = 0;
     if (!pipeline->UsesPushDescriptors()) {
+        asc_why = 1;
         static std::atomic<u64> no_push{0};
         const u64 n = no_push.fetch_add(1) + 1;
         if ((n & (n - 1)) == 0) {
@@ -7611,12 +7622,13 @@ bool Rasterizer::AscCandidate(const ComputePipeline* pipeline) const {
                                     desc.is_written);
             }
             LOG_INFO(Render_Vulkan, "AscCensusPipe: cs_{:08x} images={} samplers={} uses_dma={} "
-                                    "buffers:{}",
+                                    "readconst_types={} buffers:{}",
                      info->pgm_hash, info->images.size(), info->samplers.size(), info->uses_dma,
-                     bufs);
+                     static_cast<u32>(info->readconst_types), bufs);
         }
     }
     if (!info || !info->images.empty() || !info->samplers.empty() || info->uses_dma) {
+        asc_why = !info ? 2 : !info->images.empty() ? 3 : !info->samplers.empty() ? 4 : 5;
         return false;
     }
     // SHADPS4_ASC_TEXEL=1: formatted (texel) buffers are allowed; BindBuffers keeps a dispatch on
@@ -7630,11 +7642,13 @@ bool Rasterizer::AscCandidate(const ComputePipeline* pipeline) const {
     }();
     for (const auto& desc : info->buffers) {
         if (desc.is_formatted && !asc_texel) {
+            asc_why = 6;
             return false;
         }
         if (desc.IsSpecial() && desc.buffer_type != Shader::BufferType::GdsBuffer &&
             desc.buffer_type != Shader::BufferType::Flatbuf &&
             desc.buffer_type != Shader::BufferType::SharedMemory) {
+            asc_why = 7;
             return false;
         }
     }

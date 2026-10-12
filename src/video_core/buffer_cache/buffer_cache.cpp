@@ -2148,6 +2148,12 @@ void BufferCache::RecordFaultCopiesOnReadbackQueue(vk::CommandBuffer cmdbuf, vk:
 void BufferCache::RecordFaultCopies(vk::CommandBuffer cmdbuf, Buffer& source, vk::Buffer staging,
                                     std::span<const vk::BufferCopy> copies) {
     source.NoteMainAccess(scheduler.CurrentTick(), false);
+    if (g_lane_who && Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
+        for (const auto& copy : copies) {
+            const VAddr lo = source.CpuAddr() + copy.srcOffset;
+            LaneProbeRead(lo, lo + copy.size, scheduler.CurrentTick(), 10); // q9 census
+        }
+    }
     if (g_range_notes) {
         for (const auto& copy : copies) {
             source.NoteMainRange(scheduler.CurrentTick(), false, source.CpuAddr() + copy.srcOffset,
@@ -2214,6 +2220,12 @@ bool BufferCache::AsyncFaultCopies() {
 void BufferCache::RecordFaultCopiesAsync(Buffer& source, vk::Buffer staging,
                                          std::span<const vk::BufferCopy> copies) {
     source.NoteMainAccess(scheduler.CurrentTick(), false);
+    if (g_lane_who && Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
+        for (const auto& copy : copies) {
+            const VAddr lo = source.CpuAddr() + copy.srcOffset;
+            LaneProbeRead(lo, lo + copy.size, scheduler.CurrentTick(), 10); // q9 census
+        }
+    }
     if (g_range_notes) {
         for (const auto& copy : copies) {
             source.NoteMainRange(scheduler.CurrentTick(), false, source.CpuAddr() + copy.srcOffset,
@@ -2341,6 +2353,100 @@ void BufferCache::DisarmEarlyCut(u32 mask) {
 
 thread_local bool t_in_dispatch = false;
 
+namespace {
+// q9 census (back thread): lane producer hits by writer, kept-on-main by reason, logged every ~5 s.
+struct WhoCount {
+    u64 n{}, open{};
+};
+std::unordered_map<u64, WhoCount> g_who_hits;
+std::unordered_map<u64, u64> g_who_kept;
+u64 g_who_log_tsc = 0;
+u64 g_who_bindings = 0, g_who_written = 0;
+u64 WhoKey(u32 kind, u64 id) {
+    return (u64{kind & 0xff} << 56) | (id & 0x00ffffffffffffffull);
+}
+void LaneWhoLog() {
+    std::vector<std::pair<u64, WhoCount>> h(g_who_hits.begin(), g_who_hits.end());
+    std::sort(h.begin(), h.end(), [](const auto& a, const auto& b) { return a.second.n > b.second.n; });
+    u64 tot = 0, tot_open = 0;
+    std::string top;
+    for (size_t i = 0; i < h.size(); ++i) {
+        tot += h[i].second.n;
+        tot_open += h[i].second.open;
+        if (i < 12) {
+            top += fmt::format(" [k{} {:08x} n={} open={}]", h[i].first >> 56,
+                               h[i].first & 0x00ffffffffffffffull, h[i].second.n, h[i].second.open);
+        }
+    }
+    LOG_INFO(Render_Vulkan, "LaneWho hits (~5 s): lane bindings {} written {} producer hits {} open {}:{}",
+             g_who_bindings, g_who_written, tot, tot_open, top);
+    std::vector<std::pair<u64, u64>> k(g_who_kept.begin(), g_who_kept.end());
+    std::sort(k.begin(), k.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::string kt;
+    u64 ktot = 0;
+    for (size_t i = 0; i < k.size(); ++i) {
+        ktot += k[i].second;
+        if (i < 12) {
+            kt += fmt::format(" [r{} {:08x} n={}]", k[i].first >> 56, k[i].first & 0x00ffffffffffffffull,
+                              k[i].second);
+        }
+    }
+    LOG_INFO(Render_Vulkan, "LaneWho kept on main (~5 s): {}:{}", ktot, kt);
+    std::string pr;
+    for (u32 i = 0; i < g_lprobe_n.load(std::memory_order_relaxed); ++i) {
+        pr += fmt::format(" [{:#x}+{:#x}]", g_lprobe[i].lo.load(std::memory_order_relaxed),
+                          g_lprobe[i].hi.load(std::memory_order_relaxed) -
+                              g_lprobe[i].lo.load(std::memory_order_relaxed));
+    }
+    const auto& d = g_lprobe_dist;
+    const auto& l = g_label_dist;
+    LOG_INFO(Render_Vulkan,
+             "LaneWho pool probe (~5 s): written lane bindings over a probe {} | open - newest read "
+             "0:{} 1:{} 2:{} 3:{} 4+:{} done:{} never:{} | read after newest gfx label {} | label "
+             "distance 0:{} 1:{} 2:{} 3:{} 4+:{} done:{} | stamps A2 {} other {} | probes{}",
+             d[8], d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], l[0], l[1], l[2], l[3], l[4], l[5],
+             d[9], d[10], pr);
+    g_who_hits.clear();
+    g_who_kept.clear();
+    g_lprobe_dist.fill(0);
+    g_label_dist.fill(0);
+    g_who_bindings = g_who_written = 0;
+}
+} // namespace
+
+void LaneWhoNote(u64 t, u64 open, bool written, u64 lo, u64 hi) {
+    ++g_who_bindings;
+    if (t != 0) {
+        auto& c = g_who_hits[WhoKey(g_lc_hit_wk, g_lc_hit_wid)];
+        ++c.n;
+        c.open += t >= open ? 1 : 0;
+    }
+    if (written) {
+        ++g_who_written;
+        u64 rd = 0;
+        if (LaneProbeWrite(lo, hi, rd)) {
+            ++g_lprobe_dist[8];
+            const auto bucket = [&](u64 v) -> u32 {
+                return v <= g_lc_done ? 5u : static_cast<u32>(std::min<u64>(open - std::min(open, v), 4));
+            };
+            g_lprobe_dist[rd == 0 ? 6 : bucket(rd)]++;
+            if (rd > g_gfx_label_tick) {
+                ++g_lprobe_dist[7];
+            }
+            g_label_dist[bucket(g_gfx_label_tick)]++;
+        }
+    }
+    const u64 now = __rdtsc();
+    if (now - g_who_log_tsc > 17'500'000'000ULL) {
+        g_who_log_tsc = now;
+        LaneWhoLog();
+    }
+}
+
+void LaneWhoKept(u32 reason, u64 hash) {
+    ++g_who_kept[WhoKey(reason, hash)];
+}
+
 void BufferCache::NoteBatchWrite(VAddr addr, u64 size) {
     if (size == 0) {
         return;
@@ -2355,7 +2461,8 @@ void BufferCache::NoteBatchWrite(VAddr addr, u64 size) {
         if (Common::FaultMonitor::t_is_cp_thread) {
             const bool lane_side =
                 g_lane_on ? Vulkan::Scheduler::t_lane_mode : t_force_binding_sync;
-            LaneNoteRange(addr, addr + size, scheduler.CurrentTick(), lane_side ? 2 : 0);
+            LaneNoteRange(addr, addr + size, scheduler.CurrentTick(), lane_side ? 2 : 0, census_kind,
+                          census_id);
         } else {
             g_lc[13].fetch_add(1, std::memory_order_relaxed);
         }
@@ -3380,6 +3487,12 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     Common::FaultMonitor::CountReadbackDownload(total_size_bytes);
     const auto [download, offset] = download_buffer.Map(total_size_bytes);
     buffer.NoteMainAccess(scheduler.CurrentTick(), false);
+    if (g_lane_who && Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
+        for (const auto& copy : copies) {
+            const VAddr lo = buffer.CpuAddr() + copy.srcOffset;
+            LaneProbeRead(lo, lo + copy.size, scheduler.CurrentTick(), 10); // q9 census
+        }
+    }
     if (g_range_notes) {
         for (const auto& copy : copies) {
             buffer.NoteMainRange(scheduler.CurrentTick(), false, buffer.CpuAddr() + copy.srcOffset,
@@ -3963,6 +4076,10 @@ const Buffer* BufferCache::NativeRunSpan(
     if (lo == 0 || hi <= lo || hi - lo > (u64{64} << 20)) {
         return nullptr;
     }
+    if (g_lane_who && Common::FaultMonitor::t_is_cp_thread && !Vulkan::Scheduler::t_lane_mode)
+        [[unlikely]] {
+        LaneProbeRead(lo, hi, scheduler.CurrentTick(), 10); // q9 census
+    }
     const BufferId id = page_table[lo >> CACHING_PAGEBITS].buffer_id;
     if (!id) {
         return nullptr;
@@ -4217,6 +4334,10 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
     }();
     src_buffer.NoteMainAccess(scheduler.CurrentTick(), false);
     dst_buffer.NoteMainAccess(scheduler.CurrentTick(), true);
+    if (g_lane_who && !src_gds && Common::FaultMonitor::t_is_cp_thread &&
+        !Vulkan::Scheduler::t_lane_mode) [[unlikely]] {
+        LaneProbeRead(src, src + num_bytes, scheduler.CurrentTick(), 10); // q9 census
+    }
     if (g_range_notes) {
         if (!src_gds) {
             src_buffer.NoteMainRange(scheduler.CurrentTick(), false, src, num_bytes, 4, 0);
@@ -4432,10 +4553,15 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     if (g_lane_on && Vulkan::Scheduler::t_lane_mode) [[unlikely]] {
         g_lc_done = scheduler.GetMasterSemaphore()->KnownGpuTick();
         const u64 t = LaneMainProducer(device_addr, device_addr + size);
+        if (g_lane_who) [[unlikely]] {
+            LaneWhoNote(t, scheduler.CurrentTick(), is_written, device_addr, device_addr + size);
+        }
         scheduler.LaneNeedMain(t, g_lc_src);
         if (is_written) {
             scheduler.LaneNeedMain(g_gfx_label_tick, 2, true); // WAR, never the open batch (p1d)
         }
+    } else if (g_lane_who && !is_written && Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
+        LaneProbeRead(device_addr, device_addr + size, scheduler.CurrentTick(), 10); // q9 census
     }
     if (g_lane_census && Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
         const u64 lo = device_addr, hi = device_addr + size;
@@ -5221,6 +5347,10 @@ std::pair<Buffer*, u32> BufferCache::ObtainReadLean(VAddr device_addr, u32 size,
         return {};
     }
     Buffer& buffer = slot_buffers[buffer_id];
+    if (g_lane_who && Common::FaultMonitor::t_is_cp_thread && !Vulkan::Scheduler::t_lane_mode)
+        [[unlikely]] {
+        LaneProbeRead(device_addr, device_addr + size, scheduler.CurrentTick(), 10); // q9 census
+    }
     if (g_lane_census && Common::FaultMonitor::t_is_cp_thread && !t_force_binding_sync)
         [[unlikely]] {
         g_lc[8].fetch_add(1, std::memory_order_relaxed);
@@ -5682,7 +5812,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             }
             for (const auto& copy : copies) {
                 const VAddr lo = buffer_start + copy.dstOffset;
-                LaneNoteRange(lo, lo + copy.size, scheduler.CurrentTick(), lane_side ? 3 : 1);
+                LaneNoteRange(lo, lo + copy.size, scheduler.CurrentTick(), lane_side ? 3 : 1, 9, 0);
             }
         } else {
             g_lc[13].fetch_add(1, std::memory_order_relaxed);

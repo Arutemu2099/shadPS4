@@ -5289,6 +5289,9 @@ void Liverpool::A2Execute(const CpSplit::RecordHeader& record) {
                             Vulkan::A2::Replay(*cmds, cmdbuf, *inst);
                         });
                         s.tick->store(sched.CurrentTick(), std::memory_order_release);
+                        for (const auto& [plo, phi] : s.probe_reads) {
+                            VideoCore::LaneProbeRead(plo, phi, sched.CurrentTick(), 9); // q9
+                        }
                         rasterizer->A2EndStretch();
                         // The stretch's register writes (its records are never visited), after the
                         // pass was resolved from the mirror at its first draw.
@@ -9241,6 +9244,9 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                              vk::CommandBuffer cmdbuf) { Vulkan::A2::Replay(*cmds, cmdbuf, *inst); });
         }
         st.tick->store(sched.CurrentTick(), std::memory_order_release);
+        for (const auto& [plo, phi] : st.probe_reads) {
+            VideoCore::LaneProbeRead(plo, phi, sched.CurrentTick(), 9); // q9 census
+        }
         rasterizer->A2EndStretch();
         lap(g_blc.pub_record);
         // The stretch's register writes (its records are never visited), after the pass was

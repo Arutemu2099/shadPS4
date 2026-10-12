@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <mutex>
+#include <string>
+#include <unordered_set>
+#include "common/logging/log.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/profile.h"
@@ -156,9 +161,30 @@ void Visit(Info& info, const IR::Inst& inst) {
 
 void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
     auto& info = program.info;
+    static const bool who = [] {
+        const char* env = std::getenv("SHADPS4_LANE_WHO");
+        return env && env[0] == '1';
+    }();
+    std::string rc_offs; // q9 census: ReadConst flatbuf offsets (0 = dynamic)
+    u32 rc_n = 0;
     for (IR::Block* const block : program.post_order_blocks) {
         for (IR::Inst& inst : block->Instructions()) {
             Visit(info, inst);
+            if (who && inst.GetOpcode() == IR::Opcode::ReadConst) {
+                ++rc_n;
+                if (rc_n <= 48) {
+                    rc_offs += fmt::format(" {}", inst.Flags<u32>());
+                }
+            }
+        }
+    }
+    if (who && rc_n != 0 && info.stage == Stage::Compute) {
+        static std::mutex mu;
+        static std::unordered_set<u64> seen;
+        std::scoped_lock lk{mu};
+        if (seen.insert(info.pgm_hash).second) {
+            LOG_INFO(Render_Recompiler, "LaneWhoReadConst: cs_{:08x} readconst={} types={} offs(dw):{}",
+                     info.pgm_hash, rc_n, static_cast<u32>(info.readconst_types), rc_offs);
         }
     }
 

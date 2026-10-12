@@ -499,6 +499,9 @@ private:
     std::array<u64, 7> asc_demote_reason{};
     u64 asc_flushes{};
     bool AscCandidate(const ComputePipeline* pipeline) const;
+    /// q9 census: AscCandidate's last refusal (1 heap descriptors, 2 no info, 3 images, 4 samplers,
+    /// 5 uses_dma, 6 formatted, 7 special buffer).
+    mutable u32 asc_why{};
     u64 StreamBatchId(u32 stream) const;
     u64 effective_run_counter{};
     bool bind_memo_rebound{};  // BindTextures re-found a needs_rebind image

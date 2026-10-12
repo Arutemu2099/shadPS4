@@ -113,6 +113,8 @@ inline const bool g_lane_census = [] {
 struct LaneNote {
     u64 lo, hi, tick, seq;
     u32 kind; // 0 main write, 1 main upload, 2 early write, 3 early upload
+    u32 wk{}; // q9 census: writer kind (BufferCache::SetWriterTag; 9 upload)
+    u64 wid{}; // q9 census: writer id (pipeline hash)
 };
 struct LaneTable {
     std::array<std::array<LaneNote, 8>, 4096> b{};
@@ -156,7 +158,7 @@ inline std::array<std::atomic<u64>, 20> g_lc{};
 inline u32 LaneBucket(u64 w) noexcept {
     return u32((w * 0x9E3779B97F4A7C15ull) >> 52) & 4095;
 }
-inline void LaneNoteRange(u64 lo, u64 hi, u64 tick, u32 kind) noexcept {
+inline void LaneNoteRange(u64 lo, u64 hi, u64 tick, u32 kind, u32 wk = 0, u64 wid = 0) noexcept {
     if (hi <= lo) {
         return;
     }
@@ -193,6 +195,8 @@ inline void LaneNoteRange(u64 lo, u64 hi, u64 tick, u32 kind) noexcept {
         if (last.seq != 0 && last.lo == lo && last.hi == hi && last.kind == kind) {
             last.tick = tick;
             last.seq = seq;
+            last.wk = wk;
+            last.wid = wid;
             continue;
         }
         auto& slot = t.b[k][t.pos[k]++ & 7];
@@ -200,7 +204,7 @@ inline void LaneNoteRange(u64 lo, u64 hi, u64 tick, u32 kind) noexcept {
             u64& e = g_lc_lost_win[LaneWin(w)];
             e = std::max(e, slot.tick);
         }
-        slot = {lo, hi, tick, seq, kind};
+        slot = {lo, hi, tick, seq, kind, wk, wid};
     }
 }
 /// The newest note overlapping [lo, hi) whose main tick is not complete.
@@ -221,6 +225,75 @@ inline const LaneNote* LaneFind(const LaneTable& t, u64 lo, u64 hi) noexcept {
     }
     return best;
 }
+/// q9 census (SHADPS4_LANE_WHO=1, back thread): the writer of LaneMainProducer's answer (kind 250 + src
+/// for the coarse sources, which name no note).
+inline const bool g_lane_who = [] {
+    const char* env = std::getenv("SHADPS4_LANE_WHO");
+    return env && env[0] == '1';
+}();
+inline u32 g_lc_hit_wk = 0;
+inline u64 g_lc_hit_wid = 0;
+/// q9 census: large written lane bindings (>= 8 MiB: the particle pools / arenas) and the newest main
+/// batch that READ each. Registered and stamped by the back; workers only test overlap.
+struct LaneProbe {
+    std::atomic<u64> lo{0}, hi{0};
+    u64 rd{0};
+};
+inline std::array<LaneProbe, 8> g_lprobe{};
+inline std::atomic<u32> g_lprobe_n{0};
+/// 0..4 open - newest read (4 = 4+), 5 read done, 6 never read, 7 newest read after the newest gfx label,
+/// 8 written lane bindings over a probe, 9 A2 stamps, 10 old-path / copy stamps, 11 registered.
+inline std::array<u64, 12> g_lprobe_dist{};
+/// open - g_gfx_label_tick at the same bindings (0..4 as above, 5 done).
+inline std::array<u64, 6> g_label_dist{};
+inline bool LaneProbeAny(u64 lo, u64 hi) noexcept {
+    const u32 n = g_lprobe_n.load(std::memory_order_acquire);
+    for (u32 i = 0; i < n; ++i) {
+        if (g_lprobe[i].lo.load(std::memory_order_relaxed) < hi &&
+            lo < g_lprobe[i].hi.load(std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+inline void LaneProbeRead(u64 lo, u64 hi, u64 tick, u32 ctr) noexcept {
+    const u32 n = g_lprobe_n.load(std::memory_order_relaxed);
+    for (u32 i = 0; i < n; ++i) {
+        auto& p = g_lprobe[i];
+        if (p.lo.load(std::memory_order_relaxed) < hi && lo < p.hi.load(std::memory_order_relaxed)) {
+            p.rd = std::max(p.rd, tick);
+            ++g_lprobe_dist[ctr];
+        }
+    }
+}
+/// A written lane binding: the newest read tick over the probes it overlaps (registers a big one).
+/// Returns false when no probe overlapped before this call.
+inline bool LaneProbeWrite(u64 lo, u64 hi, u64& rd) noexcept {
+    rd = 0;
+    bool hit = false;
+    const u32 n = g_lprobe_n.load(std::memory_order_relaxed);
+    for (u32 i = 0; i < n; ++i) {
+        auto& p = g_lprobe[i];
+        const u64 plo = p.lo.load(std::memory_order_relaxed);
+        const u64 phi = p.hi.load(std::memory_order_relaxed);
+        if (plo < hi && lo < phi) {
+            hit = true;
+            rd = std::max(rd, p.rd);
+        }
+    }
+    if (!hit && hi - lo >= (u64{8} << 20) && n < g_lprobe.size()) {
+        g_lprobe[n].lo.store(lo, std::memory_order_relaxed);
+        g_lprobe[n].hi.store(hi, std::memory_order_relaxed);
+        g_lprobe[n].rd = 0;
+        g_lprobe_n.store(n + 1, std::memory_order_release);
+        ++g_lprobe_dist[11];
+    }
+    return hit;
+}
+/// Defined in buffer_cache.cpp (back thread): tallies one lane binding's producer answer / probe.
+void LaneWhoNote(u64 t, u64 open, bool written, u64 lo, u64 hi);
+void LaneWhoKept(u32 reason, u64 hash);
+
 /// p1: the newest unfinished main tick that wrote or uploaded [lo, hi) (0: none known).
 inline u64 LaneMainProducer(u64 lo, u64 hi) noexcept {
     u64 t = 0;
@@ -229,11 +302,14 @@ inline u64 LaneMainProducer(u64 lo, u64 hi) noexcept {
     }
     const u64 w0 = lo >> 16, w1 = (hi - 1) >> 16;
     g_lc_src = 0;
+    g_lc_hit_wk = 0;
+    g_lc_hit_wid = 0;
     if (w1 - w0 > 63) {
         // p1e: more than the 64 windows LaneFind reads: the per-window newest ticks.
         if (w1 - w0 > 1023) {
             t = g_lc_main_newest;
             g_lc_src = 1;
+            g_lc_hit_wk = 251;
         } else {
             // p1g: the window table pre-filters; a flagged window is confirmed against the notes
             // of its bucket ring (exact range overlap). Bucket rings hold several windows' notes
@@ -246,17 +322,23 @@ inline u64 LaneMainProducer(u64 lo, u64 hi) noexcept {
                     if (e.seq != 0 && e.tick > g_lc_done && e.tick > t && e.lo < hi && lo < e.hi) {
                         t = e.tick;
                         g_lc_src = 2;
+                        g_lc_hit_wk = e.wk;
+                        g_lc_hit_wid = e.wid;
                     }
                 }
             }
         }
     } else if (const LaneNote* m = LaneFind(g_lc_main, lo, hi)) {
         t = m->tick;
+        g_lc_hit_wk = m->wk;
+        g_lc_hit_wid = m->wid;
     }
     const auto raise = [&](u64 v, u32 src) {
         if (v > g_lc_done && v > t) {
             t = v;
             g_lc_src = src;
+            g_lc_hit_wk = 250 + src;
+            g_lc_hit_wid = 0;
         }
     };
     for (u64 w = w0; w <= w1 && w <= w0 + 1023; ++w) {

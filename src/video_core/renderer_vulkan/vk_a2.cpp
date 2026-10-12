@@ -1780,6 +1780,34 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     stretch->last_seq = draw.seq;
     ++stretch->draws;
     ++owner->taken;
+    if (VideoCore::g_lane_who &&
+        VideoCore::g_lprobe_n.load(std::memory_order_relaxed) != 0) [[unlikely]] {
+        // q9 census: this draw's reads over a lane pool probe (guest slots, vertex streams, the
+        // index range, the indirect args).
+        auto& pr = stretch->probe_reads;
+        const auto add = [&](VAddr lo, u64 size) {
+            if (lo == 0 || size == 0 || pr.size() >= 256 || !VideoCore::LaneProbeAny(lo, lo + size)) {
+                return;
+            }
+            for (const auto& [a, b] : pr) {
+                if (a == lo && b == lo + size) {
+                    return;
+                }
+            }
+            pr.emplace_back(lo, lo + size);
+        };
+        for (u64 m = guest_mask; m != 0; m &= m - 1) {
+            const u32 b = static_cast<u32>(std::countr_zero(m));
+            add(o_addr[b], o_vsize[b]);
+        }
+        for (u32 k = 0; k < vb_n; ++k) {
+            add(vaddr_vi[k], attribs[k].size);
+        }
+        add(index_addr, u64(ind ? regs.num_indices : index_count) * index_size);
+        if (ind) {
+            add(draw.arg_address, 20);
+        }
+    }
     return true;
 }
 
