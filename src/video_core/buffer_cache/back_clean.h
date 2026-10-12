@@ -155,6 +155,7 @@ struct LaneTable {
 };
 inline LaneTable g_lc_main{}, g_lc_early{};
 inline u64 g_lc_seq = 0;
+inline u64 g_lc_main_seq = 0; // q25: bumped by every main note (kind < 2) before it changes main state
 /// SHADPS4_ASC_LANE (p1): the n1 notes are the lane's producer index; the main batch of the newest
 /// gfx EOP label the back wrote (labels are written at record time: WAR rule); big main notes.
 inline bool g_lane_on = false;
@@ -198,6 +199,9 @@ inline void LaneNoteRange(u64 lo, u64 hi, u64 tick, u32 kind, u32 wk = 0, u64 wi
     LbScope lb_scope{7}; // q11a
     LaneTable& t = kind >= 2 ? g_lc_early : g_lc_main;
     const u64 seq = ++g_lc_seq;
+    if (kind < 2) {
+        ++g_lc_main_seq; // q25
+    }
     const u64 w0 = lo >> 16;
     u64 w1 = (hi - 1) >> 16;
     if (w1 - w0 > 63) {
@@ -378,7 +382,7 @@ void LaneWhoNote(u64 t, u64 open, bool written, u64 rd, bool hit);
 void LaneWhoKept(u32 reason, u64 hash);
 
 /// p1: the newest unfinished main tick that wrote or uploaded [lo, hi) (0: none known).
-inline u64 LaneMainProducer(u64 lo, u64 hi) noexcept {
+inline u64 LaneMainProducerFull(u64 lo, u64 hi) noexcept {
     u64 t = 0;
     if (hi <= lo) {
         return 0;
@@ -437,6 +441,42 @@ inline u64 LaneMainProducer(u64 lo, u64 hi) noexcept {
         t = 0;
     }
     g_lc_coarse = g_lc_src != 0;
+    return t;
+}
+/// q25: SHADPS4_LANE_PRODUCER_MEMO (1 memo, 2 verify).
+inline const int g_lc_memo_mode = [] {
+    const char* e = std::getenv("SHADPS4_LANE_PRODUCER_MEMO");
+    return e && (e[0] == '1' || e[0] == '2') ? e[0] - '0' : 0;
+}();
+struct LaneProdMemo {
+    u64 lo = 0, hi = 0, seq = 0, t = 0, wid = 0;
+    u32 src = 0, wk = 0;
+};
+inline std::array<LaneProdMemo, 16> g_lc_memo{};
+inline std::array<u64, 4> g_lc_memo_c{}; // hits, misses, verified, mismatches
+inline u64 LaneMainProducer(u64 lo, u64 hi) noexcept {
+    if (g_lc_memo_mode == 0 || hi <= lo) {
+        return LaneMainProducerFull(lo, hi);
+    }
+    LaneProdMemo& m = g_lc_memo[((lo >> 12) ^ ((hi >> 12) * 0x9E3779B1ULL)) & 15];
+    if (m.seq != 0 && m.seq == g_lc_main_seq && m.lo == lo && m.hi == hi) {
+        const u64 t = m.t > g_lc_done ? m.t : 0;
+        ++g_lc_memo_c[0];
+        if (g_lc_memo_mode == 2) {
+            const u64 full = LaneMainProducerFull(lo, hi);
+            ++g_lc_memo_c[2];
+            g_lc_memo_c[3] += full != t ? 1 : 0;
+            return full;
+        }
+        g_lc_src = t != 0 ? m.src : 0;
+        g_lc_hit_wk = t != 0 ? m.wk : 0;
+        g_lc_hit_wid = t != 0 ? m.wid : 0;
+        g_lc_coarse = g_lc_src != 0;
+        return t;
+    }
+    ++g_lc_memo_c[1];
+    const u64 t = LaneMainProducerFull(lo, hi);
+    m = {lo, hi, g_lc_main_seq, t, g_lc_hit_wid, g_lc_src, g_lc_hit_wk};
     return t;
 }
 inline void EarlyInvPrune(u64 read_pos) noexcept {

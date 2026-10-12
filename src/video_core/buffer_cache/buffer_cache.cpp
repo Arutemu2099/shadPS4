@@ -4887,6 +4887,10 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         LbScope lb_scope{6}; // q11a
         g_lc_done = scheduler.GetMasterSemaphore()->KnownGpuTick();
         const u64 t = LaneMainProducer(device_addr, device_addr + size);
+        if (g_lc_memo_mode != 0 && ((g_lc_memo_c[0] + g_lc_memo_c[1]) & 0xfffff) == 0) [[unlikely]] {
+            LOG_INFO(Render_Vulkan, "q25 LaneProducerMemo: hits {} misses {} verified {} mismatches {} (mode {})",
+                     g_lc_memo_c[0], g_lc_memo_c[1], g_lc_memo_c[2], g_lc_memo_c[3], g_lc_memo_mode);
+        }
         const u64 open = scheduler.CurrentTick();
         u64 war_rd = 0;
         bool war_hit = false, war_cov = false;
