@@ -871,6 +871,14 @@ void GameMainCensusMaybeLog() {
         wait_total += m;
         waits += fmt::format(" {} {:.1f} ms/s ({:.0f}/s)", names[i], m, n);
     }
+    {
+        static constexpr const char* sc_names[] = {"prepare", "settle", "finish", "other"};
+        waits += " | q13 SendCommand queue/run ms/s:";
+        for (u32 i = 0; i < 4; ++i) {
+            waits += fmt::format(" {} {:.1f}/{:.1f}", sc_names[i], ms(g_sc_queue_ticks[i]),
+                                 ms(g_sc_run_ticks[i]));
+        }
+    }
     std::string gm_cls, all_cls;
     double gm_fault_ms = 0.0, gm_fault_n = 0.0, all_fault_ms = 0.0, all_fault_n = 0.0;
     static constexpr const char* cls_names[] = {"none", "buffer", "readback", "buffer+readback",

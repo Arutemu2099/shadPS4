@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include "common/lean.h"
@@ -100,6 +101,9 @@ struct SendCmdKind {
         t_sendcmd_kind = prev;
     }
 };
+/// q13: Game:Main's blocking SendCommand by kind: queue (enqueue -> the back starts it) and run (the callback).
+inline std::array<std::atomic<u64>, 4> g_sc_queue_ticks{};
+inline std::array<std::atomic<u64>, 4> g_sc_run_ticks{};
 /// Owner bits of the write fault being handled: 1 buffer cache, 2 readback download, 4 texture.
 inline thread_local u8 t_fault_class = 0;
 void MarkGameMainThread();

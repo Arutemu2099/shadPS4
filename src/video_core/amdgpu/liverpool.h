@@ -140,10 +140,21 @@ public:
         }
         if constexpr (wait_done) {
             std::binary_semaphore sem{0};
+            // q13: queue vs run split of Game:Main's waits (census only).
+            const bool sc_on =
+                Common::FaultMonitor::t_is_game_main && Common::FaultMonitor::GameMainCensus();
+            const u64 sc_enq = sc_on ? Common::FaultMonitor::CensusTicks() : 0;
+            u64 sc_t1 = 0, sc_t2 = 0;
             {
                 std::scoped_lock lk{submit_mutex};
-                command_queue.emplace([&sem, &func] {
+                command_queue.emplace([&sem, &func, &sc_t1, &sc_t2, sc_on] {
+                    if (sc_on) {
+                        sc_t1 = Common::FaultMonitor::CensusTicks();
+                    }
                     func();
+                    if (sc_on) {
+                        sc_t2 = Common::FaultMonitor::CensusTicks();
+                    }
                     sem.release();
                 });
                 ++num_commands;
@@ -152,8 +163,15 @@ public:
             if (split_enabled) [[unlikely]] {
                 split->WakeBackIfParked();
             }
-            Common::FaultMonitor::GameMainWaitScope gm_wait{10 + Common::FaultMonitor::t_sendcmd_kind}; // f2
-            sem.acquire();
+            {
+                Common::FaultMonitor::GameMainWaitScope gm_wait{10 + Common::FaultMonitor::t_sendcmd_kind}; // f2
+                sem.acquire();
+            }
+            if (sc_on) {
+                const u32 k = Common::FaultMonitor::t_sendcmd_kind & 3;
+                Common::FaultMonitor::g_sc_queue_ticks[k].fetch_add(sc_t1 - sc_enq, std::memory_order_relaxed);
+                Common::FaultMonitor::g_sc_run_ticks[k].fetch_add(sc_t2 - sc_t1, std::memory_order_relaxed);
+            }
         } else {
             {
                 std::scoped_lock lk{submit_mutex};

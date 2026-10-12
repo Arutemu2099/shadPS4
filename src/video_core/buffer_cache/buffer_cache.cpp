@@ -3460,7 +3460,8 @@ u64 BufferCache::PrefetchAfterLabel(VAddr label) {
         // Main writers still unfinished: the segment waits on them (rule A; an open-batch writer
         // defers it and the caller's LaneCutNow flushes main first).
         auto* master = scheduler.GetMasterSemaphore();
-        const u64 pm = PreciseProducer(copies);
+        // Review: a write is stamped at bind time and can land in the next batch: wait pm + 1.
+        const u64 pm = PreciseProducer(copies) + 1;
         if (pm > master->KnownGpuTick()) {
             master->Refresh();
             if (pm > master->KnownGpuTick()) {
@@ -3550,7 +3551,7 @@ void BufferCache::PrefetchWaiterLoop(std::stop_token stop) {
             pf_queue.erase(pf_queue.begin());
         }
         scheduler.GetAscSemaphore()->Wait(it.value);
-        if (PrefetchMode() == 1 && g_fault_guest_copy) {
+        if (PrefetchMode() == 1 && g_fault_guest_copy && !Offload::VerifyEnabled()) {
             GuestCopyFaultJob(fault_jobs[it.slot]); // slot held: never another job's
         }
         liverpool->SendCommand<false>([this, id = it.id, slot = it.slot] { PublishPrefetch(id, slot); });
@@ -3562,14 +3563,7 @@ void BufferCache::PublishPrefetch(u64 id, u32 slot) {
     FaultJob& job = fault_jobs[slot];
     if (job.state == FaultJobState::Pending && job.id == id && job.prefetch) {
         job.state = FaultJobState::Settling;
-        const u32 stream = scheduler.ActiveStream();
-        if (stream != 0) {
-            scheduler.SwitchStream(0); // =2 verify records on main
-        }
-        FinalizeFaultJob(job); // the lane value is complete: no GPU wait
-        if (stream != 0) {
-            scheduler.SwitchStream(stream);
-        }
+        FinalizeFaultJob(job); // the lane value is complete; ProcessCommands runs this on main
         ++pf_c[pf_last_ok ? 15 : 16]; // published / vetoed
     } else {
         ++pf_c[17]; // settled before the waiter (guest early or an overlap settle)
