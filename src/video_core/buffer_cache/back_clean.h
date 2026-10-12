@@ -155,7 +155,12 @@ struct LaneTable {
 };
 inline LaneTable g_lc_main{}, g_lc_early{};
 inline u64 g_lc_seq = 0;
-inline u64 g_lc_main_seq = 0; // q25: bumped by every main note (kind < 2) before it changes main state
+inline u64 g_lc_main_seq = 0;
+inline u64 g_lc_lost_max = 0, g_lc_big_max = 0; // q28: newest tick ever written to g_lc_lost_win / g_lc_big
+inline const bool g_lc_fast = [] {
+    const char* e = std::getenv("SHADPS4_LANE_PRODUCER_FAST");
+    return e && e[0] == '1';
+}(); // q25: bumped by every main note (kind < 2) before it changes main state
 /// SHADPS4_ASC_LANE (p1): the n1 notes are the lane's producer index; the main batch of the newest
 /// gfx EOP label the back wrote (labels are written at record time: WAR rule); big main notes.
 inline bool g_lane_on = false;
@@ -216,6 +221,7 @@ inline void LaneNoteRange(u64 lo, u64 hi, u64 tick, u32 kind, u32 wk = 0, u64 wi
                 g_lc_big_lost.fetch_add(1, std::memory_order_relaxed);
             }
             slot = {lo, hi, tick};
+            g_lc_big_max = std::max(g_lc_big_max, tick); // q28
         }
     }
     g_lc[14].fetch_add(1, std::memory_order_relaxed);
@@ -241,6 +247,7 @@ inline void LaneNoteRange(u64 lo, u64 hi, u64 tick, u32 kind, u32 wk = 0, u64 wi
         if (kind < 2 && g_lane_on && slot.seq != 0 && slot.tick > g_lc_done) {
             u64& e = g_lc_lost_win[LaneWin(w)];
             e = std::max(e, slot.tick);
+            g_lc_lost_max = std::max(g_lc_lost_max, slot.tick); // q28
         }
         slot = {lo, hi, tick, seq, kind, wk, wid};
     }
@@ -515,12 +522,16 @@ inline u64 LaneMainProducerFull(u64 lo, u64 hi) noexcept {
             g_lc_hit_wid = 0;
         }
     };
-    for (u64 w = w0; w <= w1 && w <= w0 + 1023; ++w) {
-        raise(g_lc_lost_win[LaneWin(w)], 6); // a lost unfinished note in this window
+    if (!g_lc_fast || g_lc_lost_max > g_lc_done) { // q28: no lost note is unfinished -> nothing to raise
+        for (u64 w = w0; w <= w1 && w <= w0 + 1023; ++w) {
+            raise(g_lc_lost_win[LaneWin(w)], 6); // a lost unfinished note in this window
+        }
     }
-    for (const LaneBig& b : g_lc_big) {
-        if (b.lo < hi && lo < b.hi) {
-            raise(b.tick, 5);
+    if (!g_lc_fast || g_lc_big_max > g_lc_done) { // q28
+        for (const LaneBig& b : g_lc_big) {
+            if (b.lo < hi && lo < b.hi) {
+                raise(b.tick, 5);
+            }
         }
     }
     raise(g_lc_big_evicted, 6); // a big note was lost: assume it covered this range
