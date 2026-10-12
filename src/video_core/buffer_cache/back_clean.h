@@ -372,7 +372,7 @@ inline u32 g_draw_stamps_n = 0;
 inline std::array<std::pair<u64, u64>, 64> g_draw_stamps{};
 inline void LaneProbeRead(u64 lo, u64 hi, u64 tick, u32 ctr, u32 site = 10) noexcept {
     const u32 n = g_lprobe_n.load(std::memory_order_relaxed);
-    if (g_draw_stamps_on && n != 0) [[unlikely]] {
+    if (g_draw_stamps_on) [[unlikely]] {
         if (g_draw_stamps_n < g_draw_stamps.size()) {
             g_draw_stamps[g_draw_stamps_n++] = {lo, hi};
         } else {

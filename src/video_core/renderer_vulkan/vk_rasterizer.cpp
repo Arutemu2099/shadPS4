@@ -9254,7 +9254,8 @@ bool Rasterizer::DrawRepeatMatch(const GraphicsPipeline* pipeline, bool rs_hit) 
 
 void Rasterizer::DrawRepeatApply(const GraphicsPipeline* pipeline, bool patch_infos) {
     if (VideoCore::g_lane_war && !Scheduler::t_lane_mode) [[unlikely]] {
-        VideoCore::LaneProbeReadAllMain(scheduler.CurrentTick()); // q9c (2b): no bindings resolved
+        // q9c (2b): no bindings resolved. q29b: a heap repeat binds new addresses -> every probe.
+        VideoCore::LaneProbeReadAllMain(scheduler.CurrentTick(), draw_repeat.heap_new.empty() ? 19u : 25u);
     }
     // What BindResources leaves besides the resolved infos (still those of the previous draw):
     // push_data. The viewport transform and the pushed registers come from this draw, the
