@@ -320,6 +320,10 @@ inline const bool g_lane_small_probes = [] {
     const char* e = std::getenv("SHADPS4_LANE_SMALL_PROBES");
     return e && e[0] == '1';
 }();
+inline const bool g_lane_probe_merge = [] { // q30 E4
+    const char* e = std::getenv("SHADPS4_LANE_PROBE_MERGE");
+    return e && e[0] == '1';
+}();
 inline u32 g_lane_war_site = 0;                      // q26 E0: stamping site of the window that set LaneProbeWrite's rd
 inline std::array<u64, 32> g_lprobe_all_c{};        // q26 E0: LaneProbeReadAll calls by site
 /// q26 E0: compact wait-site codes for Scheduler::LaneNeedMain.
@@ -443,6 +447,80 @@ inline bool LaneProbeWrite(u64 lo, u64 hi, u64 open, u64& rd, bool& hit) noexcep
             first = std::min(first, i);
             covered = covered || (plo <= lo && hi <= phi);
         }
+    }
+    if (g_lane_probe_merge && g_lane_win != 0 && !covered) {
+        // q30 E4: grow the overlapping / nearest probe (window ticks kept), else register an aligned one.
+        constexpr u64 W = u64{1} << 18;
+        constexpr u64 MaxSpan = u64{64} << 20;
+        const u64 alo = lo & ~(W - 1), ahi = (hi + W - 1) & ~(W - 1);
+        u32 pick = hit ? first : n;
+        if (!hit) {
+            u64 best = (u64{4} << 20) + 1;
+            for (u32 i = 0; i < n; ++i) {
+                const u64 plo = g_lprobe[i].lo.load(std::memory_order_relaxed);
+                const u64 phi = g_lprobe[i].hi.load(std::memory_order_relaxed);
+                const u64 gap = phi <= alo ? alo - phi : (ahi <= plo ? plo - ahi : 0);
+                if (gap < best && std::max(phi, ahi) - std::min(plo, alo) <= MaxSpan) {
+                    best = gap;
+                    pick = i;
+                }
+            }
+        }
+        if (pick < n) {
+            auto& p = g_lprobe[pick];
+            const u64 plo = p.lo.load(std::memory_order_relaxed);
+            const u64 phi = p.hi.load(std::memory_order_relaxed);
+            const u64 nlo = std::min(alo, plo), nhi = std::max(ahi, phi);
+            if (nhi - nlo <= MaxSpan && (plo & (W - 1)) == 0) {
+                const u64 shift = (plo - nlo) >> 18;
+                const u64 oldn = std::min<u64>((phi - plo + W - 1) >> 18, 256);
+                if (shift != 0) {
+                    for (u64 i = 256; i-- > shift;) {
+                        p.wrd[i] = p.wrd[i - shift];
+                        p.wsite[i] = p.wsite[i - shift];
+                    }
+                }
+                const u64 newn = std::min<u64>((nhi - nlo) >> 18, 256);
+                for (u64 i = 0; i < newn; ++i) {
+                    if (i < shift || i >= shift + oldn) {
+                        p.wrd[i] = open; // newly covered: earlier main reads were never stamped
+                        p.wsite[i] = 22;
+                    }
+                }
+                p.lo.store(nlo, std::memory_order_relaxed);
+                p.hi.store(nhi, std::memory_order_relaxed);
+                p.rd = std::max(p.rd, open);
+                g_lprobe_gen.fetch_add(1, std::memory_order_release);
+                u64 r = p.all;
+                u32 s = p.all_site;
+                const u64 i0 = (lo - nlo) >> 18, i1 = std::min<u64>((hi - 1 - nlo) >> 18, 255);
+                for (u64 k = i0; k <= i1; ++k) {
+                    if (p.wrd[k] > r) {
+                        r = p.wrd[k];
+                        s = p.wsite[k];
+                    }
+                }
+                if (r > rd) {
+                    rd = r;
+                    g_lane_war_site = s;
+                }
+                return true;
+            }
+        }
+        if (!hit && n < g_lprobe.size() && ahi - alo <= MaxSpan) {
+            g_lprobe[n].lo.store(alo, std::memory_order_relaxed);
+            g_lprobe[n].hi.store(ahi, std::memory_order_relaxed);
+            g_lprobe[n].rd = open;
+            g_lprobe[n].all = open;
+            g_lprobe[n].all_site = 21;
+            g_lane_war_site = 21;
+            g_lprobe_n.store(n + 1, std::memory_order_release);
+            g_lprobe_gen.fetch_add(1, std::memory_order_release);
+            ++g_lprobe_dist[11];
+            rd = open;
+            return true;
+        }
+        return covered;
     }
     if (!hit && hi - lo >= (g_lane_small_probes ? u64{4096} : (u64{1} << 20)) &&
         n < (g_lane_small_probes ? g_lprobe.size() : 16)) {
