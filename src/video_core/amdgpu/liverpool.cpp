@@ -785,6 +785,12 @@ const int g_asc_service = [] {
     const char* v = std::getenv("SHADPS4_ASC_SERVICE");
     return v ? std::atoi(v) : 0;
 }();
+// q14: SHADPS4_EARLY_CMD_POLL=1 - guest commands run between early ASC records (Game:Main's fault round trips).
+const bool g_early_cmd_poll = [] {
+    const char* v = std::getenv("SHADPS4_EARLY_CMD_POLL");
+    return v && v[0] == '1';
+}();
+std::atomic<u64> g_early_cmd_polls{0};
 struct AscEarlyStats {
     std::atomic<u64> dispatches{}, packets{}, in_order{}, blocked{}, skipped{};
     std::atomic<u64> forced_checks{}, upload_bytes{}, uploading_records{}, cross_waits{};
@@ -3075,11 +3081,19 @@ void Liverpool::BackLoop(std::stop_token stoken) {
     std::deque<u64> early_done;
     const bool asc_early = g_asc_early && split->early_items != nullptr && g_mtb_p3 == 0;
     u64 early_last_tsc = 0;
+    bool early_in_service = false; // q14: a command run inside the service never re-enters it
     auto early_service = [&] {
         if (split->early_head.load(std::memory_order_relaxed) ==
             split->early_tail.load(std::memory_order_acquire)) {
             return; // q11b: nothing queued (the common case between job records)
         }
+        if (early_in_service) [[unlikely]] {
+            return;
+        }
+        early_in_service = true;
+        SCOPE_EXIT {
+            early_in_service = false;
+        };
         VideoCore::LbScope lb_scope{0}; // q11a
         VideoCore::g_lb_in_service = true;
         ++VideoCore::g_lb[1];
@@ -3202,6 +3216,15 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                 (it.type == RT::Dispatch ? g_asc_early_stats.dispatches : g_asc_early_stats.packets)
                     .fetch_add(1, std::memory_order_relaxed);
                 ++head;
+                if (g_early_cmd_poll && num_commands.load(std::memory_order_relaxed) != 0) [[unlikely]] {
+                    // q14: Game:Main's fault commands do not wait for the whole service.
+                    ch.early_head.store(head, std::memory_order_release);
+                    ProcessCommands();
+                    const u64 n = g_early_cmd_polls.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if ((n & (n - 1)) == 0) {
+                        LOG_INFO(Render, "q14: {} command runs inside the early ASC service", n);
+                    }
+                }
                 continue;
             }
             if (it.type == RT::RegWrite || it.type == RT::EpochBump || it.type == RT::Diag) {
