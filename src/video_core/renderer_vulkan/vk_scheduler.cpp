@@ -960,7 +960,29 @@ u64 Scheduler::AscMainWaitValue(bool no_i1) {
     const u64 last = asc_last_submitted.load(std::memory_order_relaxed);
     const u64 precise = std::min(VideoCore::g_main_wait_asc, last);
     VideoCore::g_main_wait_asc = 0;
-    asc_semaphore->Refresh();
+    // q23: SHADPS4_ASC_KNOWN_LAZY=1 (lane only) - the counter query at most once per ~100 us; a stale (lower)
+    // g_asc_known is conservative for every reader.
+    static const bool known_lazy = [] {
+        const char* e = std::getenv("SHADPS4_ASC_KNOWN_LAZY");
+        const bool on = e && e[0] == '1';
+        if (on) {
+            LOG_INFO(Render_Vulkan, "q23: SHADPS4_ASC_KNOWN_LAZY=1 (lane: ASC semaphore refresh at most every ~100 us)");
+        }
+        return on;
+    }();
+    static u64 q23_calls = 0, q23_refresh = 0, q23_cyc = 0, q23_last = 0;
+    ++q23_calls;
+    const u64 q23_now = __rdtsc();
+    if (!(known_lazy && lane_enabled) || q23_now - q23_last > 350'000) {
+        q23_last = q23_now;
+        ++q23_refresh;
+        asc_semaphore->Refresh();
+        q23_cyc += __rdtsc() - q23_now;
+    }
+    if (lane_enabled && (q23_calls & 0xffff) == 0) {
+        LOG_INFO(Render_Vulkan, "q23 AscMainWaitValue: calls={} refreshes={} refresh cycles/call={:.0f} (lazy {})",
+                 q23_calls, q23_refresh, q23_refresh ? double(q23_cyc) / double(q23_refresh) : 0.0, known_lazy);
+    }
     VideoCore::g_asc_known = asc_semaphore->KnownGpuTick();
     // The batch being flushed took the tick NextTick() is about to return; accesses from now on
     // belong to the next one (+1). Only the falsifier reads it.
