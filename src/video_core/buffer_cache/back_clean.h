@@ -302,6 +302,8 @@ struct LaneProbe {
     std::array<u64, 256> wrd{};
     std::array<u8, 256> wsite{};
     std::array<u64, 256> wid{}; // q34: draw pipeline id of the newest stamp (census)
+    std::array<u64, 256> wargs{}; // q35 H5: the stamping draw's indirect args address (0 = not indirect)
+    std::array<u16, 256> wflip{}; // q35 H5: the back's flip count at the stamp
 };
 inline std::array<LaneProbe, 64> g_lprobe{};
 /// q26 flags (see q26_lane_exact_waits.py).
@@ -328,6 +330,24 @@ inline const bool g_lane_probe_merge = [] { // q30 E4
 inline u32 g_lane_war_site = 0;
 inline u64 g_lane_war_wid = 0;                 // q34: pipeline id of the window that set LaneProbeWrite's rd
 inline u64 g_lane_stamp_id = 0;                // q34: set by the stamping caller (ObtainBuffer: census_id)
+inline u64 g_lane_stamp_args = 0;              // q35 H5: the stamping draw's indirect args address
+inline u64 g_census_args = 0;                  // q35: the current draw's indirect args (rasterizer, census only)
+inline u64 g_census_vs = 0;                    // q35: the current draw's vertex shader hash (census only)
+inline u64 g_back_flip_seq = 0;                // q35 H5: PatchedFlip packets the back executed
+/// q35 H1: SHADPS4_LANE_COPY_NOSTAMP=1 - a fault copy recorded on the lane is not stamped as a main read.
+inline const bool g_lane_copy_nostamp = [] {
+    const char* e = std::getenv("SHADPS4_LANE_COPY_NOSTAMP");
+    return e && e[0] == '1';
+}();
+/// q35 H5: wid (fs hash, low 32 bits) + meta in bits 56..59: class (0 unknown, 1 same group, 2 other) | flips (0..3) << 2.
+inline u64 LaneH5Meta(u64 wid, u64 args, u16 flip, u64 lo) noexcept {
+    if (wid == 0) {
+        return 0;
+    }
+    const u64 cls = args == 0 ? 0 : (lo + (u64{16} << 20) >= args && lo < args + (u64{2} << 20)) ? 1 : 2;
+    const u64 fd = std::min<u64>(static_cast<u16>(static_cast<u16>(g_back_flip_seq) - flip), 3);
+    return (wid & 0xffffffffULL) | ((cls | (fd << 2)) << 56);
+}
 inline std::array<u64, 8> g_s15_size_hist{};   // q34: s15 stamps over a probe by size <64K/256K/1M/4M/12M/32M/128M/more                      // q26 E0: stamping site of the window that set LaneProbeWrite's rd
 inline std::array<u64, 32> g_lprobe_all_c{};        // q26 E0: LaneProbeReadAll calls by site
 /// q26 E0: compact wait-site codes for Scheduler::LaneNeedMain.
@@ -350,6 +370,8 @@ inline void LaneProbeWindows(LaneProbe& p, u64 lo, u64 hi, u64 v, u32 site) noex
             p.wrd[i] = v;
             p.wsite[i] = static_cast<u8>(site);
             p.wid[i] = g_lane_stamp_id;
+            p.wargs[i] = g_lane_stamp_args;
+            p.wflip[i] = static_cast<u16>(g_back_flip_seq);
         }
     }
 }
@@ -437,7 +459,8 @@ inline bool LaneProbeWrite(u64 lo, u64 hi, u64 open, u64& rd, bool& hit) noexcep
             hit = true;
             u64 r = p.rd;
             u32 s = 10;
-            u64 wid = 0;
+            u64 wid = 0, wargs = 0;
+            u16 wflip = 0;
             if (g_lane_win != 0) {
                 // q26 E1: the newest read over this write's windows only (+ the probe's floor).
                 r = p.all;
@@ -449,13 +472,15 @@ inline bool LaneProbeWrite(u64 lo, u64 hi, u64 open, u64& rd, bool& hit) noexcep
                         r = p.wrd[k];
                         s = p.wsite[k];
                         wid = p.wid[k];
+                        wargs = p.wargs[k];
+                        wflip = p.wflip[k];
                     }
                 }
             }
             if (r > rd) {
                 rd = r;
                 g_lane_war_site = s;
-                g_lane_war_wid = wid;
+                g_lane_war_wid = g_lane_seg_census ? LaneH5Meta(wid, wargs, wflip, lo) : wid;
             }
             first = std::min(first, i);
             covered = covered || (plo <= lo && hi <= phi);

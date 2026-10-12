@@ -2176,7 +2176,8 @@ void BufferCache::RecordFaultCopiesOnReadbackQueue(vk::CommandBuffer cmdbuf, vk:
 void BufferCache::RecordFaultCopies(vk::CommandBuffer cmdbuf, Buffer& source, vk::Buffer staging,
                                     std::span<const vk::BufferCopy> copies) {
     source.NoteMainAccess(scheduler.CurrentTick(), false);
-    if (g_lane_probe && Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
+    if (g_lane_probe && Common::FaultMonitor::t_is_cp_thread &&
+        !(g_lane_copy_nostamp && Vulkan::Scheduler::t_lane_mode)) [[unlikely]] { // q35 H1
         for (const auto& copy : copies) {
             const VAddr lo = source.CpuAddr() + copy.srcOffset;
             LaneProbeRead(lo, lo + copy.size, scheduler.CurrentTick(), 10, 11); // q9 census
@@ -2248,7 +2249,8 @@ bool BufferCache::AsyncFaultCopies() {
 void BufferCache::RecordFaultCopiesAsync(Buffer& source, vk::Buffer staging,
                                          std::span<const vk::BufferCopy> copies) {
     source.NoteMainAccess(scheduler.CurrentTick(), false);
-    if (g_lane_probe && Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
+    if (g_lane_probe && Common::FaultMonitor::t_is_cp_thread &&
+        !(g_lane_copy_nostamp && Vulkan::Scheduler::t_lane_mode)) [[unlikely]] { // q35 H1
         for (const auto& copy : copies) {
             const VAddr lo = source.CpuAddr() + copy.srcOffset;
             LaneProbeRead(lo, lo + copy.size, scheduler.CurrentTick(), 10, 11); // q9 census
@@ -4935,8 +4937,39 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             g_q31_pre = LaneProbeQuiet(device_addr, device_addr + size, g_q31_pre_tick);
         }
         g_lane_stamp_id = census_id; // q34
+        g_lane_stamp_args = g_census_args; // q35 H5
+        if (g_lane_seg_census && LaneProbeAny(device_addr, device_addr + size)) [[unlikely]] {
+            // q35: the read bindings behind the copy-holding stamps (big windows first, then those draws' small ones).
+            static std::vector<std::array<u64, 5>> seen;
+            static std::vector<u64> big_ids;
+            static u32 small_n = 0;
+            const bool big = size >= (u64{64} << 20);
+            const std::array<u64, 5> key{census_id, g_census_vs, device_addr, size, g_census_args};
+            const bool known_id = std::find(big_ids.begin(), big_ids.end(), census_id) != big_ids.end();
+            if ((big ? seen.size() < 48 : (known_id && small_n < 64)) &&
+                std::find(seen.begin(), seen.end(), key) == seen.end()) {
+                seen.push_back(key);
+                small_n += big ? 0 : 1;
+                if (big && !known_id) {
+                    big_ids.push_back(census_id);
+                }
+                std::string ps;
+                const u32 pn = g_lprobe_n.load(std::memory_order_relaxed);
+                for (u32 i = 0; i < pn; ++i) {
+                    const u64 plo = g_lprobe[i].lo.load(std::memory_order_relaxed);
+                    const u64 phi = g_lprobe[i].hi.load(std::memory_order_relaxed);
+                    if (plo < device_addr + size && device_addr < phi) {
+                        ps += fmt::format(" [{:#x}-{:#x}]", plo, phi);
+                    }
+                }
+                LOG_INFO(Render_Vulkan, "q35 ReadBind: fs {:08x} vs {:08x} {} {:#x} size {:#x} ({} MiB) texel {} args {:#x} "
+                         "flip {} | probes:{}", census_id, g_census_vs, big ? "WINDOW" : "small", device_addr, size,
+                         size >> 20, is_texel_buffer, g_census_args, g_back_flip_seq, ps);
+            }
+        }
         LaneProbeRead(device_addr, device_addr + size, scheduler.CurrentTick(), 10, 15); // q9 census
         g_lane_stamp_id = 0;
+        g_lane_stamp_args = 0;
     }
     if (g_lane_census && Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
         const u64 lo = device_addr, hi = device_addr + size;

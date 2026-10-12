@@ -1191,6 +1191,7 @@ private:
     u32 asc_wait_site = 0; // q26 E0: the site that set asc_wait_main
     u64 asc_wait_wid = 0;  // q34: its stamping draw pipeline id (WAR s15)
     std::unordered_map<u64, u64> lane_copy_wid_c; // q34
+    std::array<u64, 16> lane_copy_h5{}, lane_seg_h5{}; // q35 H5: held s15 copies / waiting s15 segments by (class, flips)
     std::array<u64, 324> lane_site_c{};
     u64 lane_seg_n = 0, lane_seg_unf = 0, lane_seg_behind = 0, lane_seg_log_tsc = 0;
     void LaneSegCensus(u64 wait_main, u64 value);

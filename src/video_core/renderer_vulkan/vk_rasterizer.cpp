@@ -2274,9 +2274,14 @@ void Rasterizer::ExecuteDraw(const SplitDraw& draw,
         }
         if (VideoCore::BufferCache::CensusEnabled()) [[unlikely]] {
             u64 id = 0;
+            VideoCore::g_census_vs = 0; // q35
+            VideoCore::g_census_args = 0;
             for (const auto* stage : draw.pipeline->GetStages()) {
                 if (stage && stage->l_stage == Shader::LogicalStage::Fragment) {
                     id = stage->pgm_hash;
+                }
+                if (stage && stage->l_stage == Shader::LogicalStage::Vertex) {
+                    VideoCore::g_census_vs = stage->pgm_hash;
                 }
             }
             buffer_cache.SetWriterTag(1, id);
@@ -7505,6 +7510,8 @@ void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
             }
         }
         buffer_cache.SetWriterTag(dispatch_queue == 0 ? 2 : 3, id);
+        VideoCore::g_census_vs = 0; // q35
+        VideoCore::g_census_args = 0;
     }
     dispatch_on_asc = false;
     // An indirect dispatch reads its argument buffer: BindBuffers checks it with the bindings.
@@ -8372,6 +8379,9 @@ void Rasterizer::DrawIndirectTail(const GraphicsPipeline* pipeline, bool is_inde
     }
     rs_memo.valid = false; // RENDER_STATE_MEMO: this path rewrites cb_descs / db_desc
     PrepareRenderState(pipeline);
+    if (VideoCore::g_lane_seg_census) [[unlikely]] {
+        VideoCore::g_census_args = arg_address + offset; // q35 H5
+    }
     if (!BindResources(pipeline)) {
         return;
     }

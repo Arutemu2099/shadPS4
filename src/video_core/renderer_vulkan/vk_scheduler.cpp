@@ -1944,6 +1944,9 @@ void Scheduler::LaneCopyCensus(u64 copy_value) {
         lane_copy_behind += max_wait - main_known;
         ++lane_copy_site_c[std::min<u32>(site, 323)];
         ++lane_copy_wid_c[(u64(site) << 48) ^ (wid & 0xffffffffffffULL)]; // q34
+        if (site == 256 + 15) {
+            ++lane_copy_h5[(wid >> 56) & 15]; // q35 H5
+        }
     }
     const u64 now = __rdtsc();
     if (now - lane_copy_log_tsc < 17'500'000'000ULL) {
@@ -1987,6 +1990,21 @@ void Scheduler::LaneCopyCensus(u64 copy_value) {
                  ws, h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
         lane_copy_wid_c.clear();
         VideoCore::g_s15_size_hist.fill(0);
+        // q35 H5: class 0 unknown (not indirect) / 1 same particle group as the reader's args / 2 other; flips 0..3+.
+        const auto h5 = [](const std::array<u64, 16>& a) {
+            std::string s;
+            for (u32 c = 0; c < 3; ++c) {
+                s += fmt::format(" {}:", c == 0 ? "unk" : c == 1 ? "same" : "other");
+                for (u32 f = 0; f < 4; ++f) {
+                    s += fmt::format("{}{}", f ? "/" : "", a[c | (f << 2)]);
+                }
+            }
+            return s;
+        };
+        LOG_INFO(Render_Vulkan, "q35 H5 s15 by group and flips 0/1/2/3+: held copies{} | waiting segments{}",
+                 h5(lane_copy_h5), h5(lane_seg_h5));
+        lane_copy_h5.fill(0);
+        lane_seg_h5.fill(0);
     }
     lane_copy_n = lane_copy_blocked = lane_copy_behind = lane_copy_ahead = 0;
     lane_copy_site_c.fill(0);
@@ -2002,6 +2020,9 @@ void Scheduler::LaneSegCensus(u64 wait_main, u64 value) {
         ++lane_seg_unf;
         lane_seg_behind += wait_main - known;
         ++lane_site_c[std::min<u32>(asc_wait_site, 323)];
+        if (asc_wait_site == 256 + 15) {
+            ++lane_seg_h5[(asc_wait_wid >> 56) & 15]; // q35 H5
+        }
     }
     const u64 now = __rdtsc();
     if (now - lane_seg_log_tsc < 17'500'000'000ULL) {
