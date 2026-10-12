@@ -12132,7 +12132,7 @@ void Rasterizer::BindBuffers(const Shader::BoundStage& bound, Shader::Backend::B
     // same lookup, so lane read bindings take the lean path too (SHADPS4_LANE_LEAN_READ=0: the old way).
     static const bool lane_lean = [] {
         const char* env = std::getenv("SHADPS4_LANE_LEAN_READ");
-        return !env || env[0] != '0';
+        return env && env[0] == '1'; // q11d: off by default (no gain, s653)
     }();
     const bool lean_read = lean_bind && buffer_cache.LeanReadOk() &&
                            (lane_lean || !Vulkan::Scheduler::t_lane_mode);

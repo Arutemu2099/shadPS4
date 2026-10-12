@@ -5437,9 +5437,11 @@ std::pair<Buffer*, u32> BufferCache::ObtainReadLean(VAddr device_addr, u32 size,
                   u64(buffer_id.index);
     ReadMemoEntry& entry = read_memo_table[(h ^ (h >> 31)) & (read_memo_table.size() - 1)];
     std::pair<Buffer*, u32> result{};
+    bool memo_hit = false; // q11d
     if (entry.addr == device_addr && entry.size == size && entry.buffer_index == buffer_id.index &&
         entry.epoch == epoch && entry.gen == gen && (!serial_guard || gen != 0)) {
         result = {&buffer, buffer.Offset(device_addr)};
+        memo_hit = true;
     } else if (memory_tracker->ReadSyncClean(device_addr, size)) {
         // READ_SYNC_FAST=1's clean answer: record nothing, write the memo as the full path does.
         last_sync_upload_bytes = 0;
@@ -5456,14 +5458,26 @@ std::pair<Buffer*, u32> BufferCache::ObtainReadLean(VAddr device_addr, u32 size,
         const u64 uploads = sync_upload_bytes_total;
         const auto full = ObtainBuffer(device_addr, size, false, false, buffer_id,
                                        Common::BufferSampleCaller::Uniform);
+        static u64 v_n = 0, v_bad = 0, v_bad_still = 0; // q11d (back thread)
+        ++v_n;
         if (full != result || sync_upload_bytes_total != uploads) {
-            if (++lean_stats[5] <= 20) {
+            const bool moved = g_dirty_epoch.load(std::memory_order_acquire) != epoch;
+            ++v_bad;
+            v_bad_still += moved ? 0 : 1;
+            if (++lean_stats[5] <= 40) {
                 LOG_ERROR(Render,
                           "LeanBind verify: lean read {:#x}+{:#x} -> {}+{:#x}, full -> {}+{:#x}, "
-                          "uploaded {}",
+                          "uploaded {} | q11d: {} epoch {} | lane {} early {} coherent {}",
                           device_addr, size, fmt::ptr(result.first), result.second,
-                          fmt::ptr(full.first), full.second, sync_upload_bytes_total - uploads);
+                          fmt::ptr(full.first), full.second, sync_upload_bytes_total - uploads,
+                          memo_hit ? "memo hit" : "clean check",
+                          moved ? "MOVED (a CPU write in between: race)" : "UNCHANGED (a miss)",
+                          Vulkan::Scheduler::t_lane_mode, t_force_binding_sync, coherent_live);
             }
+        }
+        if ((v_n & 0xfffff) == 0) {
+            LOG_INFO(Render, "LeanBind verify (q11d): compares {} mismatches {} with the epoch unchanged {}",
+                     v_n, v_bad, v_bad_still);
         }
         return full;
     }
