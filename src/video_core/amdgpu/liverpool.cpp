@@ -1418,10 +1418,10 @@ void BackLeanMaybeLog() {
         LOG_INFO(Render,
                  "q8 texture table (window): worker materials looked up {} all hit {} | published "
                  "pre-resolved {} rejected (generation moved) {} | back image inserts {} "
-                 "ineligible {} | kills {} image kills {} | verify {} BAD {} (cumulative) stale {}",
+                 "ineligible {} | kills {} image kills {} | verify {} BAD {} (cumulative) stale {} evictions {}",
                  tk(TT::g_c[0]), tk(TT::g_c[1]), tk(TT::g_c[2]), tk(TT::g_c[3]),
                  tk(TT::g_c[4]), tk(TT::g_c[7]), tk(TT::g_kills), tk(TT::g_img_kills),
-                 tk(TT::g_c[5]), TT::g_c[6].load(), tk(TT::g_c[8]));
+                 tk(TT::g_c[5]), TT::g_c[6].load(), tk(TT::g_c[8]), tk(TT::g_c[9]));
     }
     {
         std::string pk_s; // q4
@@ -3076,6 +3076,10 @@ void Liverpool::BackLoop(std::stop_token stoken) {
     const bool asc_early = g_asc_early && split->early_items != nullptr && g_mtb_p3 == 0;
     u64 early_last_tsc = 0;
     auto early_service = [&] {
+        if (split->early_head.load(std::memory_order_relaxed) ==
+            split->early_tail.load(std::memory_order_acquire)) {
+            return; // q11b: nothing queued (the common case between job records)
+        }
         VideoCore::LbScope lb_scope{0}; // q11a
         VideoCore::g_lb_in_service = true;
         ++VideoCore::g_lb[1];

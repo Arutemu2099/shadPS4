@@ -50,7 +50,7 @@ inline u32 Ep(u32 id) noexcept {
 }
 /// 0 worker materials looked up, 1 all hit, 2 published pre-resolved, 3 publish rejected (generation
 /// moved), 4 back inserts (images), 5 verify compares, 6 verify BAD, 7 ineligible images at insert.
-inline std::array<std::atomic<u64>, 9> g_c{}; ///< 8: verify stale (killed mid-compare)
+inline std::array<std::atomic<u64>, 10> g_c{}; ///< 8: verify stale (killed mid-compare), 9: q11b evictions of a current entry with another key
 
 inline u64 Gen() noexcept {
     return g_gen.load(std::memory_order_acquire);
@@ -109,7 +109,7 @@ struct SmpEntry {
     u64 lru{};
     std::array<u32, 4> words{};
 };
-constexpr u32 ImgSize = 4096, SmpSize = 1024;
+constexpr u32 ImgSize = 16384, SmpSize = 1024; // q11b: was 4096
 inline std::array<ImgEntry, ImgSize> g_img{};
 inline std::array<SmpEntry, SmpSize> g_smp{};
 
@@ -135,6 +135,9 @@ inline void InsertImg(u32 dkey, const std::array<u32, 8>& w, u32 slot, u32 id, u
     if (V2() && e.gen == gen && e.dkey == dkey && e.slot == slot && e.id == id && e.ep == ep &&
         e.words == w) {
         return; // q10: the same current entry (the back is the only writer)
+    }
+    if (e.seq.load(std::memory_order_relaxed) != 0 && e.gen == gen && (e.dkey != dkey || e.words != w)) {
+        g_c[9].fetch_add(1, std::memory_order_relaxed); // q11b: a current entry of another key evicted
     }
     const u64 s = e.seq.load(std::memory_order_relaxed);
     e.seq.store(s + 1, std::memory_order_relaxed);

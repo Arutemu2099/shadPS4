@@ -5553,7 +5553,7 @@ void Rasterizer::A2TexTableTouch() {
     namespace TT = VideoCore::TexTable;
     static auto last = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
-    if (now - last < std::chrono::milliseconds(4)) {
+    if (now - last < std::chrono::milliseconds(16)) { // q11b: 16384 entries (was 4096 / 4 ms)
         return;
     }
     last = now;
