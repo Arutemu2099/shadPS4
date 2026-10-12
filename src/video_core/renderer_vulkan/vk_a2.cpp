@@ -615,6 +615,7 @@ struct StretchTranslator::Impl {
     bool b_colour{};
     u64 b_vbuf{};  ///< colour: the one vertex VkBuffer of the opener
     u32 b_vmask{}; ///< colour: the opener's non-null pulled locations
+    u32 b_vptmask{}; ///< q18: the opener's page-table-pulled locations
     u32* count_ptr{};
     u8* cmd_ptr{};
     const GraphicsPipeline* b_native{};
@@ -1218,6 +1219,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     std::array<u64, 16> vb_handle{}, vcpu{}, voff{};
     u64 vbuf = 0;
     u32 vmask = 0;
+    u32 vptmask = 0; // q18: locations pulled through the page table (SHADPS4_A2_PT_VERTEX)
     for (u32 k = 0; k < vb_n; ++k) {
         const u32 loc = attribs[k].desc.location;
         if (colour && (attribs[k].desc.instanced || loc >= Shader::NativeMaxPulledLocations)) {
@@ -1235,20 +1237,41 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         vcpu[k] = vb->CpuAddr();
         voff[k] = vaddr_vi[k] - vcpu[k];
         if (colour) {
+            bool pt_loc = false;
             if ((vbuf != 0 && vb_handle[k] != vbuf) || voff[k] > 0xffffffffull) {
-                ++owner->sub[vbuf != 0 && vb_handle[k] != vbuf ? 45 : 46]; // q4: 2nd buffer / offset
-                return refuse(RefuseColourVertex);
+                if (Shader::g_pt_vertex == 0) {
+                    ++owner->sub[vbuf != 0 && vb_handle[k] != vbuf ? 45 : 46]; // q4: 2nd buffer / offset
+                    return refuse(RefuseColourVertex);
+                }
+                pt_loc = true; // q18: pulled through the page table from its full guest address
             }
             if (!vb->IsInBounds(vaddr_vi[k], attribs[k].size)) {
                 return refuse(RefuseColourStream); // NativeRingPrepare fail 7 (the run's span)
             }
-            vbuf = vb_handle[k];
+            if (pt_loc) {
+                // q18: the page-table fetch reads the same bytes as a direct bind only if the stream's last byte
+                // maps to the same cached buffer and that buffer starts on a page (entry = BDA + page distance).
+                const u64 last = vaddr_vi[k] + std::max<u64>(attribs[k].size, 1) - 1;
+                if (ctx.buffer_cache->A2LookupBuffer(last) != vb ||
+                    (vb->CpuAddr() & (VideoCore::BufferCache::CACHING_PAGESIZE - 1)) != 0) {
+                    ++owner->sub[45];
+                    return refuse(RefuseColourVertex);
+                }
+                vptmask |= 1u << loc;
+            } else {
+                vbuf = vb_handle[k];
+            }
             vmask |= 1u << loc;
         }
     }
     if (colour && vbuf == 0) {
-        ++owner->sub[47]; // q4: every stream null
+        ++owner->sub[47]; // q4: every stream null (or every stream page-table pulled: the vertex SSBO needs one)
         return refuse(RefuseColourVertex);
+    }
+    if (vptmask != 0) {
+        // q18: the shader reads the mask from buf_offsets[0..1] (native shaders never read buf_offsets).
+        push.buf_offsets[0] = static_cast<u8>(vptmask & 0xff);
+        push.buf_offsets[1] = static_cast<u8>(vptmask >> 8);
     }
 
     // Dynamic state of this draw on top of the tracked state (a copy: a refusal below must not
@@ -1294,7 +1317,8 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
                 inh_ps == b_inh_ps && ib_handle == b_ib && index_size == b_index_size &&
                 vb_n == b_vb_n && draw.vi->desc_id == last_desc_id && PushKeySame(push, b_push) &&
                 guest_mask == b_guest_mask && !AnyDirty(cand) &&
-                (!colour || (vbuf == b_vbuf && vmask == b_vmask)) && inh_slots == b_inh_slots &&
+                (!colour || (vbuf == b_vbuf && vmask == b_vmask && vptmask == b_vptmask)) &&
+                inh_slots == b_inh_slots &&
                 clip_on == b_clip && (!clip_on || planes == b_planes) && fmt_mask == b_fmt_mask;
     for (u64 m = fmt_mask; cont && m != 0; m &= m - 1) {
         // The back's member rule: a formatted slot binds the opener's own V#.
@@ -1555,7 +1579,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
             vb_changed = vb_handle[k] != b_vb[k] || bo[k] != b_vb_off[k];
         }
         sb.emit_pipeline = first_batch || native != b_native;
-        sb.emit_push = first_batch || !PushKeySame(push, b_push);
+        sb.emit_push = first_batch || !PushKeySame(push, b_push) || vptmask != b_vptmask; // q18
         sb.emit_descriptors = true; // the table is a new region every sub-batch
         sb.emit_vertex_input = first_batch || draw.vi->desc_id != last_desc_id;
         sb.emit_index = ib_changed;
@@ -1629,6 +1653,14 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         b_colour = colour;
         b_vbuf = vbuf;
         b_vmask = vmask;
+        b_vptmask = vptmask;
+        if (vptmask != 0) [[unlikely]] {
+            static std::atomic<u64> pt_batches{0};
+            const u64 n = pt_batches.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((n & (n - 1)) == 0) {
+                LOG_INFO(Render_Vulkan, "q18: {} colour sub-batches with page-table vertex streams", n);
+            }
+        }
         b_slot = slot;
         b_union = union_idx;
         b_head = head;

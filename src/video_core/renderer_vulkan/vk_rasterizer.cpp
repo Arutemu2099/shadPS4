@@ -3261,7 +3261,7 @@ void Rasterizer::NativeGpuVerify(const u32* ud, const std::array<u32, Shader::NU
         ++st.gv[0];
         return;
     }
-    if (!gpu_ok) {
+    if (gpu_ok != 1) { // q18 B: 2 = A2 translator only
         ++st.gv[1];
         return;
     }
@@ -3452,7 +3452,7 @@ bool Rasterizer::NativeRingPrepare(const GraphicsPipeline* base,
     const u32 push_inh0 = r0.push_inh, inh_vs0 = r0.inh_vs, inh_ps0 = r0.inh_ps;
     const u64 inh_slots0 = r0.inh_slots;
     std::atomic_thread_fence(std::memory_order_acquire);
-    if (r0.stamp.load(std::memory_order_relaxed) != idx + 1 || cmd0 != draw_job_cmd || !gpu_ok0) {
+    if (r0.stamp.load(std::memory_order_relaxed) != idx + 1 || cmd0 != draw_job_cmd || gpu_ok0 != 1) {
         return fail(3);
     }
     // Colour: every member must sample the opener's images and samplers (raw T# / S# words, as
@@ -3677,7 +3677,7 @@ bool Rasterizer::NativeRingPrepare(const GraphicsPipeline* base,
         const u64 inh_slots = r.inh_slots;
         std::atomic_thread_fence(std::memory_order_acquire);
         if (r.stamp.load(std::memory_order_relaxed) != mi + 1 || run_k != k || head_idx != head ||
-            !gpu_ok || uidx != union0 || !inst_known || io_ud != 0 || index_count == 0) {
+            gpu_ok != 1 || uidx != union0 || !inst_known || io_ud != 0 || index_count == 0) {
             why = 10;
             break;
         }
@@ -3901,7 +3901,7 @@ bool Rasterizer::NativeSegPrepare(const GraphicsPipeline* base,
     const u32 push_inh0 = r0.push_inh;
     const u64 inh_slots0 = r0.inh_slots;
     std::atomic_thread_fence(std::memory_order_acquire);
-    if (r0.stamp.load(std::memory_order_relaxed) != idx + 1 || cmd0 != draw_job_cmd || !gpu_ok0) {
+    if (r0.stamp.load(std::memory_order_relaxed) != idx + 1 || cmd0 != draw_job_cmd || gpu_ok0 != 1) {
         return fail(8);
     }
     // Material 0: member 0's job key is the segment's first and agrees with the back's key.
@@ -6098,7 +6098,7 @@ bool Rasterizer::NativeDirectBind(const GraphicsPipeline* base, const GraphicsPi
     const void* cmd = r0.cmd;
     std::atomic_thread_fence(std::memory_order_acquire);
     if (r0.stamp.load(std::memory_order_relaxed) != draw_job_idx + 1 || cmd != draw_job_cmd ||
-        !gpu_ok) {
+        gpu_ok != 1) {
         return fail(2);
     }
     if (inh_slots != 0) {
@@ -6289,7 +6289,7 @@ bool Rasterizer::NativeRingJoinOk() {
     const void* cmd = r.cmd;
     std::atomic_thread_fence(std::memory_order_acquire);
     if (r.stamp.load(std::memory_order_relaxed) != draw_job_idx + 1 || cmd != draw_job_cmd ||
-        !gpu_ok) {
+        gpu_ok != 1) {
         ++st.rj_fail[1];
         return false;
     }

@@ -103,6 +103,14 @@ struct NativeEmit {
     u32 vs_smp_base{};
 };
 inline thread_local NativeEmit t_native_emit{};
+/// q18: SHADPS4_A2_PT_VERTEX=1 - colour vertex streams outside the bound vertex buffer are pulled through the page
+/// table (mask bit per location in PushData::buf_offsets[0..1]).
+/// =2 (bit-exact gate only): EVERY pulled location reads through the page table (no mask), so
+/// SHADPS4_NATIVE_COLOUR_DIAG=4096 compares the page-table fetch against the real vertex input on the back's path.
+inline const int g_pt_vertex = [] {
+    const char* e = std::getenv("SHADPS4_A2_PT_VERTEX");
+    return e ? std::atoi(e) : 0;
+}();
 /// q3: SHADPS4_NATIVE_BINDLESS_VS=1.
 inline const bool g_native_bindless_vs = [] {
     const char* e = std::getenv("SHADPS4_NATIVE_BINDLESS_VS");

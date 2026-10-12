@@ -7790,7 +7790,7 @@ bool NativeSegBDraw(const PM4Header* header, const Vulkan::GraphicsPipeline* pip
     }
     // Seqlock read (Opus review 1): copy, fence, re-check the stamp, then use.
     const bool cmd_ok = src.cmd == w;
-    const bool derived = src.derived != 0, gpu_ok = src.gpu_ok != 0;
+    const bool derived = src.derived != 0, gpu_ok = src.gpu_ok == 1; // q18 B: 2 = A2 translator only
     const u32 inh_vs = src.inh_vs, inh_ps = src.inh_ps, push_inh = src.push_inh;
     const u64 inh_slots = src.inh_slots;
     const u32 io_ud = src.io_ud, vo_ud = src.vo_ud;

@@ -1318,13 +1318,105 @@ Id EmitContext::NativePullAttribute(u32 loc, Id vindex) {
     const Id aligned{OpIEqual(U1[1], sh, u32_zero_value)};
     const Id inv{OpISub(U32[1], ConstU32(32u), sh)};
     std::array<Id, 4> d{};
-    Id lo{NativeVbufLoad(dw0)};
-    for (u32 i = 0; i < ndw; ++i) {
-        const Id hi{NativeVbufLoad(OpIAdd(U32[1], dw0, ConstU32(i + 1)))};
-        const Id funnel{OpBitwiseOr(U32[1], OpShiftRightLogical(U32[1], lo, sh),
-                                    OpShiftLeftLogical(U32[1], hi, inv))};
-        d[i] = OpSelect(U32[1], aligned, lo, funnel);
-        lo = hi;
+    const auto vbuf_dwords = [&] {
+        std::array<Id, 4> r{};
+        Id lo{NativeVbufLoad(dw0)};
+        for (u32 i = 0; i < ndw; ++i) {
+            const Id hi{NativeVbufLoad(OpIAdd(U32[1], dw0, ConstU32(i + 1)))};
+            const Id funnel{OpBitwiseOr(U32[1], OpShiftRightLogical(U32[1], lo, sh),
+                                        OpShiftLeftLogical(U32[1], hi, inv))};
+            r[i] = OpSelect(U32[1], aligned, lo, funnel);
+            lo = hi;
+        }
+        return r;
+    };
+    if (native_pt && native_ring && Shader::g_pt_vertex != 0) {
+        // q18: this location's stream may sit outside the bound vertex buffer (push mask bit): read it through
+        // the page table from its full guest address, as Guest bindings (NativePtTranslate).
+        const auto pt_dwords = [&] {
+            const auto u64_of = [&](Id lo32, Id hi32) {
+                return OpBitwiseOr(U64, OpUConvert(U64, lo32),
+                                   OpShiftLeftLogical(U64, OpUConvert(U64, hi32), ConstU32(32u)));
+            };
+            const Id glo{NativeRecordLoad(Shader::NativeRecordVoffOffset + loc)};
+            const Id ghi{OpBitFieldUExtract(U32[1], NativeRecordLoad(Shader::NativeRecordVhiOffset + loc / 4),
+                                            ConstU32((loc % 4) * 8), ConstU32(8u))};
+            const Id guest{u64_of(glo, ghi)};
+            const Id a{OpIAdd(U64, guest,
+                              OpUConvert(U64, OpSelect(U32[1], in_bounds, rel, u32_zero_value)))};
+            const Id a4{OpBitwiseAnd(U64, a, Constant(U64, ~u64{3}))};
+            const Id last{OpIAdd(U64, a4, Constant(U64, u64{(ndw + 1) * 4 - 1}))};
+            const Id fallback{u64_of(NativeTableLoad(Shader::NativeTablePtFallback),
+                                     NativeTableLoad(Shader::NativeTablePtFallback + 1))};
+            const Id page{OpShiftRightLogical(U64, a4, ConstU32(VideoCore::BufferCache::CACHING_PAGEBITS))};
+            const Id last_page{
+                OpShiftRightLogical(U64, last, ConstU32(VideoCore::BufferCache::CACHING_PAGEBITS))};
+            const auto entry_at = [&](Id pg) {
+                const Id ea{OpIAdd(U64, fallback, OpShiftLeftLogical(U64, pg, ConstU32(3u)))};
+                return OpLoad(U64, OpConvertUToPtr(physical_pointer_type_u64, ea),
+                              spv::MemoryAccessMask::Aligned, 8u);
+            };
+            const Id entry{entry_at(page)};
+            const Id entry_last{entry_at(last_page)};
+            const Id distance{OpShiftLeftLogical(U64, OpISub(U64, last_page, page),
+                                                 ConstU32(VideoCore::BufferCache::CACHING_PAGEBITS))};
+            const Id contiguous{OpLogicalAnd(U1[1], OpIEqual(U1[1], entry_last, OpIAdd(U64, entry, distance)),
+                                             OpINotEqual(U1[1], entry_last, u64_zero_value))};
+            const Id miss{OpLogicalOr(U1[1], OpIEqual(U1[1], entry, u64_zero_value),
+                                      OpLogicalNot(U1[1], contiguous))};
+            const Id npages{
+                OpUConvert(U32[1], OpIAdd(U64, OpISub(U64, last_page, page), Constant(U64, u64{1})))};
+            const Id flag{OpLogicalAnd(U1[1], miss, OpINotEqual(U1[1], guest, u64_zero_value))};
+            OpFunctionCall(void_id, native_pt_fault, NativeTableLoad(Shader::NativeTableFaultAddr),
+                           NativeTableLoad(Shader::NativeTableFaultAddr + 1), OpUConvert(U32[1], page),
+                           OpSelect(U32[1], flag, npages, u32_zero_value));
+            const Id in_page{OpBitwiseAnd(U64, a4, Constant(U64, VideoCore::BufferCache::CACHING_PAGESIZE - 1))};
+            const Id dev{OpSelect(U64, miss, fallback, OpIAdd(U64, entry, in_page))};
+            const Id psh{OpShiftLeftLogical(U32[1], OpBitwiseAnd(U32[1], OpUConvert(U32[1], a), ConstU32(3u)),
+                                            ConstU32(3u))};
+            const Id paligned{OpIEqual(U1[1], psh, u32_zero_value)};
+            const Id pinv{OpISub(U32[1], ConstU32(32u), psh)};
+            std::array<Id, 5> w{};
+            for (u32 j = 0; j <= ndw; ++j) {
+                const Id ptr{OpConvertUToPtr(physical_pointer_type_u32,
+                                             OpIAdd(U64, dev, Constant(U64, u64{j} * 4)))};
+                w[j] = OpSelect(U32[1], miss, u32_zero_value,
+                                OpLoad(U32[1], ptr, spv::MemoryAccessMask::Aligned, 4u));
+            }
+            std::array<Id, 4> r{};
+            for (u32 i = 0; i < ndw; ++i) {
+                const Id funnel{OpBitwiseOr(U32[1], OpShiftRightLogical(U32[1], w[i], psh),
+                                            OpShiftLeftLogical(U32[1], w[i + 1], pinv))};
+                r[i] = OpSelect(U32[1], paligned, w[i], funnel);
+            }
+            return r;
+        };
+        if (Shader::g_pt_vertex == 2) {
+            d = pt_dwords(); // q18 bit-exact gate: every location through the page table
+        } else {
+        const Id mask_ptr{OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U32[1]),
+                                        push_data_block, ConstU32(Shader::PushData::BufOffsetIndex),
+                                        u32_zero_value)};
+        const Id use_pt{OpINotEqual(U1[1], OpBitwiseAnd(U32[1], OpLoad(U32[1], mask_ptr), ConstU32(1u << loc)),
+                                    u32_zero_value)};
+        const Id l_pt{OpLabel()};
+        const Id l_vb{OpLabel()};
+        const Id l_merge{OpLabel()};
+        OpSelectionMerge(l_merge, spv::SelectionControlMask::MaskNone);
+        OpBranchConditional(use_pt, l_pt, l_vb);
+        AddLabel(l_pt);
+        const auto dp = pt_dwords();
+        OpBranch(l_merge);
+        AddLabel(l_vb);
+        const auto dv = vbuf_dwords();
+        OpBranch(l_merge);
+        AddLabel(l_merge);
+        for (u32 i = 0; i < ndw; ++i) {
+            d[i] = OpPhi(U32[1], dp[i], l_pt, dv[i], l_vb);
+        }
+        }
+    } else {
+        d = vbuf_dwords();
     }
     const bool is_int = param.is_integer;
     const Id comp_type = param.component_type;

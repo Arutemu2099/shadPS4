@@ -1186,6 +1186,11 @@ static_assert(NR::GpuRecHiOffset == Shader::NativeRecordHiOffset);
 /// q3b: indirect records by outcome (0 total, 1 not derived, 2 index type unknown, 3 no union,
 /// 4 killed, 5 ok).
 std::array<std::atomic<u64>, 6> g_nr_ind{};
+/// q18 B: SHADPS4_NR_ITYPE_LATE=1 (see q18_pt_vertex.py).
+const bool g_nr_itype_late = [] {
+    const char* e = std::getenv("SHADPS4_NR_ITYPE_LATE");
+    return e && e[0] == '1';
+}();
 thread_local u32 t_nr_gpu_why = 0; // q3b: NativeRecGpu's exit (1-4; 0 = ok / not reached)
 /// q15: every record's NativeRecGpu exit (see q15_nr_gpu_why.py): 0 ok, 1-3 as q3b, 4 kill other, 5 stage,
 /// 6 slots, 7 unmapped V#.
@@ -1217,7 +1222,8 @@ void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
         NR::g_unions[slot].store(r.unions, std::memory_order_release);
     }
     // q4: an indirect record needs no known index type (the translator reads the mirror's).
-    if (!rec.derived || (!r.it_known && !t_nr_indirect)) {
+    const bool itype_late = g_nr_itype_late && !r.it_known && !t_nr_indirect; // q18 B
+    if (!rec.derived || (!r.it_known && !t_nr_indirect && !itype_late)) {
         t_nr_gpu_why = !rec.derived ? 1 : 2;
         if (rec.run_k == 0) {
             r.run_union = ~0u;
@@ -1408,7 +1414,7 @@ void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
         }
     }
     u.vcount = std::max(u.vcount, vcount);
-    const u32 index_size = (r.index_type & 3) == 1 ? 4u : 2u;
+    const u32 index_size = itype_late || (r.index_type & 3) == 1 ? 4u : 2u; // q18 B: unknown -> upper bound
     u.ilo = std::min(u.ilo, rec.index_addr);
     u.ihi = std::max<u64>(u.ihi, rec.index_addr + u64(rec.index_count) * index_size);
     const auto* fetch = gp->GetFetchShader();
@@ -1425,7 +1431,7 @@ void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
                 sizeof(u32) * (NR::GpuRecDwords - NR::GpuRecHiOffset));
     _mm_sfence(); // Opus G2 #5: write-combined ring memory before the union count
     rec.union_idx = r.run_union;
-    rec.gpu_ok = 1;
+    rec.gpu_ok = itype_late ? 2 : 1; // q18 B: 2 = only the A2 translator may use it
     u.n.store(rec.run_k + 1, std::memory_order_release);
 }
 
