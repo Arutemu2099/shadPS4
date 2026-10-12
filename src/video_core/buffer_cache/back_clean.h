@@ -360,8 +360,25 @@ inline bool LaneProbeAny(u64 lo, u64 hi) noexcept {
     }
     return false;
 }
+/// q29 E6: probe read ranges stamped inside the current graphics BindResources (back thread).
+inline const bool g_lane_repeat_exact = [] {
+    const char* e = std::getenv("SHADPS4_LANE_REPEAT_EXACT");
+    return e && e[0] == '1';
+}();
+inline bool g_draw_stamps_on = false;   // inside a graphics BindResources
+inline bool g_draw_stamps_valid = false; // the list describes the last full graphics bind
+inline bool g_draw_stamps_over = false;
+inline u32 g_draw_stamps_n = 0;
+inline std::array<std::pair<u64, u64>, 64> g_draw_stamps{};
 inline void LaneProbeRead(u64 lo, u64 hi, u64 tick, u32 ctr, u32 site = 10) noexcept {
     const u32 n = g_lprobe_n.load(std::memory_order_relaxed);
+    if (g_draw_stamps_on && n != 0) [[unlikely]] {
+        if (g_draw_stamps_n < g_draw_stamps.size()) {
+            g_draw_stamps[g_draw_stamps_n++] = {lo, hi};
+        } else {
+            g_draw_stamps_over = true;
+        }
+    }
     for (u32 i = 0; i < n; ++i) {
         auto& p = g_lprobe[i];
         if (p.lo.load(std::memory_order_relaxed) < hi && lo < p.hi.load(std::memory_order_relaxed)) {
@@ -467,6 +484,13 @@ inline bool LaneProbeWrite(u64 lo, u64 hi, u64 open, u64& rd, bool& hit) noexcep
 /// q9c: stamps every probe (a main read of unknown range) - back thread, outside lane mode.
 inline void LaneProbeReadAllMain(u64 tick, u32 site = 19) noexcept {
     if (g_lane_war_mode == 1 && g_lprobe_n.load(std::memory_order_relaxed) != 0) {
+        if (site == 19 && g_lane_repeat_exact && g_draw_stamps_valid && !g_draw_stamps_over) {
+            // q29 E6: the repeated draw binds what the last full graphics bind bound.
+            for (u32 i = 0; i < g_draw_stamps_n; ++i) {
+                LaneProbeRead(g_draw_stamps[i].first, g_draw_stamps[i].second, tick, 10, 24);
+            }
+            return;
+        }
         g_war_dma_all.fetch_add(1, std::memory_order_relaxed);
         LaneProbeReadAll(tick, site);
     }

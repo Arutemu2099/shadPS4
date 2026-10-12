@@ -9940,6 +9940,21 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 #if SHADPS4_BINDING_PROBE
     ProbeBindingChanges(pipeline, BoundStages(pipeline));
 #endif
+    // q29 E6: collect this graphics bind's probe read stamps for a later draw repeat.
+    const bool q29_collect = VideoCore::g_lane_repeat_exact && !pipeline->IsCompute() &&
+                             Common::FaultMonitor::t_is_cp_thread && !Scheduler::t_lane_mode;
+    if (q29_collect) {
+        VideoCore::g_draw_stamps_n = 0;
+        VideoCore::g_draw_stamps_over = false;
+        VideoCore::g_draw_stamps_valid = false;
+        VideoCore::g_draw_stamps_on = true;
+    }
+    SCOPE_EXIT {
+        if (q29_collect) {
+            VideoCore::g_draw_stamps_on = false;
+            VideoCore::g_draw_stamps_valid = true;
+        }
+    };
 
     set_write_index = 0;
     set_writes.clear();
