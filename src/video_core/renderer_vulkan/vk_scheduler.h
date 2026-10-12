@@ -618,6 +618,15 @@ public:
     bool IsAsyncRecording() const {
         return recording_worker && synchronous_scopes == 0 && !t_lane_mode;
     }
+    /// q17 (SHADPS4_LANE_COALESCE=1): an inline transfer record on the lane (back, outside a borrow) keeps the
+    /// lane's transfer group open; the next non-transfer record, a borrow or the segment's submit closes it.
+    bool LaneCoalesce() const noexcept {
+        static const bool on = [] {
+            const char* e = std::getenv("SHADPS4_LANE_COALESCE");
+            return e && e[0] == '1';
+        }();
+        return on && t_lane_mode && synchronous_scopes == 0 && !lane_rec;
+    }
     /// The command buffer an inline record writes into: the lane's in lane mode.
     vk::CommandBuffer InlineCmdbuf() const noexcept {
         return t_lane_mode ? asc_cmdbuf : current_cmdbuf;
@@ -662,6 +671,12 @@ public:
         }
         if (!IsAsyncRecording()) {
             const vk::CommandBuffer cmdbuf = InlineCmdbuf();
+            if constexpr (IsTransfer) {
+                if (LaneCoalesce()) {
+                    command(cmdbuf); // q17: the lane's group stays open across uploads
+                    return;
+                }
+            }
             CloseTransferGroup(cmdbuf);
             command(cmdbuf);
             CloseTransferGroup(cmdbuf); // no group survives a synchronous record
@@ -733,6 +748,12 @@ public:
         }
         if (!IsAsyncRecording()) {
             const vk::CommandBuffer cmdbuf = InlineCmdbuf();
+            if constexpr (IsTransfer) {
+                if (LaneCoalesce()) {
+                    command(cmdbuf, arrays...); // q17
+                    return;
+                }
+            }
             CloseTransferGroup(cmdbuf);
             command(cmdbuf, arrays...);
             CloseTransferGroup(cmdbuf);

@@ -223,7 +223,21 @@ void Scheduler::BeginTransferOnWorker(vk::CommandBuffer cmdbuf, const TransferRa
                                       const TransferRange& write) {
     TransferGroup& group = RecorderTransferGroup();
     ++g_tcs.ops;
-    if (!group.open) {
+    // q17 (b): DIAGNOSTIC, UNSAFE - skip the group-open barrier (timing only).
+    static const bool open_barrier = [] {
+        const char* e = std::getenv("SHADPS4_TRANSFER_OPEN_BARRIER");
+        const bool on = !(e && e[0] == '0');
+        if (!on) {
+            LOG_WARNING(Render_Vulkan, "q17: SHADPS4_TRANSFER_OPEN_BARRIER=0 - UNSAFE timing diagnostic");
+        }
+        return on;
+    }();
+    if (!group.open && !open_barrier) {
+        group.open = true;
+        group.num_reads = 0;
+        group.num_writes = 0;
+        ++g_tcs.groups;
+    } else if (!group.open) {
         // Everything recorded before the group -> the group's transfers (was: one such barrier
         // per op, scoped to its buffer; global is a superset).
         const vk::MemoryBarrier2 pre = {
