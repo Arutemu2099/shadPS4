@@ -1925,7 +1925,7 @@ void Scheduler::LaneCopyCensus(u64 copy_value) {
     const u64 lane_known = asc_semaphore->KnownGpuTick();
     master_semaphore.Refresh();
     const u64 main_known = master_semaphore.KnownGpuTick();
-    u64 max_wait = 0, ahead = 0;
+    u64 max_wait = 0, ahead = 0, wid = 0;
     u32 site = 0;
     for (const auto& r : lane_seg_ring) {
         if (r.value > lane_known && r.value <= copy_value) {
@@ -1933,6 +1933,7 @@ void Scheduler::LaneCopyCensus(u64 copy_value) {
             if (r.wait > max_wait) {
                 max_wait = r.wait;
                 site = r.site;
+                wid = r.wid;
             }
         }
     }
@@ -1942,6 +1943,7 @@ void Scheduler::LaneCopyCensus(u64 copy_value) {
         ++lane_copy_blocked;
         lane_copy_behind += max_wait - main_known;
         ++lane_copy_site_c[std::min<u32>(site, 323)];
+        ++lane_copy_wid_c[(u64(site) << 48) ^ (wid & 0xffffffffffffULL)]; // q34
     }
     const u64 now = __rdtsc();
     if (now - lane_copy_log_tsc < 17'500'000'000ULL) {
@@ -1969,13 +1971,30 @@ void Scheduler::LaneCopyCensus(u64 copy_value) {
              lane_copy_n, lane_copy_blocked,
              lane_copy_blocked ? double(lane_copy_behind) / double(lane_copy_blocked) : 0.0,
              lane_copy_n ? double(lane_copy_ahead) / double(lane_copy_n) : 0.0, s);
+    {
+        // q34: holding (site, draw pipeline) pairs and the s15 stamp sizes over probes.
+        std::vector<std::pair<u64, u64>> w(lane_copy_wid_c.begin(), lane_copy_wid_c.end());
+        std::sort(w.begin(), w.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        std::string ws;
+        for (size_t k = 0; k < std::min<size_t>(w.size(), 8); ++k) {
+            ws += fmt::format(" [s{} {:012x} {}]", (w[k].first >> 48) >= 256 ? (w[k].first >> 48) - 256 : (w[k].first >> 48),
+                              w[k].first & 0xffffffffffffULL, w[k].second);
+        }
+        const auto& h = VideoCore::g_s15_size_hist;
+        LOG_INFO(Render_Vulkan,
+                 "q34 holding draws:{} | s15 stamps over a probe by size <64K/256K/1M/4M/12M/32M/128M/more "
+                 "{}/{}/{}/{}/{}/{}/{}/{}",
+                 ws, h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+        lane_copy_wid_c.clear();
+        VideoCore::g_s15_size_hist.fill(0);
+    }
     lane_copy_n = lane_copy_blocked = lane_copy_behind = lane_copy_ahead = 0;
     lane_copy_site_c.fill(0);
 }
 
 void Scheduler::LaneSegCensus(u64 wait_main, u64 value) {
     // q26 E0: which site set each segment's final main wait, and whether that batch is still unfinished.
-    lane_seg_ring[lane_seg_ring_pos++ % lane_seg_ring.size()] = {value, wait_main, asc_wait_site}; // q33
+    lane_seg_ring[lane_seg_ring_pos++ % lane_seg_ring.size()] = {value, wait_main, asc_wait_site, asc_wait_wid}; // q33/q34
     ++lane_seg_n;
     master_semaphore.Refresh();
     const u64 known = master_semaphore.KnownGpuTick();

@@ -927,7 +927,7 @@ public:
     /// batch: submitted right after that batch's flush).
     /// p1d: `src` 0 exact producer, 1 coarse, 2 WAR (gfx label), 3 GDS, 4 carry; `cap`: never
     /// defer (an open-batch tick becomes the newest submitted batch).
-    void LaneNeedMain(u64 tick, u32 src = 0, bool cap = false, u32 site = ~0u) {
+    void LaneNeedMain(u64 tick, u32 src = 0, bool cap = false, u32 site = ~0u, u64 wid = 0) {
         if (tick == 0 || !asc_dirty) {
             return;
         }
@@ -952,6 +952,7 @@ public:
         if (tick > asc_wait_main) {
             asc_wait_main = tick;
             asc_wait_site = site; // q26 E0
+            asc_wait_wid = wid;   // q34
             const bool on_open = tick >= open;
             ++lane_c[on_open ? 10 : 9];
             if (on_open) {
@@ -1188,6 +1189,8 @@ private:
     u64 open_asc_value = 0;
     u64 asc_wait_main = 0;
     u32 asc_wait_site = 0; // q26 E0: the site that set asc_wait_main
+    u64 asc_wait_wid = 0;  // q34: its stamping draw pipeline id (WAR s15)
+    std::unordered_map<u64, u64> lane_copy_wid_c; // q34
     std::array<u64, 324> lane_site_c{};
     u64 lane_seg_n = 0, lane_seg_unf = 0, lane_seg_behind = 0, lane_seg_log_tsc = 0;
     void LaneSegCensus(u64 wait_main, u64 value);
@@ -1195,6 +1198,7 @@ private:
     struct LaneSegRec {
         u64 value = 0, wait = 0;
         u32 site = 0;
+        u64 wid = 0; // q34
     };
     std::array<LaneSegRec, 128> lane_seg_ring{};
     u64 lane_seg_ring_pos = 0;

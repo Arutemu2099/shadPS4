@@ -2489,7 +2489,7 @@ void LaneWarWait(Vulkan::Scheduler& sch, u64 lo, u64 hi) {
         if (w >= open) {
             g_war_open.fetch_add(1, std::memory_order_relaxed);
         }
-        sch.LaneNeedMain(w, 2, false, LaneSiteWar(g_lane_war_site));
+        sch.LaneNeedMain(w, 2, false, LaneSiteWar(g_lane_war_site), g_lane_war_wid);
         return;
     }
     g_war_label.fetch_add(g_lane_war ? 1 : 0, std::memory_order_relaxed);
@@ -4920,7 +4920,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                 if (w >= open) {
                     g_war_open.fetch_add(1, std::memory_order_relaxed);
                 }
-                scheduler.LaneNeedMain(w, 2, false, LaneSiteWar(g_lane_war_site));
+                scheduler.LaneNeedMain(w, 2, false, LaneSiteWar(g_lane_war_site), g_lane_war_wid);
             } else {
                 g_war_label.fetch_add(g_lane_war ? 1 : 0, std::memory_order_relaxed);
                 scheduler.LaneNeedMain(g_gfx_label_tick, 2, true); // WAR, never the open batch (p1d)
@@ -4934,7 +4934,9 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             g_q31_pre_tick = scheduler.CurrentTick();
             g_q31_pre = LaneProbeQuiet(device_addr, device_addr + size, g_q31_pre_tick);
         }
+        g_lane_stamp_id = census_id; // q34
         LaneProbeRead(device_addr, device_addr + size, scheduler.CurrentTick(), 10, 15); // q9 census
+        g_lane_stamp_id = 0;
     }
     if (g_lane_census && Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
         const u64 lo = device_addr, hi = device_addr + size;

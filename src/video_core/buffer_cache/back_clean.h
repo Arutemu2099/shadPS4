@@ -301,6 +301,7 @@ struct LaneProbe {
     u8 all_site{0};
     std::array<u64, 256> wrd{};
     std::array<u8, 256> wsite{};
+    std::array<u64, 256> wid{}; // q34: draw pipeline id of the newest stamp (census)
 };
 inline std::array<LaneProbe, 64> g_lprobe{};
 /// q26 flags (see q26_lane_exact_waits.py).
@@ -324,7 +325,10 @@ inline const bool g_lane_probe_merge = [] { // q30 E4
     const char* e = std::getenv("SHADPS4_LANE_PROBE_MERGE");
     return e && e[0] == '1';
 }();
-inline u32 g_lane_war_site = 0;                      // q26 E0: stamping site of the window that set LaneProbeWrite's rd
+inline u32 g_lane_war_site = 0;
+inline u64 g_lane_war_wid = 0;                 // q34: pipeline id of the window that set LaneProbeWrite's rd
+inline u64 g_lane_stamp_id = 0;                // q34: set by the stamping caller (ObtainBuffer: census_id)
+inline std::array<u64, 8> g_s15_size_hist{};   // q34: s15 stamps over a probe by size <64K/256K/1M/4M/12M/32M/128M/more                      // q26 E0: stamping site of the window that set LaneProbeWrite's rd
 inline std::array<u64, 32> g_lprobe_all_c{};        // q26 E0: LaneProbeReadAll calls by site
 /// q26 E0: compact wait-site codes for Scheduler::LaneNeedMain.
 constexpr u32 LaneSiteRaw(u32 wk) {
@@ -345,6 +349,7 @@ inline void LaneProbeWindows(LaneProbe& p, u64 lo, u64 hi, u64 v, u32 site) noex
         if (v > p.wrd[i]) {
             p.wrd[i] = v;
             p.wsite[i] = static_cast<u8>(site);
+            p.wid[i] = g_lane_stamp_id;
         }
     }
 }
@@ -388,6 +393,11 @@ inline void LaneProbeRead(u64 lo, u64 hi, u64 tick, u32 ctr, u32 site = 10) noex
         if (p.lo.load(std::memory_order_relaxed) < hi && lo < p.hi.load(std::memory_order_relaxed)) {
             p.rd = std::max(p.rd, tick);
             ++g_lprobe_dist[ctr];
+            if (site == 15 && g_lane_seg_census) [[unlikely]] {
+                const u64 sz = hi - lo; // q34
+                ++g_s15_size_hist[sz < (64u << 10) ? 0 : sz < (256u << 10) ? 1 : sz < (1u << 20) ? 2 : sz < (4u << 20) ? 3
+                                  : sz < (12u << 20) ? 4 : sz < (32u << 20) ? 5 : sz < (128u << 20) ? 6 : 7];
+            }
             if (g_lane_win != 0) {
                 // q26 E1 / E3-lite: =2 stores lookup stamps pre-adjusted (+1); A2 publish stamps (9) are exact.
                 LaneProbeWindows(p, lo, hi, (g_lane_win == 2 && site != 9) ? tick + 1 : tick, site);
@@ -427,6 +437,7 @@ inline bool LaneProbeWrite(u64 lo, u64 hi, u64 open, u64& rd, bool& hit) noexcep
             hit = true;
             u64 r = p.rd;
             u32 s = 10;
+            u64 wid = 0;
             if (g_lane_win != 0) {
                 // q26 E1: the newest read over this write's windows only (+ the probe's floor).
                 r = p.all;
@@ -437,12 +448,14 @@ inline bool LaneProbeWrite(u64 lo, u64 hi, u64 open, u64& rd, bool& hit) noexcep
                     if (p.wrd[k] > r) {
                         r = p.wrd[k];
                         s = p.wsite[k];
+                        wid = p.wid[k];
                     }
                 }
             }
             if (r > rd) {
                 rd = r;
                 g_lane_war_site = s;
+                g_lane_war_wid = wid;
             }
             first = std::min(first, i);
             covered = covered || (plo <= lo && hi <= phi);
