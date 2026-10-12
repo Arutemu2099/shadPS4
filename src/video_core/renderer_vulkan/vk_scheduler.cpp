@@ -178,6 +178,19 @@ Scheduler::Scheduler(const Instance& instance, bool allow_recording_worker)
                  "{} recording lanes)",
                  instance.GetReadbackQueueFamilyIndex(), par_rec);
     }
+    if (const char* e = std::getenv("SHADPS4_CHAIN_TIMING"); e && e[0] == '1' && !lane_enabled) {
+        // q24 (design-game-main D3): the particle chain's early-service runs in the main batch, timed.
+        chain_timer = std::make_unique<ChainTimer>();
+        chain_timer->pool = instance.GetDevice()
+                                .createQueryPoolUnique(vk::QueryPoolCreateInfo{
+                                    .queryType = vk::QueryType::eTimestamp,
+                                    .queryCount = ChainTimer::Slots * 3,
+                                })
+                                .value;
+        chain_timer->period_ns = instance.GetPhysicalDevice().getProperties().limits.timestampPeriod;
+        chain_timer->window = std::chrono::steady_clock::now();
+        LOG_INFO(Render_Vulkan, "q24: SHADPS4_CHAIN_TIMING=1 (early ASC service runs timed in the main batch)");
+    }
     AllocateWorkerCommandBuffers();
     priority_pending_ops_thread =
         std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
@@ -1623,6 +1636,97 @@ void Scheduler::BeginAscCmdbufOnWorker() {
     }));
     if (asc_timer) {
         AscTimerBegin();
+    }
+}
+
+void Scheduler::ChainTimerBegin() {
+    auto& t = *chain_timer;
+    ChainTimerCollect();
+    if (t.write_seq - t.read_seq >= ChainTimer::Slots) {
+        t.began = false; // ring full: this run is not timed
+        ++t.skipped;
+        return;
+    }
+    t.open_slot = static_cast<u32>(t.write_seq % ChainTimer::Slots);
+    t.begin_tick = master_semaphore.CurrentTick();
+    EndRendering(); // the query reset must be outside a render pass (the dispatch ends it anyway)
+    Record([pool = *t.pool, q = t.open_slot * 3](vk::CommandBuffer cmdbuf) {
+        cmdbuf.resetQueryPool(pool, q, 3);
+        cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, pool, q);
+        cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, pool, q + 1);
+    });
+    t.began = true;
+}
+
+void Scheduler::ChainTimerEnd(u32 ndisp) {
+    auto& t = *chain_timer;
+    if (!t.began) {
+        return;
+    }
+    t.began = false;
+    Record([pool = *t.pool, q = t.open_slot * 3](vk::CommandBuffer cmdbuf) {
+        cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, pool, q + 2);
+    });
+    const u64 end_tick = master_semaphore.CurrentTick();
+    t.tick[t.open_slot] = end_tick;
+    t.ndisp[t.open_slot] = ndisp;
+    t.crossed[t.open_slot] = end_tick != t.begin_tick ? 1 : 0;
+    ++t.write_seq;
+}
+
+void Scheduler::ChainTimerCollect() {
+    auto& t = *chain_timer;
+    while (t.read_seq < t.write_seq) {
+        const u32 slot = static_cast<u32>(t.read_seq % ChainTimer::Slots);
+        if (master_semaphore.KnownGpuTick() < t.tick[slot]) {
+            master_semaphore.Refresh();
+            if (master_semaphore.KnownGpuTick() < t.tick[slot]) {
+                break;
+            }
+        }
+        std::array<u64, 3> ts{};
+        const auto result = instance.GetDevice().getQueryPoolResults(
+            *t.pool, slot * 3, 3, sizeof(ts), ts.data(), sizeof(u64), vk::QueryResultFlagBits::e64);
+        ++t.read_seq;
+        if (result != vk::Result::eSuccess || ts[2] < ts[1] || ts[1] < ts[0]) {
+            ++t.bad;
+            continue;
+        }
+        const u64 span = u64(double(ts[2] - ts[1]) * t.period_ns);
+        t.span_ns += span;
+        t.lag_ns += u64(double(ts[1] - ts[0]) * t.period_ns);
+        t.max_span = std::max(t.max_span, span);
+        t.disp += t.ndisp[slot];
+        t.crossed_runs += t.crossed[slot];
+        ++t.runs;
+        ++t.hist[span < 10'000 ? 0 : span < 50'000 ? 1 : span < 200'000 ? 2 : span < 1'000'000 ? 3
+                                                                              : span < 5'000'000 ? 4 : 5];
+        if (t.prev_end != 0 && ts[1] >= t.prev_end) {
+            t.gap_ns += u64(double(ts[1] - t.prev_end) * t.period_ns);
+            ++t.gaps;
+        }
+        t.prev_end = ts[2];
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const double wall_ns =
+        double(std::chrono::duration_cast<std::chrono::nanoseconds>(now - t.window).count());
+    if (wall_ns >= 10e9) {
+        const double s = wall_ns / 1e9;
+        LOG_INFO(Render_Vulkan,
+                 "q24 ChainTiming (per s over {:.1f} s): runs {:.0f} dispatches {:.0f} | GPU span {:.1f} ms/s, "
+                 "{:.1f} us per run, {:.2f} us per dispatch, max {:.1f} us | lag behind earlier work {:.1f} ms/s "
+                 "({:.1f} us per run) | gap between runs {:.1f} us mean | span <10us/<50/<200/<1ms/<5ms/more "
+                 "{}/{}/{}/{}/{}/{} | crossed a batch {} | skipped {} bad {}",
+                 s, double(t.runs) / s, double(t.disp) / s, double(t.span_ns) / 1e6 / s,
+                 t.runs ? double(t.span_ns) / double(t.runs) / 1e3 : 0.0,
+                 t.disp ? double(t.span_ns) / double(t.disp) / 1e3 : 0.0, double(t.max_span) / 1e3,
+                 double(t.lag_ns) / 1e6 / s, t.runs ? double(t.lag_ns) / double(t.runs) / 1e3 : 0.0,
+                 t.gaps ? double(t.gap_ns) / double(t.gaps) / 1e3 : 0.0, t.hist[0], t.hist[1], t.hist[2],
+                 t.hist[3], t.hist[4], t.hist[5], t.crossed_runs, t.skipped, t.bad);
+        t.runs = t.disp = t.span_ns = t.lag_ns = t.gap_ns = t.gaps = t.crossed_runs = t.max_span = 0;
+        t.skipped = t.bad = 0;
+        t.hist.fill(0);
+        t.window = now;
     }
 }
 

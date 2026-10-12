@@ -3121,6 +3121,18 @@ void Liverpool::BackLoop(std::stop_token stoken) {
         }
         const u64 published = ch.PublishedEnd();
         const u64 read = ch.ReadPos();
+        // q24: SHADPS4_CHAIN_TIMING - this run's dispatches timed on the GPU (lane off).
+        Vulkan::Scheduler* const q24_sch =
+            rasterizer && !VideoCore::g_lane_on && rasterizer->GetScheduler().ChainTiming()
+                ? &rasterizer->GetScheduler()
+                : nullptr;
+        u32 q24_disp = 0;
+        bool q24_timed = false;
+        SCOPE_EXIT {
+            if (q24_timed) {
+                q24_sch->ChainTimerEnd(q24_disp);
+            }
+        };
         while (head != tail) {
             const auto& it = ch.early_items[head & (CpSplit::Channel::EarlySlots - 1)];
             if (it.pos < read) {
@@ -3175,6 +3187,13 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                             sch.LaneFallbackMain();
                         }
                     }
+                }
+                if (q24_sch && it.type == RT::Dispatch) [[unlikely]] {
+                    if (!q24_timed) {
+                        q24_sch->ChainTimerBegin();
+                        q24_timed = true;
+                    }
+                    ++q24_disp;
                 }
                 const u64 tx0 = __rdtsc();
                 ExecuteRecordImpl(*r);

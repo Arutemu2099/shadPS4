@@ -911,6 +911,12 @@ public:
     bool HasLane() const noexcept {
         return lane_enabled;
     }
+    /// q24: SHADPS4_CHAIN_TIMING=1 - GPU timestamps around each early ASC service run in the main batch (lane off).
+    bool ChainTiming() const noexcept {
+        return chain_timer != nullptr;
+    }
+    void ChainTimerBegin();
+    void ChainTimerEnd(u32 ndisp);
     /// Back thread: recording into the lane (SwitchStream(1) with the lane on).
     static inline thread_local bool t_lane_mode = false;
     /// Rule A: the open lane segment must run after main tick `tick` (deferred if it is the open
@@ -1184,6 +1190,23 @@ private:
         std::chrono::steady_clock::time_point window{};
     };
     std::unique_ptr<AscTimer> asc_timer;
+    struct ChainTimer { // q24
+        static constexpr u32 Slots = 8192;
+        vk::UniqueQueryPool pool; // 3 queries per slot
+        std::array<u64, Slots> tick{};
+        std::array<u32, Slots> ndisp{};
+        std::array<u8, Slots> crossed{};
+        u64 write_seq = 0, read_seq = 0, begin_tick = 0, prev_end = 0;
+        u32 open_slot = 0;
+        bool began = false;
+        double period_ns = 1.0;
+        u64 runs = 0, disp = 0, span_ns = 0, lag_ns = 0, gap_ns = 0, gaps = 0, crossed_runs = 0, max_span = 0,
+            skipped = 0, bad = 0;
+        std::array<u64, 6> hist{};
+        std::chrono::steady_clock::time_point window{};
+    };
+    std::unique_ptr<ChainTimer> chain_timer;
+    void ChainTimerCollect();
     void AscTimerBegin();
     void AscTimerEnd(u64 value);
     void AscTimerCollect();
