@@ -1779,9 +1779,29 @@ void Scheduler::LaneSubmit() {
     // q12b: queued only outside a borrow; inside one (lane or main borrow -> nested flush) the
     // recorder is drained and the segment is submitted inline.
     const bool queued = lane_rec && synchronous_scopes == 0;
+    // q12f (diagnostic): SHADPS4_LANE_REC_WAIT=1 the recorder waits for each segment on the GPU,
+    // =2 the back waits until the recorder has submitted it.
+    static const int rec_wait = [] {
+        const char* e = std::getenv("SHADPS4_LANE_REC_WAIT");
+        const int m = e ? std::atoi(e) : 0;
+        if (m != 0) {
+            LOG_INFO(Render_Vulkan, "q12f: SHADPS4_LANE_REC_WAIT={}", m);
+        }
+        return m;
+    }();
     if (queued) {
         // q12: the lane recorder ends and submits it after the segment's queued commands.
-        LaneRecPush([this, value, wait_main] { AscSubmitOnWorker(value, wait_main); });
+        if (rec_wait == 1) {
+            LaneRecPush([this, value, wait_main] {
+                AscSubmitOnWorker(value, wait_main);
+                asc_semaphore->Wait(value);
+            });
+        } else {
+            LaneRecPush([this, value, wait_main] { AscSubmitOnWorker(value, wait_main); });
+        }
+        if (rec_wait == 2) {
+            LaneRecDrain();
+        }
     } else {
         if (lane_rec) {
             LaneRecDrain(); // the worker idle: the back owns asc_cmdbuf now
@@ -1966,7 +1986,11 @@ void Scheduler::AscSubmitOnWorker(u64 value, u64 wait_main) {
         .pSignalSemaphores = &signal_sema,
     };
     const auto result = instance.GetAscQueue().submit(submit_info);
-    ASSERT_MSG(result != vk::Result::eErrorDeviceLost, "Device lost during ASC submit");
+    ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
+               "Device lost during ASC submit (q12f: value {} wait_main {} main gpu {} asc gpu {} "
+               "recorder thread {})",
+               value, wait_main, master_semaphore.KnownGpuTick(), asc_semaphore->KnownGpuTick(),
+               t_lane_mode && lane_rec);
     asc_cmdbuf = nullptr;
     if (worker_stream == 1) {
         BeginAscCmdbufOnWorker();
