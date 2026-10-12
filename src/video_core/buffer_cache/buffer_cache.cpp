@@ -6382,6 +6382,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     if (total_size_bytes != 0) {
         // Upload volume, every ~5 s, only from calls that upload (NATIVE_COHERENT pair check).
         ++sync_upload_calls;
+        Common::FaultMonitor::sync_upload_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
+        Common::FaultMonitor::sync_upload_calls.fetch_add(1, std::memory_order_relaxed);
         const u64 now = __rdtsc();
         if (now - sync_upload_log_tsc > 17'500'000'000ULL) {
             sync_upload_log_tsc = now;

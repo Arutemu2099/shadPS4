@@ -48,6 +48,8 @@ std::atomic<u64> guest_write_ns{0};
 std::atomic<u64> jit_patch_faults{0};
 std::atomic<u64> jit_patch_ns{0};
 std::atomic<u64> presented_frames{0};
+std::atomic<u64> sync_upload_bytes{0};
+std::atomic<u64> sync_upload_calls{0};
 std::atomic<u64> frame_last_ns{0};
 std::atomic<u64> frame_max_ns{0};
 std::atomic<u64> frame_over_10ms{0};
@@ -595,7 +597,7 @@ std::ofstream OpenCsv() {
                "up_fastpath_pct,"
                "up_memohit_pct,"
                "frame_max_ms,frames_over_10ms,frames_over_17ms,frames_over_33ms,frame_slow_ms,"
-               "front_idle_ms,front_wait_ms,back_idle_ms,rf_guest_ms\n";
+               "front_idle_ms,front_wait_ms,back_idle_ms,rf_guest_ms,upload_kb_per_frame,uploads_per_frame\n";
         csv.flush();
         LOG_INFO(Render, "FaultMonitor: rate CSV at {}", FS::PathToUTF8String(path));
     } else {
@@ -840,7 +842,7 @@ void GameMainCensusMaybeLog() {
     // SHADPS4_GAME_MAIN_CENSUS_WINDOW_S (2026-10-12, play telemetry): window length, default 10 s.
     static const double window = [] {
         const char* v = std::getenv("SHADPS4_GAME_MAIN_CENSUS_WINDOW_S");
-        return v ? std::clamp(std::atof(v), 1.0, 600.0) : 10.0;
+        return v ? std::clamp(std::atof(v), 0.5, 600.0) : 10.0;
     }();
     const double sec = double(now - last_tsc) / 3.5e9;
     if (sec < window) {
@@ -1458,7 +1460,7 @@ void ReportLoop() {
                 "{:.3f},{:.3f},{:.3f},{:.3f},{:.4f},{:.3f},{:.4f},{:.3f},"
                 "{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},"
                 "{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},"
-                "{:.2f},{:.2f},{:.1f},{:.3f},{:.3f},{:.3f},{:.3f},{:.1f},{:.2f},{:.3f},{:.3f},{:.1f},{:.2f},{:.3f},{:.3f},{:.2f},{:.1f},{:.2f},{:.2f},{:.2f},{},{},{},{:.1f},{:.1f},{:.1f},{:.1f},{:.1f}\n",
+                "{:.2f},{:.2f},{:.1f},{:.3f},{:.3f},{:.3f},{:.3f},{:.1f},{:.2f},{:.3f},{:.3f},{:.1f},{:.2f},{:.3f},{:.3f},{:.2f},{:.1f},{:.2f},{:.2f},{:.2f},{},{},{},{:.1f},{:.1f},{:.1f},{:.1f},{:.1f},{:.1f},{:.2f}\n",
                 elapsed, fps, read_rate, write_rate, jit_rate, per_frame, read_us, write_us,
                 handler_pct, cur.read, cur.read_unhandled, cur.write, cur.write_unhandled, cur.jit,
                 cur.frames, cur.fragments, static_cast<double>(d_adds) / dt,
@@ -1481,7 +1483,13 @@ void ReportLoop() {
                 frame_over_17ms.exchange(0, std::memory_order_relaxed),
                 frame_over_33ms.exchange(0, std::memory_order_relaxed),
                 static_cast<double>(frame_slow_ns.exchange(0, std::memory_order_relaxed)) / 1e6,
-                front_idle_ms, front_wait_ms, back_idle_ms, rf_guest_ms);
+                front_idle_ms, front_wait_ms, back_idle_ms, rf_guest_ms,
+                d_frames ? static_cast<double>(sync_upload_bytes.exchange(0, std::memory_order_relaxed)) /
+                               1024.0 / static_cast<double>(d_frames)
+                         : 0.0,
+                d_frames ? static_cast<double>(sync_upload_calls.exchange(0, std::memory_order_relaxed)) /
+                               static_cast<double>(d_frames)
+                         : 0.0);
             csv.flush(); // a killed process must not lose the curve
         }
 

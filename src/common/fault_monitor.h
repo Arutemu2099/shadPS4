@@ -49,6 +49,9 @@ extern std::atomic<u64> guest_write_ns;
 extern std::atomic<u64> jit_patch_faults;
 extern std::atomic<u64> jit_patch_ns;
 extern std::atomic<u64> presented_frames;
+// Buffer bytes / calls SynchronizeBuffer uploaded (per-second CSV columns, 2026-10-12 play telemetry).
+extern std::atomic<u64> sync_upload_bytes;
+extern std::atomic<u64> sync_upload_calls;
 // Frame-interval statistics of the current report window (2026-10-02): written by the presenter
 // thread in CountPresentedFrame, read and reset by the report thread.
 extern std::atomic<u64> frame_last_ns;
