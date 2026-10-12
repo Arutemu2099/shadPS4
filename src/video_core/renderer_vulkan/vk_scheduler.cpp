@@ -2089,8 +2089,10 @@ void Scheduler::LaneCopyCensus(u64 copy_value) {
             }
             return s;
         };
-        LOG_INFO(Render_Vulkan, "q35 H5 s15 by group and flips 0/1/2/3+: held copies{} | waiting segments{}",
-                 h5(lane_copy_h5), h5(lane_seg_h5));
+        LOG_INFO(Render_Vulkan, "q35 H5 s15 by group and flips 0/1/2/3+: held copies{} | waiting segments{} | q38 window "
+                 "reads lowered by the extent check {}",
+                 h5(lane_copy_h5), h5(lane_seg_h5), VideoCore::g_lane_ext_saved);
+        VideoCore::g_lane_ext_saved = 0;
         lane_copy_h5.fill(0);
         lane_seg_h5.fill(0);
     }

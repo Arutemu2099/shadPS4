@@ -4424,7 +4424,7 @@ void BufferCache::BindVertexBuffersDerived(
         std::span<const vk::DeviceSize>{host_sizes}, std::span<const vk::DeviceSize>{host_strides});
 }
 
-const Buffer* BufferCache::NativeBufferAt(VAddr addr, u64 size) {
+const Buffer* BufferCache::NativeBufferAt(VAddr addr, u64 size, u32 site) {
     if (addr == 0) {
         return nullptr;
     }
@@ -4437,8 +4437,17 @@ const Buffer* BufferCache::NativeBufferAt(VAddr addr, u64 size) {
         !Vulkan::Scheduler::t_lane_mode) [[unlikely]] {
         // q9b: the native back paths read through the page table (segment members); the whole
         // cached buffer counts as read (conservative). q26 E2: the caller's range when it has one.
-        if (g_lane_native_exact && size != 0) {
+        // q37 H2: SHADPS4_LANE_LOOKUP_NOSTAMP=1 - handle lookups with no GPU read of their own (31-33) do not stamp.
+        static const bool lookup_nostamp = [] {
+            const char* e = std::getenv("SHADPS4_LANE_LOOKUP_NOSTAMP");
+            return e && e[0] == '1';
+        }();
+        if (lookup_nostamp && site >= 31 && site <= 33) {
+            // no stamp
+        } else if (g_lane_native_exact && size != 0) {
             LaneProbeRead(addr, addr + size, scheduler.CurrentTick(), 10, 12);
+        } else if (site != 23) {
+            LaneProbeRead(found.CpuAddr(), found.CpuAddr() + found.SizeBytes(), scheduler.CurrentTick(), 10, site);
         } else {
             LaneProbeRead(found.CpuAddr(), found.CpuAddr() + found.SizeBytes(), scheduler.CurrentTick(), 10, 23);
         }

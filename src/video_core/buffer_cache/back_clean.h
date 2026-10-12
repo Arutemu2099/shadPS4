@@ -304,6 +304,9 @@ struct LaneProbe {
     std::array<u64, 256> wid{}; // q34: draw pipeline id of the newest stamp (census)
     std::array<u64, 256> wargs{}; // q35 H5: the stamping draw's indirect args address (0 = not indirect)
     std::array<u16, 256> wflip{}; // q35 H5: the back's flip count at the stamp
+    // q38: byte extent (offsets in the window) of the stamps at wrd's tick; wprev = max tick of every older stamp.
+    std::array<u64, 256> wprev{};
+    std::array<u32, 256> wxlo{}, wxhi{};
 };
 inline std::array<LaneProbe, 64> g_lprobe{};
 /// q26 flags (see q26_lane_exact_waits.py).
@@ -332,6 +335,12 @@ inline u64 g_lane_war_wid = 0;                 // q34: pipeline id of the window
 inline u64 g_lane_stamp_id = 0;                // q34: set by the stamping caller (ObtainBuffer: census_id)
 inline u64 g_lane_stamp_args = 0;              // q35 H5: the stamping draw's indirect args address
 inline u64 g_lane_war_win = 0, g_lane_war_args = 0; // q36c: the window (and its stamp's args) that set the WAR rd
+/// q38: SHADPS4_LANE_WIN_EXTENT=1 - window reads are byte extents of the newest tick + an older-tick floor (see q38 patch).
+inline const bool g_lane_win_extent = [] {
+    const char* e = std::getenv("SHADPS4_LANE_WIN_EXTENT");
+    return e && e[0] == '1';
+}();
+inline u64 g_lane_ext_saved = 0; // q38 census: window reads that the extent check lowered
 /// q36c census: SHADPS4_Q35_FS=hash[,hash...] (hex fs hashes) - log those draws' s15 stamps over probes and the lane
 /// writes their stamps hold.
 inline const std::array<u64, 4> g_q35_fs = [] {
@@ -389,6 +398,22 @@ inline void LaneProbeWindows(LaneProbe& p, u64 lo, u64 hi, u64 v, u32 site) noex
     }
     const u64 i0 = std::min<u64>((a - plo) >> 18, 255), i1 = std::min<u64>((b - 1 - plo) >> 18, 255);
     for (u64 i = i0; i <= i1; ++i) {
+        if (g_lane_win_extent) {
+            // q38: this stamp's bytes inside window i.
+            const u64 wb = plo + (i << 18);
+            const u32 xlo = static_cast<u32>(std::max(a, wb) - wb);
+            const u32 xhi = static_cast<u32>(std::min(b, wb + (u64{1} << 18)) - wb);
+            if (v > p.wrd[i]) {
+                p.wprev[i] = p.wrd[i]; // the old extent's tick now covers the whole window
+                p.wxlo[i] = xlo;
+                p.wxhi[i] = xhi;
+            } else if (v == p.wrd[i]) {
+                p.wxlo[i] = std::min(p.wxlo[i], xlo);
+                p.wxhi[i] = std::max(p.wxhi[i], xhi);
+            } else {
+                p.wprev[i] = std::max(p.wprev[i], v);
+            }
+        }
         if (v > p.wrd[i]) {
             p.wrd[i] = v;
             p.wsite[i] = static_cast<u8>(site);
@@ -397,6 +422,23 @@ inline void LaneProbeWindows(LaneProbe& p, u64 lo, u64 hi, u64 v, u32 site) noex
             p.wflip[i] = static_cast<u16>(g_back_flip_seq);
         }
     }
+}
+/// q38: the read tick window k of probe p (base plo) holds for a write [lo, hi).
+inline u64 LaneWinRead(const LaneProbe& p, u64 k, u64 plo, u64 lo, u64 hi) noexcept {
+    if (!g_lane_win_extent) {
+        return p.wrd[k];
+    }
+    const u64 wb = plo + (k << 18);
+    const bool over = p.wxlo[k] < p.wxhi[k] && wb + p.wxlo[k] < hi && lo < wb + p.wxhi[k];
+    const u64 r = std::max(p.wprev[k], over ? p.wrd[k] : 0);
+    g_lane_ext_saved += r < p.wrd[k] ? 1 : 0;
+    return r;
+}
+/// q38: a window whose tick is set without a byte range (growth, re-base): full extent.
+inline void LaneWinFull(LaneProbe& p, u64 k) noexcept {
+    p.wprev[k] = p.wrd[k];
+    p.wxlo[k] = 0;
+    p.wxhi[k] = 1u << 18;
 }
 inline std::atomic<u32> g_lprobe_n{0};
 /// 0..4 open - newest read (4 = 4+), 5 read done, 6 never read, 7 newest read after the newest gfx label,
@@ -491,8 +533,9 @@ inline bool LaneProbeWrite(u64 lo, u64 hi, u64 open, u64& rd, bool& hit) noexcep
                 const u64 a = std::max(lo, plo), b = std::min(hi, phi);
                 const u64 i0 = std::min<u64>((a - plo) >> 18, 255), i1 = std::min<u64>((b - 1 - plo) >> 18, 255);
                 for (u64 k = i0; k <= i1; ++k) {
-                    if (p.wrd[k] > r) {
-                        r = p.wrd[k];
+                    const u64 wr = LaneWinRead(p, k, plo, lo, hi); // q38
+                    if (wr > r) {
+                        r = wr;
                         s = p.wsite[k];
                         wid = p.wid[k];
                         wargs = p.wargs[k];
@@ -541,6 +584,9 @@ inline bool LaneProbeWrite(u64 lo, u64 hi, u64 open, u64& rd, bool& hit) noexcep
                     for (u64 i = 256; i-- > shift;) {
                         p.wrd[i] = p.wrd[i - shift];
                         p.wsite[i] = p.wsite[i - shift];
+                        p.wprev[i] = p.wprev[i - shift]; // q38
+                        p.wxlo[i] = p.wxlo[i - shift];
+                        p.wxhi[i] = p.wxhi[i - shift];
                     }
                 }
                 const u64 newn = std::min<u64>((nhi - nlo) >> 18, 256);
@@ -548,6 +594,7 @@ inline bool LaneProbeWrite(u64 lo, u64 hi, u64 open, u64& rd, bool& hit) noexcep
                     if (i < shift || i >= shift + oldn) {
                         p.wrd[i] = open; // newly covered: earlier main reads were never stamped
                         p.wsite[i] = 22;
+                        LaneWinFull(p, i); // q38
                     }
                 }
                 p.lo.store(nlo, std::memory_order_relaxed);
@@ -558,8 +605,9 @@ inline bool LaneProbeWrite(u64 lo, u64 hi, u64 open, u64& rd, bool& hit) noexcep
                 u32 s = p.all_site;
                 const u64 i0 = (lo - nlo) >> 18, i1 = std::min<u64>((hi - 1 - nlo) >> 18, 255);
                 for (u64 k = i0; k <= i1; ++k) {
-                    if (p.wrd[k] > r) {
-                        r = p.wrd[k];
+                    const u64 wr = LaneWinRead(p, k, nlo, lo, hi); // q38
+                    if (wr > r) {
+                        r = wr;
                         s = p.wsite[k];
                     }
                 }
@@ -613,6 +661,9 @@ inline bool LaneProbeWrite(u64 lo, u64 hi, u64 open, u64& rd, bool& hit) noexcep
                 p.all_site = 22;
                 p.wrd.fill(0);
                 p.wsite.fill(0);
+                p.wprev.fill(0); // q38: the floor `all` covers every earlier stamp
+                p.wxlo.fill(0);
+                p.wxhi.fill(0);
             }
             g_lane_war_site = 22;
             g_lprobe_gen.fetch_add(1, std::memory_order_release);
@@ -644,7 +695,7 @@ inline bool LaneProbeQuiet(u64 lo, u64 hi, u64 open) noexcept {
         const u64 a = std::max(lo, plo), b = std::min(hi, phi);
         const u64 i0 = std::min<u64>((a - plo) >> 18, 255), i1 = std::min<u64>((b - 1 - plo) >> 18, 255);
         for (u64 k = i0; k <= i1; ++k) {
-            if (p.wrd[k] >= open) {
+            if (LaneWinRead(p, k, plo, lo, hi) >= open) { // q38
                 return false;
             }
         }

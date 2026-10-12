@@ -9504,7 +9504,7 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                             x.verify_mid.fetch_add(1, std::memory_order_relaxed);
                             continue;
                         }
-                        const auto* buf = rasterizer->A2BufferCache().NativeBufferAt(c.addr);
+                        const auto* buf = rasterizer->A2BufferCache().NativeBufferAt(c.addr, 0, 32);
                         const u64 clamp =
                             Core::Memory::Instance()->ClampRangeSize(c.addr, c.vsize);
                         const bool ok = buf && c.addr - buf->CpuAddr() == c.off &&
@@ -9556,7 +9556,7 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                             x.verify_mid.fetch_add(1, std::memory_order_relaxed);
                             continue;
                         }
-                        const auto* buf = rasterizer->A2BufferCache().NativeBufferAt(c.addr);
+                        const auto* buf = rasterizer->A2BufferCache().NativeBufferAt(c.addr, 0, 33);
                         const bool ok = buf && static_cast<u32>(buf->CpuAddr()) == c.base;
                         x.fmt_cmp.fetch_add(1, std::memory_order_relaxed);
                         if (!ok && x.fmt_bad.fetch_add(1, std::memory_order_relaxed) < 16) {

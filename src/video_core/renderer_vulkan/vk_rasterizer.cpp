@@ -3296,7 +3296,7 @@ void Rasterizer::NativeGpuVerify(const u32* ud, const std::array<u32, Shader::NU
                 continue;
             }
             const u32 loc = attribs[a].desc.location;
-            const auto* vb = buffer_cache.NativeBufferAt(vaddr[a]);
+            const auto* vb = buffer_cache.NativeBufferAt(vaddr[a], 0, 27);
             if (loc >= Shader::NativeMaxPulledLocations || !vb) {
                 continue;
             }
@@ -3308,7 +3308,7 @@ void Rasterizer::NativeGpuVerify(const u32* ud, const std::array<u32, Shader::NU
         }
     }
     if (why.empty()) {
-        const auto* ib = buffer_cache.NativeBufferAt(index_addr);
+        const auto* ib = buffer_cache.NativeBufferAt(index_addr, 0, 28);
         const u32 want_first =
             ib ? static_cast<u32>((index_addr - ib->CpuAddr()) / b.index_size) : ~0u;
         const auto& regs = liverpool->BackRegs();
@@ -3623,7 +3623,7 @@ bool Rasterizer::NativeRingPrepare(const GraphicsPipeline* base,
         if ((eq_mask & bit) && first_addr[bi] == o_addr[bi]) {
             // Every draw of the run binds the opener's own V# here (e.g. the 2.4 GB window): the
             // opener's generic bind synced it; no span.
-            const VideoCore::Buffer* buf = buffer_cache.NativeBufferAt(o_addr[bi]);
+            const VideoCore::Buffer* buf = buffer_cache.NativeBufferAt(o_addr[bi], 0, 29);
             if (!buf || std::bit_cast<u64>(static_cast<VkBuffer>(buf->Handle())) != b.buf[bi]) {
                 return fail(5);
             }
@@ -4016,7 +4016,7 @@ bool Rasterizer::NativeSegPrepare(const GraphicsPipeline* base,
         // (the descriptor path: scalar reads of this slot by members outside it are a known gap,
         // sec. 19); the pt loads address each member's range through the page table and flag
         // uncached / non-contiguous pages for ProcessFaultBuffer.
-        const VideoCore::Buffer* ob = buffer_cache.NativeBufferAt(o_addr[bi]);
+        const VideoCore::Buffer* ob = buffer_cache.NativeBufferAt(o_addr[bi], 0, 30);
         if (!ob) {
             return fail(6);
         }
@@ -5088,7 +5088,7 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         std::array<u64, Shader::NUM_BUFFERS> cpu{};
         for (u32 i = 0; i < Shader::NUM_BUFFERS; ++i) {
             if (b.guest_mask & (u64{1} << i)) {
-                const auto* ob = buffer_cache.NativeBufferAt(open_addr[i]);
+                const auto* ob = buffer_cache.NativeBufferAt(open_addr[i], 0, 31);
                 cpu[i] = ob ? ob->CpuAddr() : 0;
             }
         }
