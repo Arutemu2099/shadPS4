@@ -1707,17 +1707,34 @@ void Scheduler::LaneRecSync() {
     if (!lane_rec) {
         return;
     }
+    // q12e: calls / calls that waited / wait cycles since the last log (any thread: under the lock).
+    static u64 s_calls = 0, s_waited = 0, s_cyc = 0, s_log = 0;
     std::unique_lock lk{lane_rec_mu};
+    ++s_calls;
+    const u64 now0 = __rdtsc();
+    if (now0 - s_log > 17'500'000'000ULL) {
+        if (s_log != 0) {
+            const double secs = double(now0 - s_log) / 3.5e9;
+            LOG_INFO(Render_Vulkan,
+                     "q12e LaneRecSync (before deferred operations): {:.0f} calls/s, {:.0f} waited/s, "
+                     "wait {:.2f} ms/s",
+                     double(s_calls) / secs, double(s_waited) / secs, double(s_cyc) / 3.5e6 / secs);
+        }
+        s_log = now0;
+        s_calls = s_waited = s_cyc = 0;
+    }
     const u64 target = lane_rec_pushed;
     if (lane_rec_done >= target) {
         return;
     }
+    ++s_waited;
     ++lane_rec_waiters;
     if (lane_rec_sleeping) {
         lane_rec_cv.notify_one();
     }
     lane_rec_idle_cv.wait(lk, [this, target] { return lane_rec_done >= target; });
     --lane_rec_waiters;
+    s_cyc += __rdtsc() - now0;
 }
 
 void Scheduler::LaneSwitch(u32 stream) {
