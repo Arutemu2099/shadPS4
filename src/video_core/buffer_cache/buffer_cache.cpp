@@ -635,6 +635,8 @@ static std::pair<VAddr, u64> WidenReadFault(const Buffer& buffer, VAddr device_a
     return {begin, end - begin};
 }
 
+extern BufferCache* g_discard_cache; // SHADPS4_PARTICLE_ARENA_DISCARD, defined below
+
 BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                          AmdGpu::Liverpool* liverpool_, TextureCache& texture_cache_,
                          PageManager& tracker)
