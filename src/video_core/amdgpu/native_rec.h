@@ -133,15 +133,21 @@ inline std::atomic<u32* (*)(u32 slot)> g_gpu_alloc{nullptr};
 inline std::array<std::atomic<u64>, MaxSlots> g_gpu_handles{};
 /// SHADPS4_NATIVE_SEG: the ring's device address (published before its handle; 0: none).
 inline std::array<std::atomic<u64>, MaxSlots> g_gpu_bda{};
+/// q47: one cache line per job slot for the per-draw stores below (16 slots shared two lines:
+/// every job thread's per-draw store took the line from the others).
+template <typename T>
+struct alignas(64) PaddedAtomic : std::atomic<T> {
+    PaddedAtomic() noexcept : std::atomic<T>(T{}) {}
+};
 /// The job thread's next ring index (relaxed; the back's ring-lifetime check).
-inline std::array<std::atomic<u32>, MaxSlots> g_job_next{};
+inline std::array<PaddedAtomic<u32>, MaxSlots> g_job_next{};
 
 constexpr u32 PayloadBits = 23; // 8 MB per thread
 constexpr u64 PayloadSize = u64{1} << PayloadBits;
 inline std::array<std::atomic<u8*>, MaxSlots> g_payloads{};
 /// Opus review 2: per slot, the payload position the job thread has claimed up to (published
 /// before it writes there). A reader's bytes at [pos, ...) are intact iff claim - pos <= size.
-inline std::array<std::atomic<u64>, MaxSlots> g_payload_claim{};
+inline std::array<PaddedAtomic<u64>, MaxSlots> g_payload_claim{};
 /// Slot 15 is shared by every thread past the 14th: no records there (review 6).
 constexpr u32 MaxRecordSlot = 14;
 

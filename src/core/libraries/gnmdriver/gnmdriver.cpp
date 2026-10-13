@@ -568,20 +568,47 @@ u64 ShaderHashNoAssert(u32 pgm) {
     return 0;
 }
 
+/// q47 (SHADPS4_NR_SHARDED=2): the three census counters per thread, folded into the shared ones
+/// every 4,096 calls (they were locked adds on one shared line by every job thread, per call).
+const bool g_draw_tag_local = [] {
+    const char* v = std::getenv("SHADPS4_NR_SHARDED");
+    return v && v[0] == '2';
+}();
+thread_local u64 t_dt_calls = 0, t_dt_addr = 0, t_dt_hash = 0;
+
 inline void DrawTagShaderChange(u32 stage, const u32* regs) {
     const u32 pgm = regs && regs[1] == 0 ? regs[0] : 0;
-    const u64 calls = g_draw_tag_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    u64 calls = 0;
+    if (g_draw_tag_local) {
+        if ((++t_dt_calls & 0xfff) == 0) {
+            calls = g_draw_tag_calls.fetch_add(t_dt_calls, std::memory_order_relaxed) + t_dt_calls;
+            g_draw_tag_addr_changes.fetch_add(t_dt_addr, std::memory_order_relaxed);
+            g_draw_tag_hash_changes.fetch_add(t_dt_hash, std::memory_order_relaxed);
+            t_dt_calls = t_dt_addr = t_dt_hash = 0;
+        }
+    } else {
+        calls = g_draw_tag_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
     if (pgm != t_draw_tag_pgm[stage]) {
         t_draw_tag_pgm[stage] = pgm;
-        g_draw_tag_addr_changes.fetch_add(1, std::memory_order_relaxed);
+        if (g_draw_tag_local) {
+            ++t_dt_addr;
+        } else {
+            g_draw_tag_addr_changes.fetch_add(1, std::memory_order_relaxed);
+        }
         const u64 hash = ShaderHashNoAssert(pgm);
         if (hash != t_draw_tag_hash[stage]) {
             t_draw_tag_hash[stage] = hash;
-            g_draw_tag_hash_changes.fetch_add(1, std::memory_order_relaxed);
+            if (g_draw_tag_local) {
+                ++t_dt_hash;
+            } else {
+                g_draw_tag_hash_changes.fetch_add(1, std::memory_order_relaxed);
+            }
             ++t_draw_tag_run;
         }
     }
-    if ((calls & 0x3ffff) == 0) {
+    if (g_draw_tag_local ? calls != 0 && (calls >> 18) != ((calls - 4096) >> 18)
+                         : (calls & 0x3ffff) == 0) {
         LOG_INFO(Lib_GnmDriver, "DrawTagShader: {} Set/Update calls, program address changed {}, "
                                 "shader hash changed {}",
                  calls, g_draw_tag_addr_changes.load(), g_draw_tag_hash_changes.load());
@@ -862,7 +889,15 @@ thread_local RecThread t_rec;
 /// shard; readers sum the shards. Off: one shared shard, as before.
 inline const bool g_nr_sharded = [] {
     const char* v = std::getenv("SHADPS4_NR_SHARDED");
-    return v && v[0] == '1';
+    return v && (v[0] == '1' || v[0] == '2');
+}();
+/// SHADPS4_NR_SHARDED=2 (q47, s854 JobWorker1 profile): a shard is written only by its own
+/// thread, so it counts with a plain load + store instead of a locked add. The locked add at the
+/// end of NativeRecGpu (g_q15_why) was 2.4% of the job thread's wall time - a full barrier that
+/// waits for the GPU record's write-combined stores to drain. Readers report deltas.
+inline const bool g_nr_owner_inc = [] {
+    const char* v = std::getenv("SHADPS4_NR_SHARDED");
+    return v && v[0] == '2';
 }();
 template <size_t N, int Tag>
 struct ShardedCounters {
@@ -872,6 +907,7 @@ struct ShardedCounters {
     static inline std::mutex mu;
     static inline std::vector<Shard*> shards;
     static inline Shard shared;
+    static inline std::array<u64, N> reported{}; ///< owner-inc mode: sums already reported
     static Shard& Local() {
         if (!g_nr_sharded) {
             return shared;
@@ -887,7 +923,12 @@ struct ShardedCounters {
     struct Ref {
         size_t i;
         void fetch_add(u64 x, std::memory_order o = std::memory_order_relaxed) {
-            Local().v[i].fetch_add(x, o);
+            auto& c = Local().v[i];
+            if (g_nr_owner_inc) {
+                c.store(c.load(std::memory_order_relaxed) + x, std::memory_order_relaxed);
+            } else {
+                c.fetch_add(x, o);
+            }
         }
         u64 load(std::memory_order o = std::memory_order_relaxed) const {
             u64 s = shared.v[i].load(o);
@@ -895,11 +936,20 @@ struct ShardedCounters {
             for (Shard* sh : shards) {
                 s += sh->v[i].load(o);
             }
-            return s;
+            return g_nr_owner_inc ? s - reported[i] : s;
         }
         u64 exchange(u64, std::memory_order o = std::memory_order_relaxed) {
             u64 s = shared.v[i].exchange(0, o);
             std::scoped_lock lk{mu};
+            if (g_nr_owner_inc) {
+                u64 sum = 0;
+                for (Shard* sh : shards) {
+                    sum += sh->v[i].load(std::memory_order_relaxed);
+                }
+                const u64 d = sum - reported[i];
+                reported[i] = sum;
+                return s + d;
+            }
             for (Shard* sh : shards) {
                 s += sh->v[i].exchange(0, o);
             }
