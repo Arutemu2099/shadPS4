@@ -2124,15 +2124,16 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
             // ms each behind the main queue's backlog). The newest batch that wrote a copied
             // byte, + 1 (a write is stamped at bind time and can land in the next batch; f2
             // review), is submitted but not complete: the copy waits on the main timeline for
-            // that value only, on the fast lane, not for everything queued after it - as the
-            // readback queue's side path (modes 1 / 2) does. Unsubmitted: the prebatch below.
-            const u64 p = (PreciseProducerEnabled() ? PreciseProducer(job->copies)
-                                                    : ProducerTick(addr, bytes)) + 1;
+            // that value only, on the fast lane, not for everything queued after it - like the
+            // readback queue's side path (modes 1 / 2, which waits producer without + 1). Unsubmitted: the prebatch below.
+            // Opus review (q51): always the per-batch write history (kept whenever the fast lane
+            // is on); ProducerTick misses writers that only call NoteBatchWrite.
+            const u64 p = PreciseProducer(job->copies) + 1;
             const VkSemaphore async_timeline = Vulkan::Scheduler::async_timeline.load();
             const bool submitted =
                 async_timeline == VK_NULL_HANDLE ||
                 p <= Vulkan::Scheduler::async_submitted_tick.load(std::memory_order_acquire);
-            if (p > 1 && p < tick && submitted) {
+            if (p > 1 && p > completed && p < tick && submitted) {
                 producer = p;
                 waits_producer = true;
                 g_fast_lane_producer_jobs.fetch_add(1, std::memory_order_relaxed);
@@ -4193,8 +4194,8 @@ void BufferCache::PrefetchArenaReads(VAddr half) {
         const u64 tick = scheduler.CurrentTick();
         const u64 completed = master->KnownGpuTick();
         // + 1: a write is stamped at bind time and can land in the next batch (f2 review).
-        const u64 producer = (PreciseProducerEnabled() ? PreciseProducer(copies)
-                                                       : ProducerTick(lo, bytes)) + 1;
+        // Opus review (q51): the per-batch write history, never ProducerTick.
+        const u64 producer = PreciseProducer(copies) + 1;
         const VkSemaphore async_timeline = Vulkan::Scheduler::async_timeline.load();
         const bool producer_submitted =
             async_timeline == VK_NULL_HANDLE ||
@@ -7866,7 +7867,8 @@ void BufferCache::DeleteBuffer(BufferId buffer_id) {
     const u64 rq_tick = readback_queue && !readback_queue->InQueueOrder()
                             ? readback_queue->Semaphore().CurrentTick() - 1
                             : 0;
-    // The fast lane likewise waits only for completed producers.
+    // The fast lane likewise waits only for completed producers, or (q51) for a submitted main
+    // value below the current tick - below this deletion's wait, so no cycle.
     const u64 lane_tick = fast_lane ? fast_lane->Semaphore().CurrentTick() - 1 : 0;
     scheduler.DeferOperation([this, buffer_id, rq_tick, lane_tick] {
         if (rq_tick != 0) {
