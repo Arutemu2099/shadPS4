@@ -903,6 +903,9 @@ static void NoteHotPage(VAddr addr, u64 size) {
 // like HotPrefetch's. The f2 waiter copies the bytes and has them published before the next frame
 // start reads them; a read that comes first takes f2's H7 retry (waits for the job, no new copy).
 static const bool g_arena_read_prefetch = EnvIs1("SHADPS4_ARENA_READ_PREFETCH");
+/// q51 SHADPS4_FAST_LANE_PRODUCER=1 (see PrepareFaultDownload) and its job count.
+static const bool g_fast_lane_producer = EnvIs1("SHADPS4_FAST_LANE_PRODUCER");
+static std::atomic<u64> g_fast_lane_producer_jobs{0};
 static constexpr u64 ArenaHalf = 0x1E00000ULL;
 /// The half 0x3ee7d0 fills this frame (set by the discard hook before it runs).
 static std::atomic<VAddr> g_arena_cur_half{0};
@@ -2114,8 +2117,28 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
         const u64 completed = master->KnownGpuTick();
         const bool done = completed != 0 && completed < tick &&
                           !BatchesWriteAny(job->copies, completed, tick);
-        const u64 producer = completed;
-        if (done) {
+        u64 producer = completed;
+        bool waits_producer = false;
+        if (!done && g_fast_lane_producer) {
+            // q51 (SHADPS4_FAST_LANE_PRODUCER=1; s870 fire: prebatched copies waited 1.2 -> 2.0
+            // ms each behind the main queue's backlog). The newest batch that wrote a copied
+            // byte, + 1 (a write is stamped at bind time and can land in the next batch; f2
+            // review), is submitted but not complete: the copy waits on the main timeline for
+            // that value only, on the fast lane, not for everything queued after it - as the
+            // readback queue's side path (modes 1 / 2) does. Unsubmitted: the prebatch below.
+            const u64 p = (PreciseProducerEnabled() ? PreciseProducer(job->copies)
+                                                    : ProducerTick(addr, bytes)) + 1;
+            const VkSemaphore async_timeline = Vulkan::Scheduler::async_timeline.load();
+            const bool submitted =
+                async_timeline == VK_NULL_HANDLE ||
+                p <= Vulkan::Scheduler::async_submitted_tick.load(std::memory_order_acquire);
+            if (p > 1 && p < tick && submitted) {
+                producer = p;
+                waits_producer = true;
+                g_fast_lane_producer_jobs.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (done || waits_producer) {
             const auto record = [&](vk::CommandBuffer cmd) {
                 ForEachSourceRun(vk_sources.data(), vk_sources.size(),
                                  [&](size_t first, size_t count) {
@@ -2164,8 +2187,8 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
             }
             static std::atomic<u64> lane_jobs{0};
             if (((lane_jobs.fetch_add(1) + 1) & 0x3ff) == 0) {
-                LOG_INFO(Render_Vulkan, "ReadbackFastLane: {} jobs on the fast lane",
-                         lane_jobs.load());
+                LOG_INFO(Render_Vulkan, "ReadbackFastLane: {} jobs on the fast lane ({} waiting on their producer, q51)",
+                         lane_jobs.load(), g_fast_lane_producer_jobs.load(std::memory_order_relaxed));
             }
             return lane_ticket;
         }
@@ -4100,8 +4123,8 @@ void BufferCache::PrefetchArenaReads(VAddr half) {
     if (!usable) {
         return;
     }
-    constexpr u32 MaxJobs = 6;
-    constexpr u32 KeepFree = 4; // slots left for guest faults
+    constexpr u32 MaxJobs = 3;  // q51: 8 slots again (s867 asserted with 16; cause not found)
+    constexpr u32 KeepFree = 3; // slots left for guest faults
     const auto count = [](u32 k, u64 v = 1) { g_arena_n[k].fetch_add(v, std::memory_order_relaxed); };
     count(1);
     const u64 now = Common::FaultMonitor::presented_frames.load(std::memory_order_relaxed);
@@ -4169,8 +4192,9 @@ void BufferCache::PrefetchArenaReads(VAddr half) {
         // read fault downloads as before.
         const u64 tick = scheduler.CurrentTick();
         const u64 completed = master->KnownGpuTick();
-        const u64 producer = PreciseProducerEnabled() ? PreciseProducer(copies)
-                                                      : ProducerTick(lo, bytes);
+        // + 1: a write is stamped at bind time and can land in the next batch (f2 review).
+        const u64 producer = (PreciseProducerEnabled() ? PreciseProducer(copies)
+                                                       : ProducerTick(lo, bytes)) + 1;
         const VkSemaphore async_timeline = Vulkan::Scheduler::async_timeline.load();
         const bool producer_submitted =
             async_timeline == VK_NULL_HANDLE ||
@@ -4178,7 +4202,7 @@ void BufferCache::PrefetchArenaReads(VAddr half) {
         const bool done = completed != 0 && completed < tick &&
                           !BatchesWriteAny(copies, completed, tick);
         const u64 wait_value = done ? completed : producer;
-        if (!fast_lane || (!done && (producer == 0 || producer >= tick || !producer_submitted))) {
+        if (!fast_lane || (!done && (producer <= 1 || producer >= tick || !producer_submitted))) {
             ReleaseFaultStaging(std::move(staging));
             count(13);
             continue;

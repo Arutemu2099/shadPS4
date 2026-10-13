@@ -716,8 +716,8 @@ private:
         Mismatch,
     };
 
-    /// q48: 16 (was 8) - arena read prefetches hold up to 6 slots for about a frame.
-    static constexpr size_t MaxFaultJobs = 16;
+    /// q51: back to 8 (s867, q50 with 16: page_manager "Not enough watchers" assert in arm A).
+    static constexpr size_t MaxFaultJobs = 8;
     /// SHADPS4_FAULT_STAGING_MB=N (default 2): per-job readback staging size.
     static u64 FaultStagingSize() {
         static const u64 size = [] {
