@@ -1625,7 +1625,6 @@ u32 NativeRecDraw(const u32* cmdbuf, u64 index_addr, u32 index_count, u32 tag,
                      "primitive 11=head overwritten:{}",
                      line);
         }
-        (void)n;
     }
     r.set_called = false;
     rec.tag = tag;
