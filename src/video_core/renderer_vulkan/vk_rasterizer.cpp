@@ -5029,6 +5029,7 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
     w.descriptorType = vk::DescriptorType::eStorageBuffer;
     w.pBufferInfo = &buffer_infos.back();
     ++set_write_index;
+    vk::Buffer vb2{}; // q53: the second vertex SSBO's buffer (the back binds its one vertex buffer twice)
     if (colour) {
         // The whole vertex VkBuffer (a stream-buffer stand-in when every stream is null).
         const vk::Buffer vb = b.vbuf != 0 ? vk::Buffer{std::bit_cast<VkBuffer>(b.vbuf)}
@@ -5042,22 +5043,7 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         wv.descriptorType = vk::DescriptorType::eStorageBuffer;
         wv.pBufferInfo = &buffer_infos.back();
         ++set_write_index;
-        if (native->native_vertex2_binding != GraphicsPipeline::NoNativeRecords) {
-            // q53: the back pulls from its one vertex buffer: the same buffer at the second vertex binding, so any
-            // mask bit reads the same bytes. =2 / =3 (bit-exact gate): every / every other location through it.
-            buffer_infos.emplace_back(vb, 0, VK_WHOLE_SIZE);
-            auto& wv2 = set_writes.emplace_back();
-            wv2.dstSet = VK_NULL_HANDLE;
-            wv2.dstBinding = native->native_vertex2_binding;
-            wv2.dstArrayElement = 0;
-            wv2.descriptorCount = 1;
-            wv2.descriptorType = vk::DescriptorType::eStorageBuffer;
-            wv2.pBufferInfo = &buffer_infos.back();
-            ++set_write_index;
-            const u8 m = Shader::g_vbuf2 == 2 ? 0xffu : Shader::g_vbuf2 == 3 ? 0x55u : 0u;
-            push_data.buf_offsets[2] = m;
-            push_data.buf_offsets[3] = m;
-        }
+        vb2 = vb; // q53: written last (binding order), below
         if (VideoCore::g_native_colour_diag & 4096) {
             if (!native_dbg) {
                 native_dbg = std::make_unique<VideoCore::Buffer>(
@@ -5117,6 +5103,24 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         } else if (ring_verify) {
             NativeRingVerifyWrite();
         }
+    }
+    if (colour && native->native_vertex2_binding != GraphicsPipeline::NoNativeRecords) {
+        // q53: the second vertex SSBO = the back's one vertex buffer, so any mask bit reads the same bytes; =2 / =3
+        // (bit-exact gate): every / every other location through it. LAST: its binding follows the table's, and
+        // the draw packet (SHADPS4_DRAW_PACKET) pairs buffer infos with the layout's bindings in binding order
+        // (s882 / s883: the write placed before the table bound the table to the vertex buffer -> device lost).
+        buffer_infos.emplace_back(vb2, 0, VK_WHOLE_SIZE);
+        auto& wv2 = set_writes.emplace_back();
+        wv2.dstSet = VK_NULL_HANDLE;
+        wv2.dstBinding = native->native_vertex2_binding;
+        wv2.dstArrayElement = 0;
+        wv2.descriptorCount = 1;
+        wv2.descriptorType = vk::DescriptorType::eStorageBuffer;
+        wv2.pBufferInfo = &buffer_infos.back();
+        ++set_write_index;
+        const u8 m = Shader::g_vbuf2 == 2 ? 0xffu : Shader::g_vbuf2 == 3 ? 0x55u : 0u;
+        push_data.buf_offsets[2] = m;
+        push_data.buf_offsets[3] = m;
     }
     if (prep_on) [[unlikely]] {
         NativePrepWrite();
