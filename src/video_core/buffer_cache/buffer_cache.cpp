@@ -906,6 +906,9 @@ static const bool g_arena_read_prefetch = EnvIs1("SHADPS4_ARENA_READ_PREFETCH");
 static constexpr u64 ArenaHalf = 0x1E00000ULL;
 /// The half 0x3ee7d0 fills this frame (set by the discard hook before it runs).
 static std::atomic<VAddr> g_arena_cur_half{0};
+/// q50 (review): set by the hook, taken by the frame end - no prefetch for a frame whose hook
+/// was skipped (bad base / parity), so a stale half is never prefetched.
+static std::atomic<bool> g_arena_hook_ran{false};
 struct ArenaReadPage {
     u32 page1; ///< page index in the half + 1 (0: empty)
     u64 frame;
@@ -915,8 +918,8 @@ static std::mutex g_arena_rd_mutex;
 static std::array<ArenaReadPage, ArenaReadSlots> g_arena_rd{};
 /// 0 guest read faults in the current half; 1 prefetch calls, 2 jobs, 3 of them on the fast lane,
 /// 4 KB, 5 learned pages covered; skipped: 6 page clean, 7 pending job, 8 cap / slot / staging,
-/// 9 other; waiter: 10 published, 11 vetoed, 12 settled by a guest fault first.
-static std::atomic<u64> g_arena_n[13]{};
+/// 9 other; waiter: 10 published, 11 vetoed, 12 settled before the waiter (a guest fault, a discard or an overlap settle); 13 skipped: the producing batch open or not yet submitted (q50).
+static std::atomic<u64> g_arena_n[14]{};
 
 static void NoteArenaRead(VAddr addr) {
     const VAddr half = g_arena_cur_half.load(std::memory_order_relaxed);
@@ -941,7 +944,7 @@ static void NoteArenaRead(VAddr addr) {
 void ArenaReadPrefetchFrameEnd() {
     BufferCache* bc = g_discard_cache;
     const VAddr half = g_arena_cur_half.load(std::memory_order_relaxed);
-    if (!g_arena_read_prefetch || !bc || half == 0) {
+    if (!g_arena_read_prefetch || !bc || half == 0 || !g_arena_hook_ran.exchange(false)) {
         return;
     }
     bc->PostArenaReadPrefetch(half);
@@ -965,6 +968,7 @@ void PS4_SYSV_ABI ParticleArenaDiscardHook() {
         return;
     }
     g_arena_cur_half.store(base + parity * Half, std::memory_order_relaxed); // q48
+    g_arena_hook_ran.store(true, std::memory_order_relaxed);
     static bool logged = false;
     if (!logged) {
         logged = true;
@@ -3954,7 +3958,7 @@ void BufferCache::PrefetchHotPages() {
         u32 held = 0; // unfinalized hot jobs (their hold ends in FinalizeFaultJob)
         for (FaultJob& candidate : fault_jobs) {
             const bool hold = candidate.pf_hold.load(std::memory_order_acquire);
-            held += hold;
+            held += hold && !candidate.arena; // q50 (review): arena holds have their own cap
             if (!job && candidate.state == FaultJobState::Free && !hold) {
                 job = &candidate;
             }
@@ -4115,8 +4119,7 @@ void BufferCache::PrefetchArenaReads(VAddr half) {
     auto* master = scheduler.GetMasterSemaphore();
     master->Refresh();
     boost::container::small_vector<PrefetchItem, MaxJobs> items;
-    bool main_copies = false;
-    for (size_t i = 0; i < n;) {
+    for (size_t i = 0; i < n && items.size() < MaxJobs;) { // review nit: stop at the cap
         const VAddr page = pages[i];
         const BufferId buffer_id = page_table[page >> CACHING_PAGEBITS].buffer_id;
         if (IsBufferInvalid(buffer_id) || !slot_buffers[buffer_id].IsInBounds(page, 4096) ||
@@ -4158,12 +4161,29 @@ void BufferCache::PrefetchArenaReads(VAddr half) {
             count(fits ? 8 : 9);
             continue;
         }
-        // Fast lane as in PrepareFaultDownload: no batch from the newest completed one on wrote
-        // a copied byte, so the copy waits for nothing unfinished.
+        // q50 (s866: main-batch jobs ride the frame-end batch, which holds the whole frame's
+        // graphics; a frame-start read that met one waited ~1 ms): fast lane only. The copy
+        // waits on the main timeline for the newest batch that wrote a copied byte (the
+        // chain's), not for later graphics. That batch must be submitted (as the readback
+        // queue's side path requires, review 2026-09-27); otherwise no job - the guest's own
+        // read fault downloads as before.
         const u64 tick = scheduler.CurrentTick();
         const u64 completed = master->KnownGpuTick();
-        const bool lane = fast_lane && completed != 0 && completed < tick &&
+        const u64 producer = PreciseProducerEnabled() ? PreciseProducer(copies)
+                                                      : ProducerTick(lo, bytes);
+        const VkSemaphore async_timeline = Vulkan::Scheduler::async_timeline.load();
+        const bool producer_submitted =
+            async_timeline == VK_NULL_HANDLE ||
+            producer <= Vulkan::Scheduler::async_submitted_tick.load(std::memory_order_acquire);
+        const bool done = completed != 0 && completed < tick &&
                           !BatchesWriteAny(copies, completed, tick);
+        const u64 wait_value = done ? completed : producer;
+        if (!fast_lane || (!done && (producer == 0 || producer >= tick || !producer_submitted))) {
+            ReleaseFaultStaging(std::move(staging));
+            count(13);
+            continue;
+        }
+        const bool lane = true;
         const u64 id = next_fault_job_id++;
         job->seqs.clear();
         memory_tracker->SnapshotGpuWriteSeq(lo, bytes, job->seqs);
@@ -4214,30 +4234,14 @@ void BufferCache::PrefetchArenaReads(VAddr half) {
         }
         const std::span<const vk::BufferCopy> list{vk_copies.data(), vk_copies.size()};
         const vk::Buffer staging_handle = job->staging->Handle();
-        if (lane) {
-            job->tick = fast_lane->Submit(master->Handle(), completed, [&](vk::CommandBuffer cmd) {
-                RecordFaultCopiesOnReadbackQueue(cmd, source.Handle(), staging_handle, list, false);
-            });
-        } else {
-            scheduler.EndRendering();
-            if (AsyncFaultCopies()) {
-                RecordFaultCopiesAsync(source, staging_handle, list);
-            } else {
-                auto command_access = scheduler.AcquireCommandBuffer();
-                RecordFaultCopies(command_access.Handle(), source, staging_handle, list);
-            }
-            job->tick = scheduler.CurrentTick(); // after recording: the batch holding the copy
-            main_copies = true;
-        }
-        items.push_back({id, static_cast<u32>(job - fault_jobs.data()), job->tick,
-                         static_cast<u8>(lane ? 1 : 2), true});
+        job->tick = fast_lane->Submit(master->Handle(), wait_value, [&](vk::CommandBuffer cmd) {
+            RecordFaultCopiesOnReadbackQueue(cmd, source.Handle(), staging_handle, list, false);
+        });
+        items.push_back({id, static_cast<u32>(job - fault_jobs.data()), job->tick, 1, true});
         count(2);
         count(3, lane);
         count(4, total >> 10);
         count(5, covered);
-    }
-    if (main_copies) {
-        scheduler.Flush(); // the waiter and a guest's H7 retry wait for this batch's tick
     }
     if (!items.empty()) {
         {
@@ -4257,9 +4261,9 @@ void BufferCache::PrefetchArenaReads(VAddr half) {
         LOG_INFO(Render,
                  "ArenaReadPrefetch: {} calls | guest read faults in the current half {} | {} jobs "
                  "({} on the fast lane), {} KB, covering {} learned pages | skipped: page clean {}, "
-                 "pending job {}, cap / slot / staging {}, other {} | published {} vetoed {} "
-                 "settled by a guest fault first {}",
-                 v(1), v(0), v(2), v(3), v(4), v(5), v(6), v(7), v(8), v(9), v(10), v(11), v(12));
+                 "pending job {}, cap / slot / staging {}, producer batch open / unsubmitted {}, "
+                 "other {} | published {} vetoed {} settled before the waiter {}",
+                 v(1), v(0), v(2), v(3), v(4), v(5), v(6), v(7), v(8), v(13), v(9), v(10), v(11), v(12));
     }
 }
 

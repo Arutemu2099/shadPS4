@@ -472,7 +472,8 @@ private:
         /// f2 (SHADPS4_LANE_PREFETCH): a lane prefetch job (no owner thread; abandoned from the start).
         bool prefetch{};
         /// f2: the slot is held for the prefetch waiter until the back's publish has run (never reused before).
-        /// A hot-page prefetch (not on_asc) holds it only until FinalizeFaultJob.
+        /// A hot-page prefetch (not on_asc) holds it only until FinalizeFaultJob; an arena read
+        /// prefetch (q48, rena) like f2, until PublishPrefetch.
         std::atomic<bool> pf_hold{false};
         /// q48 (SHADPS4_ARENA_READ_PREFETCH): an arena read prefetch. Holds its slot until
         /// PublishPrefetch like an f2 job, so the waiter copies the bytes, not the back.
