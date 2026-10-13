@@ -845,7 +845,10 @@ static const bool g_arena_block = [] {
     const char* v = std::getenv("SHADPS4_PARTICLE_ARENA_BLOCK");
     return v && v[0] == '1';
 }();
-static std::atomic<u64> g_discard_calls{0}, g_discard_bytes{0}, g_discard_skipped{0};
+static std::atomic<u64> g_discard_calls{0}, g_discard_bytes{0};
+/// Opus review (F2-lite): hook calls skipped for an invalid arena base / parity, and 4 MB chunks
+/// skipped because their GPU write sequence moved after the snapshot.
+static std::atomic<u64> g_discard_skipped_hook{0}, g_discard_skipped_chunk{0};
 
 // SHADPS4_HOT_PAGE_PREFETCH=1 (2026-10-13, "F2-lite"; see PrefetchHotPages): the pages guest
 // threads took readback-class write faults on (InvalidateMemory's flush callback), with the
@@ -866,8 +869,15 @@ static std::atomic<u64> g_hot_n[11]{};
 static void NoteHotPage(VAddr addr, u64 size) {
     const u64 frame = Common::FaultMonitor::presented_frames.load(std::memory_order_relaxed);
     const VAddr first = Common::AlignDown(addr, 4096);
+    // Opus review: pages in the particle arena are skipped by PrefetchHotPages (the discard
+    // settles them), so they would only take hot-set entries from pages that can be prefetched.
+    const VAddr arena_lo = g_arena_lo.load(std::memory_order_relaxed);
+    const VAddr arena_hi = g_arena_hi.load(std::memory_order_relaxed);
     std::scoped_lock lk{g_hot_mutex};
     for (VAddr page = first; page < addr + size && page < first + 4 * 4096; page += 4096) {
+        if (page >= arena_lo && page < arena_hi) {
+            continue;
+        }
         HotPage* slot = &g_hot_pages[0]; // the same page, else the oldest (empty: frame 0)
         for (HotPage& h : g_hot_pages) {
             if (h.page == page) {
@@ -890,7 +900,7 @@ void PS4_SYSV_ABI ParticleArenaDiscardHook() {
     const u64 parity = *reinterpret_cast<const u64*>(eboot + 0x7d3eb38ULL);
     constexpr u64 Half = 0x1E00000ULL;
     if (base < 0x100000000ULL || base >= 0x1000000000ULL || parity > 1) {
-        g_discard_skipped.fetch_add(1, std::memory_order_relaxed);
+        g_discard_skipped_hook.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     static bool logged = false;
@@ -928,7 +938,7 @@ void BufferCache::DiscardDeadGpuData(
         const VAddr c = chunks[ci].first;
         const VAddr end = ci + 1 < chunks.size() ? chunks[ci + 1].first : lo + size;
         if (!memory_tracker->GpuWriteSeqMatches(c, end - c, chunks[ci].second)) {
-            g_discard_skipped.fetch_add(1, std::memory_order_relaxed); // a new GPU write
+            g_discard_skipped_chunk.fetch_add(1, std::memory_order_relaxed); // a new GPU write
             continue;
         }
         memory_tracker->ForEachDownloadRange<false>(c, end - c, [&](u64 range_addr, u64 range_size) {
@@ -941,8 +951,12 @@ void BufferCache::DiscardDeadGpuData(
     g_discard_bytes.fetch_add(bytes, std::memory_order_relaxed);
     const u64 n = g_discard_calls.fetch_add(1, std::memory_order_relaxed) + 1;
     if ((n & 1023) == 0) {
-        LOG_INFO(Render, "ArenaDiscard: {} discards, {:.2f} MB of GPU-modified state dropped per discard, {} skipped",
-                 n, double(g_discard_bytes.load()) / double(n) / 1048576.0, g_discard_skipped.load());
+        LOG_INFO(Render,
+                 "ArenaDiscard: {} discards, {:.2f} MB of GPU-modified state dropped per discard, "
+                 "skipped: {} hook calls (bad arena base / parity), {} chunks (GPU write after the "
+                 "snapshot)",
+                 n, double(g_discard_bytes.load()) / double(n) / 1048576.0,
+                 g_discard_skipped_hook.load(), g_discard_skipped_chunk.load());
     }
     if (g_hot_prefetch) {
         PrefetchHotPages(); // the same once-per-frame CP step
@@ -3348,6 +3362,13 @@ void BufferCache::FinalizeFaultJob(FaultJob& job) {
     if (job.prefetch) {
         pf_last_ok = ok; // f2
         --pf_pending;
+        if (!job.on_asc) {
+            // SHADPS4_HOT_PAGE_PREFETCH (Opus review): the waiter never touches a hot job's slot
+            // (no guest copy off the ASC lane; PublishPrefetch checks the job id), so the slot is
+            // free for guest faults as soon as the job is finalized. f2 jobs keep the hold until
+            // PublishPrefetch: the waiter may still guest-copy through the slot.
+            job.pf_hold.store(false, std::memory_order_release);
+        }
     }
     if (job.abandoned) {
         job.state = FaultJobState::Free;
@@ -3735,17 +3756,22 @@ void BufferCache::PrefetchWaiterLoop(std::stop_token stop) {
         // lane 0: the ASC lane (f2); 1 the fast lane, 2 main (SHADPS4_HOT_PAGE_PREFETCH).
         (it.lane == 2 ? *scheduler.GetMasterSemaphore() : JobSemaphore(it.lane == 1, it.lane == 0))
             .Wait(it.value);
-        if (PrefetchMode() == 1 && g_fault_guest_copy && !Offload::VerifyEnabled()) {
+        // f2 jobs only: a hot-page job's slot is released when it is finalized (FinalizeFaultJob),
+        // so it may already hold another job; its bytes are copied by PublishFaultJob on the back.
+        if (it.lane == 0 && PrefetchMode() == 1 && g_fault_guest_copy && !Offload::VerifyEnabled()) {
             GuestCopyFaultJob(fault_jobs[it.slot]); // slot held: never another job's
         }
-        liverpool->SendCommand<false>([this, id = it.id, slot = it.slot] { PublishPrefetch(id, slot); });
+        liverpool->SendCommand<false>(
+            [this, id = it.id, slot = it.slot, lane = it.lane] { PublishPrefetch(id, slot, lane); });
     }
 }
 
-void BufferCache::PublishPrefetch(u64 id, u32 slot) {
-    // H6 (back). A guest's retry or an overlapping settle may have finalized the job already.
+void BufferCache::PublishPrefetch(u64 id, u32 slot, u8 lane) {
+    // H6 (back). A guest's retry or an overlapping settle may have finalized the job already; a
+    // hot-page job's slot (lane 1 / 2) may then even hold a newer job (its hold ends at finalize).
     FaultJob& job = fault_jobs[slot];
-    const bool pending = job.state == FaultJobState::Pending && job.id == id && job.prefetch;
+    const bool same_job = job.id == id; // ids are never reused
+    const bool pending = same_job && job.state == FaultJobState::Pending && job.prefetch;
     if (pending) {
         job.state = FaultJobState::Settling;
         FinalizeFaultJob(job); // the lane value is complete; ProcessCommands runs this on main
@@ -3753,11 +3779,13 @@ void BufferCache::PublishPrefetch(u64 id, u32 slot) {
     } else {
         ++pf_c[17]; // settled before the waiter (guest early or an overlap settle)
     }
-    if (!job.on_asc) { // SHADPS4_HOT_PAGE_PREFETCH (f2 jobs are on the ASC lane; slot still held)
+    if (lane != 0) { // SHADPS4_HOT_PAGE_PREFETCH (f2 jobs are on the ASC lane, lane 0)
         g_hot_n[!pending ? 10 : pf_last_ok ? 8 : 9].fetch_add(1, std::memory_order_relaxed);
     }
-    job.pf_hold.store(false, std::memory_order_release);
-    if (job.on_asc) {
+    if (same_job) { // never another job's hold (Opus review)
+        job.pf_hold.store(false, std::memory_order_release);
+    }
+    if (lane == 0) {
         PrefetchMaybeLog();
     }
 }
@@ -3806,6 +3834,10 @@ void BufferCache::PrefetchHotPages() {
         return;
     }
     constexpr u32 MaxJobs = 4; // prefetch jobs held at once; guest faults keep the other slots
+    // Opus review: a main-batch job holds its slot until that batch completes (~a frame), so at
+    // most this many per call (per frame) go into the main batch; fast-lane jobs are not capped.
+    constexpr u32 MaxMainJobs = 2;
+    u32 main_jobs = 0;
     const u64 now = Common::FaultMonitor::presented_frames.load(std::memory_order_relaxed);
     std::array<VAddr, HotPageSlots> pages{};
     size_t n = 0;
@@ -3848,7 +3880,7 @@ void BufferCache::PrefetchHotPages() {
             continue;
         }
         FaultJob* job = nullptr;
-        u32 held = 0; // prefetch slots until the waiter's publish (pf_hold outlives pf_pending)
+        u32 held = 0; // unfinalized hot jobs (their hold ends in FinalizeFaultJob)
         for (FaultJob& candidate : fault_jobs) {
             const bool hold = candidate.pf_hold.load(std::memory_order_acquire);
             held += hold;
@@ -3870,6 +3902,11 @@ void BufferCache::PrefetchHotPages() {
         const u64 completed = master->KnownGpuTick();
         const bool lane = fast_lane && completed != 0 && completed < tick &&
                           !BatchesWriteAny(copies, completed, tick);
+        if (!lane && main_jobs >= MaxMainJobs) {
+            ReleaseFaultStaging(std::move(staging)); // nothing else was taken or mutated
+            count(6);
+            continue;
+        }
         const u64 id = next_fault_job_id++;
         job->seqs.clear();
         memory_tracker->SnapshotGpuWriteSeq(lo, bytes, job->seqs);
@@ -3881,6 +3918,7 @@ void BufferCache::PrefetchHotPages() {
             job->state = FaultJobState::Pending;
             job->abandoned = true; // no owner: finalization frees the slot
             job->prefetch = true;  // published by the f2 waiter; guest faults take H7
+            // Held until finalized (FinalizeFaultJob clears it for non-ASC jobs).
             job->pf_hold.store(true, std::memory_order_release);
             job->is_write = false;
             job->addr = lo;
@@ -3933,6 +3971,7 @@ void BufferCache::PrefetchHotPages() {
             }
             job->tick = scheduler.CurrentTick(); // after recording: the batch holding the copy
             main_copies = true;
+            ++main_jobs;
         }
         items.push_back({id, static_cast<u32>(job - fault_jobs.data()), job->tick,
                          static_cast<u8>(lane ? 1 : 2)});

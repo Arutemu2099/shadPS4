@@ -311,8 +311,10 @@ static void ApplyParticleLateRead() {
         if (writes[1].bytes.size() != 21 || writes[0].bytes[40] != 0xe9) {
             LOG_ERROR(Loader, "SHADPS4_PARTICLE_ARENA_DISCARD: bad patch layout, not applied");
             writes = patched;
+        } else {
+            LOG_INFO(Loader, "SHADPS4_PARTICLE_ARENA_DISCARD: frame-start hook {:#x} after the cave",
+                     hook);
         }
-        LOG_INFO(Loader, "SHADPS4_PARTICLE_ARENA_DISCARD: frame-start hook {:#x} after the cave", hook);
     }
     for (const auto& p : writes) {
         std::memcpy(reinterpret_cast<void*>(g_eboot_address + p.offset), p.bytes.data(),

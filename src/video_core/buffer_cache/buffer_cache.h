@@ -470,6 +470,7 @@ private:
         /// f2 (SHADPS4_LANE_PREFETCH): a lane prefetch job (no owner thread; abandoned from the start).
         bool prefetch{};
         /// f2: the slot is held for the prefetch waiter until the back's publish has run (never reused before).
+        /// A hot-page prefetch (not on_asc) holds it only until FinalizeFaultJob.
         std::atomic<bool> pf_hold{false};
     };
     /// The vote of a fault job: true if no GPU write marking touched it since its snapshot
@@ -637,7 +638,9 @@ public:
 
 private:
     /// f2: back; the waiter posts it after the job's lane value completed (and its guest copy).
-    void PublishPrefetch(u64 id, u32 slot);
+    /// `lane` is the PrefetchItem's (0 f2, 1 / 2 hot-page jobs). Clears the slot's hold only
+    /// while the slot still holds job `id`.
+    void PublishPrefetch(u64 id, u32 slot, u8 lane);
     void PrefetchNoteWindow(VAddr addr, u64 size);
     void PrefetchWaiterLoop(std::stop_token stop);
     void PrefetchMaybeLog();
