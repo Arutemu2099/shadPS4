@@ -214,6 +214,9 @@ struct SpanFrameBlocks {
     u64 frames{};
 };
 SpanFrameBlocks span_blocks;
+/// 2026-10-13: readback-class write faults (page held GPU-written bytes) by page, all threads /
+/// Game:Main (SHADPS4_WRITE_FAULT_PAGES + SHADPS4_GAME_MAIN_CENSUS). Under write_page_mutex.
+std::unordered_map<u64, std::pair<u32, u32>> rb_fault_pages;
 } // namespace
 
 void RecordWriteFaultPage(u64 addr) {
@@ -320,6 +323,34 @@ std::string WriteFaultPageReport(u64 frames, u64 d_gfx, u64 d_asc) {
                        "blocks1M={:.1f} (frames {})",
                        sb_sums[0] / sbf, sb_sums[1] / sbf, sb_sums[2] / sbf, sb_sums[3] / sbf,
                        sb_frames);
+    {
+        std::vector<std::pair<u64, std::pair<u32, u32>>> rb;
+        {
+            std::scoped_lock lk(write_page_mutex);
+            rb.assign(rb_fault_pages.begin(), rb_fault_pages.end());
+            rb_fault_pages.clear();
+        }
+        std::sort(rb.begin(), rb.end(),
+                  [](const auto& x, const auto& y) { return x.second.first > y.second.first; });
+        u64 rb_total = 0;
+        std::unordered_map<u64, u64> rb_regions;
+        for (const auto& [pg, c] : rb) {
+            rb_total += c.first;
+            rb_regions[pg >> 12] += c.first;
+        }
+        out += fmt::format(" | readback-class faults/frame={:.2f} pages={} top_pages(faults/frame, Game:Main):",
+                           rb_total / f, rb.size());
+        for (size_t i = 0; i < std::min<size_t>(12, rb.size()); ++i) {
+            out += fmt::format(" {:#x}:{:.2f}/{:.2f}", rb[i].first << 12, rb[i].second.first / f,
+                               rb[i].second.second / f);
+        }
+        std::vector<std::pair<u64, u64>> rr(rb_regions.begin(), rb_regions.end());
+        std::sort(rr.begin(), rr.end(), [](const auto& x, const auto& y) { return x.second > y.second; });
+        out += " rb_regions16M:";
+        for (size_t i = 0; i < std::min<size_t>(6, rr.size()); ++i) {
+            out += fmt::format(" {:#x}:{:.2f}", rr[i].first << 24, rr[i].second / f);
+        }
+    }
     out += fmt::format(" regions16M={} top_regions:", by_region.size());
     for (size_t i = 0; i < std::min<size_t>(8, by_region.size()); ++i) {
         out += fmt::format(" {:#x}:{}p/{:.0f}f", by_region[i].first << 24,
@@ -979,6 +1010,12 @@ void NoteWriteFaultCensus(u64 addr, u64 ticks, u8 cls) {
         g_gm.all_pages.clear();
     }
     g_gm.all_pages.insert(addr >> 12);
+    if ((cls & 2) != 0 && WriteFaultPagesEnabled()) {
+        std::scoped_lock lk2(write_page_mutex);
+        auto& e = rb_fault_pages[addr >> 12];
+        ++e.first;
+        e.second += t_is_game_main ? 1 : 0;
+    }
     if (t_is_game_main) {
         g_gm.gm_pages.insert(addr >> 12);
     }
