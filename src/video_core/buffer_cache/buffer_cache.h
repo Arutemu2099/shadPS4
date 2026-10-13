@@ -189,6 +189,11 @@ public:
     void InvalidateMemory(VAddr device_addr, u64 size,
                           InvalidateOrigin origin = InvalidateOrigin::Explicit);
 
+    /// SHADPS4_PARTICLE_ARENA_DISCARD: drop the GPU-modified state of a dead particle arena half
+    /// (no download). Posted from Game:Main; DiscardDeadGpuData runs on the CP thread.
+    void PostArenaDiscard(VAddr lo, u64 size, VAddr arena_lo, VAddr arena_hi);
+    void DiscardDeadGpuData(VAddr lo, u64 size);
+
     /// Block new asynchronous readbacks before GPU unmap and settle earlier ones.
     void BeginGpuUnmap(VAddr device_addr, u64 size);
 

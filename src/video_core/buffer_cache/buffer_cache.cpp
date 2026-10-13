@@ -21,6 +21,7 @@
 #include "common/readback_offload.h"
 #include "common/scope_exit.h"
 #include "common/thread.h"
+#include "common/memory_patcher.h"
 #include "core/memory.h"
 #include "shader_recompiler/native_emit.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -652,6 +653,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       bda_pagetable_buffer{instance, scheduler, MemoryUsage::DeviceLocal,
                            0,        AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress,
                            BDA_PAGETABLE_SIZE} {
+    g_discard_cache = this; // SHADPS4_PARTICLE_ARENA_DISCARD hook
     g_lane_on = scheduler.HasLane();
     g_lane_counters = &scheduler.lane_c;
     g_lane_open_src = &scheduler.lane_open_src;
@@ -827,6 +829,68 @@ void BufferCache::EndGpuMap(VAddr device_addr, u64 size) {
     }
 }
 
+// SHADPS4_PARTICLE_ARENA_DISCARD (2026-10-13, with SHADPS4_PARTICLE_LATE_READ): the game's particle
+// arena is two 30 MiB halves at [0x807d3eb10] alternating by frame (parity [0x807d3eb38]); 0x3ee7d0
+// reuses the half of two frames ago. At that point its GPU data is dead: the CPU read it at the
+// previous frame's start (V1), the previous frame's chain (which reads it as old particle state)
+// finished at that frame's end (0x3ee470's label wait), and nothing reads it again. Discarding it
+// (no download) turns the game's writes into the half from readback-class faults (~0.6 ms each,
+// a GPU round trip) into plain faults. SHADPS4_PARTICLE_ARENA_BLOCK=1 also gives write faults in
+// the arena the heap span's block widening (SHADPS4_HEAP_WRITE_BLOCK).
+BufferCache* g_discard_cache = nullptr;
+std::atomic<VAddr> g_arena_lo{0}, g_arena_hi{0};
+static const bool g_arena_block = [] {
+    const char* v = std::getenv("SHADPS4_PARTICLE_ARENA_BLOCK");
+    return v && v[0] == '1';
+}();
+static std::atomic<u64> g_discard_calls{0}, g_discard_bytes{0}, g_discard_skipped{0};
+
+void PS4_SYSV_ABI ParticleArenaDiscardHook() {
+    BufferCache* bc = g_discard_cache;
+    const u64 eboot = MemoryPatcher::g_eboot_address;
+    if (!bc || eboot == 0) {
+        return;
+    }
+    const VAddr base = *reinterpret_cast<const u64*>(eboot + 0x7d3eb10ULL);
+    const u64 parity = *reinterpret_cast<const u64*>(eboot + 0x7d3eb38ULL);
+    constexpr u64 Half = 0x1E00000ULL;
+    if (base < 0x100000000ULL || base >= 0x1000000000ULL || parity > 1) {
+        g_discard_skipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        LOG_INFO(Render, "ArenaDiscard: arena {:#x}-{:#x}, first discard of half {:#x}-{:#x}", base,
+                 base + 2 * Half, base + parity * Half, base + (parity + 1) * Half);
+    }
+    bc->PostArenaDiscard(base + parity * Half, Half, base, base + 2 * Half);
+}
+
+void BufferCache::PostArenaDiscard(VAddr lo, u64 size, VAddr arena_lo, VAddr arena_hi) {
+    g_arena_lo.store(arena_lo, std::memory_order_relaxed);
+    g_arena_hi.store(arena_hi, std::memory_order_relaxed);
+    liverpool->SendCommand<false>([this, lo, size] { DiscardDeadGpuData(lo, size); });
+}
+
+void BufferCache::DiscardDeadGpuData(VAddr lo, u64 size) {
+    // On the CP thread, like ResolveFaultSync: no fault job may still publish over the range.
+    SettleOverlappingJobs(lo, size);
+    u64 bytes = 0;
+    memory_tracker->ForEachDownloadRange<false>(lo, size, [&](u64 range_addr, u64 range_size) {
+        gpu_modified_ranges.Subtract(range_addr, range_size);
+        MemoryTracker::gpu_clear_epoch.fetch_add(1, std::memory_order_acq_rel);
+        bytes += range_size;
+    });
+    memory_tracker->UnmarkRegionAsGpuModified(lo, size);
+    g_discard_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    const u64 n = g_discard_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((n & 1023) == 0) {
+        LOG_INFO(Render, "ArenaDiscard: {} discards, {:.2f} MB of GPU-modified state dropped per discard, {} skipped",
+                 n, double(g_discard_bytes.load()) / double(n) / 1048576.0, g_discard_skipped.load());
+    }
+}
+
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, InvalidateOrigin origin) {
     if (!IsRegionRegistered(device_addr, size)) {
         return;
@@ -872,9 +936,14 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, InvalidateOrigin
     VAddr settle_addr = device_addr;
     u64 settle_size = size;
     if (heap_block.bytes != 0 && origin == InvalidateOrigin::GuestWriteFault &&
-        device_addr >= heap_block.lo && device_addr + size <= heap_block.hi) {
+        ((device_addr >= heap_block.lo && device_addr + size <= heap_block.hi) ||
+         (g_arena_block && device_addr >= g_arena_lo.load(std::memory_order_relaxed) &&
+          device_addr + size <= g_arena_hi.load(std::memory_order_relaxed)))) {
         const VAddr block = Common::AlignDown(device_addr, heap_block.bytes);
-        if (block >= heap_block.lo && block + heap_block.bytes <= heap_block.hi &&
+        const bool in_heap = device_addr >= heap_block.lo && device_addr + size <= heap_block.hi;
+        const VAddr span_lo = in_heap ? heap_block.lo : g_arena_lo.load(std::memory_order_relaxed);
+        const VAddr span_hi = in_heap ? heap_block.hi : g_arena_hi.load(std::memory_order_relaxed);
+        if (block >= span_lo && block + heap_block.bytes <= span_hi &&
             device_addr + size <= block + heap_block.bytes) {
             block_bytes = heap_block.bytes;
             settle_addr = block;

@@ -15,6 +15,10 @@
 #include "core/file_format/psf.h"
 #include "memory_patcher.h"
 
+namespace VideoCore {
+void PS4_SYSV_ABI ParticleArenaDiscardHook(); // buffer_cache.cpp
+}
+
 namespace MemoryPatcher {
 
 EXPORT uintptr_t g_eboot_address;
@@ -282,7 +286,22 @@ static void ApplyParticleLateRead() {
             return;
         }
     }
-    for (const auto& p : patched) {
+    // SHADPS4_PARTICLE_ARENA_DISCARD=1 (2026-10-13): the main loop first calls a host hook that
+    // drops the GPU-modified state of the arena half 0x3ee7d0 is about to reuse (dead data), then
+    // jumps to the cave: movabs rax, hook; call rax; jmp 0x3ee160; 4 NOPs (21 bytes at 0x29cc89).
+    std::vector<Bytes> writes = patched;
+    const char* discard = std::getenv("SHADPS4_PARTICLE_ARENA_DISCARD");
+    if (discard && discard[0] == '1') {
+        const u64 hook = reinterpret_cast<u64>(&VideoCore::ParticleArenaDiscardHook);
+        std::vector<u8> b = {0x48, 0xb8};
+        for (int i = 0; i < 8; ++i) {
+            b.push_back(static_cast<u8>(hook >> (8 * i)));
+        }
+        b.insert(b.end(), {0xff, 0xd0, 0xe9, 0xc6, 0x14, 0x15, 0x00, 0x90, 0x90, 0x90, 0x90});
+        writes[1] = {0x29cc89, b};
+        LOG_INFO(Loader, "SHADPS4_PARTICLE_ARENA_DISCARD: frame-start hook {:#x} before the cave", hook);
+    }
+    for (const auto& p : writes) {
         std::memcpy(reinterpret_cast<void*>(g_eboot_address + p.offset), p.bytes.data(),
                     p.bytes.size());
     }
