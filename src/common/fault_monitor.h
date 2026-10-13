@@ -110,6 +110,13 @@ inline std::array<std::atomic<u64>, 4> g_sc_run_ticks{};
 /// Owner bits of the write fault being handled: 1 buffer cache, 2 readback download, 4 texture.
 inline thread_local u8 t_fault_class = 0;
 void MarkGameMainThread();
+/// SHADPS4_JOB_CENSUS=1 (with SHADPS4_GAME_MAIN_CENSUS=1, 2026-10-12): Game:Main's main-loop step histogram
+/// (render-job span), a RIP sampler over the JobWorker threads, NativeRec cycles. Diagnostic only.
+bool JobCensus();
+/// Called at guest thread start with its name; registers JobWorker* threads for the job census.
+void NoteGuestThread(const char* name);
+/// Cycles spent in one NativeRecDraw / NativeRecShader call (job census only).
+void NoteNativeRecCycles(u64 cycles);
 u64 CensusTicks();
 void NoteWriteFaultCensus(u64 addr, u64 ticks, u8 cls);
 void NoteGameMainWait(u32 kind, u64 ticks);

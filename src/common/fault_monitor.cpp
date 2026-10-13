@@ -638,8 +638,68 @@ struct GmCensus {
     std::unordered_set<u64> gm_pages, all_pages;
     u64 gm_pages_sum{}, all_pages_sum{}, frames{};
     void* thread{};
+    // SHADPS4_JOB_CENSUS (2026-10-12): Game:Main's main-loop step and the job threads' split.
+    // Main loop 0x29c8d0 (one caller): the qword below its RSP while it is inside a call holds
+    // that call's return address = the step. Found once by a stack scan, then one read per sample.
+    u64 loop_slot{}, loop_slot_finds{}, loop_misses{}, stack_lo{}, stack_hi{};
+    std::unordered_map<u32, u64> steps; // step (eboot offset of the return address) -> samples
+    u64 step_samples{};
+    std::atomic<u32> nthreads{0};
+    std::array<void*, 16> threads{};
+    std::array<u64, 16> last_cyc{};
+    u32 rr{};
+    u64 job_samples{}, job_idle{}, job_busy_cyc{};
+    u64 job_span_samples{}, job_span_idle{}, job_span_busy_cyc{};
+    std::unordered_map<u64, u64> job_class, job_class_span; // 1 game, 2 delay, 3 other guest, else host 4 KB page
+    u64 last_frames{};
+    std::array<std::atomic<u64>, 2> nrec_cyc{}, nrec_n{}; // [Game:Main, other threads]
 } g_gm;
+
+constexpr u64 kLoopLo = 0x80029c8d0ULL, kLoopHi = 0x80029ce40ULL;   // main loop body
+constexpr u64 kCaveLo = 0x8003ee160ULL, kCaveHi = 0x8003ee190ULL;   // V1 cave (main-loop depth)
+// Steps from the render-job kick (0x190090 returns to 0x29cd07) to the join's return (0x29cd3b).
+inline bool InRenderSpan(u32 step) {
+    return step >= 0x29cd07 && step <= 0x29cd3b;
+}
 } // namespace
+
+bool JobCensus() {
+    static const bool on = [] {
+        const char* v = std::getenv("SHADPS4_JOB_CENSUS");
+        return v && v[0] == '1' && GameMainCensus();
+    }();
+    return on;
+}
+
+void NoteGuestThread(const char* name) {
+#ifdef _WIN32
+    if (!JobCensus() || !name || std::strncmp(name, "JobWorker", 9) != 0) {
+        return;
+    }
+    HANDLE h{};
+    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h,
+                    THREAD_QUERY_LIMITED_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
+                    FALSE, 0);
+    static std::mutex mu;
+    std::scoped_lock lk{mu};
+    const u32 n = g_gm.nthreads.load(std::memory_order_relaxed);
+    if (h && n < g_gm.threads.size()) {
+        g_gm.threads[n] = h;
+        g_gm.nthreads.store(n + 1, std::memory_order_release);
+    }
+#endif
+}
+
+void NoteNativeRecCycles(u64 cycles) {
+    thread_local u64 acc = 0, n = 0;
+    acc += cycles;
+    if ((++n & 255) == 0) {
+        const u32 i = t_is_game_main ? 0 : 1;
+        g_gm.nrec_cyc[i].fetch_add(acc, std::memory_order_relaxed);
+        g_gm.nrec_n[i].fetch_add(256, std::memory_order_relaxed);
+        acc = 0;
+    }
+}
 
 bool GameMainCensus() {
     static const bool on = [] {
@@ -703,9 +763,104 @@ void MarkGameMainThread() {
                     // the guest stack is ordinary committed memory; copied while suspended
                     std::memcpy(stack.data(), reinterpret_cast<const void*>(ctx.Rsp), sizeof(stack));
                 }
+                // SHADPS4_JOB_CENSUS: the main-loop step (one qword at the found slot) or, until the
+                // slot is known, up to 16 KB of stack (clamped to the stack's region) to find it.
+                const bool job = JobCensus();
+                u64 slot_val = 0;
+                u32 scan_n = 0;
+                static std::array<u64, 2048> big{};
+                if (job && ok) {
+                    const u64 slot = g_gm.loop_slot;
+                    if (slot != 0) {
+                        if (ctx.Rsp < slot && slot + 8 <= g_gm.stack_hi) {
+                            slot_val = *reinterpret_cast<const u64*>(slot);
+                        }
+                    } else if (ctx.Rsp >= g_gm.stack_lo && ctx.Rsp < g_gm.stack_hi) {
+                        scan_n = static_cast<u32>(
+                            std::min<u64>(big.size(), (g_gm.stack_hi - ctx.Rsp) / 8));
+                        std::memcpy(big.data(), reinterpret_cast<const void*>(ctx.Rsp), scan_n * 8ULL);
+                    }
+                }
                 ResumeThread(h);
                 if (!ok) {
                     continue;
+                }
+                u32 step = 0;
+                if (job) {
+                    if (ctx.Rsp < g_gm.stack_lo || ctx.Rsp >= g_gm.stack_hi) {
+                        MEMORY_BASIC_INFORMATION mbi{};
+                        if (VirtualQuery(reinterpret_cast<void*>(ctx.Rsp), &mbi, sizeof(mbi))) {
+                            g_gm.stack_lo = reinterpret_cast<u64>(mbi.BaseAddress);
+                            g_gm.stack_hi = g_gm.stack_lo + mbi.RegionSize;
+                            g_gm.loop_slot = 0;
+                        }
+                    }
+                    const bool loop_ret = (slot_val >= kLoopLo && slot_val < kLoopHi) ||
+                                          (slot_val >= kCaveLo && slot_val < kCaveHi);
+                    if (ctx.Rip >= kLoopLo && ctx.Rip < kLoopHi) {
+                        step = 1; // in the loop body itself
+                    } else if (loop_ret) {
+                        step = static_cast<u32>(slot_val - 0x800000000ULL);
+                        g_gm.loop_misses = 0;
+                    } else if (g_gm.loop_slot != 0 && ++g_gm.loop_misses > 4000) {
+                        g_gm.loop_slot = 0; // ~2 s without the loop: find it again
+                        g_gm.loop_misses = 0;
+                    }
+                    // the outermost return address into the loop body is its current call's slot
+                    for (u32 i = scan_n; i-- > 0;) {
+                        if (big[i] >= kLoopLo && big[i] < kLoopHi) {
+                            g_gm.loop_slot = ctx.Rsp + 8ULL * i;
+                            ++g_gm.loop_slot_finds;
+                            step = static_cast<u32>(big[i] - 0x800000000ULL);
+                            break;
+                        }
+                    }
+                    const u32 nt = g_gm.nthreads.load(std::memory_order_acquire);
+                    if (nt != 0) {
+                        // one job thread per tick, round robin (~0.5 ms ticks)
+                        const u32 i = g_gm.rr++ % nt;
+                        HANDLE jh = static_cast<HANDLE>(g_gm.threads[i]);
+                        ULONG64 cyc = 0;
+                        QueryThreadCycleTime(jh, &cyc);
+                        const u64 prev = g_gm.last_cyc[i];
+                        g_gm.last_cyc[i] = cyc;
+                        if (prev != 0 && SuspendThread(jh) != DWORD(-1)) {
+                            CONTEXT jc{};
+                            jc.ContextFlags = CONTEXT_CONTROL;
+                            const BOOL jok = GetThreadContext(jh, &jc);
+                            ResumeThread(jh);
+                            if (jok) {
+                                const u64 d = cyc - prev;
+                                // visited every nt ticks: idle if it ran < 25% of that interval
+                                const bool idle = d < 437'500ULL * nt / 4;
+                                const u64 rip = jc.Rip;
+                                const u64 key = rip >= 0x80053b2b0ULL && rip < 0x80053b360ULL ? 2
+                                                : rip >= 0x800000000ULL && rip < 0x8087a8000ULL ? 1
+                                                : rip >= 0x8087a8000ULL && rip < 0x1000000000ULL ? 3
+                                                : (rip >> 12) << 12;
+                                const bool span = InRenderSpan(step);
+                                std::scoped_lock lk{g_gm.rip_mutex};
+                                ++g_gm.job_samples;
+                                g_gm.job_busy_cyc += d;
+                                if (span) {
+                                    ++g_gm.job_span_samples;
+                                    g_gm.job_span_busy_cyc += d;
+                                }
+                                if (idle) {
+                                    ++g_gm.job_idle;
+                                    g_gm.job_span_idle += span;
+                                } else {
+                                    ++g_gm.job_class[key];
+                                    if (span) {
+                                        ++g_gm.job_class_span[key];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    std::scoped_lock lk{g_gm.rip_mutex};
+                    ++g_gm.steps[step];
+                    ++g_gm.step_samples;
                 }
                 const u64 rip = ctx.Rip;
                 u64 c1 = 0, c2 = 0;
@@ -1045,6 +1200,130 @@ void GameMainCensusMaybeLog() {
                          "dl main sem, 2 fault dl readback queue, 3 fault dl fast lane, 4 buffer dl sync, 5 "
                          "fault verify, 6 DownloadBufferMemory sync, 7 texture dl sync, 0 untagged):{}",
                  ps);
+    }
+    if (JobCensus()) {
+        const u64 frames_now = presented_frames.load(std::memory_order_relaxed);
+        const double fr = double(frames_now - g_gm.last_frames) / sec;
+        g_gm.last_frames = frames_now;
+        const double frame_ms = fr > 0 ? 1000.0 / fr : 0.0;
+        const auto host_name = [](u64 addr) {
+            HMODULE mod{};
+            char name[64] = "?";
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   reinterpret_cast<LPCSTR>(addr), &mod)) {
+                char path[MAX_PATH];
+                if (GetModuleFileNameA(mod, path, MAX_PATH)) {
+                    const char* base = std::strrchr(path, '\\');
+                    std::snprintf(name, sizeof(name), "%s", base ? base + 1 : path);
+                }
+            }
+            return fmt::format("{}+{:#x}", name, addr - reinterpret_cast<u64>(mod));
+        };
+        std::vector<std::pair<u64, u32>> steps;
+        u64 ns = 0, finds = 0, slot = 0, js = 0, ji = 0, jss = 0, jsi = 0;
+        double busy_ms = 0, span_busy_ms = 0;
+        std::vector<std::pair<u64, u64>> cls, cls_span;
+        {
+            std::scoped_lock lk{g_gm.rip_mutex};
+            for (const auto& [s, c] : g_gm.steps) {
+                steps.emplace_back(c, s);
+            }
+            ns = std::max<u64>(1, g_gm.step_samples);
+            finds = g_gm.loop_slot_finds;
+            slot = g_gm.loop_slot;
+            js = g_gm.job_samples;
+            ji = g_gm.job_idle;
+            jss = g_gm.job_span_samples;
+            jsi = g_gm.job_span_idle;
+            busy_ms = double(g_gm.job_busy_cyc) / 3.5e6 / sec;
+            span_busy_ms = double(g_gm.job_span_busy_cyc) / 3.5e6 / sec;
+            for (const auto& [k, c] : g_gm.job_class) {
+                cls.emplace_back(c, k);
+            }
+            for (const auto& [k, c] : g_gm.job_class_span) {
+                cls_span.emplace_back(c, k);
+            }
+            g_gm.steps.clear();
+            g_gm.step_samples = 0;
+            g_gm.job_samples = g_gm.job_idle = g_gm.job_span_samples = g_gm.job_span_idle = 0;
+            g_gm.job_busy_cyc = g_gm.job_span_busy_cyc = 0;
+            g_gm.job_class.clear();
+            g_gm.job_class_span.clear();
+        }
+        std::sort(steps.rbegin(), steps.rend());
+        double span = 0.0;
+        std::string ss;
+        for (const auto& [c, s] : steps) {
+            const double share = double(c) / double(ns);
+            if (InRenderSpan(static_cast<u32>(s))) {
+                span += share;
+            }
+        }
+        for (size_t i = 0; i < std::min<size_t>(steps.size(), 24); ++i) {
+            const double share = double(steps[i].first) / double(ns);
+            ss += fmt::format(" {:#x}:{:.1f}%={:.2f}ms", steps[i].second, 100.0 * share, share * frame_ms);
+        }
+        LOG_INFO(Render,
+                 "JobCensus steps: window {:.1f}s fps {:.1f} | Game:Main main-loop steps (return address of "
+                 "the loop's current call; 1 = loop body, 0 = not in the loop; share of wall = ms per "
+                 "frame):{} | render span (kick 0x29cd07 .. join 0x29cd3b) {:.1f}% = {:.2f} ms/frame | "
+                 "loop slot {:#x}, finds {}",
+                 sec, fr, ss, 100.0 * span, span * frame_ms, slot, finds);
+        const auto split = [&](std::vector<std::pair<u64, u64>>& v, u64 busy_samples) {
+            std::map<std::string, u64> mods;
+            std::vector<std::pair<u64, u64>> pages;
+            u64 game = 0, dly = 0, guest = 0;
+            for (const auto& [c, k] : v) {
+                if (k == 1) {
+                    game = c;
+                } else if (k == 2) {
+                    dly = c;
+                } else if (k == 3) {
+                    guest = c;
+                } else {
+                    const std::string n = host_name(k);
+                    mods[n.substr(0, n.find('+'))] += c;
+                    pages.emplace_back(c, k);
+                }
+            }
+            std::sort(pages.rbegin(), pages.rend());
+            const double b = double(std::max<u64>(1, busy_samples));
+            std::string s = fmt::format("game code {:.1f}% delay() spin {:.1f}% other guest {:.1f}% |",
+                                        100.0 * game / b, 100.0 * dly / b, 100.0 * guest / b);
+            for (const auto& [n, c] : mods) {
+                s += fmt::format(" {} {:.1f}%", n, 100.0 * c / b);
+            }
+            s += " | host pages:";
+            for (size_t i = 0; i < std::min<size_t>(pages.size(), 14); ++i) {
+                s += fmt::format(" {}:{:.1f}%", host_name(pages[i].second), 100.0 * pages[i].first / b);
+            }
+            return s;
+        };
+        std::sort(cls.rbegin(), cls.rend());
+        std::sort(cls_span.rbegin(), cls_span.rend());
+        const u32 nt = g_gm.nthreads.load(std::memory_order_relaxed);
+        LOG_INFO(Render,
+                 "JobCensus jobs: {} JobWorker threads, busy {:.0f} ms/s = {:.2f} ms/frame (all threads, "
+                 "QueryThreadCycleTime at 3.5 GHz), samples {} idle {:.1f}% | busy samples: {}",
+                 nt, busy_ms, fr > 0 ? busy_ms / fr : 0.0, js, js ? 100.0 * ji / js : 0.0,
+                 split(cls, js - ji));
+        LOG_INFO(Render,
+                 "JobCensus jobs during the render span: samples {} idle {:.1f}%, busy {:.0f} ms/s = "
+                 "{:.2f} ms/frame | busy samples: {}",
+                 jss, jss ? 100.0 * jsi / jss : 0.0, span_busy_ms, fr > 0 ? span_busy_ms / fr : 0.0,
+                 split(cls_span, jss - jsi));
+        const double gm_cyc = double(g_gm.nrec_cyc[0].exchange(0));
+        const double ot_cyc = double(g_gm.nrec_cyc[1].exchange(0));
+        const double gm_n = double(g_gm.nrec_n[0].exchange(0));
+        const double ot_n = double(g_gm.nrec_n[1].exchange(0));
+        LOG_INFO(Render,
+                 "JobCensus NativeRec (NativeRecDraw + NativeRecShader, rdtsc): Game:Main {:.2f} ms/frame "
+                 "({:.0f} calls/frame, {:.0f} cycles each) | other threads {:.2f} ms/frame ({:.0f} "
+                 "calls/frame, {:.0f} cycles each)",
+                 fr > 0 ? gm_cyc / 3.5e6 / sec / fr : 0.0, fr > 0 ? gm_n / sec / fr : 0.0,
+                 gm_n > 0 ? gm_cyc / gm_n : 0.0, fr > 0 ? ot_cyc / 3.5e6 / sec / fr : 0.0,
+                 fr > 0 ? ot_n / sec / fr : 0.0, ot_n > 0 ? ot_cyc / ot_n : 0.0);
     }
 }
 

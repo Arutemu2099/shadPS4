@@ -863,6 +863,16 @@ std::atomic<u32> g_nr_last_nop{0};
 
 /// Walks the packets the game wrote from the cursor to `to` into the mirror. False (and every
 /// known bit cleared) when the walk does not land exactly on `to`.
+/// SHADPS4_JOB_CENSUS (2026-10-12): cycles of one NativeRecDraw / NativeRecShader call, by thread.
+struct NativeRecTimer {
+    u64 t0;
+    NativeRecTimer() : t0(Common::FaultMonitor::JobCensus() ? __rdtsc() : 0) {}
+    ~NativeRecTimer() {
+        if (t0) {
+            Common::FaultMonitor::NoteNativeRecCycles(__rdtsc() - t0);
+        }
+    }
+};
 bool NativeRecWalk(const u32* to) {
     auto& r = t_rec;
     const u32* p = r.cursor;
@@ -973,6 +983,7 @@ bool NativeRecWalk(const u32* to) {
 void DrawTagOtherShader(const u32* cmdbuf, u32 size, u32 stage);
 
 void NativeRecShader(const u32* cmdbuf, u32 size, bool is_set, u32 stage, const u32* regs) {
+    const NativeRecTimer timer;
     NativeRecWalk(cmdbuf);
     t_rec.cursor = cmdbuf + size;
     t_rec.set_called = t_rec.set_called || is_set;
@@ -1440,6 +1451,7 @@ std::array<std::atomic<u64>, 12> g_nr_why{};
 /// Returns the ring index written for this draw.
 u32 NativeRecDraw(const u32* cmdbuf, u64 index_addr, u32 index_count, u32 tag,
                   u32 packet_dwords = 10, bool indirect = false) {
+    const NativeRecTimer timer;
     auto& r = t_rec;
     if ((tag >> 28) > NR::MaxRecordSlot) [[unlikely]] {
         return ~0u; // a shared overflow slot: no records (Opus review 6)
