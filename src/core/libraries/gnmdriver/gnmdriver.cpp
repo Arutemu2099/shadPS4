@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdlib>
 #include <string>
+#include <mutex>
 #include <thread>
 #include <vector>
 #include "gnm_error.h"
@@ -855,10 +856,67 @@ struct RecThread {
 thread_local RecThread t_rec;
 /// Stage a2 job-side derive outcomes: 0 ok, 1 user data unknown, 2 VS not in the table yet,
 /// 3 no pipeline for (VS, PS, fetch shader); 4 run ended by the vertex layout.
-std::array<std::atomic<u64>, 5> g_nr_d{};
+/// SHADPS4_NR_SHARDED=1 (2026-10-13): the per-draw census counters of the NativeRec path were
+/// global atomics bumped by every job thread on every draw (s838 JobWorker1 profile: two of them
+/// were ~38% of NativeRec's samples - cache-line ping-pong). Each thread now counts in its own
+/// shard; readers sum the shards. Off: one shared shard, as before.
+inline const bool g_nr_sharded = [] {
+    const char* v = std::getenv("SHADPS4_NR_SHARDED");
+    return v && v[0] == '1';
+}();
+template <size_t N, int Tag>
+struct ShardedCounters {
+    struct alignas(64) Shard {
+        std::array<std::atomic<u64>, N> v{};
+    };
+    static inline std::mutex mu;
+    static inline std::vector<Shard*> shards;
+    static inline Shard shared;
+    static Shard& Local() {
+        if (!g_nr_sharded) {
+            return shared;
+        }
+        static thread_local Shard* t = nullptr;
+        if (!t) [[unlikely]] {
+            t = new Shard();
+            std::scoped_lock lk{mu};
+            shards.push_back(t);
+        }
+        return *t;
+    }
+    struct Ref {
+        size_t i;
+        void fetch_add(u64 x, std::memory_order o = std::memory_order_relaxed) {
+            Local().v[i].fetch_add(x, o);
+        }
+        u64 load(std::memory_order o = std::memory_order_relaxed) const {
+            u64 s = shared.v[i].load(o);
+            std::scoped_lock lk{mu};
+            for (Shard* sh : shards) {
+                s += sh->v[i].load(o);
+            }
+            return s;
+        }
+        u64 exchange(u64, std::memory_order o = std::memory_order_relaxed) {
+            u64 s = shared.v[i].exchange(0, o);
+            std::scoped_lock lk{mu};
+            for (Shard* sh : shards) {
+                s += sh->v[i].exchange(0, o);
+            }
+            return s;
+        }
+    };
+    Ref operator[](size_t i) const {
+        return Ref{i};
+    }
+    static constexpr size_t size() {
+        return N;
+    }
+};
+ShardedCounters<5, 1> g_nr_d{};
 // Diagnostic: which packet put a gap off the whitelist (opcode; 256 = other SH register, 257 = a
 // marker / flip NOP, 258 = other uconfig, 259 = other DMA).
-std::array<std::atomic<u64>, 260> g_nr_off{};
+ShardedCounters<260, 2> g_nr_off{};
 std::atomic<u32> g_nr_last_nop{0};
 
 /// Walks the packets the game wrote from the cursor to `to` into the mirror. False (and every
@@ -1056,8 +1114,8 @@ u64 NativeRecSpecKey(const Shader::BoundStage& bs, const Shader::Gcn::FetchShade
 /// Stage a2: derive what the front's FRONT_DERIVE + stage copy produce (flattened user data of
 /// VS / PS, the vertex inputs) on the job thread, through the program table the front publishes.
 /// Writes into the thread's payload ring; fills the record's derive fields (derived = 0: none).
-std::array<std::atomic<u64>, 4> g_nr_need{};
-std::array<std::atomic<u64>, 32> g_nr_need_reg{};
+ShardedCounters<4, 3> g_nr_need{};
+ShardedCounters<32, 4> g_nr_need_reg{};
 
 void NativeRecDerive(NR::Record& rec) {
     auto& r = t_rec;
@@ -1196,7 +1254,7 @@ static_assert(NR::GpuRecHiOffset == Shader::NativeRecordHiOffset);
 
 /// q3b: indirect records by outcome (0 total, 1 not derived, 2 index type unknown, 3 no union,
 /// 4 killed, 5 ok).
-std::array<std::atomic<u64>, 6> g_nr_ind{};
+ShardedCounters<6, 5> g_nr_ind{};
 /// q18 B: SHADPS4_NR_ITYPE_LATE=1 (see q18_pt_vertex.py).
 const bool g_nr_itype_late = [] {
     const char* e = std::getenv("SHADPS4_NR_ITYPE_LATE");
@@ -1205,7 +1263,7 @@ const bool g_nr_itype_late = [] {
 thread_local u32 t_nr_gpu_why = 0; // q3b: NativeRecGpu's exit (1-4; 0 = ok / not reached)
 /// q15: every record's NativeRecGpu exit (see q15_nr_gpu_why.py): 0 ok, 1-3 as q3b, 4 kill other, 5 stage,
 /// 6 slots, 7 unmapped V#.
-std::array<std::atomic<u64>, 8> g_q15_why{};
+ShardedCounters<8, 6> g_q15_why{};
 thread_local u32 t_nr_kill = 0;
 thread_local bool t_nr_indirect = false; // q4: the record being written is an indirect draw's
 
@@ -1446,7 +1504,7 @@ void NativeRecGpu(NR::Record& rec, u32 idx, u32 slot) {
     u.n.store(rec.run_k + 1, std::memory_order_release);
 }
 
-std::array<std::atomic<u64>, 12> g_nr_why{};
+ShardedCounters<12, 7> g_nr_why{};
 
 /// Returns the ring index written for this draw.
 u32 NativeRecDraw(const u32* cmdbuf, u64 index_addr, u32 index_count, u32 tag,
@@ -1516,9 +1574,10 @@ u32 NativeRecDraw(const u32* cmdbuf, u64 index_addr, u32 index_count, u32 tag,
                         : r.prim != r.run_prim              ? 10
                                                             : 11;
         g_nr_why[why].fetch_add(1, std::memory_order_relaxed);
-        const u64 n = g_nr_why[0].load(std::memory_order_relaxed) + 1;
         static std::atomic<u64> total{0};
-        if ((total.fetch_add(1, std::memory_order_relaxed) & 0xfffff) == 0xfffff) {
+        thread_local u64 t_total = 0;
+        const u64 tick = g_nr_sharded ? t_total++ : total.fetch_add(1, std::memory_order_relaxed);
+        if ((tick & 0xfffff) == 0xfffff) {
             std::string line;
             for (u32 i = 0; i < g_nr_why.size(); ++i) {
                 line += fmt::format(" {}={}", i, g_nr_why[i].exchange(0));

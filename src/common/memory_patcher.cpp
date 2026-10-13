@@ -297,9 +297,22 @@ static void ApplyParticleLateRead() {
         for (int i = 0; i < 8; ++i) {
             b.push_back(static_cast<u8>(hook >> (8 * i)));
         }
-        b.insert(b.end(), {0xff, 0xd0, 0xe9, 0xc6, 0x14, 0x15, 0x00, 0x90, 0x90, 0x90, 0x90});
-        writes[1] = {0x29cc89, b};
-        LOG_INFO(Loader, "SHADPS4_PARTICLE_ARENA_DISCARD: frame-start hook {:#x} before the cave", hook);
+        // Opus review (q43): the hook runs AFTER the cave (the cave may still read a stale
+        // control block in the half being discarded): 0x29cc89 jmp cave (as V1); the cave's
+        // last jmp returns to 0x29cc8e = push rdi; push rsi; movabs rax, hook; call rax;
+        // pop rsi; pop rdi (16 bytes, ends at 0x29cc9e = call 0x3ee7d0).
+        std::vector<u8> tail = {0x57, 0x56};
+        tail.insert(tail.end(), b.begin(), b.end());
+        tail.insert(tail.end(), {0xff, 0xd0, 0x5e, 0x5f});
+        std::vector<u8> jump = {0xe9, 0xd2, 0x14, 0x15, 0x00};
+        jump.insert(jump.end(), tail.begin(), tail.end());
+        writes[1] = {0x29cc89, jump};
+        writes[0].bytes[41] = 0x01; // cave: jmp 0x29cc8e (E9 01 EB EA FF) instead of 0x29cc9e
+        if (writes[1].bytes.size() != 21 || writes[0].bytes[40] != 0xe9) {
+            LOG_ERROR(Loader, "SHADPS4_PARTICLE_ARENA_DISCARD: bad patch layout, not applied");
+            writes = patched;
+        }
+        LOG_INFO(Loader, "SHADPS4_PARTICLE_ARENA_DISCARD: frame-start hook {:#x} after the cave", hook);
     }
     for (const auto& p : writes) {
         std::memcpy(reinterpret_cast<void*>(g_eboot_address + p.offset), p.bytes.data(),

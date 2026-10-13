@@ -192,7 +192,8 @@ public:
     /// SHADPS4_PARTICLE_ARENA_DISCARD: drop the GPU-modified state of a dead particle arena half
     /// (no download). Posted from Game:Main; DiscardDeadGpuData runs on the CP thread.
     void PostArenaDiscard(VAddr lo, u64 size, VAddr arena_lo, VAddr arena_hi);
-    void DiscardDeadGpuData(VAddr lo, u64 size);
+    void DiscardDeadGpuData(VAddr lo, u64 size,
+                            const std::vector<std::pair<VAddr, std::vector<u64>>>& chunks);
 
     /// Block new asynchronous readbacks before GPU unmap and settle earlier ones.
     void BeginGpuUnmap(VAddr device_addr, u64 size);
@@ -640,10 +641,14 @@ private:
     void PrefetchNoteWindow(VAddr addr, u64 size);
     void PrefetchWaiterLoop(std::stop_token stop);
     void PrefetchMaybeLog();
+    /// SHADPS4_HOT_PAGE_PREFETCH: back, once per frame (DiscardDeadGpuData); owner-less read jobs
+    /// over the pages of guest readback-class write faults, published by the f2 waiter.
+    void PrefetchHotPages();
     struct PrefetchItem {
         u64 id;
         u32 slot;
         u64 value;
+        u8 lane{}; ///< timeline of `value`: 0 the ASC lane (f2), 1 the fast lane, 2 main
     };
     std::mutex pf_mutex;
     std::condition_variable_any pf_cv;
