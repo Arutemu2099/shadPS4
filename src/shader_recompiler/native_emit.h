@@ -101,6 +101,11 @@ struct NativeEmit {
     bool bindless_vs{};
     u32 vs_img_base{};
     u32 vs_smp_base{};
+    /// q53 (SHADPS4_A2_VBUF2): a second whole vertex storage buffer at `vertex2_binding` (after
+    /// every other set-0 binding); location l pulls from it when bit 16 + l of the push word
+    /// PushData::buf_offsets[0..3] is set (bits 0-15 stay q18's page-table mask).
+    bool vbuf2{};
+    u32 vertex2_binding{};
 };
 inline thread_local NativeEmit t_native_emit{};
 /// q18: SHADPS4_A2_PT_VERTEX=1 - colour vertex streams outside the bound vertex buffer are pulled through the page
@@ -109,6 +114,14 @@ inline thread_local NativeEmit t_native_emit{};
 /// SHADPS4_NATIVE_COLOUR_DIAG=4096 compares the page-table fetch against the real vertex input on the back's path.
 inline const int g_pt_vertex = [] {
     const char* e = std::getenv("SHADPS4_A2_PT_VERTEX");
+    return e ? std::atoi(e) : 0;
+}();
+/// q53: SHADPS4_A2_VBUF2=1 - colour variants get a second vertex SSBO; the A2 translator takes draws whose streams
+/// sit in two cached buffers (the second one's locations: mask bits 16 + l of buf_offsets[0..3]).
+/// =2 / =3 (bit-exact gate only, with SHADPS4_NATIVE_COLOUR_DIAG=4096 on the back's path): the back binds its one
+/// vertex buffer to both bindings and sets mask 0xffff (every location through SSBO 2) / 0x5555 (alternating).
+inline const int g_vbuf2 = [] {
+    const char* e = std::getenv("SHADPS4_A2_VBUF2");
     return e ? std::atoi(e) : 0;
 }();
 /// q3: SHADPS4_NATIVE_BINDLESS_VS=1.

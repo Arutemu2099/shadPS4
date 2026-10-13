@@ -271,6 +271,7 @@ public:
     Id native_draw_out{};      // VS: flat uint output at NativeDrawIndexLocation
     Id native_draw_in{};       // PS: the matching flat input
     Id native_vbuf{};          // VS: the whole vertex storage buffer (uint data[])
+    Id native_vbuf2{};         // q53: the second vertex storage buffer (SHADPS4_A2_VBUF2)
     Id native_dbg{};           // VS, compare diagnostic: writable uint data[]
     Id native_dbg_ptr{};
     void NativeCompareAttribute(u32 location, Id vertex_index_value, Id draw);
@@ -298,7 +299,7 @@ public:
     Id NativeSegSlotLoad(u32 word);
     void NativeSegRecordPointer(Id draw);
     std::array<Id, IR::NumParams> native_attr_value{}; // VS: pulled vec4 per fetch semantic
-    Id NativeVbufLoad(Id dword_index);
+    Id NativeVbufLoad(Id dword_index, Id buffer = {});
     Id NativePullAttribute(u32 location, Id vertex_index_value);
     Id instance_id{};
     Id push_data_block{};

@@ -347,7 +347,8 @@ public:
     /// 0 or >= 1 GB, no cached buffer holding it, offset over 32 bits), 19 draws taken with an
     /// inherited slot, 20 draws taken with user clip planes, 21 a 17th texel range refused,
     /// 22 draws taken with a formatted slot, 23 guest slots resolved by the opener's own V#.
-    std::array<u64, 48> sub{}; ///< 34-43 (q1): indirect without a variant by cause; 32-33 (m3): indirect draws with / without a variant ///< 24-27 (l4b): "no variant" by pipeline state; 28-31 (l4c) slots
+    std::array<u64, 52> sub{}; ///< 48-49 (q53): colour vertex third VkBuffer refused / draws taken with a second one
+    ///< 34-43 (q1): indirect without a variant by cause; 32-33 (m3): indirect draws with / without a variant ///< 24-27 (l4b): "no variant" by pipeline state; 28-31 (l4c) slots
     /// Draws taken and sub-batches opened so far (logged by the caller).
     u64 taken{}, sub_batches{};
     /// The reason of the last refusal (TakeDraw returned false).

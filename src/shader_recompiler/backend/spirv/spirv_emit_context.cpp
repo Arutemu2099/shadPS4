@@ -992,6 +992,15 @@ void EmitContext::DefineBuffers() {
             Decorate(native_vbuf, spv::Decoration::NonWritable);
             Name(native_vbuf, "native_vbuf");
             interfaces.push_back(native_vbuf);
+            if (Shader::t_native_emit.vbuf2) {
+                // q53: the second vertex SSBO (same block type).
+                native_vbuf2 = AddGlobalVariable(struct_pointer_type, spv::StorageClass::StorageBuffer);
+                Decorate(native_vbuf2, spv::Decoration::Binding, Shader::t_native_emit.vertex2_binding);
+                Decorate(native_vbuf2, spv::Decoration::DescriptorSet, 0U);
+                Decorate(native_vbuf2, spv::Decoration::NonWritable);
+                Name(native_vbuf2, "native_vbuf2");
+                interfaces.push_back(native_vbuf2);
+            }
         }
         if (native_ring) {
             native_table = AddGlobalVariable(struct_pointer_type, spv::StorageClass::StorageBuffer);
@@ -1238,9 +1247,9 @@ Id EmitContext::NativeSegSlotLoad(u32 word) {
                   spv::MemoryAccessMask::Aligned, 4u);
 }
 
-Id EmitContext::NativeVbufLoad(Id dword_index) {
-    return OpLoad(U32[1],
-                  OpAccessChain(native_records_ptr, native_vbuf, u32_zero_value, dword_index));
+Id EmitContext::NativeVbufLoad(Id dword_index, Id buffer) {
+    return OpLoad(U32[1], OpAccessChain(native_records_ptr, Sirit::ValidId(buffer) ? buffer : native_vbuf,
+                                        u32_zero_value, dword_index));
 }
 
 void EmitContext::NativeCompareAttribute(u32 loc, Id vindex, Id draw) {
@@ -1318,15 +1327,45 @@ Id EmitContext::NativePullAttribute(u32 loc, Id vindex) {
     const Id aligned{OpIEqual(U1[1], sh, u32_zero_value)};
     const Id inv{OpISub(U32[1], ConstU32(32u), sh)};
     std::array<Id, 4> d{};
-    const auto vbuf_dwords = [&] {
+    const auto vbuf_dwords_from = [&](Id buffer) {
         std::array<Id, 4> r{};
-        Id lo{NativeVbufLoad(dw0)};
+        Id lo{NativeVbufLoad(dw0, buffer)};
         for (u32 i = 0; i < ndw; ++i) {
-            const Id hi{NativeVbufLoad(OpIAdd(U32[1], dw0, ConstU32(i + 1)))};
+            const Id hi{NativeVbufLoad(OpIAdd(U32[1], dw0, ConstU32(i + 1)), buffer)};
             const Id funnel{OpBitwiseOr(U32[1], OpShiftRightLogical(U32[1], lo, sh),
                                         OpShiftLeftLogical(U32[1], hi, inv))};
             r[i] = OpSelect(U32[1], aligned, lo, funnel);
             lo = hi;
+        }
+        return r;
+    };
+    const auto vbuf_dwords = [&] {
+        if (!Sirit::ValidId(native_vbuf2)) {
+            return vbuf_dwords_from(native_vbuf);
+        }
+        // q53: bit 16 + loc of the push word picks the second vertex SSBO (a uniform branch: the
+        // push constants are the same for every invocation); the same offsets and decode.
+        const Id mask_ptr{OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U32[1]),
+                                        push_data_block, ConstU32(Shader::PushData::BufOffsetIndex),
+                                        u32_zero_value)};
+        const Id use_2{OpINotEqual(U1[1],
+                                   OpBitwiseAnd(U32[1], OpLoad(U32[1], mask_ptr), ConstU32(1u << (16 + loc))),
+                                   u32_zero_value)};
+        const Id l_2{OpLabel()};
+        const Id l_1{OpLabel()};
+        const Id l_merge{OpLabel()};
+        OpSelectionMerge(l_merge, spv::SelectionControlMask::MaskNone);
+        OpBranchConditional(use_2, l_2, l_1);
+        AddLabel(l_2);
+        const auto r2 = vbuf_dwords_from(native_vbuf2);
+        OpBranch(l_merge);
+        AddLabel(l_1);
+        const auto r1 = vbuf_dwords_from(native_vbuf);
+        OpBranch(l_merge);
+        AddLabel(l_merge);
+        std::array<Id, 4> r{};
+        for (u32 i = 0; i < ndw; ++i) {
+            r[i] = OpPhi(U32[1], r2[i], l_2, r1[i], l_1);
         }
         return r;
     };
@@ -1417,10 +1456,14 @@ Id EmitContext::NativePullAttribute(u32 loc, Id vindex) {
         OpBranch(l_merge);
         AddLabel(l_vb);
         const auto dv = vbuf_dwords();
+        // q53: vbuf_dwords may end in its own merge block; the phi names this one.
+        const Id l_vb_end{OpLabel()};
+        OpBranch(l_vb_end);
+        AddLabel(l_vb_end);
         OpBranch(l_merge);
         AddLabel(l_merge);
         for (u32 i = 0; i < ndw; ++i) {
-            d[i] = OpPhi(U32[1], dp[i], l_pt, dv[i], l_vb);
+            d[i] = OpPhi(U32[1], dp[i], l_pt, dv[i], l_vb_end);
         }
         }
     } else {

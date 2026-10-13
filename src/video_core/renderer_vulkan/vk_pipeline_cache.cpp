@@ -444,6 +444,7 @@ struct PipelineCache::NativeColourJob {
     u32 vertex_binding{};
     u32 table_binding{GraphicsPipeline::NoNativeRecords};
     u32 pt_debug_binding{GraphicsPipeline::NoNativeRecords}; // SHADPS4_NATIVE_PT=2
+    u32 vertex2_binding{GraphicsPipeline::NoNativeRecords};  // q53: SHADPS4_A2_VBUF2
     bool bindless{};
     const char* bindless_why{}; // q1b census
     u64 dead_mask{};            // q3: bindings the sparse layout dropped
@@ -523,6 +524,7 @@ private:
                     variant->native_vertex_binding = job->vertex_binding;
                     variant->native_table_binding = job->table_binding;
                     variant->native_pt_debug_binding = job->pt_debug_binding;
+                    variant->native_vertex2_binding = job->vertex2_binding;
                     slot.set_variant.store(variant.get(), std::memory_order_release);
                     PipelineCache::g_nc_claims[7].fetch_add(1, std::memory_order_relaxed);
                 }
@@ -530,6 +532,7 @@ private:
                 variant->native_vertex_binding = job->vertex_binding;
                 variant->native_table_binding = job->table_binding;
                 variant->native_pt_debug_binding = job->pt_debug_binding;
+                variant->native_vertex2_binding = job->vertex2_binding;
                 slot.variant.store(variant.get(), std::memory_order_release);
                 PipelineCache::g_nc_claims[5].fetch_add(1, std::memory_order_relaxed);
             }
@@ -1536,7 +1539,8 @@ void PipelineCache::PrepareNativeColourLocked(const GraphicsPipeline* base,
             // + the records and vertex SSBOs in buffer_infos (static_vector of NUM_BUFFERS).
             const u32 extra = ((VideoCore::g_native_colour_diag & 4096) ? 3u : 2u) +
                               (Shader::g_native_ring ? 1u : 0u) + // review #5; + the table
-                              (Shader::g_native_ring ? u32(Shader::g_native_pt) : 0u); // + PT
+                              (Shader::g_native_ring ? u32(Shader::g_native_pt) : 0u) + // + PT
+                              (Shader::g_native_ring && Shader::g_vbuf2 != 0 ? 1u : 0u); // q53: + vbuf2
             if (vs->buffers.size() + fs->buffers.size() + extra > Shader::NUM_BUFFERS) {
                 return "buffer count";
             }
@@ -1711,6 +1715,10 @@ void PipelineCache::PrepareNativeColourLocked(const GraphicsPipeline* base,
     // SHADPS4_NATIVE_SEG (sec. 20 brick A): records by pointer through the batch's list.
     emit.seg = Shader::g_native_seg != 0 && emit.pt;
     emit.seg_compare = Shader::g_native_seg_compare && emit.pt;
+    // q53 (SHADPS4_A2_VBUF2): the second vertex SSBO after every other set-0 binding (ring mode only: the A2
+    // translator's layout check keeps records / vertex / table at unified + 0 / 1 / 2).
+    emit.vbuf2 = Shader::g_vbuf2 != 0 && emit.ring;
+    emit.vertex2_binding = (emit.pt_compare ? emit.pt_debug_binding : emit.table_binding) + 1;
     // SHADPS4_NATIVE_BINDLESS (sec. 12): the PS samples the global arrays; the VS has no image
     // or sampler, the PS at most 16 of each, all sampled (no storage, no mip fallback).
     const char* bindless_why = nullptr; // q1b census
@@ -1878,6 +1886,15 @@ void PipelineCache::PrepareNativeColourLocked(const GraphicsPipeline* base,
                 .stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
             });
             job->pt_debug_binding = emit.pt_debug_binding;
+        }
+        if (emit.vbuf2) {
+            job->bindings.push_back({
+                .binding = emit.vertex2_binding,
+                .descriptorType = vk::DescriptorType::eStorageBuffer,
+                .descriptorCount = 1,
+                .stageFlags = vk::ShaderStageFlagBits::eVertex,
+            });
+            job->vertex2_binding = emit.vertex2_binding;
         }
     }
     // SHADPS4_NATIVE_SPARSE_LAYOUT (l4c): the bindless PS samples set 1; set 0's image / sampler

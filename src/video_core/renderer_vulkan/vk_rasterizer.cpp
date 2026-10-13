@@ -5042,6 +5042,22 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         wv.descriptorType = vk::DescriptorType::eStorageBuffer;
         wv.pBufferInfo = &buffer_infos.back();
         ++set_write_index;
+        if (native->native_vertex2_binding != GraphicsPipeline::NoNativeRecords) {
+            // q53: the back pulls from its one vertex buffer: the same buffer at the second vertex binding, so any
+            // mask bit reads the same bytes. =2 / =3 (bit-exact gate): every / every other location through it.
+            buffer_infos.emplace_back(vb, 0, VK_WHOLE_SIZE);
+            auto& wv2 = set_writes.emplace_back();
+            wv2.dstSet = VK_NULL_HANDLE;
+            wv2.dstBinding = native->native_vertex2_binding;
+            wv2.dstArrayElement = 0;
+            wv2.descriptorCount = 1;
+            wv2.descriptorType = vk::DescriptorType::eStorageBuffer;
+            wv2.pBufferInfo = &buffer_infos.back();
+            ++set_write_index;
+            const u8 m = Shader::g_vbuf2 == 2 ? 0xffu : Shader::g_vbuf2 == 3 ? 0x55u : 0u;
+            push_data.buf_offsets[2] = m;
+            push_data.buf_offsets[3] = m;
+        }
         if (VideoCore::g_native_colour_diag & 4096) {
             if (!native_dbg) {
                 native_dbg = std::make_unique<VideoCore::Buffer>(

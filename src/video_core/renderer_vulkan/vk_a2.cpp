@@ -616,6 +616,8 @@ struct StretchTranslator::Impl {
     u64 b_vbuf{};  ///< colour: the one vertex VkBuffer of the opener
     u32 b_vmask{}; ///< colour: the opener's non-null pulled locations
     u32 b_vptmask{}; ///< q18: the opener's page-table-pulled locations
+    u64 b_vbuf2{};   ///< q53: the opener's second vertex VkBuffer (0 = none)
+    u32 b_v2mask{};  ///< q53: the opener's locations pulled from it
     u32* count_ptr{};
     u8* cmd_ptr{};
     const GraphicsPipeline* b_native{};
@@ -1220,6 +1222,11 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     u64 vbuf = 0;
     u32 vmask = 0;
     u32 vptmask = 0; // q18: locations pulled through the page table (SHADPS4_A2_PT_VERTEX)
+    // q53 (SHADPS4_A2_VBUF2): a second distinct vertex VkBuffer goes to the variant's second vertex SSBO (its
+    // locations in v2mask); a third is refused (or page-table pulled with q18).
+    const bool v2_on = colour && native->native_vertex2_binding != GraphicsPipeline::NoNativeRecords;
+    u64 vbuf2 = 0;
+    u32 v2mask = 0;
     for (u32 k = 0; k < vb_n; ++k) {
         const u32 loc = attribs[k].desc.location;
         if (colour && (attribs[k].desc.instanced || loc >= Shader::NativeMaxPulledLocations)) {
@@ -1238,9 +1245,15 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         voff[k] = vaddr_vi[k] - vcpu[k];
         if (colour) {
             bool pt_loc = false;
-            if ((vbuf != 0 && vb_handle[k] != vbuf) || voff[k] > 0xffffffffull) {
+            bool v2_loc = false;
+            const bool other = vbuf != 0 && vb_handle[k] != vbuf;
+            const bool third = other && v2_on && vbuf2 != 0 && vb_handle[k] != vbuf2;
+            if (other && v2_on && !third && voff[k] <= 0xffffffffull) {
+                v2_loc = true; // q53: the second vertex SSBO
+            } else if (other || voff[k] > 0xffffffffull) {
                 if (Shader::g_pt_vertex == 0) {
-                    ++owner->sub[vbuf != 0 && vb_handle[k] != vbuf ? 45 : 46]; // q4: 2nd buffer / offset
+                    // q4: 2nd buffer / offset; q53: 3rd buffer
+                    ++owner->sub[third ? 48 : (other && !v2_on) ? 45 : 46];
                     return refuse(RefuseColourVertex);
                 }
                 pt_loc = true; // q18: pulled through the page table from its full guest address
@@ -1258,6 +1271,9 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
                     return refuse(RefuseColourVertex);
                 }
                 vptmask |= 1u << loc;
+            } else if (v2_loc) {
+                vbuf2 = vb_handle[k];
+                v2mask |= 1u << loc;
             } else {
                 vbuf = vb_handle[k];
             }
@@ -1272,6 +1288,11 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         // q18: the shader reads the mask from buf_offsets[0..1] (native shaders never read buf_offsets).
         push.buf_offsets[0] = static_cast<u8>(vptmask & 0xff);
         push.buf_offsets[1] = static_cast<u8>(vptmask >> 8);
+    }
+    if (v2mask != 0) {
+        // q53: the shader reads the second-SSBO mask from buf_offsets[2..3] (bits 16-31 of the push word).
+        push.buf_offsets[2] = static_cast<u8>(v2mask & 0xff);
+        push.buf_offsets[3] = static_cast<u8>(v2mask >> 8);
     }
 
     // Dynamic state of this draw on top of the tracked state (a copy: a refusal below must not
@@ -1317,7 +1338,8 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
                 inh_ps == b_inh_ps && ib_handle == b_ib && index_size == b_index_size &&
                 vb_n == b_vb_n && draw.vi->desc_id == last_desc_id && PushKeySame(push, b_push) &&
                 guest_mask == b_guest_mask && !AnyDirty(cand) &&
-                (!colour || (vbuf == b_vbuf && vmask == b_vmask && vptmask == b_vptmask)) &&
+                (!colour || (vbuf == b_vbuf && vmask == b_vmask && vptmask == b_vptmask &&
+                             vbuf2 == b_vbuf2 && v2mask == b_v2mask)) &&
                 inh_slots == b_inh_slots &&
                 clip_on == b_clip && (!clip_on || planes == b_planes) && fmt_mask == b_fmt_mask;
     for (u64 m = fmt_mask; cont && m != 0; m &= m - 1) {
@@ -1579,7 +1601,8 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
             vb_changed = vb_handle[k] != b_vb[k] || bo[k] != b_vb_off[k];
         }
         sb.emit_pipeline = first_batch || native != b_native;
-        sb.emit_push = first_batch || !PushKeySame(push, b_push) || vptmask != b_vptmask; // q18
+        sb.emit_push = first_batch || !PushKeySame(push, b_push) || vptmask != b_vptmask || // q18
+                       v2mask != b_v2mask;                                                    // q53
         sb.emit_descriptors = true; // the table is a new region every sub-batch
         sb.emit_vertex_input = first_batch || draw.vi->desc_id != last_desc_id;
         sb.emit_index = ib_changed;
@@ -1598,6 +1621,12 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         }
         writes[num_writes++] = {native->native_table_binding, ctx.arena->buffer, region_off,
                                 TableBytes};
+        if (v2_on) {
+            // q53: the second vertex VkBuffer (the first one when the draw has none), the last binding.
+            writes[num_writes++] = {native->native_vertex2_binding,
+                                    vk::Buffer{std::bit_cast<VkBuffer>(vbuf2 != 0 ? vbuf2 : vbuf)}, 0,
+                                    VK_WHOLE_SIZE};
+        }
         if (clip_on) {
             std::memcpy(region + clip_off_in_region, planes.data(), ClipBytes);
             writes[clip_wi].buffer = ctx.arena->buffer;
@@ -1654,6 +1683,8 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         b_vbuf = vbuf;
         b_vmask = vmask;
         b_vptmask = vptmask;
+        b_vbuf2 = vbuf2;
+        b_v2mask = v2mask;
         if (vptmask != 0) [[unlikely]] {
             static std::atomic<u64> pt_batches{0};
             const u64 n = pt_batches.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1788,6 +1819,9 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
                 cmds->inh_checks.push_back({draw.seq, b_iaddr[b], b_isize[b], b_ioff[b], b_isz[b]});
             }
         }
+    }
+    if (v2mask != 0) {
+        ++owner->sub[49]; // q53: taken with a second vertex VkBuffer
     }
     if (fmt_mask != 0) {
         ++owner->sub[22];
