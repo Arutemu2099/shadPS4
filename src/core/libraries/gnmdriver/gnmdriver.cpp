@@ -44,6 +44,10 @@ extern Frontend::WindowSDL* g_window;
 std::unique_ptr<Vulkan::Presenter> presenter;
 std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
+namespace VideoCore {
+void ArenaReadPrefetchFrameEnd(); // buffer_cache.cpp (q48)
+}
+
 namespace Libraries::GnmDriver {
 
 using namespace AmdGpu;
@@ -3699,6 +3703,10 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffers(u32 count, const u32* dcb_gpu_addrs[
 int PS4_SYSV_ABI sceGnmSubmitDone() {
     HLE_TRACE;
     LOG_DEBUG(Lib_GnmDriver, "called");
+    if (Common::FaultMonitor::t_is_game_main) {
+        // q48 SHADPS4_ARENA_READ_PREFETCH: the frame's particle chain is recorded (wait #2 passed).
+        VideoCore::ArenaReadPrefetchFrameEnd();
+    }
     {
         Common::FaultMonitor::GnmWaitScope gm_wait{7};
         WaitGpuIdle();

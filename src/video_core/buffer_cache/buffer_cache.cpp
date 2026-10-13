@@ -890,6 +890,67 @@ static void NoteHotPage(VAddr addr, u64 size) {
     }
 }
 
+// SHADPS4_ARENA_READ_PREFETCH=1 (q48, 2026-10-13; with SHADPS4_PARTICLE_LATE_READ,
+// SHADPS4_PARTICLE_ARENA_DISCARD and HotPrefetch's prerequisites). With V1 the frame start reads
+// the previous frame's half of the particle arena: 0x3edef0 on Game:Main (~770 control blocks) and
+// the collision jobs 0x3fed00 on the job threads (records, sim state). Those pages are GPU-written,
+// so each read faults and downloads (~0.45 ms per fault: two CP round trips and the copy; s852 city:
+// the cave's two steps cost Game:Main 0.97 + 0.68 ms per frame). The pages read move little from
+// frame to frame relative to the half (0x3ee7d0 allocates in instance order). So every guest read
+// fault in the current half is noted by its offset in the half, and at the end of the next frame
+// (sceGnmSubmitDone on Game:Main: the game's wait #2 at 0x29cd56 has passed the chain's CP-time
+// label, so the chain is recorded) the same offsets of that frame's half get owner-less read jobs
+// like HotPrefetch's. The f2 waiter copies the bytes and has them published before the next frame
+// start reads them; a read that comes first takes f2's H7 retry (waits for the job, no new copy).
+static const bool g_arena_read_prefetch = EnvIs1("SHADPS4_ARENA_READ_PREFETCH");
+static constexpr u64 ArenaHalf = 0x1E00000ULL;
+/// The half 0x3ee7d0 fills this frame (set by the discard hook before it runs).
+static std::atomic<VAddr> g_arena_cur_half{0};
+struct ArenaReadPage {
+    u32 page1; ///< page index in the half + 1 (0: empty)
+    u64 frame;
+};
+static constexpr size_t ArenaReadSlots = 96; // the oldest is evicted
+static std::mutex g_arena_rd_mutex;
+static std::array<ArenaReadPage, ArenaReadSlots> g_arena_rd{};
+/// 0 guest read faults in the current half; 1 prefetch calls, 2 jobs, 3 of them on the fast lane,
+/// 4 KB, 5 learned pages covered; skipped: 6 page clean, 7 pending job, 8 cap / slot / staging,
+/// 9 other; waiter: 10 published, 11 vetoed, 12 settled by a guest fault first.
+static std::atomic<u64> g_arena_n[13]{};
+
+static void NoteArenaRead(VAddr addr) {
+    const VAddr half = g_arena_cur_half.load(std::memory_order_relaxed);
+    if (half == 0 || addr < half || addr >= half + ArenaHalf) {
+        return;
+    }
+    g_arena_n[0].fetch_add(1, std::memory_order_relaxed);
+    const u32 page1 = static_cast<u32>((addr - half) >> 12) + 1;
+    const u64 frame = Common::FaultMonitor::presented_frames.load(std::memory_order_relaxed);
+    std::scoped_lock lk{g_arena_rd_mutex};
+    ArenaReadPage* slot = &g_arena_rd[0]; // the same page, else the oldest (empty: frame 0)
+    for (ArenaReadPage& h : g_arena_rd) {
+        if (h.page1 == page1) {
+            slot = &h;
+            break;
+        }
+        slot = h.frame < slot->frame ? &h : slot;
+    }
+    *slot = {page1, frame};
+}
+
+void ArenaReadPrefetchFrameEnd() {
+    BufferCache* bc = g_discard_cache;
+    const VAddr half = g_arena_cur_half.load(std::memory_order_relaxed);
+    if (!g_arena_read_prefetch || !bc || half == 0) {
+        return;
+    }
+    bc->PostArenaReadPrefetch(half);
+}
+
+void BufferCache::PostArenaReadPrefetch(VAddr half) {
+    liverpool->SendCommand<false>([this, half] { PrefetchArenaReads(half); });
+}
+
 void PS4_SYSV_ABI ParticleArenaDiscardHook() {
     BufferCache* bc = g_discard_cache;
     const u64 eboot = MemoryPatcher::g_eboot_address;
@@ -903,6 +964,7 @@ void PS4_SYSV_ABI ParticleArenaDiscardHook() {
         g_discard_skipped_hook.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    g_arena_cur_half.store(base + parity * Half, std::memory_order_relaxed); // q48
     static bool logged = false;
     if (!logged) {
         logged = true;
@@ -1146,6 +1208,9 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool of
     const bool cp_self = liverpool->IsGpuThread();
     const auto origin = cp_self ? Offload::Origin::CpSelf : Offload::Origin::Guest;
     Offload::CountFault(origin);
+    if (g_arena_read_prefetch && !is_write && !cp_self) {
+        NoteArenaRead(device_addr); // q48
+    }
     // Thread-wait column rf_guest_ms (always on): a guest thread's time in a read fault,
     // synchronous or offloaded (review 2026-10-02); command processor faults are not counted.
     struct GuestReadTime {
@@ -1914,6 +1979,7 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
         job->state = FaultJobState::Pending;
         job->abandoned = false;
         job->prefetch = false; // f2
+        job->arena = false;    // q48
         job->is_write = is_write;
         job->addr = addr;
         job->size = bytes;
@@ -3362,7 +3428,7 @@ void BufferCache::FinalizeFaultJob(FaultJob& job) {
     if (job.prefetch) {
         pf_last_ok = ok; // f2
         --pf_pending;
-        if (!job.on_asc) {
+        if (!job.on_asc && !job.arena) { // q48: an arena job keeps the hold until its publish
             // SHADPS4_HOT_PAGE_PREFETCH (Opus review): the waiter never touches a hot job's slot
             // (no guest copy off the ASC lane; PublishPrefetch checks the job id), so the slot is
             // free for guest faults as soon as the job is finalized. f2 jobs keep the hold until
@@ -3684,6 +3750,7 @@ u64 BufferCache::PrefetchAfterLabel(VAddr label) {
             job->state = FaultJobState::Pending;
             job->abandoned = true; // no owner: finalization frees the slot
             job->prefetch = true;
+            job->arena = false;
             job->pf_hold.store(true, std::memory_order_release);
             job->is_write = false;
             job->addr = lo;
@@ -3758,7 +3825,9 @@ void BufferCache::PrefetchWaiterLoop(std::stop_token stop) {
             .Wait(it.value);
         // f2 jobs only: a hot-page job's slot is released when it is finalized (FinalizeFaultJob),
         // so it may already hold another job; its bytes are copied by PublishFaultJob on the back.
-        if (it.lane == 0 && PrefetchMode() == 1 && g_fault_guest_copy && !Offload::VerifyEnabled()) {
+        // q48: arena jobs too - their slot is held until PublishPrefetch, which this posts below.
+        if (((it.lane == 0 && PrefetchMode() == 1) || it.arena) && g_fault_guest_copy &&
+            !Offload::VerifyEnabled()) {
             GuestCopyFaultJob(fault_jobs[it.slot]); // slot held: never another job's
         }
         liverpool->SendCommand<false>(
@@ -3779,7 +3848,9 @@ void BufferCache::PublishPrefetch(u64 id, u32 slot, u8 lane) {
     } else {
         ++pf_c[17]; // settled before the waiter (guest early or an overlap settle)
     }
-    if (lane != 0) { // SHADPS4_HOT_PAGE_PREFETCH (f2 jobs are on the ASC lane, lane 0)
+    if (same_job && job.arena) { // q48
+        g_arena_n[!pending ? 12 : pf_last_ok ? 10 : 11].fetch_add(1, std::memory_order_relaxed);
+    } else if (lane != 0) { // SHADPS4_HOT_PAGE_PREFETCH (f2 jobs are on the ASC lane, lane 0)
         g_hot_n[!pending ? 10 : pf_last_ok ? 8 : 9].fetch_add(1, std::memory_order_relaxed);
     }
     if (same_job) { // never another job's hold (Opus review)
@@ -3918,6 +3989,7 @@ void BufferCache::PrefetchHotPages() {
             job->state = FaultJobState::Pending;
             job->abandoned = true; // no owner: finalization frees the slot
             job->prefetch = true;  // published by the f2 waiter; guest faults take H7
+            job->arena = false;
             // Held until finalized (FinalizeFaultJob clears it for non-ASC jobs).
             job->pf_hold.store(true, std::memory_order_release);
             job->is_write = false;
@@ -4005,6 +4077,189 @@ void BufferCache::PrefetchHotPages() {
                  "cap / slot / staging {}, other {} | published {} vetoed {} settled by a guest "
                  "fault first {}",
                  calls, n, v(0), v(1), v(2), v(3), v(4), v(5), v(6), v(7), v(8), v(9), v(10));
+    }
+}
+
+// SHADPS4_ARENA_READ_PREFETCH=1 (q48, see NoteArenaRead). CP thread, once per frame end. As
+// PrefetchHotPages, over the learned arena offsets mapped into `half`, with these differences: the
+// arena is the target (no arena skip); up to 6 jobs per call, most in the open main batch (the
+// chain that wrote the half was just recorded); 4 slots always stay free for guest faults; the
+// jobs keep their slot until PublishPrefetch so the waiter copies their bytes (up to ~1 MB each).
+void BufferCache::PrefetchArenaReads(VAddr half) {
+    static const bool usable = [this] {
+        const bool ok = Offload::Enabled() && g_write_fault_offload && g_fault_write_skip_settle &&
+                        !scheduler.HasAscStream() && !scheduler.HasLane();
+        LOG_INFO(Render, "ArenaReadPrefetch: {}", ok ? "on" : "off (needs SHADPS4_READBACK_OFFLOAD, "
+                 "WRITE_FAULT_OFFLOAD, FAULT_WRITE_SKIP_SETTLE and no ASC stream or lane)");
+        return ok;
+    }();
+    if (!usable) {
+        return;
+    }
+    constexpr u32 MaxJobs = 6;
+    constexpr u32 KeepFree = 4; // slots left for guest faults
+    const auto count = [](u32 k, u64 v = 1) { g_arena_n[k].fetch_add(v, std::memory_order_relaxed); };
+    count(1);
+    const u64 now = Common::FaultMonitor::presented_frames.load(std::memory_order_relaxed);
+    std::array<VAddr, ArenaReadSlots> pages{};
+    size_t n = 0;
+    {
+        std::scoped_lock lk{g_arena_rd_mutex};
+        for (const ArenaReadPage& h : g_arena_rd) {
+            if (h.page1 != 0 && h.frame + 4 >= now) {
+                pages[n++] = half + (u64(h.page1 - 1) << 12);
+            }
+        }
+    }
+    std::sort(pages.begin(), pages.begin() + n);
+    auto* master = scheduler.GetMasterSemaphore();
+    master->Refresh();
+    boost::container::small_vector<PrefetchItem, MaxJobs> items;
+    bool main_copies = false;
+    for (size_t i = 0; i < n;) {
+        const VAddr page = pages[i];
+        const BufferId buffer_id = page_table[page >> CACHING_PAGEBITS].buffer_id;
+        if (IsBufferInvalid(buffer_id) || !slot_buffers[buffer_id].IsInBounds(page, 4096) ||
+            !memory_tracker->IsRegionGpuModified(page, 4096)) {
+            ++i;
+            count(6);
+            continue;
+        }
+        Buffer& source = slot_buffers[buffer_id];
+        const auto window = ResolveFaultWindow(source, page, 4096, false);
+        const VAddr lo = window.first;
+        const u64 bytes = window.second;
+        u64 covered = 0;
+        do {
+            ++covered; // the learned pages of this window (sorted; none below `page`)
+        } while (++i < n && pages[i] < lo + bytes);
+        if (HasOverlappingFaultJob(lo, bytes)) {
+            count(7);
+            continue;
+        }
+        FaultJob* job = nullptr;
+        u32 free_slots = 0;
+        for (FaultJob& candidate : fault_jobs) {
+            if (candidate.state == FaultJobState::Free &&
+                !candidate.pf_hold.load(std::memory_order_acquire)) {
+                ++free_slots;
+                job = job ? job : &candidate;
+            }
+        }
+        if (items.size() >= MaxJobs || free_slots <= KeepFree) {
+            count(8);
+            continue;
+        }
+        std::vector<FaultCopy> copies;
+        const u64 total = CollectFaultCopies(lo, bytes, copies);
+        const bool fits = total != 0 && total <= FaultStagingSize();
+        std::unique_ptr<Buffer> staging = fits ? AcquireFaultStaging() : nullptr;
+        if (!staging) {
+            count(fits ? 8 : 9);
+            continue;
+        }
+        // Fast lane as in PrepareFaultDownload: no batch from the newest completed one on wrote
+        // a copied byte, so the copy waits for nothing unfinished.
+        const u64 tick = scheduler.CurrentTick();
+        const u64 completed = master->KnownGpuTick();
+        const bool lane = fast_lane && completed != 0 && completed < tick &&
+                          !BatchesWriteAny(copies, completed, tick);
+        const u64 id = next_fault_job_id++;
+        job->seqs.clear();
+        memory_tracker->SnapshotGpuWriteSeq(lo, bytes, job->seqs);
+        job->write_log_pos = GpuWriteLog::Position();
+        const bool admitted = fault_mapping_gate.TryAdmit(lo, bytes, [&] {
+            job->id = id;
+            job->guest_copy.store(0, std::memory_order_seq_cst);
+            job->guest_submit.store(4, std::memory_order_seq_cst);
+            job->state = FaultJobState::Pending;
+            job->abandoned = true; // no owner: finalization frees the slot
+            job->prefetch = true;  // published by the f2 waiter; guest faults take H7
+            job->arena = true;     // held until PublishPrefetch; the waiter copies
+            job->pf_hold.store(true, std::memory_order_release);
+            job->is_write = false;
+            job->addr = lo;
+            job->size = bytes;
+            job->tick = tick; // replaced below, in this same CP step
+            job->on_readback_queue = lane;
+            job->on_fast_lane = lane;
+            job->on_asc = false;
+            job->total_bytes = total;
+            job->copies = std::move(copies);
+            job->spans.clear();
+            job->spans.emplace_back(lo, lo + bytes);
+            job->mark_addr = lo;
+            job->mark_size = bytes;
+            job->staging = std::move(staging);
+            std::scoped_lock lk{fault_window_mutex};
+            const auto [window_begin, window_end] = TrackerPageSpan(lo, bytes);
+            fault_windows[job - fault_jobs.data()] = {window_begin, window_end};
+            pending_fault_jobs.fetch_add(1);
+            fault_jobs_admitted.fetch_add(1, std::memory_order_acq_rel);
+        });
+        if (!admitted) {
+            job->seqs.clear();
+            ReleaseFaultStaging(std::move(staging));
+            count(9);
+            continue;
+        }
+        ++pf_pending;
+        boost::container::small_vector<vk::BufferCopy, 8> vk_copies;
+        for (const FaultCopy& c : job->copies) {
+            vk_copies.push_back(vk::BufferCopy{
+                .srcOffset = c.addr - source.CpuAddr(),
+                .dstOffset = c.staging_offset,
+                .size = c.size,
+            });
+        }
+        const std::span<const vk::BufferCopy> list{vk_copies.data(), vk_copies.size()};
+        const vk::Buffer staging_handle = job->staging->Handle();
+        if (lane) {
+            job->tick = fast_lane->Submit(master->Handle(), completed, [&](vk::CommandBuffer cmd) {
+                RecordFaultCopiesOnReadbackQueue(cmd, source.Handle(), staging_handle, list, false);
+            });
+        } else {
+            scheduler.EndRendering();
+            if (AsyncFaultCopies()) {
+                RecordFaultCopiesAsync(source, staging_handle, list);
+            } else {
+                auto command_access = scheduler.AcquireCommandBuffer();
+                RecordFaultCopies(command_access.Handle(), source, staging_handle, list);
+            }
+            job->tick = scheduler.CurrentTick(); // after recording: the batch holding the copy
+            main_copies = true;
+        }
+        items.push_back({id, static_cast<u32>(job - fault_jobs.data()), job->tick,
+                         static_cast<u8>(lane ? 1 : 2), true});
+        count(2);
+        count(3, lane);
+        count(4, total >> 10);
+        count(5, covered);
+    }
+    if (main_copies) {
+        scheduler.Flush(); // the waiter and a guest's H7 retry wait for this batch's tick
+    }
+    if (!items.empty()) {
+        {
+            std::scoped_lock lk{pf_mutex};
+            for (const PrefetchItem& it : items) {
+                pf_queue.insert(it.lane == 1 ? pf_queue.begin() : pf_queue.end(), it);
+            }
+        }
+        pf_cv.notify_one();
+        if (!pf_thread.joinable()) {
+            pf_thread = std::jthread([this](std::stop_token st) { PrefetchWaiterLoop(st); });
+        }
+    }
+    static u64 calls = 0;
+    if ((++calls & 1023) == 0) {
+        const auto v = [](u32 k) { return g_arena_n[k].load(std::memory_order_relaxed); };
+        LOG_INFO(Render,
+                 "ArenaReadPrefetch: {} calls | guest read faults in the current half {} | {} jobs "
+                 "({} on the fast lane), {} KB, covering {} learned pages | skipped: page clean {}, "
+                 "pending job {}, cap / slot / staging {}, other {} | published {} vetoed {} "
+                 "settled by a guest fault first {}",
+                 v(1), v(0), v(2), v(3), v(4), v(5), v(6), v(7), v(8), v(9), v(10), v(11), v(12));
     }
 }
 

@@ -192,6 +192,8 @@ public:
     /// SHADPS4_PARTICLE_ARENA_DISCARD: drop the GPU-modified state of a dead particle arena half
     /// (no download). Posted from Game:Main; DiscardDeadGpuData runs on the CP thread.
     void PostArenaDiscard(VAddr lo, u64 size, VAddr arena_lo, VAddr arena_hi);
+    /// SHADPS4_ARENA_READ_PREFETCH (q48): Game:Main at the frame's submit; posts PrefetchArenaReads.
+    void PostArenaReadPrefetch(VAddr half);
     void DiscardDeadGpuData(VAddr lo, u64 size,
                             const std::vector<std::pair<VAddr, std::vector<u64>>>& chunks);
 
@@ -472,6 +474,9 @@ private:
         /// f2: the slot is held for the prefetch waiter until the back's publish has run (never reused before).
         /// A hot-page prefetch (not on_asc) holds it only until FinalizeFaultJob.
         std::atomic<bool> pf_hold{false};
+        /// q48 (SHADPS4_ARENA_READ_PREFETCH): an arena read prefetch. Holds its slot until
+        /// PublishPrefetch like an f2 job, so the waiter copies the bytes, not the back.
+        bool arena{};
     };
     /// The vote of a fault job: true if no GPU write marking touched it since its snapshot
     /// (region sequences; with SHADPS4_FAULT_VETO_EXACT=1 a moved sequence is refined by the
@@ -647,11 +652,15 @@ private:
     /// SHADPS4_HOT_PAGE_PREFETCH: back, once per frame (DiscardDeadGpuData); owner-less read jobs
     /// over the pages of guest readback-class write faults, published by the f2 waiter.
     void PrefetchHotPages();
+    /// SHADPS4_ARENA_READ_PREFETCH (q48): back, once per frame end; owner-less read jobs over the
+    /// pages of `half` at the half-relative offsets where guest reads faulted lately.
+    void PrefetchArenaReads(VAddr half);
     struct PrefetchItem {
         u64 id;
         u32 slot;
         u64 value;
         u8 lane{}; ///< timeline of `value`: 0 the ASC lane (f2), 1 the fast lane, 2 main
+        bool arena{}; ///< q48: the waiter copies the bytes (the slot is held until the publish)
     };
     std::mutex pf_mutex;
     std::condition_variable_any pf_cv;
@@ -706,7 +715,8 @@ private:
         Mismatch,
     };
 
-    static constexpr size_t MaxFaultJobs = 8;
+    /// q48: 16 (was 8) - arena read prefetches hold up to 6 slots for about a frame.
+    static constexpr size_t MaxFaultJobs = 16;
     /// SHADPS4_FAULT_STAGING_MB=N (default 2): per-job readback staging size.
     static u64 FaultStagingSize() {
         static const u64 size = [] {
