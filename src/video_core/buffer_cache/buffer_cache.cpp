@@ -6867,17 +6867,33 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
             // r15b: the extension stops at the next existing buffer (s1043: the 542 MB heap buffer
             // grew into the mesh buffer and merged with it - a 3 GB copy and one 3.6 GB buffer
             // holding the CPU-written heap too, rooftop -2.7%).
+            // r15c: small buffers (< 64 MB) inside the extension are absorbed (joined - cheap
+            // copies; s1047 / s1050: stopping at them pushed the growth into the scene, where the
+            // coherent upload of the extension stalled 1.0-1.2 s); a big one ends the extension.
+            boost::container::small_vector<BufferId, 16> extra;
             for (VAddr a = Common::AlignUp(end, CACHING_PAGESIZE); a < grow_end;
                  a += CACHING_PAGESIZE) {
                 const BufferId id = page_table[a >> CACHING_PAGEBITS].buffer_id;
-                if (id && !slot_buffers[id].is_picked) {
-                    grow_end = Common::AlignDown(slot_buffers[id].CpuAddr(), CACHING_PAGESIZE);
+                if (!id || slot_buffers[id].is_picked) {
+                    continue;
+                }
+                Buffer& o = slot_buffers[id];
+                if (o.SizeBytes() >= (64ull << 20) || o.CpuAddr() < end) {
+                    grow_end = Common::AlignDown(o.CpuAddr(), CACHING_PAGESIZE);
                     break;
                 }
+                o.is_picked = true;
+                extra.push_back(id);
+                grow_end = std::max<VAddr>(grow_end, o.CpuAddr() + o.SizeBytes());
             }
-            if (grow_end > end) {
+            if (grow_end > end && grow_end - begin < 0xFFFF0000ull) {
+                overlap_ids.insert(overlap_ids.end(), extra.begin(), extra.end());
                 end = grow_end;
                 ++big_grow_count;
+            } else {
+                for (const BufferId id : extra) {
+                    slot_buffers[id].is_picked = false;
+                }
             }
         }
     }
