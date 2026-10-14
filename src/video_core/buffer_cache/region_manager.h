@@ -42,6 +42,13 @@ struct DeferredWatch {
 };
 inline thread_local std::vector<DeferredWatch>* g_deferred_watch = nullptr;
 
+/// q56b (SHADPS4_READ_UNTRACK_FENCE=1): a read-watch removal applied directly (not deferred) first waits until every
+/// read protection queued for the Protector (SHADPS4_DEFER_READ_PROTECT) is applied. The counts are 1-bit per page:
+/// a removal that overtakes the queued add of the same page asserts "Not enough watchers" (s867, s915). Defined in
+/// buffer_cache.cpp (protect_queue.h includes this header).
+bool ReadUntrackFenceOn();
+void FenceDeferredReadProtects();
+
 inline void ApplyDeferredWatches(std::vector<DeferredWatch>& list) {
     for (DeferredWatch& w : list) {
         if (w.track) {
@@ -473,6 +480,11 @@ private:
         if (g_deferred_watch) {
             g_deferred_watch->push_back({tracker, cpu_addr, mask, track, is_read});
             return;
+        }
+        if constexpr (!track && is_read) {
+            if (ReadUntrackFenceOn()) {
+                FenceDeferredReadProtects(); // q56b
+            }
         }
         const auto t_protect = Common::FaultMonitor::Now();
         tracker->UpdatePageWatchersForRegion<track, is_read>(cpu_addr, mask);

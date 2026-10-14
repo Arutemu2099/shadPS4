@@ -854,6 +854,24 @@ static std::atomic<u64> g_discard_skipped_hook{0}, g_discard_skipped_chunk{0};
 // threads took readback-class write faults on (InvalidateMemory's flush callback), with the
 // presented frame they were last seen in. ~800 faults/s on ~30 pages (q43c): a mutex is fine.
 static const bool g_hot_prefetch = EnvIs1("SHADPS4_HOT_PAGE_PREFETCH");
+
+// q56b (region_manager.h): read-watch removals wait for queued deferred read protections first.
+static const bool g_read_untrack_fence = EnvIs1("SHADPS4_READ_UNTRACK_FENCE");
+static std::atomic<u64> g_untrack_fences{0}, g_untrack_fence_waits{0};
+bool ReadUntrackFenceOn() {
+    return g_read_untrack_fence && ProtectQueue::Enabled();
+}
+void FenceDeferredReadProtects() {
+    const u64 n = g_untrack_fences.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (ProtectQueue::Instance().Pending()) {
+        g_untrack_fence_waits.fetch_add(1, std::memory_order_relaxed);
+    }
+    ProtectQueue::Instance().Fence();
+    if ((n & 0xffff) == 0) {
+        LOG_INFO(Render, "q56b read-untrack fences: {} (of which the queue had pending protections {})", n,
+                 g_untrack_fence_waits.load(std::memory_order_relaxed));
+    }
+}
 struct HotPage {
     VAddr page;
     u64 frame;

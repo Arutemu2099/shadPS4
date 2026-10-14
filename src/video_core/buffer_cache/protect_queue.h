@@ -144,6 +144,11 @@ public:
         }
     }
 
+    /// q56b: some protection queued so far is not applied yet.
+    bool Pending() const {
+        return applied.load(std::memory_order_acquire) < enqueued.load(std::memory_order_acquire);
+    }
+
     /// Waits until every protection queued so far is applied. Cheap when the queue is idle.
     void Fence() {
         if (wake_stats) [[unlikely]] {
