@@ -570,6 +570,7 @@ private:
     vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT list_restart_features;
     vk::DriverIdKHR driver_id;
     vk::UniqueDebugUtilsMessengerEXT debug_callback{};
+    vk::UniqueDebugUtilsMessengerEXT addr_bind_callback{}; ///< SHADPS4_ADDR_BIND_REPORT=1
     std::string vendor_name;
     VmaAllocator allocator{};
     vk::Queue present_queue;
@@ -612,6 +613,7 @@ private:
     bool image_view_min_lod{};
     bool supports_memory_budget{};
     bool device_fault{}; ///< SHADPS4_DEVICE_FAULT=1 and VK_EXT_device_fault enabled
+    bool addr_bind_report{}; ///< SHADPS4_ADDR_BIND_REPORT=1 and the extension enabled
     bool supports_block_texel_view{};
     mutable bool native_bindings_active{};
     NativeBindingLayout native_binding_layout{};

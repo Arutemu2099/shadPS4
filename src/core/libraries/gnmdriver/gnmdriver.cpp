@@ -3653,7 +3653,7 @@ HouseCensus* HouseCensusOn() {
         const char* a = std::getenv("SHADPS4_HOUSE_SPLIT");
         const char* b = std::getenv("SHADPS4_HOUSE_CHUNK");
         const char* c = std::getenv("SHADPS4_HOUSE_CENSUS");
-        const bool on = (a && a[0] == '1') || (b && b[0] != '\0' && b[0] != '0') || (c && c[0] == '1');
+        const bool on = (a && (a[0] == '1' || a[0] == '2')) || (b && b[0] != '\0' && b[0] != '0') || (c && c[0] == '1');
         return on && MemoryPatcher::g_eboot_address != 0 &&
                        MemoryPatcher::g_game_serial == "CUSA00004"
                    ? new HouseCensus

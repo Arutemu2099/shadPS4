@@ -337,7 +337,11 @@ static void ApplyParticleLateRead() {
 static void ApplyHouseSplit() {
     const char* env = std::getenv("SHADPS4_HOUSE_SPLIT");
     const char* chunk_env = std::getenv("SHADPS4_HOUSE_CHUNK");
-    const bool mask_on = env && env[0] == '1';
+    // =2 (diagnostic, study 11:35): FUN_800197130 -> mov rax, -1; ret - every run > 1000 items is
+    // cut at its chunk (200 in passes 0x13 / 0x17); tells apart "houses in another pass / equal keys"
+    // (contexts up, span down) from "the pass is walked serially" (contexts up, span flat).
+    const bool all_ones = env && env[0] == '2';
+    const bool mask_on = env && (env[0] == '1' || all_ones);
     const u32 chunk = chunk_env ? static_cast<u32>(std::strtoul(chunk_env, nullptr, 10)) : 0;
     if (!mask_on && chunk == 0) {
         return;
@@ -373,7 +377,11 @@ static void ApplyHouseSplit() {
         !matches(0x197050, chunk_fn, sizeof(chunk_fn))) {
         return;
     }
-    if (mask_on) {
+    if (all_ones) {
+        // mov rax, -1; ret at the function start (48 c7 c0 ff ff ff ff c3)
+        static constexpr u8 ret_all[8] = {0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff, 0xc3};
+        std::memcpy(reinterpret_cast<void*>(g_eboot_address + 0x197130), ret_all, sizeof(ret_all));
+    } else if (mask_on) {
         // imm64 of mov rax, 0xffff000000000000 at 0x19715d -> 0xffffffffffff0000
         static constexpr u8 mask[8] = {0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
         std::memcpy(reinterpret_cast<void*>(g_eboot_address + 0x19715d), mask, sizeof(mask));
@@ -382,8 +390,11 @@ static void ApplyHouseSplit() {
         // imm32 of mov eax, 1000 at 0x19705e
         std::memcpy(reinterpret_cast<void*>(g_eboot_address + 0x19705e), &chunk, sizeof(chunk));
     }
-    LOG_INFO(Loader, "SHADPS4_HOUSE_SPLIT: default split mask {} | chunk {}",
-             mask_on ? "0xffffffffffff0000" : "unchanged", chunk != 0 ? chunk : 1000);
+    LOG_INFO(Loader, "SHADPS4_HOUSE_SPLIT: split mask {} | chunk {}",
+             all_ones  ? "all ones in every pass (diagnostic)"
+             : mask_on ? "default 0xffffffffffff0000"
+                       : "unchanged",
+             chunk != 0 ? chunk : 1000);
 }
 
 void OnGameLoaded() {

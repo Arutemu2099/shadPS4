@@ -13,6 +13,9 @@
 #define VK_USE_PLATFORM_XLIB_KHR
 #endif
 
+#include <cstdlib>
+#include <map>
+#include <mutex>
 #include <vector>
 #include <fmt/ranges.h>
 
@@ -420,6 +423,128 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*instance);
 
     return std::move(instance);
+}
+
+// SHADPS4_ADDR_BIND_REPORT=1 (2026-10-14, the rooftop load crash: a shader ReadInvalid at a GPU VA
+// that ends 0x1e1000 mod 2 MB, identical in every r10 crash): VK_EXT_device_address_binding_report.
+// Every GPU VA bind / unbind (buffers, images, memory) is kept: live bindings by base address and a
+// ring of the last unbinds. On a device fault DumpAddressBindings(addr) prints what holds or ends
+// just below the faulting address, and what was unbound there recently (use after free).
+namespace {
+struct AddrBind {
+    u64 seq;
+    u64 base;
+    u64 size;
+    u32 flags;
+    u32 obj_type;
+    u64 handle;
+};
+std::mutex g_ab_mutex;
+std::map<u64, AddrBind> g_ab_live; // by base address
+std::vector<AddrBind> g_ab_unbound; // ring
+u64 g_ab_seq = 0;
+u64 g_ab_binds = 0;
+u64 g_ab_unbinds = 0;
+constexpr size_t AbUnboundCap = 1 << 16;
+
+VKAPI_ATTR VkBool32 VKAPI_CALL AddrBindCallback(VkDebugUtilsMessageSeverityFlagBitsEXT,
+                                                VkDebugUtilsMessageTypeFlagsEXT type,
+                                                const VkDebugUtilsMessengerCallbackDataEXT* data,
+                                                void*) {
+    if (!(type & VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT) || !data) {
+        return VK_FALSE;
+    }
+    for (auto* p = static_cast<const VkBaseInStructure*>(data->pNext); p; p = p->pNext) {
+        if (p->sType != VK_STRUCTURE_TYPE_DEVICE_ADDRESS_BINDING_CALLBACK_DATA_EXT) {
+            continue;
+        }
+        const auto* b = reinterpret_cast<const VkDeviceAddressBindingCallbackDataEXT*>(p);
+        AddrBind e{0, b->baseAddress, b->size, static_cast<u32>(b->flags), 0, 0};
+        if (data->objectCount > 0 && data->pObjects) {
+            e.obj_type = static_cast<u32>(data->pObjects[0].objectType);
+            e.handle = data->pObjects[0].objectHandle;
+        }
+        std::scoped_lock lk{g_ab_mutex};
+        e.seq = ++g_ab_seq;
+        if (b->bindingType == VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT) {
+            ++g_ab_binds;
+            g_ab_live[e.base] = e;
+        } else {
+            ++g_ab_unbinds;
+            g_ab_live.erase(e.base);
+            if (g_ab_unbound.size() < AbUnboundCap) {
+                g_ab_unbound.push_back(e);
+            } else {
+                g_ab_unbound[g_ab_unbinds % AbUnboundCap] = e;
+            }
+        }
+    }
+    return VK_FALSE;
+}
+} // namespace
+
+bool AddrBindReportOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("SHADPS4_ADDR_BIND_REPORT");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
+vk::UniqueDebugUtilsMessengerEXT CreateAddressBindingCallback(vk::Instance instance) {
+    VkDebugUtilsMessengerCreateInfoEXT ci{};
+    ci.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+    ci.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT |
+                         VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT |
+                         VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                         VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+    ci.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT;
+    ci.pfnUserCallback = AddrBindCallback;
+    auto [result, messenger] = instance.createDebugUtilsMessengerEXTUnique(
+        *reinterpret_cast<const vk::DebugUtilsMessengerCreateInfoEXT*>(&ci));
+    LOG_INFO(Render_Vulkan, "AddrBind: address binding messenger {}", vk::to_string(result));
+    return result == vk::Result::eSuccess ? std::move(messenger)
+                                          : vk::UniqueDebugUtilsMessengerEXT{};
+}
+
+void DumpAddressBindings(u64 addr) {
+    std::scoped_lock lk{g_ab_mutex};
+    LOG_CRITICAL(Render_Vulkan,
+                 "AddrBind: fault {:#x} | {} live bindings, {} binds and {} unbinds since start",
+                 addr, g_ab_live.size(), g_ab_binds, g_ab_unbinds);
+    const auto print = [&](const char* what, const AddrBind& e) {
+        const u64 end = e.base + e.size;
+        LOG_CRITICAL(Render_Vulkan,
+                     "AddrBind: {} [{:#x}, {:#x}) size {:#x} ({} B) end-to-fault {} | object type "
+                     "{} handle {:#x} flags {:#x} seq {} of {}",
+                     what, e.base, end, e.size, e.size,
+                     addr >= end ? fmt::format("+{:#x}", addr - end)
+                                 : fmt::format("-{:#x}", end - addr),
+                     e.obj_type, e.handle, e.flags, e.seq, g_ab_seq);
+    };
+    // Live bindings that hold the address or end within 4 MB below it, and the next one above.
+    auto it = g_ab_live.upper_bound(addr);
+    if (it != g_ab_live.end()) {
+        print("live above", it->second);
+    }
+    int n = 0;
+    for (auto jt = it; jt != g_ab_live.begin() && n < 8;) {
+        --jt;
+        const AddrBind& e = jt->second;
+        if (e.base + e.size + (4ull << 20) < addr && n > 0) {
+            break;
+        }
+        print(e.base <= addr && addr < e.base + e.size ? "LIVE HOLDS" : "live below", e);
+        ++n;
+    }
+    // Recent unbinds that held the address or ended within 64 KB below it.
+    int u = 0;
+    for (const AddrBind& e : g_ab_unbound) {
+        if (e.base <= addr && addr < e.base + e.size + 0x10000 && u < 16) {
+            print(addr < e.base + e.size ? "UNBOUND HELD" : "unbound just below", e);
+            ++u;
+        }
+    }
 }
 
 vk::UniqueDebugUtilsMessengerEXT CreateDebugCallback(vk::Instance instance) {

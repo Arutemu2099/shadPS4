@@ -105,6 +105,9 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
     if (enable_validation) {
         debug_callback = CreateDebugCallback(*instance);
     }
+    if (AddrBindReportOn()) {
+        addr_bind_callback = CreateAddressBindingCallback(*instance);
+    }
     const std::size_t num_physical_devices = static_cast<u16>(physical_devices.size());
     ASSERT_MSG(num_physical_devices > 0, "No physical devices found");
     LOG_INFO(Render_Vulkan, "Found {} physical devices", num_physical_devices);
@@ -354,6 +357,11 @@ bool Instance::CreateDevice() {
         device_fault = add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
         LOG_INFO(Render_Vulkan, "DeviceFault: VK_EXT_device_fault {}",
                  device_fault ? "enabled" : "not offered by the driver");
+    }
+    if (AddrBindReportOn()) {
+        addr_bind_report = add_extension(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
+        LOG_INFO(Render_Vulkan, "AddrBind: VK_EXT_device_address_binding_report {}",
+                 addr_bind_report ? "enabled" : "not offered by the driver");
     }
     if (const char* mirror = std::getenv("SHADPS4_HOST_MIRROR"); mirror && mirror[0] == '1') {
         external_memory_host = add_extension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
@@ -686,6 +694,15 @@ bool Instance::CreateDevice() {
         fault_features.pNext = const_cast<void*>(device_ci.pNext);
         device_ci.pNext = &fault_features;
     }
+    // SHADPS4_ADDR_BIND_REPORT: the same splice.
+    vk::PhysicalDeviceAddressBindingReportFeaturesEXT bind_report_features = {
+        .reportAddressBinding = true,
+    };
+    if (addr_bind_report) {
+        auto& device_ci = device_chain.get<vk::DeviceCreateInfo>();
+        bind_report_features.pNext = const_cast<void*>(device_ci.pNext);
+        device_ci.pNext = &bind_report_features;
+    }
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
     if (device_result != vk::Result::eSuccess) {
@@ -960,6 +977,9 @@ void Instance::LogDeviceFault() const {
         LOG_CRITICAL(Render_Vulkan, "DeviceFault: address {} type {} reported {:#x} precision {:#x}",
                      i, vk::to_string(addresses[i].addressType), addresses[i].reportedAddress,
                      addresses[i].addressPrecision);
+        if (addr_bind_report) {
+            DumpAddressBindings(addresses[i].reportedAddress);
+        }
     }
     for (u32 i = 0; i < counts.vendorInfoCount && i < vendors.size(); ++i) {
         LOG_CRITICAL(Render_Vulkan, "DeviceFault: vendor {} '{}' code {:#x} data {:#x}", i,

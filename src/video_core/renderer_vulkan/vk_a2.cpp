@@ -713,7 +713,7 @@ struct StretchTranslator::Impl {
     bool RecReserve();
     /// r9 census (this translator): records written, verify compares, mismatching records by
     /// region (user data, address, size, vertex address, vertex size, high bytes), ring full.
-    std::array<u64, 9> nrw{};
+    std::array<u64, 18> nrw{};
     void NrwLog();
 };
 
@@ -876,9 +876,11 @@ void StretchTranslator::Impl::NrwLog() {
     LOG_INFO(Render_Vulkan,
              "NrWorker (mode {}, worker {}): records written {} | verify compares {}, mismatching: "
              "user data {} address {} size {} vertex address {} vertex size {} high bytes {} | "
-             "ring full refusals {}",
+             "ring full refusals {} | guest lookup refusals: V# size 0 {} over MaxSpan {} no "
+             "cached buffer {} below buffer {} past the end by <=4K {} <=64K {} more {} | mode-2 "
+             "union binds {} with the own V# past the buffer end {}",
              NrWorkerMode(), ctx.worker_index, nrw[0], nrw[1], nrw[2], nrw[3], nrw[4], nrw[5],
-             nrw[6], nrw[7], nrw[8]);
+             nrw[6], nrw[7], nrw[8], nrw[9], nrw[10], nrw[11], nrw[12], nrw[13], nrw[14], nrw[15], nrw[17], nrw[16]);
 }
 
 /// q2: SHADPS4_A2_INDIRECT=1 - indirect colour draws on the translator.
@@ -1696,7 +1698,30 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
                     ++owner->sub[23];
                 } else {
                     ++owner->sub[!buf ? 10 : 11];
+                    if (wrec) {
+                        // r10 census: why the mode-1 fallback failed.
+                        if (o_vsize[b] == 0) {
+                            ++nrw[9];
+                        } else if (o_vsize[b] > MaxSpan) {
+                            ++nrw[10];
+                        } else if (!fb) {
+                            ++nrw[11];
+                        } else if (o_addr[b] < fb->CpuAddr()) {
+                            ++nrw[12];
+                        } else {
+                            const u64 over = o_addr[b] + o_vsize[b] - (fb->CpuAddr() + fb->SizeBytes());
+                            ++nrw[over <= 4096 ? 13 : over <= 65536 ? 14 : 15];
+                        }
+                    }
                     return refuse(RefuseGuestLookup);
+                }
+            }
+            if (wm == 2 && !(fb_mask & (u64{1} << b))) {
+                // r10 census (mode 2 runs the job-record path): Guest binds through the run union,
+                // and how many of them have an own V# that runs past the cached buffer's end.
+                ++nrw[17];
+                if (!buf->IsInBounds(o_addr[b], o_vsize[b])) {
+                    ++nrw[16];
                 }
             }
             base[b] = static_cast<u32>(buf->CpuAddr());

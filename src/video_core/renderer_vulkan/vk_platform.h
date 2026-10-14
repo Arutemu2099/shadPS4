@@ -27,6 +27,12 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
 
 vk::UniqueDebugUtilsMessengerEXT CreateDebugCallback(vk::Instance instance);
 
+/// SHADPS4_ADDR_BIND_REPORT=1: VK_EXT_device_address_binding_report - keep every GPU VA bind /
+/// unbind; DumpAddressBindings prints what surrounds a faulting address (from LogDeviceFault).
+bool AddrBindReportOn();
+vk::UniqueDebugUtilsMessengerEXT CreateAddressBindingCallback(vk::Instance instance);
+void DumpAddressBindings(u64 addr);
+
 template <typename T>
 concept VulkanHandleType = vk::isVulkanHandleType<T>::value;
 
