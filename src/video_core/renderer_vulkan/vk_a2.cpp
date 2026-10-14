@@ -693,6 +693,7 @@ struct StretchTranslator::Impl {
     std::array<u32, 24> b_planes{};
     u64 b_fmt_mask{};
     u64 b_fb_mask{}; ///< slots resolved by the opener's own V# (guest-lookup fallback)
+    u64 b_big_mask{}; ///< r12 mode 1: slots with a V# over MaxSpan (members bind the identical V#)
     bool b_ind{};    ///< q2: the open sub-batch is a guest indirect draw (never continued)
     std::array<u32, Shader::NUM_BUFFERS> b_tbase{}; ///< the opener's table bases (checks)
 
@@ -713,7 +714,7 @@ struct StretchTranslator::Impl {
     bool RecReserve();
     /// r9 census (this translator): records written, verify compares, mismatching records by
     /// region (user data, address, size, vertex address, vertex size, high bytes), ring full.
-    std::array<u64, 18> nrw{};
+    std::array<u64, 19> nrw{};
     void NrwLog();
 };
 
@@ -878,9 +879,9 @@ void StretchTranslator::Impl::NrwLog() {
              "user data {} address {} size {} vertex address {} vertex size {} high bytes {} | "
              "ring full refusals {} | guest lookup refusals: V# size 0 {} over MaxSpan {} no "
              "cached buffer {} below buffer {} past the end by <=4K {} <=64K {} more {} | mode-2 "
-             "union binds {} with the own V# past the buffer end {}",
+             "union binds {} with the own V# past the buffer end {} | mode-1 big-V# binds {}",
              NrWorkerMode(), ctx.worker_index, nrw[0], nrw[1], nrw[2], nrw[3], nrw[4], nrw[5],
-             nrw[6], nrw[7], nrw[8], nrw[9], nrw[10], nrw[11], nrw[12], nrw[13], nrw[14], nrw[15], nrw[17], nrw[16]);
+             nrw[6], nrw[7], nrw[8], nrw[9], nrw[10], nrw[11], nrw[12], nrw[13], nrw[14], nrw[15], nrw[17], nrw[16], nrw[18]);
 }
 
 /// q2: SHADPS4_A2_INDIRECT=1 - indirect colour draws on the translator.
@@ -1541,7 +1542,9 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     for (u64 m = guest_mask; cont && m != 0; m &= m - 1) {
         const u32 b = static_cast<u32>(std::countr_zero(m));
         cont = o_addr[b] >= b_glo[b] && o_addr[b] < b_ghi[b] &&
-               (!(b_fb_mask & (u64{1} << b)) || o_addr[b] + o_vsize[b] <= b_ghi[b]);
+               (!(b_fb_mask & (u64{1} << b)) || o_addr[b] + o_vsize[b] <= b_ghi[b]) &&
+               (!(b_big_mask & (u64{1} << b)) ||
+                (o_addr[b] == b_iaddr[b] && o_vsize[b] == b_isize[b]));
     }
     // The member's vertexOffset against the opener's rebased bindings (NativeRingPrepare's
     // d / q loop): one common quotient over the per-vertex streams; instance-rate and
@@ -1647,6 +1650,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         std::array<VAddr, Shader::NUM_BUFFERS> glo{}, ghi{};
         std::array<u32, Shader::NUM_BUFFERS> i_off{}, i_size{};
         u64 fb_mask = 0;
+        u64 big_mask = 0;
         for (u64 m = guest_mask; m != 0; m &= m - 1) {
             const u32 b = static_cast<u32>(std::countr_zero(m));
             if (inh_slots & (u64{1} << b)) {
@@ -1681,6 +1685,22 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
             } else if (lo[b] != 0 && hi[b] > lo[b] && hi[b] - lo[b] <= MaxSpan) {
                 buf = ctx.buffer_cache->A2LookupBuffer(lo[b]);
                 if (buf && !buf->IsInBounds(lo[b], hi[b] - lo[b])) {
+                    buf = nullptr;
+                }
+            }
+            if (!buf && wrec && o_vsize[b] > MaxSpan) {
+                // r12 (mode 1): a V# larger than the union bound - the game binds its whole mesh
+                // memory (~2 GB at 0x271258000) and picks each draw's part by offsets. Mode 0 took
+                // these through the union's equal-V# path (the cached buffer holding the address,
+                // no size check); mode 1 has no union, so the same rule per run: the opener binds
+                // the cached buffer holding its address, members must bind the identical V#
+                // (b_big_mask, the continuation check).
+                buf = ctx.buffer_cache->A2LookupBuffer(o_addr[b]);
+                if (buf && o_addr[b] >= buf->CpuAddr() &&
+                    o_addr[b] - buf->CpuAddr() < buf->SizeBytes()) {
+                    big_mask |= u64{1} << b;
+                    ++nrw[18];
+                } else {
                     buf = nullptr;
                 }
             }
@@ -1929,6 +1949,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         b_fmt_mask = fmt_mask;
         b_tbase = base;
         b_fb_mask = fb_mask;
+        b_big_mask = big_mask;
         b_ind = ind;
         last_desc_id = draw.vi->desc_id;
         ++owner->sub_batches;
