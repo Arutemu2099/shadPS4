@@ -1461,12 +1461,17 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool of
         }
         const u64 m2_t0 = ticket.m2_main && Common::FaultMonitor::t_is_game_main ? __rdtsc() : 0;
         {
-            // Site 8 (r18): a pending arena retry job's copy on its own queue.
+            // Site 8 (r18): a pending arena retry job's copy on its own queue. Site 9 (r19c): a
+            // main-timeline ticket taken from a pending job (H7 / overlap retry, e.g. a hot-page
+            // prefetch recorded in the main batch) - split from site 1, the fault's own main copy.
             const Common::FaultMonitor::GpuWaitTag tag{
                 ticket.on_readback_queue
                     ? (ticket.on_retry_lane ? 8u : ticket.on_fast_lane ? 3u : 2u)
-                    : 1u,
+                    : (ticket.retry ? 9u : 1u),
                 early_hit};
+            if (ticket.on_retry_lane && Common::FaultMonitor::t_is_game_main) {
+                g_arena_retry_n[14].fetch_add(1, std::memory_order_relaxed); // r18: on the waiter
+            }
             if (ticket.on_readback_queue) {
                 JobSemaphore(ticket.on_fast_lane, ticket.on_asc, ticket.on_retry_lane)
                     .Wait(ticket.tick);
@@ -1987,9 +1992,6 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
                 ++pf_c[8]; // guest early
                 if (job.arena && job.arena_retry) { // r18: guests waiting on a retry copy
                     g_arena_retry_n[13].fetch_add(1, std::memory_order_relaxed);
-                    if (Common::FaultMonitor::t_is_game_main) {
-                        g_arena_retry_n[14].fetch_add(1, std::memory_order_relaxed);
-                    }
                 }
                 // The job's own timeline: the lane for f2, the fast lane or main for a hot-page
                 // prefetch (SHADPS4_HOT_PAGE_PREFETCH), the retry queue for an r18 retry job.
