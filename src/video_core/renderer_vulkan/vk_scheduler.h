@@ -1078,7 +1078,16 @@ public:
 
     /// Defers an operation until the gpu has reached the current cpu tick.
     /// Will be run when submitting or calling PopPendingOperations.
+    /// SHADPS4_PENDING_OPS_LOCK=1 (r19a; upstream #4844 / #4846): a guest thread reaches this too
+    /// (sceKernelMunmap -> Rasterizer::UnmapMemory -> TextureCache::FreeImage -> DeleteImage)
+    /// while the command processor pops the queue, so the queue is guarded by its own mutex.
     void DeferOperation(Common::UniqueFunction<void>&& func) {
+        if (PendingOpsLock()) {
+            std::scoped_lock lk{pending_ops_mutex};
+            pending_ops.emplace(std::move(func), CurrentTick());
+            pending_ops_count.fetch_add(1, std::memory_order_release);
+            return;
+        }
         pending_ops.emplace(std::move(func), CurrentTick());
     }
 
@@ -1508,6 +1517,11 @@ private:
         u64 gpu_tick;
     };
     std::queue<PendingOp> pending_ops;
+    /// r19a SHADPS4_PENDING_OPS_LOCK: guards pending_ops (never held while a callback runs);
+    /// the count lets the per-draw empty check stay lock-free.
+    std::mutex pending_ops_mutex;
+    std::atomic<u64> pending_ops_count{0};
+    static bool PendingOpsLock();
     std::queue<PendingOp> priority_pending_ops;
     std::mutex priority_pending_ops_mutex;
     std::condition_variable_any priority_pending_ops_cv;

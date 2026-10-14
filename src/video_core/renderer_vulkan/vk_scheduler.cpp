@@ -1078,7 +1078,49 @@ void Scheduler::WaitMain(u64 tick) {
     }
 }
 
+bool Scheduler::PendingOpsLock() {
+    static const bool on = [] {
+        const char* e = std::getenv("SHADPS4_PENDING_OPS_LOCK");
+        const bool v = e && e[0] == '1';
+        if (v) {
+            LOG_INFO(Render_Vulkan, "SHADPS4_PENDING_OPS_LOCK=1: deferred operations queue locked "
+                                    "(guest-thread DeferOperation, upstream #4844 / #4846)");
+        }
+        return v;
+    }();
+    return on;
+}
+
 void Scheduler::PopPendingOperations() {
+    if (PendingOpsLock()) {
+        // r19a: pop under pending_ops_mutex, run each callback outside it (a callback may defer
+        // more; a guest DeferOperation never waits for a callback). Same order, same retire test.
+        if (pending_ops_count.load(std::memory_order_acquire) == 0) {
+            return;
+        }
+        std::unique_lock lk(priority_pending_ops_mutex);
+        master_semaphore.Refresh();
+        bool lane_synced = false;
+        for (;;) {
+            Common::UniqueFunction<void> callback;
+            {
+                std::scoped_lock ql{pending_ops_mutex};
+                if (pending_ops.empty() || !master_semaphore.IsFree(pending_ops.front().gpu_tick) ||
+                    !AscRetired(pending_ops.front().gpu_tick)) {
+                    break;
+                }
+                callback = std::move(pending_ops.front().callback);
+                pending_ops.pop();
+                pending_ops_count.fetch_sub(1, std::memory_order_relaxed);
+            }
+            if (lane_rec && !lane_synced) {
+                LaneRecSync(); // q12d: queued lane closures name objects these operations destroy
+                lane_synced = true;
+            }
+            callback();
+        }
+        return;
+    }
     // SHADPS4_POP_FASTPATH=1: called on every draw and dispatch; skip the lock and the driver
     // counter query when nothing is queued, and poll the counter only every 16th call while the
     // oldest operation is not yet known to be free. Measured 2026-09-24 on 386F5167: ~1.6% of the
