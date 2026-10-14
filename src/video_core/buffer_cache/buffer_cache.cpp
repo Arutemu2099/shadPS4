@@ -861,6 +861,16 @@ struct HotPage {
 static constexpr size_t HotPageSlots = 64; // the oldest is evicted
 static std::mutex g_hot_mutex;
 static std::array<HotPage, HotPageSlots> g_hot_pages{};
+// q56 (SHADPS4_HOT_PREFETCH_AT_WRITE=1, with HOT_PAGE_PREFETCH): guest READ faults outside the particle arena make
+// their page hot too (s909: the auto-exposure page 0x24bfde000 read-faults ~0.9 times per frame on Game:Main, its
+// producer finished in 80%), and a dispatch whose write covers a hot page runs PrefetchHotPages right after it on the
+// CP thread, so the download is recorded behind the producing dispatch in the same batch instead of at the arena hook
+// (where the page is often not GPU-modified yet: 'page clean' ~2.8 per frame). g_hot_buckets: bit (page >> 20) & 63
+// of every hot page, a cheap pre-filter for NoteBatchWrite (rebuilt when the set changes).
+static const bool g_hot_at_write = g_hot_prefetch && EnvIs1("SHADPS4_HOT_PREFETCH_AT_WRITE");
+static std::atomic<u64> g_hot_buckets{0};
+static thread_local bool t_hot_write_pending = false; // CP thread (set in NoteBatchWrite, taken after the dispatch)
+static std::atomic<u64> g_hot_trigger{0};               // q56: dispatches that wrote a hot page
 /// 0 jobs, 1 of them on the fast lane, 2 hot pages covered, 3 KB copied; skipped: 4 page clean,
 /// 5 pending job or arena, 6 cap / slot / staging, 7 other; waiter: 8 published, 9 vetoed,
 /// 10 settled by a guest fault first (f2's H7 retry).
@@ -887,6 +897,9 @@ static void NoteHotPage(VAddr addr, u64 size) {
             slot = h.frame < slot->frame ? &h : slot;
         }
         *slot = {page, frame};
+        if (g_hot_at_write) {
+            g_hot_buckets.fetch_or(u64{1} << ((page >> 20) & 63), std::memory_order_relaxed); // q56
+        }
     }
 }
 
@@ -1217,6 +1230,9 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool of
     Offload::CountFault(origin);
     if (g_arena_read_prefetch && !is_write && !cp_self) {
         NoteArenaRead(device_addr); // q48
+    }
+    if (g_hot_at_write && !is_write && !cp_self) {
+        NoteHotPage(device_addr, std::min<u64>(size, 4096)); // q56: read-fault pages (arena pages are skipped)
     }
     // Thread-wait column rf_guest_ms (always on): a guest thread's time in a read fault,
     // synchronous or offloaded (review 2026-10-02); command processor faults are not counted.
@@ -2787,6 +2803,33 @@ void BufferCache::NoteBatchWrite(VAddr addr, u64 size) {
     if (size == 0) {
         return;
     }
+    if (g_hot_at_write && t_in_dispatch && !t_hot_write_pending &&
+        Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
+        // q56: does this dispatch write a hot page (outside the arena)? Bucket pre-filter, then the slots.
+        const VAddr arena_lo = g_arena_lo.load(std::memory_order_relaxed);
+        const VAddr arena_hi = g_arena_hi.load(std::memory_order_relaxed);
+        const u64 buckets = g_hot_buckets.load(std::memory_order_relaxed);
+        if (buckets != 0 && !(addr >= arena_lo && addr + size <= arena_hi)) {
+            u64 mask = 0;
+            if (size >= (u64{64} << 20)) {
+                mask = ~u64{0};
+            } else {
+                for (VAddr b = addr >> 20; b <= (addr + size - 1) >> 20; ++b) {
+                    mask |= u64{1} << (b & 63);
+                }
+            }
+            if (mask & buckets) {
+                const u64 now = Common::FaultMonitor::presented_frames.load(std::memory_order_relaxed);
+                std::scoped_lock lk{g_hot_mutex};
+                for (const HotPage& h : g_hot_pages) {
+                    if (h.page != 0 && h.frame + 16 >= now && h.page < addr + size && addr < h.page + 4096) {
+                        t_hot_write_pending = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
     if (EarlyCutOn() && Common::FaultMonitor::t_is_cp_thread && t_in_dispatch) [[unlikely]] {
         if (const u32 m = HitsReadbackWindow(addr, size)) {
             early_cut_pending = true; // q7; q7c: dispatch writes only, armed windows only
@@ -3919,6 +3962,26 @@ void BufferCache::PrefetchMaybeLog() {
 // is done, so the guest's write meets a GPU-clean page (a plain fault). A GPU write after the
 // snapshot vetoes the publication; a guest fault in the window before it takes f2's H7 retry.
 // Nothing here waits on the GPU: what would (no slot or staging, a pending job there) is skipped.
+void BufferCache::HotPrefetchAfterWrite() {
+    // q56: right after a dispatch that wrote a hot page (CP thread): its download goes into the open batch behind it.
+    if (!t_hot_write_pending) {
+        return;
+    }
+    t_hot_write_pending = false;
+    // At most 8 per presented frame (a hot page written by many dispatches must not run this per dispatch).
+    static u64 frame = 0, in_frame = 0;
+    const u64 now = Common::FaultMonitor::presented_frames.load(std::memory_order_relaxed);
+    if (now != frame) {
+        frame = now;
+        in_frame = 0;
+    }
+    if (++in_frame > 8) {
+        return;
+    }
+    g_hot_trigger.fetch_add(1, std::memory_order_relaxed);
+    PrefetchHotPages();
+}
+
 void BufferCache::PrefetchHotPages() {
     // Guest write faults must reach H7 with no CP settle first (offloaded, no pre-settle); an ASC
     // stream or lane would need PrepareFaultDownload's ASC producer ordering.
@@ -4100,11 +4163,12 @@ void BufferCache::PrefetchHotPages() {
     if ((++calls & 1023) == 0) {
         const auto v = [](u32 k) { return g_hot_n[k].load(std::memory_order_relaxed); };
         LOG_INFO(Render,
-                 "HotPrefetch: {} frames, {} hot pages now | {} jobs ({} on the fast lane) "
+                 "HotPrefetch: {} calls ({} after a hot write, q56), {} hot pages now | {} jobs ({} on the fast lane) "
                  "covering {} hot pages, {} KB | skipped: page clean {}, pending job / arena {}, "
                  "cap / slot / staging {}, other {} | published {} vetoed {} settled by a guest "
                  "fault first {}",
-                 calls, n, v(0), v(1), v(2), v(3), v(4), v(5), v(6), v(7), v(8), v(9), v(10));
+                 calls, g_hot_trigger.load(std::memory_order_relaxed), n, v(0), v(1), v(2), v(3), v(4), v(5),
+                 v(6), v(7), v(8), v(9), v(10));
     }
 }
 

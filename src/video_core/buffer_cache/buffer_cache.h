@@ -111,6 +111,8 @@ public:
         return early_cut_pending;
     }
     void DisarmEarlyCut(u32 mask);
+    /// q56 (SHADPS4_HOT_PREFETCH_AT_WRITE): after a dispatch (CP thread), prefetch hot pages it wrote.
+    void HotPrefetchAfterWrite();
     u32 early_cut_mask{};
 
     static constexpr u32 CACHING_PAGEBITS = 14;

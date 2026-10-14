@@ -8605,6 +8605,7 @@ void Rasterizer::DispatchDirectTail(const ComputePipeline* pipeline) {
     VideoCore::t_in_dispatch = true; // q7c
     SCOPE_EXIT {
         VideoCore::t_in_dispatch = false;
+        buffer_cache.HotPrefetchAfterWrite(); // q56
         MaybeEarlyCut();
     };
     if (native_batch.open) [[unlikely]] {
@@ -8698,6 +8699,7 @@ void Rasterizer::DispatchIndirectTail(const ComputePipeline* pipeline, VAddr add
     VideoCore::t_in_dispatch = true; // q7c
     SCOPE_EXIT {
         VideoCore::t_in_dispatch = false;
+        buffer_cache.HotPrefetchAfterWrite(); // q56
         MaybeEarlyCut(); // q7
     };
     if (!BindResources(pipeline)) {
