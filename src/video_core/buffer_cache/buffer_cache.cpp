@@ -6864,26 +6864,20 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
         const u64 mapped = memory->TryClampRangeSize(begin, want);
         VAddr grow_end = Common::AlignDown(begin + mapped, CACHING_PAGESIZE);
         if (mapped > cur && grow_end > end) {
-            boost::container::small_vector<BufferId, 16> extra;
+            // r15b: the extension stops at the next existing buffer (s1043: the 542 MB heap buffer
+            // grew into the mesh buffer and merged with it - a 3 GB copy and one 3.6 GB buffer
+            // holding the CPU-written heap too, rooftop -2.7%).
             for (VAddr a = Common::AlignUp(end, CACHING_PAGESIZE); a < grow_end;
                  a += CACHING_PAGESIZE) {
                 const BufferId id = page_table[a >> CACHING_PAGEBITS].buffer_id;
-                if (!id || slot_buffers[id].is_picked) {
-                    continue;
+                if (id && !slot_buffers[id].is_picked) {
+                    grow_end = Common::AlignDown(slot_buffers[id].CpuAddr(), CACHING_PAGESIZE);
+                    break;
                 }
-                Buffer& o = slot_buffers[id];
-                o.is_picked = true;
-                extra.push_back(id);
-                grow_end = std::max<VAddr>(grow_end, o.CpuAddr() + o.SizeBytes());
             }
-            if (grow_end - begin < 0xFFFF0000ull) {
-                overlap_ids.insert(overlap_ids.end(), extra.begin(), extra.end());
+            if (grow_end > end) {
                 end = grow_end;
                 ++big_grow_count;
-            } else {
-                for (const BufferId id : extra) {
-                    slot_buffers[id].is_picked = false;
-                }
             }
         }
     }
