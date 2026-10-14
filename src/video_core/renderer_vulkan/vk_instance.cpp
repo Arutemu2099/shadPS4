@@ -404,7 +404,7 @@ bool Instance::CreateDevice() {
     // SHADPS4_READBACK_QUEUE for guest readback copies (see buffer_cache/readback_queue.h):
     // 1 = a second queue of the graphics family (measured 2026-09-23: no gain, likely shares
     // the graphics engine); 2 = a transfer-only family, i.e. a dedicated copy engine.
-    static constexpr std::array queue_priorities = {1.0f, 1.0f};
+    static constexpr std::array queue_priorities = {1.0f, 1.0f, 1.0f};
     const char readback_mode = [] {
         const char* value = std::getenv("SHADPS4_READBACK_QUEUE");
         return value ? value[0] : '0';
@@ -449,6 +449,14 @@ bool Instance::CreateDevice() {
         const char* value = std::getenv("SHADPS4_ASC_LANE");
         return value && value[0] == '1';
     }() && readback_family_concurrent && family_properties[readback_queue_family].queueCount >= 2;
+    // SHADPS4_ARENA_RETRY_QUEUE=1 (r18): the next free queue of the compute-only family for the
+    // arena prefetch retry copies (CONCURRENT buffers already cover the family).
+    const u32 retry_index = has_asc_queue || has_asc_lane ? 2u : 1u;
+    has_retry_queue = [] {
+        const char* value = std::getenv("SHADPS4_ARENA_RETRY_QUEUE");
+        return value && value[0] == '1';
+    }() && readback_family_concurrent &&
+                      family_properties[readback_queue_family].queueCount > retry_index;
     const std::array queue_infos = {
         vk::DeviceQueueCreateInfo{
             .queueFamilyIndex = queue_family_index,
@@ -457,7 +465,7 @@ bool Instance::CreateDevice() {
         },
         vk::DeviceQueueCreateInfo{
             .queueFamilyIndex = readback_queue_family,
-            .queueCount = has_asc_queue || has_asc_lane ? 2u : 1u,
+            .queueCount = has_retry_queue ? retry_index + 1 : (has_asc_queue || has_asc_lane ? 2u : 1u),
             .pQueuePriorities = queue_priorities.data(),
         },
     };
@@ -758,6 +766,11 @@ bool Instance::CreateDevice() {
             asc_queue = device->getQueue(readback_queue_family, 1);
             LOG_INFO(Render_Vulkan, "AscStream: guest async compute on queue 1 of family {}",
                      readback_queue_family);
+        }
+        if (has_retry_queue) {
+            retry_queue = device->getQueue(readback_queue_family, retry_index);
+            LOG_INFO(Render_Vulkan, "ArenaRetryQueue: retry copies on queue {} of family {}",
+                     retry_index, readback_queue_family);
         }
         LOG_INFO(Render_Vulkan, "ReadbackQueue: using queue {} of family {}", index,
                  readback_queue_family);

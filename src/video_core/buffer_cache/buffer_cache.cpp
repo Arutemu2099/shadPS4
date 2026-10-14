@@ -700,6 +700,14 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         fast_lane = std::make_unique<ReadbackQueue>(instance);
         LOG_INFO(Render, "ReadbackFastLane: completed-producer copies on a second queue, the "
                          "rest prebatched");
+        if (instance.HasRetryQueue()) {
+            // r18 SHADPS4_ARENA_RETRY_QUEUE: the arena retry copies wait for their producer;
+            // on their own queue they never hold up a fault copy queued after them.
+            retry_lane = std::make_unique<ReadbackQueue>(instance, instance.GetRetryQueue(),
+                                                         instance.GetReadbackQueueFamilyIndex(),
+                                                         nullptr);
+            LOG_INFO(Render, "ArenaRetryQueue: arena prefetch retry copies on their own queue");
+        }
     } else if (instance.HasReadbackQueue()) {
         readback_queue = std::make_unique<ReadbackQueue>(instance);
     } else if (PrebatchEnabled() && Offload::Enabled()) {
@@ -954,6 +962,9 @@ static const bool g_arena_read_prefetch = EnvIs1("SHADPS4_ARENA_READ_PREFETCH");
 /// q51 SHADPS4_FAST_LANE_PRODUCER=1 (see PrepareFaultDownload) and its job count.
 static const bool g_fast_lane_producer = EnvIs1("SHADPS4_FAST_LANE_PRODUCER");
 static std::atomic<u64> g_fast_lane_producer_jobs{0};
+/// r18: of those, the copies whose newest writer had already completed - they wait only for the
+/// + 1 batch (a write stamped at bind time could land in the next batch).
+static std::atomic<u64> g_fast_lane_plus1_only{0};
 static constexpr u64 ArenaHalf = 0x1E00000ULL;
 /// The half 0x3ee7d0 fills this frame (set by the discard hook before it runs).
 static std::atomic<VAddr> g_arena_cur_half{0};
@@ -990,8 +1001,9 @@ static std::atomic<u64> g_arena_hook_gen{0};
 /// 0 armed, 1 posted (12 of them run at once on the CP thread), 2 retries run, 3 retry jobs,
 /// 4 their KB, 5 windows a retry skipped again (producer still open / unsubmitted), dropped:
 /// 6 stale (the half's discard posted), 7 per-frame cap; waiter: 8 retry jobs published,
-/// 9 vetoed, 10 settled before the waiter; 11 skipped: no fast lane (split from 13).
-static std::atomic<u64> g_arena_retry_n[13]{};
+/// 9 vetoed, 10 settled before the waiter; 11 skipped: no fast lane (split from 13); r18:
+/// 13 guest faults that took a pending retry job's ticket (H7), 14 of them on Game:Main.
+static std::atomic<u64> g_arena_retry_n[15]{};
 
 static void ArmArenaRetry(VAddr half, u64 gen, u64 need) {
     std::scoped_lock lk{g_arena_retry_mutex};
@@ -1449,10 +1461,15 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool of
         }
         const u64 m2_t0 = ticket.m2_main && Common::FaultMonitor::t_is_game_main ? __rdtsc() : 0;
         {
+            // Site 8 (r18): a pending arena retry job's copy on its own queue.
             const Common::FaultMonitor::GpuWaitTag tag{
-                ticket.on_readback_queue ? (ticket.on_fast_lane ? 3u : 2u) : 1u, early_hit};
+                ticket.on_readback_queue
+                    ? (ticket.on_retry_lane ? 8u : ticket.on_fast_lane ? 3u : 2u)
+                    : 1u,
+                early_hit};
             if (ticket.on_readback_queue) {
-                JobSemaphore(ticket.on_fast_lane, ticket.on_asc).Wait(ticket.tick);
+                JobSemaphore(ticket.on_fast_lane, ticket.on_asc, ticket.on_retry_lane)
+                    .Wait(ticket.tick);
             } else if (spin_ns != 0) {
                 semaphore->SpinWait(ticket.tick, spin_ns);
             } else {
@@ -1968,11 +1985,18 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
             const auto [job_begin, job_end] = TrackerPageSpan(job.addr, job.size);
             if (job_begin < end && begin < job_end) {
                 ++pf_c[8]; // guest early
+                if (job.arena && job.arena_retry) { // r18: guests waiting on a retry copy
+                    g_arena_retry_n[13].fetch_add(1, std::memory_order_relaxed);
+                    if (Common::FaultMonitor::t_is_game_main) {
+                        g_arena_retry_n[14].fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
                 // The job's own timeline: the lane for f2, the fast lane or main for a hot-page
-                // prefetch (SHADPS4_HOT_PAGE_PREFETCH).
+                // prefetch (SHADPS4_HOT_PAGE_PREFETCH), the retry queue for an r18 retry job.
                 FaultTicket retry_ticket{job.id, job.tick, true, job.on_readback_queue};
                 retry_ticket.on_fast_lane = job.on_fast_lane;
                 retry_ticket.on_asc = job.on_asc;
+                retry_ticket.on_retry_lane = job.on_retry_lane;
                 return retry_ticket;
             }
         }
@@ -1991,6 +2015,7 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
                     FaultTicket retry_ticket{job.id, job.tick, true, job.on_readback_queue};
                     retry_ticket.on_fast_lane = job.on_fast_lane;
                     retry_ticket.on_asc = job.on_asc;
+                    retry_ticket.on_retry_lane = job.on_retry_lane;
                     return retry_ticket;
                 }
             }
@@ -2172,6 +2197,7 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
     job->on_readback_queue = false;
     job->on_fast_lane = false;
     job->on_asc = false;
+    job->on_retry_lane = false;
     // SHADPS4_ASC_STREAM: the newest ASC-stream writer of the window and whether it completed.
     u64 asc_producer = 0;
     bool asc_done = true;
@@ -2273,6 +2299,9 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
                 producer = p;
                 waits_producer = true;
                 g_fast_lane_producer_jobs.fetch_add(1, std::memory_order_relaxed);
+                if (p - 1 <= completed) { // r18 census: the writer itself has completed
+                    g_fast_lane_plus1_only.fetch_add(1, std::memory_order_relaxed);
+                }
             }
         }
         if (done || waits_producer) {
@@ -2324,8 +2353,11 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
             }
             static std::atomic<u64> lane_jobs{0};
             if (((lane_jobs.fetch_add(1) + 1) & 0x3ff) == 0) {
-                LOG_INFO(Render_Vulkan, "ReadbackFastLane: {} jobs on the fast lane ({} waiting on their producer, q51)",
-                         lane_jobs.load(), g_fast_lane_producer_jobs.load(std::memory_order_relaxed));
+                LOG_INFO(Render_Vulkan,
+                         "ReadbackFastLane: {} jobs on the fast lane ({} waiting on their producer, "
+                         "q51; {} of them only for the batch after a completed writer, r18)",
+                         lane_jobs.load(), g_fast_lane_producer_jobs.load(std::memory_order_relaxed),
+                         g_fast_lane_plus1_only.load(std::memory_order_relaxed));
             }
             return lane_ticket;
         }
@@ -3066,7 +3098,11 @@ void BufferCache::NoteBatchWrite(VAddr addr, u64 size) {
     batch_writes.emplace_back(addr, addr + size);
 }
 
-Vulkan::MasterSemaphore& BufferCache::JobSemaphore(bool on_fast_lane, bool on_asc) {
+Vulkan::MasterSemaphore& BufferCache::JobSemaphore(bool on_fast_lane, bool on_asc,
+                                                   bool on_retry_lane) {
+    if (on_retry_lane) {
+        return retry_lane->Semaphore();
+    }
     return on_asc ? *scheduler.GetAscSemaphore() : LaneOf(on_fast_lane).Semaphore();
 }
 
@@ -3475,7 +3511,7 @@ u64 BufferCache::ProducerTick(VAddr addr, u64 size) const {
 void BufferCache::WaitFaultJob(FaultJob& job) {
     if (job.on_readback_queue) {
         CloseGuestSubmit(job); // SHADPS4_FAULT_GUEST_SUBMIT: the tick exists only after this
-        JobSemaphore(job.on_fast_lane, job.on_asc).Wait(job.tick);
+        JobSemaphore(job.on_fast_lane, job.on_asc, job.on_retry_lane).Wait(job.tick);
         return;
     }
     // Main only: a fault copy recorded on main waits its producers explicitly; a dual wait would
@@ -4002,6 +4038,7 @@ u64 BufferCache::PrefetchAfterLabel(VAddr label) {
             job->on_readback_queue = true;
             job->on_fast_lane = false;
             job->on_asc = true;
+            job->on_retry_lane = false;
             job->total_bytes = total;
             job->copies = std::move(copies);
             job->spans.clear();
@@ -4049,22 +4086,28 @@ u64 BufferCache::PrefetchAfterLabel(VAddr label) {
     return recorded;
 }
 
-void BufferCache::PrefetchWaiterLoop(std::stop_token stop) {
+void BufferCache::PrefetchWaiterLoop(std::stop_token stop, bool own) {
     // H5: wait the lane value, copy staging -> guest memory (FAULT_GUEST_COPY CAS 0 -> 1 -> 2; fails
     // when the back already closed it), then a non-blocking publish on the back.
-    Common::SetCurrentThreadName("shadPS4:LanePrefetch");
+    // `own` (r18): the arena retry items' waiter, on pf_retry_queue.
+    Common::SetCurrentThreadName(own ? "shadPS4:ArenaRetryWait" : "shadPS4:LanePrefetch");
+    std::mutex& mutex = own ? pf_retry_mutex : pf_mutex;
+    std::condition_variable_any& cv = own ? pf_retry_cv : pf_cv;
+    std::vector<PrefetchItem>& queue = own ? pf_retry_queue : pf_queue;
     for (;;) {
         PrefetchItem it{};
         {
-            std::unique_lock lk{pf_mutex};
-            if (!pf_cv.wait(lk, stop, [this] { return !pf_queue.empty(); })) {
+            std::unique_lock lk{mutex};
+            if (!cv.wait(lk, stop, [&queue] { return !queue.empty(); })) {
                 return;
             }
-            it = pf_queue.front();
-            pf_queue.erase(pf_queue.begin());
+            it = queue.front();
+            queue.erase(queue.begin());
         }
-        // lane 0: the ASC lane (f2); 1 the fast lane, 2 main (SHADPS4_HOT_PAGE_PREFETCH).
-        (it.lane == 2 ? *scheduler.GetMasterSemaphore() : JobSemaphore(it.lane == 1, it.lane == 0))
+        // lane 0: the ASC lane (f2); 1 the fast lane, 2 main (SHADPS4_HOT_PAGE_PREFETCH), 3 the
+        // arena retry queue (r18).
+        (it.lane == 2 ? *scheduler.GetMasterSemaphore()
+                      : JobSemaphore(it.lane == 1, it.lane == 0, it.lane == 3))
             .Wait(it.value);
         // f2 jobs only: a hot-page job's slot is released when it is finalized (FinalizeFaultJob),
         // so it may already hold another job; its bytes are copied by PublishFaultJob on the back.
@@ -4270,6 +4313,7 @@ void BufferCache::PrefetchHotPages(VAddr only_page) {
             job->on_readback_queue = lane;
             job->on_fast_lane = lane;
             job->on_asc = false;
+            job->on_retry_lane = false;
             job->total_bytes = total;
             job->copies = std::move(copies);
             job->spans.clear();
@@ -4407,13 +4451,26 @@ void BufferCache::PrefetchArenaReads(VAddr half, u64 gen, bool retry) {
     }
     u64 need = 0; // max producer of the windows skipped as open / unsubmitted
     count(1);
+    // r18 SHADPS4_ARENA_RETRY_QUEUE: a retry run copies on its own queue, only the pages faulted
+    // in the last frame, and submits its copies in ascending wait order after the scan.
+    const bool own_queue = retry && retry_lane != nullptr;
+    const u64 recent_frames = own_queue ? 1 : 4;
+    struct OwnSubmit {
+        FaultJob* job;
+        u64 id;
+        u64 wait_value;
+        vk::Buffer source;
+        vk::Buffer staging;
+        boost::container::small_vector<vk::BufferCopy, 8> copies;
+    };
+    boost::container::small_vector<OwnSubmit, MaxJobs> own_submits;
     const u64 now = Common::FaultMonitor::presented_frames.load(std::memory_order_relaxed);
     std::array<VAddr, ArenaReadSlots> pages{};
     size_t n = 0;
     {
         std::scoped_lock lk{g_arena_rd_mutex};
         for (const ArenaReadPage& h : g_arena_rd) {
-            if (h.page1 != 0 && h.frame + 4 >= now) {
+            if (h.page1 != 0 && h.frame + recent_frames >= now) {
                 pages[n++] = half + (u64(h.page1 - 1) << 12);
             }
         }
@@ -4518,8 +4575,9 @@ void BufferCache::PrefetchArenaReads(VAddr half, u64 gen, bool retry) {
             job->size = bytes;
             job->tick = tick; // replaced below, in this same CP step
             job->on_readback_queue = lane;
-            job->on_fast_lane = lane;
+            job->on_fast_lane = lane && !own_queue;
             job->on_asc = false;
+            job->on_retry_lane = own_queue;
             job->total_bytes = total;
             job->copies = std::move(copies);
             job->spans.clear();
@@ -4550,10 +4608,17 @@ void BufferCache::PrefetchArenaReads(VAddr half, u64 gen, bool retry) {
         }
         const std::span<const vk::BufferCopy> list{vk_copies.data(), vk_copies.size()};
         const vk::Buffer staging_handle = job->staging->Handle();
-        job->tick = fast_lane->Submit(master->Handle(), wait_value, [&](vk::CommandBuffer cmd) {
-            RecordFaultCopiesOnReadbackQueue(cmd, source.Handle(), staging_handle, list, false);
-        });
-        items.push_back({id, static_cast<u32>(job - fault_jobs.data()), job->tick, 1, true});
+        if (own_queue) {
+            // Submitted after the scan, in ascending wait order (same CP step: nothing reads
+            // the job's tick before then).
+            own_submits.push_back({job, id, wait_value, source.Handle(), staging_handle,
+                                   std::move(vk_copies)});
+        } else {
+            job->tick = fast_lane->Submit(master->Handle(), wait_value, [&](vk::CommandBuffer cmd) {
+                RecordFaultCopiesOnReadbackQueue(cmd, source.Handle(), staging_handle, list, false);
+            });
+            items.push_back({id, static_cast<u32>(job - fault_jobs.data()), job->tick, 1, true});
+        }
         count(2);
         count(3, lane);
         count(4, total >> 10);
@@ -4561,6 +4626,26 @@ void BufferCache::PrefetchArenaReads(VAddr half, u64 gen, bool retry) {
         if (retry) {
             rcount(3);
             rcount(4, total >> 10);
+        }
+    }
+    if (!own_submits.empty()) {
+        // r18: one in-order queue - an early producer's copy must not wait behind a later one.
+        std::sort(own_submits.begin(), own_submits.end(),
+                  [](const OwnSubmit& a, const OwnSubmit& b) { return a.wait_value < b.wait_value; });
+        for (OwnSubmit& o : own_submits) {
+            const std::span<const vk::BufferCopy> list{o.copies.data(), o.copies.size()};
+            o.job->tick = retry_lane->Submit(master->Handle(), o.wait_value, [&](vk::CommandBuffer cmd) {
+                RecordFaultCopiesOnReadbackQueue(cmd, o.source, o.staging, list, false);
+            });
+            const PrefetchItem it{o.id, static_cast<u32>(o.job - fault_jobs.data()), o.job->tick, 3,
+                                  true};
+            std::scoped_lock lk{pf_retry_mutex};
+            pf_retry_queue.push_back(it);
+        }
+        pf_retry_cv.notify_one();
+        if (!pf_retry_thread.joinable()) {
+            pf_retry_thread =
+                std::jthread([this](std::stop_token st) { PrefetchWaiterLoop(st, true); });
         }
     }
     if (!items.empty()) {
@@ -4610,10 +4695,11 @@ void BufferCache::PrefetchArenaReads(VAddr half, u64 gen, bool retry) {
                      "no fast lane {}, other {} | published {} vetoed {} settled before the waiter {} "
                      "| retry: armed {}, posted {} ({} at once on the CP thread), run {}, {} jobs, "
                      "{} KB, skipped again {}, dropped stale {} / cap {} | retry jobs published {} "
-                     "vetoed {} settled before the waiter {}",
+                     "vetoed {} settled before the waiter {} | guest faults on a pending retry "
+                     "job {} (Game:Main {}), own queue {}",
                      v(1), v(0), v(2), v(3), v(4), v(5), v(6), v(7), v(8), v(13), r(11), v(9), v(10),
                      v(11), v(12), r(0), r(1), r(12), r(2), r(3), r(4), r(5), r(6), r(7), r(8), r(9),
-                     r(10));
+                     r(10), r(13), r(14), retry_lane != nullptr);
         }
     }
     if (retry_now) {
@@ -8328,12 +8414,17 @@ void BufferCache::DeleteBuffer(BufferId buffer_id) {
     // The fast lane likewise waits only for completed producers, or (q51) for a submitted main
     // value below the current tick - below this deletion's wait, so no cycle.
     const u64 lane_tick = fast_lane ? fast_lane->Semaphore().CurrentTick() - 1 : 0;
-    Common::UniqueFunction<void> destroy = [this, buffer_id, rq_tick, lane_tick] {
+    // r18: the arena retry queue's copies wait for submitted producers too.
+    const u64 retry_tick = retry_lane ? retry_lane->Semaphore().CurrentTick() - 1 : 0;
+    Common::UniqueFunction<void> destroy = [this, buffer_id, rq_tick, lane_tick, retry_tick] {
         if (rq_tick != 0) {
             readback_queue->Semaphore().Wait(rq_tick);
         }
         if (lane_tick != 0) {
             fast_lane->Semaphore().Wait(lane_tick);
+        }
+        if (retry_tick != 0) {
+            retry_lane->Semaphore().Wait(retry_tick);
         }
         slot_buffers.erase(buffer_id);
     };

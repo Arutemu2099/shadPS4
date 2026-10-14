@@ -477,6 +477,8 @@ private:
         bool on_fast_lane{};
         /// With on_readback_queue: the ASC stream's timeline (SHADPS4_ASC_STREAM).
         bool on_asc{};
+        /// With on_readback_queue: the arena retry queue's timeline (SHADPS4_ARENA_RETRY_QUEUE).
+        bool on_retry_lane{};
         u64 total_bytes{};
         std::vector<FaultCopy> copies;
         /// Buffer spans the copies were collected in, in order: [addr, addr + size) for a read
@@ -547,6 +549,8 @@ private:
         bool on_fast_lane{};
         /// With on_readback_queue: the ASC stream's timeline.
         bool on_asc{};
+        /// With on_readback_queue: the arena retry queue's timeline (SHADPS4_ARENA_RETRY_QUEUE).
+        bool on_retry_lane{};
         /// SHADPS4_READBACK_LATENCY diagnostics, set by PrepareFaultDownload.
         u64 prep_end_ns{};
         u64 flush_end_ns{};
@@ -587,6 +591,9 @@ private:
     std::unique_ptr<ReadbackQueue> readback_queue;
     /// SHADPS4_READBACK_FAST_LANE: second queue for copies whose producer already completed.
     std::unique_ptr<ReadbackQueue> fast_lane;
+    /// SHADPS4_ARENA_RETRY_QUEUE (r18): the arena prefetch retry copies, which wait for their
+    /// producer, on their own queue (never ahead of a fault copy on the fast lane).
+    std::unique_ptr<ReadbackQueue> retry_lane;
     ReadbackQueue& LaneOf(bool on_fast_lane) {
         return on_fast_lane ? *fast_lane : *readback_queue;
     }
@@ -656,7 +663,8 @@ public:
 private:
     /// SHADPS4_ASC_STREAM: newest ASC value whose history slot was overwritten.
     u64 asc_hist_evicted{};
-    Vulkan::MasterSemaphore& JobSemaphore(bool on_fast_lane, bool on_asc);
+    Vulkan::MasterSemaphore& JobSemaphore(bool on_fast_lane, bool on_asc,
+                                          bool on_retry_lane = false);
     /// SHADPS4_ASC_STREAM: GPU write ranges recorded in the last WriteHistory ASC segments.
     std::array<std::vector<std::pair<VAddr, VAddr>>, 512> asc_write_hist;
     std::array<u64, 512> asc_write_hist_value{};
@@ -682,7 +690,8 @@ private:
     /// while the slot still holds job `id`.
     void PublishPrefetch(u64 id, u32 slot, u8 lane);
     void PrefetchNoteWindow(VAddr addr, u64 size);
-    void PrefetchWaiterLoop(std::stop_token stop);
+    /// `retry_lane`: the r18 waiter of the arena retry items (pf_retry_queue).
+    void PrefetchWaiterLoop(std::stop_token stop, bool retry_lane = false);
     void PrefetchMaybeLog();
     /// SHADPS4_HOT_PAGE_PREFETCH: back, once per frame (DiscardDeadGpuData); owner-less read jobs
     /// over the pages of guest readback-class write faults, published by the f2 waiter.
@@ -696,12 +705,18 @@ private:
         u64 id;
         u32 slot;
         u64 value;
-        u8 lane{}; ///< timeline of `value`: 0 the ASC lane (f2), 1 the fast lane, 2 main
+        u8 lane{}; ///< timeline of `value`: 0 the ASC lane (f2), 1 the fast lane, 2 main,
+                   ///< 3 the arena retry queue (r18)
         bool arena{}; ///< q48: the waiter copies the bytes (the slot is held until the publish)
     };
     std::mutex pf_mutex;
     std::condition_variable_any pf_cv;
     std::vector<PrefetchItem> pf_queue;
+    /// r18 SHADPS4_ARENA_RETRY_QUEUE: retry items (lane 3) wait in their own queue and thread,
+    /// so an item waiting for its producer never holds up the publish of the others.
+    std::mutex pf_retry_mutex;
+    std::condition_variable_any pf_retry_cv;
+    std::vector<PrefetchItem> pf_retry_queue;
     /// f2: back-thread state. Hot windows: first page << 24 | pages, the learned label, idle triggers.
     struct PrefetchWindow {
         u64 packed{};
@@ -1116,8 +1131,9 @@ private:
     Common::ReadbackUnmapGate fault_mapping_gate;
     /// Guest threads between entering the offload path and consuming their result.
     std::atomic<u32> fault_guest_waiters{0};
-    /// f2: the prefetch waiter (last member: stopped and joined first).
+    /// f2: the prefetch waiter (last members: stopped and joined first).
     std::jthread pf_thread;
+    std::jthread pf_retry_thread; ///< r18: the retry items' waiter
 };
 
 /// f2: the guest address of the last ASC RELEASE_MEM the back executed (back thread only).

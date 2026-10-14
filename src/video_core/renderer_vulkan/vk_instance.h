@@ -98,6 +98,14 @@ public:
     vk::Queue GetAscQueue() const {
         return asc_queue;
     }
+    /// SHADPS4_ARENA_RETRY_QUEUE=1 (r18): one more queue of the compute-only family for the
+    /// arena prefetch retry copies, so a copy waiting for its producer never blocks fault copies.
+    bool HasRetryQueue() const {
+        return has_retry_queue;
+    }
+    vk::Queue GetRetryQueue() const {
+        return retry_queue;
+    }
     bool BuffersShareReadbackFamily() const {
         return readback_family_concurrent;
     }
@@ -581,6 +589,8 @@ private:
     bool has_asc_queue{};
     bool has_asc_lane{};
     vk::Queue asc_queue{};
+    bool has_retry_queue{};
+    vk::Queue retry_queue{};
     u32 readback_queue_family{};
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
