@@ -888,6 +888,7 @@ static std::array<HotPage, HotPageSlots> g_hot_pages{};
 static const bool g_hot_at_write = g_hot_prefetch && EnvIs1("SHADPS4_HOT_PREFETCH_AT_WRITE");
 static std::atomic<u64> g_hot_buckets{0};
 static thread_local bool t_hot_write_pending = false; // CP thread (set in NoteBatchWrite, taken after the dispatch)
+static thread_local VAddr t_hot_write_page = 0;        // q56c (review 2): the hot page the dispatch wrote
 static std::atomic<u64> g_hot_trigger{0};               // q56: dispatches that wrote a hot page
 /// 0 jobs, 1 of them on the fast lane, 2 hot pages covered, 3 KB copied; skipped: 4 page clean,
 /// 5 pending job or arena, 6 cap / slot / staging, 7 other; waiter: 8 published, 9 vetoed,
@@ -916,7 +917,14 @@ static void NoteHotPage(VAddr addr, u64 size) {
         }
         *slot = {page, frame};
         if (g_hot_at_write) {
-            g_hot_buckets.fetch_or(u64{1} << ((page >> 20) & 63), std::memory_order_relaxed); // q56
+            // q56c (review 1): rebuilt from the live slots, so evicted / stale pages leave the filter.
+            u64 b = 0;
+            for (const HotPage& h : g_hot_pages) {
+                if (h.page != 0 && h.frame + 16 >= frame) {
+                    b |= u64{1} << ((h.page >> 20) & 63);
+                }
+            }
+            g_hot_buckets.store(b, std::memory_order_relaxed);
         }
     }
 }
@@ -2842,6 +2850,7 @@ void BufferCache::NoteBatchWrite(VAddr addr, u64 size) {
                 for (const HotPage& h : g_hot_pages) {
                     if (h.page != 0 && h.frame + 16 >= now && h.page < addr + size && addr < h.page + 4096) {
                         t_hot_write_pending = true;
+                        t_hot_write_page = h.page;
                         break;
                     }
                 }
@@ -3997,10 +4006,10 @@ void BufferCache::HotPrefetchAfterWrite() {
         return;
     }
     g_hot_trigger.fetch_add(1, std::memory_order_relaxed);
-    PrefetchHotPages();
+    PrefetchHotPages(t_hot_write_page); // q56c: only the page this dispatch wrote
 }
 
-void BufferCache::PrefetchHotPages() {
+void BufferCache::PrefetchHotPages(VAddr only_page) {
     // Guest write faults must reach H7 with no CP settle first (offloaded, no pre-settle); an ASC
     // stream or lane would need PrepareFaultDownload's ASC producer ordering.
     static const bool usable = [this] {
@@ -4024,7 +4033,7 @@ void BufferCache::PrefetchHotPages() {
     {
         std::scoped_lock lk{g_hot_mutex};
         for (const HotPage& h : g_hot_pages) {
-            if (h.page != 0 && h.frame + 16 >= now) {
+            if (h.page != 0 && h.frame + 16 >= now && (only_page == 0 || h.page == only_page)) {
                 pages[n++] = h.page;
             }
         }
@@ -4061,12 +4070,18 @@ void BufferCache::PrefetchHotPages() {
         }
         FaultJob* job = nullptr;
         u32 held = 0; // unfinalized hot jobs (their hold ends in FinalizeFaultJob)
+        u32 free_slots = 0;
         for (FaultJob& candidate : fault_jobs) {
             const bool hold = candidate.pf_hold.load(std::memory_order_acquire);
             held += hold && !candidate.arena; // q50 (review): arena holds have their own cap
-            if (!job && candidate.state == FaultJobState::Free && !hold) {
-                job = &candidate;
+            if (candidate.state == FaultJobState::Free && !hold) {
+                ++free_slots;
+                job = job ? job : &candidate;
             }
+        }
+        if (g_hot_at_write && free_slots <= 3) { // q56c (review 4): 3 slots kept for guest faults
+            count(6);
+            continue;
         }
         std::vector<FaultCopy> copies;
         const u64 total = held < MaxJobs ? CollectFaultCopies(lo, bytes, copies) : 0;

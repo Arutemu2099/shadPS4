@@ -654,7 +654,7 @@ private:
     void PrefetchMaybeLog();
     /// SHADPS4_HOT_PAGE_PREFETCH: back, once per frame (DiscardDeadGpuData); owner-less read jobs
     /// over the pages of guest readback-class write faults, published by the f2 waiter.
-    void PrefetchHotPages();
+    void PrefetchHotPages(VAddr only_page = 0);
     /// SHADPS4_ARENA_READ_PREFETCH (q48): back, once per frame end; owner-less read jobs over the
     /// pages of `half` at the half-relative offsets where guest reads faulted lately.
     void PrefetchArenaReads(VAddr half);
