@@ -1200,6 +1200,7 @@ void RegScanRun(std::span<const u32> dcb, AmdGpu::Regs& r, RegScanStats& st, u32
         }
         case PM4ItOpcode::IndexBufferSize:
             r.num_indices = reinterpret_cast<const PM4CmdDrawIndexBufferSize*>(header)->num_indices;
+            r.max_index_size = r.num_indices; // r4: INDEX_BUFFER_SIZE = VGT_DMA_MAX_SIZE (upstream #5278)
             ++st.reg_pkts;
             break;
         case PM4ItOpcode::EventWrite: {
@@ -1850,6 +1851,7 @@ void LeanChainScan(std::span<const u32> dcb, LeanScanRefs s, bool guest_markers,
         }
         case PM4ItOpcode::IndexBufferSize:
             r.num_indices = reinterpret_cast<const PM4CmdDrawIndexBufferSize*>(header)->num_indices;
+            r.max_index_size = r.num_indices; // r4: INDEX_BUFFER_SIZE = VGT_DMA_MAX_SIZE (upstream #5278)
             break;
         case PM4ItOpcode::SetBase:
             s.iaa = reinterpret_cast<const PM4CmdSetBase*>(header)->Address<u64>();
@@ -11515,6 +11517,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* index_size = reinterpret_cast<const PM4CmdDrawIndexBufferSize*>(header);
                 regs.num_indices = index_size->num_indices;
                 JournalField(regs.num_indices);
+                // r4 (upstream #5278): INDEX_BUFFER_SIZE also sets VGT_DMA_MAX_SIZE, the capacity an
+                // indexed INDIRECT draw reads from INDEX_BASE; direct draws overwrite num_indices.
+                regs.max_index_size = index_size->num_indices;
+                JournalField(regs.max_index_size);
                 break;
             }
             case PM4ItOpcode::SetBase: {

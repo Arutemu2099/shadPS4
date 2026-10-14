@@ -67,6 +67,10 @@ enum class Origin : u32;
 struct SyncTiming;
 } // namespace Common::ReadbackOffload
 
+namespace AmdGpu {
+union Regs;
+}
+
 namespace VideoCore {
 
 /// SHADPS4_DRAW_COST=1 (diagnostic): cycles of the last SynchronizeBuffer on this thread, split into
@@ -83,6 +87,21 @@ inline const int g_lean_bind = [] {
     const int mode = env ? env[0] - '0' : 0;
     return mode == 1 || mode == 2 ? mode : 0;
 }();
+
+/// r4 (2026-10-14, upstream #5278): SHADPS4_IB_INDIRECT_CAP. An indexed INDIRECT draw reads its
+/// indices up to the capacity INDEX_BUFFER_SIZE set (VGT_DMA_MAX_SIZE = regs.max_index_size), but
+/// the bound / checked range came from regs.num_indices, which every direct draw overwrites with
+/// its own index count: the index buffer could end before the indices the GPU reads (the rooftop
+/// load's device losses, s947 ff.: ReadInvalid just past one resource). 1 = bind / check
+/// max(num_indices, max_index_size) indices (capped at 2^24) + census; 2 = census only.
+inline const int g_ib_indirect_cap = [] {
+    const char* env = std::getenv("SHADPS4_IB_INDIRECT_CAP");
+    const int mode = env ? env[0] - '0' : 0;
+    return mode == 1 || mode == 2 ? mode : 0;
+}();
+/// The index count an indexed indirect draw binds (0: regs.num_indices, the old rule). `path`:
+/// 0 = the generic DrawIndirectTail, 1 = the A2 worker translator (census only).
+u32 IndirectIndexCapacity(const AmdGpu::Regs& regs, u32 path);
 
 class TextureCache;
 class MemoryTracker;
@@ -262,8 +281,10 @@ public:
                                NativeJoinVi& out,
                                boost::container::small_vector<vk::BufferMemoryBarrier2, 16>* barriers);
 
+    /// r4: `num_indices` != 0 overrides regs.num_indices (indexed indirect draws: the capacity).
     void BindIndexBuffer(u32 index_offset,
-                         boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers);
+                         boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers,
+                         u32 num_indices = 0);
 
     /// Writes a value to GPU buffer. (uses command buffer to temporarily store the data)
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);

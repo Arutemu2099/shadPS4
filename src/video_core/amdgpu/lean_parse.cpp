@@ -1116,6 +1116,8 @@ SpanResult Parser::Parse(std::span<const u32> dcb, u32 cut_dw, ChainState& st,
             const auto* index_size = reinterpret_cast<const PM4CmdDrawIndexBufferSize*>(header);
             regs.num_indices = index_size->num_indices;
             JournalField(out, regs, regs.num_indices);
+            regs.max_index_size = index_size->num_indices; // r4: VGT_DMA_MAX_SIZE (upstream #5278)
+            JournalField(out, regs, regs.max_index_size);
             break;
         }
         case PM4ItOpcode::SetBase: {

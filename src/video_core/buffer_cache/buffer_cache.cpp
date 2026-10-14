@@ -5408,8 +5408,36 @@ void BufferCache::NativeJoinVertexIndex(
     out.ib_off = offset;
 }
 
+u32 IndirectIndexCapacity(const AmdGpu::Regs& regs, u32 path) {
+    if (g_ib_indirect_cap == 0) {
+        return 0;
+    }
+    const u32 num = regs.num_indices;
+    const u32 cap = std::min<u32>(std::max(num, regs.max_index_size), 1u << 24);
+    // Census: indexed indirect draws by path, of which the old rule bound fewer indices than the
+    // capacity (and the largest shortfall), logged every 2^12.
+    static std::array<std::atomic<u64>, 2> total{}, short_n{};
+    static std::atomic<u32> worst{0};
+    const u64 t = total[path & 1].fetch_add(1, std::memory_order_relaxed) + 1;
+    if (cap > num) {
+        short_n[path & 1].fetch_add(1, std::memory_order_relaxed);
+        u32 w = worst.load(std::memory_order_relaxed);
+        while (cap - num > w && !worst.compare_exchange_weak(w, cap - num)) {
+        }
+    }
+    if ((t & 0xfff) == 0) {
+        LOG_INFO(Render_Vulkan,
+                 "IbIndirectCap (mode {}): indexed indirect draws generic {} (old range short {}) "
+                 "A2 {} (short {}), worst shortfall {} indices",
+                 g_ib_indirect_cap, total[0].load(), short_n[0].load(), total[1].load(),
+                 short_n[1].load(), worst.load());
+    }
+    return g_ib_indirect_cap == 1 ? cap : 0;
+}
+
 void BufferCache::BindIndexBuffer(
-    u32 index_offset, boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers) {
+    u32 index_offset, boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers,
+    u32 num_indices) {
     const auto& regs = liverpool->BackRegs();
 
     // Figure out index type and size.
@@ -5419,8 +5447,19 @@ void BufferCache::BindIndexBuffer(
     const VAddr index_address =
         regs.index_base_address.Address<VAddr>() + index_offset * index_size;
 
-    // Bind index buffer.
-    const u32 index_buffer_size = regs.num_indices * index_size;
+    // Bind index buffer. r4: an override (indexed indirect capacity) is clamped to the guest memory
+    // mapped contiguously from the index base (TryClampRangeSize clamps only from 1 GB up: ask for
+    // at least that much); unmapped -> the old range.
+    u32 index_buffer_size = regs.num_indices * index_size;
+    if (num_indices != 0 && num_indices > regs.num_indices) {
+        const u64 want = u64(num_indices) * index_size;
+        const u64 mapped = Core::Memory::Instance()->TryClampRangeSize(
+            index_address, std::max<u64>(want, u64{1} << 30));
+        const u64 bytes = std::min(want, mapped) / index_size * index_size;
+        if (bytes > index_buffer_size) {
+            index_buffer_size = static_cast<u32>(bytes);
+        }
+    }
     const u64 pb_t0 = g_pb_census != 0 && t_pb_sampled ? __rdtsc() : 0;
     const auto [vk_buffer, offset] = ObtainBuffer(index_address, index_buffer_size, false);
     if (g_pb_census != 0) [[unlikely]] {

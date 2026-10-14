@@ -8431,7 +8431,10 @@ void Rasterizer::DrawIndirectTail(const GraphicsPipeline* pipeline, bool is_inde
     buffer_cache.BindVertexBuffers(*pipeline, GetBoundStage(Shader::LogicalStage::Vertex),
                                    buffer_barriers);
     if (is_indexed) {
-        buffer_cache.BindIndexBuffer(0, buffer_barriers);
+        // r4 (SHADPS4_IB_INDIRECT_CAP): an indexed indirect draw reads up to the capacity
+        // INDEX_BUFFER_SIZE set (VGT_DMA_MAX_SIZE), not the last direct draw's index count.
+        buffer_cache.BindIndexBuffer(0, buffer_barriers,
+                                     VideoCore::IndirectIndexCapacity(liverpool->BackRegs(), 0));
     }
 
     const auto& [buffer, base] =

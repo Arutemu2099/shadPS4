@@ -1203,9 +1203,15 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     push.buf_offsets = {}; // whole-range bindings: the record carries each draw's offset
 
     // Index buffer: the whole index range in one cached buffer, bound at offset 0.
+    // r4 (SHADPS4_IB_INDIRECT_CAP): an indirect draw's range is the INDEX_BUFFER_SIZE capacity.
+    u32 ind_count = regs.num_indices;
+    if (ind) {
+        if (const u32 cap = VideoCore::IndirectIndexCapacity(regs, 1); cap != 0) {
+            ind_count = cap;
+        }
+    }
     const VideoCore::Buffer* ib = ctx.buffer_cache->A2LookupBuffer(index_addr);
-    if (!ib || !ib->IsInBounds(index_addr,
-                               u64(ind ? regs.num_indices : index_count) * index_size)) {
+    if (!ib || !ib->IsInBounds(index_addr, u64(ind ? ind_count : index_count) * index_size)) {
         return refuse(RefuseIndexLookup);
     }
     const u64 ib_off = index_addr - ib->CpuAddr();
