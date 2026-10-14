@@ -1526,7 +1526,10 @@ void ReportLoop() {
                           static_cast<double>(d_draws) / 1024.0
                     : 0.0;
 #if defined(__LLVM_INSTR_PROFILE_GENERATE)
-        if (!pgo_reset && elapsed >= 180.0 && draws_per_frame > 1000.0) {
+        // 2026-10-14: or > 20 FPS - with the lean workers drawing (r9 / r12) the back's draw counter
+        // reads ~190 per frame in gameplay, so the reset (and the dump) never happened.
+        const double pgo_fps = dt > 0.0 ? static_cast<double>(d_frames) / dt : 0.0;
+        if (!pgo_reset && elapsed >= 180.0 && (draws_per_frame > 1000.0 || pgo_fps > 20.0)) {
             __llvm_profile_reset_counters();
             pgo_reset = true;
             pgo_reset_elapsed = elapsed;
