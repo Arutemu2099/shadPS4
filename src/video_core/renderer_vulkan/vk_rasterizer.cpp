@@ -3466,7 +3466,7 @@ bool Rasterizer::NativeRingPrepare(const GraphicsPipeline* base,
     // Ring lifetime: the GPU reads entries idx .. idx + 63 when it executes the batch; the job
     // thread must not have written more than a quarter ring past them by now (it would need
     // another ~12 k draws, ~7 frames of one job thread, before the GPU ran the batch).
-    if (NR::g_job_next[slot].load(std::memory_order_relaxed) - idx > NR::RingSize / 4) {
+    if (NR::g_job_next[slot].load(std::memory_order_relaxed) - idx > NR::LifetimeWindow()) {
         return fail(2);
     }
     const NR::Record& r0 = ring[idx & mask];
@@ -3950,7 +3950,7 @@ bool Rasterizer::NativeSegPrepare(const GraphicsPipeline* base,
         const u32 mi = segx_list[j] & 0xffffffu;
         if (slot >= NR::MaxSlots || NR::g_gpu_bda[slot].load(std::memory_order_acquire) == 0 ||
             ((NR::g_job_next[slot].load(std::memory_order_relaxed) - mi) & 0xffffffu) >
-                NR::RingSize / 4) {
+                NR::LifetimeWindow()) {
             return fail(2);
         }
     }
@@ -7103,12 +7103,12 @@ bool Rasterizer::NativeSegEvaluate(const AmdGpu::CpSplit::SplitSegmentRecord& se
     }
     for (u32 j = 0; j < seg.n; ++j) {
         // The entry's low 24 bits are the job's ring counter (unmasked); the age against the
-        // job's next counter, modulo 2^24, must leave the GPU its safe window (RingSize / 4).
+        // job's next counter, modulo 2^24, must leave the GPU its safe window (r3: NR::LifetimeWindow()).
         const u32 slot = (list[j] >> 24) & Shader::NativeSegSlotMask;
         const u32 idx = list[j] & 0xffffffu;
         const u32 next = slot < NR::MaxSlots ? NR::g_job_next[slot].load(std::memory_order_relaxed) : 0u;
         const u32 age = (next - idx) & 0xffffffu;
-        if (slot >= NR::MaxSlots || age > NR::RingSize / 4) {
+        if (slot >= NR::MaxSlots || age > NR::LifetimeWindow()) {
             static u32 logged = 0;
             if (++logged <= 10) {
                 LOG_INFO(Render_Vulkan,

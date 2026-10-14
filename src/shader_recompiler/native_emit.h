@@ -188,7 +188,7 @@ constexpr u32 NativeTablePtFallback = NativeTablePtHi + NativeRecordHiDwords; //
 /// AmdGpu::NativeRec::RingSize in vk_rasterizer.cpp).
 constexpr u32 NativeSegLegacySlot = 16; // = AmdGpu::NativeRec::MaxSlots
 constexpr u32 NativeSegSlots = NativeSegLegacySlot + 1;
-constexpr u32 NativeSegRingMask = (1u << 14) - 1;
+constexpr u32 NativeSegRingMask = (1u << 16) - 1; // r3: = NativeRec::RingSize - 1
 constexpr u32 NativeTableSlotAddr = 176;                                       // 176..209
 constexpr u32 NativeTableSegList = NativeTableSlotAddr + 2 * NativeSegSlots; // 210, 211
 /// SHADPS4_NATIVE_PT (brick C v2): the fault buffer's u64 device address (a non-contiguous or

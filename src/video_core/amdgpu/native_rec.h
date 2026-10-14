@@ -19,8 +19,22 @@
 namespace AmdGpu::NativeRec {
 
 constexpr u32 Magic = 0x4e415431u; // 'NAT1' in the trailing NOP's data_block[0]
-constexpr u32 RingBits = 14;
+// r3 (2026-10-14): 2^16 records per job slot (was 2^14). The rooftop (~11 k draws per frame, a slot
+// writing several thousand per frame) refused ~1,900 draws per frame at the translator's lifetime
+// check: the job thread was more than RingSize / 4 records ahead when a worker reached the draw.
+constexpr u32 RingBits = 16;
 constexpr u32 RingSize = 1u << RingBits;
+/// r3: SHADPS4_NR_WINDOW = how far (records) the job thread may be ahead of a draw a translator
+/// takes (the rest of the ring is the GPU's safe window). Default 4096 = the 2^14 ring's quarter
+/// (the old behaviour); at most RingSize / 4.
+inline u32 LifetimeWindow() {
+    static const u32 w = [] {
+        const char* v = std::getenv("SHADPS4_NR_WINDOW");
+        const long n = v ? std::atol(v) : 4096;
+        return static_cast<u32>(n < 1 ? 1 : n > long(RingSize / 4) ? long(RingSize / 4) : n);
+    }();
+    return w;
+}
 constexpr u32 MaxSlots = 16;
 constexpr u32 MaxRun = 4096;
 

@@ -1654,6 +1654,20 @@ bool LeanRunNeutral(PM4ItOpcode op) {
         return false;
     }
 }
+/// r3 (2026-10-14): SHADPS4_LEAN_SPLIT_ANY=N - head splitting every N draws at ANY draw, not only
+/// after a render-target change (0 = off: the 256-draw render-target rule). The rooftop's long
+/// single-target passes (3,158 distant houses, a 1,791-draw shadow cascade) were never split, so
+/// one lean worker parsed each at ~3.4 us per draw while the back waited on it (~2.9 ms per frame).
+/// A mid-pass span boundary is an ordinary stretch boundary: the next span's entry state is the
+/// front's live state there, as at a render-target split.
+u32 LeanSplitAny() {
+    static const u32 n = [] {
+        const char* v = std::getenv("SHADPS4_LEAN_SPLIT_ANY");
+        const long x = v ? std::atol(v) : 0;
+        return static_cast<u32>(x < 0 ? 0 : x > 65536 ? 65536 : x);
+    }();
+    return n;
+}
 void LeanChainScan(std::span<const u32> dcb, LeanScanRefs s, bool guest_markers, bool post_dma,
                    u32& cut_dw, u32& pkts, u32& draws, bool stop_at_cut = false,
                    u32* run_bumps = nullptr, u32 max_draws = 0, bool* split = nullptr) {
@@ -1702,7 +1716,8 @@ void LeanChainScan(std::span<const u32> dcb, LeanScanRefs s, bool guest_markers,
             }
             // Head splitting: after max_draws draws, end this span right before the next draw
             // packet; the live state here is the next span's entry state.
-            if (!cut && stop_at_cut && max_draws != 0 && draws >= max_draws && rt_changed &&
+            if (!cut && stop_at_cut && max_draws != 0 && draws >= max_draws &&
+                (rt_changed || LeanSplitAny() != 0) &&
                 (op == PM4ItOpcode::DrawIndex2 || op == PM4ItOpcode::DrawIndexOffset2 ||
                  op == PM4ItOpcode::DrawIndexAuto)) {
                 cut_dw = static_cast<u32>(dcb.data() - base);
@@ -9043,7 +9058,8 @@ Liverpool::LeanL2Begin Liverpool::LeanFrontBeginL2(std::span<const u32> dcb,
     // Heads longer than LeanSplitDraws draws are cut (head splitting) at the first render-target
     // change after each LeanSplitDraws draws - where the worker's stretch ends anyway: each span
     // is one job (own slot, channel, DcbRef), its entry state the front's live state at its start.
-    constexpr u32 LeanSplitDraws = 256; // heads above it split, at a render-target change
+    // heads above it split, at a render-target change (r3: at any draw, SHADPS4_LEAN_SPLIT_ANY=N)
+    const u32 LeanSplitDraws = LeanSplitAny() != 0 ? LeanSplitAny() : 256u;
     u32 start = 0, cur = idx, total_bumps = 0, spans = 0;
     for (;;) {
         auto& jj = s.jobs[cur % LeanSlots];

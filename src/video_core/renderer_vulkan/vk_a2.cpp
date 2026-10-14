@@ -943,7 +943,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     constexpr u32 mask = NR::RingSize - 1;
     const u32 idx = draw.job_idx;
     // Ring lifetime (NativeRingPrepare fail 2): the job thread must not be a quarter ring ahead.
-    if (NR::g_job_next[slot].load(std::memory_order_relaxed) - idx > NR::RingSize / 4) {
+    if (NR::g_job_next[slot].load(std::memory_order_relaxed) - idx > NR::LifetimeWindow()) {
         return refuse(RefuseLifetime);
     }
     // The job record (seqlock: fields, acquire fence, stamp).
