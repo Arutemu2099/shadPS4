@@ -46,6 +46,10 @@ std::atomic<void (*)(u64)> Scheduler::submitted_hook{nullptr};
 Scheduler::Scheduler(const Instance& instance, bool allow_recording_worker)
     : instance{instance}, master_semaphore{instance}, command_pool{instance, &master_semaphore} {
     g_maintenance7 = instance.IsMaintenance7Supported();
+    if (pending_ops_lock) {
+        LOG_INFO(Render_Vulkan, "SHADPS4_PENDING_OPS_LOCK=1: deferred operations queue locked "
+                                "(guest-thread DeferOperation; upstream #4844 / #4846)");
+    }
 #if TRACY_GPU_ENABLED
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
 #endif
@@ -1078,37 +1082,40 @@ void Scheduler::WaitMain(u64 tick) {
     }
 }
 
-bool Scheduler::PendingOpsLock() {
-    static const bool on = [] {
-        const char* e = std::getenv("SHADPS4_PENDING_OPS_LOCK");
-        const bool v = e && e[0] == '1';
-        if (v) {
-            LOG_INFO(Render_Vulkan, "SHADPS4_PENDING_OPS_LOCK=1: deferred operations queue locked "
-                                    "(guest-thread DeferOperation, upstream #4844 / #4846)");
-        }
-        return v;
-    }();
-    return on;
-}
-
 void Scheduler::PopPendingOperations() {
-    if (PendingOpsLock()) {
+    if (pending_ops_lock) {
         // r19a: pop under pending_ops_mutex, run each callback outside it (a callback may defer
         // more; a guest DeferOperation never waits for a callback). Same order, same retire test.
+        // Poppers are serialized by priority_pending_ops_mutex and pushers only append, so the
+        // front read under the lock stays the front while the retire test (a driver call in
+        // AscRetired) runs outside it (review).
         if (pending_ops_count.load(std::memory_order_acquire) == 0) {
+            if (!g_pop_fastpath) {
+                // As the unlocked path: the GPU tick is refreshed on every call (review: other
+                // readers of KnownGpuTick rely on it between submits).
+                std::unique_lock lk(priority_pending_ops_mutex);
+                master_semaphore.Refresh();
+            }
             return;
         }
         std::unique_lock lk(priority_pending_ops_mutex);
         master_semaphore.Refresh();
         bool lane_synced = false;
         for (;;) {
+            u64 front_tick = 0;
+            {
+                std::scoped_lock ql{pending_ops_mutex};
+                if (pending_ops.empty()) {
+                    break;
+                }
+                front_tick = pending_ops.front().gpu_tick;
+            }
+            if (!master_semaphore.IsFree(front_tick) || !AscRetired(front_tick)) {
+                break;
+            }
             Common::UniqueFunction<void> callback;
             {
                 std::scoped_lock ql{pending_ops_mutex};
-                if (pending_ops.empty() || !master_semaphore.IsFree(pending_ops.front().gpu_tick) ||
-                    !AscRetired(pending_ops.front().gpu_tick)) {
-                    break;
-                }
                 callback = std::move(pending_ops.front().callback);
                 pending_ops.pop();
                 pending_ops_count.fetch_sub(1, std::memory_order_relaxed);
@@ -1124,7 +1131,7 @@ void Scheduler::PopPendingOperations() {
     // SHADPS4_POP_FASTPATH=1: called on every draw and dispatch; skip the lock and the driver
     // counter query when nothing is queued, and poll the counter only every 16th call while the
     // oldest operation is not yet known to be free. Measured 2026-09-24 on 386F5167: ~1.6% of the
-    // CP's wall time. pending_ops is only touched on this thread.
+    // CP's wall time. Without SHADPS4_PENDING_OPS_LOCK a guest-thread DeferOperation races this.
     const bool fast = g_pop_fastpath;
     if (fast) {
         if (pending_ops.empty()) {

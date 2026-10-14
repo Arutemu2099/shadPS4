@@ -1082,7 +1082,7 @@ public:
     /// (sceKernelMunmap -> Rasterizer::UnmapMemory -> TextureCache::FreeImage -> DeleteImage)
     /// while the command processor pops the queue, so the queue is guarded by its own mutex.
     void DeferOperation(Common::UniqueFunction<void>&& func) {
-        if (PendingOpsLock()) {
+        if (pending_ops_lock) {
             std::scoped_lock lk{pending_ops_mutex};
             pending_ops.emplace(std::move(func), CurrentTick());
             pending_ops_count.fetch_add(1, std::memory_order_release);
@@ -1521,7 +1521,11 @@ private:
     /// the count lets the per-draw empty check stay lock-free.
     std::mutex pending_ops_mutex;
     std::atomic<u64> pending_ops_count{0};
-    static bool PendingOpsLock();
+    /// SHADPS4_PENDING_OPS_LOCK=1 (read once; checked on every draw).
+    static inline const bool pending_ops_lock = [] {
+        const char* e = std::getenv("SHADPS4_PENDING_OPS_LOCK");
+        return e != nullptr && e[0] == '1';
+    }();
     std::queue<PendingOp> priority_pending_ops;
     std::mutex priority_pending_ops_mutex;
     std::condition_variable_any priority_pending_ops_cv;
