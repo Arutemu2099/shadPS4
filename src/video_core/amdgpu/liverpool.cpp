@@ -895,9 +895,28 @@ void PrefetchProgramsOnWrite(const Regs& regs, u32 offset, u32 count) {
 static int FenceAtGpu() {
     static const int mode = [] {
         const char* value = std::getenv("SHADPS4_FENCE_AT_GPU");
-        return value && value[0] >= '1' && value[0] <= '3' ? value[0] - '0' : 0;
+        return value && value[0] >= '1' && value[0] <= '4' ? value[0] - '0' : 0;
     }();
     return mode;
+}
+
+// q58 (B0 port of 3ef44d28, zero-copy gate; notes/zero-copy-heap-2026-10-07.md sec. 7): SHADPS4_FENCE_AT_GPU=4 writes
+// only the graphics EOP / EOS label at SHADPS4_FENCE_AT_GPU_ADDR=<hex> (the game's end-of-frame label 0x248000000) at
+// host-GPU completion (mode 1 for that label); every other label stays CP-time and keeps fence forwarding.
+static u64 GpuTimedLabel() {
+    static const u64 address = [] {
+        const char* value = std::getenv("SHADPS4_FENCE_AT_GPU_ADDR");
+        return value ? std::strtoull(value, nullptr, 16) : 0ull;
+    }();
+    return address;
+}
+static bool GpuTimedLabelHit(u64 address) {
+    return FenceAtGpu() == 4 && address != 0 && address == GpuTimedLabel();
+}
+/// Whether the label at `address` is written at host-GPU completion (modes 1-3: every label of their kinds; 4: one).
+static bool FenceDeferredAt(u64 address) {
+    const int mode = FenceAtGpu();
+    return mode != 0 && (mode != 4 || GpuTimedLabelHit(address));
 }
 
 static void WriteFenceValue(void* address, u64 data, u32 num_bytes) {
@@ -6578,7 +6597,7 @@ void Liverpool::RunFence(const PM4Header* header, std::span<const u32> rest, VAd
         const auto write = FenceValue(header);
         const auto* next = reinterpret_cast<const u32*>(header) + dwords;
         const VAddr head = reinterpret_cast<VAddr>(header);
-        if (write && FenceAtGpu() == 0 && (!asc || t_fwd_asc_allowed) &&
+        if (write && !FenceDeferredAt(label) && (!asc || t_fwd_asc_allowed) &&
             label + write->width <= head && label + 256 >= head &&
             reinterpret_cast<VAddr>(next) < hi &&
             !SplitSpansOverlap(label, label + write->width)) {
@@ -6621,7 +6640,7 @@ void Liverpool::RunFence(const PM4Header* header, std::span<const u32> rest, VAd
         split->Sync(sync_reason);
         return;
     }
-    if (const auto fw = FenceValue(header); fw && FenceAtGpu() == 0) {
+    if (const auto fw = FenceValue(header); fw && !FenceDeferredAt(label)) {
         split->NotePostedWrite(label, LabelBytes, true, fw->value, true, 1);
     } else {
         split->NotePostedWrite(label, LabelBytes, false, 0, true, 1);
@@ -10323,10 +10342,11 @@ void Liverpool::ExecuteGfxPacket(const PM4Header* header, bool guest_markers_ena
                 rasterizer->GetScheduler().CurrentTick(), std::memory_order_relaxed);
         }
         VideoCore::ProtectFence();
-        if ((FenceAtGpu() == 1 || FenceAtGpu() == 2) && rasterizer &&
-            event_eos->command != PM4CmdEventWriteEos::Command::GdsStore) {
+        if ((FenceAtGpu() == 1 || FenceAtGpu() == 2 ||
+             GpuTimedLabelHit(reinterpret_cast<u64>(event_eos->Address()))) &&
+            rasterizer && event_eos->command != PM4CmdEventWriteEos::Command::GdsStore) {
             rasterizer->DeferToGpu([packet = *event_eos] { packet.SignalFence(WriteFenceValue); },
-                                   FenceAtGpu() == 1);
+                                   FenceAtGpu() != 2);
         } else {
             event_eos->SignalFence(WriteFenceValue);
         }
@@ -10352,7 +10372,9 @@ void Liverpool::ExecuteGfxPacket(const PM4Header* header, bool guest_markers_ena
                 rasterizer->GetScheduler().CurrentTick(), std::memory_order_relaxed);
         }
         VideoCore::ProtectFence();
-        if (FenceAtGpu() != 0 && rasterizer) {
+        if (((FenceAtGpu() != 0 && FenceAtGpu() != 4) ||
+             GpuTimedLabelHit(reinterpret_cast<u64>(event_eop->Address<u32>()))) &&
+            rasterizer) {
             rasterizer->DeferToGpu(
                 [packet = *event_eop] {
                     packet.SignalFence(WriteFenceValue, [] {
