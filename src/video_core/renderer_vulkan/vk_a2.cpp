@@ -482,6 +482,57 @@ bool SecondaryMode() {
     return on;
 }
 
+/// r9 (2026-10-14, notes/rooftop-2026-10-14.md sec. 6): SHADPS4_NR_WORKER. The job threads' draw
+/// records (NativeRec: derive + GPU record per DrawIndex HLE call) cost the rooftop's render-job
+/// span 2.85 ms per frame (s992 vs s986: span 4.80 -> 1.95 ms with SHADPS4_NATIVE_REC=0) - on
+/// Game:Main's critical path, while everything the translator needs it already computes from its
+/// own exact register state (user data, each Guest V#'s address and size, the vertex streams).
+/// 1 = the translator writes each taken draw's GPU record into its own ring (no job record read;
+/// run with SHADPS4_NATIVE_REC=0 so the job threads do no record work); 2 = verify: job records
+/// stay the ones drawn, and the translator builds its own record for every taken draw without
+/// inherited registers and compares it dword by dword with the job's (GPU record words 0-127,
+/// 160-175; 128-159 are the back's slot words).
+int NrWorkerMode() {
+    static const int m = [] {
+        const char* e = std::getenv("SHADPS4_NR_WORKER");
+        const int v = e ? e[0] - '0' : 0;
+        return v == 1 || v == 2 ? v : 0;
+    }();
+    return m;
+}
+constexpr u32 WorkerRecBits = 15;
+constexpr u32 WorkerRecSize = 1u << WorkerRecBits; ///< records per translator (~23 MB)
+constexpr u32 WorkerRecMask = WorkerRecSize - 1;
+
+/// r9: one draw's GPU record as NativeRecGpu writes it (words 0-127 and 160-175; the slot words
+/// 128-159 stay zero here, Replay writes them).
+void BuildWorkerRecord(std::array<u32, NR::GpuRecDwords>& g, const Shader::PushData& push,
+                       u64 guest_mask, const std::array<VAddr, Shader::NUM_BUFFERS>& o_addr,
+                       const std::array<u64, Shader::NUM_BUFFERS>& o_vsize, u32 vb_n,
+                       const AmdGpu::CpSplit::VertexInputAttrib* attribs,
+                       const std::array<VAddr, 16>& vaddr_vi) {
+    g.fill(0);
+    std::memcpy(g.data() + Shader::NativeRecordUdOffset, push.ud_regs.data(),
+                sizeof(u32) * Shader::NUM_USER_DATA_REGS);
+    for (u64 m = guest_mask; m != 0; m &= m - 1) {
+        const u32 b = static_cast<u32>(std::countr_zero(m));
+        g[Shader::NativeRecordOffOffset + b] = static_cast<u32>(o_addr[b]);
+        g[Shader::NativeRecordSizeOffset + b] = static_cast<u32>(std::min<u64>(o_vsize[b], 0xffffffffull));
+        g[Shader::NativeRecordHiOffset + b / 4] |= static_cast<u32>((o_addr[b] >> 32) & 0xffu)
+                                                   << ((b % 4) * 8);
+    }
+    for (u32 k = 0; k < vb_n && k < 16; ++k) {
+        const u32 loc = attribs[k].desc.location;
+        if (vaddr_vi[k] == 0 || loc >= Shader::NativeMaxPulledLocations) {
+            continue;
+        }
+        g[Shader::NativeRecordVoffOffset + loc] = static_cast<u32>(vaddr_vi[k]);
+        g[Shader::NativeRecordVsizeOffset + loc] = 0xffffffffu;
+        g[Shader::NativeRecordVhiOffset + loc / 4] |= static_cast<u32>((vaddr_vi[k] >> 32) & 0xffu)
+                                                      << ((loc % 4) * 8);
+    }
+}
+
 void Replay(const StretchCmds& cmds, vk::CommandBuffer cmdbuf, const Instance& instance) {
     WriteSlots(cmds);
     RecordBatches(cmds, cmds.bindless_set, cmdbuf, instance);
@@ -492,9 +543,9 @@ void WriteSlots(const StretchCmds& cmds) {
     // before recording this closure; write each draw's slot words into its job ring record
     // exactly as Rasterizer::BindlessRingWrite does (write-combined ring memory, 128-159).
     for (const auto& sw : cmds.slot_writes) {
-        u32* gr = NR::g_gpu_recs[sw.tag >> 28].load(std::memory_order_acquire);
+        u32* gr = sw.ring ? sw.ring : NR::g_gpu_recs[sw.tag >> 28].load(std::memory_order_acquire);
         if (gr && sw.mat < MaxMaterials) {
-            std::memcpy(gr + size_t(sw.idx & (NR::RingSize - 1)) * NR::GpuRecDwords +
+            std::memcpy(gr + size_t(sw.idx & (sw.ring ? WorkerRecMask : NR::RingSize - 1)) * NR::GpuRecDwords +
                             Shader::NativeRecordImgOffset,
                         cmds.mat_slots[sw.mat].data(), sizeof(u32) * Shader::NativeBindlessSlots);
         }
@@ -644,6 +695,26 @@ struct StretchTranslator::Impl {
     u64 b_fb_mask{}; ///< slots resolved by the opener's own V# (guest-lookup fallback)
     bool b_ind{};    ///< q2: the open sub-batch is a guest indirect draw (never continued)
     std::array<u32, Shader::NUM_BUFFERS> b_tbase{}; ///< the opener's table bases (checks)
+
+    // r9 (SHADPS4_NR_WORKER=1): this translator's own GPU record ring (records are written by this
+    // thread only; an entry is reused only after the GPU passed the tick of the stretch that last
+    // wrote it - the arena's rule).
+    std::unique_ptr<VideoCore::StreamBuffer> rec_ring;
+    u32* rec_mapped{};
+    u64 rec_handle{};
+    u64 rec_head{};          ///< next record index (unmasked)
+    u64 rec_stretch_start{}; ///< the open stretch's first record index
+    struct RecFence {
+        u64 start, end;
+        std::shared_ptr<std::atomic<u64>> tick;
+    };
+    std::vector<RecFence> rec_fences;
+    /// True if entry rec_head may be written now (never waits).
+    bool RecReserve();
+    /// r9 census (this translator): records written, verify compares, mismatching records by
+    /// region (user data, address, size, vertex address, vertex size, high bytes), ring full.
+    std::array<u64, 9> nrw{};
+    void NrwLog();
 };
 
 StretchTranslator::Impl::Impl(StretchTranslator* owner_, const WorkerContext& ctx_)
@@ -687,6 +758,18 @@ StretchTranslator::Impl::Impl(StretchTranslator* owner_, const WorkerContext& ct
                 ctx.arena->size = ArenaBytes;
                 ctx.arena->head = 0;
             }
+        }
+    }
+    if (!why && NrWorkerMode() == 1) {
+        // r9: the record ring in mapped coherent memory, as the job slots' rings (NativeGpuRingAlloc).
+        rec_ring = std::make_unique<VideoCore::StreamBuffer>(
+            *ctx.instance, *ctx.scheduler, VideoCore::MemoryUsage::Stream,
+            u64(WorkerRecSize) * NR::GpuRecDwords * sizeof(u32), vk::BufferUsageFlags{});
+        if (rec_ring->mapped_data.empty() || !rec_ring->IsCoherent()) {
+            why = "SHADPS4_NR_WORKER: record ring not mapped coherent memory";
+        } else {
+            rec_mapped = reinterpret_cast<u32*>(rec_ring->mapped_data.data());
+            rec_handle = std::bit_cast<u64>(static_cast<VkBuffer>(rec_ring->Handle()));
         }
     }
     if (!why) {
@@ -759,6 +842,43 @@ bool StretchTranslator::Impl::AllocRegion(u64 bytes, u64& start, u64& masked_off
     masked_off = a % ar.size;
     ptr = ar.mapped + masked_off;
     return true;
+}
+
+bool StretchTranslator::Impl::RecReserve() {
+    const u64 next = rec_head + 1;
+    if (next <= WorkerRecSize) {
+        return true;
+    }
+    const u64 reuse_below = next - WorkerRecSize; // entries below it are overwritten from here
+    if (stretch && rec_stretch_start < reuse_below) {
+        return false; // the open stretch would overwrite its own records
+    }
+    u64 known = 0;
+    bool known_read = false;
+    while (!rec_fences.empty() && rec_fences.front().start < reuse_below) {
+        const u64 tick = rec_fences.front().tick->load(std::memory_order_acquire);
+        if (tick == 0) {
+            return false; // not published yet
+        }
+        if (!known_read) {
+            known = ctx.scheduler->GetMasterSemaphore()->KnownGpuTick();
+            known_read = true;
+        }
+        if (known < tick) {
+            return false; // the GPU has not passed that stretch
+        }
+        rec_fences.erase(rec_fences.begin());
+    }
+    return true;
+}
+
+void StretchTranslator::Impl::NrwLog() {
+    LOG_INFO(Render_Vulkan,
+             "NrWorker (mode {}, worker {}): records written {} | verify compares {}, mismatching: "
+             "user data {} address {} size {} vertex address {} vertex size {} high bytes {} | "
+             "ring full refusals {}",
+             NrWorkerMode(), ctx.worker_index, nrw[0], nrw[1], nrw[2], nrw[3], nrw[4], nrw[5],
+             nrw[6], nrw[7], nrw[8]);
 }
 
 /// q2: SHADPS4_A2_INDIRECT=1 - indirect colour draws on the translator.
@@ -927,62 +1047,109 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
             }
         }
     }
-    if (draw.job_tag == 0) {
-        return refuse(RefuseNoJob);
-    }
-    const u32 slot = draw.job_tag >> 28;
-    if (slot > NR::MaxRecordSlot) {
-        return refuse(RefuseNoRing);
-    }
-    const NR::Record* ring = NR::g_rings[slot].load(std::memory_order_acquire);
-    const NR::RunUnion* unions = NR::g_unions[slot].load(std::memory_order_acquire);
-    const u64 ring_handle = NR::g_gpu_handles[slot].load(std::memory_order_acquire);
-    if (!ring || !unions || ring_handle == 0) {
-        return refuse(RefuseNoRing);
-    }
-    constexpr u32 mask = NR::RingSize - 1;
-    const u32 idx = draw.job_idx;
-    // Ring lifetime (NativeRingPrepare fail 2): the job thread must not be a quarter ring ahead.
-    if (NR::g_job_next[slot].load(std::memory_order_relaxed) - idx > NR::LifetimeWindow()) {
-        return refuse(RefuseLifetime);
-    }
-    // The job record (seqlock: fields, acquire fence, stamp).
-    const NR::Record& r = ring[idx & mask];
-    const u32 run_k = r.run_k, head_idx = r.head_idx, gpu_ok = r.gpu_ok;
-    const u32 union_idx = r.union_idx, inst_known = r.inst_known, instances = r.instances;
-    const u32 index_count = r.index_count, io_ud = r.io_ud, vcount = r.vcount;
-    const u64 index_addr_rec = r.index_addr;
-    const std::array<u64, 16> vaddr = r.vaddr;
-    const void* cmd = r.cmd;
-    const u32 push_inh = r.push_inh, inh_vs = r.inh_vs, inh_ps = r.inh_ps;
-    const u64 inh_slots = r.inh_slots;
-    const u32 img_n_rec = r.img_n;
-    const u64 img_h1_rec = r.img_h1, img_h2_rec = r.img_h2;
-    std::atomic_thread_fence(std::memory_order_acquire);
-    if (const u32 stamp = r.stamp.load(std::memory_order_relaxed); stamp != idx + 1 || !gpu_ok) {
-        ++owner->sub[stamp != idx + 1 ? (s32(stamp - (idx + 1)) < 0 ? 12 : 13) : 14];
-        return refuse(RefuseStamp);
-    }
-    if (draw.job_cmd) {
-        if (cmd != draw.job_cmd) {
-            ++owner->sub[15];
+    // r9 (SHADPS4_NR_WORKER=1): no job record - this translator's own register state gives every
+    // field (no inherited registers: the worker's mirror is complete) and its own ring holds the
+    // GPU record (written at the commit below). Run / union: every draw is its own head; a
+    // sub-batch continues on this ring's consecutive entries while the members' Guest ranges fit
+    // the opener's buffers (the fallback rule below).
+    const int wm = NrWorkerMode();
+    const bool wrec = wm == 1;
+    u32 slot = 0;
+    const NR::Record* ring = nullptr;
+    const NR::RunUnion* unions = nullptr;
+    u64 ring_handle = 0;
+    u32 mask = NR::RingSize - 1;
+    u32 idx = 0;
+    u32 run_k = 0, head_idx = 0, union_idx = 0;
+    u32 index_count = 0, io_ud = 0, vcount = 0;
+    u64 index_addr_rec = 0;
+    std::array<u64, 16> vaddr{};
+    u32 push_inh = 0, inh_vs = 0, inh_ps = 0;
+    u64 inh_slots = 0;
+    u32 img_n_rec = 0;
+    u64 img_h1_rec = 0, img_h2_rec = 0;
+    u32 n_inst = regs.num_instances.NumInstances();
+    if (wrec) {
+        if (!rec_mapped) {
+            return refuse(RefuseNoRing);
+        }
+        if (!RecReserve()) {
+            ++nrw[8];
+            return refuse(RefuseArena);
+        }
+        ring_handle = rec_handle;
+        mask = WorkerRecMask;
+        idx = static_cast<u32>(rec_head);
+        index_count = regs.num_indices;
+        if (!ind && index_count == 0) {
+            ++owner->sub[2];
+            return refuse(RefuseRecordFields);
+        }
+    } else {
+        if (draw.job_tag == 0) {
+            return refuse(RefuseNoJob);
+        }
+        slot = draw.job_tag >> 28;
+        if (slot > NR::MaxRecordSlot) {
+            return refuse(RefuseNoRing);
+        }
+        ring = NR::g_rings[slot].load(std::memory_order_acquire);
+        unions = NR::g_unions[slot].load(std::memory_order_acquire);
+        ring_handle = NR::g_gpu_handles[slot].load(std::memory_order_acquire);
+        if (!ring || !unions || ring_handle == 0) {
+            return refuse(RefuseNoRing);
+        }
+        idx = draw.job_idx;
+        // Ring lifetime (NativeRingPrepare fail 2): the job thread must not be a quarter ring ahead.
+        if (NR::g_job_next[slot].load(std::memory_order_relaxed) - idx > NR::LifetimeWindow()) {
+            return refuse(RefuseLifetime);
+        }
+        // The job record (seqlock: fields, acquire fence, stamp).
+        const NR::Record& r = ring[idx & mask];
+        run_k = r.run_k;
+        head_idx = r.head_idx;
+        const u32 gpu_ok = r.gpu_ok;
+        union_idx = r.union_idx;
+        const u32 inst_known = r.inst_known, instances = r.instances;
+        index_count = r.index_count;
+        io_ud = r.io_ud;
+        vcount = r.vcount;
+        index_addr_rec = r.index_addr;
+        vaddr = r.vaddr;
+        const void* cmd = r.cmd;
+        push_inh = r.push_inh;
+        inh_vs = r.inh_vs;
+        inh_ps = r.inh_ps;
+        inh_slots = r.inh_slots;
+        img_n_rec = r.img_n;
+        img_h1_rec = r.img_h1;
+        img_h2_rec = r.img_h2;
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (const u32 stamp = r.stamp.load(std::memory_order_relaxed); stamp != idx + 1 || !gpu_ok) {
+            ++owner->sub[stamp != idx + 1 ? (s32(stamp - (idx + 1)) < 0 ? 12 : 13) : 14];
             return refuse(RefuseStamp);
         }
-    } else if (!cmd_warned) {
-        cmd_warned = true;
-        ++owner->refusals[RefuseNoCmd];
+        if (draw.job_cmd) {
+            if (cmd != draw.job_cmd) {
+                ++owner->sub[15];
+                return refuse(RefuseStamp);
+            }
+        } else if (!cmd_warned) {
+            cmd_warned = true;
+            ++owner->refusals[RefuseNoCmd];
+        }
+        // q2: an indirect record has no index count, and its instance-offset register is the
+        // CP's (the args' firstInstance, as DrawIndirectTail).
+        if ((!ind && (io_ud != 0 || index_count == 0)) ||
+            (push_inh >> Shader::NUM_USER_DATA_REGS) != 0) {
+            ++owner->sub[io_ud != 0 ? 1 : index_count == 0 ? 2 : 3];
+            return refuse(RefuseRecordFields);
+        }
+        // The record knows the instance count only after a NUM_INSTANCES packet in the same DCB;
+        // the mirror always has it (as the generic draw path reads it).
+        n_inst = inst_known ? instances : regs.num_instances.NumInstances();
+        owner->sub[0] += inst_known ? 0 : 1; // census: instance count taken from the mirror
     }
-    // q2: an indirect record has no index count, and its instance-offset register is the
-    // CP's (the args' firstInstance, as DrawIndirectTail).
-    if ((!ind && (io_ud != 0 || index_count == 0)) ||
-        (push_inh >> Shader::NUM_USER_DATA_REGS) != 0) {
-        ++owner->sub[io_ud != 0 ? 1 : index_count == 0 ? 2 : 3];
-        return refuse(RefuseRecordFields);
-    }
-    // The record knows the instance count only after a NUM_INSTANCES packet in the same DCB; the
-    // mirror always has it (as the generic draw path reads it).
-    const u32 n_inst = inst_known ? instances : regs.num_instances.NumInstances();
-    owner->sub[0] += inst_known ? 0 : 1; // census: instance count taken from the mirror
     // Inherited Guest slots (l3e): every member binds the opener's V# through the table (Base =
     // 0 - offset, Size, the InhSlots bit, PtLo / PtHi), as NativeRingPrepare does; resolved in the
     // union loop below.
@@ -993,7 +1160,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     const VAddr index_addr =
         regs.index_base_address.Address<VAddr>() +
         (ind ? 0 : u64(draw.index_offset) * index_size);
-    if (!ind && (index_addr != index_addr_rec || regs.num_indices != index_count ||
+    if (!wrec && !ind && (index_addr != index_addr_rec || regs.num_indices != index_count ||
                  regs.num_instances.NumInstances() != n_inst)) {
         return refuse(RefuseRecordRegs);
     }
@@ -1012,14 +1179,14 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     }
     const auto* attribs = AmdGpu::CpSplit::VertexInputAttribs(*draw.vi);
     const u32 vb_n = draw.vi->count;
-    if (vcount != vb_n) {
+    if (!wrec && vcount != vb_n) {
         return refuse(RefuseRecordRegs);
     }
     std::array<VAddr, 16> vaddr_vi{};
     for (u32 k = 0; k < vb_n; ++k) {
         const auto& a = attribs[k];
         vaddr_vi[k] = (a.base_address != 0 && a.size != 0) ? a.base_address : 0;
-        if (vaddr_vi[k] != vaddr[k]) {
+        if (!wrec && vaddr_vi[k] != vaddr[k]) {
             return refuse(RefuseRecordRegs);
         }
     }
@@ -1186,10 +1353,10 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         }
         // The job record's image count / key hashes must agree with the stages (NativeRingPrepare
         // fail 13), unless a T# / S# sat in inherited registers (zeros in the job's key).
-        if ((img_n_rec & ~NR::ImgInhBit) != key.n) {
+        if (!wrec && (img_n_rec & ~NR::ImgInhBit) != key.n) {
             return refuse(RefuseColourKeyHash);
         }
-        if (!(img_n_rec & NR::ImgInhBit)) {
+        if (!wrec && !(img_n_rec & NR::ImgInhBit)) {
             u64 h1 = 0, h2 = 0;
             NR::ImageKeyHash(key.w.data(), key.n, h1, h2);
             if (h1 != img_h1_rec || h2 != img_h2_rec) {
@@ -1336,7 +1503,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
     // vertex rebase quotient rule (below), fewer than MaxDraws draws. Colour: the same vertex
     // VkBuffer and the same set of non-null locations (NativeJoin's `had` rule); the material
     // may differ (each draw's record gets its own slot words).
-    const u32 head = run_k == 0 ? idx : head_idx;
+    const u32 head = wrec ? 0u : (run_k == 0 ? idx : head_idx); // r9: no runs
     bool cont = !ind && !b_ind && batch_open && b_native == native && b_colour == colour &&
                 b_slot == slot &&
                 idx == b_next_idx && cmds->batches.back().n < MaxDraws && union_idx == b_union &&
@@ -1451,22 +1618,28 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         // The run union (NativeRingPrepare): per Guest slot the buffer holding the run's range
         // (its CPU address low 32 bits is the table base), or the opener's own V# when every
         // draw of the run binds the same one. Seqlock as the back reads it.
-        const NR::RunUnion& u = unions[union_idx & NR::UnionMask];
-        const u32 un = u.n.load(std::memory_order_acquire);
-        if (u.stamp.load(std::memory_order_relaxed) != head + 1 || un <= run_k) {
-            return refuse(RefuseUnion);
-        }
-        const u64 u_guest = u.guest_mask, u_eq = u.eq_mask;
+        // r9 (worker records): no run union - every Guest slot takes the opener's own V# inside one
+        // cached buffer (the fallback below); members must fit those buffers (the continuation check).
+        u64 u_guest = guest_mask, u_eq = 0;
         std::array<u64, Shader::NUM_BUFFERS> lo{}, hi{}, first{};
-        for (u64 m = guest_mask; m != 0; m &= m - 1) {
-            const u32 b = static_cast<u32>(std::countr_zero(m));
-            lo[b] = u.lo[b];
-            hi[b] = u.hi[b];
-            first[b] = u.first_addr[b];
-        }
-        std::atomic_thread_fence(std::memory_order_acquire);
-        if (u.stamp.load(std::memory_order_relaxed) != head + 1) {
-            return refuse(RefuseUnion);
+        if (!wrec) {
+            const NR::RunUnion& u = unions[union_idx & NR::UnionMask];
+            const u32 un = u.n.load(std::memory_order_acquire);
+            if (u.stamp.load(std::memory_order_relaxed) != head + 1 || un <= run_k) {
+                return refuse(RefuseUnion);
+            }
+            u_guest = u.guest_mask;
+            u_eq = u.eq_mask;
+            for (u64 m = guest_mask; m != 0; m &= m - 1) {
+                const u32 b = static_cast<u32>(std::countr_zero(m));
+                lo[b] = u.lo[b];
+                hi[b] = u.hi[b];
+                first[b] = u.first_addr[b];
+            }
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (u.stamp.load(std::memory_order_relaxed) != head + 1) {
+                return refuse(RefuseUnion);
+            }
         }
         std::array<u32, Shader::NUM_BUFFERS> base{};
         std::array<VAddr, Shader::NUM_BUFFERS> glo{}, ghi{};
@@ -1543,6 +1716,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
             stretch->first_seq = draw.seq;
             stretch->rt_pipe = native; // p2: the pass formats of the secondary's inheritance
             stretch->tick = std::make_shared<std::atomic<u64>>(0);
+            rec_stretch_start = rec_head; // r9
             stretch->buf_gen = ctx.buffer_cache->StructGeneration();
             stretch->probe_gen = VideoCore::g_lprobe_gen.load(std::memory_order_acquire); // q9b
             cmds = std::make_shared<StretchCmds>();
@@ -1815,7 +1989,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
                 }
             }
         }
-        cmds->slot_writes.push_back({draw.job_tag, idx, static_cast<u32>(mat)});
+        cmds->slot_writes.push_back({draw.job_tag, idx, static_cast<u32>(mat), wrec ? rec_mapped : nullptr});
     }
     if (inh_slots != 0) {
         ++owner->sub[19];
@@ -1857,6 +2031,44 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         if (Mode() == 2) {
             cmds->clip_checks.push_back(
                 {draw.seq, regs.clipper_control.user_clip_plane_enable, b_planes});
+        }
+    }
+    if (wm != 0) {
+        // r9: this draw's GPU record from the translator's own state.
+        std::array<u32, NR::GpuRecDwords> g;
+        BuildWorkerRecord(g, push, guest_mask, o_addr, o_vsize, vb_n, attribs, vaddr_vi);
+        if (wrec) {
+            u32* const rec = rec_mapped + size_t(idx & WorkerRecMask) * NR::GpuRecDwords;
+            std::memcpy(rec, g.data(), sizeof(u32) * NR::GpuRecJobDwords);
+            std::memcpy(rec + NR::GpuRecHiOffset, g.data() + NR::GpuRecHiOffset,
+                        sizeof(u32) * (NR::GpuRecDwords - NR::GpuRecHiOffset));
+            ++rec_head;
+            ++nrw[0];
+        } else if (push_inh == 0 && inh_slots == 0 && inh_vs == 0 && inh_ps == 0) {
+            // =2 verify: field compare with the job thread's record of the same draw.
+            const u32* jr = NR::g_gpu_recs[slot].load(std::memory_order_acquire);
+            if (jr) {
+                jr += size_t(idx & mask) * NR::GpuRecDwords;
+                ++nrw[1];
+                const auto diff = [&](u32 lo_dw, u32 n) {
+                    return std::memcmp(g.data() + lo_dw, jr + lo_dw, sizeof(u32) * n) != 0;
+                };
+                const bool d_ud = diff(Shader::NativeRecordUdOffset, Shader::NUM_USER_DATA_REGS);
+                const bool d_off = diff(Shader::NativeRecordOffOffset, Shader::NUM_BUFFERS);
+                const bool d_size = diff(Shader::NativeRecordSizeOffset, Shader::NUM_BUFFERS);
+                const bool d_voff = diff(Shader::NativeRecordVoffOffset, Shader::NativeMaxPulledLocations);
+                const bool d_vsize = diff(Shader::NativeRecordVsizeOffset, Shader::NativeMaxPulledLocations);
+                const bool d_hi = diff(NR::GpuRecHiOffset, NR::GpuRecDwords - NR::GpuRecHiOffset);
+                nrw[2] += d_ud;
+                nrw[3] += d_off;
+                nrw[4] += d_size;
+                nrw[5] += d_voff;
+                nrw[6] += d_vsize;
+                nrw[7] += d_hi;
+            }
+        }
+        if (((nrw[0] + nrw[1]) & 0xffff) == 0 && nrw[0] + nrw[1] != 0) {
+            NrwLog();
         }
     }
     b_next_idx = idx + 1;
@@ -2042,6 +2254,10 @@ std::unique_ptr<Stretch> StretchTranslator::Impl::End() {
     RecordSecondary();
     stretch->arena_end = ctx.arena->head;
     ctx.arena->fences.push_back({stretch_start, ctx.arena->head, stretch->tick});
+    if (rec_mapped) {
+        _mm_sfence(); // r9: the records' write-combined stores before the stretch is published
+        rec_fences.push_back({rec_stretch_start, rec_head, stretch->tick});
+    }
     batch_open = false;
     b_native = nullptr;
     cmd_ptr = nullptr;

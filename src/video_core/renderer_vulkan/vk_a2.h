@@ -182,6 +182,7 @@ struct StretchCmds {
         u32 tag{};
         u32 idx{};
         u32 mat{};
+        u32* ring{}; ///< r9 (SHADPS4_NR_WORKER=1): the translator's own record ring (null: the job slot's)
     };
     std::vector<SlotWrite> slot_writes;
     /// SHADPS4_A2=2 direct checks, one entry per taken draw (the back compares at that draw):
