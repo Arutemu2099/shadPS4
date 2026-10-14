@@ -1100,6 +1100,10 @@ public:
     /// submitted, so no batch on the queue waits for a signal queued behind it.
     static std::atomic<VkSemaphore> async_timeline;
     static std::atomic<u64> async_submitted_tick;
+    /// SHADPS4_ARENA_PREFETCH_RETRY (installed by the buffer cache; null: off): called with the
+    /// submitted value after the recording worker's and a par-rec lane worker's submit, outside
+    /// submit_mutex. Not called for the CP thread's synchronous submits.
+    static std::atomic<void (*)(u64)> submitted_hook;
 
 private:
     static constexpr size_t AlignedPayloadSize(size_t bytes) {

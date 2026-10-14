@@ -969,8 +969,49 @@ static std::mutex g_arena_rd_mutex;
 static std::array<ArenaReadPage, ArenaReadSlots> g_arena_rd{};
 /// 0 guest read faults in the current half; 1 prefetch calls, 2 jobs, 3 of them on the fast lane,
 /// 4 KB, 5 learned pages covered; skipped: 6 page clean, 7 pending job, 8 cap / slot / staging,
-/// 9 other; waiter: 10 published, 11 vetoed, 12 settled before the waiter (a guest fault, a discard or an overlap settle); 13 skipped: the producing batch open or not yet submitted (q50).
+/// 9 other; waiter: 10 published, 11 vetoed, 12 settled before the waiter (a guest fault, a discard or an overlap settle); 13 skipped: the producing batch open or not yet submitted (q50; with ARENA_PREFETCH_RETRY the no-fast-lane case moves to g_arena_retry_n[11]).
 static std::atomic<u64> g_arena_n[14]{};
+// SHADPS4_ARENA_PREFETCH_RETRY=1 (2026-10-14, notes/arena-prefetch-retry-design-2026-10-14.md;
+// needs ARENA_READ_PREFETCH and the async submit timeline). A window the frame-end run skipped
+// because the batch that wrote it was still open or not yet handed to vkQueueSubmit (13) arms a
+// retry: the scheduler's submitted hook (recording worker or par-rec lane worker, after its
+// submit) posts PrefetchArenaReads of the same half to the CP thread once that batch is
+// submitted. The retry runs every eligibility rule again; at most 2 per frame, dropped once the
+// half's discard was posted (discard hook generation + 2).
+static const bool g_arena_prefetch_retry = EnvIs1("SHADPS4_ARENA_PREFETCH_RETRY");
+/// The armed retry: the main-timeline value that must be submitted first (0: none). Written
+/// only under g_arena_retry_mutex, stored last (release); the hook's fast path reads it alone.
+static std::atomic<u64> g_arena_retry_need{0};
+static std::mutex g_arena_retry_mutex; ///< the (half, gen) pair is taken whole with `need`
+static VAddr g_arena_retry_half = 0;
+static u64 g_arena_retry_gen = 0;
+/// Discard hook calls (Game:Main, one per frame; counted only with the retry on).
+static std::atomic<u64> g_arena_hook_gen{0};
+/// 0 armed, 1 posted (12 of them run at once on the CP thread), 2 retries run, 3 retry jobs,
+/// 4 their KB, 5 windows a retry skipped again (producer still open / unsubmitted), dropped:
+/// 6 stale (the half's discard posted), 7 per-frame cap; waiter: 8 retry jobs published,
+/// 9 vetoed, 10 settled before the waiter; 11 skipped: no fast lane (split from 13).
+static std::atomic<u64> g_arena_retry_n[13]{};
+
+static void ArmArenaRetry(VAddr half, u64 gen, u64 need) {
+    std::scoped_lock lk{g_arena_retry_mutex};
+    g_arena_retry_half = half;
+    g_arena_retry_gen = gen;
+    g_arena_retry_need.store(need, std::memory_order_release); // last
+}
+
+/// Takes the armed retry if `submitted` covers it (CAS need -> 0); false if none or not due.
+static bool TakeArenaRetry(u64 submitted, VAddr& half, u64& gen) {
+    std::scoped_lock lk{g_arena_retry_mutex};
+    u64 need = g_arena_retry_need.load(std::memory_order_acquire);
+    if (need == 0 || submitted < need ||
+        !g_arena_retry_need.compare_exchange_strong(need, 0, std::memory_order_acq_rel)) {
+        return false;
+    }
+    half = g_arena_retry_half;
+    gen = g_arena_retry_gen;
+    return true;
+}
 
 static void NoteArenaRead(VAddr addr) {
     const VAddr half = g_arena_cur_half.load(std::memory_order_relaxed);
@@ -1002,7 +1043,40 @@ void ArenaReadPrefetchFrameEnd() {
 }
 
 void BufferCache::PostArenaReadPrefetch(VAddr half) {
+    if (g_arena_prefetch_retry) {
+        // The generation of the discard hook that set `half` (this same thread, Game:Main).
+        const u64 gen = g_arena_hook_gen.load(std::memory_order_relaxed);
+        liverpool->SendCommand<false>([this, half, gen] { PrefetchArenaReads(half, gen, false); });
+        return;
+    }
     liverpool->SendCommand<false>([this, half] { PrefetchArenaReads(half); });
+}
+
+// SHADPS4_ARENA_PREFETCH_RETRY: Vulkan::Scheduler::submitted_hook, on the recording worker or a
+// par-rec lane worker right after its vkQueueSubmit of `submitted`, outside submit_mutex.
+static void ArenaRetryOnSubmit(u64 submitted) {
+    const u64 need = g_arena_retry_need.load(std::memory_order_acquire);
+    if (need == 0 || submitted < need) [[likely]] {
+        return;
+    }
+    if (BufferCache* bc = g_discard_cache) {
+        bc->PostArenaReadRetry(submitted);
+    }
+}
+
+void BufferCache::PostArenaReadRetry(u64 submitted) {
+    // On the CP thread SendCommand runs the retry inline, inside a submit: leave it armed for
+    // the next worker submit instead.
+    if (liverpool->IsGpuThread()) {
+        return;
+    }
+    VAddr half = 0;
+    u64 gen = 0;
+    if (!TakeArenaRetry(submitted, half, gen)) {
+        return; // another submit thread took it first
+    }
+    g_arena_retry_n[1].fetch_add(1, std::memory_order_relaxed);
+    liverpool->SendCommand<false>([this, half, gen] { PrefetchArenaReads(half, gen, true); });
 }
 
 void PS4_SYSV_ABI ParticleArenaDiscardHook() {
@@ -1026,6 +1100,9 @@ void PS4_SYSV_ABI ParticleArenaDiscardHook() {
             label = *reinterpret_cast<const volatile u32*>(0x248000000ULL);
         }
         g_lane_frame_label.store(u64{label} + 1, std::memory_order_release);
+    }
+    if (g_arena_prefetch_retry) {
+        g_arena_hook_gen.fetch_add(1, std::memory_order_relaxed); // before this half's discard post
     }
     g_arena_hook_ran.store(true, std::memory_order_relaxed);
     static bool logged = false;
@@ -4014,7 +4091,9 @@ void BufferCache::PublishPrefetch(u64 id, u32 slot, u8 lane) {
     } else {
         ++pf_c[17]; // settled before the waiter (guest early or an overlap settle)
     }
-    if (same_job && job.arena) { // q48
+    if (same_job && job.arena && job.arena_retry) { // SHADPS4_ARENA_PREFETCH_RETRY: own counters
+        g_arena_retry_n[!pending ? 10 : pf_last_ok ? 8 : 9].fetch_add(1, std::memory_order_relaxed);
+    } else if (same_job && job.arena) { // q48
         g_arena_n[!pending ? 12 : pf_last_ok ? 10 : 11].fetch_add(1, std::memory_order_relaxed);
     } else if (lane != 0) { // SHADPS4_HOT_PAGE_PREFETCH (f2 jobs are on the ASC lane, lane 0)
         g_hot_n[!pending ? 10 : pf_last_ok ? 8 : 9].fetch_add(1, std::memory_order_relaxed);
@@ -4278,12 +4357,18 @@ void BufferCache::PrefetchHotPages(VAddr only_page) {
 // arena is the target (no arena skip); up to 6 jobs per call, most in the open main batch (the
 // chain that wrote the half was just recorded); 4 slots always stay free for guest faults; the
 // jobs keep their slot until PublishPrefetch so the waiter copies their bytes (up to ~1 MB each).
-void BufferCache::PrefetchArenaReads(VAddr half) {
+// SHADPS4_ARENA_PREFETCH_RETRY: `gen` is the discard hook generation of `half`; `retry` marks a
+// run posted by the submitted hook (its own counters; the main line counts frame-end runs only).
+void BufferCache::PrefetchArenaReads(VAddr half, u64 gen, bool retry) {
     static const bool usable = [this] {
         const bool ok = Offload::Enabled() && g_write_fault_offload && g_fault_write_skip_settle &&
                         !scheduler.HasAscStream() && !scheduler.HasLane();
         LOG_INFO(Render, "ArenaReadPrefetch: {}", ok ? "on" : "off (needs SHADPS4_READBACK_OFFLOAD, "
                  "WRITE_FAULT_OFFLOAD, FAULT_WRITE_SKIP_SETTLE and no ASC stream or lane)");
+        if (ok && g_arena_prefetch_retry) {
+            Vulkan::Scheduler::submitted_hook.store(&ArenaRetryOnSubmit, std::memory_order_release);
+            LOG_INFO(Render, "ArenaReadPrefetch: retry at batch submit on (SHADPS4_ARENA_PREFETCH_RETRY)");
+        }
         return ok;
     }();
     if (!usable) {
@@ -4291,7 +4376,36 @@ void BufferCache::PrefetchArenaReads(VAddr half) {
     }
     constexpr u32 MaxJobs = 3;  // q51: 8 slots again (s867 asserted with 16; cause not found)
     constexpr u32 KeepFree = 3; // slots left for guest faults
-    const auto count = [](u32 k, u64 v = 1) { g_arena_n[k].fetch_add(v, std::memory_order_relaxed); };
+    const auto count = [retry](u32 k, u64 v = 1) {
+        if (!retry) {
+            g_arena_n[k].fetch_add(v, std::memory_order_relaxed);
+        }
+    };
+    const auto rcount = [](u32 k, u64 v = 1) {
+        g_arena_retry_n[k].fetch_add(v, std::memory_order_relaxed);
+    };
+    // Retry runs of the current frame (CP thread only); the frame is the discard hook generation.
+    static u64 retry_frame = 0;
+    static u32 retry_runs = 0;
+    constexpr u32 MaxRetries = 2;
+    if (retry) {
+        const u64 gen_now = g_arena_hook_gen.load(std::memory_order_relaxed);
+        if (gen_now - gen >= 2) {
+            rcount(6); // the half's discard is posted: it settles the half's jobs
+            return;
+        }
+        if (retry_frame != gen_now) {
+            retry_frame = gen_now;
+            retry_runs = 0;
+        }
+        if (retry_runs >= MaxRetries) {
+            rcount(7);
+            return;
+        }
+        ++retry_runs;
+        rcount(2);
+    }
+    u64 need = 0; // max producer of the windows skipped as open / unsubmitted
     count(1);
     const u64 now = Common::FaultMonitor::presented_frames.load(std::memory_order_relaxed);
     std::array<VAddr, ArenaReadSlots> pages{};
@@ -4370,7 +4484,18 @@ void BufferCache::PrefetchArenaReads(VAddr half) {
         const u64 wait_value = done ? completed : producer;
         if (!fast_lane || (!done && (producer <= 1 || producer >= tick || !producer_submitted))) {
             ReleaseFaultStaging(std::move(staging));
-            count(13);
+            if (!g_arena_prefetch_retry) {
+                count(13);
+            } else if (!fast_lane || producer <= 1) {
+                rcount(11); // no fast lane (or no known producer): a retry cannot help
+            } else {
+                // The producer batch is open or not yet submitted: retry once it is submitted.
+                count(13);
+                if (retry) {
+                    rcount(5);
+                }
+                need = std::max(need, producer);
+            }
             continue;
         }
         const bool lane = true;
@@ -4386,6 +4511,7 @@ void BufferCache::PrefetchArenaReads(VAddr half) {
             job->abandoned = true; // no owner: finalization frees the slot
             job->prefetch = true;  // published by the f2 waiter; guest faults take H7
             job->arena = true;     // held until PublishPrefetch; the waiter copies
+            job->arena_retry = retry; // read only with `arena` (PublishPrefetch's counters)
             job->pf_hold.store(true, std::memory_order_release);
             job->is_write = false;
             job->addr = lo;
@@ -4432,6 +4558,10 @@ void BufferCache::PrefetchArenaReads(VAddr half) {
         count(3, lane);
         count(4, total >> 10);
         count(5, covered);
+        if (retry) {
+            rcount(3);
+            rcount(4, total >> 10);
+        }
     }
     if (!items.empty()) {
         {
@@ -4445,15 +4575,53 @@ void BufferCache::PrefetchArenaReads(VAddr half) {
             pf_thread = std::jthread([this](std::stop_token st) { PrefetchWaiterLoop(st); });
         }
     }
+    // SHADPS4_ARENA_PREFETCH_RETRY: arm after this run's jobs are queued. Without the async submit
+    // timeline no worker submit calls the hook. A retry run past the cap does not arm (nothing
+    // would take it this frame; the next frame end arms afresh).
+    bool retry_now = false;
+    VAddr retry_half = 0;
+    u64 retry_gen = 0;
+    if (g_arena_prefetch_retry && need != 0 &&
+        Vulkan::Scheduler::async_timeline.load() != VK_NULL_HANDLE &&
+        (!retry || retry_runs < MaxRetries)) {
+        ArmArenaRetry(half, gen, need);
+        rcount(0);
+        // A worker submit between the skip and the store above found nothing armed.
+        retry_now = TakeArenaRetry(
+            Vulkan::Scheduler::async_submitted_tick.load(std::memory_order_acquire), retry_half,
+            retry_gen);
+    }
     static u64 calls = 0;
-    if ((++calls & 1023) == 0) {
+    if (!retry && (++calls & 1023) == 0) {
         const auto v = [](u32 k) { return g_arena_n[k].load(std::memory_order_relaxed); };
-        LOG_INFO(Render,
-                 "ArenaReadPrefetch: {} calls | guest read faults in the current half {} | {} jobs "
-                 "({} on the fast lane), {} KB, covering {} learned pages | skipped: page clean {}, "
-                 "pending job {}, cap / slot / staging {}, producer batch open / unsubmitted {}, "
-                 "other {} | published {} vetoed {} settled before the waiter {}",
-                 v(1), v(0), v(2), v(3), v(4), v(5), v(6), v(7), v(8), v(13), v(9), v(10), v(11), v(12));
+        if (!g_arena_prefetch_retry) {
+            LOG_INFO(Render,
+                     "ArenaReadPrefetch: {} calls | guest read faults in the current half {} | {} jobs "
+                     "({} on the fast lane), {} KB, covering {} learned pages | skipped: page clean {}, "
+                     "pending job {}, cap / slot / staging {}, producer batch open / unsubmitted {}, "
+                     "other {} | published {} vetoed {} settled before the waiter {}",
+                     v(1), v(0), v(2), v(3), v(4), v(5), v(6), v(7), v(8), v(13), v(9), v(10), v(11), v(12));
+        } else {
+            const auto r = [](u32 k) { return g_arena_retry_n[k].load(std::memory_order_relaxed); };
+            LOG_INFO(Render,
+                     "ArenaReadPrefetch: {} calls | guest read faults in the current half {} | {} jobs "
+                     "({} on the fast lane), {} KB, covering {} learned pages | skipped: page clean {}, "
+                     "pending job {}, cap / slot / staging {}, producer batch open / unsubmitted {}, "
+                     "no fast lane {}, other {} | published {} vetoed {} settled before the waiter {} "
+                     "| retry: armed {}, posted {} ({} at once on the CP thread), run {}, {} jobs, "
+                     "{} KB, skipped again {}, dropped stale {} / cap {} | retry jobs published {} "
+                     "vetoed {} settled before the waiter {}",
+                     v(1), v(0), v(2), v(3), v(4), v(5), v(6), v(7), v(8), v(13), r(11), v(9), v(10),
+                     v(11), v(12), r(0), r(1), r(12), r(2), r(3), r(4), r(5), r(6), r(7), r(8), r(9),
+                     r(10));
+        }
+    }
+    if (retry_now) {
+        // Already on the CP thread, where SendCommand would run it inline: run it here, last.
+        // Bounded: each retry run counts against MaxRetries before it can arm again.
+        rcount(1);
+        rcount(12);
+        PrefetchArenaReads(retry_half, retry_gen, true);
     }
 }
 

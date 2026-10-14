@@ -216,6 +216,9 @@ public:
     void PostArenaDiscard(VAddr lo, u64 size, VAddr arena_lo, VAddr arena_hi);
     /// SHADPS4_ARENA_READ_PREFETCH (q48): Game:Main at the frame's submit; posts PrefetchArenaReads.
     void PostArenaReadPrefetch(VAddr half);
+    /// SHADPS4_ARENA_PREFETCH_RETRY: a submit thread after vkQueueSubmit of `submitted`; posts the
+    /// armed PrefetchArenaReads retry once `submitted` covers it (never from the CP thread).
+    void PostArenaReadRetry(u64 submitted);
     void DiscardDeadGpuData(VAddr lo, u64 size,
                             const std::vector<std::pair<VAddr, std::vector<u64>>>& chunks);
 
@@ -506,6 +509,9 @@ private:
         /// q48 (SHADPS4_ARENA_READ_PREFETCH): an arena read prefetch. Holds its slot until
         /// PublishPrefetch like an f2 job, so the waiter copies the bytes, not the back.
         bool arena{};
+        /// SHADPS4_ARENA_PREFETCH_RETRY: an arena job of a retry run (set with `arena`, read
+        /// only with it).
+        bool arena_retry{};
     };
     /// The vote of a fault job: true if no GPU write marking touched it since its snapshot
     /// (region sequences; with SHADPS4_FAULT_VETO_EXACT=1 a moved sequence is refined by the
@@ -683,7 +689,9 @@ private:
     void PrefetchHotPages(VAddr only_page = 0);
     /// SHADPS4_ARENA_READ_PREFETCH (q48): back, once per frame end; owner-less read jobs over the
     /// pages of `half` at the half-relative offsets where guest reads faulted lately.
-    void PrefetchArenaReads(VAddr half);
+    /// SHADPS4_ARENA_PREFETCH_RETRY: `gen` the discard hook generation of `half`, `retry` a run
+    /// posted by the scheduler's submitted hook.
+    void PrefetchArenaReads(VAddr half, u64 gen = 0, bool retry = false);
     struct PrefetchItem {
         u64 id;
         u32 slot;

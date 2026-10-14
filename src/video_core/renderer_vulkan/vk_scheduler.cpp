@@ -41,6 +41,7 @@ std::mutex Scheduler::submit_mutex;
 std::atomic<VkSemaphore> Scheduler::async_timeline{VK_NULL_HANDLE};
 static bool g_maintenance7 = false; // p2: set once in the constructor
 std::atomic<u64> Scheduler::async_submitted_tick{0};
+std::atomic<void (*)(u64)> Scheduler::submitted_hook{nullptr};
 
 Scheduler::Scheduler(const Instance& instance, bool allow_recording_worker)
     : instance{instance}, master_semaphore{instance}, command_pool{instance, &master_semaphore} {
@@ -1330,6 +1331,10 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
             ASSERT_MSG(result != vk::Result::eErrorDeviceLost, "Device lost during submit");
             async_submitted_tick.store(signal_value, std::memory_order_release);
         }
+        // SHADPS4_ARENA_PREFETCH_RETRY: outside submit_mutex (the hook may post to the CP thread).
+        if (const auto hook = submitted_hook.load(std::memory_order_acquire)) [[unlikely]] {
+            hook(signal_value);
+        }
         main_cmdbuf = command_pool.Commit();
         Check(main_cmdbuf.begin(vk::CommandBufferBeginInfo{
             .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
@@ -1579,6 +1584,10 @@ void Scheduler::SubmitLaneOnWorker(const SubmitInfo& info, u64 signal_value, u64
     }
     rec_submitted.fetch_add(1, std::memory_order_acq_rel);
     rec_submitted.notify_all();
+    // SHADPS4_ARENA_PREFETCH_RETRY: outside submit_mutex (the hook may post to the CP thread).
+    if (const auto hook = submitted_hook.load(std::memory_order_acquire)) [[unlikely]] {
+        hook(signal_value);
+    }
     // The lane's next batch is batch + lanes; its signal value is unknown until then.
     lane.cmdbuf = lane.pool->CommitInFlight(lane.cmdbuf_slot);
     Check(lane.cmdbuf.begin(vk::CommandBufferBeginInfo{
