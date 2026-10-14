@@ -28,6 +28,7 @@
 #include "common/readback_unmap_gate.h"
 #include "common/slot_vector.h"
 #include "common/types.h"
+#include "common/unique_function.h"
 #include "video_core/buffer_cache/back_clean.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/submit_epoch.h"
@@ -309,6 +310,10 @@ public:
 
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
+
+    /// r13: hands the buffer destroys parked since the last draw / dispatch entry to the
+    /// scheduler at the tick current now (call at every draw / dispatch entry, back thread).
+    void CommitDeletes();
 
     /// SHADPS4_BIND_MEMO_STATS: lock-free exact per-page CPU-dirty check; a range without a
     /// tracker region counts as dirty. CP thread.
@@ -828,6 +833,10 @@ private:
     void TouchBuffer(const Buffer& buffer);
 
     void DeleteBuffer(BufferId buffer_id);
+    /// r13 SHADPS4_DELETE_AT_NEXT_DRAW (default on; =0 off): destroys parked until CommitDeletes.
+    static bool DeleteAtNextDraw();
+    std::mutex pending_deletes_mutex;
+    std::vector<Common::UniqueFunction<void>> pending_deletes;
 
     /// FRONT_DERIVE=1: BindVertexBuffers from the front's block (no V# reads, no sort here).
     void BindVertexBuffersDerived(

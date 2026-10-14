@@ -1992,6 +1992,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     auto sample = Common::DrawSampleProbe::Begin();
     const auto t_entry = Common::FaultMonitor::Now();
+    buffer_cache.CommitDeletes(); // r13
     scheduler.PopPendingOperations();
     if (native_bindings) {
         // The only point where the heap backend may flush or wait; nothing is assembled yet.
@@ -2194,6 +2195,7 @@ void Rasterizer::ExecuteDraw(const SplitDraw& draw,
     RENDERER_TRACE;
     // Same prologue as the inline Draw/DrawIndirect, minus what the front already did.
     const auto begin = [&] {
+        buffer_cache.CommitDeletes(); // r13
         scheduler.PopPendingOperations();
         if (native_bindings) {
             native_bindings->BeginDraw();
@@ -4466,6 +4468,7 @@ bool Rasterizer::NativePrepConfirm(const SplitDraw& draw, bool plain,
     if (!vi || vi->desc_id != b.desc_id) {
         return refuse(4);
     }
+    buffer_cache.CommitDeletes(); // r13
     scheduler.PopPendingOperations();
     if (b.n != p.slot0 + j || b.n >= NativeMaxDraws) {
         return refuse(5);
@@ -7527,6 +7530,7 @@ void Rasterizer::ExecuteDispatch(const ComputePipeline* pipeline,
         // record on the main stream; BindBuffers moves an eligible dispatch to the ASC stream.
         scheduler.SwitchStream(0);
     }
+    buffer_cache.CommitDeletes(); // r13
     scheduler.PopPendingOperations();
     if (native_bindings) {
         native_bindings->BeginDraw();
@@ -8395,6 +8399,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               u32 max_count, VAddr count_address) {
     RENDERER_TRACE;
 
+    buffer_cache.CommitDeletes(); // r13
     scheduler.PopPendingOperations();
     if (native_bindings) {
         native_bindings->BeginDraw();
@@ -8555,6 +8560,7 @@ void Rasterizer::DispatchDirect() {
         Common::FaultMonitor::CountDispatch(Common::FaultMonitor::SinceNs(t_dispatch));
     };
 
+    buffer_cache.CommitDeletes(); // r13
     scheduler.PopPendingOperations();
     if (native_bindings) {
         native_bindings->BeginDraw();
@@ -8684,6 +8690,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         Common::FaultMonitor::CountDispatch(Common::FaultMonitor::SinceNs(t_dispatch));
     };
 
+    buffer_cache.CommitDeletes(); // r13
     scheduler.PopPendingOperations();
     if (native_bindings) {
         native_bindings->BeginDraw();

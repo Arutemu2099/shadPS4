@@ -8081,7 +8081,7 @@ void BufferCache::DeleteBuffer(BufferId buffer_id) {
     // The fast lane likewise waits only for completed producers, or (q51) for a submitted main
     // value below the current tick - below this deletion's wait, so no cycle.
     const u64 lane_tick = fast_lane ? fast_lane->Semaphore().CurrentTick() - 1 : 0;
-    scheduler.DeferOperation([this, buffer_id, rq_tick, lane_tick] {
+    Common::UniqueFunction<void> destroy = [this, buffer_id, rq_tick, lane_tick] {
         if (rq_tick != 0) {
             readback_queue->Semaphore().Wait(rq_tick);
         }
@@ -8089,8 +8089,43 @@ void BufferCache::DeleteBuffer(BufferId buffer_id) {
             fast_lane->Semaphore().Wait(lane_tick);
         }
         slot_buffers.erase(buffer_id);
-    });
+    };
+    if (DeleteAtNextDraw()) {
+        // r13 (2026-10-14, the rooftop load crash): a draw can capture this buffer's handle, then
+        // join it away here, then flush mid-draw (a stream-buffer wrap, a download) and queue its
+        // push into the NEXT batch; deferring to today's tick freed the buffer while that push
+        // still waited for the recorder (GPU-AV: invalid VkBuffer in vkCmdPushDescriptorSetKHR;
+        // the binding report: the fault lies in the just-unbound mesh buffer). Park the destroy
+        // until the next draw / dispatch entry (CommitDeletes), when every packet of this draw
+        // is queued, and defer it to the tick current then.
+        std::scoped_lock lk{pending_deletes_mutex};
+        pending_deletes.push_back(std::move(destroy));
+    } else {
+        scheduler.DeferOperation(std::move(destroy));
+    }
     buffer.is_deleted = true;
+}
+
+bool BufferCache::DeleteAtNextDraw() {
+    static const bool on = [] {
+        const char* e = std::getenv("SHADPS4_DELETE_AT_NEXT_DRAW");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
+void BufferCache::CommitDeletes() {
+    std::vector<Common::UniqueFunction<void>> todo;
+    {
+        std::scoped_lock lk{pending_deletes_mutex};
+        if (pending_deletes.empty()) {
+            return;
+        }
+        todo.swap(pending_deletes);
+    }
+    for (auto& f : todo) {
+        scheduler.DeferOperation(std::move(f));
+    }
 }
 
 } // namespace VideoCore
