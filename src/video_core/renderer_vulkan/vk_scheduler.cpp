@@ -159,6 +159,10 @@ Scheduler::Scheduler(const Instance& instance, bool allow_recording_worker)
         if (const char* t = std::getenv("SHADPS4_ASC_TIMING"); t && t[0] == '1') {
             // q16: the lane's segments timed like the ASC stream's.
             asc_timer = std::make_unique<AscTimer>();
+            const u32 fam = instance.GetReadbackQueueFamilyIndex();
+            const auto families = instance.GetPhysicalDevice().getQueueFamilyProperties();
+            LOG_INFO(Render_Vulkan, "G0: lane segment timing on family {} (timestampValidBits {})", fam,
+                     fam < families.size() ? families[fam].timestampValidBits : 0u);
             asc_timer->pool = instance.GetDevice()
                                   .createQueryPoolUnique(vk::QueryPoolCreateInfo{
                                       .queryType = vk::QueryType::eTimestamp,
@@ -1861,14 +1865,25 @@ void Scheduler::AscTimerBegin() {
     t.began = true;
 }
 
-void Scheduler::AscTimerEnd(u64 value) {
+void Scheduler::AscTimerEnd(u64 value, u64 wait_main) {
     auto& t = *asc_timer;
+    const std::array<u32, 3> cur = t.cur; // G0: work noted since the previous segment ended
+    t.cur = {};
     if (!t.began) {
         return;
     }
     asc_cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *t.pool,
                               t.open_slot * 2 + 1);
     t.value[t.open_slot] = value;
+    for (u32 k = 0; k < 3; ++k) {
+        t.work[t.open_slot][k] = static_cast<u16>(std::min<u32>(cur[k], 0xffff));
+    }
+    bool unfinished = false;
+    if (wait_main != 0) {
+        master_semaphore.Refresh();
+        unfinished = master_semaphore.KnownGpuTick() < wait_main;
+    }
+    t.waits_unfinished[t.open_slot] = unfinished ? 1 : 0;
     ++t.write_seq;
     t.began = false;
 }
@@ -1893,6 +1908,37 @@ void Scheduler::AscTimerCollect() {
             t.busy_ns += ns;
             t.max_ns = std::max(t.max_ns, ns);
             ++t.segments;
+            // G0: class by content; lane idle before this segment (same device timestamp domain).
+            const auto& w = t.work[slot];
+            const u32 cls = (w[0] | w[1] | w[2]) == 0 ? 4
+                            : (w[1] | w[2]) == 0  ? 0
+                            : (w[0] | w[2]) == 0  ? 1
+                            : (w[0] | w[1]) == 0  ? 2
+                                                  : 3;
+            t.cls_ns[cls] += ns;
+            ++t.cls_n[cls];
+            for (u32 k = 0; k < 3; ++k) {
+                t.work_n[k] += w[k];
+            }
+            if (cls == 0) {
+                t.disp_only_disp += w[0];
+            }
+            const u64 start = u64(double(ts[0]) * t.period_ns);
+            const u64 end = u64(double(ts[1]) * t.period_ns);
+            if (t.prev_end != 0) {
+                if (start < t.prev_end) {
+                    ++t.overlaps;
+                } else if (start - t.prev_end < 50'000'000) {
+                    if (t.waits_unfinished[slot]) {
+                        t.gap_wait_ns += start - t.prev_end;
+                        ++t.gap_wait_n;
+                    } else {
+                        t.gap_other_ns += start - t.prev_end;
+                        ++t.gap_other_n;
+                    }
+                }
+            }
+            t.prev_end = end;
         }
     }
     const auto now = std::chrono::steady_clock::now();
@@ -1905,6 +1951,22 @@ void Scheduler::AscTimerCollect() {
                  t.segments, double(t.busy_ns) / 1e6, 100.0 * double(t.busy_ns) / wall_ns,
                  t.segments ? double(t.busy_ns) / double(t.segments) / 1000.0 : 0.0,
                  double(t.max_ns) / 1000.0, wall_ns / 1e9);
+        const double ws = wall_ns / 1e9;
+        LOG_INFO(Render_Vulkan,
+                 "AscTimingG0: per s: segs disp/up/copy/mixed/empty {:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f} busy_ms "
+                 "{:.1f}/{:.1f}/{:.1f}/{:.1f}/{:.1f} | dispatches {:.0f} uploads {:.0f} fault copies {:.0f} | "
+                 "us per dispatch in dispatch-only segs {:.2f} | lane idle gaps ms: before a segment waiting on "
+                 "unfinished main {:.1f} ({:.0f}), other {:.1f} ({:.0f}) | overlaps {}",
+                 t.cls_n[0] / ws, t.cls_n[1] / ws, t.cls_n[2] / ws, t.cls_n[3] / ws, t.cls_n[4] / ws,
+                 t.cls_ns[0] / 1e6 / ws, t.cls_ns[1] / 1e6 / ws, t.cls_ns[2] / 1e6 / ws, t.cls_ns[3] / 1e6 / ws,
+                 t.cls_ns[4] / 1e6 / ws, t.work_n[0] / ws, t.work_n[1] / ws, t.work_n[2] / ws,
+                 t.disp_only_disp ? double(t.cls_ns[0]) / double(t.disp_only_disp) / 1000.0 : 0.0,
+                 t.gap_wait_ns / 1e6 / ws, t.gap_wait_n / ws, t.gap_other_ns / 1e6 / ws, t.gap_other_n / ws,
+                 t.overlaps);
+        t.cls_ns = {};
+        t.cls_n = {};
+        t.work_n = {};
+        t.disp_only_disp = t.overlaps = t.gap_wait_ns = t.gap_wait_n = t.gap_other_ns = t.gap_other_n = 0;
         t.busy_ns = t.segments = t.max_ns = 0;
         t.window = now;
     }
@@ -2383,7 +2445,7 @@ void Scheduler::AscSubmitOnWorker(u64 value, u64 wait_main) {
         CloseTransferGroupSlow(transfer_group[1], asc_cmdbuf);
     }
     if (asc_timer) {
-        AscTimerEnd(value);
+        AscTimerEnd(value, wait_main);
     }
     Check(asc_cmdbuf.end());
     if (lane_up_on) {

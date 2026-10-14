@@ -885,11 +885,19 @@ public:
     /// A compute dispatch: NoteOp plus the per-batch dispatch count (SHADPS4_GPU_BATCH_TIMING).
     void NoteDispatch() noexcept {
         if (active_stream != 0) {
+            NoteAscWork(0); // G0
             return; // ASC stream: its segments are cut at guest ASC RELEASE_MEMs.
         }
         RecordContext& rc = Rc();
         ++rc.batch_ops;
         ++rc.batch_dispatches;
+    }
+    /// G0 (SHADPS4_ASC_TIMING=1, back thread): what the open ASC / lane segment holds, for the per-segment
+    /// GPU time split (0 dispatch, 1 upload, 2 fault copy). Counted only while stream 1 is active.
+    void NoteAscWork(u32 kind) noexcept {
+        if (asc_timer && active_stream != 0) [[unlikely]] {
+            ++asc_timer->cur[kind];
+        }
     }
 
     /**
@@ -1249,6 +1257,15 @@ private:
         double period_ns = 1.0;
         u64 busy_ns = 0, segments = 0, max_ns = 0;
         std::chrono::steady_clock::time_point window{};
+        // G0 (plan-gpu-bound-verified-2026-10-12): the lane's GPU time by segment content, and the lane's idle
+        // gaps split by whether the next segment waited on a main batch that was unfinished at its submit.
+        std::array<u32, 3> cur{};                     // work noted into the open segment (NoteAscWork)
+        std::array<std::array<u16, 3>, Slots> work{}; // per timed segment: dispatches, uploads, fault copies
+        std::array<u8, Slots> waits_unfinished{};
+        std::array<u64, 5> cls_ns{}, cls_n{}; // dispatch-only, upload-only, copy-only, mixed, empty
+        std::array<u64, 3> work_n{};
+        u64 disp_only_disp = 0, prev_end = 0, overlaps = 0;
+        u64 gap_wait_ns = 0, gap_wait_n = 0, gap_other_ns = 0, gap_other_n = 0;
     };
     std::unique_ptr<AscTimer> asc_timer;
     struct ChainTimer { // q24
@@ -1269,7 +1286,7 @@ private:
     std::unique_ptr<ChainTimer> chain_timer;
     void ChainTimerCollect();
     void AscTimerBegin();
-    void AscTimerEnd(u64 value);
+    void AscTimerEnd(u64 value, u64 wait_main = 0);
     void AscTimerCollect();
     u64 asc_waited_by_main = 0;
     struct TransferGroup {

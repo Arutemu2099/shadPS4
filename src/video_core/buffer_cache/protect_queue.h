@@ -26,8 +26,10 @@ namespace VideoCore {
  * The tracker bits change on the CP at once; only the OS protection lags. Guest code may only
  * read GPU results after a signal the CP writes (EOS/EOP/RELEASE_MEM labels, WRITE_DATA,
  * interrupts, GPU idle), and the CP calls Fence() before each of those, which waits until every
- * queued protection has been applied. Watcher counts commute (see DeferredWatch), so applying
- * these after later updates of the same pages leaves the same final state.
+ * queued protection has been applied. Watcher counts commute only while no removal is applied
+ * before its own queued add: num_read_watchers is a 1-bit field that asserts on underflow ("Not
+ * enough watchers", s915), so the CP's read-watch removals fence the queued adds first (q56b,
+ * SHADPS4_READ_UNTRACK_FENCE). Other reorderings leave the same final state.
  */
 class ProtectQueue {
 public:
@@ -187,7 +189,8 @@ private:
      *   any thread's acquire load that sees it. That is the same guarantee the single Protector
      *   gave, when claim order and publish order could not differ.
      * - The two batches in flight (Protector's and the stolen one) may be applied concurrently and
-     *   out of order. That is already allowed: watcher counts commute (see DeferredWatch), and the
+     *   out of order. That is allowed for adds, and for removals whose add is already applied (a removal
+     *   that overtakes its queued add underflows the 1-bit read count: q56b fences that case), and the
      *   Protector already runs UpdatePageWatchersForRegion concurrently with the CP's own updates
      *   and with fault handlers, under the page manager's locks.
      * - No deadlock: each claimer waits only for the claim immediately before its own, and the

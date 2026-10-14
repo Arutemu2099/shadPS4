@@ -30,7 +30,8 @@ namespace VideoCore {
 /// SHADPS4_FAULT_WATCH_OUTSIDE=1: page-watcher updates (the VirtualProtect calls) that a guest
 /// write fault's invalidation computes under a region lock, applied after the lock is released.
 /// Measured 2026-09-24 on 386F5167: the CP spun on these region locks for ~3.3% of its wall
-/// time while fault handlers held them across VirtualProtect. Watcher counts commute and each
+/// time while fault handlers held them across VirtualProtect. Watcher counts commute as long as no
+/// removal is applied before its own add (the 1-bit read count asserts on underflow; q56b), and each
 /// update sets protection from the counts under the page manager's own locks, so a reordered
 /// update leaves the same final state; at worst the faulting write faults once more.
 struct DeferredWatch {

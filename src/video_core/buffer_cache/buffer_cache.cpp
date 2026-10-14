@@ -862,6 +862,15 @@ bool ReadUntrackFenceOn() {
     return g_read_untrack_fence && ProtectQueue::Enabled();
 }
 void FenceDeferredReadProtects() {
+    // Opus review (q56b): every read-watch removal runs on the CP, and Fence() assumes one claimer that
+    // nothing can push behind while it waits. Off the CP this ordering argument does not hold.
+    if (!Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
+        static std::atomic<u64> off_cp{0};
+        if (off_cp.fetch_add(1, std::memory_order_relaxed) == 0) {
+            LOG_WARNING(Render, "q56b: read-untrack fence called off the CP thread (review assumed CP only)");
+        }
+    }
+    DEBUG_ASSERT(Common::FaultMonitor::t_is_cp_thread);
     const u64 n = g_untrack_fences.fetch_add(1, std::memory_order_relaxed) + 1;
     if (ProtectQueue::Instance().Pending()) {
         g_untrack_fence_waits.fetch_add(1, std::memory_order_relaxed);
@@ -2575,6 +2584,7 @@ bool BufferCache::AsyncFaultCopies() {
 
 void BufferCache::RecordFaultCopiesAsync(Buffer& source, vk::Buffer staging,
                                          std::span<const vk::BufferCopy> copies) {
+    scheduler.NoteAscWork(2); // G0
     source.NoteMainAccess(scheduler.CurrentTick(), false);
     if (g_lane_probe && Common::FaultMonitor::t_is_cp_thread &&
         !(g_lane_copy_nostamp && Vulkan::Scheduler::t_lane_mode)) [[unlikely]] { // q35 H1
@@ -7320,6 +7330,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                         }
                     }
                 });
+            scheduler.NoteAscWork(1); // G0: an upload into the open lane segment
             scheduler.RecordArrays(
                 [src_buffer, destination = buffer.Handle(), pre_barrier,
                  post_barrier](vk::CommandBuffer cmdbuf, auto owned_copies) {
@@ -7345,6 +7356,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                 write.hi = std::max<u64>(write.hi, copy.dstOffset + copy.size);
             }
             // SHADPS4_PAR_REC: protect + guest copy in the single recorder's order.
+            scheduler.NoteAscWork(1); // G0: an upload into the open lane segment
             scheduler.RecordArraysOrdered<true>(
                 [src_buffer, destination = buffer.Handle(), write, sched = &scheduler,
                  memory = memory, pm = &page_manager](vk::CommandBuffer cmdbuf, auto owned_copies,
@@ -7369,6 +7381,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                 std::span<const PageManager::ProtectRange>{deferred_protects});
             TouchBuffer(buffer);
         } else if (defer) {
+            scheduler.NoteAscWork(1); // G0: an upload into the open lane segment
             scheduler.RecordArraysOrdered(
                 [src_buffer, destination = buffer.Handle(), pre_barrier, post_barrier,
                  memory = memory, pm = &page_manager](vk::CommandBuffer cmdbuf, auto owned_copies,
@@ -7402,6 +7415,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                 std::span<const PageManager::ProtectRange>{deferred_protects});
             TouchBuffer(buffer);
         } else {
+        scheduler.NoteAscWork(1); // G0: an upload into the open lane segment
         scheduler.RecordArrays(
             [src_buffer, destination = buffer.Handle(), pre_barrier,
              post_barrier](vk::CommandBuffer cmdbuf, auto owned_copies) {
