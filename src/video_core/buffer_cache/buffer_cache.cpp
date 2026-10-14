@@ -2826,14 +2826,33 @@ void LaneWhoKept(u32 reason, u64 hash) {
 /// q9c: the WAR wait of a lane write of [lo, hi): scoped to the newest main read of its probe + 1 (a read
 /// stamped at lookup may be recorded into the next batch), deferred if that is the open batch; the newest
 /// gfx label batch (capped) when no probe covers the range.
+/// q60b census (SHADPS4_LANE_WAIT_CENSUS): distinct lane writes outside the arena, with the pipeline being bound.
+u64 g_q60_census_id = 0;
+static void LaneOutsideArenaNote(u64 lo, u64 hi, VAddr alo, VAddr ahi, const char* via) {
+    static std::vector<std::array<u64, 3>> seen;
+    static std::array<u64, 4> cls{}; // fully below, overlaps the arena, fully above, no arena yet
+    const u32 c = alo >= ahi ? 3 : hi <= alo ? 0 : lo >= ahi ? 2 : 1;
+    ++cls[c];
+    const std::array<u64, 3> key{lo, hi - lo, g_q60_census_id};
+    if (seen.size() < 64 && std::find(seen.begin(), seen.end(), key) == seen.end()) {
+        seen.push_back(key);
+        LOG_INFO(Render_Vulkan, "q60b OutsideArena: lane write {:#x}-{:#x} size {:#x} ({} MiB) pipeline {:08x} via {} | "
+                 "arena {:#x}-{:#x} | so far below {} overlapping {} above {} no-arena {}", lo, hi, hi - lo,
+                 (hi - lo) >> 20, g_q60_census_id, via, alo, ahi, cls[0], cls[1], cls[2], cls[3]);
+    }
+}
+
 /// q60: SHADPS4_LANE_FRAME_SCOPE - a lane write inside the particle arena waits for the frame-fence frame's end only.
-static bool LaneFrameScopedWar(Vulkan::Scheduler& sch, u64 lo, u64 hi) {
+static bool LaneFrameScopedWar(Vulkan::Scheduler& sch, u64 lo, u64 hi, const char* via = "dma") {
     if (!g_lane_frame_scope) {
         return false;
     }
     const VAddr alo = g_arena_lo.load(std::memory_order_relaxed), ahi = g_arena_hi.load(std::memory_order_relaxed);
     if (alo >= ahi || lo < alo || hi > ahi) {
         g_lane_frame_c[2].fetch_add(1, std::memory_order_relaxed);
+        if (g_lane_wait_census) [[unlikely]] {
+            LaneOutsideArenaNote(lo, hi, alo, ahi, via);
+        }
         return false;
     }
     u64 tick = 0;
@@ -5771,7 +5790,8 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             LaneWhoNote(t, open, is_written, war_rd, war_hit);
         }
         scheduler.LaneNeedMain(t, g_lc_src, false, LaneSiteRaw(g_lc_hit_wk));
-        if (is_written && LaneFrameScopedWar(scheduler, device_addr, device_addr + size)) {
+        g_q60_census_id = census_id; // q60b census
+        if (is_written && LaneFrameScopedWar(scheduler, device_addr, device_addr + size, "bind")) {
             // q60: the frame-fence frame's end (inside the particle arena).
         } else if (is_written) {
             if (g_lane_war && war_cov) {
