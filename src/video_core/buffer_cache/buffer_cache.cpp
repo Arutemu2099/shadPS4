@@ -1004,6 +1004,43 @@ static std::atomic<u64> g_arena_hook_gen{0};
 /// 9 vetoed, 10 settled before the waiter; 11 skipped: no fast lane (split from 13); r18:
 /// 13 guest faults that took a pending retry job's ticket (H7), 14 of them on Game:Main.
 static std::atomic<u64> g_arena_retry_n[15]{};
+/// r20: the newest ranges written by the exposure metering dispatch (CP thread only), only small
+/// ones (a whole-heap binding would make every heap read tolerant; such a range is not kept).
+static std::array<std::pair<VAddr, VAddr>, 8> g_tolerant_writes{};
+static u32 g_tolerant_next = 0;
+/// r20 counters: 0 guest reads released stale, 1 released jobs published fresh, 2 vetoed (a newer
+/// GPU write), 3 tolerant ranges noted, 4 ranges refused as too large, 5 H7 hits on a hot job that
+/// was not tolerant.
+static std::atomic<u64> g_stale_n[6]{};
+
+bool BufferCache::ExposureStaleRead() {
+    static const bool on = [] {
+        const bool v = EnvIs1("SHADPS4_EXPOSURE_STALE_READ");
+        if (v) {
+            LOG_INFO(Render, "SHADPS4_EXPOSURE_STALE_READ=1: exposure metering reads do not wait "
+                             "for the GPU (r20)");
+        }
+        return v;
+    }();
+    return on;
+}
+
+template <typename Copies> // BufferCache::FaultCopy is private: deduced
+static bool TolerantCopies(const Copies& copies) {
+    if (copies.empty()) {
+        return false;
+    }
+    for (const auto& c : copies) {
+        bool inside = false;
+        for (const auto& [lo, hi] : g_tolerant_writes) {
+            inside = inside || (hi != 0 && lo <= c.addr && c.addr + c.size <= hi);
+        }
+        if (!inside) {
+            return false;
+        }
+    }
+    return true;
+}
 
 static void ArmArenaRetry(VAddr half, u64 gen, u64 need) {
     std::scoped_lock lk{g_arena_retry_mutex};
@@ -1989,6 +2026,33 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
             }
             const auto [job_begin, job_end] = TrackerPageSpan(job.addr, job.size);
             if (job_begin < end && begin < job_end) {
+                if (job.released) {
+                    continue; // r20: its window is CPU-valid already; not a ticket to wait on
+                }
+                if (ExposureStaleRead() && !is_write && !job.on_readback_queue && !job.on_asc &&
+                    !job.arena) [[unlikely]] {
+                    // r20: a main-batch hot-page job (its copy completes with the open batch,
+                    // ~3 ms away). If every copied byte is exposure metering output, let the
+                    // read through with the bytes in memory now (what a PS4 read sees before the
+                    // GPU finished); the job's publish writes the fresh bytes later.
+                    if (TolerantCopies(job.copies)) {
+                        for (const auto& [lo, hi] : job.spans) {
+                            memory_tracker->ForEachDownloadRange<false>(
+                                lo, hi - lo, [&](u64 device_addr_out, u64 range_size) {
+                                    gpu_modified_ranges.Subtract(device_addr_out, range_size);
+                                    MemoryTracker::gpu_clear_epoch.fetch_add(
+                                        1, std::memory_order_acq_rel);
+                                    Common::FaultMonitor::CountRangeSubtract(
+                                        gpu_modified_ranges.Fragments());
+                                });
+                            memory_tracker->UnmarkRegionAsGpuModified(lo, hi - lo);
+                        }
+                        job.released = true;
+                        g_stale_n[0].fetch_add(1, std::memory_order_relaxed);
+                        return FaultTicket{}; // resolved: the guest retries its access
+                    }
+                    g_stale_n[5].fetch_add(1, std::memory_order_relaxed);
+                }
                 ++pf_c[8]; // guest early
                 if (job.arena && job.arena_retry) { // r18: guests waiting on a retry copy
                     g_arena_retry_n[13].fetch_add(1, std::memory_order_relaxed);
@@ -2200,6 +2264,7 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
     job->on_fast_lane = false;
     job->on_asc = false;
     job->on_retry_lane = false;
+    job->released = false;
     // SHADPS4_ASC_STREAM: the newest ASC-stream writer of the window and whether it completed.
     u64 asc_producer = 0;
     bool asc_done = true;
@@ -2838,6 +2903,8 @@ void BufferCache::DisarmEarlyCut(u32 mask) {
 }
 
 thread_local bool t_in_dispatch = false;
+thread_local bool t_tolerant_writer = false;
+
 
 namespace {
 // q9 census (back thread): lane producer hits by writer, kept-on-main by reason, logged every ~5 s.
@@ -3007,6 +3074,23 @@ void LaneWarWait(Vulkan::Scheduler& sch, u64 lo, u64 hi) {
 void BufferCache::NoteBatchWrite(VAddr addr, u64 size) {
     if (size == 0) {
         return;
+    }
+    if (t_tolerant_writer) [[unlikely]] { // r20: the exposure metering output
+        const bool small = size <= (u64{64} << 10);
+        if (small) {
+            g_tolerant_writes[g_tolerant_next++ % g_tolerant_writes.size()] = {addr, addr + size};
+        }
+        const u64 n = g_stale_n[small ? 3 : 4].fetch_add(1, std::memory_order_relaxed) + 1;
+        if (g_stale_n[3].load(std::memory_order_relaxed) + g_stale_n[4].load(std::memory_order_relaxed) <= 4 ||
+            (n & 0x3ff) == 0) {
+            LOG_INFO(Render,
+                     "ExposureStaleRead: metering write {:#x}+{:#x} ({}) | reads released {} | "
+                     "released jobs published {} vetoed {} | ranges noted {} refused {} | hot jobs "
+                     "not tolerant {}",
+                     addr, size, small ? "kept" : "too large, not tolerant", g_stale_n[0].load(),
+                     g_stale_n[1].load(), g_stale_n[2].load(), g_stale_n[3].load(),
+                     g_stale_n[4].load(), g_stale_n[5].load());
+        }
     }
     if (g_hot_at_write && t_in_dispatch && !t_hot_write_pending &&
         Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
@@ -3717,6 +3801,7 @@ void BufferCache::FinalizeFaultJob(FaultJob& job) {
             job.pf_hold.store(false, std::memory_order_release);
         }
     }
+    job.released = false; // r20
     if (job.abandoned) {
         job.state = FaultJobState::Free;
     } else {
@@ -4041,6 +4126,7 @@ u64 BufferCache::PrefetchAfterLabel(VAddr label) {
             job->on_fast_lane = false;
             job->on_asc = true;
             job->on_retry_lane = false;
+            job->released = false;
             job->total_bytes = total;
             job->copies = std::move(copies);
             job->spans.clear();
@@ -4316,6 +4402,7 @@ void BufferCache::PrefetchHotPages(VAddr only_page) {
             job->on_fast_lane = lane;
             job->on_asc = false;
             job->on_retry_lane = false;
+            job->released = false;
             job->total_bytes = total;
             job->copies = std::move(copies);
             job->spans.clear();
@@ -4580,6 +4667,7 @@ void BufferCache::PrefetchArenaReads(VAddr half, u64 gen, bool retry) {
             job->on_fast_lane = lane && !own_queue;
             job->on_asc = false;
             job->on_retry_lane = own_queue;
+            job->released = false;
             job->total_bytes = total;
             job->copies = std::move(copies);
             job->spans.clear();
@@ -4715,6 +4803,37 @@ void BufferCache::PrefetchArenaReads(VAddr half, u64 gen, bool retry) {
 }
 
 bool BufferCache::PublishFaultJob(FaultJob& job, bool guest_copied) {
+    if (job.released) [[unlikely]] {
+        // r20: the tracker was made CPU-valid when the read was let through; only the fresh
+        // bytes are left to write. A newer GPU write of the window (vote) marked it GPU-modified
+        // again: nothing is written and the next read faults as usual.
+        if (!FaultJobUnwritten(job)) {
+            g_stale_n[2].fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        if (!job.staging->is_coherent) {
+            vmaInvalidateAllocation(instance.GetAllocator(), job.staging->buffer.allocation, 0,
+                                    job.total_bytes);
+        }
+        const u8* const fresh = job.staging->mapped_data.data();
+        auto* mem = Core::Memory::Instance();
+        if (!guest_copied) {
+            for (const FaultCopy& copy : job.copies) {
+                mem->TryWriteBackingDownload(std::bit_cast<u8*>(copy.addr),
+                                             fresh + copy.staging_offset, copy.size);
+            }
+        }
+        const u64 n = g_stale_n[1].fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((n & 0x3ff) == 0) {
+            LOG_INFO(Render,
+                     "ExposureStaleRead: reads released {} | released jobs published {} vetoed "
+                     "{} | tolerant ranges noted {} refused (too large) {} | hot jobs not "
+                     "tolerant {}",
+                     g_stale_n[0].load(), n, g_stale_n[2].load(), g_stale_n[3].load(),
+                     g_stale_n[4].load(), g_stale_n[5].load());
+        }
+        return true;
+    }
     // One uninterrupted command processor step: vote, compare, then mutate. Nothing here can
     // fault or submit, so no GPU write marking lands between the vote and the clears.
     if (!FaultJobUnwritten(job)) {

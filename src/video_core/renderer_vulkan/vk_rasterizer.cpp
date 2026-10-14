@@ -8610,10 +8610,25 @@ void Rasterizer::MaybeEarlyCut(bool run_end) {
     }
 }
 
+// r20 SHADPS4_EXPOSURE_STALE_READ: the game's exposure metering shader (REFERENCE cs_a8b68717).
+static bool IsExposureMetering(const ComputePipeline* pipeline) {
+    if (!VideoCore::BufferCache::ExposureStaleRead() || !pipeline) {
+        return false;
+    }
+    for (const auto* stage : pipeline->GetStages()) {
+        if (stage && stage->pgm_hash == 0xa8b68717ULL) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void Rasterizer::DispatchDirectTail(const ComputePipeline* pipeline) {
     VideoCore::t_in_dispatch = true; // q7c
+    VideoCore::t_tolerant_writer = IsExposureMetering(pipeline); // r20
     SCOPE_EXIT {
         VideoCore::t_in_dispatch = false;
+        VideoCore::t_tolerant_writer = false;
         buffer_cache.HotPrefetchAfterWrite(); // q56
         MaybeEarlyCut();
     };
@@ -8707,8 +8722,10 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 void Rasterizer::DispatchIndirectTail(const ComputePipeline* pipeline, VAddr address, u32 offset,
                                       u32 size) {
     VideoCore::t_in_dispatch = true; // q7c
+    VideoCore::t_tolerant_writer = IsExposureMetering(pipeline); // r20
     SCOPE_EXIT {
         VideoCore::t_in_dispatch = false;
+        VideoCore::t_tolerant_writer = false;
         buffer_cache.HotPrefetchAfterWrite(); // q56
         MaybeEarlyCut(); // q7
     };

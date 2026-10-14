@@ -113,6 +113,9 @@ enum class NativeRunAccess : u32 { Storage, Vertex, Index };
 
 /// q7c: set by the rasterizer while a dispatch executes (CP thread).
 extern thread_local bool t_in_dispatch;
+/// r20 SHADPS4_EXPOSURE_STALE_READ: set by the rasterizer while it binds a dispatch of the game's
+/// exposure metering shader (cs_a8b68717); NoteBatchWrite then records the written ranges.
+extern thread_local bool t_tolerant_writer;
 
 class BufferCache {
 public:
@@ -514,6 +517,10 @@ private:
         /// SHADPS4_ARENA_PREFETCH_RETRY: an arena job of a retry run (set with `arena`, read
         /// only with it).
         bool arena_retry{};
+        /// r20 SHADPS4_EXPOSURE_STALE_READ: a pending hot-page job whose window a guest read was
+        /// let through with the stale bytes (tracker already CPU-valid); its publish only writes
+        /// the fresh bytes into guest memory. Reset when the job is finalized.
+        bool released{};
     };
     /// The vote of a fault job: true if no GPU write marking touched it since its snapshot
     /// (region sequences; with SHADPS4_FAULT_VETO_EXACT=1 a moved sequence is refined by the
@@ -609,6 +616,10 @@ public:
         census_id = id;
     }
     [[nodiscard]] static bool CensusEnabled();
+    /// r20 SHADPS4_EXPOSURE_STALE_READ (game-specific, inFAMOUS Second Son): the CPU reads the
+    /// exposure metering output a frame late with no wait (REFERENCE 0x171610); like the PS4, a
+    /// read before the GPU finished sees the bytes already in memory instead of waiting.
+    [[nodiscard]] static bool ExposureStaleRead();
     /// Census (b): one ASC candidate binding (before the stream decision).
     void CensusAscBinding(BufferId buffer_id, VAddr addr, u64 size, bool written);
     [[nodiscard]] static bool RangeShadowEnabled();
