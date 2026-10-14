@@ -6928,6 +6928,20 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
     wanted_size = static_cast<u32>(device_addr_end - device_addr);
     const OverlapResult overlap = ResolveOverlaps(device_addr, wanted_size);
     const u32 size = static_cast<u32>(overlap.end - overlap.begin);
+    // r14 (2026-10-14, always on, rare): every buffer of >= 256 MB created by a join - the game's
+    // ~2 GB mesh memory is one buffer-cache buffer re-created (and copied whole on the GPU) each
+    // time a new block's range touches it (study, s1021 / s1023); suspect for the city-streaming
+    // hitches. Old sizes, copy bytes, CPU ms of the create + joins.
+    u64 big_copy = 0, big_old = 0;
+    const bool big = size >= (256u << 20) && !overlap.ids.empty();
+    const auto big_t0 = big ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (big) {
+        for (const BufferId overlap_id : overlap.ids) {
+            const u64 s = slot_buffers[overlap_id].SizeBytes();
+            big_copy += s;
+            big_old = std::max(big_old, s);
+        }
+    }
     const BufferId new_buffer_id =
         slot_buffers.insert(instance, scheduler, MemoryUsage::DeviceLocal, overlap.begin,
                             AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size);
@@ -6935,6 +6949,17 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
     new_buffer.memo_serial = ++buffer_memo_serial;
     for (const BufferId overlap_id : overlap.ids) {
         JoinOverlap(new_buffer_id, overlap_id, !overlap.has_stream_leap);
+    }
+    if (big) {
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - big_t0)
+                              .count();
+        LOG_INFO(Render_Vulkan,
+                 "BigJoin: new buffer [{:#x}, +{:#x}) ({} MB) from {} joined (largest {} MB, copy {} "
+                 "MB on the GPU), wanted [{:#x}, +{:#x}), stream leap {}, CPU {:.2f} ms, tick {}",
+                 overlap.begin, size, size >> 20, overlap.ids.size(), big_old >> 20,
+                 big_copy >> 20, device_addr, wanted_size, overlap.has_stream_leap, ms,
+                 scheduler.CurrentTick());
     }
     Register(new_buffer_id);
     if (g_native_coherent != 0 && coherent_live &&
