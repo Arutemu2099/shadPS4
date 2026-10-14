@@ -6848,6 +6848,45 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
             }
         }
     }
+    static const bool big_grow = [] {
+        const char* e = std::getenv("SHADPS4_BIG_GROW");
+        return e && e[0] == '1';
+    }();
+    if (big_grow && !overlap_ids.empty() && end - begin >= (256ull << 20)) {
+        // r15 SHADPS4_BIG_GROW=1 (2026-10-14): a join that yields a buffer of >= 256 MB is sized
+        // ahead by max(768 MB, 50%) (clamped to mapped guest memory, under 4 GB). The game's mesh
+        // memory (~2-2.5 GB at 0x271258000) grows as blocks stream in; each growth re-created it
+        // and copied it whole on the GPU (r14 BigJoin: 2.0-2.5 GB copies, an 85 ms frame on the
+        // rooftop at the last one - the play hitches). Buffers inside the extension are joined
+        // like any overlap, so no page keeps two buffers.
+        const u64 cur = end - begin;
+        const u64 want = std::min<u64>(cur + std::max<u64>(768ull << 20, cur / 2), 0xF0000000ull);
+        const u64 mapped = memory->TryClampRangeSize(begin, want);
+        VAddr grow_end = Common::AlignDown(begin + mapped, CACHING_PAGESIZE);
+        if (mapped > cur && grow_end > end) {
+            boost::container::small_vector<BufferId, 16> extra;
+            for (VAddr a = Common::AlignUp(end, CACHING_PAGESIZE); a < grow_end;
+                 a += CACHING_PAGESIZE) {
+                const BufferId id = page_table[a >> CACHING_PAGEBITS].buffer_id;
+                if (!id || slot_buffers[id].is_picked) {
+                    continue;
+                }
+                Buffer& o = slot_buffers[id];
+                o.is_picked = true;
+                extra.push_back(id);
+                grow_end = std::max<VAddr>(grow_end, o.CpuAddr() + o.SizeBytes());
+            }
+            if (grow_end - begin < 0xFFFF0000ull) {
+                overlap_ids.insert(overlap_ids.end(), extra.begin(), extra.end());
+                end = grow_end;
+                ++big_grow_count;
+            } else {
+                for (const BufferId id : extra) {
+                    slot_buffers[id].is_picked = false;
+                }
+            }
+        }
+    }
     return OverlapResult{
         .ids = std::move(overlap_ids),
         .begin = begin,
@@ -6956,10 +6995,11 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
                               .count();
         LOG_INFO(Render_Vulkan,
                  "BigJoin: new buffer [{:#x}, +{:#x}) ({} MB) from {} joined (largest {} MB, copy {} "
-                 "MB on the GPU), wanted [{:#x}, +{:#x}), stream leap {}, CPU {:.2f} ms, tick {}",
+                 "MB on the GPU), wanted [{:#x}, +{:#x}), stream leap {}, CPU {:.2f} ms, tick {}, "
+                 "grown ahead so far {}",
                  overlap.begin, size, size >> 20, overlap.ids.size(), big_old >> 20,
                  big_copy >> 20, device_addr, wanted_size, overlap.has_stream_leap, ms,
-                 scheduler.CurrentTick());
+                 scheduler.CurrentTick(), big_grow_count);
     }
     Register(new_buffer_id);
     if (g_native_coherent != 0 && coherent_live &&

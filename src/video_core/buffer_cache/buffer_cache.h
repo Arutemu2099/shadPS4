@@ -835,6 +835,7 @@ private:
     void DeleteBuffer(BufferId buffer_id);
     /// r13 SHADPS4_DELETE_AT_NEXT_DRAW (default on; =0 off): destroys parked until CommitDeletes.
     static bool DeleteAtNextDraw();
+    u64 big_grow_count{}; ///< r15 SHADPS4_BIG_GROW: big joins sized ahead
     std::mutex pending_deletes_mutex;
     std::vector<Common::UniqueFunction<void>> pending_deletes;
 
