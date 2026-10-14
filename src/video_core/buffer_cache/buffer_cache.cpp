@@ -1007,10 +1007,11 @@ static std::atomic<u64> g_arena_retry_n[15]{};
 /// r20: the newest ranges written by the exposure metering dispatch (CP thread only), only small
 /// ones (a whole-heap binding would make every heap read tolerant; such a range is not kept).
 static std::array<std::pair<VAddr, VAddr>, 8> g_tolerant_writes{};
+static std::array<u64, 8> g_tolerant_frames{}; ///< presented_frames when noted (review: expire)
 static u32 g_tolerant_next = 0;
-/// r20 counters: 0 guest reads released stale, 1 released jobs published fresh, 2 vetoed (a newer
-/// GPU write), 3 tolerant ranges noted, 4 ranges refused as too large, 5 H7 hits on a hot job that
-/// was not tolerant.
+/// r20 counters: 0 guest reads released stale, 1 released jobs published fresh, 2 copies skipped at
+/// that publish (a newer GPU write re-marked them), 3 tolerant ranges noted, 4 ranges refused as too
+/// large, 5 H7 hits on a hot job that could not be released (not tolerant, changed or finished).
 static std::atomic<u64> g_stale_n[6]{};
 
 bool BufferCache::ExposureStaleRead() {
@@ -1030,10 +1031,13 @@ static bool TolerantCopies(const Copies& copies) {
     if (copies.empty()) {
         return false;
     }
+    const u64 now = Common::FaultMonitor::presented_frames.load(std::memory_order_relaxed);
     for (const auto& c : copies) {
         bool inside = false;
-        for (const auto& [lo, hi] : g_tolerant_writes) {
-            inside = inside || (hi != 0 && lo <= c.addr && c.addr + c.size <= hi);
+        for (size_t k = 0; k < g_tolerant_writes.size(); ++k) {
+            const auto& [lo, hi] = g_tolerant_writes[k];
+            inside = inside || (hi != 0 && g_tolerant_frames[k] + 3 >= now && lo <= c.addr &&
+                                c.addr + c.size <= hi);
         }
         if (!inside) {
             return false;
@@ -2026,16 +2030,31 @@ BufferCache::FaultTicket BufferCache::PrepareFaultDownload(VAddr device_addr, u6
             }
             const auto [job_begin, job_end] = TrackerPageSpan(job.addr, job.size);
             if (job_begin < end && begin < job_end) {
-                if (job.released) {
-                    continue; // r20: its window is CPU-valid already; not a ticket to wait on
-                }
-                if (ExposureStaleRead() && !is_write && !job.on_readback_queue && !job.on_asc &&
-                    !job.arena) [[unlikely]] {
+                if (ExposureStaleRead() && !job.released && !is_write && !job.on_readback_queue &&
+                    !job.on_asc && !job.arena && !Offload::VerifyEnabled() &&
+                    PrefetchMode() != 2) [[unlikely]] {
                     // r20: a main-batch hot-page job (its copy completes with the open batch,
                     // ~3 ms away). If every copied byte is exposure metering output, let the
                     // read through with the bytes in memory now (what a PS4 read sees before the
                     // GPU finished); the job's publish writes the fresh bytes later.
-                    if (TolerantCopies(job.copies)) {
+                    // Review BUG 1: only while the window holds nothing but the job's own
+                    // (tolerant) GPU bytes - no GPU write since the snapshot, the same copy list
+                    // now - and the batch is still unfinished (a finished one costs no wait).
+                    bool releasable = TolerantCopies(job.copies) && FaultJobUnwritten(job);
+                    if (releasable) {
+                        std::vector<FaultCopy> now_copies;
+                        u64 now_bytes = 0;
+                        for (const auto& [lo, hi] : job.spans) {
+                            now_bytes = CollectFaultCopies(lo, hi - lo, now_copies, now_bytes);
+                        }
+                        releasable = now_bytes == job.total_bytes && now_copies == job.copies;
+                    }
+                    if (releasable) {
+                        auto* main_sem = scheduler.GetMasterSemaphore();
+                        main_sem->Refresh();
+                        releasable = !main_sem->IsFree(job.tick);
+                    }
+                    if (releasable) {
                         for (const auto& [lo, hi] : job.spans) {
                             memory_tracker->ForEachDownloadRange<false>(
                                 lo, hi - lo, [&](u64 device_addr_out, u64 range_size) {
@@ -3075,18 +3094,22 @@ void BufferCache::NoteBatchWrite(VAddr addr, u64 size) {
     if (size == 0) {
         return;
     }
-    if (t_tolerant_writer) [[unlikely]] { // r20: the exposure metering output
+    if (t_tolerant_writer && Common::FaultMonitor::t_is_cp_thread) [[unlikely]] {
+        // r20: the exposure metering output (CP thread only: the ring has no lock).
         const bool small = size <= (u64{64} << 10);
         if (small) {
-            g_tolerant_writes[g_tolerant_next++ % g_tolerant_writes.size()] = {addr, addr + size};
+            const u32 k = g_tolerant_next++ % g_tolerant_writes.size();
+            g_tolerant_writes[k] = {addr, addr + size};
+            g_tolerant_frames[k] =
+                Common::FaultMonitor::presented_frames.load(std::memory_order_relaxed);
         }
         const u64 n = g_stale_n[small ? 3 : 4].fetch_add(1, std::memory_order_relaxed) + 1;
         if (g_stale_n[3].load(std::memory_order_relaxed) + g_stale_n[4].load(std::memory_order_relaxed) <= 4 ||
             (n & 0x3ff) == 0) {
             LOG_INFO(Render,
                      "ExposureStaleRead: metering write {:#x}+{:#x} ({}) | reads released {} | "
-                     "released jobs published {} vetoed {} | ranges noted {} refused {} | hot jobs "
-                     "not tolerant {}",
+                     "released jobs published {} copies re-marked {} | ranges noted {} refused {} | "
+                     "hot jobs not released {}",
                      addr, size, small ? "kept" : "too large, not tolerant", g_stale_n[0].load(),
                      g_stale_n[1].load(), g_stale_n[2].load(), g_stale_n[3].load(),
                      g_stale_n[4].load(), g_stale_n[5].load());
@@ -4805,12 +4828,9 @@ void BufferCache::PrefetchArenaReads(VAddr half, u64 gen, bool retry) {
 bool BufferCache::PublishFaultJob(FaultJob& job, bool guest_copied) {
     if (job.released) [[unlikely]] {
         // r20: the tracker was made CPU-valid when the read was let through; only the fresh
-        // bytes are left to write. A newer GPU write of the window (vote) marked it GPU-modified
-        // again: nothing is written and the next read faults as usual.
-        if (!FaultJobUnwritten(job)) {
-            g_stale_n[2].fetch_add(1, std::memory_order_relaxed);
-            return false;
-        }
+        // bytes are left to write - always (review BUG 2: a vote failing on a write elsewhere
+        // in the window would freeze the exposure). A copy a newer GPU write re-marked is
+        // skipped: the next read of it faults and downloads the newer bytes.
         if (!job.staging->is_coherent) {
             vmaInvalidateAllocation(instance.GetAllocator(), job.staging->buffer.allocation, 0,
                                     job.total_bytes);
@@ -4819,6 +4839,10 @@ bool BufferCache::PublishFaultJob(FaultJob& job, bool guest_copied) {
         auto* mem = Core::Memory::Instance();
         if (!guest_copied) {
             for (const FaultCopy& copy : job.copies) {
+                if (memory_tracker->IsRegionGpuModified(copy.addr, copy.size)) {
+                    g_stale_n[2].fetch_add(1, std::memory_order_relaxed); // re-marked: skipped
+                    continue;
+                }
                 mem->TryWriteBackingDownload(std::bit_cast<u8*>(copy.addr),
                                              fresh + copy.staging_offset, copy.size);
             }
@@ -4826,9 +4850,9 @@ bool BufferCache::PublishFaultJob(FaultJob& job, bool guest_copied) {
         const u64 n = g_stale_n[1].fetch_add(1, std::memory_order_relaxed) + 1;
         if ((n & 0x3ff) == 0) {
             LOG_INFO(Render,
-                     "ExposureStaleRead: reads released {} | released jobs published {} vetoed "
-                     "{} | tolerant ranges noted {} refused (too large) {} | hot jobs not "
-                     "tolerant {}",
+                     "ExposureStaleRead: reads released {} | released jobs published {} copies "
+                     "re-marked {} | tolerant ranges noted {} refused (too large) {} | hot jobs "
+                     "not released {}",
                      g_stale_n[0].load(), n, g_stale_n[2].load(), g_stale_n[3].load(),
                      g_stale_n[4].load(), g_stale_n[5].load());
         }

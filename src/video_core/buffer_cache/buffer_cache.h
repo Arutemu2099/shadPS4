@@ -1042,14 +1042,19 @@ private:
         BufferCache& cache;
         u8 kind;
         u64 id;
+        bool tolerant; ///< r20 review: the cache's own writes (DMA, joins, fills, image copies) inside
+                       ///< a metering dispatch tail are never exposure metering output
         WriterTagScope(BufferCache& cache_, u8 new_kind)
-            : cache{cache_}, kind{cache_.census_kind}, id{cache_.census_id} {
+            : cache{cache_}, kind{cache_.census_kind}, id{cache_.census_id},
+              tolerant{t_tolerant_writer} {
             cache.census_kind = new_kind;
             cache.census_id = 0;
+            t_tolerant_writer = false;
         }
         ~WriterTagScope() {
             cache.census_kind = kind;
             cache.census_id = id;
+            t_tolerant_writer = tolerant;
         }
     };
     /// Newest main write-history entry in [first, last] overlapping the copies: its tag, or
