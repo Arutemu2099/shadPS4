@@ -6852,7 +6852,9 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
         const char* e = std::getenv("SHADPS4_BIG_GROW");
         return e && e[0] == '1';
     }();
-    if (big_grow && !overlap_ids.empty() && end - begin >= (256ull << 20)) {
+    // r15e: only joins of >= 1 GB (the mesh memory) - growing the 542 MB heap buffer over the
+    // particle arena put CPU-written pages under tracking: write faults 35 k -> 57-60 k/s (s1051-s1056).
+    if (big_grow && !overlap_ids.empty() && end - begin >= (1ull << 30)) {
         // r15 SHADPS4_BIG_GROW=1 (2026-10-14): a join that yields a buffer of >= 256 MB is sized
         // ahead by max(768 MB, 50%) (clamped to mapped guest memory, under 4 GB). The game's mesh
         // memory (~2-2.5 GB at 0x271258000) grows as blocks stream in; each growth re-created it
