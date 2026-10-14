@@ -23,6 +23,7 @@
 #include <immintrin.h>
 #include <cstring>
 #include <map>
+#include <tuple>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -675,6 +676,9 @@ struct GmCensus {
     u64 loop_slot{}, loop_slot_finds{}, loop_misses{}, stack_lo{}, stack_hi{};
     std::unordered_map<u32, u64> steps; // step (eboot offset of the return address) -> samples
     std::unordered_map<u32, u64> steps_host; // of those, samples with Game:Main's RIP in host code
+    /// r19c (2026-10-14 evening): (step, host RIP page) -> samples and the last exact RIP seen there,
+    /// so the emulator functions behind each step's host time can be symbolized offline.
+    std::map<std::pair<u32, u64>, std::pair<u64, u64>> steps_host_pages;
     u64 step_samples{};
     std::atomic<u32> nthreads{0};
     std::array<void*, 16> threads{};
@@ -897,6 +901,9 @@ void MarkGameMainThread() {
                     // code (eboot / guest modules live at 0x800000000+): fault handling, HLE, waits.
                     if (ctx.Rip < 0x800000000ULL || ctx.Rip >= 0x1000000000ULL) {
                         ++g_gm.steps_host[step];
+                        auto& hp = g_gm.steps_host_pages[{step, (ctx.Rip >> 12) << 12}];
+                        ++hp.first;
+                        hp.second = ctx.Rip;
                     }
                 }
                 const u64 rip = ctx.Rip;
@@ -1265,6 +1272,7 @@ void GameMainCensusMaybeLog() {
         };
         std::vector<std::pair<u64, u32>> steps;
         std::unordered_map<u32, u64> steps_host;
+        std::map<std::pair<u32, u64>, std::pair<u64, u64>> steps_host_pages;
         u64 ns = 0, finds = 0, slot = 0, js = 0, ji = 0, jss = 0, jsi = 0;
         double busy_ms = 0, span_busy_ms = 0;
         std::vector<std::pair<u64, u64>> cls, cls_span;
@@ -1275,6 +1283,7 @@ void GameMainCensusMaybeLog() {
             }
             steps_host = g_gm.steps_host;
             g_gm.steps_host.clear();
+            steps_host_pages.swap(g_gm.steps_host_pages);
             ns = std::max<u64>(1, g_gm.step_samples);
             finds = g_gm.loop_slot_finds;
             slot = g_gm.loop_slot;
@@ -1318,6 +1327,33 @@ void GameMainCensusMaybeLog() {
             hs += fmt::format(" {:#x}:{:.2f}ms", steps[i].second, h * frame_ms);
         }
         LOG_INFO(Render, "JobCensus steps host: emulator-code ms per frame inside each step:{}", hs);
+        // r19c: the host pages behind the four steps with the most host time (ms per frame, a sample
+        // RIP for llvm-symbolizer: module offset + the linked base 0x700000000000 for shadPS4.exe).
+        {
+            std::vector<std::pair<u64, u32>> by_host;
+            for (const auto& [st, c] : steps_host) {
+                by_host.emplace_back(c, st);
+            }
+            std::sort(by_host.rbegin(), by_host.rend());
+            for (size_t i = 0; i < std::min<size_t>(by_host.size(), 4); ++i) {
+                const u32 st = by_host[i].second;
+                std::vector<std::tuple<u64, u64, u64>> pages; // samples, page, rip
+                for (const auto& [key, v] : steps_host_pages) {
+                    if (key.first == st) {
+                        pages.emplace_back(v.first, key.second, v.second);
+                    }
+                }
+                std::sort(pages.rbegin(), pages.rend());
+                std::string ps;
+                for (size_t k = 0; k < std::min<size_t>(pages.size(), 10); ++k) {
+                    const auto& [c, page, rip] = pages[k];
+                    ps += fmt::format(" {}:{:.3f}ms(rip {})", host_name(page),
+                                      double(c) / double(ns) * frame_ms, host_name(rip));
+                }
+                LOG_INFO(Render, "JobCensus step host pages {:#x} ({:.2f} ms/frame host):{}", st,
+                         double(by_host[i].first) / double(ns) * frame_ms, ps);
+            }
+        }
         LOG_INFO(Render,
                  "JobCensus steps: window {:.1f}s fps {:.1f} | Game:Main main-loop steps (return address of "
                  "the loop's current call; 1 = loop body, 0 = not in the loop; share of wall = ms per "
