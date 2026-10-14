@@ -173,6 +173,50 @@ inline void LaneWaitFrameEnd(u64 tick) noexcept {
         g_frame_end_ticks[g_frame_end_n++ & 3] = tick;
     }
 }
+/// q60: SHADPS4_LANE_FRAME_SCOPE=1 (user option 2, 2026-10-13): a lane WRITE into the game's alternating particle arena
+/// (two 30 MiB halves picked by the frame parity [eboot+0x7d3eb38]; each half = record pool + draw list + control blocks
+/// / args; REFERENCE game map) waits for the host-GPU end of the newest frame the game's frame fence had seen when the
+/// chain was kicked, not for the newest main batch that read the range. Why it is the game's own guarantee: its ASC ring
+/// never waits on graphics (q59: 0/s); 0x1f1e30 submits frame F-1 only after the end-of-frame label reached F-2, and
+/// 0x3ee7d0 kicks chain F after that; graphics of frame F-2 is the last reader of half F % 2 (graphics of F reads chain
+/// F's output, ordered by Game:Main's wait #2). The label value L read at the arena hook is >= F-2, so waiting for
+/// frame L's end is safe (one frame conservative at worst). Producer (RAW) waits on main uploads stay.
+inline const bool g_lane_frame_scope = [] {
+    const char* e = std::getenv("SHADPS4_LANE_FRAME_SCOPE");
+    return e && e[0] == '1';
+}();
+inline std::atomic<u64> g_lane_frame_label{0}; // Game:Main at the arena hook: label 0x248000000's value (low 32 bits) + 1
+inline std::array<std::pair<u32, u64>, 8> g_frame_label_ring{}; // back: (frame-end label value, main tick of its EOP)
+inline u64 g_frame_label_ring_n = 0;
+inline void NoteFrameEndLabel(u32 value, u64 tick) noexcept {
+    g_frame_label_ring[g_frame_label_ring_n++ & 7] = {value, tick};
+}
+/// q60 (back): the main tick holding the EOP of frame g_lane_frame_label; false when the back has not recorded it yet.
+inline bool LaneFrameTick(u64& tick) noexcept {
+    const u64 want1 = g_lane_frame_label.load(std::memory_order_acquire);
+    if (want1 == 0 || g_frame_label_ring_n == 0) {
+        return false;
+    }
+    const u32 want = static_cast<u32>(want1 - 1);
+    const u64 n = std::min<u64>(g_frame_label_ring_n, 8);
+    for (u64 k = 0; k < n; ++k) {
+        const auto& e = g_frame_label_ring[(g_frame_label_ring_n - 1 - k) & 7];
+        const s32 d = static_cast<s32>(e.first - want);
+        if (d == 0) {
+            tick = e.second;
+            return true;
+        }
+        if (d < 0) {
+            return false; // a gap: that frame's EOP was not recorded (or not yet)
+        }
+        if (k + 1 == n) {
+            tick = e.second; // older than the ring: wait for the oldest frame end kept (later than needed)
+            return true;
+        }
+    }
+    return false;
+}
+inline std::array<std::atomic<u64>, 4> g_lane_frame_c{}; // q60: scoped, not recorded yet, outside the arena, no hook
 struct LaneNote {
     u64 lo, hi, tick, seq;
     u32 kind; // 0 main write, 1 main upload, 2 early write, 3 early upload

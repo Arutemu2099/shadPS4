@@ -1019,6 +1019,14 @@ void PS4_SYSV_ABI ParticleArenaDiscardHook() {
         return;
     }
     g_arena_cur_half.store(base + parity * Half, std::memory_order_relaxed); // q48
+    if (g_lane_frame_scope) {
+        // q60: the end-of-frame label's value the frame fence has seen (>= F-2 for this chain F).
+        u32 label = 0;
+        if (!Core::Memory::Instance()->TryReadBacking(0x248000000ULL, reinterpret_cast<u8*>(&label), sizeof(label))) {
+            label = *reinterpret_cast<const volatile u32*>(0x248000000ULL);
+        }
+        g_lane_frame_label.store(u64{label} + 1, std::memory_order_release);
+    }
     g_arena_hook_ran.store(true, std::memory_order_relaxed);
     static bool logged = false;
     if (!logged) {
@@ -2818,7 +2826,38 @@ void LaneWhoKept(u32 reason, u64 hash) {
 /// q9c: the WAR wait of a lane write of [lo, hi): scoped to the newest main read of its probe + 1 (a read
 /// stamped at lookup may be recorded into the next batch), deferred if that is the open batch; the newest
 /// gfx label batch (capped) when no probe covers the range.
+/// q60: SHADPS4_LANE_FRAME_SCOPE - a lane write inside the particle arena waits for the frame-fence frame's end only.
+static bool LaneFrameScopedWar(Vulkan::Scheduler& sch, u64 lo, u64 hi) {
+    if (!g_lane_frame_scope) {
+        return false;
+    }
+    const VAddr alo = g_arena_lo.load(std::memory_order_relaxed), ahi = g_arena_hi.load(std::memory_order_relaxed);
+    if (alo >= ahi || lo < alo || hi > ahi) {
+        g_lane_frame_c[2].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    u64 tick = 0;
+    if (!LaneFrameTick(tick)) {
+        g_lane_frame_c[g_lane_frame_label.load(std::memory_order_relaxed) == 0 ? 3 : 1].fetch_add(
+            1, std::memory_order_relaxed);
+        return false;
+    }
+    const u64 n = g_lane_frame_c[0].fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((n & 0x3ffff) == 0) {
+        LOG_INFO(Render_Vulkan, "q60 LaneFrameScope: {} arena writes scoped to the frame-fence frame end, fell back: {} "
+                 "(frame end not recorded yet), {} outside the arena, {} before the first hook",
+                 n, g_lane_frame_c[1].load(), g_lane_frame_c[2].load(), g_lane_frame_c[3].load());
+    }
+    g_lane_war_exact = 13; // q59 census: frame scoped
+    g_lane_war_tsc = 0;
+    sch.LaneNeedMain(tick, 2, false, LaneSiteWar(40));
+    return true;
+}
+
 void LaneWarWait(Vulkan::Scheduler& sch, u64 lo, u64 hi) {
+    if (LaneFrameScopedWar(sch, lo, hi)) {
+        return; // q60
+    }
     const u64 open = sch.CurrentTick();
     u64 rd = 0;
     bool hit = false;
@@ -5732,7 +5771,9 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             LaneWhoNote(t, open, is_written, war_rd, war_hit);
         }
         scheduler.LaneNeedMain(t, g_lc_src, false, LaneSiteRaw(g_lc_hit_wk));
-        if (is_written) {
+        if (is_written && LaneFrameScopedWar(scheduler, device_addr, device_addr + size)) {
+            // q60: the frame-fence frame's end (inside the particle arena).
+        } else if (is_written) {
             if (g_lane_war && war_cov) {
                 // q9b: WAR scoped to the newest main batch that read this pool range (deferred
                 // if it is the open batch: a read recorded there is a real hazard); q9c: + 1.

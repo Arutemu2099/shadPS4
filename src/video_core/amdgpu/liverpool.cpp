@@ -5728,6 +5728,13 @@ void Liverpool::ExecuteRecordImpl(const CpSplit::RecordHeader& record) {
                                      op == PM4ItOpcode::EventWriteEop ||
                                      op == PM4ItOpcode::EventWriteEos)) {
                     VideoCore::g_gfx_label_tick = sch.CurrentTick();
+                    if (VideoCore::g_lane_frame_scope && op == PM4ItOpcode::EventWriteEop) {
+                        // q60: the end-of-frame label's value -> its main tick.
+                        const auto* eop = reinterpret_cast<const PM4CmdEventWriteEop*>(h);
+                        if (reinterpret_cast<u64>(eop->Address<u32>()) == 0x248000000ULL) {
+                            VideoCore::NoteFrameEndLabel(eop->DataDWord(), sch.CurrentTick());
+                        }
+                    }
                     if (VideoCore::g_lane_wait_census) [[unlikely]] {
                         // q59: the game's frame-end label batches (frame age of lane waits).
                         const u64 addr =
