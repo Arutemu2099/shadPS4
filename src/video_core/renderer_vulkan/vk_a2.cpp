@@ -1688,7 +1688,11 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
                     buf = nullptr;
                 }
             }
-            if (!buf && wrec && o_vsize[b] > MaxSpan) {
+            static const bool big_on = [] {
+                const char* e = std::getenv("SHADPS4_NR_WORKER_BIG");
+                return !(e && e[0] == '0'); // =0: r9's behaviour (screen arm)
+            }();
+            if (!buf && wrec && big_on && o_vsize[b] > MaxSpan) {
                 // r12 (mode 1): a V# larger than the union bound - the game binds its whole mesh
                 // memory (~2 GB at 0x271258000) and picks each draw's part by offsets. Mode 0 took
                 // these through the union's equal-V# path (the cached buffer holding the address,
