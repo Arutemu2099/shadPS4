@@ -4479,7 +4479,7 @@ void BufferCache::PrefetchArenaReads(VAddr half, u64 gen, bool retry) {
     auto* master = scheduler.GetMasterSemaphore();
     master->Refresh();
     boost::container::small_vector<PrefetchItem, MaxJobs> items;
-    for (size_t i = 0; i < n && items.size() < MaxJobs;) { // review nit: stop at the cap
+    for (size_t i = 0; i < n && items.size() + own_submits.size() < MaxJobs;) { // review nit: stop at the cap
         const VAddr page = pages[i];
         const BufferId buffer_id = page_table[page >> CACHING_PAGEBITS].buffer_id;
         if (IsBufferInvalid(buffer_id) || !slot_buffers[buffer_id].IsInBounds(page, 4096) ||
@@ -4509,7 +4509,7 @@ void BufferCache::PrefetchArenaReads(VAddr half, u64 gen, bool retry) {
                 job = job ? job : &candidate;
             }
         }
-        if (items.size() >= MaxJobs || free_slots <= KeepFree) {
+        if (items.size() + own_submits.size() >= MaxJobs || free_slots <= KeepFree) { // r18 review: own-queue jobs count
             count(8);
             continue;
         }
@@ -4606,14 +4606,15 @@ void BufferCache::PrefetchArenaReads(VAddr half, u64 gen, bool retry) {
                 .size = c.size,
             });
         }
-        const std::span<const vk::BufferCopy> list{vk_copies.data(), vk_copies.size()};
         const vk::Buffer staging_handle = job->staging->Handle();
         if (own_queue) {
-            // Submitted after the scan, in ascending wait order (same CP step: nothing reads
-            // the job's tick before then).
+            // Submitted after the scan, in ascending wait order. Safe while every reader of a
+            // Pending job's tick runs on the CP thread and nothing in this scan settles a job
+            // (r18 review): the placeholder main tick is never waited on the retry timeline.
             own_submits.push_back({job, id, wait_value, source.Handle(), staging_handle,
                                    std::move(vk_copies)});
         } else {
+            const std::span<const vk::BufferCopy> list{vk_copies.data(), vk_copies.size()};
             job->tick = fast_lane->Submit(master->Handle(), wait_value, [&](vk::CommandBuffer cmd) {
                 RecordFaultCopiesOnReadbackQueue(cmd, source.Handle(), staging_handle, list, false);
             });

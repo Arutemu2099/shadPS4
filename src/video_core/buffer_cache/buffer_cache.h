@@ -691,7 +691,7 @@ private:
     void PublishPrefetch(u64 id, u32 slot, u8 lane);
     void PrefetchNoteWindow(VAddr addr, u64 size);
     /// `retry_lane`: the r18 waiter of the arena retry items (pf_retry_queue).
-    void PrefetchWaiterLoop(std::stop_token stop, bool retry_lane = false);
+    void PrefetchWaiterLoop(std::stop_token stop, bool own = false);
     void PrefetchMaybeLog();
     /// SHADPS4_HOT_PAGE_PREFETCH: back, once per frame (DiscardDeadGpuData); owner-less read jobs
     /// over the pages of guest readback-class write faults, published by the f2 waiter.
