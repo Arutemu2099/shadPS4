@@ -10209,6 +10209,9 @@ void Liverpool::ExecuteGfxPacket(const PM4Header* header, bool guest_markers_ena
             // There is no evidence that GPU CP drives flip events by parsing
             // special NOP packets. For convenience lets assume that it does.
             ++VideoCore::g_back_flip_seq; // q35 H5
+            if (VideoCore::g_lane_wait_census && rasterizer) [[unlikely]] {
+                VideoCore::LaneWaitFrameEnd(rasterizer->GetScheduler().CurrentTick()); // q59b
+            }
             Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
             break;
         }

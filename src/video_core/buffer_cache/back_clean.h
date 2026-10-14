@@ -162,11 +162,13 @@ inline const u64 g_frame_label_addr = [] {
     return e ? std::strtoull(e, nullptr, 16) : 0x248000000ull;
 }();
 inline std::array<u64, 4> g_frame_end_ticks{};
-inline u64 g_frame_end_n = 0;
-inline void LaneWaitFrameLabel(u64 addr, u64 tick) noexcept {
-    if (addr != g_frame_label_addr) {
-        return;
-    }
+inline u64 g_frame_end_n = 0, g_frame_label_hits = 0;
+/// q59b: s932 showed the label above is written ~6 times per frame in fire: counted only. Frame ends = the back's
+/// PatchedFlip packets (LaneWaitFrameEnd).
+inline void LaneWaitFrameLabel(u64 addr, u64) noexcept {
+    g_frame_label_hits += addr == g_frame_label_addr ? 1 : 0;
+}
+inline void LaneWaitFrameEnd(u64 tick) noexcept {
     if (g_frame_end_n == 0 || g_frame_end_ticks[(g_frame_end_n - 1) & 3] != tick) {
         g_frame_end_ticks[g_frame_end_n++ & 3] = tick;
     }
@@ -358,11 +360,33 @@ struct LaneProbe {
     // q38: byte extent (offsets in the window) of the stamps at wrd's tick; wprev = max tick of every older stamp.
     std::array<u64, 256> wprev{};
     std::array<u32, 256> wxlo{}, wxhi{};
-    // q59 census: up to 4 exact [lo, hi) offsets of the stamps at wrd's tick (count 5 = overflow), newest stamp tsc.
-    std::array<std::array<u32, 8>, 256> wr{};
-    std::array<u8, 256> wrn{};
-    std::array<u64, 256> wtsc{};
+    // q59 census: up to 16 exact [lo, hi) offsets (merged when they touch) of the stamps at wrd's tick (count 17 =
+    // overflow) and the newest stamp tsc; q59b: the same for the tick before (wtick2).
+    std::array<std::array<u32, 32>, 256> wr{}, wr2{};
+    std::array<u8, 256> wrn{}, wrn2{};
+    std::array<u64, 256> wtsc{}, wtsc2{}, wtick2{};
 };
+inline constexpr u8 LaneWrCap = 16;
+/// q59b: adds [rlo, rhi) to a window's range list (merging touching ranges); n = LaneWrCap + 1 marks overflow.
+inline void LaneWrAdd(std::array<u32, 32>& r, u8& n, u32 rlo, u32 rhi) noexcept {
+    if (n > LaneWrCap) {
+        return;
+    }
+    for (u32 j = 0; j < n; ++j) {
+        if (r[2 * j] <= rhi && rlo <= r[2 * j + 1]) {
+            r[2 * j] = std::min(r[2 * j], rlo);
+            r[2 * j + 1] = std::max(r[2 * j + 1], rhi);
+            return;
+        }
+    }
+    if (n == LaneWrCap) {
+        n = LaneWrCap + 1;
+        return;
+    }
+    r[2 * n] = rlo;
+    r[2 * n + 1] = rhi;
+    ++n;
+}
 inline std::array<LaneProbe, 64> g_lprobe{};
 /// q26 flags (see q26_lane_exact_waits.py).
 inline const int g_lane_win = [] {
@@ -489,19 +513,25 @@ inline void LaneProbeWindows(LaneProbe& p, u64 lo, u64 hi, u64 v, u32 site) noex
             const u32 rlo = static_cast<u32>(std::max(a, wb) - wb);
             const u32 rhi = static_cast<u32>(std::min(b, wb + (u64{1} << 18)) - wb);
             if (v > p.wrd[i]) {
-                p.wrn[i] = clamped ? 5 : 1;
-                p.wr[i][0] = rlo;
-                p.wr[i][1] = rhi;
-                p.wtsc[i] = __rdtsc();
-            } else if (v == p.wrd[i]) {
-                if (clamped || p.wrn[i] >= 4) {
-                    p.wrn[i] = 5;
+                p.wr2[i] = p.wr[i]; // q59b: the previous tick's list
+                p.wrn2[i] = p.wrn[i];
+                p.wtsc2[i] = p.wtsc[i];
+                p.wtick2[i] = p.wrd[i];
+                p.wrn[i] = 0;
+            }
+            if (v >= p.wrd[i]) {
+                if (clamped) {
+                    p.wrn[i] = LaneWrCap + 1;
                 } else {
-                    p.wr[i][2 * p.wrn[i]] = rlo;
-                    p.wr[i][2 * p.wrn[i] + 1] = rhi;
-                    ++p.wrn[i];
+                    LaneWrAdd(p.wr[i], p.wrn[i], rlo, rhi);
                 }
                 p.wtsc[i] = __rdtsc();
+            } else if (v == p.wtick2[i]) {
+                if (clamped) {
+                    p.wrn2[i] = LaneWrCap + 1;
+                } else {
+                    LaneWrAdd(p.wr2[i], p.wrn2[i], rlo, rhi);
+                }
             }
         }
         if (v > p.wrd[i]) {
@@ -535,22 +565,26 @@ inline void LaneWinFull(LaneProbe& p, u64 k) noexcept {
 }
 /// q59: overlap class (see g_lane_war_exact) of window k's read tick r for a lane write [lo, hi), and its stamp tsc.
 inline void LaneWarClass(const LaneProbe& p, u64 k, u64 plo, u64 lo, u64 hi, u64 r, u8& cls, u64& tsc) noexcept {
-    tsc = p.wtsc[k];
-    if (r != p.wrd[k]) {
-        cls = 3;
+    const bool cur = r == p.wrd[k];
+    if (!cur && (r != p.wtick2[k] || r == 0)) {
+        cls = 3; // older than the two ticks kept
+        tsc = 0;
         return;
     }
-    if (p.wsite[k] == 22) {
+    tsc = cur ? p.wtsc[k] : p.wtsc2[k];
+    if (cur && p.wsite[k] == 22) {
         cls = 5;
         return;
     }
-    if (p.wrn[k] == 0 || p.wrn[k] > 4) {
+    const u8 n = cur ? p.wrn[k] : p.wrn2[k];
+    const auto& rr = cur ? p.wr[k] : p.wr2[k];
+    if (n == 0 || n > LaneWrCap) {
         cls = 6;
         return;
     }
     const u64 wb = plo + (k << 18);
-    for (u32 j = 0; j < p.wrn[k]; ++j) {
-        if (wb + p.wr[k][2 * j] < hi && lo < wb + p.wr[k][2 * j + 1]) {
+    for (u32 j = 0; j < n; ++j) {
+        if (wb + rr[2 * j] < hi && lo < wb + rr[2 * j + 1]) {
             cls = 1;
             return;
         }
@@ -717,6 +751,10 @@ inline bool LaneProbeWrite(u64 lo, u64 hi, u64 open, u64& rd, bool& hit) noexcep
                         p.wr[i] = p.wr[i - shift]; // q59
                         p.wrn[i] = p.wrn[i - shift];
                         p.wtsc[i] = p.wtsc[i - shift];
+                        p.wr2[i] = p.wr2[i - shift];
+                        p.wrn2[i] = p.wrn2[i - shift];
+                        p.wtsc2[i] = p.wtsc2[i - shift];
+                        p.wtick2[i] = p.wtick2[i - shift];
                     }
                 }
                 const u64 newn = std::min<u64>((nhi - nlo) >> 18, 256);

@@ -2260,6 +2260,7 @@ void Scheduler::LaneWaitResolve() {
             ++lw_left_n;
         }
         ++lw_pos[pos];
+        lw_pos_real[pos] += real ? 1 : 0;
         lw_real_cur_late += (real && w.frame == 2 && pos == 3) ? 1 : 0;
         const u64 key = (u64{w.site} << 32) | (w.wid & 0xffffffffULL);
         if (lw_pipe.size() < 4096 || lw_pipe.contains(key)) {
@@ -2350,21 +2351,25 @@ void Scheduler::LaneSegCensus(u64 wait_main, u64 value) {
         }
         const auto& q = lw_cls;
         LOG_INFO(Render_Vulkan,
-                 "q59 LaneWaitCensus (~5 s): waiting segments resolved {} (dropped {}) | frame age vs the frame-end "
-                 "label ({} seen): >=2 frames old {} previous frame {} current frame {} unknown {} | overlap: war exact "
+                 "q59 LaneWaitCensus (~5 s): waiting segments resolved {} (dropped {}) | frame age vs the back's "
+                 "flips ({} seen): >=2 frames old {} previous frame {} current frame {} unknown {} | overlap: war exact "
                  "{} / war window, no byte overlap {} / war older-tick floor {} / war ReadAll floor {} / war new or "
                  "re-based probe {} / war list overflow {} / war grown probe {} / raw note {} / raw coarse {} / label "
                  "fallback {} / gds {} / other {} / unknown {} | access position in its batch (record time) <25% {} "
                  "25-50% {} 50-75% {} >=75% {} earlier batch {} unknown {} | record time from the access to the waited "
                  "batch's close {:.3f} ms mean | real (byte / note overlap) {} of which current frame and >=75% into "
-                 "its batch {} | top (site, pipeline):{}",
+                 "its batch {} | real by position <25% {} 25-50% {} 50-75% {} >=75% {} earlier batch {} unknown {} | "
+                 "label {:#x} writes {} | top (site, pipeline):{}",
                  lw_resolved, lw_dropped, VideoCore::g_frame_end_n, lw_frame[0], lw_frame[1], lw_frame[2], lw_frame[3],
                  q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8], q[9], q[10], q[11], q[12], q[0], lw_pos[0], lw_pos[1],
                  lw_pos[2], lw_pos[3], lw_pos[4], lw_pos[5],
-                 lw_left_n ? double(lw_left_cyc) / double(lw_left_n) / 3.5e6 : 0.0, lw_real, lw_real_cur_late, ps);
+                 lw_left_n ? double(lw_left_cyc) / double(lw_left_n) / 3.5e6 : 0.0, lw_real, lw_real_cur_late,
+                 lw_pos_real[0], lw_pos_real[1], lw_pos_real[2], lw_pos_real[3], lw_pos_real[4], lw_pos_real[5],
+                 VideoCore::g_frame_label_addr, VideoCore::g_frame_label_hits, ps);
         lw_cls.fill(0);
         lw_frame.fill(0);
         lw_pos.fill(0);
+        lw_pos_real.fill(0);
         lw_left_cyc = lw_left_n = lw_real = lw_real_cur_late = lw_resolved = lw_dropped = 0;
         lw_pipe.clear();
     }

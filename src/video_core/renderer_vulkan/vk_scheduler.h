@@ -1249,7 +1249,7 @@ private:
     u64 lane_wait_w = 0, lane_wait_r = 0;
     std::array<u64, 16> lw_cls{};
     std::array<u64, 4> lw_frame{};
-    std::array<u64, 6> lw_pos{};
+    std::array<u64, 6> lw_pos{}, lw_pos_real{};
     u64 lw_left_cyc = 0, lw_left_n = 0, lw_real = 0, lw_real_cur_late = 0, lw_resolved = 0, lw_dropped = 0;
     std::unordered_map<u64, u64> lw_pipe;
     void LaneWaitCapture(u32 src, u32 site);
