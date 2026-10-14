@@ -326,8 +326,69 @@ static void ApplyParticleLateRead() {
              g_eboot_address + 0x3ee160, g_eboot_address + 0x29cc89, g_eboot_address + 0x29cd1e);
 }
 
+// SHADPS4_HOUSE_SPLIT=1 (2026-10-14, notes/study-house-draws-2026-10-14.md sec. 3): the game's
+// command-buffer splitter FUN_80043cef0 cuts a pass's item list into jobs of <= 1000 items only where
+// key & mask changes; the mask comes from FUN_800197130 (default 0xffff000000000000 = class runs).
+// The rooftop's ~3,300 distant houses are one class run, so ONE job records them all. Writing
+// 0xffffffffffff0000 (everything above bit 16: a superset of today's cut points) lets the splitter
+// cut that run into ~5 jobs recorded in parallel. SHADPS4_HOUSE_CHUNK=N also sets the 1000-item chunk
+// (FUN_800197050's imm32). Refused unless every original byte matches. The game's context pool has
+// no bounds check (at most 254 per frame): the census in gnmdriver logs the count per frame.
+static void ApplyHouseSplit() {
+    const char* env = std::getenv("SHADPS4_HOUSE_SPLIT");
+    const char* chunk_env = std::getenv("SHADPS4_HOUSE_CHUNK");
+    const bool mask_on = env && env[0] == '1';
+    const u32 chunk = chunk_env ? static_cast<u32>(std::strtoul(chunk_env, nullptr, 10)) : 0;
+    if (!mask_on && chunk == 0) {
+        return;
+    }
+    const auto app_version =
+        std::string(Common::Singleton<PSF>::Instance()->GetString("APP_VER").value_or(""));
+    if (g_game_serial != "CUSA00004" || app_version != "01.07") {
+        LOG_ERROR(Loader, "SHADPS4_HOUSE_SPLIT: refused, game {} version {} (needs CUSA00004 01.07)",
+                  g_game_serial, app_version);
+        return;
+    }
+    // FUN_800197130 (split mask by pass) and FUN_800197050 (chunk by pass), whole functions.
+    static constexpr u8 mask_fn[58] = {
+        0xba, 0x01, 0x00, 0x00, 0x00, 0x40, 0x88, 0xf9, 0xb8, 0x00, 0x00, 0xff, 0x7f, 0x48, 0xbe,
+        0x00, 0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00, 0x48, 0xd3, 0xe2, 0x48, 0x0f, 0xa3, 0xfe,
+        0x72, 0x19, 0xf7, 0xc2, 0x00, 0x44, 0x88, 0x00, 0xb9, 0x00, 0x00, 0xff, 0xff, 0x48, 0xb8,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x48, 0x0f, 0x45, 0xc1, 0xc3};
+    static constexpr u8 chunk_fn[19] = {0x83, 0xcf, 0x04, 0xb8, 0xc8, 0x00, 0x00, 0x00, 0x83, 0xff,
+                                        0x17, 0x74, 0x05, 0xb8, 0xe8, 0x03, 0x00, 0x00, 0xc3};
+    const auto matches = [](u64 offset, const u8* bytes, size_t n) {
+        const auto* live = reinterpret_cast<const u8*>(g_eboot_address + offset);
+        if (std::memcmp(live, bytes, n) == 0) {
+            return true;
+        }
+        std::string found;
+        for (size_t i = 0; i < n; ++i) {
+            found += fmt::format("{:02x}", live[i]);
+        }
+        LOG_ERROR(Loader, "SHADPS4_HOUSE_SPLIT: refused, eboot+{:#x} holds {}", offset, found);
+        return false;
+    };
+    if (!matches(0x197130, mask_fn, sizeof(mask_fn)) ||
+        !matches(0x197050, chunk_fn, sizeof(chunk_fn))) {
+        return;
+    }
+    if (mask_on) {
+        // imm64 of mov rax, 0xffff000000000000 at 0x19715d -> 0xffffffffffff0000
+        static constexpr u8 mask[8] = {0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+        std::memcpy(reinterpret_cast<void*>(g_eboot_address + 0x19715d), mask, sizeof(mask));
+    }
+    if (chunk != 0) {
+        // imm32 of mov eax, 1000 at 0x19705e
+        std::memcpy(reinterpret_cast<void*>(g_eboot_address + 0x19705e), &chunk, sizeof(chunk));
+    }
+    LOG_INFO(Loader, "SHADPS4_HOUSE_SPLIT: default split mask {} | chunk {}",
+             mask_on ? "0xffffffffffff0000" : "unchanged", chunk != 0 ? chunk : 1000);
+}
+
 void OnGameLoaded() {
     ApplyParticleLateRead();
+    ApplyHouseSplit();
     std::filesystem::path patch_dir = Common::FS::GetUserPath(Common::FS::PathType::PatchesDir);
     if (!patch_file.empty()) {
 

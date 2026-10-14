@@ -20,6 +20,7 @@
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
+#include "common/memory_patcher.h"
 #include "common/slot_vector.h"
 #include "core/address_space.h"
 #include "core/debug_state.h"
@@ -3637,6 +3638,65 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
                                       ccb_sizes_in_bytes);
 }
 
+// SHADPS4_HOUSE_CENSUS=1 (also on with SHADPS4_HOUSE_SPLIT / SHADPS4_HOUSE_CHUNK; 2026-10-14): DCBs
+// submitted per frame and the game's recording-context counter (CUSA00004: pool 0x800f1bcd0 +
+// 0xdf0ef0, read at every submit, max per frame; the pool holds at most 254 contexts, no bounds
+// check in the game). A frame ends at sceGnmSubmitDone. Logged every 600 frames.
+namespace {
+struct HouseCensus {
+    std::mutex m;
+    u32 dcbs = 0, ctx_max = 0, frames = 0, dcb_peak = 0, ctx_peak = 0;
+    u64 dcb_sum = 0, ctx_sum = 0;
+};
+HouseCensus* HouseCensusOn() {
+    static HouseCensus* hc = [] {
+        const char* a = std::getenv("SHADPS4_HOUSE_SPLIT");
+        const char* b = std::getenv("SHADPS4_HOUSE_CHUNK");
+        const char* c = std::getenv("SHADPS4_HOUSE_CENSUS");
+        const bool on = (a && a[0] == '1') || (b && b[0] != '\0' && b[0] != '0') || (c && c[0] == '1');
+        return on && MemoryPatcher::g_eboot_address != 0 &&
+                       MemoryPatcher::g_game_serial == "CUSA00004"
+                   ? new HouseCensus
+                   : nullptr;
+    }();
+    return hc;
+}
+u32 HouseContextCounter() {
+    return *reinterpret_cast<const volatile u32*>(MemoryPatcher::g_eboot_address + 0x1d0cbc0);
+}
+void HouseCensusSubmit(u32 count) {
+    if (auto* hc = HouseCensusOn()) {
+        const u32 ctx = HouseContextCounter();
+        std::scoped_lock lk{hc->m};
+        hc->dcbs += count;
+        hc->ctx_max = std::max(hc->ctx_max, ctx);
+    }
+}
+void HouseCensusFrame() {
+    if (auto* hc = HouseCensusOn()) {
+        const u32 ctx = HouseContextCounter();
+        std::scoped_lock lk{hc->m};
+        hc->ctx_max = std::max(hc->ctx_max, ctx);
+        hc->dcb_sum += hc->dcbs;
+        hc->ctx_sum += hc->ctx_max;
+        hc->dcb_peak = std::max(hc->dcb_peak, hc->dcbs);
+        hc->ctx_peak = std::max(hc->ctx_peak, hc->ctx_max);
+        hc->dcbs = 0;
+        hc->ctx_max = 0;
+        if (++hc->frames == 600) {
+            LOG_INFO(Lib_GnmDriver,
+                     "HouseCensus: 600 frames | DCBs per frame mean {:.1f} max {} | game recording "
+                     "contexts per frame (max of submit-time reads) mean {:.1f} max {} (pool limit 254)",
+                     double(hc->dcb_sum) / 600.0, hc->dcb_peak, double(hc->ctx_sum) / 600.0,
+                     hc->ctx_peak);
+            hc->frames = 0;
+            hc->dcb_sum = hc->ctx_sum = 0;
+            hc->dcb_peak = hc->ctx_peak = 0;
+        }
+    }
+}
+} // namespace
+
 int PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
                                                        const u32* dcb_gpu_addrs[],
                                                        u32* dcb_sizes_in_bytes,
@@ -3644,6 +3704,7 @@ int PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
                                                        u32* ccb_sizes_in_bytes) {
     HLE_TRACE;
     LOG_DEBUG(Lib_GnmDriver, "called");
+    HouseCensusSubmit(count);
 
     if (!dcb_gpu_addrs || !dcb_sizes_in_bytes) {
         LOG_ERROR(Lib_GnmDriver, "dcbGpuAddrs and dcbSizesInBytes must not be NULL");
@@ -3756,6 +3817,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffers(u32 count, const u32* dcb_gpu_addrs[
 int PS4_SYSV_ABI sceGnmSubmitDone() {
     HLE_TRACE;
     LOG_DEBUG(Lib_GnmDriver, "called");
+    HouseCensusFrame();
     if (Common::FaultMonitor::t_is_game_main) {
         // q48 SHADPS4_ARENA_READ_PREFETCH: the frame's particle chain is recorded (wait #2 passed).
         VideoCore::ArenaReadPrefetchFrameEnd();
