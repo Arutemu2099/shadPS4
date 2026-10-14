@@ -278,12 +278,12 @@ public:
     struct A2SlotProbe {
         u32 tag{}, idx{};
         u64 n{};
-        std::array<u32, 2 * Shader::NativeBindlessMax> slots{};
+        std::array<u32, Shader::NativeBindlessSlots> slots{};
     } a2_probe;
     /// SHADPS4_A2=2: what each colour draw of a verified stretch must get (key tag << 32 | idx);
     /// BindlessRingWrite compares every write against it and erases the entry.
     struct A2Expect {
-        std::array<u32, 2 * Shader::NativeBindlessMax> slots{};
+        std::array<u32, Shader::NativeBindlessSlots> slots{};
         u32 n_img{}, n_smp{};
     };
     std::unordered_map<u64, A2Expect> a2_expect;
@@ -715,7 +715,7 @@ private:
         /// slots (16 images, 16 samplers) and the set copy they live in.
         bool bindless{};
         u32 bl_set{};
-        std::array<u32, 2 * Shader::NativeBindlessMax> bl_slots{};
+        std::array<u32, Shader::NativeBindlessSlots> bl_slots{};
         std::array<u64, Shader::NUM_BUFFERS> buf{};
         u64 guest_mask{};
         u64 stream_off{};
@@ -812,9 +812,9 @@ private:
         u32 n_img{}, n_smp{};
         u64 touch_gc{~0ull}, touch_age{~0ull}; ///< l4e: the last touch's gc_tick / AgeTick
         u64 used{}; ///< l4e: replacement order within the set
-        std::array<u32, 2 * Shader::NativeBindlessMax> slots{};
-        std::array<MatMemoImg, Shader::NativeBindlessMax> img{};
-        std::array<size_t, Shader::NativeBindlessMax> lru{};
+        std::array<u32, Shader::NativeBindlessSlots> slots{};
+        std::array<MatMemoImg, Shader::NativeBindlessImgCap> img{};
+        std::array<size_t, Shader::NativeBindlessSmpCap> lru{};
     };
     u64 mat_memo_clock{};
     std::vector<MatMemo> mat_memo;

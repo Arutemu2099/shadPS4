@@ -496,7 +496,7 @@ void WriteSlots(const StretchCmds& cmds) {
         if (gr && sw.mat < MaxMaterials) {
             std::memcpy(gr + size_t(sw.idx & (NR::RingSize - 1)) * NR::GpuRecDwords +
                             Shader::NativeRecordImgOffset,
-                        cmds.mat_slots[sw.mat].data(), sizeof(u32) * 2 * Shader::NativeBindlessMax);
+                        cmds.mat_slots[sw.mat].data(), sizeof(u32) * Shader::NativeBindlessSlots);
         }
     }
 }
@@ -1140,7 +1140,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
             // mip level under the DynamicIndex fallback - refuse that mode rather than guess.
             tot_img += static_cast<u32>(info->images.size()); // q3: FS + VS <= 16 each
             tot_smp += static_cast<u32>(info->samplers.size());
-            if (tot_img > Shader::NativeBindlessMax || tot_smp > Shader::NativeBindlessMax) {
+            if (tot_img > Shader::g_bl_img_max || tot_smp > Shader::g_bl_smp_max) { // q54 split
                 return refuse(RefuseColourImages);
             }
             for (const auto& desc : info->images) {
@@ -1792,7 +1792,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
                     std::memcpy(w.data(), &ss, sizeof(w));
                     u32 slot = 0;
                     all = TT::LookupSmp(w, tg, slot);
-                    ms[Shader::NativeBindlessMax + j] = slot;
+                    ms[Shader::g_bl_img_max + j] = slot;
                 }
                 if (!all) {
                     stretch->tab_imgs.resize(imgs0); // q10: only taken materials' images

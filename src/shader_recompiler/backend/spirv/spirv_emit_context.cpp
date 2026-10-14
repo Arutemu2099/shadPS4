@@ -1606,9 +1606,9 @@ Id EmitContext::LoadSampler(u32 index) {
         return OpLoad(sampler_type, samplers[index]);
     }
     const Id slot{native_seg
-                      ? NativeSegSlotLoad(Shader::NativeBindlessMax + bindless_smp_base + index)
-                      : NativeRecordLoad(Shader::NativeRecordSmpOffset + bindless_smp_base +
-                                         index)};
+                      ? NativeSegSlotLoad(Shader::g_bl_img_max + bindless_smp_base + index)
+                      : NativeRecordLoad(Shader::NativeRecordImgOffset + Shader::g_bl_img_max +
+                                         bindless_smp_base + index)}; // q54: samplers after g_bl_img_max images
     const Id ptr{OpAccessChain(sampler_pointer_type, samplers[index], slot)};
     const Id value{OpLoad(sampler_type, ptr)};
     return value;

@@ -5432,8 +5432,8 @@ void Liverpool::A2Execute(const CpSplit::RecordHeader& record) {
                                 bad = pr.slots[i] != want[i];
                             }
                             for (u32 j = 0; !bad && j < ns; ++j) {
-                                bad = pr.slots[Shader::NativeBindlessMax + j] !=
-                                      want[Shader::NativeBindlessMax + j];
+                                bad = pr.slots[Shader::g_bl_img_max + j] !=
+                                      want[Shader::g_bl_img_max + j];
                             }
                             ++c.slot_cmp;
                             if (bad && ++c.slot_bad <= 16) {
@@ -9170,7 +9170,7 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
             }
             for (size_t m = 0; ok && m < st.materials.size(); ++m) {
                 const auto& mr = st.materials[m];
-                std::array<u32, 2 * Shader::NativeBindlessMax> pre_slots{};
+                std::array<u32, Shader::NativeBindlessSlots> pre_slots{};
                 const bool pre = tab_ok && ((st.mat_pre >> m) & 1) != 0;
                 if (pre) {
                     TT::g_c[2].fetch_add(1, std::memory_order_relaxed);
@@ -9194,8 +9194,8 @@ void Liverpool::LeanBackFollow(const CpSplit::DcbRefPayload& ref) {
                         bad = pre_slots[i] != st.cmds->mat_slots[m][i];
                     }
                     for (u32 j = 0; !bad && j < mat_n[m].second; ++j) {
-                        bad = pre_slots[Shader::NativeBindlessMax + j] !=
-                              st.cmds->mat_slots[m][Shader::NativeBindlessMax + j];
+                        bad = pre_slots[Shader::g_bl_img_max + j] !=
+                              st.cmds->mat_slots[m][Shader::g_bl_img_max + j];
                     }
                     if (bad && TT::g_c[6].fetch_add(1, std::memory_order_relaxed) < 8) {
                         LOG_WARNING(Render, "q8 texture table VERIFY BAD: material {} ({} / {} "

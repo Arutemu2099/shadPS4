@@ -4662,8 +4662,8 @@ bool Rasterizer::NativeOpen(const GraphicsPipeline* base, const GraphicsPipeline
         if (native && native->native_bindless) {
             // SHADPS4_NATIVE_BINDLESS: the opener's slots, checked against what BindTextures
             // just bound for it (the generic writes: views + layouts, samplers, in order).
-            std::array<vk::ImageView, Shader::NativeBindlessMax> views{};
-            std::array<vk::Sampler, Shader::NativeBindlessMax> smps{};
+            std::array<vk::ImageView, Shader::NativeBindlessImgCap> views{};
+            std::array<vk::Sampler, Shader::NativeBindlessSmpCap> smps{};
             u32 ni = 0, ns = 0;
             const u64 s0 = scheduler.RecordSeq();
             if (!BindlessResolve(base, b.bl_slots.data(), views.data(), smps.data(), ni, ns) ||
@@ -5406,7 +5406,7 @@ bool Rasterizer::A2MaterialMemo(const GraphicsPipeline* base, u64 h1, u64 h2, u3
     if (native_batch.open) {
         NativeClose(15); // as A2ResolveMaterial
     }
-    std::array<VideoCore::ImageId, Shader::NativeBindlessMax> q4ids{};
+    std::array<VideoCore::ImageId, Shader::NativeBindlessImgCap> q4ids{};
     for (u32 i = 0; i < m.n_img; ++i) {
         if (touch) {
             texture_cache.TouchImageAccess(texture_cache.PeekImage(m.img[i].id));
@@ -5492,10 +5492,10 @@ bool Rasterizer::A2ResolveMaterial(const GraphicsPipeline* base, const Shader::B
     if (vfy) {
         old = *mm;
     }
-    std::array<VideoCore::ImageId, Shader::NativeBindlessMax> got{};
+    std::array<VideoCore::ImageId, Shader::NativeBindlessImgCap> got{};
     MatMemo fill{};
-    std::array<BindlessImgEntry, Shader::NativeBindlessMax> cap{};
-    std::array<BindlessSmpEntry, Shader::NativeBindlessMax> cap_s{}; // q8
+    std::array<BindlessImgEntry, Shader::NativeBindlessImgCap> cap{};
+    std::array<BindlessSmpEntry, Shader::NativeBindlessSmpCap> cap_s{}; // q8
     const bool tab = VideoCore::TexTable::Mode() != 0;
     const u64 tg0 = VideoCore::TexTable::Gen(); // q8b (D): before the resolve
     if (memo || tab) {
@@ -5566,7 +5566,7 @@ bool Rasterizer::A2ResolveMaterial(const GraphicsPipeline* base, const Shader::B
             bad = old.slots[i] != slots[i] || old.img[i].id != got[i];
         }
         for (u32 j = 0; !bad && j < n_smp; ++j) {
-            bad = old.slots[Shader::NativeBindlessMax + j] != slots[Shader::NativeBindlessMax + j];
+            bad = old.slots[Shader::g_bl_img_max + j] != slots[Shader::g_bl_img_max + j];
         }
         if (bad && ++st.mm_bad <= 16) {
             LOG_WARNING(Render_Vulkan,
@@ -5700,13 +5700,13 @@ void Rasterizer::BindlessRingWrite(u32 tag, u32 idx, const u32* slots) {
     if (gr) {
         std::memcpy(gr + size_t(idx & (NR::RingSize - 1)) * NR::GpuRecDwords +
                         Shader::NativeRecordImgOffset,
-                    slots, sizeof(u32) * 2 * Shader::NativeBindlessMax);
+                    slots, sizeof(u32) * Shader::NativeBindlessSlots);
     }
     static const bool a2_verify = Vulkan::A2::Mode() == 2;
     if (a2_verify) [[unlikely]] {
         a2_probe.tag = tag;
         a2_probe.idx = idx;
-        std::memcpy(a2_probe.slots.data(), slots, sizeof(u32) * 2 * Shader::NativeBindlessMax);
+        std::memcpy(a2_probe.slots.data(), slots, sizeof(u32) * Shader::NativeBindlessSlots);
         ++a2_probe.n;
         if (const auto it = a2_expect.find(u64{tag} << 32 | idx); it != a2_expect.end()) {
             const auto& ex = it->second;
@@ -5715,7 +5715,7 @@ void Rasterizer::BindlessRingWrite(u32 tag, u32 idx, const u32* slots) {
                 bad = slots[i] != ex.slots[i];
             }
             for (u32 j = 0; !bad && j < ex.n_smp; ++j) {
-                bad = slots[Shader::NativeBindlessMax + j] != ex.slots[Shader::NativeBindlessMax + j];
+                bad = slots[Shader::g_bl_img_max + j] != ex.slots[Shader::g_bl_img_max + j];
             }
             ++a2_slot_cmp;
             if (bad && ++a2_slot_bad <= 16) {
@@ -5791,18 +5791,18 @@ bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::I
             vsb = nullptr;
         }
     }
-    std::array<const Shader::ImageResource*, Shader::NativeBindlessMax> img_d{};
-    std::array<const Shader::BoundStage*, Shader::NativeBindlessMax> img_b{};
-    std::array<const Shader::SamplerResource*, Shader::NativeBindlessMax> smp_d{};
-    std::array<const Shader::BoundStage*, Shader::NativeBindlessMax> smp_b{};
+    std::array<const Shader::ImageResource*, Shader::NativeBindlessImgCap> img_d{};
+    std::array<const Shader::BoundStage*, Shader::NativeBindlessImgCap> img_b{};
+    std::array<const Shader::SamplerResource*, Shader::NativeBindlessSmpCap> smp_d{};
+    std::array<const Shader::BoundStage*, Shader::NativeBindlessSmpCap> smp_b{};
     n_img = 0;
     n_smp = 0;
     for (const Shader::BoundStage* sb : {fs, vsb}) {
         if (!sb) {
             continue;
         }
-        if (n_img + sb->info->images.size() > Shader::NativeBindlessMax ||
-            n_smp + sb->info->samplers.size() > Shader::NativeBindlessMax) {
+        if (n_img + sb->info->images.size() > Shader::g_bl_img_max ||
+            n_smp + sb->info->samplers.size() > Shader::g_bl_smp_max) { // q54 split
             ++st.bl_fail[0];
             return false;
         }
@@ -5930,7 +5930,7 @@ bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::I
         }
         st.c_bl_miss += __rdtsc() - tc0;
     }
-    std::array<size_t, Shader::NativeBindlessMax> lru{};
+    std::array<size_t, Shader::NativeBindlessSmpCap> lru{};
     u32 n_lru = 0;
     const u64 ts0 = __rdtsc();
     for (u32 j = 0; j < n_smp; ++j) {
@@ -5952,7 +5952,7 @@ bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::I
         }
         auto& e = bl.smp_cache[(hsh ^ (hsh >> 29)) & (bl.smp_cache.size() - 1)];
         if (e.gen == bl.smp_gen && e.words == words) {
-            slots[Shader::NativeBindlessMax + j] = e.slot;
+            slots[Shader::g_bl_img_max + j] = e.slot;
             if (samplers) {
                 samplers[j] = e.sampler;
             }
@@ -5997,7 +5997,7 @@ bool Rasterizer::BindlessResolve(const GraphicsPipeline* base, u32* slots, vk::I
         if (bl.cap_smp) {
             bl.cap_smp[j] = e; // q8
         }
-        slots[Shader::NativeBindlessMax + j] = slot;
+        slots[Shader::g_bl_img_max + j] = slot;
         if (samplers) {
             samplers[j] = sh;
         }
@@ -6459,7 +6459,7 @@ bool Rasterizer::NativeJoin(const SplitDraw& draw,
         NativeClose(12);
         return false;
     }
-    std::array<u32, 2 * Shader::NativeBindlessMax> jslots{};
+    std::array<u32, Shader::NativeBindlessSlots> jslots{};
     bool jslots_own = false;
     if (b.colour) {
         // SHADPS4_NATIVE_COLOUR: the draw-repeat conditions for "the same images": identical

@@ -140,14 +140,24 @@ constexpr u32 NativeRecordSizeOffset = NUM_USER_DATA_REGS + NUM_BUFFERS;
 constexpr u32 NativeMaxPulledLocations = 16;
 constexpr u32 NativeRecordVoffOffset = NUM_USER_DATA_REGS + 2 * NUM_BUFFERS;
 constexpr u32 NativeRecordVsizeOffset = NativeRecordVoffOffset + NativeMaxPulledLocations;
-/// SHADPS4_NATIVE_BINDLESS: PS image / sampler slots in the global descriptor arrays.
-constexpr u32 NativeBindlessMax = 16;
+/// SHADPS4_NATIVE_BINDLESS: PS image / sampler slots in the global descriptor arrays: NativeBindlessSlots record
+/// words from NativeRecordImgOffset, the images first, the samplers from slot word g_bl_img_max.
+/// q54 (SHADPS4_BINDLESS_SPLIT=1): 22 image + 10 sampler slots instead of 16 + 16 (8 city / fire materials sample
+/// 17-22 images with at most 9 samplers: no bindless variant, > 32 push descriptors -> the back's old path).
+constexpr u32 NativeBindlessSlots = 32;
+constexpr u32 NativeBindlessImgCap = 22; ///< array bounds: the most image / sampler slots any split gives
+constexpr u32 NativeBindlessSmpCap = 16;
+inline const u32 g_bl_img_max = [] {
+    const char* e = std::getenv("SHADPS4_BINDLESS_SPLIT");
+    return e && e[0] == '1' ? 22u : 16u;
+}();
+inline const u32 g_bl_smp_max = NativeBindlessSlots - g_bl_img_max;
+static_assert(NativeBindlessImgCap + NativeBindlessSmpCap >= NativeBindlessSlots);
 constexpr u32 NativeRecordImgOffset = NativeRecordVsizeOffset + NativeMaxPulledLocations; // 128
-constexpr u32 NativeRecordSmpOffset = NativeRecordImgOffset + NativeBindlessMax;           // 144
 /// SHADPS4_NATIVE_PT: byte b % 4 of dword NativeRecordHiOffset + b / 4 = bits 32..39 of Guest
 /// binding b's guest address; the same for pulled vertex locations at NativeRecordVhiOffset
 /// (written, not read by the shaders yet). 174-175 spare.
-constexpr u32 NativeRecordHiOffset = NativeRecordSmpOffset + NativeBindlessMax;            // 160
+constexpr u32 NativeRecordHiOffset = NativeRecordImgOffset + NativeBindlessSlots;          // 160
 constexpr u32 NativeRecordHiDwords = (NUM_BUFFERS + 3) / 4;                                 // 10
 constexpr u32 NativeRecordVhiOffset = NativeRecordHiOffset + NativeRecordHiDwords;           // 170
 constexpr u32 NativeRecordVhiDwords = NativeMaxPulledLocations / 4;                          // 4
@@ -187,12 +197,12 @@ constexpr u32 NativeTableFaultAddr = NativeTableSegList + 2; // 212, 213
 /// Brick C v3 item 4 (multi-material segments): a list entry's slot is bits 24..28, its
 /// material index bits 29..31 (0..NativeSegMaxMaterials - 1); the table's NativeTableSegMat =
 /// the u64 device address of the segment's slot table (per material NativeSegMatWords words:
-/// NativeBindlessMax image slots, then NativeBindlessMax sampler slots), 0 = no table: the
+/// g_bl_img_max image slots, then g_bl_smp_max sampler slots), 0 = no table: the
 /// slots come from the record words (legacy / ring batches).
 constexpr u32 NativeSegSlotMask = 0x1f;
 constexpr u32 NativeSegMatShift = 29;
 constexpr u32 NativeSegMaxMaterials = 8;
-constexpr u32 NativeSegMatWords = 2 * NativeBindlessMax;
+constexpr u32 NativeSegMatWords = NativeBindlessSlots;
 constexpr u32 NativeTableSegMat = NativeTableFaultAddr + 2; // 214, 215
 constexpr u32 NativeTableDwords = 256;
 static_assert(NativeTableSegMat + 2 <= NativeTableDwords);

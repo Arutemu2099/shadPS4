@@ -1733,9 +1733,9 @@ void PipelineCache::PrepareNativeColourLocked(const GraphicsPipeline* base,
             return false;
         }
         // q3: the VS's after the FS's, <= 16 of each in all.
-        if (fs->images.size() + vs->images.size() > Shader::NativeBindlessMax ||
-            fs->samplers.size() + vs->samplers.size() > Shader::NativeBindlessMax) {
-            bindless_why = "fs > 16 images / samplers";
+        if (fs->images.size() + vs->images.size() > Shader::g_bl_img_max ||
+            fs->samplers.size() + vs->samplers.size() > Shader::g_bl_smp_max) {
+            bindless_why = "fs > image / sampler slots"; // q54: 16 / 16, or 22 / 10 with SHADPS4_BINDLESS_SPLIT=1
             return false;
         }
         for (const auto& desc : vs->images) {

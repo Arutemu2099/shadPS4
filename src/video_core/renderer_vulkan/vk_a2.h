@@ -170,11 +170,11 @@ struct SubBatch {
 struct StretchCmds {
     std::vector<SubBatch> batches;
     /// Colour (bindless) sub-batches: the set-1 copy and the per-material slot words
-    /// (NativeBindlessMax image slots, then NativeBindlessMax sampler slots: the record words
-    /// Shader::NativeRecordImgOffset .. +2*NativeBindlessMax). Both set by the back at publish
+    /// (Shader::g_bl_img_max image slots, then the sampler slots: the record words
+    /// Shader::NativeRecordImgOffset .. +NativeBindlessSlots). Both set by the back at publish
     /// (BindlessResolve per material); unused when slot_writes is empty.
     vk::DescriptorSet bindless_set{}; ///< set by the back at publish
-    std::array<std::array<u32, 2 * Shader::NativeBindlessMax>, MaxMaterials>
+    std::array<std::array<u32, Shader::NativeBindlessSlots>, MaxMaterials>
         mat_slots{}; ///< set by the back
     /// One per colour draw: Replay writes mat_slots[mat] into job record (tag, idx) of the GPU
     /// ring (as Rasterizer::BindlessRingWrite) before it records the draws.
@@ -312,7 +312,7 @@ enum Refusal : u32 {
     // Colour draws (v2).
     RefuseColourGates,   ///< colour off / diag bits 1 or 4096 / variant not bindless-ring-pt
     RefuseColourStages,  ///< images or samplers outside the fragment stage, or no fragment stage
-    RefuseColourImages,  ///< > NativeBindlessMax, storage / atomic image, mip fallback DynamicIndex,
+    RefuseColourImages,  ///< > g_bl_img_max / g_bl_smp_max, storage / atomic image, mip fallback DynamicIndex,
                          ///< null or invalid-format T#, key over 512 words
     RefuseColourKeyHash, ///< the job record's image count / key hash disagree with the stages
     RefuseColourVertex,  ///< instanced attribute, location >= 16, streams in more than one buffer,
