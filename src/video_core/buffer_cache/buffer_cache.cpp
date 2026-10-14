@@ -6860,7 +6860,9 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
         // rooftop at the last one - the play hitches). Buffers inside the extension are joined
         // like any overlap, so no page keeps two buffers.
         const u64 cur = end - begin;
-        const u64 want = std::min<u64>(cur + std::max<u64>(768ull << 20, cur / 2), 0xF0000000ull);
+        // r15d: straight to the cap (3.75 GB) at the first big join - normally the load - so the
+        // region never grows again in the scene (r15b: an in-scene growth's coherent upload stalled ~1 s).
+        const u64 want = 0xF0000000ull;
         const u64 mapped = memory->TryClampRangeSize(begin, want);
         VAddr grow_end = Common::AlignDown(begin + mapped, CACHING_PAGESIZE);
         if (mapped > cur && grow_end > end) {
