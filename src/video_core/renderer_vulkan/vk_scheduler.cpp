@@ -183,6 +183,10 @@ Scheduler::Scheduler(const Instance& instance, bool allow_recording_worker)
             LOG_INFO(Render_Vulkan, "q36: SHADPS4_LANE_DEFER_UPLOAD={} (lane uploads: protect + copy and the lane "
                      "submit on the LaneUpload FIFO; recording stays on the back)", e[0]);
         }
+        lane_wait_census = VideoCore::g_lane_wait_census && VideoCore::g_lane_seg_census;
+        if (lane_wait_census) {
+            LOG_INFO(Render_Vulkan, "q59: SHADPS4_LANE_WAIT_CENSUS=1 (frame label {:#x})", VideoCore::g_frame_label_addr);
+        }
         LOG_INFO(Render_Vulkan,
                  "AscLane: on (early ASC records inline on the back, queue 1 of family {}, no I1, "
                  "{} recording lanes)",
@@ -1176,6 +1180,9 @@ void Scheduler::SubmitExecutionAsync(SubmitInfo& info) {
         LaneCutForFlush(info);
     }
     const u64 signal_value = AdvanceTick();
+    if (lane_wait_census) [[unlikely]] {
+        batch_close_tsc[signal_value & 4095] = {signal_value, __rdtsc()}; // q59
+    }
     NoteAscAtFlush(signal_value);
     info.AddSignal(master_semaphore.Handle(), signal_value);
     // SHADPS4_SUBMIT_LOCK_SKIP=1: take the global submit lock for the overlay's texture uploads
@@ -1418,6 +1425,9 @@ void Scheduler::SubmitExecutionImpl(SubmitInfo& info) {
         }
     }
     const u64 signal_value = AdvanceTick();
+    if (lane_wait_census) [[unlikely]] {
+        batch_close_tsc[signal_value & 4095] = {signal_value, __rdtsc()}; // q59
+    }
     NoteAscAtFlush(signal_value);
     last_batch_draws = Rc().batch_draws;
     Rc().batch_draws = 0;
@@ -1587,6 +1597,9 @@ void Scheduler::SubmitExecutionLaneSync(SubmitInfo& info) {
         LaneCutForFlush(info);
     }
     const u64 signal_value = AdvanceTick();
+    if (lane_wait_census) [[unlikely]] {
+        batch_close_tsc[signal_value & 4095] = {signal_value, __rdtsc()}; // q59
+    }
     NoteAscAtFlush(signal_value);
     last_batch_draws = Rc().batch_draws;
     Rc().batch_draws = 0;
@@ -2196,7 +2209,69 @@ void Scheduler::LaneCopyCensus(u64 copy_value) {
     lane_copy_site_c.fill(0);
 }
 
+void Scheduler::LaneWaitCapture(u32 src, u32 site) {
+    // q59: the access behind the wait just raised (set by the LaneProbeWrite / LaneMainProducerFull call before it).
+    if (src == 2 && site >= 256 && site < 320) {
+        asc_wait_exact = VideoCore::g_lane_war_exact;
+        asc_wait_tsc = VideoCore::g_lane_war_tsc;
+    } else if (src == 0 || src == 1 || src == 5 || src == 6) {
+        asc_wait_exact = VideoCore::g_lc_hit_exact;
+        asc_wait_tsc = VideoCore::g_lc_hit_tsc;
+    } else {
+        asc_wait_exact = src == 2 ? 10 : src == 3 ? 11 : 12; // label fallback, gds, other
+        asc_wait_tsc = 0;
+    }
+}
+
+void Scheduler::LaneWaitResolve() {
+    // q59: waiting segments whose batch has closed: where the access sat in its batch (record time).
+    const u64 open = master_semaphore.CurrentTick();
+    while (lane_wait_r < lane_wait_w) {
+        const LaneWaitRec w = lane_wait_pend[lane_wait_r % lane_wait_pend.size()];
+        if (w.t >= open) {
+            break;
+        }
+        ++lane_wait_r;
+        ++lw_resolved;
+        ++lw_cls[std::min<u32>(w.exact, 15)];
+        ++lw_frame[std::min<u32>(w.frame, 3)];
+        const bool real = w.exact == 1 || w.exact == 8;
+        lw_real += real ? 1 : 0;
+        u32 pos = 5; // unknown
+        const auto& ce = batch_close_tsc[w.t & 4095];
+        if (w.tsc != 0 && ce.first == w.t && ce.second >= w.tsc) {
+            u64 bt = w.t; // the batch that recorded the access: close(bt - 1) < tsc <= close(bt)
+            for (u32 k = 0; k < 8 && bt > 1; ++k) {
+                const auto& pe = batch_close_tsc[(bt - 1) & 4095];
+                if (pe.first != bt - 1 || pe.second < w.tsc) {
+                    break;
+                }
+                --bt;
+            }
+            const auto& pe = batch_close_tsc[(bt - 1) & 4095];
+            const auto& be = batch_close_tsc[bt & 4095];
+            if (bt != w.t) {
+                pos = 4;
+            } else if (pe.first == bt - 1 && be.first == bt && be.second > pe.second) {
+                const double f = double(w.tsc - std::min(w.tsc, pe.second)) / double(be.second - pe.second);
+                pos = f < 0.25 ? 0 : f < 0.5 ? 1 : f < 0.75 ? 2 : 3;
+            }
+            lw_left_cyc += ce.second - w.tsc;
+            ++lw_left_n;
+        }
+        ++lw_pos[pos];
+        lw_real_cur_late += (real && w.frame == 2 && pos == 3) ? 1 : 0;
+        const u64 key = (u64{w.site} << 32) | (w.wid & 0xffffffffULL);
+        if (lw_pipe.size() < 4096 || lw_pipe.contains(key)) {
+            ++lw_pipe[key];
+        }
+    }
+}
+
 void Scheduler::LaneSegCensus(u64 wait_main, u64 value) {
+    if (lane_wait_census) [[unlikely]] {
+        LaneWaitResolve(); // q59
+    }
     // q26 E0: which site set each segment's final main wait, and whether that batch is still unfinished.
     lane_seg_ring[lane_seg_ring_pos++ % lane_seg_ring.size()] = {value, wait_main, asc_wait_site, asc_wait_wid}; // q33/q34
     ++lane_seg_n;
@@ -2208,6 +2283,22 @@ void Scheduler::LaneSegCensus(u64 wait_main, u64 value) {
         ++lane_site_c[std::min<u32>(asc_wait_site, 323)];
         if (asc_wait_site == 256 + 15) {
             ++lane_seg_h5[(asc_wait_wid >> 56) & 15]; // q35 H5
+        }
+        if (lane_wait_census) [[unlikely]] {
+            // q59: frame age of the waited batch vs the newest frame-end label batches the back recorded.
+            u8 frame = 3;
+            const u64 n = VideoCore::g_frame_end_n;
+            if (n >= 2) {
+                const u64 fe1 = VideoCore::g_frame_end_ticks[(n - 1) & 3];
+                const u64 fe2 = VideoCore::g_frame_end_ticks[(n - 2) & 3];
+                frame = wait_main <= fe2 ? 0 : wait_main <= fe1 ? 1 : 2;
+            }
+            if (lane_wait_w - lane_wait_r < lane_wait_pend.size()) {
+                lane_wait_pend[lane_wait_w++ % lane_wait_pend.size()] = {wait_main, asc_wait_tsc, asc_wait_wid,
+                                                                          asc_wait_site, asc_wait_exact, frame};
+            } else {
+                ++lw_dropped;
+            }
         }
     }
     const u64 now = __rdtsc();
@@ -2241,6 +2332,42 @@ void Scheduler::LaneSegCensus(u64 wait_main, u64 value) {
              "behind) | by site:{} | probe ReadAll by site:{} | probes {}",
              lane_seg_n, lane_seg_unf, lane_seg_unf ? double(lane_seg_behind) / double(lane_seg_unf) : 0.0, s, ra,
              VideoCore::g_lprobe_n.load(std::memory_order_relaxed));
+    if (lane_wait_census) {
+        std::vector<std::pair<u64, u64>> tp;
+        tp.reserve(lw_pipe.size());
+        for (const auto& [k, v] : lw_pipe) {
+            tp.emplace_back(v, k);
+        }
+        std::sort(tp.begin(), tp.end(), std::greater<>());
+        std::string ps;
+        for (size_t k = 0; k < std::min<size_t>(tp.size(), 10); ++k) {
+            const u32 site = static_cast<u32>(tp[k].second >> 32);
+            const u32 wid = static_cast<u32>(tp[k].second);
+            ps += site < 256   ? fmt::format(" [raw k{} {:08x} {}]", site, wid, tp[k].first)
+                  : site < 320 ? fmt::format(" [war s{} {:08x} {}]", site - 256, wid, tp[k].first)
+                               : fmt::format(" [{} {}]", site == 320 ? "label" : site == 321 ? "gds" : "other",
+                                             tp[k].first);
+        }
+        const auto& q = lw_cls;
+        LOG_INFO(Render_Vulkan,
+                 "q59 LaneWaitCensus (~5 s): waiting segments resolved {} (dropped {}) | frame age vs the frame-end "
+                 "label ({} seen): >=2 frames old {} previous frame {} current frame {} unknown {} | overlap: war exact "
+                 "{} / war window, no byte overlap {} / war older-tick floor {} / war ReadAll floor {} / war new or "
+                 "re-based probe {} / war list overflow {} / war grown probe {} / raw note {} / raw coarse {} / label "
+                 "fallback {} / gds {} / other {} / unknown {} | access position in its batch (record time) <25% {} "
+                 "25-50% {} 50-75% {} >=75% {} earlier batch {} unknown {} | record time from the access to the waited "
+                 "batch's close {:.3f} ms mean | real (byte / note overlap) {} of which current frame and >=75% into "
+                 "its batch {} | top (site, pipeline):{}",
+                 lw_resolved, lw_dropped, VideoCore::g_frame_end_n, lw_frame[0], lw_frame[1], lw_frame[2], lw_frame[3],
+                 q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8], q[9], q[10], q[11], q[12], q[0], lw_pos[0], lw_pos[1],
+                 lw_pos[2], lw_pos[3], lw_pos[4], lw_pos[5],
+                 lw_left_n ? double(lw_left_cyc) / double(lw_left_n) / 3.5e6 : 0.0, lw_real, lw_real_cur_late, ps);
+        lw_cls.fill(0);
+        lw_frame.fill(0);
+        lw_pos.fill(0);
+        lw_left_cyc = lw_left_n = lw_real = lw_real_cur_late = lw_resolved = lw_dropped = 0;
+        lw_pipe.clear();
+    }
     lane_seg_n = lane_seg_unf = lane_seg_behind = 0;
     lane_site_c.fill(0);
     VideoCore::g_lprobe_all_c.fill(0);

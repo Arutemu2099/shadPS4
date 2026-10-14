@@ -969,9 +969,19 @@ public:
             }
         }
         if (tick > asc_wait_main) {
+            const u32 prev_site = asc_wait_site; // q59
+            const u64 prev_wid = asc_wait_wid;
             asc_wait_main = tick;
             asc_wait_site = site; // q26 E0
             asc_wait_wid = wid;   // q34
+            if (lane_wait_census) [[unlikely]] {
+                if (src == 4) {
+                    asc_wait_site = prev_site; // q59: a carried wait keeps its cause
+                    asc_wait_wid = prev_wid;
+                } else {
+                    LaneWaitCapture(src, site);
+                }
+            }
             const bool on_open = tick >= open;
             ++lane_c[on_open ? 10 : 9];
             if (on_open) {
@@ -1224,6 +1234,26 @@ private:
     u64 asc_wait_main = 0;
     u32 asc_wait_site = 0; // q26 E0: the site that set asc_wait_main
     u64 asc_wait_wid = 0;  // q34: its stamping draw pipeline id (WAR s15)
+    // q59 SHADPS4_LANE_WAIT_CENSUS: overlap class and record tsc of the access behind asc_wait_main; when each main
+    // batch closed (record time); waiting segments kept until their batch closes; tallies.
+    bool lane_wait_census = false;
+    u8 asc_wait_exact = 0;
+    u64 asc_wait_tsc = 0;
+    std::array<std::pair<u64, u64>, 4096> batch_close_tsc{};
+    struct LaneWaitRec {
+        u64 t, tsc, wid;
+        u32 site;
+        u8 exact, frame;
+    };
+    std::array<LaneWaitRec, 2048> lane_wait_pend{};
+    u64 lane_wait_w = 0, lane_wait_r = 0;
+    std::array<u64, 16> lw_cls{};
+    std::array<u64, 4> lw_frame{};
+    std::array<u64, 6> lw_pos{};
+    u64 lw_left_cyc = 0, lw_left_n = 0, lw_real = 0, lw_real_cur_late = 0, lw_resolved = 0, lw_dropped = 0;
+    std::unordered_map<u64, u64> lw_pipe;
+    void LaneWaitCapture(u32 src, u32 site);
+    void LaneWaitResolve();
     std::unordered_map<u64, u64> lane_copy_wid_c; // q34
     std::array<u64, 16> lane_copy_h5{}, lane_seg_h5{}; // q35 H5: held s15 copies / waiting s15 segments by (class, flips)
     std::array<u64, 324> lane_site_c{};
