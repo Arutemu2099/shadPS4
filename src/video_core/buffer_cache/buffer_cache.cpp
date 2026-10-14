@@ -4829,8 +4829,7 @@ bool BufferCache::PublishFaultJob(FaultJob& job, bool guest_copied) {
     if (job.released) [[unlikely]] {
         // r20: the tracker was made CPU-valid when the read was let through; only the fresh
         // bytes are left to write - always (review BUG 2: a vote failing on a write elsewhere
-        // in the window would freeze the exposure). A copy a newer GPU write re-marked is
-        // skipped: the next read of it faults and downloads the newer bytes.
+        // in the window would freeze the exposure).
         if (!job.staging->is_coherent) {
             vmaInvalidateAllocation(instance.GetAllocator(), job.staging->buffer.allocation, 0,
                                     job.total_bytes);
@@ -4838,11 +4837,10 @@ bool BufferCache::PublishFaultJob(FaultJob& job, bool guest_copied) {
         const u8* const fresh = job.staging->mapped_data.data();
         auto* mem = Core::Memory::Instance();
         if (!guest_copied) {
+            // Every copy (re-check: the tracker's page bits are coarser than the 2.5 KB buffers,
+            // so a skip by page could drop these bytes for good). Safe: this job is settled and
+            // published before any later download of its window, which then writes newer bytes.
             for (const FaultCopy& copy : job.copies) {
-                if (memory_tracker->IsRegionGpuModified(copy.addr, copy.size)) {
-                    g_stale_n[2].fetch_add(1, std::memory_order_relaxed); // re-marked: skipped
-                    continue;
-                }
                 mem->TryWriteBackingDownload(std::bit_cast<u8*>(copy.addr),
                                              fresh + copy.staging_offset, copy.size);
             }
