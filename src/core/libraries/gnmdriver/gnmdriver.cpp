@@ -572,6 +572,49 @@ u64 ShaderHashNoAssert(u32 pgm) {
     return 0;
 }
 
+/// r5 (2026-10-14): SHADPS4_SHADER_HASH_MEMO=1 - a per-thread memo of ShaderHashNoAssert. The game
+/// binds per-object shader copies: the program address changed on 99.6% of Set/Update calls (s971r,
+/// rooftop: 25.3 M of 25.4 M), and each change scanned the code dword by dword (up to 64 KB) for the
+/// binary-info footer, on the job threads and Game:Main. An entry keeps the address, the footer's
+/// dword offset, the hash and the code's first 4 dwords; a hit re-checks both (the footer still
+/// valid with that hash, the code start unchanged), so new code at a reused address is rescanned.
+const bool g_shader_hash_memo = [] {
+    const char* v = std::getenv("SHADPS4_SHADER_HASH_MEMO");
+    return v && v[0] == '1';
+}();
+struct ShaderHashMemoEntry {
+    u32 pgm;
+    u32 off;
+    u64 hash;
+    std::array<u32, 4> head;
+};
+u64 ShaderHashMemo(u32 pgm) {
+    if (!g_shader_hash_memo || pgm == 0) {
+        return ShaderHashNoAssert(pgm);
+    }
+    static thread_local std::array<ShaderHashMemoEntry, 1024> memo{};
+    auto& e = memo[(pgm * 0x9E3779B1u) >> 22];
+    const auto* code = reinterpret_cast<const u32*>(u64{pgm} << 8);
+    if (e.pgm == pgm && e.off >= 4 && std::memcmp(code, e.head.data(), sizeof(e.head)) == 0) {
+        const auto* info = std::bit_cast<const AmdGpu::BinaryInfo*>(code + e.off);
+        if (info->Valid() && info->shader_hash == e.hash) {
+            return e.hash;
+        }
+    }
+    for (u32 i = 0; i < 0x4000; ++i) {
+        const auto* info = std::bit_cast<const AmdGpu::BinaryInfo*>(code + i);
+        if (info->Valid()) {
+            e.pgm = pgm;
+            e.off = i;
+            e.hash = info->shader_hash;
+            std::memcpy(e.head.data(), code, sizeof(e.head));
+            return e.hash;
+        }
+    }
+    e.pgm = 0;
+    return 0;
+}
+
 /// q47 (SHADPS4_NR_SHARDED=2): the three census counters per thread, folded into the shared ones
 /// every 4,096 calls (they were locked adds on one shared line by every job thread, per call).
 const bool g_draw_tag_local = [] {
@@ -600,7 +643,7 @@ inline void DrawTagShaderChange(u32 stage, const u32* regs) {
         } else {
             g_draw_tag_addr_changes.fetch_add(1, std::memory_order_relaxed);
         }
-        const u64 hash = ShaderHashNoAssert(pgm);
+        const u64 hash = ShaderHashMemo(pgm);
         if (hash != t_draw_tag_hash[stage]) {
             t_draw_tag_hash[stage] = hash;
             if (g_draw_tag_local) {
@@ -903,6 +946,13 @@ inline const bool g_nr_owner_inc = [] {
     const char* v = std::getenv("SHADPS4_NR_SHARDED");
     return v && v[0] == '2';
 }();
+/// r5 (2026-10-14): SHADPS4_NR_QUIET=1 - the NativeRec census counters (pure diagnostics, logged
+/// every 2^20 draws) are not counted at all: ShardedCounters::Ref::fetch_add was still 2.9% of the
+/// job threads' render-span samples (s949 / s971r: a TLS lookup + a call per counter, ~4-6 per draw).
+inline const bool g_nr_quiet = [] {
+    const char* v = std::getenv("SHADPS4_NR_QUIET");
+    return v && v[0] == '1';
+}();
 template <size_t N, int Tag>
 struct ShardedCounters {
     struct alignas(64) Shard {
@@ -927,6 +977,9 @@ struct ShardedCounters {
     struct Ref {
         size_t i;
         void fetch_add(u64 x, std::memory_order o = std::memory_order_relaxed) {
+            if (g_nr_quiet) {
+                return;
+            }
             auto& c = Local().v[i];
             if (g_nr_owner_inc) {
                 c.store(c.load(std::memory_order_relaxed) + x, std::memory_order_relaxed);
