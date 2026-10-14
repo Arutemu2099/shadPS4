@@ -674,6 +674,7 @@ struct GmCensus {
     // that call's return address = the step. Found once by a stack scan, then one read per sample.
     u64 loop_slot{}, loop_slot_finds{}, loop_misses{}, stack_lo{}, stack_hi{};
     std::unordered_map<u32, u64> steps; // step (eboot offset of the return address) -> samples
+    std::unordered_map<u32, u64> steps_host; // of those, samples with Game:Main's RIP in host code
     u64 step_samples{};
     std::atomic<u32> nthreads{0};
     std::array<void*, 16> threads{};
@@ -892,6 +893,11 @@ void MarkGameMainThread() {
                     std::scoped_lock lk{g_gm.rip_mutex};
                     ++g_gm.steps[step];
                     ++g_gm.step_samples;
+                    // 2026-10-14: emulator (host) samples per step - Game:Main's RIP outside guest
+                    // code (eboot / guest modules live at 0x800000000+): fault handling, HLE, waits.
+                    if (ctx.Rip < 0x800000000ULL || ctx.Rip >= 0x1000000000ULL) {
+                        ++g_gm.steps_host[step];
+                    }
                 }
                 const u64 rip = ctx.Rip;
                 u64 c1 = 0, c2 = 0;
@@ -1258,6 +1264,7 @@ void GameMainCensusMaybeLog() {
             return fmt::format("{}+{:#x}", name, addr - reinterpret_cast<u64>(mod));
         };
         std::vector<std::pair<u64, u32>> steps;
+        std::unordered_map<u32, u64> steps_host;
         u64 ns = 0, finds = 0, slot = 0, js = 0, ji = 0, jss = 0, jsi = 0;
         double busy_ms = 0, span_busy_ms = 0;
         std::vector<std::pair<u64, u64>> cls, cls_span;
@@ -1266,6 +1273,8 @@ void GameMainCensusMaybeLog() {
             for (const auto& [s, c] : g_gm.steps) {
                 steps.emplace_back(c, s);
             }
+            steps_host = g_gm.steps_host;
+            g_gm.steps_host.clear();
             ns = std::max<u64>(1, g_gm.step_samples);
             finds = g_gm.loop_slot_finds;
             slot = g_gm.loop_slot;
@@ -1301,6 +1310,14 @@ void GameMainCensusMaybeLog() {
             const double share = double(steps[i].first) / double(ns);
             ss += fmt::format(" {:#x}:{:.1f}%={:.2f}ms", steps[i].second, 100.0 * share, share * frame_ms);
         }
+        // 2026-10-14: the emulator (host-code) part of the top steps, ms per frame.
+        std::string hs;
+        for (size_t i = 0; i < std::min<size_t>(steps.size(), 12); ++i) {
+            const auto it = steps_host.find(steps[i].second);
+            const double h = it == steps_host.end() ? 0.0 : double(it->second) / double(ns);
+            hs += fmt::format(" {:#x}:{:.2f}ms", steps[i].second, h * frame_ms);
+        }
+        LOG_INFO(Render, "JobCensus steps host: emulator-code ms per frame inside each step:{}", hs);
         LOG_INFO(Render,
                  "JobCensus steps: window {:.1f}s fps {:.1f} | Game:Main main-loop steps (return address of "
                  "the loop's current call; 1 = loop body, 0 = not in the loop; share of wall = ms per "
