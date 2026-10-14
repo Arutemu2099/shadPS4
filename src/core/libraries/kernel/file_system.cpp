@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <map>
 #include <ranges>
 #include <magic_enum/magic_enum.hpp>
@@ -340,11 +341,23 @@ s64 PS4_SYSV_ABI sceKernelWrite(s32 fd, const void* buf, u64 nbytes) {
 
 static thread_local std::vector<u8> file_buf{};
 
+/// r5 (2026-10-14, notes/frame-hitches-2026-10-14.md): SHADPS4_READFILE_PROBE=1 - for reads of
+/// 1 MB or more, log the destination, the size and the ms spent invalidating (a GPU-written
+/// destination makes the invalidate download synchronously, inferred) and reading. Every single
+/// 75+ ms frame of play session 160900 fell within a second of a 10-33 MB city block pack read.
+static const bool g_readfile_probe = [] {
+    const char* v = std::getenv("SHADPS4_READFILE_PROBE");
+    return v && v[0] == '1';
+}();
+
 s64 ReadFile(Core::FileSys::File* file, void* buf, u64 nbytes) {
     const auto* memory = Core::Memory::Instance();
     // Invalidate up to the actual number of bytes that could be read.
     const auto remaining = file->GetSize() - file->Tell();
+    const bool probe = g_readfile_probe && nbytes >= (u64{1} << 20);
+    const auto t0 = probe ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     memory->InvalidateMemory(reinterpret_cast<VAddr>(buf), std::min<u64>(nbytes, remaining));
+    const auto t1 = probe ? std::chrono::steady_clock::now() : t0;
     if (file_buf.capacity() < nbytes) {
         file_buf.reserve(nbytes);
     }
@@ -353,6 +366,13 @@ s64 ReadFile(Core::FileSys::File* file, void* buf, u64 nbytes) {
         return bytes;
     }
     std::memcpy(buf, file_buf.data(), bytes);
+    if (probe) {
+        const auto t2 = std::chrono::steady_clock::now();
+        LOG_INFO(Kernel_Fs, "ReadFileProbe: dst {:#x} size {} KB invalidate {:.2f} ms read+copy {:.2f} ms",
+                 reinterpret_cast<VAddr>(buf), nbytes >> 10,
+                 std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                 std::chrono::duration<double, std::milli>(t2 - t1).count());
+    }
     return bytes;
 }
 
