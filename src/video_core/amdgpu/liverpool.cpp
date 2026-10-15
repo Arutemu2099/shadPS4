@@ -224,7 +224,7 @@ static const bool g_claim_wake = [] {
 /// (bigger / set-associative worker memos) and vk_a2.cpp (sub-batch growth, fence queues).
 static const bool g_lean_perdraw = [] {
     const char* v = std::getenv("SHADPS4_LEAN_PERDRAW");
-    return v != nullptr && v[0] == '1';
+    return v != nullptr && (((v[0] - '0') & 2) != 0); // bit 2: allocation reuse (s2 screen: =1 both halved FPS)
 }();
 static const u64 g_claim_spin_ticks = [] {
     const char* v = std::getenv("SHADPS4_CLAIM_SPIN_US");

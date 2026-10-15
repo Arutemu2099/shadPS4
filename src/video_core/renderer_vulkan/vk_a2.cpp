@@ -513,7 +513,7 @@ constexpr u32 WorkerRecMask = WorkerRecSize - 1;
 static bool LeanPerDrawOn() {
     static const bool on = [] {
         const char* e = std::getenv("SHADPS4_LEAN_PERDRAW");
-        return e && e[0] == '1';
+        return e && (((e[0] - '0') & 2) != 0); // bit 2 (s2 screen: L3 translate 1.35 -> 6.09 us per draw)
     }();
     return on;
 }
