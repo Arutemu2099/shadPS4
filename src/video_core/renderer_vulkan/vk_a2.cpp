@@ -509,7 +509,7 @@ constexpr u32 WorkerRecBits = 15;
 constexpr u32 WorkerRecSize = 1u << WorkerRecBits; ///< records per translator (~23 MB)
 constexpr u32 WorkerRecMask = WorkerRecSize - 1;
 
-/// SHADPS4_LEAN_PERDRAW=1 (2026-10-15; also read by liverpool.cpp and lean_parse.cpp): the
+/// SHADPS4_LEAN_PERDRAW bit 2 (2026-10-15; also read by liverpool.cpp and lean_parse.cpp): the
 /// translator's per-stretch container costs - a stretch's sub-batch list starts at a recent
 /// high-water mark (8..16) and doubles when full (the 1.5x growth moved every SubBatch, ~3 KB
 /// each, again at 12, 18, 27, ...), and the arena / record fence queues pop their front in O(1)
@@ -533,7 +533,7 @@ static bool LeanFencePopOn() {
     return on;
 }
 
-/// LeanPerDrawOn: pops a fence queue's front. The popped entry drops its tick reference now (as
+/// LeanFencePopOn: pops a fence queue's front. The popped entry drops its tick reference now (as
 /// erase did); the dead prefix is erased once it is at least half the vector (amortized O(1)).
 /// `head` is the queue's first live entry (0 forever with the flag off).
 template <typename Fences>

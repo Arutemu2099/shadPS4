@@ -218,7 +218,7 @@ static const bool g_claim_wake = [] {
     const char* v = std::getenv("SHADPS4_CLAIM_WAKE");
     return v != nullptr && v[0] == '1';
 }();
-/// SHADPS4_LEAN_PERDRAW=1 (2026-10-15): lean-worker per-draw costs. Here: a finished stretch's
+/// SHADPS4_LEAN_PERDRAW bit 2 or 4 (2026-10-15): lean-worker per-draw costs. Here: a finished stretch's
 /// register deltas SWAP with its xl_side slot's previous vectors instead of moving out (the
 /// worker's vectors keep their capacity; no allocation per stretch). Also read by lean_parse.cpp
 /// (bigger / set-associative worker memos) and vk_a2.cpp (sub-batch growth, fence queues).

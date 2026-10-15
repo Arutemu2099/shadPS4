@@ -117,8 +117,8 @@ struct Arena {
         std::shared_ptr<std::atomic<u64>> tick;
     };
     std::vector<Fence> fences;
-    /// SHADPS4_LEAN_PERDRAW: index of the first live entry of `fences` (popped in O(1); the dead
-    /// prefix is erased in bulk). Stays 0 with the flag off.
+    /// SHADPS4_LEAN_PERDRAW bit 2 or 8: index of the first live entry of `fences` (popped in O(1);
+    /// the dead prefix is erased in bulk). Stays 0 with those bits off.
     size_t fence_head{};
 };
 
