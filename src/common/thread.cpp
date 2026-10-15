@@ -464,8 +464,9 @@ void ApplyHelperThreadPlacement(const char* name) {
     } else if (mode == 2) {
         ok = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     }
-    LOG_INFO(Common, "SHADPS4_HELPER_PLACE={}: {} ({} efficiency logical processors), ok {}", mode,
-             name, n, ok);
+    LOG_INFO(Common, "{}={}: {} ({} efficiency logical processors), ok {}",
+             std::getenv("SHADPS4_HELPER_PLACE") ? "SHADPS4_HELPER_PLACE" : "SHADPS4_POOL_AUTO helper mode",
+             mode, name, n, ok);
 }
 
 void ApplyCommandProcessorPlacement() {

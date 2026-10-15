@@ -39,18 +39,25 @@ namespace {
 /// lock word (std::atomic::wait = WaitOnAddress) until the holder's unlock wakes it. Measured
 /// 2026-10-15 (4c/8t, s1166): guest job threads spent 25% of their wall time in lock() on region
 /// locks; a preempted holder left the waiters spinning whole quanta on the cores it needed.
-/// Read once, on first use (a function-local static: no static-init-order window in which a
-/// lock could be taken in one mode and released in the other).
-unsigned ParkSpins() {
-    static const unsigned spins = [] {
-        const char* value = std::getenv("SHADPS4_SPINLOCK_PARK");
-        if (value == nullptr || value[0] == '0' || value[0] == '\0') {
-            return 0u;
-        }
+/// Read on first use and cached in a plain atomic (review 10-15: a function-local static's guard
+/// on ~100k unlocks per frame is not free). Every thread computes the same value, so the race to
+/// fill it is harmless, and no lock can be taken in one mode and released in the other.
+std::atomic<unsigned> g_park_spins{~0u};
+
+unsigned ReadParkSpins() {
+    const char* value = std::getenv("SHADPS4_SPINLOCK_PARK");
+    unsigned spins = 0;
+    if (value != nullptr && value[0] != '0' && value[0] != '\0') {
         const unsigned long n = std::strtoul(value, nullptr, 10);
-        return n <= 1 ? 512u : static_cast<unsigned>(n > 1u << 20 ? 1u << 20 : n);
-    }();
+        spins = n <= 1 ? 512u : static_cast<unsigned>(n > 1u << 20 ? 1u << 20 : n);
+    }
+    g_park_spins.store(spins, std::memory_order_relaxed);
     return spins;
+}
+
+inline unsigned ParkSpins() {
+    const unsigned spins = g_park_spins.load(std::memory_order_relaxed);
+    return spins != ~0u ? spins : ReadParkSpins();
 }
 
 } // Anonymous namespace
