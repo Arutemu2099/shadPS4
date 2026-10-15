@@ -98,6 +98,13 @@ bool EnvFlag(const char* name) {
     return v && v[0] == '1';
 }
 
+/// SHADPS4_LEAN_PERDRAW=1 (2026-10-15; also read by liverpool.cpp and vk_a2.cpp): the worker's
+/// lookup memo becomes 4-way set-associative (256 sets, LRU; one render state may keep several
+/// specializations) and its program-Info and fetch-shader caches grow 8x - fewer LookupGraphics /
+/// ProgramInfoFor calls (shared lock) and fetch-shader decodes per draw. Every hit keeps today's
+/// validation (memo: full state + epoch + both guards; Info: the hash; fetch: the code words).
+const bool g_lean_perdraw = EnvFlag("SHADPS4_LEAN_PERDRAW");
+
 /// Liverpool::JournalField: the field's word offset inside the register file.
 template <typename T>
 u32 FieldWordOffset(const Regs& regs, const T& field) {
@@ -189,11 +196,13 @@ struct Parser::Caches {
     u64 span_gen{~u64{0}};
     // Program Infos by shader hash (non-null ProgramInfoFor results; graphics programs are never
     // erased from the program cache and a retired one stays alive in retired_programs).
+    // The three tables below are vectors sized once in the constructor (powers of two; indexed
+    // with size() - 1 as the mask): 256 / 64 / 128 entries, SHADPS4_LEAN_PERDRAW 2048 / 512 / 1024.
     struct InfoEnt {
         u64 hash{};
         const Shader::Info* info{};
     };
-    std::array<InfoEnt, 256> info{};
+    std::vector<InfoEnt> info;
     struct Hdr {
         VAddr code{};
         u32 off{};
@@ -205,7 +214,7 @@ struct Parser::Caches {
         std::vector<u32> words;
         std::vector<std::pair<u32, u32>> attrs; ///< (V# pointer sgpr, dword offset)
     };
-    std::array<Fetch, 64> fetch{};
+    std::vector<Fetch> fetch;
     struct Memo {
         bool valid{};
         Vulkan::PreparedGraphicsState state{};
@@ -217,8 +226,12 @@ struct Parser::Caches {
         const Shader::Info* fs_shared{};
         const Shader::Info* vs_shared{};
         vk::ShaderModule fs_module{}, vs_module{};
+        u64 last_use{}; ///< SHADPS4_LEAN_PERDRAW: memo_clock at the last hit or store (LRU way)
     };
-    std::array<Memo, 128> memo{};
+    /// Direct-mapped (128), or SHADPS4_LEAN_PERDRAW: MemoSets sets of MemoWays ways.
+    static constexpr u32 MemoSets = 256, MemoWays = 4;
+    std::vector<Memo> memo;
+    u64 memo_clock{};
     u64 memo_hits_total{};
     // Phase ticks / counts since the last FlushPhases.
     u64 prewalk{}, lookup{}, derive{}, emit{}, draws{};
@@ -293,6 +306,10 @@ bool Parser::MappedFast(VAddr addr, u64 size) const {
 
 Parser::Parser(const Env& env_) : env{env_} {
     caches = std::make_unique<Caches>();
+    caches->info.resize(g_lean_perdraw ? 2048 : 256);
+    caches->fetch.resize(g_lean_perdraw ? 512 : 64);
+    caches->memo.resize(g_lean_perdraw ? size_t{Caches::MemoSets} * Caches::MemoWays : 128);
+    static_assert(std::has_single_bit(Caches::MemoSets));
     // The whole parser is off when the front would take a path this file does not mirror:
     //  - split_verify: EmitDraw's periodic synchronous VERIFY draw and the snapshot block;
     //  - !split_run_ahead (depth 0): every draw record syncs;
@@ -369,40 +386,72 @@ Stop Parser::DecideDraw(const PM4Header* header, std::span<const u32> dcb, u32 o
             Caches::Memo* memo = nullptr;
             bool verify_hit = false;
             if (memo_ok) {
-                memo = &cc.memo[pstate.Hash() % cc.memo.size()];
-                if (memo->valid && memo->state == pstate &&
-                    memo->epoch == env.pipeline_cache->PreparedEpoch()) {
-                    // Refresh the private Infos with THIS draw, then the guards.
+                // Refresh a memo's private Infos with THIS draw, then its guards.
+                const auto matches = [&](Caches::Memo& m) {
                     const auto refresh = [&](Shader::Info& info, u32 i, const auto& sh) {
                         info.user_data = sh.user_data;
                         info.flattened_ud_buf = scratch->pre_flat[i];
                         info.pgm_base = scratch->pre_params[i]->Base();
                     };
-                    refresh(*memo->fs_info, fsi, regs.ps_program);
-                    refresh(*memo->vs_info, vsi, regs.vs_program);
-                    if (memo->fs_guard.MatchesInputs(*memo->fs_info) &&
-                        memo->vs_guard.MatchesInputs(*memo->vs_info)) {
-                        ++cc.memo_hit;
-                        verify_hit = (++cc.memo_hits_total & 63) == 0;
-                        if (!verify_hit) {
-                            plan.draw.pipeline = memo->pipeline;
-                            scratch->Reset();
-                            const auto fill = [&](u32 i, const Shader::Info* shared,
-                                                  const Shader::Info& priv, vk::ShaderModule mod) {
-                                auto& slot = scratch->stages[i];
-                                slot.info = shared;
-                                slot.pgm_base = priv.pgm_base;
-                                slot.user_data.assign(priv.user_data.begin(), priv.user_data.end());
-                                slot.flattened_ud_buf = priv.flattened_ud_buf;
-                                slot.module = mod;
-                            };
-                            fill(fsi, memo->fs_shared, *memo->fs_info, memo->fs_module);
-                            fill(vsi, memo->vs_shared, *memo->vs_info, memo->vs_module);
-                            scratch->fetch_shader = memo->fetch;
-                            scratch->pipeline = memo->pipeline;
-                            scratch->prewalked = false;
-                            goto looked_up;
+                    refresh(*m.fs_info, fsi, regs.ps_program);
+                    refresh(*m.vs_info, vsi, regs.vs_program);
+                    return m.fs_guard.MatchesInputs(*m.fs_info) &&
+                           m.vs_guard.MatchesInputs(*m.vs_info);
+                };
+                bool hit = false;
+                if (g_lean_perdraw) {
+                    // The set of this state: a way hits under exactly the direct-mapped rule
+                    // (valid, same epoch, same state, both guards). On a miss `memo` is the
+                    // way the store below fills: a dead one (invalid / older epoch), else the
+                    // least recently used.
+                    const u64 epoch = env.pipeline_cache->PreparedEpoch();
+                    Caches::Memo* set = &cc.memo[(pstate.Hash() & (Caches::MemoSets - 1)) *
+                                                 Caches::MemoWays];
+                    Caches::Memo* victim = set;
+                    for (u32 w = 0; w < Caches::MemoWays; ++w) {
+                        Caches::Memo& m = set[w];
+                        const bool live = m.valid && m.epoch == epoch;
+                        if (live && m.state == pstate && matches(m)) {
+                            memo = &m;
+                            hit = true;
+                            break;
                         }
+                        const bool victim_live = victim->valid && victim->epoch == epoch;
+                        if (!live ? victim_live : (victim_live && m.last_use < victim->last_use)) {
+                            victim = &m;
+                        }
+                    }
+                    if (hit) {
+                        memo->last_use = ++cc.memo_clock;
+                    } else {
+                        memo = victim;
+                    }
+                } else {
+                    memo = &cc.memo[pstate.Hash() & (cc.memo.size() - 1)];
+                    hit = memo->valid && memo->state == pstate &&
+                          memo->epoch == env.pipeline_cache->PreparedEpoch() && matches(*memo);
+                }
+                if (hit) {
+                    ++cc.memo_hit;
+                    verify_hit = (++cc.memo_hits_total & 63) == 0;
+                    if (!verify_hit) {
+                        plan.draw.pipeline = memo->pipeline;
+                        scratch->Reset();
+                        const auto fill = [&](u32 i, const Shader::Info* shared,
+                                              const Shader::Info& priv, vk::ShaderModule mod) {
+                            auto& slot = scratch->stages[i];
+                            slot.info = shared;
+                            slot.pgm_base = priv.pgm_base;
+                            slot.user_data.assign(priv.user_data.begin(), priv.user_data.end());
+                            slot.flattened_ud_buf = priv.flattened_ud_buf;
+                            slot.module = mod;
+                        };
+                        fill(fsi, memo->fs_shared, *memo->fs_info, memo->fs_module);
+                        fill(vsi, memo->vs_shared, *memo->vs_info, memo->vs_module);
+                        scratch->fetch_shader = memo->fetch;
+                        scratch->pipeline = memo->pipeline;
+                        scratch->prewalked = false;
+                        goto looked_up;
                     }
                 }
                 ++cc.memo_miss;
@@ -466,8 +515,18 @@ Stop Parser::DecideDraw(const PM4Header* header, std::span<const u32> dcb, u32 o
                 memo->fetch = scratch->fetch_shader;
                 memo->fs_guard = scratch->guards[fsi];
                 memo->vs_guard = scratch->guards[vsi];
-                memo->fs_info = std::make_unique<Shader::Info>(*scratch->guard_views[fsi]);
-                memo->vs_info = std::make_unique<Shader::Info>(*scratch->guard_views[vsi]);
+                if (g_lean_perdraw && memo->fs_info && memo->vs_info) {
+                    // Copy-assign into the evicted entry's private Infos (their vectors keep
+                    // their capacity), as GraphicsLookupScratch::View refreshes a view.
+                    *memo->fs_info = *scratch->guard_views[fsi];
+                    *memo->vs_info = *scratch->guard_views[vsi];
+                } else {
+                    memo->fs_info = std::make_unique<Shader::Info>(*scratch->guard_views[fsi]);
+                    memo->vs_info = std::make_unique<Shader::Info>(*scratch->guard_views[vsi]);
+                }
+                if (g_lean_perdraw) {
+                    memo->last_use = ++cc.memo_clock;
+                }
                 memo->fs_shared = scratch->stages[fsi].info;
                 memo->vs_shared = scratch->stages[vsi].info;
                 memo->fs_module = scratch->stages[fsi].module;
@@ -1452,7 +1511,7 @@ bool Parser::FetchOk(const Shader::Info& info, std::span<const u32> ud) const {
         const VAddr base = (u64{ud[sgpr]} | (u64{ud[sgpr + 1u]} << 32)) & 0xFFFFFFFFFFFFull;
         return ReadOk(base + u64{dword_offset} * 4, sizeof(AmdGpu::Buffer), 2);
     };
-    auto& fc = cc.fetch[(code >> 4) % cc.fetch.size()];
+    auto& fc = cc.fetch[(code >> 4) & (cc.fetch.size() - 1)];
     if (fc.code == code && !fc.words.empty() && ReadOk(code, fc.words.size() * 4, 6) &&
         std::memcmp(reinterpret_cast<const void*>(code), fc.words.data(), fc.words.size() * 4) == 0) {
         // Validated hit: the same instruction words (incl. the terminating S_SETPC_B64).
@@ -1593,7 +1652,7 @@ bool Parser::Prewalk(const Regs& regs) {
             .hash = bin->shader_hash,
         };
         sc.pre_params[out_idx] = params;
-        auto& ie = cc.info[(params.hash ^ (params.hash >> 23)) % cc.info.size()];
+        auto& ie = cc.info[(params.hash ^ (params.hash >> 23)) & (cc.info.size() - 1)];
         const Shader::Info* info = ie.info != nullptr && ie.hash == params.hash ? ie.info : nullptr;
         if (!info) {
             ++cc.info_lock;
