@@ -517,7 +517,18 @@ constexpr u32 WorkerRecMask = WorkerRecSize - 1;
 static bool LeanPerDrawOn() {
     static const bool on = [] {
         const char* e = std::getenv("SHADPS4_LEAN_PERDRAW");
-        return e && (((e[0] - '0') & 2) != 0); // bit 2 (s2 screen: L3 translate 1.35 -> 6.09 us per draw)
+        return e && ((std::strtoul(e, nullptr, 10) & 2) != 0); // bit 2 (s2 screen: L3 translate 1.35 -> 6.09 us per draw)
+    }();
+    return on;
+}
+
+/// SHADPS4_LEAN_PERDRAW bit 8 (2026-10-15 evening; bit 2 includes it): only the O(1) fence queue
+/// pops, without the sub-batch reserve (the s2 screen's inferred cause). The value is a decimal
+/// bit mask (liverpool.cpp: 1 memos, 2 every allocation part, 4 the register-delta swap).
+static bool LeanFencePopOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("SHADPS4_LEAN_PERDRAW");
+        return e && ((std::strtoul(e, nullptr, 10) & (2 | 8)) != 0);
     }();
     return on;
 }
@@ -677,7 +688,8 @@ struct StretchTranslator::Impl {
     bool enabled{};
     bool colour_on{}; ///< colour draws may be taken (SHADPS4_NATIVE_COLOUR=1, no diag 1 / 4096)
     bool cmd_warned{};
-    const bool perdraw{LeanPerDrawOn()}; ///< SHADPS4_LEAN_PERDRAW
+    const bool perdraw{LeanPerDrawOn()}; ///< SHADPS4_LEAN_PERDRAW bit 2 (sub-batch growth)
+    const bool fence_pop{LeanFencePopOn()}; ///< SHADPS4_LEAN_PERDRAW bit 2 or 8 (O(1) fence pops)
     u32 batch_hint{8}; ///< perdraw: the next stretch's sub-batch reserve (decaying high-water mark)
     u64 align{256};
     u64 region_bytes{};
@@ -746,7 +758,7 @@ struct StretchTranslator::Impl {
         std::shared_ptr<std::atomic<u64>> tick;
     };
     std::vector<RecFence> rec_fences;
-    size_t rec_fence_head{}; ///< first live rec_fences entry (perdraw; 0 otherwise)
+    size_t rec_fence_head{}; ///< first live rec_fences entry (fence_pop; 0 otherwise)
     /// True if entry rec_head may be written now (never waits).
     bool RecReserve();
     /// r9 census (this translator): records written, verify compares, mismatching records by
@@ -860,7 +872,7 @@ bool StretchTranslator::Impl::AllocRegion(u64 bytes, u64& start, u64& masked_off
         const u64 reuse_below = end - ar.size;
         u64 known = 0;
         bool known_read = false;
-        size_t& head = ar.fence_head; // 0 forever unless perdraw: [0] is the front
+        size_t& head = ar.fence_head; // 0 forever unless fence_pop: [0] is the front
         while (head < ar.fences.size() && ar.fences[head].start < reuse_below) {
             const u64 tick = ar.fences[head].tick->load(std::memory_order_acquire);
             if (tick == 0) {
@@ -873,7 +885,7 @@ bool StretchTranslator::Impl::AllocRegion(u64 bytes, u64& start, u64& masked_off
             if (known < tick) {
                 return false; // the GPU has not passed it (the back refreshes the tick)
             }
-            if (perdraw) {
+            if (fence_pop) {
                 PopFenceFront(ar.fences, head);
             } else {
                 ar.fences.erase(ar.fences.begin());
@@ -898,7 +910,7 @@ bool StretchTranslator::Impl::RecReserve() {
     }
     u64 known = 0;
     bool known_read = false;
-    size_t& head = rec_fence_head; // 0 forever unless perdraw: [0] is the front
+    size_t& head = rec_fence_head; // 0 forever unless fence_pop: [0] is the front
     while (head < rec_fences.size() && rec_fences[head].start < reuse_below) {
         const u64 tick = rec_fences[head].tick->load(std::memory_order_acquire);
         if (tick == 0) {
@@ -911,7 +923,7 @@ bool StretchTranslator::Impl::RecReserve() {
         if (known < tick) {
             return false; // the GPU has not passed that stretch
         }
-        if (perdraw) {
+        if (fence_pop) {
             PopFenceFront(rec_fences, head);
         } else {
             rec_fences.erase(rec_fences.begin());

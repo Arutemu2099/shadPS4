@@ -104,9 +104,9 @@ bool EnvFlag(const char* name) {
 /// specializations) and its program-Info and fetch-shader caches grow 8x - fewer LookupGraphics /
 /// ProgramInfoFor calls (shared lock) and fetch-shader decodes per draw. Every hit keeps today's
 /// validation (memo: full state + epoch + both guards; Info: the hash; fetch: the code words).
-const bool g_lean_perdraw = [] { // bit 1: the bigger worker memos
+const bool g_lean_perdraw = [] { // bit 1: the bigger worker memos (the value is a decimal bit mask)
     const char* v = std::getenv("SHADPS4_LEAN_PERDRAW");
-    return v != nullptr && (((v[0] - '0') & 1) != 0);
+    return v != nullptr && ((std::strtoul(v, nullptr, 10) & 1) != 0);
 }();
 
 /// Liverpool::JournalField: the field's word offset inside the register file.

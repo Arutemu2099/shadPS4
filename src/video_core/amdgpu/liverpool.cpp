@@ -222,9 +222,11 @@ static const bool g_claim_wake = [] {
 /// register deltas SWAP with its xl_side slot's previous vectors instead of moving out (the
 /// worker's vectors keep their capacity; no allocation per stretch). Also read by lean_parse.cpp
 /// (bigger / set-associative worker memos) and vk_a2.cpp (sub-batch growth, fence queues).
+/// The value is a decimal bit mask: 1 memos, 2 every allocation part (s2 screen: =3 halved FPS,
+/// inferred from the sub-batch reserve), 4 this swap alone, 8 the fence queues alone (vk_a2.cpp).
 static const bool g_lean_perdraw = [] {
     const char* v = std::getenv("SHADPS4_LEAN_PERDRAW");
-    return v != nullptr && (((v[0] - '0') & 2) != 0); // bit 2: allocation reuse (s2 screen: =1 both halved FPS)
+    return v != nullptr && ((std::strtoul(v, nullptr, 10) & (2 | 4)) != 0);
 }();
 static const u64 g_claim_spin_ticks = [] {
     const char* v = std::getenv("SHADPS4_CLAIM_SPIN_US");
