@@ -259,6 +259,9 @@ static void* RunThread(void* arg) {
     g_curthread = curthread;
     Common::SetCurrentThreadName(curthread->name.c_str());
     Common::FaultMonitor::NoteGuestThread(curthread->name.c_str());
+#ifdef _WIN32
+    Common::ApplyGuestThreadPlacement(GetCurrentThread(), curthread->name.c_str());
+#endif
     DebugState.AddCurrentThreadToGuestList();
     Core::InitializeTLS();
 
@@ -505,6 +508,8 @@ int PS4_SYSV_ABI posix_pthread_rename_np(PthreadT thread, const char* name) {
         thread->name = name ? name : std::string{""};
         Common::SetThreadName(reinterpret_cast<void*>(thread->native_thr.GetHandle()),
                               thread->name.data());
+        Common::ApplyGuestThreadPlacement(reinterpret_cast<void*>(thread->native_thr.GetHandle()),
+                                          thread->name.c_str());
         if (name && False(thread->attr.flags & PthreadAttrFlags::StackUser)) {
             VAddr stack_addr = std::bit_cast<VAddr>(thread->attr.stackaddr_attr);
             memory->NameVirtualRange(stack_addr, thread->attr.stacksize_attr, name);
@@ -525,6 +530,8 @@ int PS4_SYSV_ABI posix_pthread_rename_np(PthreadT thread, const char* name) {
         thread->name = name ? name : std::string{""};
         Common::SetThreadName(reinterpret_cast<void*>(thread->native_thr.GetHandle()),
                               thread->name.data());
+        Common::ApplyGuestThreadPlacement(reinterpret_cast<void*>(thread->native_thr.GetHandle()),
+                                          thread->name.c_str());
         if (name && False(thread->attr.flags & PthreadAttrFlags::StackUser)) {
             VAddr stack_addr = std::bit_cast<VAddr>(thread->attr.stackaddr_attr);
             memory->NameVirtualRange(stack_addr, thread->attr.stacksize_attr, name);

@@ -53,6 +53,13 @@ std::string GetCurrentThreadName();
 /// THREAD_PRIORITY_HIGHEST; =2 additionally restricts it to the performance cores (highest CPU
 /// set efficiency class). Default off. Windows only; call on the thread itself.
 void ApplyCommandProcessorPlacement();
+/// SHADPS4_GUEST_PCORE=<mask> (2026-10-15, notes/gamemain-saturation-2026-10-15.md): bit 0 the game's
+/// JobWorker* threads, bit 1 Game:Main get every performance logical processor (minus reserved
+/// cores) as selected CPU sets and power throttling off. Called with the thread's handle and name.
+void ApplyGuestThreadPlacement(void* handle, const char* name);
+/// SHADPS4_HELPER_PLACE=<n> (2026-10-15): emulator helper threads (lean / A2 workers); 1 = the
+/// efficiency cores as selected CPU sets, 2 = THREAD_PRIORITY_BELOW_NORMAL. Call on the thread.
+void ApplyHelperThreadPlacement(const char* name);
 /// SHADPS4_HOT_CORES=<mask> (default 0): bit 0 gives the Vulkan recording worker, bit 1 the CP
 /// front thread a whole performance core each (the two before the one SHADPS4_CP_QOS=3 gives the
 /// CP back); the rest of the process is kept off those cores. Measured 2026-10-01 without it: the

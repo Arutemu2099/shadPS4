@@ -209,7 +209,75 @@ static const bool g_a2_park = [] {
     const char* v = std::getenv("SHADPS4_A2_PARK");
     return v != nullptr && v[0] == '1';
 }();
+/// SHADPS4_CLAIM_WAKE=1 (2026-10-15, notes/gamemain-saturation-2026-10-15.md sec. 5): an A2 or
+/// lean worker waiting for the DCB index it claimed spins at most SHADPS4_CLAIM_SPIN_US
+/// (default 2 us) and then sleeps on a bell only that index's publication rings. Off: 2,048
+/// pauses (~80 us) per claim and every parked worker woken per DCB (s1100: six A2 workers used
+/// 0.89 cores for 33 ms/s of translation).
+static const bool g_claim_wake = [] {
+    const char* v = std::getenv("SHADPS4_CLAIM_WAKE");
+    return v != nullptr && v[0] == '1';
+}();
+static const u64 g_claim_spin_ticks = [] {
+    const char* v = std::getenv("SHADPS4_CLAIM_SPIN_US");
+    const u64 us = v ? std::strtoull(v, nullptr, 10) : 2;
+    if (!g_claim_wake) {
+        return u64{0};
+    }
+    // TSC ticks per us, measured once against the steady clock (~5 ms at startup).
+    using Clock = std::chrono::steady_clock;
+    const auto c0 = Clock::now();
+    const u64 t0 = __rdtsc();
+    auto c1 = c0;
+    do {
+        c1 = Clock::now();
+    } while (c1 - c0 < std::chrono::milliseconds(5));
+    const double ns = double(std::chrono::duration_cast<std::chrono::nanoseconds>(c1 - c0).count());
+    const double per_us = double(__rdtsc() - t0) / (ns / 1000.0);
+    return static_cast<u64>(per_us * double(us));
+}();
 namespace {
+/// SHADPS4_CLAIM_WAKE: per-index wake slots of a claim counter. The publisher stores the index
+/// it published into its slot after the counter, so a waiter that read the slot before that
+/// store wakes on the change, and one that read it after sees the counter (release / acquire
+/// on the slot). Waiters on indices 16 apart share a slot (a spurious wake, re-checked).
+struct ClaimBells {
+    struct alignas(64) Bell {
+        std::atomic<u32> v{0};
+    };
+    std::array<Bell, 16> b{};
+    void Ring(u32 idx) {
+        auto& x = b[idx & 15].v;
+        x.store(idx, std::memory_order_release);
+        x.notify_all();
+    }
+    void RingAll() {
+        for (auto& x : b) {
+            x.v.fetch_add(1, std::memory_order_acq_rel);
+            x.v.notify_all();
+        }
+    }
+    /// Waits until `published` >= idx; false when `stopping()` turned true first.
+    template <class Stop>
+    bool Wait(const std::atomic<u32>& published, u32 idx, Stop&& stopping) {
+        const u64 t0 = __rdtsc();
+        while (published.load(std::memory_order_acquire) < idx) {
+            if (stopping()) {
+                return false;
+            }
+            if (__rdtsc() - t0 < g_claim_spin_ticks) {
+                _mm_pause();
+                continue;
+            }
+            auto& x = b[idx & 15].v;
+            const u32 seen = x.load(std::memory_order_acquire);
+            if (published.load(std::memory_order_acquire) < idx && !stopping()) {
+                x.wait(seen, std::memory_order_acquire);
+            }
+        }
+        return true;
+    }
+};
 constexpr u32 A2Slots = 256;
 /// Stretches one DCB can hand over (more: the rest of the DCB runs on the old path, counted).
 constexpr u32 A2MaxStretches = 128;
@@ -264,6 +332,7 @@ struct A2State {
     std::array<A2Entry, A2Slots> e;
     alignas(64) std::atomic<u32> next_claim{1};
     alignas(64) std::atomic<u32> begun{0};     ///< newest index the front began (monotonic)
+    ClaimBells bells;                           ///< SHADPS4_CLAIM_WAKE: wakes for `begun`
     alignas(64) std::atomic<u32> published{0}; ///< newest index the front completed (diagnostics)
     alignas(64) std::atomic<bool> stop{false};
     std::atomic<u64> worker_cyc{0}, worker_dcbs{0}, worker_draws{0}; ///< worker-side totals
@@ -1325,6 +1394,7 @@ struct LeanState {
     std::array<LeanJob, LeanSlots> jobs;
     std::atomic<u32> next_claim{1};
     alignas(64) std::atomic<u32> queued{0}; ///< newest DCB index handed to the workers
+    ClaimBells bells;                        ///< SHADPS4_CLAIM_WAKE: wakes for `queued`
     std::atomic<bool> stop{false};
     std::vector<std::jthread> workers;
     bool started{};
@@ -1351,6 +1421,14 @@ struct LeanState {
     std::unique_ptr<Lean::Parser> toucher; ///< front: L2 Pretouch before the exclusive lookup
 };
 LeanState g_lean_s;
+/// After `queued` advanced to idx: wake its claimer (SHADPS4_CLAIM_WAKE) or every waiter.
+inline void LeanRing(LeanState& s, u32 idx) {
+    if (g_claim_wake) {
+        s.bells.Ring(idx);
+    } else {
+        s.queued.notify_all();
+    }
+}
 /// L3 counters (workers add theirs per job; the back its own) and the per-second placement samples.
 struct LeanXlStats {
     bool on{}; ///< L2 + SHADPS4_A2 != 0: workers translate
@@ -4215,6 +4293,7 @@ void A2Log(u64 slot_cmp, u64 slot_bad, u64 expect_n) {
 
 void Liverpool::A2WorkerLoop(std::stop_token stoken, u32 index) {
     Common::SetCurrentThreadName(fmt::format("shadPS4:A2Worker{}", index).c_str());
+    Common::ApplyHelperThreadPlacement("A2Worker");
     auto& g = g_a2s;
     auto arena = std::make_unique<Vulkan::A2::Arena>();
     Vulkan::A2::WorkerContext ctx{};
@@ -4250,6 +4329,11 @@ void Liverpool::A2WorkerLoop(std::stop_token stoken, u32 index) {
         // be published).
         {
             const u64 pw0 = __rdtsc();
+            if (g_claim_wake) {
+                if (!g.bells.Wait(g.begun, idx, stopping)) {
+                    return;
+                }
+            }
             for (u32 spins = 0; g.begun.load(std::memory_order_acquire) < idx;) {
                 if (stopping()) {
                     return;
@@ -4264,6 +4348,7 @@ void Liverpool::A2WorkerLoop(std::stop_token stoken, u32 index) {
                 }
             }
             g.publish_wait_cyc.fetch_add(__rdtsc() - pw0, std::memory_order_relaxed);
+            Common::FaultMonitor::SampleEmuPlacement(4);
         }
         auto& e = g.e[idx % A2Slots];
         if (e.index.load(std::memory_order_acquire) != idx) {
@@ -4860,6 +4945,7 @@ void Liverpool::LeanStart() {
 
 void Liverpool::LeanWorkerLoop(std::stop_token stoken, u32 index) {
     Common::SetCurrentThreadName(fmt::format("shadPS4:LeanWorker{}", index).c_str());
+    Common::ApplyHelperThreadPlacement("LeanWorker");
     t_lean_worker = true; // its faults are counted, never treated as the front's
     auto& s = g_lean_s;
     Lean::Env env{};
@@ -4938,6 +5024,9 @@ void Liverpool::LeanWorkerLoop(std::stop_token stoken, u32 index) {
     while (!stopping()) {
         const u32 idx = s.next_claim.fetch_add(1, std::memory_order_acq_rel);
         const u64 tw0 = __rdtsc(); // claim wait: until the job is queued (or found not taken)
+        if (g_claim_wake && !s.bells.Wait(s.queued, idx, stopping)) {
+            return;
+        }
         for (u32 spins = 0; s.queued.load(std::memory_order_acquire) < idx;) {
             if (stopping()) {
                 return;
@@ -4953,6 +5042,7 @@ void Liverpool::LeanWorkerLoop(std::stop_token stoken, u32 index) {
         }
         const u64 tw1 = __rdtsc();
         g_lean_phase.claim_wait += tw1 - tw0;
+        Common::FaultMonitor::SampleEmuPlacement(3);
         auto& j = s.jobs[idx % LeanSlots];
         if (j.index.load(std::memory_order_acquire) != idx ||
             j.state.load(std::memory_order_acquire) != 1) {
@@ -5062,6 +5152,7 @@ void Liverpool::A2Shutdown() {
         s.stop.store(true, std::memory_order_release);
         s.queued.fetch_add(0x40000000u, std::memory_order_acq_rel);
         s.queued.notify_all();
+        s.bells.RingAll();
         for (auto& w : s.workers) {
             w.request_stop();
         }
@@ -5075,6 +5166,7 @@ void Liverpool::A2Shutdown() {
     g.stop.store(true, std::memory_order_release);
     g.begun.fetch_add(0x40000000u, std::memory_order_acq_rel); // wake every waiter
     g.begun.notify_all();
+    g.bells.RingAll();
     split->reader_bell.fetch_add(1, std::memory_order_seq_cst);
     split->reader_bell.notify_all();
     for (auto& t : g.workers) {
@@ -9017,12 +9109,12 @@ void Liverpool::LeanFrontBegin(std::span<const u32> dcb, std::span<const u32> cc
         g_lean_front = {&j, dcb.data(), true};
         j.state.store(1, std::memory_order_release);
         s.queued.store(idx, std::memory_order_release);
-        s.queued.notify_all();
+        LeanRing(s, idx);
     } else {
         c.skipped += eligible ? 1 : 0;
         // Not queued: the next index still advances so the workers' claims stay in step.
         s.queued.store(idx, std::memory_order_release);
-        s.queued.notify_all();
+        LeanRing(s, idx);
     }
     if (c.dcbs >= 65536) {
         LeanLog();
@@ -9046,7 +9138,7 @@ Liverpool::LeanL2Begin Liverpool::LeanFrontBeginL2(std::span<const u32> dcb,
     const auto not_taken = [&] {
         ++s.l2_skipped;
         s.queued.store(idx, std::memory_order_release); // the workers' claims stay in step
-        s.queued.notify_all();
+        LeanRing(s, idx);
     };
     if (!s.l2 || !ccb.empty() || j.state.load(std::memory_order_acquire) != 0) {
         not_taken();
@@ -9091,7 +9183,7 @@ Liverpool::LeanL2Begin Liverpool::LeanFrontBeginL2(std::span<const u32> dcb,
             // Nothing for a worker from here (the first packet is the front's).
             ++s.l2_skipped;
             s.queued.store(cur, std::memory_order_release); // the workers' claims stay in step
-            s.queued.notify_all();
+            LeanRing(s, cur);
             break;
         }
         c.pkts_span += pkts;
@@ -9101,7 +9193,7 @@ Liverpool::LeanL2Begin Liverpool::LeanFrontBeginL2(std::span<const u32> dcb,
         jj.cut_dw = cut;
         jj.state.store(1, std::memory_order_release);
         s.queued.store(cur, std::memory_order_release);
-        s.queued.notify_all();
+        LeanRing(s, cur);
         // The back runs the span from the job's channel when it reaches this record.
         auto* ref = split->Reserve<CpSplit::DcbRefPayload>(CpSplit::RecordType::DcbRef);
         ref->slot = cur % LeanSlots;
@@ -9118,7 +9210,7 @@ Liverpool::LeanL2Begin Liverpool::LeanFrontBeginL2(std::span<const u32> dcb,
             // Slot busy: the rest of the head is the front's.
             ++s.l2_skipped;
             s.queued.store(next, std::memory_order_release);
-            s.queued.notify_all();
+            LeanRing(s, next);
             break;
         }
         cur = next;
@@ -10861,8 +10953,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             e.cancel.store(0, std::memory_order_relaxed);
             e.index.store(idx, std::memory_order_release);
             e.state.store(1, std::memory_order_release);
+            Common::FaultMonitor::SampleEmuPlacement(5);
             g_a2s.begun.store(idx, std::memory_order_release);
-            g_a2s.begun.notify_all();
+            if (g_claim_wake) {
+                g_a2s.bells.Ring(idx);
+            } else {
+                g_a2s.begun.notify_all();
+            }
         }
     }
     if (g_reg_scan && !is_indirect_gfx) [[unlikely]] {

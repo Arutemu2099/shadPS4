@@ -22,6 +22,7 @@
 
 #include <immintrin.h>
 #include <cstring>
+#include <cwchar>
 #include <map>
 #include <tuple>
 #ifdef _WIN32
@@ -644,6 +645,9 @@ namespace {
 struct GmCensus {
     std::array<std::atomic<u64>, 16> wait_ticks{}, wait_n{};
     std::array<std::atomic<u64>, 4> place{}; // [game main P, game main E, other P, other E]
+    /// 2026-10-15: P / E samples by thread kind (PlaceKind: 0 Game:Main, 1 JobWorker, 2 other guest,
+    /// 3 LeanWorker, 4 A2Worker, 5 front).
+    std::array<std::atomic<u64>, 12> place_kind{};
     std::array<std::atomic<u64>, 16> gnm_all_ticks{}, gnm_all_n{}; // gnm waits, every thread
     std::mutex rip_mutex;
     std::unordered_map<u64, u32> rip_eboot; // 64 B buckets of the eboot offset
@@ -994,6 +998,33 @@ void SampleGuestPlacement() {
 #ifdef _WIN32
     const bool p = Common::IsPerformanceProcessor(Common::CurrentProcessor());
     g_gm.place[(t_is_game_main ? 0 : 2) + (p ? 0 : 1)].fetch_add(1, std::memory_order_relaxed);
+    // 2026-10-15: the game's job threads apart from the other guest threads (name read once).
+    thread_local int kind = -1;
+    if (kind < 0) {
+        kind = 2;
+        PWSTR desc = nullptr;
+        if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &desc)) && desc != nullptr) {
+            if (std::wcsncmp(desc, L"JobWorker", 9) == 0) {
+                kind = 1;
+            }
+            LocalFree(desc);
+        }
+    }
+    g_gm.place_kind[(t_is_game_main ? 0 : kind) * 2 + (p ? 0 : 1)].fetch_add(1, std::memory_order_relaxed);
+#endif
+}
+
+void SampleEmuPlacement(u32 kind) {
+    if (!GameMainCensus()) {
+        return;
+    }
+    thread_local u32 calls = 0;
+    if ((++calls & 15) != 0) {
+        return;
+    }
+#ifdef _WIN32
+    const bool p = Common::IsPerformanceProcessor(Common::CurrentProcessor());
+    g_gm.place_kind[std::min<u32>(kind, 5) * 2 + (p ? 0 : 1)].fetch_add(1, std::memory_order_relaxed);
 #endif
 }
 
@@ -1143,6 +1174,16 @@ void GameMainCensusMaybeLog() {
                  "{:.1f}% (n {:.0f}) | other guest threads P {:.1f}% E {:.1f}% (n {:.0f})",
                  100.0 * gp / std::max(gp + ge, 1.0), 100.0 * ge / std::max(gp + ge, 1.0), gp + ge,
                  100.0 * op / std::max(op + oe, 1.0), 100.0 * oe / std::max(op + oe, 1.0), op + oe);
+        static constexpr const char* kinds[6] = {"Game:Main", "JobWorker", "other guest",
+                                                 "LeanWorker", "A2Worker", "front"};
+        std::string k;
+        for (u32 i = 0; i < 6; ++i) {
+            const double kp = double(g_gm.place_kind[2 * i].exchange(0));
+            const double ke = double(g_gm.place_kind[2 * i + 1].exchange(0));
+            k += fmt::format(" | {} P {:.1f}% (n {:.0f})", kinds[i], 100.0 * kp / std::max(kp + ke, 1.0),
+                             kp + ke);
+        }
+        LOG_INFO(Render, "GameMain census placement by thread kind:{}", k);
     }
     {
         std::vector<std::pair<u32, u64>> top, host;

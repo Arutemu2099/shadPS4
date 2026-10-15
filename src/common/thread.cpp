@@ -9,6 +9,7 @@
 #include <ctime>
 #include <mutex>
 #include <vector>
+#include <cstring>
 #include <string>
 #include <thread>
 
@@ -356,6 +357,69 @@ void ApplyHotThreadPlacement(HotThread which) {
              first, others, ok);
 }
 
+namespace {
+/// Every logical processor of the given class kind (true: performance) minus reserved P-cores.
+std::vector<ULONG> ClassCpuSets(bool performance) {
+    const auto& c = GetCpuClasses();
+    std::vector<ULONG> ids;
+    std::scoped_lock lock{g_reserved_mutex};
+    for (size_t i = 0; i < c.count; ++i) {
+        const bool p = c.cls[i] == c.max_class;
+        if (p == performance && !(p && g_reserved_core[c.core[i]])) {
+            ids.push_back(c.ids[i]);
+        }
+    }
+    return ids;
+}
+} // namespace
+
+void ApplyGuestThreadPlacement(void* handle, const char* name) {
+    static const unsigned mask = [] {
+        const char* value = std::getenv("SHADPS4_GUEST_PCORE");
+        return value ? static_cast<unsigned>(std::strtoul(value, nullptr, 0)) : 0u;
+    }();
+    if (mask == 0 || name == nullptr) {
+        return;
+    }
+    const bool job = std::strncmp(name, "JobWorker", 9) == 0;
+    const bool main = std::strcmp(name, "Game:Main") == 0;
+    if (!((job && (mask & 1)) || (main && (mask & 2)))) {
+        return;
+    }
+    const HANDLE h = static_cast<HANDLE>(handle);
+    THREAD_POWER_THROTTLING_STATE throttling{};
+    throttling.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+    throttling.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+    throttling.StateMask = 0;
+    SetThreadInformation(h, ThreadPowerThrottling, &throttling, sizeof(throttling));
+    const auto ids = ClassCpuSets(true);
+    const bool ok = !ids.empty() && SetThreadSelectedCpuSets(h, ids.data(), ULONG(ids.size()));
+    LOG_INFO(Common, "SHADPS4_GUEST_PCORE={}: {} on {} performance logical processors, ok {}", mask,
+             name, ids.size(), ok);
+}
+
+void ApplyHelperThreadPlacement(const char* name) {
+    static const int mode = [] {
+        const char* value = std::getenv("SHADPS4_HELPER_PLACE");
+        return value ? value[0] - '0' : 0;
+    }();
+    if (mode <= 0) {
+        return;
+    }
+    bool ok = false;
+    size_t n = 0;
+    if (mode == 1) {
+        const auto ids = ClassCpuSets(false);
+        n = ids.size();
+        ok = !ids.empty() &&
+             SetThreadSelectedCpuSets(GetCurrentThread(), ids.data(), ULONG(ids.size()));
+    } else if (mode == 2) {
+        ok = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+    LOG_INFO(Common, "SHADPS4_HELPER_PLACE={}: {} ({} efficiency logical processors), ok {}", mode,
+             name, n, ok);
+}
+
 void ApplyCommandProcessorPlacement() {
     const char* value = std::getenv("SHADPS4_CP_QOS");
     const int mode = value ? value[0] - '0' : 0;
@@ -593,6 +657,8 @@ void SampleThreadPlacementSlow(const char* role, unsigned stride_log2) {
     st.cpu_100ns = cpu_100ns;
 }
 #else
+void ApplyGuestThreadPlacement(void*, const char*) {}
+void ApplyHelperThreadPlacement(const char*) {}
 void ApplyCommandProcessorPlacement() {}
 void ApplyHotThreadPlacement(HotThread) {}
 void SampleCommandProcessorCore() {}

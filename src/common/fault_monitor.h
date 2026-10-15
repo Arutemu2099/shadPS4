@@ -124,6 +124,9 @@ void GameMainCensusMaybeLog();
 /// 0 equeue, 1 cond var, 2 event flag, 3 semaphore, 4 sleep, 5 mutex, 6 join, 7 gnm WaitGpuIdle in
 /// sceGnmSubmitDone, 8 in a submit, 9 in DingDong.
 void SampleGuestPlacement();
+/// 2026-10-15: every 16th call samples the processor class for an emulator thread kind (3 LeanWorker,
+/// 4 A2Worker, 5 front); census only.
+void SampleEmuPlacement(u32 kind);
 void NoteGnmWait(u32 kind, u64 ticks);
 /// gmc3: Game:Main inside a host GPU wait (MasterSemaphore::Wait), and its timed call path.
 extern std::atomic<u32> g_gm_in_gpu_wait;
