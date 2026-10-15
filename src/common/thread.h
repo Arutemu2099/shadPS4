@@ -70,6 +70,9 @@ void ApplyHelperThreadPlacement(const char* name);
 /// 2-15% of them on efficiency cores. Windows only; call on the thread itself.
 enum class HotThread { Recorder, Front, GameMain };
 void ApplyHotThreadPlacement(HotThread which);
+/// SHADPS4_CRIT_PRIO (bit 1 recorders + front, bit 2 Game:Main): above-normal priority for the
+/// calling thread; ApplyHotThreadPlacement calls it, recorder lanes past lane 0 call it directly.
+void ApplyCriticalThreadPriority(HotThread which);
 /// SHADPS4_CP_CORE_STATS=1: sample the logical CPU this thread runs on (call often, it is cheap)
 /// and periodically log the share on performance vs efficiency cores. Diagnostic only.
 void SampleCommandProcessorCore();

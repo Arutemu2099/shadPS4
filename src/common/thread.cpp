@@ -345,7 +345,28 @@ bool ReservePerformanceCore(int rank, int& first, size_t& others_count) {
 }
 } // namespace
 
+void ApplyCriticalThreadPriority(HotThread which) {
+    // SHADPS4_CRIT_PRIO (2026-10-15, default off): bit 1 = the recorder lanes and the front, bit 2 =
+    // Game:Main, at THREAD_PRIORITY_ABOVE_NORMAL. Nothing is lowered (the reverted POOL_AUTO helper
+    // drop put below-normal workers on the back's waits). Trace s1201 (6c/12t mask, b15g): the CP
+    // waited 31% of its wall time on the recorders while they were ready-but-not-running 25% of
+    // theirs (the front 33%): lean and job threads held the cores the critical chain needed.
+    static const unsigned crit = [] {
+        const char* value = std::getenv("SHADPS4_CRIT_PRIO");
+        return value ? static_cast<unsigned>(std::strtoul(value, nullptr, 0)) : 0u;
+    }();
+    if ((crit & (which == HotThread::GameMain ? 2u : 1u)) != 0) {
+        const bool prio_ok = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+        LOG_INFO(Common, "SHADPS4_CRIT_PRIO={}: {} above normal, ok {}", crit,
+                 which == HotThread::Recorder ? "recorder"
+                 : which == HotThread::Front  ? "front"
+                                              : "Game:Main",
+                 prio_ok);
+    }
+}
+
 void ApplyHotThreadPlacement(HotThread which) {
+    ApplyCriticalThreadPriority(which);
     static const unsigned mask = [] {
         const char* value = std::getenv("SHADPS4_HOT_CORES");
         return value ? static_cast<unsigned>(std::strtoul(value, nullptr, 0)) : 0u;
@@ -706,6 +727,7 @@ void ApplyGuestThreadPlacement(void*, const char*) {}
 void ApplyHelperThreadPlacement(const char*) {}
 void ApplyCommandProcessorPlacement() {}
 void ApplyHotThreadPlacement(HotThread) {}
+void ApplyCriticalThreadPriority(HotThread) {}
 void SampleCommandProcessorCore() {}
 const bool g_thread_stats = false;
 void SampleThreadPlacementSlow(const char*, unsigned) {}

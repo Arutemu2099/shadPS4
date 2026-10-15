@@ -91,6 +91,8 @@ Scheduler::Scheduler(const Instance& instance, bool allow_recording_worker)
                                                         : "shadPS4:VkRecorder3")));
                 if (lane == 0) {
                     Common::ApplyHotThreadPlacement(Common::HotThread::Recorder);
+                } else {
+                    Common::ApplyCriticalThreadPriority(Common::HotThread::Recorder);
                 }
             },
             [this] {
