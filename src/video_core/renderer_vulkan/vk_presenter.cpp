@@ -1179,6 +1179,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
     // Present to swapchain.
     u64 lock_ns = 0;
     u64 khr_ns = 0;
+    bool recreate_after_present = false;
     {
         // submit_mutex is static and every one of the ~208 submits/frame the readback path makes
         // takes it too, so time the acquisition separately from the present itself.
@@ -1188,9 +1189,16 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
 
         const auto khr_start = Common::FaultMonitor::Now();
         if (!swapchain.Present()) {
-            swapchain.Recreate(window.GetWidth(), window.GetHeight());
+            if (SwapchainSafeWait()) {
+                recreate_after_present = true; // its wait takes submit_mutex: after the lock
+            } else {
+                swapchain.Recreate(window.GetWidth(), window.GetHeight());
+            }
         }
         khr_ns = Common::FaultMonitor::SinceNs(khr_start);
+    }
+    if (recreate_after_present) {
+        swapchain.Recreate(window.GetWidth(), window.GetHeight());
     }
     Common::FaultMonitor::CountPresentPhases(acquire_ns, flush_ns, lock_ns, khr_ns);
 

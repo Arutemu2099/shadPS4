@@ -2,16 +2,46 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
+#include <mutex>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 
 namespace Vulkan {
+
+/// SHADPS4_SWAPCHAIN_SAFE_WAIT=1 (2026-10-15, the F11 crash): before a swapchain is destroyed, wait
+/// for the queues that touch its images (the presenter's blits on the graphics queue, the present
+/// queue) under Scheduler::submit_mutex, which every graphics-queue submitter holds - instead of
+/// vkDeviceWaitIdle, which needs EVERY queue of the device externally synchronized while the
+/// readback / ASC / retry queues are submitted from guest and worker threads at any time (10-14
+/// 22:58 play session: device lost at the swapchain rebuild after leaving fullscreen). The caller
+/// must not hold submit_mutex.
+bool SwapchainSafeWait() {
+    static const bool on = [] {
+        const char* v = std::getenv("SHADPS4_SWAPCHAIN_SAFE_WAIT");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
+
+static vk::Result WaitForSwapchainIdle(const Instance& instance) {
+    if (!SwapchainSafeWait()) {
+        return instance.GetDevice().waitIdle();
+    }
+    std::scoped_lock lk{Scheduler::submit_mutex};
+    vk::Result result = instance.GetPresentQueue().waitIdle();
+    if (result == vk::Result::eSuccess && instance.GetGraphicsQueue() != instance.GetPresentQueue()) {
+        result = instance.GetGraphicsQueue().waitIdle();
+    }
+    return result;
+}
 
 static constexpr vk::SurfaceFormatKHR SURFACE_FORMAT_HDR = {
     .format = vk::Format::eA2B10G10R10UnormPack32,
@@ -90,7 +120,7 @@ void Swapchain::SetHDR(bool hdr) {
         return;
     }
 
-    auto result = instance.GetDevice().waitIdle();
+    auto result = WaitForSwapchainIdle(instance);
     if (result != vk::Result::eSuccess) {
         LOG_WARNING(ImGui, "Failed to wait for Vulkan device idle on mode change: {}",
                     vk::to_string(result));
@@ -263,7 +293,7 @@ void Swapchain::SetSurfaceProperties() {
 
 void Swapchain::Destroy() {
     vk::Device device = instance.GetDevice();
-    const auto wait_result = device.waitIdle();
+    const auto wait_result = WaitForSwapchainIdle(instance);
     if (wait_result != vk::Result::eSuccess) {
         LOG_WARNING(Render_Vulkan, "Failed to wait for device to become idle: {}",
                     vk::to_string(wait_result));

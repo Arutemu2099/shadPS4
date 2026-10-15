@@ -14,6 +14,10 @@ class WindowSDL;
 
 namespace Vulkan {
 
+/// SHADPS4_SWAPCHAIN_SAFE_WAIT=1: swapchain rebuilds wait for the present / graphics queue under
+/// Scheduler::submit_mutex instead of vkDeviceWaitIdle (vk_swapchain.cpp).
+bool SwapchainSafeWait();
+
 class Instance;
 class Scheduler;
 
