@@ -253,8 +253,10 @@ bool HasPendingUploads() {
 void NotePresented() {
     const u64 presented = g_presented.fetch_add(1, std::memory_order_acq_rel) + 1;
     if (presented >= g_destroy_due.load(std::memory_order_acquire)) {
+        // Under the list lock (once per frame at most), so Submit's clear cannot overwrite it.
+        std::unique_lock lk{g_upload_mtx};
         g_destroy_due.store(~0ULL, std::memory_order_relaxed);
-        g_upload_pending.store(true, std::memory_order_relaxed);
+        g_upload_pending.store(!g_upload_list.empty(), std::memory_order_relaxed);
     }
 }
 
@@ -263,6 +265,7 @@ void Submit() {
     {
         std::unique_lock lk{g_upload_mtx};
         if (g_upload_list.empty()) {
+            g_upload_pending.store(false, std::memory_order_relaxed);
             return;
         }
         // Upload one texture at a time to avoid slow down

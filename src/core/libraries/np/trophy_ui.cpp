@@ -319,8 +319,10 @@ void TrophyUI::Draw() {
     PopStyleVar();
 
     if (SafeTrophyReplace()) {
-        std::lock_guard<std::mutex> lock(queueMtx);
-        if (trophy_timer <= 0 || replace_requested) {
+        // try_to_lock: a guest thread may hold queueMtx while it builds the first popup (audio
+        // setup); skip the check for a frame rather than stall the present.
+        std::unique_lock<std::mutex> lock(queueMtx, std::try_to_lock);
+        if (lock.owns_lock() && (trophy_timer <= 0 || replace_requested)) {
             if (replace_requested) {
                 // As AddTrophyToQueue does for a fresh popup: restart the animation.
                 elapsed_time = 0.0f;
