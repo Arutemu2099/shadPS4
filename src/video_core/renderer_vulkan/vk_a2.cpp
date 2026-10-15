@@ -533,6 +533,70 @@ static bool LeanFencePopOn() {
     return on;
 }
 
+/// SHADPS4_LEAN_PERDRAW bit 16 (2026-10-15 evening): a stretch's StretchCmds comes from a pool
+/// instead of a fresh make_shared. s1268: the per-stretch batches.reserve(8) (~24 KB of SubBatches,
+/// above the Windows heap's low-fragmentation size limit) went to the backend allocator and cost
+/// 28% of a worker's wall once the heap layout changed (bit 4 parks the delta buffers); 0.6% in
+/// s1251. The last owner (back, recorder lane) only returns the object; the translator resets it
+/// (every field) when it takes it, so the lists keep their capacity.
+static bool LeanCmdsPoolOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("SHADPS4_LEAN_PERDRAW");
+        return e && ((std::strtoul(e, nullptr, 10) & 16) != 0);
+    }();
+    return on;
+}
+
+namespace {
+struct CmdsPool {
+    std::mutex mu;
+    std::vector<StretchCmds*> free;
+};
+
+CmdsPool& GetCmdsPool() {
+    static auto* pool = new CmdsPool(); // never destroyed: a deleter may run during shutdown
+    return *pool;
+}
+
+/// shared_ptr deleter: back to the pool (bounded; outliers and overflow are freed).
+void ReturnCmds(StretchCmds* c) {
+    if (c->batches.capacity() <= 64) {
+        auto& pool = GetCmdsPool();
+        std::scoped_lock lk{pool.mu};
+        if (pool.free.size() < 4096) {
+            pool.free.push_back(c);
+            return;
+        }
+    }
+    delete c;
+}
+
+/// A reset StretchCmds (as a fresh one) with the pool's capacity.
+std::shared_ptr<StretchCmds> TakePooledCmds() {
+    StretchCmds* c = nullptr;
+    {
+        auto& pool = GetCmdsPool();
+        std::scoped_lock lk{pool.mu};
+        if (!pool.free.empty()) {
+            c = pool.free.back();
+            pool.free.pop_back();
+        }
+    }
+    if (c) {
+        c->batches.clear();
+        c->bindless_set = vk::DescriptorSet{};
+        c->mat_slots = {};
+        c->slot_writes.clear();
+        c->inh_checks.clear();
+        c->clip_checks.clear();
+        c->fmt_checks.clear();
+    } else {
+        c = new StretchCmds();
+    }
+    return std::shared_ptr<StretchCmds>(c, &ReturnCmds);
+}
+} // namespace
+
 /// LeanFencePopOn: pops a fence queue's front. The popped entry drops its tick reference now (as
 /// erase did); the dead prefix is erased once it is at least half the vector (amortized O(1)).
 /// `head` is the queue's first live entry (0 forever with the flag off).
@@ -690,6 +754,7 @@ struct StretchTranslator::Impl {
     bool cmd_warned{};
     const bool perdraw{LeanPerDrawOn()}; ///< SHADPS4_LEAN_PERDRAW bit 2 (sub-batch growth)
     const bool fence_pop{LeanFencePopOn()}; ///< SHADPS4_LEAN_PERDRAW bit 2 or 8 (O(1) fence pops)
+    const bool cmds_pool{LeanCmdsPoolOn()}; ///< SHADPS4_LEAN_PERDRAW bit 16 (pooled StretchCmds)
     u32 batch_hint{8}; ///< perdraw: the next stretch's sub-batch reserve (decaying high-water mark)
     u64 align{256};
     u64 region_bytes{};
@@ -1855,7 +1920,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
             rec_stretch_start = rec_head; // r9
             stretch->buf_gen = ctx.buffer_cache->StructGeneration();
             stretch->probe_gen = VideoCore::g_lprobe_gen.load(std::memory_order_acquire); // q9b
-            cmds = std::make_shared<StretchCmds>();
+            cmds = cmds_pool ? TakePooledCmds() : std::make_shared<StretchCmds>();
             cmds->batches.reserve(perdraw ? batch_hint : 8);
             stretch->cmds = cmds;
             stretch_start = region_start;
