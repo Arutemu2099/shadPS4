@@ -7246,9 +7246,39 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
             }
         }
     }
-    static const bool big_grow = [] {
+    // The one mesh buffer BIG_GROW creates at the first big join.
+    constexpr u64 BigGrowBytes = 0xF0000000ull; // 3.75 GB
+    static const bool big_grow = [this] {
         const char* e = std::getenv("SHADPS4_BIG_GROW");
-        return e && e[0] == '1';
+        if (!e || e[0] != '1') {
+            return false;
+        }
+        // Release check (2026-10-15, study-release-readiness sec. 1.3): the 3.75 GB buffer must fit.
+        // BIG_GROW stays on only when the largest DEVICE_LOCAL heap is >= 11 GiB (this PC, 16 GB:
+        // whole-GPU peak 8.5-9.2 GB with it, desktop included; so 12 GB cards pass, 8 / 10 GB cards
+        // do not) and the device allows a 3.75 GB allocation (maxMemoryAllocationSize). Otherwise the
+        // old growth path (stream-leap expansion only: the mesh memory regrows as blocks stream in).
+        // SHADPS4_BIG_GROW_MIN_VRAM_MB overrides the 11264 MiB threshold (a huge value forces the
+        // fallback for testing).
+        u64 heap = 0;
+        const auto& mp = instance.GetMemoryProperties();
+        for (u32 i = 0; i < mp.memoryHeapCount; ++i) {
+            if (mp.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+                heap = std::max<u64>(heap, mp.memoryHeaps[i].size);
+            }
+        }
+        u64 min_mb = 11264;
+        if (const char* m = std::getenv("SHADPS4_BIG_GROW_MIN_VRAM_MB")) {
+            min_mb = std::strtoull(m, nullptr, 10);
+        }
+        const u64 max_alloc = instance.MaxMemoryAllocationSize();
+        const bool fits = heap >= (min_mb << 20) && max_alloc >= BigGrowBytes;
+        LOG_INFO(Render_Vulkan,
+                 "BIG_GROW: largest device-local heap {} MiB (needs >= {} MiB), max allocation {} MiB "
+                 "(needs >= {} MiB) -> {}",
+                 heap >> 20, min_mb, max_alloc >> 20, BigGrowBytes >> 20,
+                 fits ? "on (one 3.75 GB mesh buffer)" : "OFF - fallback to the old growth path");
+        return fits;
     }();
     // r15e: only joins of >= 1 GB (the mesh memory) - growing the 542 MB heap buffer over the
     // particle arena put CPU-written pages under tracking: write faults 35 k -> 57-60 k/s (s1051-s1056).
@@ -7262,7 +7292,7 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
         const u64 cur = end - begin;
         // r15d: straight to the cap (3.75 GB) at the first big join - normally the load - so the
         // region never grows again in the scene (r15b: an in-scene growth's coherent upload stalled ~1 s).
-        const u64 want = 0xF0000000ull;
+        const u64 want = BigGrowBytes;
         const u64 mapped = memory->TryClampRangeSize(begin, want);
         VAddr grow_end = Common::AlignDown(begin + mapped, CACHING_PAGESIZE);
         if (mapped > cur && grow_end > end) {

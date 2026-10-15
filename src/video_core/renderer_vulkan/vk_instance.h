@@ -390,6 +390,11 @@ public:
         return vk11_props.subgroupSize;
     }
 
+    /// Returns the largest single memory allocation the device reports (Vulkan 1.1).
+    vk::DeviceSize MaxMemoryAllocationSize() const {
+        return vk11_props.maxMemoryAllocationSize;
+    }
+
     /// Returns the maximum size of compute shared memory.
     u32 MaxComputeSharedMemorySize() const {
         return properties.limits.maxComputeSharedMemorySize;
