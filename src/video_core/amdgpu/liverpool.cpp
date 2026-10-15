@@ -4962,6 +4962,9 @@ void Liverpool::LeanStart() {
     s.regs = std::make_unique<Regs>();
     s.win_tsc = __rdtsc();
     static const u32 n = [] {
+        if (const u32 a = Common::AutoPoolWorkers(true)) {
+            return a; // SHADPS4_POOL_AUTO
+        }
         const char* v = std::getenv("SHADPS4_LEAN_WORKERS");
         const u32 x = v ? static_cast<u32>(std::strtoul(v, nullptr, 10)) : 4u;
         return std::clamp<u32>(x, 1, 8);

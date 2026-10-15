@@ -420,6 +420,22 @@ void ApplyGuestThreadPlacement(void* handle, const char* name) {
              name, ids.size(), ok);
 }
 
+u32 AutoPoolWorkers(bool lean) {
+    static const bool on = [] {
+        const char* v = std::getenv("SHADPS4_POOL_AUTO");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (!on) {
+        return 0;
+    }
+    const u32 n = static_cast<u32>(std::popcount(ProcessMaskNow()));
+    // lean: 6 logical -> 3, 12 -> 5, 20 -> 7 (measured best: 6 -> 3, 12 -> 4); A2: 1 below 16.
+    const u32 w = lean ? std::clamp<u32>(n / 4 + 2, 2, 8) : (n < 16 ? 1u : 2u);
+    LOG_INFO(Common, "SHADPS4_POOL_AUTO: {} logical processors -> {} {} workers", n, w,
+             lean ? "lean" : "A2");
+    return w;
+}
+
 void ApplyHelperThreadPlacement(const char* name) {
     static const int mode = [] {
         const char* value = std::getenv("SHADPS4_HELPER_PLACE");
@@ -680,6 +696,9 @@ void SampleThreadPlacementSlow(const char* role, unsigned stride_log2) {
     st.cpu_100ns = cpu_100ns;
 }
 #else
+u32 AutoPoolWorkers(bool) {
+    return 0;
+}
 void ApplyGuestThreadPlacement(void*, const char*) {}
 void ApplyHelperThreadPlacement(const char*) {}
 void ApplyCommandProcessorPlacement() {}

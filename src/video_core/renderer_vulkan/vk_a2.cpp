@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "video_core/texture_cache/tex_table.h"
+#include "common/thread.h"
 #include "common/logging/log.h"
 #include "shader_recompiler/native_emit.h"
 #include "video_core/amdgpu/cp_split.h"
@@ -436,6 +437,9 @@ int Mode() {
 
 u32 NumWorkers() {
     static const u32 n = [] {
+        if (const u32 a = Common::AutoPoolWorkers(false)) {
+            return a; // SHADPS4_POOL_AUTO
+        }
         const char* v = std::getenv("SHADPS4_A2_WORKERS");
         const long w = v ? std::strtol(v, nullptr, 10) : 3;
         return static_cast<u32>(std::clamp<long>(w <= 0 ? 3 : w, 1, 8));

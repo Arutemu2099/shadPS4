@@ -57,6 +57,9 @@ void ApplyCommandProcessorPlacement();
 /// JobWorker* threads, bit 1 Game:Main get every performance logical processor (minus reserved
 /// cores) as selected CPU sets and power throttling off. Called with the thread's handle and name.
 void ApplyGuestThreadPlacement(void* handle, const char* name);
+/// SHADPS4_POOL_AUTO=1 (2026-10-15): worker pools sized from the logical processors in the process
+/// affinity mask (CPU-shape matrix: 6c/12t and 6c/6t gained ~25% with smaller pools). 0 = off.
+u32 AutoPoolWorkers(bool lean);
 /// SHADPS4_HELPER_PLACE=<n> (2026-10-15): emulator helper threads (lean / A2 workers); 1 = the
 /// efficiency cores as selected CPU sets, 2 = THREAD_PRIORITY_BELOW_NORMAL. Call on the thread.
 void ApplyHelperThreadPlacement(const char* name);
