@@ -295,6 +295,16 @@ const CpuClasses& GetCpuClasses() {
     return classes;
 }
 
+/// The process affinity mask now (2026-10-15: a harness or the user may restrict it after start,
+/// e.g. the weaker-CPU arms; every placement below stays inside it).
+u64 ProcessMaskNow() {
+    DWORD_PTR proc = 0, sys = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) || proc == 0) {
+        return ~u64{0};
+    }
+    return static_cast<u64>(proc);
+}
+
 // Whole performance cores handed to single threads (SHADPS4_CP_QOS=3, SHADPS4_HOT_CORES): the
 // process default CPU set is everything except the reserved cores (both logical processors).
 std::mutex g_reserved_mutex;
@@ -304,10 +314,14 @@ std::array<bool, 64> g_reserved_core{}; // by CoreIndex, performance cores only
 /// and keeps the rest of the process off it. `first` receives its first logical processor.
 bool ReservePerformanceCore(int rank, int& first, size_t& others_count) {
     const auto& c = GetCpuClasses();
+    const u64 allowed = ProcessMaskNow();
     std::vector<int> firsts;
     for (size_t i = 0; i < c.count; ++i) {
+        // 2026-10-15: only a P-core whose first logical processor is inside the process mask
+        // (10-14 W4E arm: the CP landed on logical 10, outside a 4-E-core mask).
         if (c.cls[i] == c.max_class &&
-            (i == 0 || c.core[i - 1] != c.core[i] || c.cls[i - 1] != c.max_class)) {
+            (i == 0 || c.core[i - 1] != c.core[i] || c.cls[i - 1] != c.max_class) &&
+            ((allowed >> i) & 1) != 0) {
             firsts.push_back(int(i));
         }
     }
@@ -320,7 +334,7 @@ bool ReservePerformanceCore(int rank, int& first, size_t& others_count) {
     g_reserved_core[c.core[first]] = true;
     std::vector<ULONG> others;
     for (size_t i = 0; i < c.count; ++i) {
-        if (!(c.cls[i] == c.max_class && g_reserved_core[c.core[i]])) {
+        if (!(c.cls[i] == c.max_class && g_reserved_core[c.core[i]]) && ((allowed >> i) & 1) != 0) {
             others.push_back(c.ids[i]);
         }
     }
@@ -361,11 +375,12 @@ namespace {
 /// Every logical processor of the given class kind (true: performance) minus reserved P-cores.
 std::vector<ULONG> ClassCpuSets(bool performance) {
     const auto& c = GetCpuClasses();
+    const u64 allowed = ProcessMaskNow();
     std::vector<ULONG> ids;
     std::scoped_lock lock{g_reserved_mutex};
     for (size_t i = 0; i < c.count; ++i) {
         const bool p = c.cls[i] == c.max_class;
-        if (p == performance && !(p && g_reserved_core[c.core[i]])) {
+        if (p == performance && !(p && g_reserved_core[c.core[i]]) && ((allowed >> i) & 1) != 0) {
             ids.push_back(c.ids[i]);
         }
     }
@@ -452,9 +467,10 @@ void ApplyCommandProcessorPlacement() {
         }
     } else if (mode >= 2) {
         const auto& c = GetCpuClasses();
+        const u64 allowed = ProcessMaskNow();
         std::vector<ULONG> ids;
         for (size_t i = 0; i < c.count; ++i) {
-            if (c.cls[i] == c.max_class) {
+            if (c.cls[i] == c.max_class && ((allowed >> i) & 1) != 0) {
                 ids.push_back(c.ids[i]);
             }
         }
