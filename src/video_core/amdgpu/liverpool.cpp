@@ -218,6 +218,14 @@ static const bool g_claim_wake = [] {
     const char* v = std::getenv("SHADPS4_CLAIM_WAKE");
     return v != nullptr && v[0] == '1';
 }();
+/// SHADPS4_LEAN_PERDRAW=1 (2026-10-15): lean-worker per-draw costs. Here: a finished stretch's
+/// register deltas SWAP with its xl_side slot's previous vectors instead of moving out (the
+/// worker's vectors keep their capacity; no allocation per stretch). Also read by lean_parse.cpp
+/// (bigger / set-associative worker memos) and vk_a2.cpp (sub-batch growth, fence queues).
+static const bool g_lean_perdraw = [] {
+    const char* v = std::getenv("SHADPS4_LEAN_PERDRAW");
+    return v != nullptr && v[0] == '1';
+}();
 static const u64 g_claim_spin_ticks = [] {
     const char* v = std::getenv("SHADPS4_CLAIM_SPIN_US");
     const u64 us = std::min<u64>(v ? std::strtoull(v, nullptr, 10) : 2, 1000); // review NIT: clamp
@@ -4680,10 +4688,24 @@ void LeanXlEnd(LeanXl& x) {
         if (auto s = x.tr->EndStretch()) {
             x.job->xl[x.n] = std::move(s);
             auto& sd = x.job->xl_side[x.n];
-            sd = {x.last_end, x.last_epoch, std::move(x.delta), x.open_key};
-            sd.pre_pos = x.s_pre_pos;
-            sd.first_pos = x.s_first_pos;
-            sd.pre_delta = std::move(x.s_pre_delta);
+            if (g_lean_perdraw) {
+                // Every field, the two vectors by swap: the slot's previous buffers (its last
+                // job's; the back read them before it freed the job slot with state = 0, release,
+                // and this worker's claim acquired state = 1 after the front re-queued it) become
+                // this worker's next ones, capacity kept. Both are cleared below.
+                sd.end_pos = x.last_end;
+                sd.ctx_epoch = x.last_epoch;
+                sd.delta.swap(x.delta);
+                sd.render_key = x.open_key;
+                sd.pre_pos = x.s_pre_pos;
+                sd.first_pos = x.s_first_pos;
+                sd.pre_delta.swap(x.s_pre_delta);
+            } else {
+                sd = {x.last_end, x.last_epoch, std::move(x.delta), x.open_key};
+                sd.pre_pos = x.s_pre_pos;
+                sd.first_pos = x.s_first_pos;
+                sd.pre_delta = std::move(x.s_pre_delta);
+            }
             x.s_pre_delta.clear();
             x.s_pre_pos = ~u64{0};
             x.job->xl_ready.store(++x.n, std::memory_order_release);

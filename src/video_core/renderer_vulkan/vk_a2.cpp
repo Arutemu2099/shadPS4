@@ -505,6 +505,35 @@ constexpr u32 WorkerRecBits = 15;
 constexpr u32 WorkerRecSize = 1u << WorkerRecBits; ///< records per translator (~23 MB)
 constexpr u32 WorkerRecMask = WorkerRecSize - 1;
 
+/// SHADPS4_LEAN_PERDRAW=1 (2026-10-15; also read by liverpool.cpp and lean_parse.cpp): the
+/// translator's per-stretch container costs - a stretch's sub-batch list starts at a recent
+/// high-water mark (8..16) and doubles when full (the 1.5x growth moved every SubBatch, ~3 KB
+/// each, again at 12, 18, 27, ...), and the arena / record fence queues pop their front in O(1)
+/// (erase(begin()) shifted every live fence - an estimated 1-3 thousand - once per stretch).
+static bool LeanPerDrawOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("SHADPS4_LEAN_PERDRAW");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
+/// LeanPerDrawOn: pops a fence queue's front. The popped entry drops its tick reference now (as
+/// erase did); the dead prefix is erased once it is at least half the vector (amortized O(1)).
+/// `head` is the queue's first live entry (0 forever with the flag off).
+template <typename Fences>
+void PopFenceFront(Fences& fences, size_t& head) {
+    fences[head].tick.reset();
+    ++head;
+    if (head == fences.size()) {
+        fences.clear();
+        head = 0;
+    } else if (head >= 64 && head * 2 >= fences.size()) {
+        fences.erase(fences.begin(), fences.begin() + static_cast<std::ptrdiff_t>(head));
+        head = 0;
+    }
+}
+
 /// r9: one draw's GPU record as NativeRecGpu writes it (words 0-127 and 160-175; the slot words
 /// 128-159 stay zero here, Replay writes them).
 void BuildWorkerRecord(std::array<u32, NR::GpuRecDwords>& g, const Shader::PushData& push,
@@ -644,6 +673,8 @@ struct StretchTranslator::Impl {
     bool enabled{};
     bool colour_on{}; ///< colour draws may be taken (SHADPS4_NATIVE_COLOUR=1, no diag 1 / 4096)
     bool cmd_warned{};
+    const bool perdraw{LeanPerDrawOn()}; ///< SHADPS4_LEAN_PERDRAW
+    u32 batch_hint{8}; ///< perdraw: the next stretch's sub-batch reserve (decaying high-water mark)
     u64 align{256};
     u64 region_bytes{};
     u64 clip_off_in_region{}; ///< the sub-batch's clip planes (after table, commands, count)
@@ -711,6 +742,7 @@ struct StretchTranslator::Impl {
         std::shared_ptr<std::atomic<u64>> tick;
     };
     std::vector<RecFence> rec_fences;
+    size_t rec_fence_head{}; ///< first live rec_fences entry (perdraw; 0 otherwise)
     /// True if entry rec_head may be written now (never waits).
     bool RecReserve();
     /// r9 census (this translator): records written, verify compares, mismatching records by
@@ -824,8 +856,9 @@ bool StretchTranslator::Impl::AllocRegion(u64 bytes, u64& start, u64& masked_off
         const u64 reuse_below = end - ar.size;
         u64 known = 0;
         bool known_read = false;
-        while (!ar.fences.empty() && ar.fences.front().start < reuse_below) {
-            const u64 tick = ar.fences.front().tick->load(std::memory_order_acquire);
+        size_t& head = ar.fence_head; // 0 forever unless perdraw: [0] is the front
+        while (head < ar.fences.size() && ar.fences[head].start < reuse_below) {
+            const u64 tick = ar.fences[head].tick->load(std::memory_order_acquire);
             if (tick == 0) {
                 return false; // not published yet
             }
@@ -836,7 +869,11 @@ bool StretchTranslator::Impl::AllocRegion(u64 bytes, u64& start, u64& masked_off
             if (known < tick) {
                 return false; // the GPU has not passed it (the back refreshes the tick)
             }
-            ar.fences.erase(ar.fences.begin());
+            if (perdraw) {
+                PopFenceFront(ar.fences, head);
+            } else {
+                ar.fences.erase(ar.fences.begin());
+            }
         }
     }
     ar.head = end;
@@ -857,8 +894,9 @@ bool StretchTranslator::Impl::RecReserve() {
     }
     u64 known = 0;
     bool known_read = false;
-    while (!rec_fences.empty() && rec_fences.front().start < reuse_below) {
-        const u64 tick = rec_fences.front().tick->load(std::memory_order_acquire);
+    size_t& head = rec_fence_head; // 0 forever unless perdraw: [0] is the front
+    while (head < rec_fences.size() && rec_fences[head].start < reuse_below) {
+        const u64 tick = rec_fences[head].tick->load(std::memory_order_acquire);
         if (tick == 0) {
             return false; // not published yet
         }
@@ -869,7 +907,11 @@ bool StretchTranslator::Impl::RecReserve() {
         if (known < tick) {
             return false; // the GPU has not passed that stretch
         }
-        rec_fences.erase(rec_fences.begin());
+        if (perdraw) {
+            PopFenceFront(rec_fences, head);
+        } else {
+            rec_fences.erase(rec_fences.begin());
+        }
     }
     return true;
 }
@@ -1798,7 +1840,7 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
             stretch->buf_gen = ctx.buffer_cache->StructGeneration();
             stretch->probe_gen = VideoCore::g_lprobe_gen.load(std::memory_order_acquire); // q9b
             cmds = std::make_shared<StretchCmds>();
-            cmds->batches.reserve(8);
+            cmds->batches.reserve(perdraw ? batch_hint : 8);
             stretch->cmds = cmds;
             stretch_start = region_start;
             last_desc_id = 0;
@@ -1851,6 +1893,9 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         *count_ptr = 0;
 
         // The sub-batch record: what Replay emits before its indirect draw.
+        if (perdraw && cmds->batches.size() == cmds->batches.capacity()) {
+            cmds->batches.reserve(cmds->batches.capacity() * 2); // one move per doubling
+        }
         SubBatch& sb = cmds->batches.emplace_back();
         const bool ib_changed =
             first_batch || ib_handle != b_ib || index_size != b_index_size || ind || b_ind;
@@ -2341,6 +2386,12 @@ std::unique_ptr<Stretch> StretchTranslator::Impl::End() {
     b_native = nullptr;
     cmd_ptr = nullptr;
     count_ptr = nullptr;
+    if (perdraw && cmds) {
+        // The next reserve: this stretch's sub-batch count, or the previous hint minus 1/8, in
+        // [8, 16] (bounds the reserved memory per stretch at 2x the old reserve(8)).
+        const u32 n = static_cast<u32>(cmds->batches.size());
+        batch_hint = std::clamp<u32>(std::max(n, batch_hint - batch_hint / 8), 8, 16);
+    }
     cmds.reset();
     return std::move(stretch);
 }
