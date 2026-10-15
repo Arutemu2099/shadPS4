@@ -27,7 +27,10 @@ public:
     [[nodiscard]] bool try_lock();
 
 private:
-    std::atomic_flag lck = ATOMIC_FLAG_INIT;
+    void LockPark(unsigned spins);
+
+    /// 0 free, 1 locked, 2 locked with possible parked waiters (SHADPS4_SPINLOCK_PARK only).
+    std::atomic<unsigned> state{0};
 };
 
 } // namespace Common

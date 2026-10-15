@@ -439,7 +439,17 @@ u32 AutoPoolWorkers(bool lean) {
 void ApplyHelperThreadPlacement(const char* name) {
     static const int mode = [] {
         const char* value = std::getenv("SHADPS4_HELPER_PLACE");
-        return value ? value[0] - '0' : 0;
+        if (value) {
+            return value[0] - '0';
+        }
+        // SHADPS4_POOL_AUTO=1 without HELPER_PLACE: below-normal lean / A2 workers when the process
+        // has < 16 logical processors. Measured 10-15 (s1169, 4c/8t city): a guest write fault
+        // 311 -> 124 us, FPS 35.5 -> 43.9: normal-priority helpers preempted region-lock holders.
+        const char* pool_auto = std::getenv("SHADPS4_POOL_AUTO");
+        if (pool_auto != nullptr && pool_auto[0] == '1' && std::popcount(ProcessMaskNow()) < 16) {
+            return 2;
+        }
+        return 0;
     }();
     if (mode <= 0) {
         return;
