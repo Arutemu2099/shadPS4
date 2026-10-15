@@ -9,6 +9,7 @@
 #include <imgui.h>
 
 #include "imgui_impl_vulkan.h"
+#include "video_core/renderer_vulkan/vk_swapchain.h"
 
 #ifndef IM_MAX
 #define IM_MAX(A, B) (((A) >= (B)) ? (A) : (B))
@@ -252,7 +253,15 @@ void UploadTextureData::Destroy() {
     VkData* bd = GetBackendData();
     const InitInfo& v = bd->init_info;
 
-    CheckVkErr(v.device.waitIdle());
+    // SHADPS4_SWAPCHAIN_SAFE_WAIT=1 (review RISK 2, 10-15): vkDeviceWaitIdle needs every queue
+    // externally synchronized, but the readback / ASC queues are submitted from other threads at any
+    // time. The only caller (TextureManager::Submit) runs under Scheduler::submit_mutex, which every
+    // graphics-queue submitter holds, and this texture is only drawn on that queue (= v.queue).
+    if (Vulkan::SwapchainSafeWait()) {
+        CheckVkErr(v.queue.waitIdle());
+    } else {
+        CheckVkErr(v.device.waitIdle());
+    }
     RemoveTexture(im_texture);
     im_texture = nullptr;
 

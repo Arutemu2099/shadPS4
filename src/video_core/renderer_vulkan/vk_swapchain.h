@@ -14,8 +14,9 @@ class WindowSDL;
 
 namespace Vulkan {
 
-/// SHADPS4_SWAPCHAIN_SAFE_WAIT=1: swapchain rebuilds wait for the present / graphics queue under
-/// Scheduler::submit_mutex instead of vkDeviceWaitIdle (vk_swapchain.cpp).
+/// SHADPS4_SWAPCHAIN_SAFE_WAIT=1: swapchain rebuilds wait on an empty fenced submit to the present /
+/// graphics queue (submitted under Scheduler::submit_mutex, waited outside it) instead of
+/// vkDeviceWaitIdle (vk_swapchain.cpp); ImGui texture destroys wait for their queue only.
 bool SwapchainSafeWait();
 
 class Instance;

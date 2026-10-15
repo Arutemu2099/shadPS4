@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <limits>
 #include <mutex>
@@ -35,10 +36,36 @@ static vk::Result WaitForSwapchainIdle(const Instance& instance) {
     if (!SwapchainSafeWait()) {
         return instance.GetDevice().waitIdle();
     }
-    std::scoped_lock lk{Scheduler::submit_mutex};
-    vk::Result result = instance.GetPresentQueue().waitIdle();
-    if (result == vk::Result::eSuccess && instance.GetGraphicsQueue() != instance.GetPresentQueue()) {
-        result = instance.GetGraphicsQueue().waitIdle();
+    // Review RISK 1 (10-15): draining the queue while holding submit_mutex would hang if a queued
+    // batch waited on a semaphore that only a later, lock-taking submit signals (LANE_RECORDER /
+    // LANE_DEFER_UPLOAD modes). Mark the drain point with an empty fenced submit under the lock (a
+    // vkQueueSubmit fence covers every command earlier in submission order) and wait outside it.
+    const vk::Device device = instance.GetDevice();
+    const vk::Queue present_queue = instance.GetPresentQueue();
+    const vk::Queue graphics_queue = instance.GetGraphicsQueue();
+    const u32 num_queues = graphics_queue != present_queue ? 2 : 1;
+    std::array<vk::Fence, 2> fences{};
+    vk::Result result = vk::Result::eSuccess;
+    for (u32 i = 0; i < num_queues && result == vk::Result::eSuccess; ++i) {
+        auto created = device.createFence({});
+        result = created.result;
+        fences[i] = created.value;
+    }
+    if (result == vk::Result::eSuccess) {
+        std::scoped_lock lk{Scheduler::submit_mutex};
+        result = present_queue.submit(nullptr, fences[0]);
+        if (result == vk::Result::eSuccess && num_queues == 2) {
+            result = graphics_queue.submit(nullptr, fences[1]);
+        }
+    }
+    if (result == vk::Result::eSuccess) {
+        result = device.waitForFences({num_queues, fences.data()}, true,
+                                      std::numeric_limits<u64>::max());
+    }
+    for (const vk::Fence fence : fences) {
+        if (fence) {
+            device.destroyFence(fence);
+        }
     }
     return result;
 }
