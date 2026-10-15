@@ -4700,6 +4700,13 @@ void LeanXlEnd(LeanXl& x) {
                 sd.pre_pos = x.s_pre_pos;
                 sd.first_pos = x.s_first_pos;
                 sd.pre_delta.swap(x.s_pre_delta);
+                // Review RISK 1: a recycled buffer keeps its largest capacity; drop outliers.
+                if (x.delta.capacity() > 4096) {
+                    decltype(x.delta){}.swap(x.delta);
+                }
+                if (x.s_pre_delta.capacity() > 4096) {
+                    decltype(x.s_pre_delta){}.swap(x.s_pre_delta);
+                }
             } else {
                 sd = {x.last_end, x.last_epoch, std::move(x.delta), x.open_key};
                 sd.pre_pos = x.s_pre_pos;

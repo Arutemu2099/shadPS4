@@ -53,6 +53,7 @@
 //    DispatchSync) and the program prefetch hint (PrefetchProgramsOnWrite).
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #ifdef _MSC_VER
 #include <intrin.h>
