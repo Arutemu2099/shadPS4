@@ -22,6 +22,7 @@
 #include "imgui/invitation_prompt_layer.h"
 #include "imgui/notifications_layer.h"
 #include "imgui/renderer/imgui_core.h"
+#include "imgui/renderer/texture_manager.h"
 #include "imgui/renderer/imgui_impl_vulkan.h"
 #include "imgui/shadnet_notifications_layer.h"
 #include "sdl_window.h"
@@ -1174,6 +1175,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
     info.AddSignal(frame->present_done);
     const auto flush_start = Common::FaultMonitor::Now();
     scheduler.Flush(info);
+    // This frame's ImGui draws are submitted (texture destroys wait for two of these).
+    ImGui::Core::TextureManager::NotePresented();
     const u64 flush_ns = Common::FaultMonitor::SinceNs(flush_start);
 
     // Present to swapchain.

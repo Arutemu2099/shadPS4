@@ -14,6 +14,7 @@
 #include "core/emulator_settings.h"
 #include "imgui_impl_vulkan.h"
 #include "texture_manager.h"
+#include "video_core/renderer_vulkan/vk_swapchain.h"
 
 namespace ImGui {
 
@@ -110,7 +111,15 @@ struct UploadJob {
     Inner* core = nullptr;
     Vulkan::UploadTextureData data;
     int tick = 0; // Used to skip the first frame when destroying to await the current frame to draw
+    // SHADPS4_SWAPCHAIN_SAFE_WAIT=1 (review 10-15): `tick` counts Submit() calls, which run on
+    // every scheduler submit (hundreds per frame), so a destroy could free a texture that a present
+    // command buffer recorded but not yet submitted still samples. Destroy only once the presented
+    // frame count reaches this (0 = use `tick`).
+    u64 present_at = 0;
 };
+
+// Frames the presenter has submitted (NotePresented), for UploadJob::present_at.
+static std::atomic<u64> g_presented{0};
 
 static bool g_is_worker_running = false;
 static std::jthread g_worker_thread;
@@ -129,10 +138,14 @@ namespace Core::TextureManager {
 
 Inner::~Inner() {
     if (upload_data.im_texture != nullptr) {
+        // The frame being built now may still draw it: it is presented as g_presented + 1, so
+        // wait for + 2.
+        const bool by_present = ::Vulkan::SwapchainSafeWait();
         std::unique_lock lk{g_upload_mtx};
         g_upload_list.emplace_back(UploadJob{
             .data = this->upload_data,
-            .tick = 2,
+            .tick = by_present ? 0 : 2,
+            .present_at = by_present ? g_presented.load(std::memory_order_acquire) + 2 : 0,
         });
         g_upload_pending.store(true, std::memory_order_relaxed);
     }
@@ -233,6 +246,10 @@ bool HasPendingUploads() {
     return g_upload_pending.load(std::memory_order_relaxed);
 }
 
+void NotePresented() {
+    g_presented.fetch_add(1, std::memory_order_release);
+}
+
 void Submit() {
     UploadJob upload;
     {
@@ -246,6 +263,11 @@ void Submit() {
         if (upload.tick > 0) {
             --upload.tick;
             g_upload_list.emplace_back(upload);
+            return;
+        }
+        if (upload.present_at != 0 &&
+            g_presented.load(std::memory_order_acquire) < upload.present_at) {
+            g_upload_list.emplace_back(std::move(upload));
             return;
         }
         g_upload_pending.store(!g_upload_list.empty(), std::memory_order_relaxed);

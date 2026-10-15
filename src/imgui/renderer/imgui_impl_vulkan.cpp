@@ -273,6 +273,11 @@ void UploadTextureData::Destroy() {
     image_memory = VK_NULL_HANDLE;
 }
 
+// SHADPS4_SWAPCHAIN_SAFE_WAIT=1 (review 10-15): AddTexture runs on the texture worker and the
+// command processor, RemoveTexture on submitters and the presenter; vkAllocateDescriptorSets /
+// vkFreeDescriptorSets need the pool externally synchronized.
+static std::mutex g_descriptor_pool_mutex;
+
 // Register a texture
 ImTextureID AddTexture(vk::ImageView image_view, vk::ImageLayout image_layout,
                        vk::Sampler sampler) {
@@ -291,6 +296,10 @@ ImTextureID AddTexture(vk::ImageView image_view, vk::ImageLayout image_layout,
             .descriptorSetCount = 1,
             .pSetLayouts = &bd->descriptor_set_layout,
         };
+        std::unique_lock pool_lk{g_descriptor_pool_mutex, std::defer_lock};
+        if (::Vulkan::SwapchainSafeWait()) {
+            pool_lk.lock();
+        }
         descriptor_set = CheckVkResult(v.device.allocateDescriptorSets(alloc_info)).front();
     }
 
@@ -480,7 +489,13 @@ void RemoveTexture(ImTextureID texture) {
     IM_ASSERT(texture != nullptr);
     VkData* bd = GetBackendData();
     const InitInfo& v = bd->init_info;
-    CheckVkErr(v.device.freeDescriptorSets(bd->descriptor_pool, {texture->descriptor_set}));
+    {
+        std::unique_lock pool_lk{g_descriptor_pool_mutex, std::defer_lock};
+        if (::Vulkan::SwapchainSafeWait()) {
+            pool_lk.lock();
+        }
+        CheckVkErr(v.device.freeDescriptorSets(bd->descriptor_pool, {texture->descriptor_set}));
+    }
     delete texture;
 }
 

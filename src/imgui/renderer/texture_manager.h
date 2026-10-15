@@ -30,4 +30,8 @@ void Submit();
 /// True when an upload is queued (may be briefly stale): lets a caller skip taking the queue lock.
 bool HasPendingUploads();
 
+/// SHADPS4_SWAPCHAIN_SAFE_WAIT=1: the presenter calls this after submitting each frame; texture
+/// destroys wait for two of these instead of two scheduler submits.
+void NotePresented();
+
 }; // namespace ImGui::Core::TextureManager
