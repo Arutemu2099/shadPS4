@@ -156,6 +156,14 @@ struct Image {
     void Clear(const vk::ClearValue& clear_value, const VideoCore::SubresourceRange& range);
 
     void SetBackingSamples(u32 num_samples, bool copy_backing = true);
+    /// SHADPS4_WATER_REFLECTION_SCALE (video_core/water_scale.h): switches to a backing of the
+    /// same sample count at `scale` x the guest width / height (contents not carried over: the
+    /// game rewrites these targets every frame). Single-level, single-layer images only.
+    void SetBackingScale(u32 scale);
+    /// The current backing's scale (1 = the guest extent).
+    [[nodiscard]] u32 BackingScale() const noexcept {
+        return backing ? backing->scale : 1u;
+    }
 
 public:
     const Vulkan::Instance* instance;
@@ -198,6 +206,7 @@ public:
         boost::container::small_vector<ImageViewInfo, 4> image_view_infos;
         boost::container::small_vector<ImageViewId, 4> image_view_ids;
         u32 num_samples;
+        u32 scale{1}; ///< SHADPS4_WATER_REFLECTION_SCALE: extent = scale x the guest extent
         /// Bumped by GetBarriers whenever it emits a barrier or changes `state` or the runs
         /// (SHADPS4_TEX_TRANSIT_SKIP: an unchanged serial proves a repeated Transit is a no-op).
         u64 state_serial{1};
@@ -217,6 +226,9 @@ public:
     u64 lru_id{};
     u64 tick_accessed_last{};
     u64 hash{};
+    /// SHADPS4_WATER_REFLECTION_SCALE: 1 = the reflection's own targets (scaled for good),
+    /// 2 = a scratch target scaled only while the game's blur fs_0x6d29fb0f renders into it.
+    u8 water_scale_mode{};
 
     struct {
         u32 texture : 1;

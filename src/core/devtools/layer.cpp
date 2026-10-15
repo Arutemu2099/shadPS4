@@ -3,6 +3,8 @@
 
 #include "layer.h"
 
+#include <mutex>
+#include <string>
 #include <SDL3/SDL_events.h>
 #include <imgui.h>
 
@@ -34,6 +36,10 @@ static bool show_quit_window = false;
 
 static bool show_volume = false;
 static float volume_start_time;
+// Overlay::ShowNotice: written from the SDL thread, read by the overlay's draw.
+static std::mutex notice_mutex;
+static std::string notice_text;
+static double notice_start_time = -100.0;
 
 static float fps_scale = 1.0f;
 static int dump_frame_count = 1;
@@ -492,6 +498,28 @@ void L::Draw() {
             End();
         }
     }
+    {
+        std::string text;
+        {
+            std::scoped_lock lk{notice_mutex};
+            if (ImGui::GetTime() - notice_start_time < 3.0) {
+                text = notice_text;
+            }
+        }
+        if (!text.empty()) {
+            SetNextWindowPos(ImVec2(ImGui::GetMainViewport()->WorkPos.x +
+                                        ImGui::GetMainViewport()->WorkSize.x - 10,
+                                    ImGui::GetMainViewport()->WorkPos.y + 50),
+                             ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+            if (ImGui::Begin("Notice Window", nullptr,
+                             ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoDecoration |
+                                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDocking |
+                                 ImGuiWindowFlags_NoInputs)) {
+                TextUnformatted(text.c_str());
+            }
+            End();
+        }
+    }
 
     PopID();
 }
@@ -524,6 +552,15 @@ void ToggleQuitWindow() {
 void ShowVolume() {
     volume_start_time = ImGui::GetTime();
     show_volume = true;
+}
+
+void ShowNotice(const char* text) {
+    if (!ImGui::GetCurrentContext()) {
+        return; // before the overlay exists (review 2026-10-14)
+    }
+    std::scoped_lock lk{notice_mutex};
+    notice_text = text;
+    notice_start_time = ImGui::GetTime();
 }
 
 } // namespace Overlay

@@ -4,6 +4,8 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <cstdlib>
 #include <mutex>
 #include <optional>
 #include <utility>
@@ -16,6 +18,47 @@
 #include "core/libraries/system/userservice.h"
 
 namespace Input {
+
+/// SHADPS4_STICK_SMOOTHING_TOGGLE=1 (2026-10-14, upstream #5340 behind a live toggle): F1 flips
+/// g_real_axis_unsmoothed. While it is set, stick / trigger values that come from a real pad's
+/// analog axis reach the game unsmoothed (upstream #5340: the 33 ms ramp meant for keyboard
+/// keys bound to a stick was applied to real sticks and triggers too); keyboard-driven axis
+/// values keep the ramp. SHADPS4_STICK_UNSMOOTHED=1 starts with it set. Off = today's behaviour.
+inline const bool g_stick_smoothing_toggle = [] {
+    const char* v = std::getenv("SHADPS4_STICK_SMOOTHING_TOGGLE");
+    return v && v[0] == '1';
+}();
+inline std::atomic<bool> g_real_axis_unsmoothed{[] {
+    const char* v = std::getenv("SHADPS4_STICK_UNSMOOTHED");
+    return v && v[0] == '1';
+}()};
+
+/// SHADPS4_SYNTH_MOTION=1 (2026-10-14, notes/study-input-kbm-2026-10-14.md sec. 3): while the
+/// mouse is the motion sensor (F6), controller 0's orientation is SET from the accumulated mouse
+/// (Second Son aims the spray can from the orientation quaternion: +-0.35 rad yaw / +-0.25 rad
+/// pitch = the whole cursor), the accelerometer reads the gravity that matches the pose (so the
+/// game's re-levelling never fights it), the gyro its derivative; R (or mouse back button)
+/// = rattle (pad rolled 90 degrees + a 5 Hz 2.5 g vertical shake: the game's SprayShake test is
+/// any axis > 2.5 g while rolled > 30 degrees), Z (or mouse forward button) = tilt (roll only).
+/// A real pad's sensor events are ignored meanwhile. Mouse deltas come from SDL motion events
+/// on the main thread (g_synth_dx / dy), consumed by every 4 ms state push.
+inline const bool g_synth_motion = [] {
+    const char* v = std::getenv("SHADPS4_SYNTH_MOTION");
+    return v && v[0] == '1';
+}();
+/// Radians of pad yaw / pitch per mouse pixel (SHADPS4_SYNTH_MOTION_DEG_PER_100PX, default 5:
+/// 400 px from the centre to the cursor's side edge, 286 px to the top).
+inline const float g_synth_rad_per_px = [] {
+    const char* v = std::getenv("SHADPS4_SYNTH_MOTION_DEG_PER_100PX");
+    const float deg = v ? static_cast<float>(std::atof(v)) : 5.0f;
+    return (deg > 0.0f ? deg : 5.0f) * 3.14159265f / 180.0f / 100.0f;
+}();
+inline std::atomic<float> g_synth_dx{0.0f};
+inline std::atomic<float> g_synth_dy{0.0f};
+inline std::atomic<bool> g_synth_tilt{false};       ///< Z held
+inline std::atomic<bool> g_synth_rattle{false};     ///< R held
+inline std::atomic<bool> g_synth_tilt_btn{false};   ///< mouse forward button held
+inline std::atomic<bool> g_synth_rattle_btn{false}; ///< mouse back button held
 
 enum class Axis {
     LeftX = 0,
@@ -99,6 +142,8 @@ public:
     void UpdateAcceleration(const float acceleration[3]);
     void PollState();
     void ResetOrientation();
+    /// SHADPS4_SYNTH_MOTION: turns the mouse motion source on / off (F6 Gyro mode).
+    void SetSyntheticMotion(bool active);
     void SetLightBarRGB(u8 const r, u8 const g, u8 const b);
     void SetLightBarRGB(Colour const c);
     Colour GetLightBarRGB();
@@ -111,6 +156,16 @@ public:
     SDL_Gamepad* m_sdl_gamepad = nullptr;
 
 private:
+    /// SHADPS4_SYNTH_MOTION state (m_state_mutex).
+    struct SyntheticMotion {
+        bool active{};
+        float yaw{}, pitch{}, roll{}, phi{};
+        u64 t0{}, last_t{};
+        Libraries::Pad::OrbisFQuaternion last_q{0.0f, 0.0f, 0.0f, 1.0f};
+    };
+    SyntheticMotion m_synth{};
+    void SyntheticMotionLocked(u64 timestamp);
+
     // m_state_mutex must be held by the caller.
     void PushStateLocked(u64 timestamp = 0);
     void UpdateOrientationLocked(u64 timestamp);

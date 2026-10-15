@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <cmath>
 
 #include "common/assert.h"
@@ -50,6 +51,14 @@ void SetMouseGyroRollMode(bool mode) {
     mouse_gyro_roll_mode = mode;
 }
 
+bool IsMouseGyroMode() {
+    return mouse_mode == MouseMode::Gyro;
+}
+
+bool IsMouseGyroRollMode() {
+    return mouse_gyro_roll_mode;
+}
+
 void EmulateJoystick(GameController* controller, u32 interval) {
 
     Axis axis_x, axis_y;
@@ -87,6 +96,9 @@ void EmulateJoystick(GameController* controller, u32 interval) {
 
 constexpr float constant_down_accel[3] = {0.0f, 9.81f, 0.0f};
 void EmulateGyro(GameController* controller, u32 interval) {
+    if (g_synth_motion) {
+        return; // SHADPS4_SYNTH_MOTION: the pose comes from the 4 ms pushes (controller.cpp)
+    }
     float d_x = 0, d_y = 0;
     SDL_GetRelativeMouseState(&d_x, &d_y);
     controller->UpdateAcceleration(constant_down_accel);
@@ -109,9 +121,19 @@ void EmulateTouchpad(GameController* controller, u32 interval) {
 }
 
 void ApplyMouseInputBlockers() {
+    // SHADPS4_TOUCHPAD_BLOCK_FIX=1 (2026-10-14, input study): block only the MOUSE buttons. The
+    // ids 1 / 3 are also a pad's LEFT-Y / RIGHT-Y axes and Circle / Triangle, which touchpad mode
+    // used to swallow.
+    static const bool block_fix = [] {
+        const char* v = std::getenv("SHADPS4_TOUCHPAD_BLOCK_FIX");
+        return v && v[0] == '1';
+    }();
     switch (mouse_mode) {
     case MouseMode::Touchpad:
         for (auto& k : pressed_keys) {
+            if (block_fix && k.first.input.type != InputType::KeyboardMouse) {
+                continue;
+            }
             if (k.first.input.sdl_id == SDL_BUTTON_LEFT ||
                 k.first.input.sdl_id == SDL_BUTTON_RIGHT) {
                 k.second = true;

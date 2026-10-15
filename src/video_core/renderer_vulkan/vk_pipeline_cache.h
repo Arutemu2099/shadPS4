@@ -301,6 +301,17 @@ public:
 
     static std::string GetShaderName(Shader::Stage stage, u64 hash,
                                      std::optional<size_t> perm = {});
+    /// SHADPS4_DUMP_SHADER_HASH=<hex> (2026-10-14): writes that program's SPIR-V - as compiled
+    /// or as loaded from the pipeline cache - to <user>/shader/dumps/one_<name>_<origin>.spv,
+    /// once per permutation and origin, whatever the dump setting (the W4 water patch is built
+    /// from it).
+    static void DumpOneShader(std::span<const u32> code, u64 hash, Shader::Stage stage,
+                              size_t perm_idx, const char* origin);
+    /// <user>/shader/patch/<stage>_<hash>_src<fnv1a64 of `source`>.spv, if present (2026-10-14).
+    static std::optional<std::vector<u32>> GetShaderPatchBySource(u64 hash, Shader::Stage stage,
+                                                                  std::span<const u32> source);
+    /// Any patch file for this program in <user>/shader/patch (by index or by source).
+    static bool HasAnyShaderPatch(u64 hash, Shader::Stage stage);
 
     auto& GetProfile() const {
         return profile;

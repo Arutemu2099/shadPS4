@@ -24,6 +24,9 @@ void EmulateJoystick(GameController* controller, u32 interval);
 void EmulateGyro(GameController* controller, u32 interval);
 
 void ApplyMouseInputBlockers();
+/// SHADPS4_SYNTH_MOTION helpers.
+bool IsMouseGyroMode();
+bool IsMouseGyroRollMode();
 
 // Polls the mouse for changes
 Uint32 MousePolling(void* param, Uint32 id, Uint32 interval);

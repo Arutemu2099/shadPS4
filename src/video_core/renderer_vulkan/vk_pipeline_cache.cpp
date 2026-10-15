@@ -1508,6 +1508,14 @@ void PipelineCache::PrepareNativeColourLocked(const GraphicsPipeline* base,
             if (!vs || !fs) {
                 return "no vs / ps";
             }
+            // SHADPS4_PATCH_SHADERS: a stage with a patch installed keeps its plain (patched)
+            // module; the native colour variant is compiled from the recompiler and would
+            // bypass the patch (2026-10-14, the W4 water patch).
+            if ((EmulatorSettings.IsPatchShaders() || Shader::PatchShadersEnv()) &&
+                (HasAnyShaderPatch(fs->pgm_hash, Shader::Stage::Fragment) ||
+                 HasAnyShaderPatch(vs->pgm_hash, Shader::Stage::Vertex))) {
+                return "shader patch";
+            }
             for (u32 i = 0; i < stages.size(); ++i) {
                 if (stages[i] && i != u32(LogicalStage::Vertex) &&
                     i != u32(LogicalStage::Fragment)) {
@@ -2332,10 +2340,16 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
     DumpShader(spv, info.pgm_hash, info.stage, perm_idx, "spv");
+    DumpOneShader(spv, info.pgm_hash, info.stage, perm_idx, "compiled");
 
     vk::ShaderModule module;
 
     auto patch = GetShaderPatch(info.pgm_hash, info.stage, perm_idx, "spv");
+    if (!patch && (EmulatorSettings.IsPatchShaders() || Shader::PatchShadersEnv())) {
+        // 2026-10-14: a patch keyed on the SPIR-V it replaces, <name>_src<fnv1a64>.spv - the
+        // permutation index depends on the order shaders are first used (W4 water patch).
+        patch = GetShaderPatchBySource(info.pgm_hash, info.stage, spv);
+    }
     const bool is_patched = patch && (EmulatorSettings.IsPatchShaders() || Shader::PatchShadersEnv());
     if (is_patched) {
         LOG_INFO(Loader, "Loaded patch for {} shader {:#x}", info.stage, info.pgm_hash);
@@ -2659,6 +2673,67 @@ void PipelineCache::DumpShader(std::span<const u32> code, u64 hash, Shader::Stag
     const auto filename = fmt::format("{}.{}", GetShaderName(stage, hash, perm_idx), ext);
     const auto file = IOFile{dump_dir / filename, FileAccessMode::Create};
     file.WriteSpan(code);
+}
+
+void PipelineCache::DumpOneShader(std::span<const u32> code, u64 hash, Shader::Stage stage,
+                                  size_t perm_idx, const char* origin) {
+    static const u64 want = [] {
+        const char* v = std::getenv("SHADPS4_DUMP_SHADER_HASH");
+        return v ? std::strtoull(v, nullptr, 16) : 0ull;
+    }();
+    if (want == 0 || hash != want || code.empty()) {
+        return;
+    }
+    static std::mutex m;
+    static std::unordered_set<std::string> done;
+    const auto name = fmt::format("one_{}_{}", GetShaderName(stage, hash, perm_idx), origin);
+    std::scoped_lock lk{m};
+    if (!done.insert(name).second) {
+        return;
+    }
+    using namespace Common::FS;
+    const auto dump_dir = GetUserPath(PathType::ShaderDir) / "dumps";
+    std::error_code ec;
+    std::filesystem::create_directories(dump_dir, ec);
+    const auto file = IOFile{dump_dir / (name + ".spv"), FileAccessMode::Create};
+    file.WriteSpan(code);
+    LOG_INFO(Render_Vulkan, "DumpOneShader: wrote {}.spv ({} words)", name, code.size());
+}
+
+std::optional<std::vector<u32>> PipelineCache::GetShaderPatchBySource(
+    u64 hash, Shader::Stage stage, std::span<const u32> source) {
+    u64 h = 0xcbf29ce484222325ull; // FNV-1a 64 over the source module's bytes
+    for (const u32 w : source) {
+        for (u32 b = 0; b < 4; ++b) {
+            h ^= (w >> (8 * b)) & 0xffu;
+            h *= 0x100000001b3ull;
+        }
+    }
+    using namespace Common::FS;
+    const auto patch_dir = GetUserPath(PathType::ShaderDir) / "patch";
+    const auto filepath =
+        patch_dir / fmt::format("{}_src{:016x}.spv", GetShaderName(stage, hash), h);
+    if (!std::filesystem::exists(filepath)) {
+        return {};
+    }
+    const auto file = IOFile{filepath, FileAccessMode::Read};
+    std::vector<u32> code(file.GetSize() / sizeof(u32));
+    file.Read(code);
+    LOG_INFO(Loader, "Shader patch by source: {}", filepath.filename().string());
+    return code;
+}
+
+bool PipelineCache::HasAnyShaderPatch(u64 hash, Shader::Stage stage) {
+    using namespace Common::FS;
+    const auto patch_dir = GetUserPath(PathType::ShaderDir) / "patch";
+    const auto prefix = GetShaderName(stage, hash);
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(patch_dir, ec)) {
+        if (e.path().filename().string().starts_with(prefix)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::optional<std::vector<u32>> PipelineCache::GetShaderPatch(u64 hash, Shader::Stage stage,

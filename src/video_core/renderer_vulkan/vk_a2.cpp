@@ -23,6 +23,7 @@
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+#include "video_core/water_scale.h"
 
 // Architecture A step A2, the stretch translator: v1 shadow draws, v2 colour draws (bindless
 // textures + pulled vertices, "deferred material resolve"). Everything here runs on a WORKER
@@ -893,6 +894,30 @@ bool A2IndirectOn() {
     return on;
 }
 
+/// SHADPS4_WATER_REFLECTION_SCALE: a draw into the planar reflection's targets (a 480x270 depth,
+/// or an image the back gave a scaled backing - published addresses, relaxed atomics). Its pass
+/// needs the back's BeginRendering / viewport scaling, so the worker leaves it to the back
+/// (under RefuseOff: the refusal table is full). Pure function of the mirror + atomics.
+static bool WaterScaleTarget(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline) {
+    const auto& db = regs.depth_buffer;
+    const bool depth_used = regs.depth_control.depth_enable || regs.depth_control.depth_write_enable;
+    if (depth_used && db.DepthValid() &&
+        ((db.Pitch() == VideoCore::WaterScale::kWidth &&
+          (db.Height() == VideoCore::WaterScale::kHeight || db.Height() == 272)) ||
+         VideoCore::WaterScale::IsPublished(db.DepthAddress()))) {
+        return true;
+    }
+    // Only the colour targets the pipeline writes (stale registers of unbound slots don't count).
+    const u32 mrt = pipeline ? pipeline->GetGraphicsKey().mrt_mask : 0xffu;
+    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        const auto& c = regs.color_buffers[cb];
+        if ((mrt >> cb) & 1u && c && VideoCore::WaterScale::IsPublished(c.Address())) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw) {
     const auto refuse = [&](u32 why) {
         ++owner->refusals[why];
@@ -900,6 +925,10 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         return false;
     };
     if (!enabled) {
+        return refuse(RefuseOff);
+    }
+    if (VideoCore::WaterScale::g_active && WaterScaleTarget(regs, draw.pipeline)) [[unlikely]] {
+        VideoCore::WaterScale::g_counters.worker_refusals.fetch_add(1, std::memory_order_relaxed);
         return refuse(RefuseOff);
     }
     if (!draw.is_indexed) {

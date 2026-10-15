@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 
@@ -13,6 +14,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/amdgpu/mtb_conflict.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/water_scale.h"
 
 #include <thread>
 #if defined(_M_X64) || defined(__x86_64__)
@@ -869,6 +871,10 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         Rc().last_end_site = ~0u;
     }
     Rc().render_state = new_state;
+    {
+        // SHADPS4_WATER_REFLECTION_SCALE: the pass's viewports / scissors follow its scale.
+        Rc().dynamic_state.SetRenderScale(new_state.scale, new_state.skip != 0);
+    }
 
     Record([render_state = new_state](vk::CommandBuffer cmdbuf) {
         std::array<vk::RenderingAttachmentInfo, 8> color_attachments;
@@ -2726,6 +2732,53 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
 }
 
 void DynamicState::Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf) {
+    if (render_skip && dirty_state.scissors) [[unlikely]] {
+        // SHADPS4_WATER_REFLECTION_NO_BLUR: the pass rasterizes nothing.
+        dirty_state.scissors = false;
+        Scissors none = scissors;
+        for (auto& r : none) {
+            r = vk::Rect2D{.offset = {0, 0}, .extent = {0, 0}};
+        }
+        cmdbuf.setScissorWithCount(none);
+    }
+    if (render_scale > 1) [[unlikely]] {
+        // SHADPS4_WATER_REFLECTION_SCALE: a pass on scaled backings. Window coordinates scale
+        // linearly, so the viewport rectangle and the scissors scale with the target.
+        const float s = static_cast<float>(render_scale);
+        if (dirty_state.viewports) {
+            dirty_state.viewports = false;
+            Viewports scaled = viewports;
+            const float max_w = static_cast<float>(instance.GetMaxViewportWidth());
+            const float max_h = static_cast<float>(instance.GetMaxViewportHeight());
+            constexpr float bound = 32767.0f; // viewportBoundsRange upper end (NVIDIA)
+            for (auto& v : scaled) {
+                v.x *= s;
+                v.y *= s;
+                v.width *= s;
+                v.height *= s;
+                if (v.width > max_w || v.height > max_h || v.x + v.width > bound ||
+                    v.y + v.height > bound) {
+                    // The clip-disabled 16K window: never expected in the reflection chain.
+                    VideoCore::WaterScale::g_counters.clip_disabled.fetch_add(
+                        1, std::memory_order_relaxed);
+                    v.width = std::min({v.width, max_w, bound - v.x});
+                    v.height = std::min({v.height, max_h, bound - v.y});
+                }
+            }
+            cmdbuf.setViewportWithCount(scaled);
+        }
+        if (dirty_state.scissors) {
+            dirty_state.scissors = false;
+            Scissors scaled = scissors;
+            for (auto& r : scaled) {
+                r.offset.x = static_cast<s32>(std::min<s64>(s64(r.offset.x) * render_scale, 0x3fffffff));
+                r.offset.y = static_cast<s32>(std::min<s64>(s64(r.offset.y) * render_scale, 0x3fffffff));
+                r.extent.width = static_cast<u32>(std::min<u64>(u64(r.extent.width) * render_scale, 0x3fffffff));
+                r.extent.height = static_cast<u32>(std::min<u64>(u64(r.extent.height) * render_scale, 0x3fffffff));
+            }
+            cmdbuf.setScissorWithCount(scaled);
+        }
+    }
     if (dirty_state.viewports) {
         dirty_state.viewports = false;
         cmdbuf.setViewportWithCount(viewports);

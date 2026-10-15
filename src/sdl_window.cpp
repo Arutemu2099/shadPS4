@@ -216,6 +216,18 @@ void WindowSDL::WaitEvent() {
         return;
     }
 
+    // SHADPS4_SYNTH_MOTION: the mouse motion source follows the mouse mode (controller 0, the
+    // one Input::MousePolling drives).
+    const auto SyncSyntheticMotion = [this] {
+        if (!Input::g_synth_motion) {
+            return;
+        }
+        const bool on = Input::IsMouseGyroMode();
+        controllers[0]->SetSyntheticMotion(on);
+        Overlay::ShowNotice(on ? "Mouse = motion sensor (hold R rattle, Z tilt; F6 off)"
+                               : "Mouse motion sensor off");
+    };
+
     switch (event.type) {
     case SDL_EVENT_WINDOW_RESIZED:
     case SDL_EVENT_WINDOW_MAXIMIZED:
@@ -229,12 +241,48 @@ void WindowSDL::WaitEvent() {
         is_shown = event.type == SDL_EVENT_WINDOW_EXPOSED;
         OnResize();
         break;
+    case SDL_EVENT_MOUSE_MOTION:
+        if (Input::g_synth_motion && Input::IsMouseGyroMode()) {
+            // SHADPS4_SYNTH_MOTION: every pixel counts, consumed by the 4 ms pushes.
+            Input::g_synth_dx.fetch_add(event.motion.xrel, std::memory_order_relaxed);
+            Input::g_synth_dy.fetch_add(event.motion.yrel, std::memory_order_relaxed);
+        }
+        break;
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
     case SDL_EVENT_MOUSE_BUTTON_UP:
+        if (Input::g_synth_motion &&
+            (event.button.button == SDL_BUTTON_X1 || event.button.button == SDL_BUTTON_X2)) {
+            // Mouse back = rattle, forward = tilt (SHADPS4_SYNTH_MOTION).
+            const bool down = event.type == SDL_EVENT_MOUSE_BUTTON_DOWN;
+            (event.button.button == SDL_BUTTON_X1 ? Input::g_synth_rattle_btn
+                                                  : Input::g_synth_tilt_btn)
+                .store(down, std::memory_order_relaxed);
+        }
+        OnKeyboardMouseInput(&event);
+        break;
     case SDL_EVENT_MOUSE_WHEEL:
     case SDL_EVENT_MOUSE_WHEEL_OFF:
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP:
+        if (Input::g_synth_motion &&
+            (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) &&
+            !event.key.repeat &&
+            (event.key.key == SDLK_R || event.key.key == SDLK_Z)) {
+            // SHADPS4_SYNTH_MOTION: R = rattle, Z = tilt (held).
+            (event.key.key == SDLK_R ? Input::g_synth_rattle : Input::g_synth_tilt)
+                .store(event.type == SDL_EVENT_KEY_DOWN, std::memory_order_relaxed);
+        }
+        if (Input::g_stick_smoothing_toggle && event.type == SDL_EVENT_KEY_DOWN &&
+            event.key.key == SDLK_F1 && !event.key.repeat) {
+            // SHADPS4_STICK_SMOOTHING_TOGGLE: F1 flips upstream #5340 live (input/controller.h).
+            const bool unsmoothed =
+                !Input::g_real_axis_unsmoothed.load(std::memory_order_relaxed);
+            Input::g_real_axis_unsmoothed.store(unsmoothed, std::memory_order_relaxed);
+            LOG_INFO(Input, "StickSmoothing: real pad sticks / triggers {}",
+                     unsmoothed ? "UNSMOOTHED (upstream #5340)" : "smoothed over 33 ms (old)");
+            Overlay::ShowNotice(unsmoothed ? "Pad sticks: direct (fix #5340 ON)"
+                                           : "Pad sticks: 33 ms smoothing (old)");
+        }
         OnKeyboardMouseInput(&event);
         break;
     case SDL_EVENT_GAMEPAD_ADDED:
@@ -288,15 +336,18 @@ void WindowSDL::WaitEvent() {
     case SDL_EVENT_MOUSE_TO_JOYSTICK:
         SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(),
                                        Input::ToggleMouseModeTo(Input::MouseMode::Joystick));
+        SyncSyntheticMotion();
         break;
     case SDL_EVENT_MOUSE_TO_GYRO:
         SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(),
                                        Input::ToggleMouseModeTo(Input::MouseMode::Gyro));
+        SyncSyntheticMotion();
         break;
     case SDL_EVENT_MOUSE_TO_TOUCHPAD:
         SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(),
                                        Input::ToggleMouseModeTo(Input::MouseMode::Touchpad));
         SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(), false);
+        SyncSyntheticMotion();
         break;
     case SDL_EVENT_ADD_VIRTUAL_USER:
         for (int i = 0; i < 4; i++) {

@@ -458,6 +458,9 @@ public:
     s16 old_param;
     s16* new_param;
     bool old_button_state, new_button_state, state_changed, positive_axis;
+    // SHADPS4_STICK_SMOOTHING_TOGGLE: which kind of input drove this axis output in the current
+    // pass (a real analog axis / a key), and the last one that did (for the release to 0).
+    bool analog_now{}, key_now{}, analog_last{};
 
     ControllerOutput(const u32 b, u32 a = SDL_GAMEPAD_AXIS_INVALID, bool p = true) {
         button = b;

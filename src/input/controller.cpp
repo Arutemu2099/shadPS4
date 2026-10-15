@@ -16,6 +16,7 @@
 #include "core/libraries/system/userservice.h"
 #include "core/user_settings.h"
 #include "input/controller.h"
+#include "input/input_mouse.h"
 
 namespace Input {
 
@@ -109,12 +110,115 @@ void GameController::Axis(Input::Axis axis, int value, bool smooth) {
 
 void GameController::UpdateGyro(const float gyro[3]) {
     std::lock_guard lock{m_state_mutex};
+    if (m_synth.active) {
+        return; // SHADPS4_SYNTH_MOTION: the mouse is the sensor; a real pad's events are ignored
+    }
     std::memcpy(gyro_buf, gyro, sizeof(gyro_buf));
 }
 
 void GameController::UpdateAcceleration(const float acceleration[3]) {
     std::lock_guard lock{m_state_mutex};
+    if (m_synth.active) {
+        return;
+    }
     std::memcpy(accel_buf, acceleration, sizeof(accel_buf));
+}
+
+void GameController::SetSyntheticMotion(bool active) {
+    std::lock_guard lock{m_state_mutex};
+    if (m_synth.active == active) {
+        return;
+    }
+    m_synth = {};
+    m_synth.active = active;
+    g_synth_dx.store(0.0f, std::memory_order_relaxed);
+    g_synth_dy.store(0.0f, std::memory_order_relaxed);
+    if (!active) {
+        m_state.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+        std::fill(gyro_buf, gyro_buf + 3, 0.0f);
+        std::fill(accel_buf, accel_buf + 3, 0.0f);
+        accel_buf[1] = 9.81f;
+    }
+    m_last_orientation_update = 0;
+    LOG_INFO(Input, "SynthMotion: mouse motion sensor {}", active ? "ON" : "off");
+    PushStateLocked();
+}
+
+namespace {
+using Quat = Libraries::Pad::OrbisFQuaternion;
+Quat QMul(const Quat& a, const Quat& b) { // Hamilton product, (x, y, z, w)
+    return {a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+            a.w * b.y + a.y * b.w + a.z * b.x - a.x * b.z,
+            a.w * b.z + a.z * b.w + a.x * b.y - a.y * b.x,
+            a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+}
+Quat QAxis(float ax, float ay, float az, float angle) {
+    const float s = std::sin(angle * 0.5f);
+    return {ax * s, ay * s, az * s, std::cos(angle * 0.5f)};
+}
+} // namespace
+
+void GameController::SyntheticMotionLocked(u64 timestamp) {
+    constexpr float pi = 3.14159265f;
+    const float dx = g_synth_dx.exchange(0.0f, std::memory_order_relaxed);
+    const float dy = g_synth_dy.exchange(0.0f, std::memory_order_relaxed);
+    const float k = g_synth_rad_per_px;
+    auto& s = m_synth;
+    // Mouse right -> cursor right (yaw down), mouse up -> cursor up (pitch up); the study's
+    // pose table (scratch/study-input-20261014/padmath.py).
+    if (IsMouseGyroRollMode()) {
+        s.roll -= k * dx;
+    } else {
+        s.yaw -= k * dx;
+    }
+    s.pitch = std::clamp(s.pitch - k * dy, -80.0f * pi / 180.0f, 80.0f * pi / 180.0f);
+    if (s.yaw > pi) {
+        s.yaw -= 2.0f * pi;
+    } else if (s.yaw < -pi) {
+        s.yaw += 2.0f * pi;
+    }
+    if (s.t0 == 0) {
+        s.t0 = timestamp;
+    }
+    const float dt = s.last_t != 0 && timestamp > s.last_t
+                         ? std::min(static_cast<float>(timestamp - s.last_t) / 1e6f, 0.1f)
+                         : 0.0f;
+    const bool rattle = g_synth_rattle.load(std::memory_order_relaxed) ||
+                        g_synth_rattle_btn.load(std::memory_order_relaxed);
+    const bool tilt = rattle || g_synth_tilt.load(std::memory_order_relaxed) ||
+                      g_synth_tilt_btn.load(std::memory_order_relaxed);
+    // Roll toward 90 degrees while tilted (eased over ~80 ms: a turn, not a jump).
+    const float target = tilt ? pi * 0.5f : 0.0f;
+    s.phi += (target - s.phi) * (1.0f - std::exp(-dt / 0.08f));
+    const Quat q = QMul(QMul(QAxis(0, 1, 0, s.yaw), QAxis(1, 0, 0, s.pitch)),
+                        QAxis(0, 0, 1, s.phi + s.roll));
+    // Gravity reaction in the pad frame = world up projected on the pad axes (rows of q, the
+    // game's own formula): (r0.y, r1.y, r2.y).
+    const float gx = 2 * q.x * q.y + 2 * q.w * q.z;
+    const float gy = 1 - 2 * q.x * q.x - 2 * q.z * q.z;
+    const float gz = 2 * q.y * q.z - 2 * q.w * q.x;
+    float shake = 0.0f;
+    if (rattle) {
+        const float t = static_cast<float>(timestamp - s.t0) / 1e6f;
+        shake = 2.5f * std::sin(2.0f * pi * 5.0f * t);
+    }
+    const float g = 9.81f * (1.0f + shake);
+    m_state.acceleration = {gx * g, gy * g, gz * g};
+    // Body rate from the pose change (small-angle form), so "still" reads as still.
+    Libraries::Pad::OrbisFVector3 omega{0.0f, 0.0f, 0.0f};
+    if (dt > 0.0f) {
+        const Quat conj{-s.last_q.x, -s.last_q.y, -s.last_q.z, s.last_q.w};
+        Quat dq = QMul(conj, q);
+        if (dq.w < 0) {
+            dq = {-dq.x, -dq.y, -dq.z, -dq.w};
+        }
+        omega = {2.0f * dq.x / dt, 2.0f * dq.y / dt, 2.0f * dq.z / dt};
+    }
+    m_state.angularVelocity = omega;
+    m_state.orientation = q;
+    s.last_q = q;
+    s.last_t = timestamp;
+    m_last_orientation_update = timestamp;
 }
 
 void GameController::PollState() {
@@ -203,9 +307,13 @@ void GameController::PushStateLocked(u64 timestamp) {
         timestamp = Libraries::Kernel::sceKernelGetProcessTime();
     }
     m_state.UpdateAxisSmoothing(timestamp);
-    m_state.OnGyro(gyro_buf);
-    m_state.OnAccel(accel_buf);
-    UpdateOrientationLocked(timestamp);
+    if (m_synth.active) [[unlikely]] {
+        SyntheticMotionLocked(timestamp);
+    } else {
+        m_state.OnGyro(gyro_buf);
+        m_state.OnAccel(accel_buf);
+        UpdateOrientationLocked(timestamp);
+    }
     m_state.time = timestamp;
     m_state.touch_time_since_held_down =
         m_touch_down_timestamp == 0 ? 0 : timestamp - m_touch_down_timestamp;

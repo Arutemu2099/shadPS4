@@ -13,6 +13,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
+#include "video_core/water_scale.h"
 
 #include <vk_mem_alloc.h>
 
@@ -620,6 +621,10 @@ void Image::Upload(std::span<const vk::BufferImageCopy> upload_copies, vk::Buffe
 void Image::Download(std::span<const vk::BufferImageCopy> download_copies, vk::Buffer buffer,
                      u64 offset, u64 download_size) {
     SetBackingSamples(info.num_samples);
+    if (backing->scale > 1) [[unlikely]] {
+        // SHADPS4_WATER_REFLECTION_SCALE: the guest-sized copies read the top-left part only.
+        WaterScale::g_counters.downloads.fetch_add(1, std::memory_order_relaxed);
+    }
     scheduler->EndRendering();
 
     const vk::BufferMemoryBarrier2 pre_barrier = {
@@ -711,6 +716,9 @@ static std::pair<u32, u32> SanitizeCopyLayers(const ImageInfo& src_info, const I
 
 void Image::CopyImage(Image& src_image) {
     const auto& src_info = src_image.info;
+    if (backing->scale > 1 || src_image.backing->scale > 1) [[unlikely]] {
+        WaterScale::g_counters.copies.fetch_add(1, std::memory_order_relaxed);
+    }
 
     const u32 num_mips = std::min(src_info.resources.levels, info.resources.levels);
 
@@ -813,6 +821,9 @@ void Image::CopyImage(Image& src_image) {
 }
 void Image::CopyImageWithBuffer(Image& src_image, vk::Buffer buffer, u64 offset) {
     const auto& src_info = src_image.info;
+    if (backing->scale > 1 || src_image.backing->scale > 1) [[unlikely]] {
+        WaterScale::g_counters.copies.fetch_add(1, std::memory_order_relaxed);
+    }
     const u32 num_mips = std::min(src_info.resources.levels, info.resources.levels);
     const u32 num_layers = std::min(src_info.resources.layers, info.resources.layers);
     ASSERT(src_info.resources.layers == info.resources.layers || num_mips == 1);
@@ -896,6 +907,9 @@ void Image::CopyImageWithBuffer(Image& src_image, vk::Buffer buffer, u64 offset)
 
 void Image::CopyMip(Image& src_image, u32 mip, u32 slice) {
     const auto& src_info = src_image.info;
+    if (backing->scale > 1 || src_image.backing->scale > 1) [[unlikely]] {
+        WaterScale::g_counters.copies.fetch_add(1, std::memory_order_relaxed);
+    }
 
     const auto dst_dim = info.props.is_block ? 2 : 0;
     const auto mip_block_w = std::max(info.size.width >> (mip + dst_dim), 1u);
@@ -1021,13 +1035,18 @@ void Image::SetBackingSamples(u32 num_samples, bool copy_backing) {
     }
     ASSERT_MSG(!info.props.is_depth, "Swapping samples is only valid for color images");
     BackingImage* new_backing;
-    auto it = std::ranges::find(backing_images, num_samples, &BackingImage::num_samples);
+    // SHADPS4_WATER_REFLECTION_SCALE: a sample backing of the current scale (always 1 when off).
+    const u32 cur_scale = backing->scale;
+    auto it = std::ranges::find_if(backing_images, [&](const BackingImage& b) {
+        return b.num_samples == num_samples && b.scale == cur_scale;
+    });
     if (it == backing_images.end()) {
         auto new_image_ci = backing->image.image_ci;
         new_image_ci.samples = LiverpoolToVK::NumSamples(num_samples, supported_samples);
 
         new_backing = &backing_images.emplace_back();
         new_backing->num_samples = num_samples;
+        new_backing->scale = cur_scale;
         new_backing->image = UniqueImage{instance->GetDevice(), instance->GetAllocator()};
         new_backing->image.Create(new_image_ci);
 
@@ -1096,6 +1115,44 @@ void Image::SetBackingSamples(u32 num_samples, bool copy_backing) {
     }
 
     VideoCore::TexTable::NoteImage(tab_gen, tab_id); // q8b: the backing changes
+    backing = new_backing;
+}
+
+void Image::SetBackingScale(u32 scale) {
+    if (!backing || backing->scale == scale) {
+        return;
+    }
+    ASSERT_MSG(info.resources.levels == 1 && info.resources.layers == 1 &&
+                   info.type != AmdGpu::ImageType::Color3D,
+               "Scaled backings are single-level 2D images");
+    const u32 num_samples = backing->num_samples;
+    BackingImage* new_backing;
+    auto it = std::ranges::find_if(backing_images, [&](const BackingImage& b) {
+        return b.num_samples == num_samples && b.scale == scale;
+    });
+    if (it == backing_images.end()) {
+        auto new_image_ci = backing->image.image_ci;
+        new_image_ci.extent.width = info.size.width * scale;
+        new_image_ci.extent.height = info.size.height * scale;
+
+        new_backing = &backing_images.emplace_back();
+        new_backing->num_samples = num_samples;
+        new_backing->scale = scale;
+        new_backing->image = UniqueImage{instance->GetDevice(), instance->GetAllocator()};
+        new_backing->image.Create(new_image_ci);
+
+        Vulkan::SetObjectName(instance->GetDevice(), new_backing->image.image,
+                              "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{} (x{} backing)",
+                              info.size.width, info.size.height, info.size.depth,
+                              AmdGpu::NameOf(info.tile_mode), vk::to_string(info.pixel_format),
+                              info.guest_address, info.guest_size, info.resources.layers,
+                              info.resources.levels, num_samples, scale);
+    } else {
+        new_backing = std::addressof(*it);
+    }
+    // The views, memos and texture-table slots key on the backing: all of them miss now.
+    VideoCore::TexTable::NoteImage(tab_gen, tab_id);
+    g_image_epoch.fetch_add(1, std::memory_order_release);
     backing = new_backing;
 }
 

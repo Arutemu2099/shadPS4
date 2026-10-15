@@ -46,6 +46,7 @@
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "video_core/water_scale.h"
 
 #ifdef MemoryBarrier
 #undef MemoryBarrier
@@ -13090,6 +13091,8 @@ void Rasterizer::RenderStateMemoBegin(RenderState& state) {
             state.color_attachments[t.cb].image_layout = image.backing->state.layout;
         }
     }
+    // After the sample-backing switches above (review 2026-10-14): see BeginRendering.
+    scheduler.GetDynamicState().SetRenderScale(state.scale, state.skip != 0);
 }
 
 void Rasterizer::RenderStateMemoStore(const GraphicsPipeline* pipeline, const RenderState& state,
@@ -13201,6 +13204,47 @@ void Rasterizer::RenderStateMemoLog() {
              s.refused_other, s.epoch_moved, s.verify_prepare, s.verify_begin, s.mismatches);
 }
 
+namespace {
+/// SHADPS4_WATER_REFLECTION_SCALE: the planar reflection's own depth - the frame's only 480x270
+/// D32 target (water capture 2026-09-25: 36986).
+bool WaterScaleDepth(const VideoCore::ImageInfo& d) {
+    return d.props.is_depth && !d.props.has_stencil && d.pixel_format == vk::Format::eD32Sfloat &&
+           d.size.width == VideoCore::WaterScale::kWidth &&
+           d.size.height == VideoCore::WaterScale::kHeight && d.size.depth == 1 &&
+           d.resources.levels == 1 && d.resources.layers == 1 && d.num_samples == 1;
+}
+/// ... and a single-level RGBA16F colour target of its size bound together with it (36982).
+bool WaterScaleColour(const VideoCore::ImageInfo& c, const VideoCore::ImageInfo& d) {
+    return !c.props.is_depth && c.pixel_format == vk::Format::eR16G16B16A16Sfloat &&
+           c.size.width == d.size.width && c.size.height == d.size.height && c.size.depth == 1 &&
+           c.resources.levels == 1 && c.resources.layers == 1 && c.num_samples == 1 &&
+           c.type != AmdGpu::ImageType::Color3D;
+}
+/// v2b: the previous full BeginRendering rendered into a reflection target (water_scale_mode 1).
+/// The reflection's blur pass follows the fog pass directly (09-25 capture: fog 28228 -> blur
+/// 28238); the same blur shader also runs in the bloom chain, whose passes must stay 1x.
+/// Command-processor back thread only.
+bool g_ws_prev_reflection = false;
+void WaterScaleLog(const char* what, const VideoCore::Image& image) {
+    const auto& c = VideoCore::WaterScale::g_counters;
+    LOG_INFO(Render_Vulkan,
+             "WaterScale: x{} {} {:#x} {}x{} {} | switches depth={} colour={} scaled_passes={} "
+             "mixed={} worker_refusals={} downloads={} copies={} clip_disabled={} "
+             "scratch_switches={} skipped_blurs={}",
+             VideoCore::WaterScale::g_scale, what, image.info.guest_address, image.info.size.width,
+             image.info.size.height, vk::to_string(image.info.pixel_format),
+             c.depth_switches.load(std::memory_order_relaxed),
+             c.colour_switches.load(std::memory_order_relaxed),
+             c.scaled_passes.load(std::memory_order_relaxed),
+             c.mixed_passes.load(std::memory_order_relaxed),
+             c.worker_refusals.load(std::memory_order_relaxed),
+             c.downloads.load(std::memory_order_relaxed), c.copies.load(std::memory_order_relaxed),
+             c.clip_disabled.load(std::memory_order_relaxed),
+             c.scratch_switches.load(std::memory_order_relaxed),
+             c.skipped_blurs.load(std::memory_order_relaxed));
+}
+} // namespace
+
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     attachment_feedback_loop = false;
     const auto& regs = liverpool->BackRegs();
@@ -13210,6 +13254,45 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     state.height = instance.GetMaxFramebufferHeight();
     state.num_layers = std::numeric_limits<u16>::max();
     state.num_color_attachments = std::bit_width(key.mrt_mask);
+    // SHADPS4_WATER_REFLECTION_SCALE (video_core/water_scale.h): the reflection's depth gets its
+    // scaled backing here, before any view of it is looked up; a qualifying colour target bound
+    // with it gets one in the loop below. The switches are sticky (the images' only users are
+    // the reflection chain); everything after reads the current backing.
+    const u32 ws = VideoCore::WaterScale::g_scale;
+    const bool ws_active = VideoCore::WaterScale::g_active;
+    const VideoCore::Image* ws_depth = nullptr;
+    if (ws_active && db_desc.first) [[unlikely]] {
+        auto& dimg = texture_cache.GetImage(db_desc.first);
+        // All or nothing (review 2026-10-14 risk 4): every bound colour target must qualify too.
+        bool colours_ok = true;
+        for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
+            if (const auto id = cb_descs[cb].first;
+                id && !WaterScaleColour(texture_cache.GetImage(id).info, dimg.info)) {
+                colours_ok = false;
+            }
+        }
+        if (WaterScaleDepth(dimg.info) && colours_ok) {
+            ws_depth = &dimg;
+            if (dimg.BackingScale() != ws) {
+                dimg.SetBackingScale(ws);
+                VideoCore::WaterScale::Publish(dimg.info.guest_address);
+                VideoCore::WaterScale::g_counters.depth_switches.fetch_add(
+                    1, std::memory_order_relaxed);
+                WaterScaleLog("depth", dimg);
+            }
+        }
+    }
+    u32 ws_pass_scale = 0;
+    bool ws_mixed = false;
+    const bool ws_after_reflection = g_ws_prev_reflection;
+    bool ws_this_reflection = false;
+    const auto ws_note = [&](u32 sc) {
+        if (ws_pass_scale == 0) {
+            ws_pass_scale = sc;
+        } else if (ws_pass_scale != sc) {
+            ws_mixed = true;
+        }
+    };
     for (auto cb = 0u; cb < state.num_color_attachments; ++cb) {
         auto& [image_id, desc] = cb_descs[cb];
         if (!image_id) {
@@ -13220,6 +13303,34 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         if (image->binding.needs_rebind) {
             image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
             image = &texture_cache.GetImage(image_id);
+        }
+        if (ws_depth && image->water_scale_mode != 1 &&
+            WaterScaleColour(image->info, ws_depth->info)) [[unlikely]] {
+            image->SetBackingScale(ws);
+            image->water_scale_mode = 1;
+            VideoCore::WaterScale::Publish(image->info.guest_address);
+            VideoCore::WaterScale::g_counters.colour_switches.fetch_add(1,
+                                                                        std::memory_order_relaxed);
+            WaterScaleLog("colour", *image);
+        } else if (ws > 1 && image->water_scale_mode != 1) [[unlikely]] {
+            // v2: the blur's scratch target follows the pass (scaled under the blur shader).
+            const auto* fs = pipeline->GetStages()[int(Shader::LogicalStage::Fragment)];
+            const bool blur = ws_after_reflection && fs &&
+                              fs->pgm_hash == VideoCore::WaterScale::kBlurFs &&
+                              image->info.size.width == VideoCore::WaterScale::kWidth &&
+                              image->info.size.height == VideoCore::WaterScale::kHeight &&
+                              WaterScaleColour(image->info, image->info);
+            const u32 want = blur ? ws : 1u;
+            if (image->BackingScale() != want) {
+                image->SetBackingScale(want);
+                if (blur && image->water_scale_mode == 0) {
+                    image->water_scale_mode = 2;
+                    VideoCore::WaterScale::Publish(image->info.guest_address);
+                    WaterScaleLog("blur scratch", *image);
+                }
+                VideoCore::WaterScale::g_counters.scratch_switches.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
         }
         texture_cache.UpdateImage(image_id);
         image->SetBackingSamples(key.color_samples[cb]);
@@ -13246,8 +13357,14 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                            desc.view_info.range);
         }
 
-        state.width = std::min<u32>(state.width, std::max(image->info.size.width >> mip, 1u));
-        state.height = std::min<u32>(state.height, std::max(image->info.size.height >> mip, 1u));
+        // The render area is the current backing's (scaled by SHADPS4_WATER_REFLECTION_SCALE).
+        const u32 cb_scale = image->BackingScale();
+        ws_this_reflection |= image->water_scale_mode == 1;
+        ws_note(cb_scale);
+        state.width =
+            std::min<u32>(state.width, std::max((image->info.size.width * cb_scale) >> mip, 1u));
+        state.height =
+            std::min<u32>(state.height, std::max((image->info.size.height * cb_scale) >> mip, 1u));
         state.num_layers = std::min<u32>(state.num_layers, image_view.info.range.extent.layers);
 
         const auto clear_value =
@@ -13305,8 +13422,10 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                           vk::AccessFlagBits2::eDepthStencilAttachmentRead,
                       desc.view_info.range);
 
-        state.width = std::min<u32>(state.width, image.info.size.width);
-        state.height = std::min<u32>(state.height, image.info.size.height);
+        const u32 db_scale = image.BackingScale();
+        ws_note(db_scale);
+        state.width = std::min<u32>(state.width, image.info.size.width * db_scale);
+        state.height = std::min<u32>(state.height, image.info.size.height * db_scale);
         state.num_layers = std::min<u32>(state.num_layers, image_view.info.range.extent.layers);
 
         auto& attachment = state.depth_stencil_attachment;
@@ -13340,6 +13459,35 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     if (state.num_layers == std::numeric_limits<u16>::max()) {
         state.num_layers = 1;
     }
+    if (ws_active && VideoCore::WaterScale::g_no_blur) [[unlikely]] {
+        // The reflection's own blur passes: the blur shader right after a reflection pass (blur
+        // H into the scratch) or into the reflection itself (blur V).
+        const auto* fs = pipeline->GetStages()[int(Shader::LogicalStage::Fragment)];
+        if (fs && fs->pgm_hash == VideoCore::WaterScale::kBlurFs &&
+            (ws_after_reflection || ws_this_reflection)) {
+            state.skip = 1;
+            VideoCore::WaterScale::g_counters.skipped_blurs.fetch_add(1,
+                                                                      std::memory_order_relaxed);
+        }
+    }
+    if (ws_pass_scale > 1 || ws_mixed) [[unlikely]] {
+        // A pass on scaled backings: its viewports / scissors are scaled at commit. Mixed scales
+        // (never expected) keep 1x: the render area is the smallest attachment's.
+        auto& c = VideoCore::WaterScale::g_counters;
+        if (ws_mixed) {
+            c.mixed_passes.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            state.scale = static_cast<u16>(ws_pass_scale);
+            const u64 n = c.scaled_passes.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((n & 0x3fff) == 0 && db_desc.first) {
+                WaterScaleLog("periodic", texture_cache.GetImage(db_desc.first));
+            }
+        }
+    }
+    // The draw's dynamic state is committed before Scheduler::BeginRendering runs: the pass's
+    // scale must be in place now (review 2026-10-14 BUG 1; a no-op while the flag is off).
+    scheduler.GetDynamicState().SetRenderScale(state.scale, state.skip != 0);
+    g_ws_prev_reflection = ws_this_reflection;
 
     // Diagnostic: a render pass with no usable attachment at all.
     // A null color attachment on its own is normal - MRT gaps, or the guest disabling colour

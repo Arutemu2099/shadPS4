@@ -412,6 +412,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     if (spv.empty()) {
         return false;
     }
+    DumpOneShader(spv, program->info.pgm_hash, program->info.stage, perm_idx, "cached");
 
     // Permutation hash depends on shader variation index. To prevent collisions, we need insert it
     // at the exact position rather than append

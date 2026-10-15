@@ -67,6 +67,13 @@ struct RenderState {
     u16 height;
     u16 num_layers;
     u16 num_color_attachments;
+    /// SHADPS4_WATER_REFLECTION_SCALE: the attachments' backing scale (0 / 1 = the guest
+    /// extent); width / height above are then the scaled extent and Scheduler::BeginRendering
+    /// scales the pass's viewports and scissors at commit (DynamicState::render_scale).
+    u16 scale;
+    /// SHADPS4_WATER_REFLECTION_NO_BLUR: 1 = the pass draws nothing (zero scissors at commit).
+    u16 skip;
+    u16 reserved[2]; ///< keeps the struct free of padding (memcmp equality)
 
     bool operator==(const RenderState& other) const noexcept {
         return std::memcmp(this, &other, sizeof(RenderState)) == 0;
@@ -194,6 +201,27 @@ struct DynamicState {
     ColorWriteMasks color_write_masks{};
     float line_width{};
     bool feedback_loop_enabled{};
+    /// SHADPS4_WATER_REFLECTION_SCALE: the current pass's RenderState::scale (set by
+    /// Scheduler::BeginRendering, which marks viewports / scissors dirty when it changes); Commit
+    /// records the viewports and scissors multiplied by it. 1 = unchanged.
+    u32 render_scale{1};
+    bool render_skip{}; ///< SHADPS4_WATER_REFLECTION_NO_BLUR: zero scissors for this pass
+
+    /// SHADPS4_WATER_REFLECTION_SCALE: set by Rasterizer::BeginRendering / RenderStateMemoBegin
+    /// BEFORE the draw's dynamic state is committed (the commit precedes Scheduler::
+    /// BeginRendering; review 2026-10-14 BUG 1), and by Scheduler::BeginRendering as a backstop.
+    void SetRenderScale(u32 scale, bool skip = false) {
+        scale = scale ? scale : 1u;
+        if (render_scale != scale) {
+            render_scale = scale;
+            dirty_state.viewports = true;
+            dirty_state.scissors = true;
+        }
+        if (render_skip != skip) {
+            render_skip = skip;
+            dirty_state.scissors = true;
+        }
+    }
 
     /// Commits the dynamic state to the provided command buffer.
     void Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf);

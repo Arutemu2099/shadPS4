@@ -690,6 +690,8 @@ void ControllerOutput::ResetUpdate() {
     state_changed = false;
     new_button_state = false;
     *new_param = 0; // bruh
+    analog_now = false;
+    key_now = false;
 }
 void ControllerOutput::AddUpdate(InputEvent event) {
     switch (button) {
@@ -714,6 +716,9 @@ void ControllerOutput::AddUpdate(InputEvent event) {
 
     } else if (axis != SDL_GAMEPAD_AXIS_INVALID) {
         *new_param = (event.active ? event.axis_value : 0) + *new_param;
+        if (event.active && event.axis_value != 0) {
+            (event.input.type == InputType::Axis ? analog_now : key_now) = true;
+        }
     }
 }
 
@@ -726,6 +731,14 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
             SDL_PushEvent(&e);
         }
     };
+    // SHADPS4_STICK_SMOOTHING_TOGGLE: a real analog axis drove this output (or, with nothing
+    // active, drove it last - its release to 0); such values skip the keyboard ramp when the
+    // toggle is set (upstream #5340).
+    if (analog_now || key_now) {
+        analog_last = analog_now;
+    }
+    const bool smooth_axis =
+        !(analog_last && g_real_axis_unsmoothed.load(std::memory_order_relaxed));
     state_changed = old_button_state != new_button_state || old_param != *new_param;
     if (!state_changed) {
         return;
@@ -846,18 +859,18 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
             break;
         case Axis::TriggerLeft:
             ApplyDeadzone(new_param, lefttrigger_deadzone[gamepad_index]);
-            controller->Axis(c_axis, GetAxis(0x0, 0x7f, *new_param));
+            controller->Axis(c_axis, GetAxis(0x0, 0x7f, *new_param), smooth_axis);
             controller->Button(OrbisPadButtonDataOffset::L2, *new_param > 0x20);
             return;
         case Axis::TriggerRight:
             ApplyDeadzone(new_param, righttrigger_deadzone[gamepad_index]);
-            controller->Axis(c_axis, GetAxis(0x0, 0x7f, *new_param));
+            controller->Axis(c_axis, GetAxis(0x0, 0x7f, *new_param), smooth_axis);
             controller->Button(OrbisPadButtonDataOffset::R2, *new_param > 0x20);
             return;
         default:
             break;
         }
-        controller->Axis(c_axis, GetAxis(-0x80, 0x7f, *new_param * multiplier));
+        controller->Axis(c_axis, GetAxis(-0x80, 0x7f, *new_param * multiplier), smooth_axis);
     }
 }
 
