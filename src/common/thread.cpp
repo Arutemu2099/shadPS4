@@ -439,17 +439,10 @@ u32 AutoPoolWorkers(bool lean) {
 void ApplyHelperThreadPlacement(const char* name) {
     static const int mode = [] {
         const char* value = std::getenv("SHADPS4_HELPER_PLACE");
-        if (value) {
-            return value[0] - '0';
-        }
-        // SHADPS4_POOL_AUTO=1 without HELPER_PLACE: below-normal lean / A2 workers when the process
-        // has < 16 logical processors. Measured 10-15 (s1169, 4c/8t city): a guest write fault
-        // 311 -> 124 us, FPS 35.5 -> 43.9: normal-priority helpers preempted region-lock holders.
-        const char* pool_auto = std::getenv("SHADPS4_POOL_AUTO");
-        if (pool_auto != nullptr && pool_auto[0] == '1' && std::popcount(ProcessMaskNow()) < 16) {
-            return 2;
-        }
-        return 0;
+        // Not implied by SHADPS4_POOL_AUTO (b15f did, b15g reverted): below-normal workers sit on
+        // the back's wait paths (Opus review 10-15: starvation risk on < 16 logical), and
+        // SHADPS4_SPINLOCK_PARK=1 alone recovered more at 4c/8t (57.9 vs 54.4 FPS, s1182 / s1172).
+        return value ? value[0] - '0' : 0;
     }();
     if (mode <= 0) {
         return;
@@ -464,9 +457,8 @@ void ApplyHelperThreadPlacement(const char* name) {
     } else if (mode == 2) {
         ok = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     }
-    LOG_INFO(Common, "{}={}: {} ({} efficiency logical processors), ok {}",
-             std::getenv("SHADPS4_HELPER_PLACE") ? "SHADPS4_HELPER_PLACE" : "SHADPS4_POOL_AUTO helper mode",
-             mode, name, n, ok);
+    LOG_INFO(Common, "SHADPS4_HELPER_PLACE={}: {} ({} efficiency logical processors), ok {}", mode,
+             name, n, ok);
 }
 
 void ApplyCommandProcessorPlacement() {
