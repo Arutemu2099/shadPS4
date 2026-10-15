@@ -355,7 +355,16 @@ void ApplyCriticalThreadPriority(HotThread which) {
         const char* value = std::getenv("SHADPS4_CRIT_PRIO");
         return value ? static_cast<unsigned>(std::strtoul(value, nullptr, 0)) : 0u;
     }();
-    if ((crit & (which == HotThread::GameMain ? 2u : 1u)) != 0) {
+    // Requires SHADPS4_SPINLOCK_PARK (Opus review 10-15): with pure-pause SpinLocks an above-normal
+    // waiter never gives its core to a preempted normal-priority holder (region / page locks are
+    // taken by guest faults, the front and the recorders alike).
+    static const bool park = [] {
+        const char* value = std::getenv("SHADPS4_SPINLOCK_PARK");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    if ((crit & (which == HotThread::GameMain ? 2u : 1u)) != 0 && !park) {
+        LOG_WARNING(Common, "SHADPS4_CRIT_PRIO={} ignored: needs SHADPS4_SPINLOCK_PARK", crit);
+    } else if ((crit & (which == HotThread::GameMain ? 2u : 1u)) != 0) {
         const bool prio_ok = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
         LOG_INFO(Common, "SHADPS4_CRIT_PRIO={}: {} above normal, ok {}", crit,
                  which == HotThread::Recorder ? "recorder"
