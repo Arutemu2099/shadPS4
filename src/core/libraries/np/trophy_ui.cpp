@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -26,6 +27,18 @@ namespace Libraries::Np::NpTrophy {
 std::optional<TrophyUI> current_trophy_ui;
 std::queue<TrophyInfo> trophy_queue;
 std::mutex queueMtx;
+// SHADPS4_SWAPCHAIN_SAFE_WAIT=1 (review 10-15): a trophy unlocked while a popup shows used to
+// destroy current_trophy_ui on the guest thread while PresentThread could be inside its Draw
+// (use-after-free). Then AddTrophyToQueue only queues and sets this (under queueMtx); Draw's tail
+// replaces the popup on PresentThread.
+bool replace_requested = false;
+static bool SafeTrophyReplace() {
+    static const bool on = [] {
+        const char* v = std::getenv("SHADPS4_SWAPCHAIN_SAFE_WAIT");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
 std::string side = "right";
 double trophy_timer;
 
@@ -305,6 +318,27 @@ void TrophyUI::Draw() {
 
     PopStyleVar();
 
+    if (SafeTrophyReplace()) {
+        std::lock_guard<std::mutex> lock(queueMtx);
+        if (trophy_timer <= 0 || replace_requested) {
+            if (replace_requested) {
+                // As AddTrophyToQueue does for a fresh popup: restart the animation.
+                elapsed_time = 0.0f;
+                fade_opacity = 0.0f;
+                start_pos = ImVec2(1280.0f, 50.0f);
+            }
+            replace_requested = false;
+            if (!trophy_queue.empty()) {
+                TrophyInfo next_trophy = trophy_queue.front();
+                trophy_queue.pop();
+                current_trophy_ui.emplace(next_trophy.trophy_icon_path, next_trophy.trophy_name,
+                                          next_trophy.trophy_type);
+            } else {
+                current_trophy_ui.reset();
+            }
+        }
+        return;
+    }
     if (trophy_timer <= 0) {
         std::lock_guard<std::mutex> lock(queueMtx);
         if (!trophy_queue.empty()) {
@@ -381,6 +415,14 @@ void AddTrophyToQueue(const std::filesystem::path& trophyIconPath, const std::st
     std::lock_guard<std::mutex> lock(queueMtx);
 
     if (EmulatorSettings.IsTrophyPopupDisabled()) {
+        return;
+    } else if (SafeTrophyReplace() && current_trophy_ui.has_value()) {
+        TrophyInfo new_trophy;
+        new_trophy.trophy_icon_path = trophyIconPath;
+        new_trophy.trophy_name = trophyName;
+        new_trophy.trophy_type = rarity;
+        trophy_queue.push(new_trophy);
+        replace_requested = true;
         return;
     } else if (current_trophy_ui.has_value()) {
         current_trophy_ui.reset();

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <atomic>
 #include <deque>
 #include <utility>
@@ -120,6 +121,9 @@ struct UploadJob {
 
 // Frames the presenter has submitted (NotePresented), for UploadJob::present_at.
 static std::atomic<u64> g_presented{0};
+// When only not-yet-due destroys are queued, Submit clears g_upload_pending (so submitters skip
+// the lock again, SUBMIT_LOCK_SKIP) and NotePresented re-arms it once g_presented reaches this.
+static std::atomic<u64> g_destroy_due{~0ULL};
 
 static bool g_is_worker_running = false;
 static std::jthread g_worker_thread;
@@ -247,7 +251,11 @@ bool HasPendingUploads() {
 }
 
 void NotePresented() {
-    g_presented.fetch_add(1, std::memory_order_release);
+    const u64 presented = g_presented.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (presented >= g_destroy_due.load(std::memory_order_acquire)) {
+        g_destroy_due.store(~0ULL, std::memory_order_relaxed);
+        g_upload_pending.store(true, std::memory_order_relaxed);
+    }
 }
 
 void Submit() {
@@ -265,10 +273,23 @@ void Submit() {
             g_upload_list.emplace_back(upload);
             return;
         }
-        if (upload.present_at != 0 &&
-            g_presented.load(std::memory_order_acquire) < upload.present_at) {
-            g_upload_list.emplace_back(std::move(upload));
-            return;
+        if (upload.present_at != 0) {
+            const u64 presented = g_presented.load(std::memory_order_acquire);
+            if (presented < upload.present_at) {
+                g_upload_list.emplace_back(std::move(upload));
+                u64 due = ~0ULL;
+                for (const UploadJob& job : g_upload_list) {
+                    if (job.core != nullptr || job.tick > 0 || job.present_at <= presented) {
+                        return; // other work is due: keep the hint set
+                    }
+                    due = std::min(due, job.present_at);
+                }
+                // A present landing between the load above and this store re-arms one frame
+                // late at worst (the next NotePresented sees due <= presented).
+                g_destroy_due.store(due, std::memory_order_release);
+                g_upload_pending.store(false, std::memory_order_relaxed);
+                return;
+            }
         }
         g_upload_pending.store(!g_upload_list.empty(), std::memory_order_relaxed);
     }
