@@ -257,7 +257,7 @@ void UploadTextureData::Destroy() {
     // externally synchronized, but the readback / ASC queues are submitted from other threads at any
     // time. The only caller (TextureManager::Submit) runs under Scheduler::submit_mutex, which every
     // graphics-queue submitter holds, and this texture is only drawn on that queue (= v.queue).
-    if (Vulkan::SwapchainSafeWait()) {
+    if (::Vulkan::SwapchainSafeWait()) {
         CheckVkErr(v.queue.waitIdle());
     } else {
         CheckVkErr(v.device.waitIdle());
