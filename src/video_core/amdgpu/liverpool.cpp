@@ -220,7 +220,7 @@ static const bool g_claim_wake = [] {
 }();
 static const u64 g_claim_spin_ticks = [] {
     const char* v = std::getenv("SHADPS4_CLAIM_SPIN_US");
-    const u64 us = v ? std::strtoull(v, nullptr, 10) : 2;
+    const u64 us = std::min<u64>(v ? std::strtoull(v, nullptr, 10) : 2, 1000); // review NIT: clamp
     if (!g_claim_wake) {
         return u64{0};
     }
@@ -5152,7 +5152,9 @@ void Liverpool::A2Shutdown() {
         s.stop.store(true, std::memory_order_release);
         s.queued.fetch_add(0x40000000u, std::memory_order_acq_rel);
         s.queued.notify_all();
-        s.bells.RingAll();
+        if (g_claim_wake) {
+            s.bells.RingAll();
+        }
         for (auto& w : s.workers) {
             w.request_stop();
         }
@@ -5166,7 +5168,9 @@ void Liverpool::A2Shutdown() {
     g.stop.store(true, std::memory_order_release);
     g.begun.fetch_add(0x40000000u, std::memory_order_acq_rel); // wake every waiter
     g.begun.notify_all();
-    g.bells.RingAll();
+    if (g_claim_wake) {
+        g.bells.RingAll();
+    }
     split->reader_bell.fetch_add(1, std::memory_order_seq_cst);
     split->reader_bell.notify_all();
     for (auto& t : g.workers) {
@@ -10953,13 +10957,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             e.cancel.store(0, std::memory_order_relaxed);
             e.index.store(idx, std::memory_order_release);
             e.state.store(1, std::memory_order_release);
-            Common::FaultMonitor::SampleEmuPlacement(5);
             g_a2s.begun.store(idx, std::memory_order_release);
             if (g_claim_wake) {
                 g_a2s.bells.Ring(idx);
             } else {
                 g_a2s.begun.notify_all();
             }
+            Common::FaultMonitor::SampleEmuPlacement(5);
         }
     }
     if (g_reg_scan && !is_indirect_gfx) [[unlikely]] {

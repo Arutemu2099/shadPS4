@@ -398,6 +398,13 @@ void ApplyGuestThreadPlacement(void* handle, const char* name) {
     }
     const bool job = std::strncmp(name, "JobWorker", 9) == 0;
     const bool main = std::strcmp(name, "Game:Main") == 0;
+    if (main) {
+        // Review RISK: SHADPS4_HOT_CORES bit 2 already gave Game:Main a whole reserved core.
+        const char* hot = std::getenv("SHADPS4_HOT_CORES");
+        if (hot && (std::strtoul(hot, nullptr, 0) & 4u) != 0) {
+            return;
+        }
+    }
     if (!((job && (mask & 1)) || (main && (mask & 2)))) {
         return;
     }
