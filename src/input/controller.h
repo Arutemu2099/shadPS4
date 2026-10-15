@@ -46,12 +46,12 @@ inline const bool g_synth_motion = [] {
     const char* v = std::getenv("SHADPS4_SYNTH_MOTION");
     return v && v[0] == '1';
 }();
-/// Radians of pad yaw / pitch per mouse pixel (SHADPS4_SYNTH_MOTION_DEG_PER_100PX, default 5:
-/// 400 px from the centre to the cursor's side edge, 286 px to the top).
+/// Radians of pad yaw / pitch per mouse pixel (SHADPS4_SYNTH_MOTION_DEG_PER_100PX, default 2.5 (user 2026-10-14: 5 was too fast):
+/// 800 px from the centre to the cursor's side edge, 573 px to the top).
 inline const float g_synth_rad_per_px = [] {
     const char* v = std::getenv("SHADPS4_SYNTH_MOTION_DEG_PER_100PX");
-    const float deg = v ? static_cast<float>(std::atof(v)) : 5.0f;
-    return (deg > 0.0f ? deg : 5.0f) * 3.14159265f / 180.0f / 100.0f;
+    const float deg = v ? static_cast<float>(std::atof(v)) : 2.5f;
+    return (deg > 0.0f ? deg : 2.5f) * 3.14159265f / 180.0f / 100.0f;
 }();
 inline std::atomic<float> g_synth_dx{0.0f};
 inline std::atomic<float> g_synth_dy{0.0f};
