@@ -558,12 +558,16 @@ CmdsPool& GetCmdsPool() {
     return *pool;
 }
 
-/// shared_ptr deleter: back to the pool (bounded; outliers and overflow are freed).
+/// shared_ptr deleter: back to the pool, bounded in bytes (Opus review RISK): at most 1024
+/// objects, and an object whose lists grew past ~96 KB of sub-batches (32 x ~3 KB) or 4096
+/// slot writes / checks is freed instead (its next stretch allocates again).
 void ReturnCmds(StretchCmds* c) {
-    if (c->batches.capacity() <= 64) {
+    if (c->batches.capacity() <= 32 && c->slot_writes.capacity() <= 4096 &&
+        c->inh_checks.capacity() <= 4096 && c->clip_checks.capacity() <= 4096 &&
+        c->fmt_checks.capacity() <= 4096) {
         auto& pool = GetCmdsPool();
         std::scoped_lock lk{pool.mu};
-        if (pool.free.size() < 4096) {
+        if (pool.free.size() < 1024) {
             pool.free.push_back(c);
             return;
         }
