@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <vector>
 #include <cstdlib>
 #include "common/assert.h"
 #include "common/logging/formatter.h"
@@ -220,7 +221,36 @@ void RequestScreenshot(const ScreenshotRequest request) {
 }
 
 u32 ConsumeGameOnlyScreenshotRequests() {
-    return screenshot_game_only_count.exchange(0, std::memory_order_acq_rel);
+    u32 n = screenshot_game_only_count.exchange(0, std::memory_order_acq_rel);
+    // SHADPS4_AUTO_SHOT=<s>[,<s>...] (2026-10-15): one game-only screenshot at each of these
+    // seconds after the first call (the first presented frame) - the benchmark harness's picture
+    // gate while the display sleeps (desktop captures come out black). Present thread only.
+    static const std::vector<double> times = [] {
+        std::vector<double> t;
+        if (const char* v = std::getenv("SHADPS4_AUTO_SHOT")) {
+            for (const char* p = v; *p;) {
+                char* end = nullptr;
+                const double s = std::strtod(p, &end);
+                if (end == p) {
+                    break;
+                }
+                t.push_back(s);
+                p = *end == ',' ? end + 1 : end;
+            }
+        }
+        return t;
+    }();
+    if (!times.empty()) {
+        static const auto t0 = std::chrono::steady_clock::now();
+        static size_t next = 0;
+        const double el =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        while (next < times.size() && el >= times[next]) {
+            ++n;
+            ++next;
+        }
+    }
+    return n;
 }
 
 u32 ConsumeWithOverlaysScreenshotRequests() {
