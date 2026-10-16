@@ -30,8 +30,9 @@ struct ShaderIndex {
 /// Finds every shader binary in the game folder: an "OrbShdr" BinaryInfo record whose code start
 /// is the nearest 0xBEEB03FF token before it with (code[1] + 1) * 8 == record - code (the rule
 /// of SearchBinaryInfo). Reads every file once on several threads; the result is kept in
-/// `index_file` with a fingerprint of the folder (file count, bytes, newest write time) and read
-/// back on later launches until the folder changes.
+/// `index_file` with the folder's file list (relative path + size per file) and read back while
+/// the list is the same. Write times are not compared (v3, 2026-10-16), so an index shipped with a
+/// seed fits any copy of the same game version; ReadShaderCode checks every shader's own record.
 ShaderIndex BuildShaderIndex(const std::filesystem::path& game_folder,
                              const std::filesystem::path& index_file);
 
@@ -39,7 +40,10 @@ ShaderIndex BuildShaderIndex(const std::filesystem::path& game_folder,
 /// stamp's build id (uncommitted builds share one description).
 u64 ExecutableHash();
 
-/// The shader's code read from its game file; empty on any read error.
-std::vector<u32> ReadShaderCode(const ShaderIndex& index, const ShaderLocation& location);
+/// The shader's code read from its game file; empty on any read error, or when `expected_hash` is
+/// set and the OrbShdr record after the code does not carry that hash with the location's crc32 and
+/// code length (the index may come from another machine's copy of the game).
+std::vector<u32> ReadShaderCode(const ShaderIndex& index, const ShaderLocation& location,
+                                u64 expected_hash = 0);
 
 } // namespace VideoCore

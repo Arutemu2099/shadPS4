@@ -42,7 +42,7 @@ constexpr size_t RecordSize = 32;
 constexpr size_t SearchBack = 0x10000 * 4; // as tools/shaders.py (the emulator scans 0x4000 dwords)
 constexpr size_t ChunkSize = 32ull << 20;
 constexpr u32 IndexMagic = 0x58494853; // "SHIX"
-constexpr u32 IndexVersion = 2; // 2: ShaderLocation::crc32
+constexpr u32 IndexVersion = 3; // 2: ShaderLocation::crc32; 3: per-file sizes, no write times
 
 struct Fingerprint {
     u64 files{};
@@ -177,7 +177,8 @@ bool Get(std::ifstream& in, T& v) {
 }
 
 bool SaveIndex(const std::filesystem::path& path, const std::filesystem::path& folder,
-               const Fingerprint& fp, const ShaderIndex& index) {
+               const Fingerprint& fp, const std::vector<FileEntry>& entries,
+               const ShaderIndex& index) {
     std::ofstream out{path, std::ios::binary | std::ios::trunc};
     if (!out) {
         return false;
@@ -186,10 +187,11 @@ bool SaveIndex(const std::filesystem::path& path, const std::filesystem::path& f
     Put(out, IndexVersion);
     Put(out, fp);
     Put(out, static_cast<u32>(index.files.size()));
-    for (const auto& file : index.files) {
-        const auto rel = std::filesystem::relative(file, folder).generic_u8string();
+    for (size_t i = 0; i < index.files.size(); ++i) {
+        const auto rel = std::filesystem::relative(index.files[i], folder).generic_u8string();
         Put(out, static_cast<u32>(rel.size()));
         out.write(reinterpret_cast<const char*>(rel.data()), rel.size());
+        Put(out, i < entries.size() ? entries[i].size : u64{0});
     }
     Put(out, static_cast<u32>(index.shaders.size()));
     for (const auto& [hash, loc] : index.shaders) {
@@ -200,12 +202,14 @@ bool SaveIndex(const std::filesystem::path& path, const std::filesystem::path& f
 }
 
 bool LoadIndex(const std::filesystem::path& path, const std::filesystem::path& folder,
-               const Fingerprint& fp, ShaderIndex& index) {
+               const Fingerprint& fp, const std::vector<FileEntry>& entries,
+               ShaderIndex& index) {
     std::ifstream in{path, std::ios::binary};
     u32 magic{}, version{}, num_files{}, num_shaders{};
     Fingerprint saved{};
     if (!Get(in, magic) || !Get(in, version) || magic != IndexMagic || version != IndexVersion ||
-        !Get(in, saved) || !(saved == fp) || !Get(in, num_files) || num_files > (1u << 24)) {
+        !Get(in, saved) || saved.files != fp.files || saved.bytes != fp.bytes ||
+        !Get(in, num_files) || num_files > (1u << 24) || num_files != entries.size()) {
         return false;
     }
     for (u32 i = 0; i < num_files; ++i) {
@@ -216,6 +220,12 @@ bool LoadIndex(const std::filesystem::path& path, const std::filesystem::path& f
         std::u8string rel(len, u8'\0');
         in.read(reinterpret_cast<char*>(rel.data()), len);
         if (in.gcount() != static_cast<std::streamsize>(len)) {
+            return false;
+        }
+        u64 size{};
+        // The same relative path and size as this folder's listing (sorted the same way).
+        if (!Get(in, size) || size != entries[i].size ||
+            std::filesystem::relative(entries[i].path, folder).generic_u8string() != rel) {
             return false;
         }
         index.files.push_back(folder / std::filesystem::path{rel});
@@ -246,7 +256,7 @@ ShaderIndex BuildShaderIndex(const std::filesystem::path& game_folder,
     Fingerprint fp{};
     const auto files = ListFiles(game_folder, fp);
     ShaderIndex index;
-    if (!index_file.empty() && LoadIndex(index_file, game_folder, fp, index)) {
+    if (!index_file.empty() && LoadIndex(index_file, game_folder, fp, files, index)) {
         LOG_INFO(Render_Vulkan, "ShaderScan: index {} read: {} shaders in {} files ({:.0f} ms)",
                  index_file.string(), index.shaders.size(), index.files.size(), ms());
         return index;
@@ -298,7 +308,8 @@ ShaderIndex BuildShaderIndex(const std::filesystem::path& game_folder,
     for (const auto& [hash, loc] : index.shaders) {
         ++by_type[loc.type & 0xF];
     }
-    const bool saved = !index_file.empty() && SaveIndex(index_file, game_folder, fp, index);
+    const bool saved =
+        !index_file.empty() && SaveIndex(index_file, game_folder, fp, files, index);
     LOG_INFO(Render_Vulkan,
              "ShaderScan: {} files, {} MiB, {} records ({} without a code start) -> {} shaders "
              "(cs {}, ps {}, vs {}, other {}) on {} threads in {:.0f} ms; index {}",
@@ -336,7 +347,8 @@ u64 ExecutableHash() {
     return XXH3_64bits(bytes.data(), bytes.size());
 }
 
-std::vector<u32> ReadShaderCode(const ShaderIndex& index, const ShaderLocation& location) {
+std::vector<u32> ReadShaderCode(const ShaderIndex& index, const ShaderLocation& location,
+                                u64 expected_hash) {
     std::vector<u32> code;
     if (location.file >= index.files.size() || location.code_length == 0 ||
         (location.code_length & 3) != 0) {
@@ -348,6 +360,26 @@ std::vector<u32> ReadShaderCode(const ShaderIndex& index, const ShaderLocation& 
     in.read(reinterpret_cast<char*>(code.data()), location.code_length);
     if (in.gcount() != static_cast<std::streamsize>(location.code_length)) {
         code.clear();
+        return code;
+    }
+    if (expected_hash != 0) {
+        // The record the scan found sits (code[1] + 1) * 8 bytes after the code start.
+        std::array<u8, RecordSize> record{};
+        if (code.size() < 2 || code[0] != CodeToken) {
+            code.clear();
+            return code;
+        }
+        in.seekg(static_cast<std::streamoff>(location.offset + (u64{code[1]} + 1) * 8));
+        in.read(reinterpret_cast<char*>(record.data()), record.size());
+        u64 hash{};
+        std::memcpy(&hash, record.data() + 16, sizeof(hash));
+        const u32 bits = Load32(record.data() + 8);
+        if (in.gcount() != static_cast<std::streamsize>(record.size()) ||
+            std::memcmp(record.data(), Signature.data(), Signature.size()) != 0 ||
+            hash != expected_hash || Load32(record.data() + 24) != location.crc32 ||
+            (bits >> 8) != location.code_length) {
+            code.clear();
+        }
     }
     return code;
 }

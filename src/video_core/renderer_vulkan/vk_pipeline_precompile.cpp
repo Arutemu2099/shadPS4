@@ -799,7 +799,7 @@ std::vector<u32> PipelineCache::RebuildStageSpv(
         }
         return {};
     }
-    const auto code = VideoCore::ReadShaderCode(index, it->second);
+    const auto code = VideoCore::ReadShaderCode(index, it->second, cached.pgm_hash);
     if (code.empty()) {
         return {};
     }

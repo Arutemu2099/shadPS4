@@ -534,7 +534,10 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         const auto spv_path = CacheRebuildMode() != 0
                                   ? Storage::DataBase::Instance().SidecarPath(spv_name + ".spv")
                                   : std::filesystem::path{};
-        if (spv_path.empty() || std::filesystem::exists(spv_path, ec)) {
+        // A stage the pre-pass made is taken from `prebuilt` below, not read back from the file
+        // the pre-pass saved meanwhile (s1325: 7,630 modules made twice that way).
+        if (prebuilt.contains(spv_name)) {
+        } else if (spv_path.empty() || std::filesystem::exists(spv_path, ec)) {
             Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary, spv_name, spv);
         }
         warmup_times.spv_load += NsSince(t_spv);
