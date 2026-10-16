@@ -326,7 +326,7 @@ void DataBase::Prefetch() {
     // showed a black screen for minutes. Reading them once on many threads first makes that serial
     // loop hit warm files.
     const char* env = std::getenv("SHADPS4_CACHE_PREFETCH");
-    if (!opened || !env || (env[0] != '1' && env[0] != '2') ||
+    if (!opened || !env || (env[0] != '1' && env[0] != '2' && env[0] != '3') ||
         EmulatorSettings.IsPipelineCacheArchived()) {
         return;
     }
