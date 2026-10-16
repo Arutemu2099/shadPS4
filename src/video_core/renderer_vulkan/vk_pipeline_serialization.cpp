@@ -687,6 +687,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
                 }
             } else {
                 ++rs.differ[si];
+                stamp_differ.insert(program->info.pgm_hash);
                 // The shader meta of every differing permutation (file name = HashCombine(hash,
                 // perm), as GetProgram saves it): a seed for players drops these, so they compile
                 // at play time from the real V#s instead of a rebuild that may decode differently.
@@ -897,8 +898,13 @@ void PipelineCache::WriteSeedStamp() const {
     std::vector<Entry> entries;
     entries.reserve(stamp_perms.size());
     u64 total_perms = 0;
+    u32 left_out = 0;
     for (const auto& [hash, perm_list] : stamp_perms) {
         u32 crc32{}, length{};
+        if (stamp_differ.contains(hash)) {
+            ++left_out; // a program with a differing permutation compiles live as a whole
+            continue;
+        }
         if (!GameShaderIdentity(hash, &crc32, &length)) {
             continue;
         }
@@ -933,9 +939,9 @@ void PipelineCache::WriteSeedStamp() const {
         out.write(reinterpret_cast<const char*>(entry.perms.data()), num_perms);
     }
     LOG_INFO(Render,
-             "CacheRebuild: {} written: {} shaders, {} permutations verified word-equal, game {} "
-             "{}, build {}, dynamic vertex input {}",
-             SeedStampFile, count, total_perms, elf.GameSerial(), elf.AppVer(), BuildId(),
+             "CacheRebuild: {} written: {} shaders, {} permutations verified word-equal ({} programs "
+             "with a differing permutation left out), game {} {}, build {}, dynamic vertex input {}",
+             SeedStampFile, count, total_perms, left_out, elf.GameSerial(), elf.AppVer(), BuildId(),
              dynamic_vertex_input);
 }
 

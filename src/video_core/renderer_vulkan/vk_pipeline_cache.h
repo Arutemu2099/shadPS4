@@ -233,6 +233,10 @@ public:
     // =2: per hash the permutations rebuilt word-equal (the stamp's content; Opus review B1: the
     // stamp lists permutations, so a differing one is refused by the code, not only by packaging).
     std::unordered_map<u64, std::vector<u8>> stamp_perms;
+    // =2: programs with at least one permutation that differs: left out of the stamp entirely, so a
+    // seeded boot compiles the whole program live (s1339: a VS program with rebuilt and live
+    // permutations mixed gave VUID-VkGraphicsPipelineCreateInfo-layout-07990 at the next boot).
+    std::unordered_set<u64> stamp_differ;
     // SHADPS4_CACHE_REBUILD_THREADS=N: stages translated on N boot threads before the serial
     // preload, by spv file name ("{hash:#018x}_{perm}"): the SPIR-V is saved and its module made
     // as it arrives (main thread), only the module is kept (review E: no 0.7 GB of SPIR-V held);
