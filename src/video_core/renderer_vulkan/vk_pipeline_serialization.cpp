@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -20,12 +23,14 @@
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
+#include "shader_recompiler/ir/passes/srt.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_compile_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/shader_scan.h"
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
@@ -365,7 +370,15 @@ constexpr u32 VsFormatsVersion = 2; // codes per attribute semantic
 /// vertex input of the machine that verified it, and per shader hash the game file's OrbShdr crc32
 /// and code length.
 constexpr u32 SeedStampMagic = 0x50545353; // "SSTP"
-constexpr u32 SeedStampVersion = 1;
+constexpr u32 SeedStampVersion = 2; // 2: permutations per hash, EXE hash in the build id
+
+/// The emulator build a seed was verified with: the scm description plus the running EXE file's
+/// hash (Opus review D: s1300 and s1309-s1312, five different builds, shared one description).
+const std::string& BuildId() {
+    static const std::string id =
+        fmt::format("{} exe {:016x}", Common::g_scm_desc, VideoCore::ExecutableHash());
+    return id;
+}
 constexpr std::string_view SeedStampFile = "seed-stamp.bin";
 
 /// A cached .spv is used only when whole: SPIR-V magic, every instruction inside the file, the
@@ -389,7 +402,7 @@ bool SpirvLooksWhole(const std::vector<u32>& spv) {
 }
 
 /// SHADPS4_CACHE_REBUILD_THREADS=N (default 0 = off): with =1, the stages without SPIR-V are
-/// translated on N threads before the serial preload (which then takes them from prebuilt_spv).
+/// translated on N threads before the serial preload (which then takes them from prebuilt).
 u32 RebuildThreads() {
     static const u32 n = [] {
         const char* value = std::getenv("SHADPS4_CACHE_REBUILD_THREADS");
@@ -539,6 +552,18 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     // game's own code + this meta (RebuildStageSpv) and saved; =2 VERIFY: every stage that has
     // SPIR-V is made again and compared word for word (nothing changes). =3 both.
     bool rebuilt_known = false;
+    // A pre-pass module that is not inserted below (an existing permutation, another index, a
+    // layout refusal) is destroyed when this returns.
+    vk::ShaderModule prebuilt_module{};
+    struct ModuleGuard {
+        vk::Device device;
+        vk::ShaderModule* module;
+        ~ModuleGuard() {
+            if (*module) {
+                device.destroyShaderModule(*module);
+            }
+        }
+    } prebuilt_guard{instance.GetDevice(), &prebuilt_module};
     if (const int rebuild = CacheRebuildMode(); rebuild != 0) {
         const size_t si = std::min<size_t>(static_cast<size_t>(program->info.stage), 7);
         auto& rs = rebuild_stats;
@@ -575,39 +600,46 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
                 return false;
             }
             const auto it_stamp = seed_stamp.shaders.find(program->info.pgm_hash);
-            if (it_stamp == seed_stamp.shaders.end()) {
+            if (it_stamp == seed_stamp.shaders.end() ||
+                !seed_stamp.perms.contains(VsFormatKey(program->info.pgm_hash, perm_idx))) {
                 ++rs.not_stamped[si];
                 return false;
             }
-            bool same_layout = false;
-            bool identity_mismatch = false;
-            if (const auto it_pre = prebuilt_spv.find(spv_name); it_pre != prebuilt_spv.end()) {
-                spv = std::move(it_pre->second.first);
-                same_layout = it_pre->second.second;
-                prebuilt_spv.erase(it_pre);
+            if (const auto it_pre = prebuilt.find(spv_name); it_pre != prebuilt.end()) {
+                // Translated, saved and made a module by the pre-pass.
+                const PrebuiltStage pre = it_pre->second;
+                prebuilt.erase(it_pre);
+                if (!pre.same_layout) {
+                    ++rs.layout_mismatch[si];
+                    return false;
+                }
+                prebuilt_module = pre.module;
                 ++rs.prebuilt[si];
+                ++rs.rebuilt[si];
             } else {
+                bool same_layout = false;
+                bool identity_mismatch = false;
                 const auto t_rebuild = WarmClock::now();
                 const auto it_fmt = vs_formats.find(VsFormatKey(program->info.pgm_hash, perm_idx));
                 spv = RebuildStageSpv(program->info, loaded_fetch, spec, &same_layout,
                                       it_fmt != vs_formats.end() ? &it_fmt->second : nullptr,
                                       &it_stamp->second, &identity_mismatch);
                 warmup_times.rebuild += NsSince(t_rebuild);
+                if (identity_mismatch) {
+                    ++rs.identity_mismatch[si];
+                    return false;
+                }
+                if (spv.empty()) {
+                    ++rs.no_code[si];
+                    return false;
+                }
+                if (!same_layout) {
+                    ++rs.layout_mismatch[si];
+                    return false;
+                }
+                ++rs.rebuilt[si];
+                RegisterShaderBinary(std::vector<u32>(spv), program->info.pgm_hash, perm_idx);
             }
-            if (identity_mismatch) {
-                ++rs.identity_mismatch[si];
-                return false;
-            }
-            if (spv.empty()) {
-                ++rs.no_code[si];
-                return false;
-            }
-            if (!same_layout) {
-                ++rs.layout_mismatch[si];
-                return false;
-            }
-            ++rs.rebuilt[si];
-            RegisterShaderBinary(std::vector<u32>(spv), program->info.pgm_hash, perm_idx);
         } else if (!spv.empty() && (rebuild & 2) && !in_cache) { // each permutation once
             bool same_layout = false;
             const u64 fmt_key = VsFormatKey(program->info.pgm_hash, perm_idx);
@@ -645,7 +677,9 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
                 ++rs.no_code[si];
             } else if (again == spv && same_layout) {
                 ++rs.equal[si];
-                stamp_hashes.insert(program->info.pgm_hash);
+                if (perm_idx < 256) {
+                    stamp_perms[program->info.pgm_hash].push_back(static_cast<u8>(perm_idx));
+                }
             } else {
                 ++rs.differ[si];
                 // The shader meta of every differing permutation (file name = HashCombine(hash,
@@ -689,7 +723,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
             }
         }
     }
-    if (spv.empty() && !rebuilt_known) {
+    if (spv.empty() && !rebuilt_known && !prebuilt_module) {
         return false;
     }
     DumpOneShader(spv, program->info.pgm_hash, program->info.stage, perm_idx, "cached");
@@ -702,7 +736,8 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     auto [it_pgm, new_program] = program_cache.try_emplace(program->info.pgm_hash);
     if (new_program) {
         const auto t_module = WarmClock::now();
-        module = CompileSPV(spv, instance.GetDevice());
+        module = prebuilt_module ? std::exchange(prebuilt_module, vk::ShaderModule{})
+                                 : CompileSPV(spv, instance.GetDevice());
         warmup_times.compile_spv += NsSince(t_module);
         it_pgm.value() = std::move(program);
     } else {
@@ -732,7 +767,8 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
                 return false;
             }
             const auto t_module = WarmClock::now();
-            module = CompileSPV(spv, instance.GetDevice());
+            module = prebuilt_module ? std::exchange(prebuilt_module, vk::ShaderModule{})
+                                     : CompileSPV(spv, instance.GetDevice());
             warmup_times.compile_spv += NsSince(t_module);
         }
         // Fix A: one live (unmarked) permutation makes the program a live one: no PrecompiledUse
@@ -752,12 +788,16 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
 
 void PipelineCache::ReadSeedStamp() {
     seed_stamp = {};
-    std::ifstream in{Storage::DataBase::Instance().SidecarPath(SeedStampFile), std::ios::binary};
+    std::ifstream in{Storage::DataBase::Instance().SidecarPath(SeedStampFile),
+                     std::ios::binary | std::ios::ate};
+    const std::streamoff file_size = in ? static_cast<std::streamoff>(in.tellg()) : 0;
+    in.seekg(0);
     u32 magic{}, version{}, profile_size{}, count{};
     std::string serial, app_ver, build;
     std::vector<u8> profile_bytes;
     u8 dynamic_vertex_input{};
     std::unordered_map<u64, std::pair<u32, u32>> shaders;
+    std::unordered_set<u64> perms;
     in.read(reinterpret_cast<char*>(&magic), 4);
     in.read(reinterpret_cast<char*>(&version), 4);
     bool ok = in && magic == SeedStampMagic && version == SeedStampVersion &&
@@ -771,18 +811,28 @@ void PipelineCache::ReadSeedStamp() {
         in.read(reinterpret_cast<char*>(profile_bytes.data()), profile_size);
         in.read(reinterpret_cast<char*>(&dynamic_vertex_input), 1);
         in.read(reinterpret_cast<char*>(&count), 4);
-        ok = in && count < (1u << 24);
+        // Each entry is at least 17 bytes (review D: a corrupt count must not reserve hundreds of
+        // MB before the read fails).
+        const std::streamoff left = file_size - static_cast<std::streamoff>(in.tellg());
+        ok = in && left >= 0 && static_cast<std::streamoff>(count) * 17 <= left;
     }
     if (ok) {
         shaders.reserve(count);
         for (u32 i = 0; i < count && in; ++i) {
             u64 hash{};
             u32 crc32{}, length{};
+            u8 num_perms{};
             in.read(reinterpret_cast<char*>(&hash), 8);
             in.read(reinterpret_cast<char*>(&crc32), 4);
             in.read(reinterpret_cast<char*>(&length), 4);
+            in.read(reinterpret_cast<char*>(&num_perms), 1);
+            std::array<u8, 256> perm_list{};
+            in.read(reinterpret_cast<char*>(perm_list.data()), num_perms);
             if (in) {
                 shaders.emplace(hash, std::make_pair(crc32, length));
+                for (u32 k = 0; k < num_perms; ++k) {
+                    perms.insert(VsFormatKey(hash, perm_list[k]));
+                }
             }
         }
         ok = static_cast<bool>(in) && shaders.size() == count;
@@ -800,11 +850,11 @@ void PipelineCache::ReadSeedStamp() {
                     serial, app_ver, elf.GameSerial(), elf.AppVer());
         return;
     }
-    if (build != Common::g_scm_desc) {
+    if (build != BuildId()) {
         LOG_WARNING(Render,
                     "CacheRebuild: the seed was verified with emulator build {}, this is {}: no "
                     "stage is rebuilt (a =2 VERIFY run with this build writes a new stamp)",
-                    build, Common::g_scm_desc);
+                    build, BuildId());
         return;
     }
     Shader::Profile seed_profile{};
@@ -817,29 +867,43 @@ void PipelineCache::ReadSeedStamp() {
     seed_stamp.compute = true;
     seed_stamp.graphics = same_profile && same_vertex_input;
     seed_stamp.shaders = std::move(shaders);
+    seed_stamp.perms = std::move(perms);
     if (seed_stamp.graphics) {
-        LOG_INFO(Render, "CacheRebuild: seed stamp {} {} build {}: {} shaders, all stages",
-                 serial, app_ver, build, seed_stamp.shaders.size());
+        LOG_INFO(Render,
+                 "CacheRebuild: seed stamp {} {} build {}: {} shaders, {} permutations, all stages",
+                 serial, app_ver, build, seed_stamp.shaders.size(), seed_stamp.perms.size());
     } else {
         LOG_WARNING(Render,
-                    "CacheRebuild: seed stamp {} {} build {}: {} shaders; this GPU's profile "
-                    "{} the seed's, dynamic vertex input {}: compute stages only",
-                    serial, app_ver, build, seed_stamp.shaders.size(),
+                    "CacheRebuild: seed stamp {} {} build {}: {} shaders, {} permutations; this "
+                    "GPU's profile {} the seed's, dynamic vertex input {}: compute stages only",
+                    serial, app_ver, build, seed_stamp.shaders.size(), seed_stamp.perms.size(),
                     same_profile ? "equals" : "differs from",
                     same_vertex_input ? "same" : "differs");
     }
 }
 
 void PipelineCache::WriteSeedStamp() const {
-    std::vector<std::tuple<u64, u32, u32>> entries;
-    entries.reserve(stamp_hashes.size());
-    for (const u64 hash : stamp_hashes) {
+    struct Entry {
+        u64 hash;
+        u32 crc32;
+        u32 length;
+        std::vector<u8> perms;
+    };
+    std::vector<Entry> entries;
+    entries.reserve(stamp_perms.size());
+    u64 total_perms = 0;
+    for (const auto& [hash, perm_list] : stamp_perms) {
         u32 crc32{}, length{};
-        if (GameShaderIdentity(hash, &crc32, &length)) {
-            entries.emplace_back(hash, crc32, length);
+        if (!GameShaderIdentity(hash, &crc32, &length)) {
+            continue;
         }
+        auto perms = perm_list;
+        std::ranges::sort(perms);
+        perms.erase(std::unique(perms.begin(), perms.end()), perms.end());
+        total_perms += perms.size();
+        entries.push_back({hash, crc32, length, std::move(perms)});
     }
-    std::ranges::sort(entries);
+    std::ranges::sort(entries, {}, &Entry::hash);
     std::ofstream out{Storage::DataBase::Instance().SidecarPath(SeedStampFile),
                       std::ios::binary | std::ios::trunc};
     const auto& elf = Common::ElfInfo::Instance();
@@ -847,7 +911,7 @@ void PipelineCache::WriteSeedStamp() const {
     out.write(reinterpret_cast<const char*>(&SeedStampVersion), 4);
     PutString(out, elf.GameSerial());
     PutString(out, elf.AppVer());
-    PutString(out, Common::g_scm_desc);
+    PutString(out, BuildId());
     const u32 profile_size = sizeof(profile);
     out.write(reinterpret_cast<const char*>(&profile_size), 4);
     out.write(reinterpret_cast<const char*>(&profile), profile_size);
@@ -855,15 +919,18 @@ void PipelineCache::WriteSeedStamp() const {
     out.write(reinterpret_cast<const char*>(&dynamic_vertex_input), 1);
     const u32 count = static_cast<u32>(entries.size());
     out.write(reinterpret_cast<const char*>(&count), 4);
-    for (const auto& [hash, crc32, length] : entries) {
-        out.write(reinterpret_cast<const char*>(&hash), 8);
-        out.write(reinterpret_cast<const char*>(&crc32), 4);
-        out.write(reinterpret_cast<const char*>(&length), 4);
+    for (const auto& entry : entries) {
+        const u8 num_perms = static_cast<u8>(std::min<size_t>(entry.perms.size(), 255));
+        out.write(reinterpret_cast<const char*>(&entry.hash), 8);
+        out.write(reinterpret_cast<const char*>(&entry.crc32), 4);
+        out.write(reinterpret_cast<const char*>(&entry.length), 4);
+        out.write(reinterpret_cast<const char*>(&num_perms), 1);
+        out.write(reinterpret_cast<const char*>(entry.perms.data()), num_perms);
     }
     LOG_INFO(Render,
-             "CacheRebuild: {} written: {} shaders verified word-equal, game {} {}, build {}, "
-             "dynamic vertex input {}",
-             SeedStampFile, count, elf.GameSerial(), elf.AppVer(), Common::g_scm_desc,
+             "CacheRebuild: {} written: {} shaders, {} permutations verified word-equal, game {} "
+             "{}, build {}, dynamic vertex input {}",
+             SeedStampFile, count, total_perms, elf.GameSerial(), elf.AppVer(), BuildId(),
              dynamic_vertex_input);
 }
 
@@ -881,10 +948,48 @@ void PipelineCache::PrebuildMissingStages(u32 num_threads) {
             metas.push_back(entry.path());
         }
     }
-    num_threads = std::clamp<u32>(num_threads, 1u, std::max(1u, std::thread::hardware_concurrency()));
-    std::mutex result_mutex;
+    num_threads =
+        std::clamp<u32>(num_threads, 1u, std::max(1u, std::thread::hardware_concurrency()));
+    // Workers translate; the main thread saves each SPIR-V and makes its module as it arrives, so
+    // only modules are kept (review E).
+    struct Ready {
+        std::string name;
+        u64 hash{};
+        size_t perm{};
+        std::vector<u32> spv;
+        bool same_layout{};
+    };
+    std::mutex ready_mutex;
+    std::condition_variable ready_cv;
+    std::deque<Ready> ready;
     std::atomic<size_t> next{0};
-    std::atomic<u32> finished{0}, translated{0}, failed{0};
+    std::atomic<u32> finished{0}, failed{0};
+    u32 made = 0, refused_layout = 0;
+    auto drain = [&] {
+        std::deque<Ready> batch;
+        {
+            std::scoped_lock lock{ready_mutex};
+            batch.swap(ready);
+        }
+        for (auto& item : batch) {
+            if (!item.same_layout) {
+                prebuilt.emplace(std::move(item.name), PrebuiltStage{{}, false});
+                ++refused_layout;
+                continue;
+            }
+            const auto t_module = WarmClock::now();
+            const vk::ShaderModule module = CompileSPV(item.spv, instance.GetDevice());
+            warmup_times.compile_spv += NsSince(t_module);
+            const auto [it, inserted] =
+                prebuilt.emplace(std::move(item.name), PrebuiltStage{module, true});
+            if (!inserted) {
+                instance.GetDevice().destroyShaderModule(module);
+                continue;
+            }
+            RegisterShaderBinary(std::move(item.spv), item.hash, item.perm);
+            ++made;
+        }
+    };
     {
         std::vector<std::jthread> threads;
         for (u32 t = 0; t < num_threads; ++t) {
@@ -893,7 +998,10 @@ void PipelineCache::PrebuildMissingStages(u32 num_threads) {
                 for (size_t i = next.fetch_add(1); i < metas.size();
                      i = next.fetch_add(1), finished.fetch_add(1)) {
                     std::vector<u8> bytes;
-                    {
+                    if (const auto* kept = Storage::DataBase::Instance().Prefetched(
+                            metas[i].filename().string())) {
+                        bytes = *kept; // SHADPS4_CACHE_PREFETCH=2: no second open
+                    } else {
                         std::ifstream file{metas[i], std::ios::binary | std::ios::ate};
                         if (!file) {
                             continue;
@@ -924,7 +1032,8 @@ void PipelineCache::PrebuildMissingStages(u32 num_threads) {
                         continue;
                     }
                     const auto it_stamp = seed_stamp.shaders.find(hash);
-                    if (it_stamp == seed_stamp.shaders.end()) {
+                    if (it_stamp == seed_stamp.shaders.end() ||
+                        !seed_stamp.perms.contains(VsFormatKey(hash, perm_idx))) {
                         continue;
                     }
                     std::string name = fmt::format("{:#018x}_{}", hash, perm_idx);
@@ -943,22 +1052,32 @@ void PipelineCache::PrebuildMissingStages(u32 num_threads) {
                         failed.fetch_add(1);
                         continue; // the serial preload tries again and counts the reason
                     }
-                    translated.fetch_add(1);
-                    std::scoped_lock lock{result_mutex};
-                    prebuilt_spv.emplace(std::move(name), std::make_pair(std::move(spv), same_layout));
+                    {
+                        std::scoped_lock lock{ready_mutex};
+                        ready.push_back({std::move(name), hash, perm_idx, std::move(spv),
+                                         same_layout});
+                    }
+                    ready_cv.notify_one();
                 }
             });
         }
-        // The main thread keeps the window alive and shows progress (ShowBootProgress pumps
-        // events) until every meta has been taken.
+        // The main thread saves the results, keeps the window alive and shows progress
+        // (ShowBootProgress pumps events) until every meta has been taken.
         while (finished.load() < metas.size()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds{100});
+            {
+                std::unique_lock lock{ready_mutex};
+                ready_cv.wait_for(lock, std::chrono::milliseconds{100},
+                                  [&] { return !ready.empty(); });
+            }
+            drain();
             ShowBootProgress("shaders prepared", finished.load(), metas.size());
         }
     } // joins
+    drain(); // results pushed after the last check
     LOG_INFO(Render,
-             "CacheRebuild: pre-pass on {} threads: {} metas, {} stages translated, {} failed",
-             num_threads, metas.size(), translated.load(), failed.load());
+             "CacheRebuild: pre-pass on {} threads: {} metas, {} stages translated and saved, {} "
+             "refused for their layout, {} failed (left to the serial preload)",
+             num_threads, metas.size(), made, refused_layout, failed.load());
 }
 
 void PipelineCache::WarmUp() {
@@ -1199,12 +1318,17 @@ void PipelineCache::WarmUp() {
         LOG_INFO(Render,
                  "CacheRebuild: WarmUp main thread ms: meta load {} | spv load {} | rebuild {} | "
                  "shader modules {} | compute pipeline objects {} | pre-pass {} (threads {}, left "
-                 "unused {}) | spv not whole {}",
+                 "unused {}) | spv not whole {} | SRT walker arena {} KiB",
                  wt.meta_load / 1000000, wt.spv_load / 1000000, wt.rebuild / 1000000,
                  wt.compile_spv / 1000000, wt.compute_ctor / 1000000, wt.prepass / 1000000,
-                 RebuildThreads(), prebuilt_spv.size(), rs.bad_spv);
-        prebuilt_spv.clear();
-        if ((CacheRebuildMode() & 2) && !SimProfileActive() && !stamp_hashes.empty()) {
+                 RebuildThreads(), prebuilt.size(), rs.bad_spv, Shader::SrtWalkerArenaUsed() >> 10);
+        for (auto& [name, pre] : prebuilt) {
+            if (pre.module) {
+                instance.GetDevice().destroyShaderModule(pre.module);
+            }
+        }
+        prebuilt.clear();
+        if ((CacheRebuildMode() & 2) && !SimProfileActive() && !stamp_perms.empty()) {
             WriteSeedStamp();
         }
         if (vs_formats_dirty) {

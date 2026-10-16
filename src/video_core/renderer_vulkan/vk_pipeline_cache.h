@@ -222,6 +222,7 @@ public:
         bool compute{};
         bool graphics{};
         std::unordered_map<u64, std::pair<u32, u32>> shaders; // hash -> (crc32, code length)
+        std::unordered_set<u64> perms; // (hash << 8) | perm of every permutation verified equal
     };
     SeedStamp seed_stamp{};
     void ReadSeedStamp();
@@ -229,10 +230,18 @@ public:
     // SHADPS4_CACHE_REBUILD_THREADS: every meta in the folder without a .spv whose rebuild the
     // stamp allows, translated on `num_threads` (own Pools each) into prebuilt_spv.
     void PrebuildMissingStages(u32 num_threads);
-    std::unordered_set<u64> stamp_hashes; // =2: hashes rebuilt word-equal, the stamp's content
+    // =2: per hash the permutations rebuilt word-equal (the stamp's content; Opus review B1: the
+    // stamp lists permutations, so a differing one is refused by the code, not only by packaging).
+    std::unordered_map<u64, std::vector<u8>> stamp_perms;
     // SHADPS4_CACHE_REBUILD_THREADS=N: stages translated on N boot threads before the serial
-    // preload, by spv file name ("{hash:#018x}_{perm}"); LoadPipelineStage takes them from here.
-    std::unordered_map<std::string, std::pair<std::vector<u32>, bool>> prebuilt_spv;
+    // preload, by spv file name ("{hash:#018x}_{perm}"): the SPIR-V is saved and its module made
+    // as it arrives (main thread), only the module is kept (review E: no 0.7 GB of SPIR-V held);
+    // LoadPipelineStage takes it from here. same_layout false: refused, not translated again.
+    struct PrebuiltStage {
+        vk::ShaderModule module{};
+        bool same_layout{};
+    };
+    std::unordered_map<std::string, PrebuiltStage> prebuilt;
     // WarmUp time split (SHADPS4_CACHE_REBUILD set): ns spent in each part on the main thread.
     struct WarmUpTimes {
         u64 meta_load{}, spv_load{}, rebuild{}, compile_spv{}, compute_ctor{}, prepass{};

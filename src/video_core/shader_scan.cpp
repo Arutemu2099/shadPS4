@@ -21,6 +21,17 @@
 #include "common/logging/log.h"
 #include "video_core/shader_scan.h"
 
+#include <xxhash.h>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 namespace VideoCore {
 
 namespace {
@@ -296,6 +307,33 @@ ShaderIndex BuildShaderIndex(const std::filesystem::path& game_folder,
              index.shaders.size() - by_type[4] - by_type[0] - by_type[1], num_threads, ms(),
              saved ? index_file.string() : std::string{"not saved"});
     return index;
+}
+
+u64 ExecutableHash() {
+    std::filesystem::path exe;
+#ifdef _WIN32
+    std::wstring buf(32768, L'\0');
+    const DWORD n = GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
+    if (n == 0 || n >= buf.size()) {
+        return 0;
+    }
+    buf.resize(n);
+    exe = buf;
+#else
+    std::error_code ec;
+    exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+#endif
+    std::ifstream in{exe, std::ios::binary | std::ios::ate};
+    if (!in) {
+        return 0;
+    }
+    std::vector<char> bytes(static_cast<size_t>(in.tellg()));
+    in.seekg(0);
+    in.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    if (!in) {
+        return 0;
+    }
+    return XXH3_64bits(bytes.data(), bytes.size());
 }
 
 std::vector<u32> ReadShaderCode(const ShaderIndex& index, const ShaderLocation& location) {

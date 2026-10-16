@@ -16,6 +16,8 @@
 #include <miniz.h>
 
 #include <atomic>
+#include <string>
+#include <unordered_map>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
@@ -38,6 +40,18 @@ std::mutex m_request{};
 
 mz_zip_archive zip_ar{};
 bool ar_is_read_only{true};
+
+// SHADPS4_CACHE_PREFETCH=2 (2026-10-16): file name -> bytes of every .key / .meta read by the
+// prefetch, until FinishPreload. Opening a cache file costs ~3-8 ms while the antivirus has no
+// verdict cached for it (measured 10-16 on files made that day); WarmUp then opens none of them.
+std::unordered_map<std::string, std::vector<u8>> g_prefetched{};
+
+std::string BlobFileName(const std::string& name, std::string_view ext) {
+    std::string file_name;
+    file_name.reserve(name.size() + 1 + ext.size());
+    file_name.append(name).append(1, '.').append(ext);
+    return file_name;
+}
 
 } // namespace
 
@@ -235,6 +249,13 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u8>& dat
     if (!opened) {
         return;
     }
+    if (!g_prefetched.empty()) {
+        if (const auto it = g_prefetched.find(BlobFileName(name, GetBlobFileExtension(type)));
+            it != g_prefetched.end()) {
+            data = it->second;
+            return;
+        }
+    }
 
     auto path = EmulatorSettings.IsPipelineCacheArchived() ? std::filesystem::path{name}
                                                            : cache_path / name;
@@ -270,6 +291,13 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
     } else {
         for (const auto& file_name : std::filesystem::directory_iterator{cache_path}) {
             if (file_name.path().extension().string().ends_with(ext)) {
+                if (!g_prefetched.empty()) {
+                    if (const auto it = g_prefetched.find(file_name.path().filename().string());
+                        it != g_prefetched.end()) {
+                        func(std::vector<u8>(it->second));
+                        continue;
+                    }
+                }
                 using namespace Common::FS;
                 const auto& file = IOFile{file_name, FileAccessMode::Read};
                 if (file.IsOpen()) {
@@ -289,9 +317,11 @@ void DataBase::Prefetch() {
     // showed a black screen for minutes. Reading them once on many threads first makes that serial
     // loop hit warm files.
     const char* env = std::getenv("SHADPS4_CACHE_PREFETCH");
-    if (!opened || !env || env[0] != '1' || EmulatorSettings.IsPipelineCacheArchived()) {
+    if (!opened || !env || (env[0] != '1' && env[0] != '2') ||
+        EmulatorSettings.IsPipelineCacheArchived()) {
         return;
     }
+    const bool keep = env[0] == '2';
     const auto t_start = std::chrono::steady_clock::now();
     std::vector<std::filesystem::path> files;
     std::error_code ec;
@@ -303,12 +333,39 @@ void DataBase::Prefetch() {
     constexpr u32 NumThreads = 16;
     std::atomic<size_t> next{0};
     std::atomic<u64> bytes{0};
+    // =2: one slot per file, written only by the thread that took that index.
+    std::vector<std::vector<u8>> kept(keep ? files.size() : 0);
+    std::vector<char> keep_file(files.size(), 0);
+    if (keep) {
+        for (size_t i = 0; i < files.size(); ++i) {
+            const auto ext = files[i].extension();
+            keep_file[i] = ext == ".key" || ext == ".meta";
+        }
+    }
     {
         std::vector<std::jthread> threads;
         for (u32 t = 0; t < NumThreads; ++t) {
             threads.emplace_back([&] {
                 std::vector<char> buffer(64 * 1024);
                 for (size_t i = next.fetch_add(1); i < files.size(); i = next.fetch_add(1)) {
+                    if (keep_file[i]) {
+                        std::ifstream file(files[i], std::ios::binary | std::ios::ate);
+                        if (!file) {
+                            continue;
+                        }
+                        auto& out = kept[i];
+                        out.resize(static_cast<size_t>(file.tellg()));
+                        file.seekg(0);
+                        file.read(reinterpret_cast<char*>(out.data()),
+                                  static_cast<std::streamsize>(out.size()));
+                        if (!file) {
+                            out.clear();
+                            keep_file[i] = 0; // left to an ordinary load
+                            continue;
+                        }
+                        bytes.fetch_add(out.size(), std::memory_order_relaxed);
+                        continue;
+                    }
                     std::ifstream file(files[i], std::ios::binary);
                     while (file.read(buffer.data(), buffer.size()) || file.gcount() > 0) {
                         bytes.fetch_add(static_cast<u64>(file.gcount()), std::memory_order_relaxed);
@@ -317,6 +374,16 @@ void DataBase::Prefetch() {
             });
         }
     } // joins
+    if (keep) {
+        g_prefetched.reserve(files.size());
+        for (size_t i = 0; i < files.size(); ++i) {
+            if (keep_file[i]) {
+                g_prefetched.emplace(files[i].filename().string(), std::move(kept[i]));
+            }
+        }
+        LOG_INFO(Render, "Pipeline cache prefetch: {} key / meta files kept in memory",
+                 g_prefetched.size());
+    }
     LOG_INFO(Render, "Pipeline cache prefetch: {} files, {} MB read on {} threads in {} ms",
              files.size(), bytes.load() >> 20, NumThreads,
              std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -331,7 +398,13 @@ std::filesystem::path DataBase::SidecarPath(std::string_view file_name) const {
     return cache_path / file_name;
 }
 
+const std::vector<u8>* DataBase::Prefetched(const std::string& file_name) const {
+    const auto it = g_prefetched.find(file_name);
+    return it != g_prefetched.end() ? &it->second : nullptr;
+}
+
 void DataBase::FinishPreload() {
+    std::unordered_map<std::string, std::vector<u8>>{}.swap(g_prefetched);
     if (EmulatorSettings.IsPipelineCacheArchived()) {
         mz_zip_writer_init_from_reader(&zip_ar, cache_path.string().c_str());
         ar_is_read_only = false;

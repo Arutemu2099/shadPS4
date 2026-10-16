@@ -35,6 +35,10 @@ struct ShaderIndex {
 ShaderIndex BuildShaderIndex(const std::filesystem::path& game_folder,
                              const std::filesystem::path& index_file);
 
+/// xxh3 of the running emulator EXE file (0 if unreadable): with the scm description, the seed
+/// stamp's build id (uncommitted builds share one description).
+u64 ExecutableHash();
+
 /// The shader's code read from its game file; empty on any read error.
 std::vector<u32> ReadShaderCode(const ShaderIndex& index, const ShaderLocation& location);
 
