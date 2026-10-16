@@ -508,8 +508,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
                 {
                     std::ofstream list{Storage::DataBase::Instance().SidecarPath("rebuild-differ.txt"),
                                        std::ios::app};
-                    list << fmt::format("{:#018x} {} {:#x} {}
-",
+                    list << fmt::format("{:#018x} {} {:#x} {}\n",
                                         HashCombine(program->info.pgm_hash, perm_idx),
                                         program->info.stage, program->info.pgm_hash, perm_idx);
                 }
