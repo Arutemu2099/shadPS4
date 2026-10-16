@@ -185,12 +185,26 @@ public:
     // flattened sharps, fetch data, runtime info, start bindings). Empty if the code is not found.
     // Main thread, WarmUp only (synthetic flat / fetch globals). `same_layout`: the new
     // translation's binding layout equals the cached Info's (SameBindingLayout).
+    // `vs_conv`: per fetch attribute a number-conversion code (0 = the spec's number class, 1
+    // Uscaled, 2 Sscaled, 3 SnormNz 8-bit, 4 SnormNz 16-bit, 5 Unorm 32-bit): the cached spec
+    // keeps only the class, the conversion comes from the vs-formats table (ANNOTATE).
     std::vector<u32> RebuildStageSpv(const Shader::Info& cached,
                                      const std::optional<Shader::Gcn::FetchShaderData>& fetch,
                                      const Shader::StageSpecialization& spec,
-                                     bool* same_layout = nullptr);
+                                     bool* same_layout = nullptr,
+                                     const std::vector<u8>* vs_conv = nullptr);
+    // SHADPS4_CACHE_REBUILD ANNOTATE (bit 8, with VERIFY): the conversion codes that make a cached
+    // vertex shader's rebuild word-equal, or empty. vs_formats: (hash, perm) -> codes, read from /
+    // written to the cache folder's vs-formats.bin.
+    std::vector<u8> AnnotateVsConversions(const Shader::Info& cached,
+                                          const std::optional<Shader::Gcn::FetchShaderData>& fetch,
+                                          const Shader::StageSpecialization& spec,
+                                          const std::vector<u32>& cached_spv);
+    std::unordered_map<u64, std::vector<u8>> vs_formats;
+    bool vs_formats_dirty{};
     struct RebuildStats {
         u32 equal[8]{}, differ[8]{}, no_code[8]{}, rebuilt[8]{}, reused[8]{}, layout_mismatch[8]{};
+        u32 annotated[8]{}, annotate_failed[8]{};
     };
     RebuildStats rebuild_stats{};
     // SHADPS4_PRECOMPILE, Fable finding 1: a precompiled program whose first live dispatch matched

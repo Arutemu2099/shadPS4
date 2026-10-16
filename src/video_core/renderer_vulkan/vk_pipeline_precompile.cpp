@@ -40,6 +40,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -727,7 +728,7 @@ const VideoCore::ShaderIndex& GameShaderIndex() {
 
 std::vector<u32> PipelineCache::RebuildStageSpv(
     const Shader::Info& cached, const std::optional<Shader::Gcn::FetchShaderData>& fetch,
-    const Shader::StageSpecialization& spec, bool* same_layout) {
+    const Shader::StageSpecialization& spec, bool* same_layout, const std::vector<u8>* vs_conv) {
     const auto& index = GameShaderIndex();
     const auto it = index.shaders.find(cached.pgm_hash);
     if (it == index.shaders.end()) {
@@ -770,6 +771,29 @@ std::vector<u32> PipelineCache::RebuildStageSpv(
                 vs.num_class == AmdGpu::NumberClass::Sint   ? AmdGpu::NumberFormat::Sint
                 : vs.num_class == AmdGpu::NumberClass::Uint ? AmdGpu::NumberFormat::Uint
                                                             : AmdGpu::NumberFormat::Float);
+            // The conversion (GetNumberConversion) of an attribute: the spec does not keep it
+            // (s1300: a SnormNz 16-bit position rebuilt as plain, 108 words less). vs-formats.bin
+            // (scratch/vs-formats-from-spv-20261016.py, read from the cached SPIR-V) gives a code per
+            // attribute SEMANTIC; the raw formats are set as the real V# had them, so GetNumberFmt
+            // remaps them exactly as it did (SnormNz reads as the integer class).
+            const u8 conv =
+                vs_conv && attrib.semantic < vs_conv->size() ? (*vs_conv)[attrib.semantic] : 0;
+            if (conv != 0) {
+                using AmdGpu::DataFormat;
+                using AmdGpu::NumberFormat;
+                static constexpr std::pair<NumberFormat, DataFormat> ConvFormats[] = {
+                    {NumberFormat::Float, DataFormat::Format32_32_32_32},
+                    {NumberFormat::Uscaled, DataFormat::Format32_32_32_32},
+                    {NumberFormat::Sscaled, DataFormat::Format32_32_32_32},
+                    {NumberFormat::SnormNz, DataFormat::Format8_8_8_8},
+                    {NumberFormat::SnormNz, DataFormat::Format16_16_16_16},
+                    {NumberFormat::Unorm, DataFormat::Format32_32_32_32},
+                };
+                if (conv < std::size(ConvFormats)) {
+                    sharp.num_format = static_cast<u32>(ConvFormats[conv].first);
+                    sharp.data_format = static_cast<u32>(ConvFormats[conv].second);
+                }
+            }
             sharp.dst_sel_x = static_cast<u32>(vs.dst_select.r);
             sharp.dst_sel_y = static_cast<u32>(vs.dst_select.g);
             sharp.dst_sel_z = static_cast<u32>(vs.dst_select.b);
@@ -790,6 +814,133 @@ std::vector<u32> PipelineCache::RebuildStageSpv(
         *same_layout = SameBindingLayout(info, cached);
     }
     return spv;
+}
+
+namespace {
+/// Opcode histogram distance + length difference of two SPIR-V modules (header skipped).
+u64 SpirvDistance(const std::vector<u32>& a, const std::vector<u32>& b) {
+    std::unordered_map<u32, s64> hist;
+    auto count = [&](const std::vector<u32>& words, s64 sign) {
+        for (size_t i = 5; i < words.size();) {
+            const u32 n = words[i] >> 16;
+            hist[words[i] & 0xffff] += sign;
+            i += n ? n : 1;
+        }
+    };
+    count(a, 1);
+    count(b, -1);
+    u64 d = a.size() > b.size() ? a.size() - b.size() : b.size() - a.size();
+    for (const auto& [op, c] : hist) {
+        d += static_cast<u64>(c < 0 ? -c : c);
+    }
+    return d;
+}
+} // Anonymous namespace
+
+std::vector<u8> PipelineCache::AnnotateVsConversions(
+    const Shader::Info& cached, const std::optional<Shader::Gcn::FetchShaderData>& fetch,
+    const Shader::StageSpecialization& spec, const std::vector<u32>& cached_spv) {
+    // Superseded (2026-10-16): the codes come from the cached SPIR-V offline
+    // (scratch/vs-formats-from-spv-20261016.py; the search below indexed by attribute and skipped
+    // integer-class attributes, so it never matched). Kept for reference, not run.
+    if (cached_spv.empty() || !fetch || spec.vs_attribs.size() != fetch->attributes.size() ||
+        true) {
+        return {};
+    }
+    constexpr u8 NumConv = 6;
+    std::vector<size_t> floats;
+    for (size_t i = 0; i < spec.vs_attribs.size(); ++i) {
+        if (spec.vs_attribs[i].num_class == AmdGpu::NumberClass::Float) {
+            floats.push_back(i);
+        }
+    }
+    std::vector<u8> conv(spec.vs_attribs.size(), 0);
+    auto try_conv = [&](const std::vector<u8>& c) {
+        return RebuildStageSpv(cached, fetch, spec, nullptr, &c);
+    };
+    // Coordinate descent on the opcode-histogram distance: one attribute's conversion changed per
+    // step, the best step taken while it gets closer.
+    u64 best = SpirvDistance(try_conv(conv), cached_spv);
+    for (int step = 0; step < 8 && best != 0; ++step) {
+        u64 step_best = best;
+        size_t step_i = SIZE_MAX;
+        u8 step_c = 0;
+        for (const size_t i : floats) {
+            for (u8 c = 0; c < NumConv; ++c) {
+                if (c == conv[i]) {
+                    continue;
+                }
+                auto trial = conv;
+                trial[i] = c;
+                const auto trial_spv = try_conv(trial);
+                const u64 d = SpirvDistance(trial_spv, cached_spv);
+                static u32 dumped = 0;
+                if (dumped < 2 && step == 0 && c == 4) {
+                    ++dumped;
+                    std::ofstream out{Storage::DataBase::Instance().SidecarPath(fmt::format(
+                                          "annotate-{:016x}-attr{}-conv4.spv", cached.pgm_hash, i)),
+                                      std::ios::binary | std::ios::trunc};
+                    out.write(reinterpret_cast<const char*>(trial_spv.data()),
+                              trial_spv.size() * sizeof(u32));
+                }
+                static u32 logged = 0;
+                if (logged < 120) {
+                    ++logged;
+                    LOG_INFO(Render_Vulkan,
+                             "VsAnnotate: vs {:#x} attrs {} floats {} step {} attr {} conv {} -> "
+                             "words {} (cached {}) distance {} (best {})",
+                             cached.pgm_hash, conv.size(), floats.size(), step, i, c,
+                             trial_spv.size(), cached_spv.size(), d, best);
+                }
+                if (d < step_best) {
+                    step_best = d;
+                    step_i = i;
+                    step_c = c;
+                }
+            }
+        }
+        if (step_i == SIZE_MAX) {
+            break;
+        }
+        conv[step_i] = step_c;
+        best = step_best;
+    }
+    if (try_conv(conv) == cached_spv) {
+        return conv;
+    }
+    // The histogram does not tell WHICH attribute: the same conversions placed elsewhere.
+    std::vector<u8> chosen;
+    for (const size_t i : floats) {
+        if (conv[i] != 0) {
+            chosen.push_back(conv[i]);
+        }
+    }
+    if (chosen.empty() || chosen.size() > 3 || floats.size() > 12) {
+        return {};
+    }
+    // Every placement of the chosen conversions on distinct float attributes (<= 12^3 tries).
+    std::vector<u8> trial(conv.size(), 0);
+    std::function<bool(size_t)> place = [&](size_t k) -> bool {
+        if (k == chosen.size()) {
+            if (try_conv(trial) == cached_spv) {
+                conv = trial;
+                return true;
+            }
+            return false;
+        }
+        for (const size_t i : floats) {
+            if (trial[i] != 0) {
+                continue;
+            }
+            trial[i] = chosen[k];
+            if (place(k + 1)) {
+                return true;
+            }
+            trial[i] = 0;
+        }
+        return false;
+    };
+    return place(0) ? conv : std::vector<u8>{};
 }
 
 std::unordered_set<u64> ReadPrecompileHashes(std::string_view file_name) {

@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "shader_recompiler/spirv_variants.h"
+#include "common/hash.h"
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -17,6 +18,7 @@
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_pipeline_compile_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
@@ -331,6 +333,14 @@ int CacheRebuildMode() {
     }();
     return mode;
 }
+
+/// vs-formats.bin key: shader hashes have a zero upper half (measured), perm < 256.
+u64 VsFormatKey(u64 pgm_hash, size_t perm_idx) {
+    return (pgm_hash << 8) | (perm_idx & 0xff);
+}
+
+constexpr u32 VsFormatsMagic = 0x4d465356; // "VSFM"
+constexpr u32 VsFormatsVersion = 2; // codes per attribute semantic
 } // Anonymous namespace
 
 bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
@@ -453,7 +463,9 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
             rebuilt_known = true;
         } else if (spv.empty() && (rebuild & 1)) {
             bool same_layout = false;
-            spv = RebuildStageSpv(program->info, loaded_fetch, spec, &same_layout);
+            const auto it_fmt = vs_formats.find(VsFormatKey(program->info.pgm_hash, perm_idx));
+            spv = RebuildStageSpv(program->info, loaded_fetch, spec, &same_layout,
+                                  it_fmt != vs_formats.end() ? &it_fmt->second : nullptr);
             if (spv.empty()) {
                 ++rs.no_code[si];
                 return false;
@@ -466,16 +478,57 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
             RegisterShaderBinary(std::vector<u32>(spv), program->info.pgm_hash, perm_idx);
         } else if (!spv.empty() && (rebuild & 2) && !in_cache) { // each permutation once
             bool same_layout = false;
-            const auto again = RebuildStageSpv(program->info, loaded_fetch, spec, &same_layout);
-            if (again.empty()) {
+            const u64 fmt_key = VsFormatKey(program->info.pgm_hash, perm_idx);
+            const auto it_fmt = vs_formats.find(fmt_key);
+            const auto again = RebuildStageSpv(program->info, loaded_fetch, spec, &same_layout,
+                                               it_fmt != vs_formats.end() ? &it_fmt->second
+                                                                          : nullptr);
+            std::vector<u8> found;
+            if (!again.empty() && again != spv && same_layout && (rebuild & 8) &&
+                program->info.stage == Shader::Stage::Vertex) {
+                found = AnnotateVsConversions(program->info, loaded_fetch, spec, spv);
+                if (found.empty()) {
+                    ++rs.annotate_failed[si];
+                } else {
+                    ++rs.annotated[si];
+                }
+            }
+            if (!found.empty()) {
+                vs_formats[fmt_key] = std::move(found);
+                vs_formats_dirty = true;
+            } else if (again.empty()) {
                 ++rs.no_code[si];
             } else if (again == spv && same_layout) {
                 ++rs.equal[si];
             } else {
                 ++rs.differ[si];
+                // The shader meta of every differing permutation (file name = HashCombine(hash,
+                // perm), as GetProgram saves it): a seed for players drops these, so they compile
+                // at play time from the real V#s instead of a rebuild that may decode differently.
+                {
+                    std::ofstream list{Storage::DataBase::Instance().SidecarPath("rebuild-differ.txt"),
+                                       std::ios::app};
+                    list << fmt::format("{:#018x} {} {:#x} {}
+",
+                                        HashCombine(program->info.pgm_hash, perm_idx),
+                                        program->info.stage, program->info.pgm_hash, perm_idx);
+                }
                 u32 differs = 0;
                 for (const u32 n : rs.differ) {
                     differs += n;
+                }
+                if (differs <= 3) {
+                    // Both SPIR-V blobs next to the cache, for spirv-dis + diff.
+                    for (const auto& [suffix, words] :
+                         {std::pair<const char*, const std::vector<u32>*>{"cached", &spv},
+                          std::pair<const char*, const std::vector<u32>*>{"rebuilt", &again}}) {
+                        std::ofstream out{Storage::DataBase::Instance().SidecarPath(fmt::format(
+                                              "rebuild-diff-{:016x}-{}-{}.spv",
+                                              program->info.pgm_hash, perm_idx, suffix)),
+                                          std::ios::binary | std::ios::trunc};
+                        out.write(reinterpret_cast<const char*>(words->data()),
+                                  words->size() * sizeof(u32));
+                    }
                 }
                 if (differs <= 16) {
                     size_t first = 0;
@@ -626,6 +679,30 @@ void PipelineCache::WarmUp() {
     if (ParallelWarmUpEnabled()) {
         g_preload_jobs = &preload_jobs;
     }
+    // SHADPS4_CACHE_REBUILD: the vertex-attribute conversions of vs permutations (ANNOTATE output,
+    // shipped with a seed folder).
+    if (CacheRebuildMode() != 0) {
+        std::ifstream in{Storage::DataBase::Instance().SidecarPath("vs-formats.bin"),
+                         std::ios::binary};
+        u32 magic{}, version{}, count{};
+        in.read(reinterpret_cast<char*>(&magic), 4);
+        in.read(reinterpret_cast<char*>(&version), 4);
+        in.read(reinterpret_cast<char*>(&count), 4);
+        if (in && magic == VsFormatsMagic && version == VsFormatsVersion && count < (1u << 22)) {
+            for (u32 e = 0; e < count && in; ++e) {
+                u64 key{};
+                u8 n{};
+                in.read(reinterpret_cast<char*>(&key), 8);
+                in.read(reinterpret_cast<char*>(&n), 1);
+                std::vector<u8> codes(n);
+                in.read(reinterpret_cast<char*>(codes.data()), n);
+                if (in) {
+                    vs_formats[key] = std::move(codes);
+                }
+            }
+        }
+        LOG_INFO(Render, "CacheRebuild: vs-formats.bin entries {}", vs_formats.size());
+    }
     // SHADPS4_PRECOMPILE fix A (any build of this branch, whatever the flag: the cache may hold
     // marked metas from an earlier PRECOMPILE launch).
     precompile_retired = ReadPrecompileHashes(PrecompileRetiredFile);
@@ -718,17 +795,49 @@ void PipelineCache::WarmUp() {
 
     LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
     if (CacheRebuildMode() != 0) {
+        // SHADPS4_PRECOMPILE_WAIT=1 with a rebuild: the boot also waits for the compute pipelines
+        // the preload deferred to the compile pool (cold driver: ~17 k x ~50 ms), so the first
+        // effects never meet them still queued.
+        const char* wait_env = std::getenv("SHADPS4_PRECOMPILE_WAIT");
+        if ((CacheRebuildMode() & 1) && wait_env && wait_env[0] == '1') {
+            const auto t_wait = std::chrono::steady_clock::now();
+            while (const size_t left =
+                       PipelineCompilePool::WaitIdleFor(std::chrono::milliseconds{250})) {
+                ShowBootProgress("pipelines left", left, 0);
+            }
+            LOG_INFO(Render, "CacheRebuild: waited {} ms for the compile pool to drain",
+                     std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - t_wait)
+                         .count());
+        }
         ShowBootProgress({}, 0, ~0ull);
         const auto& rs = rebuild_stats;
         for (size_t s = 0; s < 8; ++s) {
             if (rs.equal[s] + rs.differ[s] + rs.no_code[s] + rs.rebuilt[s] + rs.reused[s] +
                 rs.layout_mismatch[s]) {
                 LOG_INFO(Render,
-                         "CacheRebuild: stage {}: verify equal={} differ={} | rebuilt={} "
-                         "reused={} layout_mismatch={} | no code in the game index={}",
-                         static_cast<Shader::Stage>(s), rs.equal[s], rs.differ[s], rs.rebuilt[s],
-                         rs.reused[s], rs.layout_mismatch[s], rs.no_code[s]);
+                         "CacheRebuild: stage {}: verify equal={} differ={} annotated={} "
+                         "annotate_failed={} | rebuilt={} reused={} layout_mismatch={} | no code "
+                         "in the game index={}",
+                         static_cast<Shader::Stage>(s), rs.equal[s], rs.differ[s],
+                         rs.annotated[s], rs.annotate_failed[s], rs.rebuilt[s], rs.reused[s],
+                         rs.layout_mismatch[s], rs.no_code[s]);
             }
+        }
+        if (vs_formats_dirty) {
+            std::ofstream out{Storage::DataBase::Instance().SidecarPath("vs-formats.bin"),
+                              std::ios::binary | std::ios::trunc};
+            const u32 count = static_cast<u32>(vs_formats.size());
+            out.write(reinterpret_cast<const char*>(&VsFormatsMagic), 4);
+            out.write(reinterpret_cast<const char*>(&VsFormatsVersion), 4);
+            out.write(reinterpret_cast<const char*>(&count), 4);
+            for (const auto& [key, codes] : vs_formats) {
+                const u8 n = static_cast<u8>(std::min<size_t>(codes.size(), 255));
+                out.write(reinterpret_cast<const char*>(&key), 8);
+                out.write(reinterpret_cast<const char*>(&n), 1);
+                out.write(reinterpret_cast<const char*>(codes.data()), n);
+            }
+            LOG_INFO(Render, "CacheRebuild: vs-formats.bin written, {} entries", count);
         }
     }
     if (num_total_pipelines > num_pipelines) {
