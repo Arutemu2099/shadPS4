@@ -27,6 +27,7 @@ std::string g_game_serial;
 std::string patch_file;
 bool patches_applied = false;
 std::vector<patchInfo> pending_patches;
+static bool g_particle_late_read_applied = false; // V1 written (ApplyParticleLightOneSubmit needs it)
 
 std::string toHex(u64 value, size_t byteSize) {
     std::stringstream ss;
@@ -320,10 +321,42 @@ static void ApplyParticleLateRead() {
         std::memcpy(reinterpret_cast<void*>(g_eboot_address + p.offset), p.bytes.data(),
                     p.bytes.size());
     }
+    g_particle_late_read_applied = true;
     LOG_INFO(Loader,
              "SHADPS4_PARTICLE_LATE_READ: applied V1 (particle readback one frame later): cave "
              "{:#x}, jump {:#x}, nop {:#x}",
              g_eboot_address + 0x3ee160, g_eboot_address + 0x29cc89, g_eboot_address + 0x29cd1e);
+}
+
+// SHADPS4_PARTICLE_LIGHT_ONE_SUBMIT=1 (2026-10-16, notes/study-fight-dips-2026-10-15.md sec. 5, G1):
+// 0x3f3ed0 records two DMA_DATAs per light-emitting particle effect and then submits the ring
+// (call 0x1691e0 at eboot 0x3f4036) - one ring submit per light, ~25 per typical fight frame, ~74 in
+// the worst. With V1 (PARTICLE_LATE_READ) the copies stay in the command buffer 0x807d3cf20 and go out
+// with 0x3ee7d0's first submit of the same frame, so the call becomes a 5-byte NOP. Only with V1
+// applied: in the vanilla order the copies would wait for the next frame (lights one frame late).
+static void ApplyParticleLightOneSubmit() {
+    const char* env = std::getenv("SHADPS4_PARTICLE_LIGHT_ONE_SUBMIT");
+    if (!env || env[0] != '1') {
+        return;
+    }
+    if (!g_particle_late_read_applied) {
+        LOG_ERROR(Loader, "SHADPS4_PARTICLE_LIGHT_ONE_SUBMIT: refused, needs SHADPS4_PARTICLE_LATE_READ "
+                          "applied (V1)");
+        return;
+    }
+    constexpr u64 offset = 0x3f4036;
+    static constexpr u8 original[] = {0xe8, 0xa5, 0x51, 0xd7, 0xff}; // call 0x1691e0
+    static constexpr u8 nop5[] = {0x0f, 0x1f, 0x44, 0x00, 0x00};
+    auto* live = reinterpret_cast<u8*>(g_eboot_address + offset);
+    if (std::memcmp(live, original, sizeof(original)) != 0) {
+        LOG_ERROR(Loader, "SHADPS4_PARTICLE_LIGHT_ONE_SUBMIT: refused, eboot+{:#x} holds "
+                          "{:02x} {:02x} {:02x} {:02x} {:02x}",
+                  offset, live[0], live[1], live[2], live[3], live[4]);
+        return;
+    }
+    std::memcpy(live, nop5, sizeof(nop5));
+    LOG_INFO(Loader, "SHADPS4_PARTICLE_LIGHT_ONE_SUBMIT: per-light ring submit at {:#x} is a NOP",
+             g_eboot_address + offset);
 }
 
 // SHADPS4_HOUSE_SPLIT=1 (2026-10-14, notes/study-house-draws-2026-10-14.md sec. 3): the game's
@@ -399,6 +432,7 @@ static void ApplyHouseSplit() {
 
 void OnGameLoaded() {
     ApplyParticleLateRead();
+    ApplyParticleLightOneSubmit();
     ApplyHouseSplit();
     std::filesystem::path patch_dir = Common::FS::GetUserPath(Common::FS::PathType::PatchesDir);
     if (!patch_file.empty()) {

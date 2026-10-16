@@ -501,6 +501,12 @@ void PipelineCache::WarmUp() {
         std::memcpy(profile_data.data(), &profile, sizeof(profile));
         Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
                                            std::move(profile_data));
+        // SHADPS4_PRECOMPILE (2026-10-16, notes/study-shader-stutter-2026-10-16.md sec. 4 step 3):
+        // a fresh cache folder (a new player's first launch) has nothing to preload but still
+        // gets the pre-compile pass; this branch used to return, so the pass (and a context table)
+        // took effect only from the second launch on. Returns at once when the flag is off.
+        precompile_retired = ReadPrecompileHashes(PrecompileRetiredFile);
+        PrecompileFromExtract();
         return;
     }
     if (profile_data.size() != sizeof(Shader::Profile)) {

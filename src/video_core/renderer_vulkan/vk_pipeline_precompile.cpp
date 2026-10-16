@@ -43,12 +43,14 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/elf_info.h"
 #include "common/hash.h"
 #include "common/logging/log.h"
 #include "common/serdes.h"
@@ -64,8 +66,10 @@
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_pipeline_compile_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/shader_scan.h"
 
 namespace Vulkan {
 
@@ -86,6 +90,9 @@ constexpr u32 FlatFillerDwords = 1024;
 struct ExtractEntry {
     std::filesystem::path bin;
     u32 code_length{};
+    // SHADPS4_PRECOMPILE_DIR=@game (2026-10-16): the code is read from the game's own file.
+    const VideoCore::ShaderIndex* index{};
+    VideoCore::ShaderLocation location{};
 };
 
 int PrecompileMode() {
@@ -152,6 +159,9 @@ std::unordered_map<u64, ExtractEntry> ReadManifest(const std::filesystem::path& 
 }
 
 std::vector<u32> ReadCode(const ExtractEntry& entry) {
+    if (entry.index) {
+        return VideoCore::ReadShaderCode(*entry.index, entry.location);
+    }
     std::vector<u32> code(entry.code_length / sizeof(u32));
     std::ifstream file{entry.bin, std::ios::binary};
     file.read(reinterpret_cast<char*>(code.data()), entry.code_length);
@@ -454,6 +464,148 @@ struct ShapeContexts {
     std::vector<const Context*> ranked;
 };
 
+/// What the pass learned about one cached program: its shape, the keys of its own (real)
+/// contexts and one full permutation's buffer strides (the stride table's source).
+struct ProgramContexts {
+    u64 shape{};
+    std::vector<u64> keys;
+    std::vector<u32> strides;
+};
+
+// SHADPS4_PRECOMPILE bit 8 EXPORT and SHADPS4_PRECOMPILE_TABLE IMPORT (2026-10-16,
+// notes/study-shader-stutter-2026-10-16.md sec. 4 step 2): the learned contexts as a file a fresh
+// cache folder (a new player's) starts from, since COMPILE otherwise learns only from the
+// player's own cache and a new player has none. Numbers only: per code shape the learned
+// contexts (RuntimeInfo + the V#s at the guessable buffers' sharp positions), per learned program
+// its shape, its own context keys and one permutation's buffer strides. No shader code, SPIR-V or
+// other game data. A wrong entry is a keyed miss at the dispatch, never a wrong shader.
+constexpr u32 ContextTableMagic = 0x54435053; // "SPCT"
+constexpr u32 ContextTableVersion = 1;
+static_assert(std::is_trivially_copyable_v<Shader::RuntimeInfo>);
+
+template <typename T>
+void PutRaw(std::ofstream& out, const T& value) {
+    out.write(reinterpret_cast<const char*>(&value), sizeof(T));
+}
+
+template <typename T>
+bool GetRaw(std::ifstream& in, T& value) {
+    in.read(reinterpret_cast<char*>(&value), sizeof(T));
+    return in.gcount() == static_cast<std::streamsize>(sizeof(T));
+}
+
+bool ExportContextTable(const std::filesystem::path& path,
+                        const std::unordered_map<u64, ShapeContexts>& shapes,
+                        const std::unordered_map<u64, ProgramContexts>& programs) {
+    std::ofstream out{path, std::ios::binary | std::ios::trunc};
+    if (!out) {
+        return false;
+    }
+    PutRaw(out, ContextTableMagic);
+    PutRaw(out, ContextTableVersion);
+    PutRaw(out, static_cast<u32>(sizeof(Shader::RuntimeInfo)));
+    PutRaw(out, static_cast<u32>(shapes.size()));
+    for (const auto& [shape, entry] : shapes) {
+        PutRaw(out, shape);
+        PutRaw(out, static_cast<u32>(entry.by_key.size()));
+        for (const auto& [key, ctx] : entry.by_key) {
+            PutRaw(out, key);
+            PutRaw(out, ctx.count);
+            PutRaw(out, ctx.runtime_info);
+            PutRaw(out, static_cast<u32>(ctx.sharps.size()));
+            for (const auto& [idx, sharp] : ctx.sharps) {
+                PutRaw(out, idx);
+                PutRaw(out, sharp);
+            }
+        }
+    }
+    PutRaw(out, static_cast<u32>(programs.size()));
+    for (const auto& [hash, program] : programs) {
+        PutRaw(out, hash);
+        PutRaw(out, program.shape);
+        PutRaw(out, static_cast<u32>(program.keys.size()));
+        for (const u64 key : program.keys) {
+            PutRaw(out, key);
+        }
+        PutRaw(out, static_cast<u32>(program.strides.size()));
+        for (const u32 stride : program.strides) {
+            PutRaw(out, stride);
+        }
+    }
+    return static_cast<bool>(out);
+}
+
+/// Reads a table into empty `shapes` / `programs`; the caller merges them only if it all read.
+bool ImportContextTable(const std::filesystem::path& path,
+                        std::unordered_map<u64, ShapeContexts>& shapes,
+                        std::unordered_map<u64, ProgramContexts>& programs) {
+    std::ifstream in{path, std::ios::binary};
+    u32 magic{}, version{}, rt_size{}, num_shapes{};
+    if (!GetRaw(in, magic) || !GetRaw(in, version) || !GetRaw(in, rt_size) ||
+        magic != ContextTableMagic || version != ContextTableVersion ||
+        rt_size != sizeof(Shader::RuntimeInfo) || !GetRaw(in, num_shapes)) {
+        return false;
+    }
+    constexpr u32 Sane = 1u << 20;
+    for (u32 s = 0; s < num_shapes; ++s) {
+        u64 shape{};
+        u32 num_ctx{};
+        if (!GetRaw(in, shape) || !GetRaw(in, num_ctx) || num_ctx > Sane) {
+            return false;
+        }
+        auto& entry = shapes[shape];
+        for (u32 c = 0; c < num_ctx; ++c) {
+            u64 key{};
+            Context ctx{};
+            u32 num_sharps{};
+            if (!GetRaw(in, key) || !GetRaw(in, ctx.count) || !GetRaw(in, ctx.runtime_info) ||
+                !GetRaw(in, num_sharps) || num_sharps > 1024) {
+                return false;
+            }
+            for (u32 i = 0; i < num_sharps; ++i) {
+                u32 idx{};
+                std::array<u32, 4> sharp{};
+                if (!GetRaw(in, idx) || !GetRaw(in, sharp)) {
+                    return false;
+                }
+                ctx.sharps.emplace_back(idx, sharp);
+            }
+            entry.by_key.try_emplace(key, std::move(ctx));
+        }
+    }
+    u32 num_programs{};
+    if (!GetRaw(in, num_programs) || num_programs > Sane) {
+        return false;
+    }
+    for (u32 p = 0; p < num_programs; ++p) {
+        u64 hash{};
+        ProgramContexts program{};
+        u32 num_keys{}, num_strides{};
+        // The export writes every key a program learned (no cap there): accept any sane count.
+        if (!GetRaw(in, hash) || !GetRaw(in, program.shape) || !GetRaw(in, num_keys) ||
+            num_keys > 4096) {
+            return false;
+        }
+        program.keys.resize(num_keys);
+        for (u64& key : program.keys) {
+            if (!GetRaw(in, key)) {
+                return false;
+            }
+        }
+        if (!GetRaw(in, num_strides) || num_strides > 1024) {
+            return false;
+        }
+        program.strides.resize(num_strides);
+        for (u32& stride : program.strides) {
+            if (!GetRaw(in, stride)) {
+                return false;
+            }
+        }
+        programs.try_emplace(hash, std::move(program));
+    }
+    return true;
+}
+
 /// The context of a cached permutation whose guest buffers are all valid, or nullopt.
 std::optional<std::pair<u64, Context>> LearnContext(const Shader::Info& info,
                                                     const Shader::StageSpecialization& spec,
@@ -613,9 +765,48 @@ void PipelineCache::PrecompileFromExtract() {
         compile = false;
     }
     const bool holdout = (mode & 4) != 0;
-    const bool learn = compile || holdout;
+    // Bit 8 EXPORT: write what this cache taught as a context table (SHADPS4_PRECOMPILE_TABLE, see
+    // ExportContextTable); a COMPILE run without bit 8 imports that file when it is set.
+    const bool export_table = (mode & 8) != 0;
+    const char* table_env = std::getenv("SHADPS4_PRECOMPILE_TABLE");
+    const std::filesystem::path table_path = table_env && *table_env ? table_env : "";
+    const bool learn = compile || holdout || export_table;
     const auto t_start = Clock::now();
-    const auto manifest = ReadManifest(dir_env);
+    // SHADPS4_PRECOMPILE_DIR=@game (2026-10-16, study-shader-stutter sec. 4 step 1): the shader list
+    // comes from scanning the game's own files (VideoCore::BuildShaderIndex, offsets kept in the
+    // cache folder's shader-index.bin), so a player needs no extracted shader folder.
+    static VideoCore::ShaderIndex game_index; // ExtractEntry::index points here
+    std::unordered_map<u64, ExtractEntry> manifest;
+    if (std::string_view{dir_env} == "@game") {
+        game_index = VideoCore::BuildShaderIndex(
+            Common::ElfInfo::Instance().GetGameFolder(),
+            Storage::DataBase::Instance().SidecarPath("shader-index.bin"));
+        for (const auto& [hash, location] : game_index.shaders) {
+            if (location.type == 4) { // compute
+                manifest[hash] = {{}, location.code_length, &game_index, location};
+            }
+        }
+        // SHADPS4_SHADER_SCAN_VERIFY=<extracted folder>: every compute shader of its manifest.csv
+        // must be in the index with the same bytes.
+        if (const char* check = std::getenv("SHADPS4_SHADER_SCAN_VERIFY"); check && *check) {
+            u32 equal = 0, missing = 0, differ = 0;
+            for (const auto& [hash, entry] : ReadManifest(check)) {
+                const auto it = manifest.find(hash);
+                if (it == manifest.end()) {
+                    ++missing;
+                } else if (ReadCode(it->second) == ReadCode(entry)) {
+                    ++equal;
+                } else {
+                    ++differ;
+                }
+            }
+            LOG_INFO(Render_Vulkan,
+                     "ShaderScan verify against {}: compute equal={} missing={} differ={}", check,
+                     equal, missing, differ);
+        }
+    } else {
+        manifest = ReadManifest(dir_env);
+    }
     LOG_INFO(Render_Vulkan, "Precompile: mode {} dir {} compute shaders in the list {} ({:.0f} ms)",
              mode, dir_env, manifest.size(), MsSince(t_start));
     if (manifest.empty()) {
@@ -632,6 +823,7 @@ void PipelineCache::PrecompileFromExtract() {
         std::vector<u32> strides;
     };
     std::unordered_map<u64, TableSource> table_sources;
+    std::unordered_map<u64, ProgramContexts> own_programs; // EXPORT's per-program part
     u32 metas = 0, unloadable = 0, compute = 0, no_code = 0, no_spv = 0, matched = 0, differed = 0;
     u32 learned = 0, unlearnable = 0, add_tid_seen = 0, precompiled_metas = 0;
     double verify_ms = 0.0;
@@ -672,6 +864,18 @@ void PipelineCache::PrecompileFromExtract() {
                     }
                     ++entry.count;
                     ++learned;
+                    if (export_table) {
+                        auto& own = own_programs[cached.pgm_hash];
+                        own.shape = shape;
+                        if (std::ranges::find(own.keys, ctx->first) == own.keys.end()) {
+                            own.keys.push_back(ctx->first);
+                        }
+                        if (own.strides.empty()) {
+                            for (const auto& buffer : spec.buffers) {
+                                own.strides.push_back(buffer.stride);
+                            }
+                        }
+                    }
                     if (compile && !table_sources.contains(cached.pgm_hash)) {
                         auto& source = table_sources[cached.pgm_hash];
                         source.shape = shape;
@@ -759,6 +963,64 @@ void PipelineCache::PrecompileFromExtract() {
     }
     if (!learn) {
         return;
+    }
+    if (export_table) {
+        if (table_path.empty()) {
+            LOG_WARNING(Render_Vulkan, "Precompile table: export needs SHADPS4_PRECOMPILE_TABLE");
+        } else {
+            u64 contexts = 0;
+            for (const auto& [shape, entry] : shapes) {
+                contexts += entry.by_key.size();
+            }
+            const bool ok = ExportContextTable(table_path, shapes, own_programs);
+            LOG_INFO(Render_Vulkan,
+                     "Precompile table: export {} -> {}: shapes={} contexts={} programs={} "
+                     "bytes={}",
+                     ok ? "ok" : "FAILED", table_path.string(), shapes.size(), contexts,
+                     own_programs.size(),
+                     ok ? std::filesystem::file_size(table_path) : 0);
+        }
+    }
+    // IMPORT: the table's contexts join the learned ones (counts add); its programs that this
+    // cache never learned get their own contexts tried first in COMPILE (table_programs).
+    std::unordered_map<u64, ProgramContexts> table_programs;
+    if (compile && !export_table && !table_path.empty()) {
+        std::unordered_map<u64, ShapeContexts> imported_shapes;
+        std::unordered_map<u64, ProgramContexts> imported_programs;
+        const auto t_import = Clock::now();
+        if (!ImportContextTable(table_path, imported_shapes, imported_programs)) {
+            LOG_WARNING(Render_Vulkan, "Precompile table: {} missing or not readable (version {})",
+                        table_path.string(), ContextTableVersion);
+        } else {
+            u32 new_contexts = 0, sources = 0;
+            for (auto& [shape, entry] : imported_shapes) {
+                auto& mine = shapes[shape];
+                for (auto& [key, ctx] : entry.by_key) {
+                    const u32 count = ctx.count;
+                    const auto [it, inserted] = mine.by_key.try_emplace(key, std::move(ctx));
+                    if (inserted) {
+                        ++new_contexts;
+                    } else {
+                        it->second.count += count;
+                    }
+                }
+            }
+            for (auto& [hash, program] : imported_programs) {
+                if (cached_programs.contains(hash)) {
+                    continue; // this cache holds the program already
+                }
+                if (!program.strides.empty() && !table_sources.contains(hash)) {
+                    table_sources[hash] = {program.shape, program.strides};
+                    ++sources;
+                }
+                table_programs.try_emplace(hash, std::move(program));
+            }
+            LOG_INFO(Render_Vulkan,
+                     "Precompile table: import {}: shapes={} new_contexts={} programs={} "
+                     "stride_sources={} ({:.0f} ms)",
+                     table_path.string(), imported_shapes.size(), new_contexts,
+                     table_programs.size(), sources, MsSince(t_import));
+        }
     }
     for (auto& [shape, entry] : shapes) {
         for (const auto& [key, ctx] : entry.by_key) {
@@ -1250,6 +1512,7 @@ void PipelineCache::PrecompileFromExtract() {
     u32 listed_new = 0, image_users = 0, movrel_users = 0, no_shape = 0, drifted = 0,
         programs_built = 0, other_nud_skipped = 0, skipped_failed = 0, retired_skipped = 0;
     u32 permutations = 0, duplicate_specs = 0, layout_mismatch = 0, predicted_contexts = 0;
+    u32 table_exact_programs = 0;
     double translate_ms = 0.0;
     const auto t_compile = Clock::now();
     for (const auto& [hash, entry] : manifest) {
@@ -1290,9 +1553,47 @@ void PipelineCache::PrecompileFromExtract() {
 
         // The candidate contexts, most frequent first; with SHADPS4_PRECOMPILE_STRIDE the indexed
         // buffers' strides predicted from this program's code (StrideVariants).
-        const size_t max_attempts = size_t{guesses} * 2;
-        const auto candidates = MakeCandidates(it_shape->second.ranked, stride_mode, max_attempts,
-                                               probe.buffers, probe.access, table_ptr);
+        // IMPORT (2026-10-16): a program the context table learned gets its own real contexts
+        // first, as they are (no stride variants), up to 7 permutations; then the shape's others.
+        u32 program_guesses = guesses;
+        std::vector<const Context*> own_ranked;
+        if (const auto it_tp = table_programs.find(hash);
+            it_tp != table_programs.end() && it_tp->second.shape == shape) {
+            for (const u64 key : it_tp->second.keys) {
+                const auto it_ctx = it_shape->second.by_key.find(key);
+                if (it_ctx != it_shape->second.by_key.end()) {
+                    own_ranked.push_back(&it_ctx->second);
+                }
+            }
+            std::ranges::stable_sort(own_ranked, [](const Context* a, const Context* b) {
+                return a->count > b->count;
+            });
+        }
+        std::vector<Candidate> candidates;
+        std::vector<const Context*> other_ranked;
+        if (own_ranked.empty()) {
+            other_ranked = it_shape->second.ranked;
+        } else {
+            ++table_exact_programs;
+            // PrecompileGuesses() is <= 7, so the clamp's bounds are ordered (Program holds 8).
+            program_guesses = std::clamp(static_cast<u32>(own_ranked.size()), guesses, 7u);
+            candidates = MakeCandidates(own_ranked, 0, own_ranked.size(), probe.buffers,
+                                        probe.access, nullptr);
+            for (const Context* ctx : it_shape->second.ranked) {
+                if (std::ranges::find(own_ranked, ctx) == own_ranked.end()) {
+                    other_ranked.push_back(ctx);
+                }
+            }
+        }
+        const size_t max_attempts = size_t{program_guesses} * 2;
+        if (candidates.size() < max_attempts) {
+            auto more = MakeCandidates(other_ranked, stride_mode, max_attempts - candidates.size(),
+                                       probe.buffers, probe.access, table_ptr);
+            for (auto& candidate : more) {
+                candidate.rank += static_cast<u32>(own_ranked.size());
+                candidates.push_back(std::move(candidate));
+            }
+        }
         for (const auto& candidate : candidates) {
             predicted_contexts += candidate.variant != StrideVariant::Learned ? 1 : 0;
         }
@@ -1306,7 +1607,8 @@ void PipelineCache::PrecompileFromExtract() {
         uds.reserve(max_attempts);
         for (const Candidate& candidate : candidates) {
             const Context* ctx = &candidate.ctx;
-            if ((program && program->modules.size() >= guesses) || uds.size() >= max_attempts) {
+            if ((program && program->modules.size() >= program_guesses) ||
+                uds.size() >= max_attempts) {
                 break;
             }
             // Fable finding 1: every permutation is pushed through the program's shared Info, made
@@ -1415,6 +1717,21 @@ void PipelineCache::PrecompileFromExtract() {
     // Fable finding 7: every translation appends an SRT walker to a fixed 32 MB arena.
     LOG_INFO(Render_Vulkan, "Precompile: SRT walker arena {} KiB used of 32768",
              Shader::SrtWalkerArenaUsed() >> 10);
+    if (!table_programs.empty()) {
+        LOG_INFO(Render_Vulkan, "Precompile table: {} programs built from their own contexts first",
+                 table_exact_programs);
+    }
+    // SHADPS4_PRECOMPILE_WAIT=1 (2026-10-16): the boot waits until the compile pool has built every
+    // queued pipeline (the driver compiles of this pass and of the boot preload), so a first launch
+    // with a cold driver cache does not meet them still queued at the first effects. Boot time,
+    // once per install (cold) or seconds (driver cache warm).
+    const char* wait_env = std::getenv("SHADPS4_PRECOMPILE_WAIT");
+    if (permutations > 0 && wait_env && wait_env[0] == '1') {
+        const auto t_wait = Clock::now();
+        PipelineCompilePool::WaitIdle();
+        LOG_INFO(Render_Vulkan, "Precompile: waited {:.0f} ms for the compile pool to drain",
+                 MsSince(t_wait));
+    }
 }
 
 } // namespace Vulkan
