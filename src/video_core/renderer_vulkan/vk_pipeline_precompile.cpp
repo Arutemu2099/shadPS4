@@ -57,6 +57,7 @@
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/frontend/decode.h"
+#include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/ir/passes/srt.h"
@@ -71,7 +72,62 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/shader_scan.h"
 
+#include <SDL3/SDL_events.h>
+#include <SDL3/SDL_video.h>
+#include "sdl_window.h"
+
+extern Frontend::WindowSDL* g_window; // emulator.cpp
+
 namespace Vulkan {
+
+/// SHADPS4_PRECOMPILE / SHADPS4_CACHE_REBUILD boot passes (2026-10-16): they run on the main thread
+/// before the game starts and can take minutes on a first launch; at most every 250 ms the window
+/// title shows the progress and the event queue is pumped, so Windows does not mark the window
+/// "Not responding". Done() puts the title back.
+class BootProgress {
+public:
+    void Show(std::string_view what, u64 done, u64 total) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last < std::chrono::milliseconds{250}) {
+            return;
+        }
+        last = now;
+        SDL_Window* window = g_window ? g_window->GetSDLWindow() : nullptr;
+        if (window) {
+            if (!saved) {
+                const char* title = SDL_GetWindowTitle(window);
+                old_title = title ? title : "";
+                saved = true;
+            }
+            const auto text = total ? fmt::format("Preparing shaders (one time): {} {} / {}", what,
+                                                  done, total)
+                                    : fmt::format("Preparing shaders (one time): {} {}", what, done);
+            SDL_SetWindowTitle(window, text.c_str());
+        }
+        SDL_PumpEvents();
+    }
+    void Done() {
+        SDL_Window* window = g_window ? g_window->GetSDLWindow() : nullptr;
+        if (window && saved) {
+            SDL_SetWindowTitle(window, old_title.c_str());
+        }
+        saved = false;
+    }
+
+private:
+    std::chrono::steady_clock::time_point last{};
+    std::string old_title;
+    bool saved{};
+};
+
+void ShowBootProgress(std::string_view what, u64 done, u64 total) {
+    static BootProgress* shared = new BootProgress{}; // WarmUp's main thread only
+    if (total == ~0ull) {
+        shared->Done();
+        return;
+    }
+    shared->Show(what, done, total);
+}
 
 namespace {
 
@@ -653,7 +709,58 @@ struct RealPerm {
     bool full{};   // every guest buffer non-empty at the dispatch it was made for
 };
 
+/// The game folder's shader index, built (or read from the cache folder's shader-index.bin) once
+/// per launch on first use; ExtractEntry::index points into it.
+const VideoCore::ShaderIndex& GameShaderIndex() {
+    static VideoCore::ShaderIndex index;
+    static bool built = false;
+    if (!built) {
+        built = true;
+        index = VideoCore::BuildShaderIndex(
+            Common::ElfInfo::Instance().GetGameFolder(),
+            Storage::DataBase::Instance().SidecarPath("shader-index.bin"));
+    }
+    return index;
+}
+
 } // Anonymous namespace
+
+std::vector<u32> PipelineCache::RebuildStageSpv(
+    const Shader::Info& cached, const std::optional<Shader::Gcn::FetchShaderData>& fetch,
+    const Shader::StageSpecialization& spec, bool* same_layout) {
+    const auto& index = GameShaderIndex();
+    const auto it = index.shaders.find(cached.pgm_hash);
+    if (it == index.shaders.end()) {
+        return {};
+    }
+    const auto code = VideoCore::ReadShaderCode(index, it->second);
+    if (code.empty()) {
+        return {};
+    }
+    // As the compute VERIFY of the pre-compile (5,770 / 5,770 word-equal, s179): user SGPRs from
+    // the cached flattened user data, every guest read of the translator from that buffer, the
+    // DMA use pinned to the cached program's, the cached runtime info and start bindings; for a
+    // vertex shader also the cached fetch-shader data (the fetch subroutine is not in memory yet).
+    UserData user_data{};
+    std::copy_n(cached.flattened_ud_buf.begin(),
+                std::min(user_data.size(), cached.flattened_ud_buf.size()), user_data.begin());
+    const Shader::ShaderParams params{.user_data = user_data, .code = code, .hash = cached.pgm_hash};
+    Shader::Info info{cached.stage, cached.l_stage, params};
+    info.pinned_uses_dma = cached.uses_dma;
+    auto runtime_info = spec.runtime_info;
+    Shader::Backend::Bindings binding = spec.start;
+    Shader::g_synthetic_flat = &cached.flattened_ud_buf;
+    Shader::Gcn::g_synthetic_fetch = fetch ? &*fetch : nullptr;
+    const auto program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
+    auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, program, binding);
+    Shader::g_synthetic_flat = nullptr;
+    Shader::Gcn::g_synthetic_fetch = nullptr;
+    if (same_layout) {
+        // The pipeline binds through the cached Info: the new translation must agree with it.
+        *same_layout = SameBindingLayout(info, cached);
+    }
+    return spv;
+}
 
 std::unordered_set<u64> ReadPrecompileHashes(std::string_view file_name) {
     std::unordered_set<u64> hashes;
@@ -775,12 +882,9 @@ void PipelineCache::PrecompileFromExtract() {
     // SHADPS4_PRECOMPILE_DIR=@game (2026-10-16, study-shader-stutter sec. 4 step 1): the shader list
     // comes from scanning the game's own files (VideoCore::BuildShaderIndex, offsets kept in the
     // cache folder's shader-index.bin), so a player needs no extracted shader folder.
-    static VideoCore::ShaderIndex game_index; // ExtractEntry::index points here
     std::unordered_map<u64, ExtractEntry> manifest;
     if (std::string_view{dir_env} == "@game") {
-        game_index = VideoCore::BuildShaderIndex(
-            Common::ElfInfo::Instance().GetGameFolder(),
-            Storage::DataBase::Instance().SidecarPath("shader-index.bin"));
+        const auto& game_index = GameShaderIndex(); // ExtractEntry::index points here
         for (const auto& [hash, location] : game_index.shaders) {
             if (location.type == 4) { // compute
                 manifest[hash] = {{}, location.code_length, &game_index, location};
@@ -1515,7 +1619,10 @@ void PipelineCache::PrecompileFromExtract() {
     u32 table_exact_programs = 0;
     double translate_ms = 0.0;
     const auto t_compile = Clock::now();
+    BootProgress ui;
+    u64 visited = 0;
     for (const auto& [hash, entry] : manifest) {
+        ui.Show("compute programs", ++visited, manifest.size());
         if (cached_programs.contains(hash) || program_cache.contains(hash)) {
             continue;
         }
@@ -1553,8 +1660,10 @@ void PipelineCache::PrecompileFromExtract() {
 
         // The candidate contexts, most frequent first; with SHADPS4_PRECOMPILE_STRIDE the indexed
         // buffers' strides predicted from this program's code (StrideVariants).
-        // IMPORT (2026-10-16): a program the context table learned gets its own real contexts
-        // first, as they are (no stride variants), up to 7 permutations; then the shape's others.
+        // IMPORT (2026-10-16): a program the context table learned gets its own real contexts, as
+        // they are (no stride variants), up to 7 permutations, and no guesses: s1296 gave every
+        // such program 4 permutations (29,116 for 7,794 programs, ~4.7 GB at ~167 KiB each).
+        // SHADPS4_PRECOMPILE_TABLE_GUESS=1 also appends the shape's guesses after them.
         u32 program_guesses = guesses;
         std::vector<const Context*> own_ranked;
         if (const auto it_tp = table_programs.find(hash);
@@ -1575,18 +1684,26 @@ void PipelineCache::PrecompileFromExtract() {
             other_ranked = it_shape->second.ranked;
         } else {
             ++table_exact_programs;
+            static const bool table_guess = [] {
+                const char* value = std::getenv("SHADPS4_PRECOMPILE_TABLE_GUESS");
+                return value && value[0] == '1';
+            }();
             // PrecompileGuesses() is <= 7, so the clamp's bounds are ordered (Program holds 8).
-            program_guesses = std::clamp(static_cast<u32>(own_ranked.size()), guesses, 7u);
+            program_guesses = table_guess
+                                  ? std::clamp(static_cast<u32>(own_ranked.size()), guesses, 7u)
+                                  : std::min(static_cast<u32>(own_ranked.size()), 7u);
             candidates = MakeCandidates(own_ranked, 0, own_ranked.size(), probe.buffers,
                                         probe.access, nullptr);
-            for (const Context* ctx : it_shape->second.ranked) {
-                if (std::ranges::find(own_ranked, ctx) == own_ranked.end()) {
-                    other_ranked.push_back(ctx);
+            if (table_guess) {
+                for (const Context* ctx : it_shape->second.ranked) {
+                    if (std::ranges::find(own_ranked, ctx) == own_ranked.end()) {
+                        other_ranked.push_back(ctx);
+                    }
                 }
             }
         }
         const size_t max_attempts = size_t{program_guesses} * 2;
-        if (candidates.size() < max_attempts) {
+        if (candidates.size() < max_attempts && !other_ranked.empty()) {
             auto more = MakeCandidates(other_ranked, stride_mode, max_attempts - candidates.size(),
                                        probe.buffers, probe.access, table_ptr);
             for (auto& candidate : more) {
@@ -1728,10 +1845,13 @@ void PipelineCache::PrecompileFromExtract() {
     const char* wait_env = std::getenv("SHADPS4_PRECOMPILE_WAIT");
     if (permutations > 0 && wait_env && wait_env[0] == '1') {
         const auto t_wait = Clock::now();
-        PipelineCompilePool::WaitIdle();
+        while (const size_t left = PipelineCompilePool::WaitIdleFor(std::chrono::milliseconds{250})) {
+            ui.Show("pipelines left", left, 0);
+        }
         LOG_INFO(Render_Vulkan, "Precompile: waited {:.0f} ms for the compile pool to drain",
                  MsSince(t_wait));
     }
+    ui.Done();
 }
 
 } // namespace Vulkan

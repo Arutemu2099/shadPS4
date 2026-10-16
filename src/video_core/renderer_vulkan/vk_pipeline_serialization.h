@@ -40,5 +40,8 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 // True when two translations of one program give the same descriptor bindings (buffer kinds and
 // order, images, samplers, fmasks). Permutations share one Info, so they must agree on these.
 bool SameBindingLayout(const Shader::Info& a, const Shader::Info& b);
+// Boot passes on the main thread (vk_pipeline_precompile.cpp): window title progress + event pump
+// at most every 250 ms; total == ~0ull puts the title back.
+void ShowBootProgress(std::string_view what, u64 done, u64 total);
 
 } // namespace Vulkan

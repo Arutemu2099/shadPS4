@@ -320,6 +320,16 @@ bool ParallelWarmUpEnabled() {
     const char* value = std::getenv("SHADPS4_PARALLEL_WARMUP");
     return value && value[0] == '1';
 }
+
+/// SHADPS4_CACHE_REBUILD (2026-10-16): 1 rebuild missing SPIR-V from the game's files, 2 VERIFY
+/// cached SPIR-V against a rebuild, 3 both (LoadPipelineStage).
+int CacheRebuildMode() {
+    static const int mode = [] {
+        const char* value = std::getenv("SHADPS4_CACHE_REBUILD");
+        return value ? std::atoi(value) : 0;
+    }();
+    return mode;
+}
 } // Anonymous namespace
 
 bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
@@ -409,6 +419,52 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,
                                        fmt::format("{:#018x}_{}", program->info.pgm_hash, perm_idx),
                                        spv);
+    // SHADPS4_CACHE_REBUILD (2026-10-16): =1 a stage whose SPIR-V is missing is made again from the
+    // game's own code + this meta (RebuildStageSpv) and saved; =2 VERIFY: every stage that has
+    // SPIR-V is made again and compared word for word (nothing changes). =3 both.
+    if (const int rebuild = CacheRebuildMode(); rebuild != 0) {
+        const size_t si = std::min<size_t>(static_cast<size_t>(program->info.stage), 7);
+        auto& rs = rebuild_stats;
+        if (spv.empty() && (rebuild & 1)) {
+            bool same_layout = false;
+            spv = RebuildStageSpv(program->info, loaded_fetch, spec, &same_layout);
+            if (spv.empty()) {
+                ++rs.no_code[si];
+                return false;
+            }
+            if (!same_layout) {
+                ++rs.layout_mismatch[si];
+                return false;
+            }
+            ++rs.rebuilt[si];
+            RegisterShaderBinary(std::vector<u32>(spv), program->info.pgm_hash, perm_idx);
+        } else if (!spv.empty() && (rebuild & 2)) {
+            bool same_layout = false;
+            const auto again = RebuildStageSpv(program->info, loaded_fetch, spec, &same_layout);
+            if (again.empty()) {
+                ++rs.no_code[si];
+            } else if (again == spv && same_layout) {
+                ++rs.equal[si];
+            } else {
+                ++rs.differ[si];
+                u32 differs = 0;
+                for (const u32 n : rs.differ) {
+                    differs += n;
+                }
+                if (differs <= 16) {
+                    size_t first = 0;
+                    while (first < spv.size() && first < again.size() && spv[first] == again[first]) {
+                        ++first;
+                    }
+                    LOG_WARNING(Render_Vulkan,
+                                "CacheRebuild verify: {} {:#x} perm {} differs: {} vs cached {} "
+                                "words, first difference at word {}, layout {}",
+                                program->info.stage, program->info.pgm_hash, perm_idx, again.size(),
+                                spv.size(), first, same_layout ? "same" : "DIFFERENT");
+                }
+            }
+        }
+    }
     if (spv.empty()) {
         return false;
     }
@@ -495,19 +551,29 @@ void PipelineCache::WarmUp() {
     std::vector<u8> profile_data{};
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderProfile, "profile", profile_data);
     if (profile_data.empty()) {
-        Storage::DataBase::Instance().FinishPreload();
-
-        profile_data.resize(sizeof(profile));
-        std::memcpy(profile_data.data(), &profile, sizeof(profile));
+        std::vector<u8> fresh(sizeof(profile));
+        std::memcpy(fresh.data(), &profile, sizeof(profile));
+        // SHADPS4_CACHE_REBUILD=1 (2026-10-16): a folder seeded with pipeline keys + shader metas
+        // but no profile and no SPIR-V (a shipped set) goes on to the preload below, which rebuilds
+        // every stage from the game's own files for this machine's profile (LoadPipelineStage).
+        if ((CacheRebuildMode() & 1) == 0) {
+            Storage::DataBase::Instance().FinishPreload();
+            Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
+                                               std::move(fresh));
+            // SHADPS4_PRECOMPILE (2026-10-16, notes/study-shader-stutter-2026-10-16.md sec. 4
+            // step 3): a fresh cache folder (a new player's first launch) has nothing to preload
+            // but still gets the pre-compile pass; this branch used to return, so the pass (and a
+            // context table) took effect only from the second launch on. Returns at once when the
+            // flag is off.
+            precompile_retired = ReadPrecompileHashes(PrecompileRetiredFile);
+            PrecompileFromExtract();
+            return;
+        }
+        profile_data = fresh;
         Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
-                                           std::move(profile_data));
-        // SHADPS4_PRECOMPILE (2026-10-16, notes/study-shader-stutter-2026-10-16.md sec. 4 step 3):
-        // a fresh cache folder (a new player's first launch) has nothing to preload but still
-        // gets the pre-compile pass; this branch used to return, so the pass (and a context table)
-        // took effect only from the second launch on. Returns at once when the flag is off.
-        precompile_retired = ReadPrecompileHashes(PrecompileRetiredFile);
-        PrecompileFromExtract();
-        return;
+                                           std::move(fresh));
+        LOG_INFO(Render, "CacheRebuild: no profile in the cache folder; this machine's saved, "
+                         "stages without SPIR-V are rebuilt from the game's files");
     }
     if (profile_data.size() != sizeof(Shader::Profile)) {
         LOG_WARNING(Render,
@@ -542,6 +608,9 @@ void PipelineCache::WarmUp() {
     Storage::DataBase::Instance().ForEachBlob(
         Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
             ++num_total_pipelines;
+            if (CacheRebuildMode() != 0) {
+                ShowBootProgress("pipelines read", num_total_pipelines, 0);
+            }
 
             Serialization::Archive ar{std::move(data)};
             Serialization::Reader pldata{ar};
@@ -622,6 +691,19 @@ void PipelineCache::WarmUp() {
                  .count());
 
     LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
+    if (CacheRebuildMode() != 0) {
+        ShowBootProgress({}, 0, ~0ull);
+        const auto& rs = rebuild_stats;
+        for (size_t s = 0; s < 8; ++s) {
+            if (rs.equal[s] + rs.differ[s] + rs.no_code[s] + rs.rebuilt[s] + rs.layout_mismatch[s]) {
+                LOG_INFO(Render,
+                         "CacheRebuild: stage {}: verify equal={} differ={} | rebuilt={} "
+                         "layout_mismatch={} | no code in the game index={}",
+                         static_cast<Shader::Stage>(s), rs.equal[s], rs.differ[s], rs.rebuilt[s],
+                         rs.layout_mismatch[s], rs.no_code[s]);
+            }
+        }
+    }
     if (num_total_pipelines > num_pipelines) {
         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
                     num_total_pipelines - num_pipelines);

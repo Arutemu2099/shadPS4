@@ -70,6 +70,11 @@ struct FetchShaderData {
 
 const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base);
 
+/// SHADPS4_CACHE_REBUILD (2026-10-16): while set, ParseFetchShader returns this instead of
+/// decoding guest memory - a vertex shader re-translated at WarmUp from the game's files has no
+/// fetch subroutine in memory yet; its cached FetchShaderData stands in (main thread only).
+inline const FetchShaderData* g_synthetic_fetch = nullptr;
+
 std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info);
 
 } // namespace Shader::Gcn

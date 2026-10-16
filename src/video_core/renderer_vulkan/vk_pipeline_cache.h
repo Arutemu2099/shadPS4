@@ -180,6 +180,19 @@ public:
     void WarmUp();
     // SHADPS4_PRECOMPILE (vk_pipeline_precompile.cpp): run by WarmUp on the main thread.
     void PrecompileFromExtract();
+    // SHADPS4_CACHE_REBUILD (2026-10-16, vk_pipeline_precompile.cpp): a cached stage's SPIR-V made
+    // again from the game's own code (VideoCore::BuildShaderIndex) and its cached meta (user data,
+    // flattened sharps, fetch data, runtime info, start bindings). Empty if the code is not found.
+    // Main thread, WarmUp only (synthetic flat / fetch globals). `same_layout`: the new
+    // translation's binding layout equals the cached Info's (SameBindingLayout).
+    std::vector<u32> RebuildStageSpv(const Shader::Info& cached,
+                                     const std::optional<Shader::Gcn::FetchShaderData>& fetch,
+                                     const Shader::StageSpecialization& spec,
+                                     bool* same_layout = nullptr);
+    struct RebuildStats {
+        u32 equal[8]{}, differ[8]{}, no_code[8]{}, rebuilt[8]{}, layout_mismatch[8]{};
+    };
+    RebuildStats rebuild_stats{};
     // SHADPS4_PRECOMPILE, Fable finding 1: a precompiled program whose first live dispatch matched
     // none of its guessed permutations leaves program_cache with its compute pipelines; both are
     // parked (a pool compile of such a pipeline may still be running), never destroyed early.

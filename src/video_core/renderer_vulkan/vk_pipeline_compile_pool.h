@@ -71,6 +71,9 @@ void Push(DeferredPipeline* job);
 void Promote(DeferredPipeline* job);
 /// Returns once nothing is queued or running (shader hot reload).
 void WaitIdle();
+/// WaitIdle for at most `timeout`; the jobs still queued or running (0 = idle). Duplicates from
+/// Promote count twice (a progress figure, not an exact count).
+size_t WaitIdleFor(std::chrono::milliseconds timeout);
 /// Stops and joins the workers; queued jobs are dropped (their pipelines are about to be
 /// destroyed). Call before destroying any pipeline that may still be queued.
 /// RULE: a Pipeline with a deferred job may be destroyed only after Shutdown or a WaitIdle

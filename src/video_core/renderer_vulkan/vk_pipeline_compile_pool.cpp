@@ -102,6 +102,17 @@ public:
         idle_cv.wait(lk, [&] { return demand.empty() && preload.empty() && running == 0; });
     }
 
+    /// WaitIdle for at most `timeout`; returns the jobs still queued or running (0 = idle).
+    size_t WaitIdleFor(std::chrono::milliseconds timeout) {
+        std::unique_lock lk{mutex};
+        if (threads.empty()) {
+            return 0;
+        }
+        idle_cv.wait_for(lk, timeout,
+                         [&] { return demand.empty() && preload.empty() && running == 0; });
+        return demand.size() + preload.size() + running;
+    }
+
     void Shutdown() {
         std::vector<std::jthread> joining;
         {
@@ -296,6 +307,10 @@ void Promote(DeferredPipeline* job) {
 
 void WaitIdle() {
     GetPool().WaitIdle();
+}
+
+size_t WaitIdleFor(std::chrono::milliseconds timeout) {
+    return GetPool().WaitIdleFor(timeout);
 }
 
 void Shutdown() {

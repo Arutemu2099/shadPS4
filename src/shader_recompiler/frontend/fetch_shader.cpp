@@ -113,6 +113,9 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
     if (!info.has_fetch_shader) {
         return std::nullopt;
     }
+    if (g_synthetic_fetch) [[unlikely]] {
+        return *g_synthetic_fetch;
+    }
     const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
     static const bool enabled = [] {
         const char* value = std::getenv("SHADPS4_FETCH_CACHE");
