@@ -14,6 +14,12 @@ struct Archive;
 
 namespace Shader::Gcn {
 
+/// SHADPS4_CACHE_REBUILD (2026-10-16): V#s standing in for the guest vertex-buffer table while a
+/// vertex shader is re-translated at WarmUp (the table is not in memory yet), keyed by
+/// (sgpr_base << 8) | dword_offset; made from the cached VS attribute specialization (number
+/// class, swizzle). Main thread only.
+inline const std::vector<std::pair<u32, AmdGpu::Buffer>>* g_synthetic_vs_sharps = nullptr;
+
 struct VertexAttribute {
     enum InstanceIdType : u8 {
         None = 0,
@@ -37,7 +43,21 @@ struct VertexAttribute {
     }
 
     constexpr AmdGpu::Buffer GetSharp(const auto& info) const noexcept {
-        auto buffer = info.template ReadUdReg<AmdGpu::Buffer>(sgpr_base, dword_offset);
+        AmdGpu::Buffer buffer{};
+        bool synthetic = false;
+        if (g_synthetic_vs_sharps) [[unlikely]] {
+            const u32 key = (u32{sgpr_base} << 8) | dword_offset;
+            for (const auto& [k, v] : *g_synthetic_vs_sharps) {
+                if (k == key) {
+                    buffer = v;
+                    synthetic = true;
+                    break;
+                }
+            }
+        }
+        if (!synthetic) {
+            buffer = info.template ReadUdReg<AmdGpu::Buffer>(sgpr_base, dword_offset);
+        }
         buffer.base_address += inst_offset;
         if (data_format) {
             buffer.data_format = data_format;

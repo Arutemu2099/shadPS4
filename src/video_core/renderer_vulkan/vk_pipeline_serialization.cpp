@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <fstream>
 #include <thread>
 #include <vector>
 
@@ -422,10 +423,35 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     // SHADPS4_CACHE_REBUILD (2026-10-16): =1 a stage whose SPIR-V is missing is made again from the
     // game's own code + this meta (RebuildStageSpv) and saved; =2 VERIFY: every stage that has
     // SPIR-V is made again and compared word for word (nothing changes). =3 both.
+    bool rebuilt_known = false;
     if (const int rebuild = CacheRebuildMode(); rebuild != 0) {
         const size_t si = std::min<size_t>(static_cast<size_t>(program->info.stage), 7);
         auto& rs = rebuild_stats;
-        if (spv.empty() && (rebuild & 1)) {
+        // Bit 4 TRACE (s1297 stopped inside WarmUp without a log line): the stage about to be
+        // rebuilt, written and flushed to the cache folder's rebuild-inprogress.txt first.
+        if (rebuild & 4) {
+            static std::ofstream trace{
+                Storage::DataBase::Instance().SidecarPath("rebuild-inprogress.txt"),
+                std::ios::binary | std::ios::trunc};
+            static u64 traced = 0;
+            trace.seekp(0);
+            trace << fmt::format("{} {:#018x} perm {} marked {} spv {} n {}            \n",
+                                 program->info.stage, program->info.pgm_hash, perm_idx,
+                                 marked ? 1 : 0, spv.size(), ++traced);
+            trace.flush();
+        }
+        // A permutation another pipeline already rebuilt (or loaded) needs no SPIR-V: the module
+        // is taken from program_cache below.
+        const auto it_known = program_cache.find(program->info.pgm_hash);
+        const bool in_cache = it_known != program_cache.end() &&
+                              std::ranges::find(it_known.value()->modules, spec,
+                                                &Program::Module::spec) !=
+                                  it_known.value()->modules.end();
+        const bool known = spv.empty() && in_cache;
+        if (known && (rebuild & 1)) {
+            ++rs.reused[si];
+            rebuilt_known = true;
+        } else if (spv.empty() && (rebuild & 1)) {
             bool same_layout = false;
             spv = RebuildStageSpv(program->info, loaded_fetch, spec, &same_layout);
             if (spv.empty()) {
@@ -438,7 +464,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
             }
             ++rs.rebuilt[si];
             RegisterShaderBinary(std::vector<u32>(spv), program->info.pgm_hash, perm_idx);
-        } else if (!spv.empty() && (rebuild & 2)) {
+        } else if (!spv.empty() && (rebuild & 2) && !in_cache) { // each permutation once
             bool same_layout = false;
             const auto again = RebuildStageSpv(program->info, loaded_fetch, spec, &same_layout);
             if (again.empty()) {
@@ -465,7 +491,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
             }
         }
     }
-    if (spv.empty()) {
+    if (spv.empty() && !rebuilt_known) {
         return false;
     }
     DumpOneShader(spv, program->info.pgm_hash, program->info.stage, perm_idx, "cached");
@@ -695,12 +721,13 @@ void PipelineCache::WarmUp() {
         ShowBootProgress({}, 0, ~0ull);
         const auto& rs = rebuild_stats;
         for (size_t s = 0; s < 8; ++s) {
-            if (rs.equal[s] + rs.differ[s] + rs.no_code[s] + rs.rebuilt[s] + rs.layout_mismatch[s]) {
+            if (rs.equal[s] + rs.differ[s] + rs.no_code[s] + rs.rebuilt[s] + rs.reused[s] +
+                rs.layout_mismatch[s]) {
                 LOG_INFO(Render,
                          "CacheRebuild: stage {}: verify equal={} differ={} | rebuilt={} "
-                         "layout_mismatch={} | no code in the game index={}",
+                         "reused={} layout_mismatch={} | no code in the game index={}",
                          static_cast<Shader::Stage>(s), rs.equal[s], rs.differ[s], rs.rebuilt[s],
-                         rs.layout_mismatch[s], rs.no_code[s]);
+                         rs.reused[s], rs.layout_mismatch[s], rs.no_code[s]);
             }
         }
     }

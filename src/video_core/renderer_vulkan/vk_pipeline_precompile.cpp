@@ -749,12 +749,42 @@ std::vector<u32> PipelineCache::RebuildStageSpv(
     info.pinned_uses_dma = cached.uses_dma;
     auto runtime_info = spec.runtime_info;
     Shader::Backend::Bindings binding = spec.start;
+    // A vertex shader's attribute V#s come from the guest vertex-buffer table, which is not in
+    // memory at WarmUp (s1298 stopped at the first vs): stand-ins from the cached specialization
+    // (number class, swizzle; the spec is the permutation key, so it holds what the translation
+    // depends on - the VERIFY run checks that word for word).
+    std::vector<std::pair<u32, AmdGpu::Buffer>> vs_sharps;
+    if (fetch) {
+        if (spec.vs_attribs.size() != fetch->attributes.size()) {
+            return {};
+        }
+        for (size_t i = 0; i < fetch->attributes.size(); ++i) {
+            const auto& attrib = fetch->attributes[i];
+            const auto& vs = spec.vs_attribs[i];
+            AmdGpu::Buffer sharp{};
+            sharp.base_address = 0x10000;
+            sharp.stride = 16;
+            sharp.num_records = 1;
+            sharp.data_format = static_cast<u32>(AmdGpu::DataFormat::Format32_32_32_32);
+            sharp.num_format = static_cast<u32>(
+                vs.num_class == AmdGpu::NumberClass::Sint   ? AmdGpu::NumberFormat::Sint
+                : vs.num_class == AmdGpu::NumberClass::Uint ? AmdGpu::NumberFormat::Uint
+                                                            : AmdGpu::NumberFormat::Float);
+            sharp.dst_sel_x = static_cast<u32>(vs.dst_select.r);
+            sharp.dst_sel_y = static_cast<u32>(vs.dst_select.g);
+            sharp.dst_sel_z = static_cast<u32>(vs.dst_select.b);
+            sharp.dst_sel_w = static_cast<u32>(vs.dst_select.a);
+            vs_sharps.emplace_back((u32{attrib.sgpr_base} << 8) | attrib.dword_offset, sharp);
+        }
+        Shader::Gcn::g_synthetic_vs_sharps = &vs_sharps;
+    }
     Shader::g_synthetic_flat = &cached.flattened_ud_buf;
     Shader::Gcn::g_synthetic_fetch = fetch ? &*fetch : nullptr;
     const auto program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, program, binding);
     Shader::g_synthetic_flat = nullptr;
     Shader::Gcn::g_synthetic_fetch = nullptr;
+    Shader::Gcn::g_synthetic_vs_sharps = nullptr;
     if (same_layout) {
         // The pipeline binds through the cached Info: the new translation must agree with it.
         *same_layout = SameBindingLayout(info, cached);

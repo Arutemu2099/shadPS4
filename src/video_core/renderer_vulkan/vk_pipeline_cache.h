@@ -190,7 +190,7 @@ public:
                                      const Shader::StageSpecialization& spec,
                                      bool* same_layout = nullptr);
     struct RebuildStats {
-        u32 equal[8]{}, differ[8]{}, no_code[8]{}, rebuilt[8]{}, layout_mismatch[8]{};
+        u32 equal[8]{}, differ[8]{}, no_code[8]{}, rebuilt[8]{}, reused[8]{}, layout_mismatch[8]{};
     };
     RebuildStats rebuild_stats{};
     // SHADPS4_PRECOMPILE, Fable finding 1: a precompiled program whose first live dispatch matched
