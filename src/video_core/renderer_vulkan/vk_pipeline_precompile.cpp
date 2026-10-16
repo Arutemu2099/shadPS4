@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -726,12 +727,76 @@ const VideoCore::ShaderIndex& GameShaderIndex() {
 
 } // Anonymous namespace
 
+bool GameShaderIdentity(u64 pgm_hash, u32* crc32, u32* code_length) {
+    const auto& index = GameShaderIndex();
+    const auto it = index.shaders.find(pgm_hash);
+    if (it == index.shaders.end()) {
+        return false;
+    }
+    *crc32 = it->second.crc32;
+    *code_length = it->second.code_length;
+    return true;
+}
+
+bool SameResourceFields(const Shader::Info& a, const Shader::Info& b) {
+    if (!SameBindingLayout(a, b) || a.flattened_ud_buf.size() != b.flattened_ud_buf.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.buffers.size(); ++i) {
+        const auto& x = a.buffers[i];
+        const auto& y = b.buffers[i];
+        if (x.sharp_idx != y.sharp_idx || x.used_types != y.used_types ||
+            x.instance_attrib != y.instance_attrib || x.is_written != y.is_written ||
+            x.is_formatted != y.is_formatted ||
+            std::memcmp(&x.inline_cbuf, &y.inline_cbuf, sizeof(x.inline_cbuf)) != 0) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < a.images.size(); ++i) {
+        const auto& x = a.images[i];
+        const auto& y = b.images[i];
+        if (x.sharp_idx != y.sharp_idx || x.is_depth != y.is_depth || x.is_atomic != y.is_atomic ||
+            x.is_array != y.is_array || x.is_r128 != y.is_r128 ||
+            x.mip_fallback_mode != y.mip_fallback_mode ||
+            x.constant_mip_index != y.constant_mip_index) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < a.samplers.size(); ++i) {
+        const auto& x = a.samplers[i];
+        const auto& y = b.samplers[i];
+        if (x.sharp_idx != y.sharp_idx || x.is_inline_sampler != y.is_inline_sampler ||
+            x.associated_image != y.associated_image || x.disable_aniso != y.disable_aniso ||
+            x.inline_sampler.raw0 != y.inline_sampler.raw0 ||
+            x.inline_sampler.raw1 != y.inline_sampler.raw1) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < a.fmasks.size(); ++i) {
+        if (a.fmasks[i].sharp_idx != b.fmasks[i].sharp_idx) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::vector<u32> PipelineCache::RebuildStageSpv(
     const Shader::Info& cached, const std::optional<Shader::Gcn::FetchShaderData>& fetch,
-    const Shader::StageSpecialization& spec, bool* same_layout, const std::vector<u8>* vs_conv) {
+    const Shader::StageSpecialization& spec, bool* same_layout, const std::vector<u8>* vs_conv,
+    const std::pair<u32, u32>* expect_identity, bool* identity_mismatch,
+    Shader::Pools* thread_pools) {
     const auto& index = GameShaderIndex();
     const auto it = index.shaders.find(cached.pgm_hash);
     if (it == index.shaders.end()) {
+        return {};
+    }
+    // Seed stamp (study sec. 5 finding 3): the game file's crc32 + code length must be the ones
+    // the seed was verified with; another game version's shader under the same hash is skipped.
+    if (expect_identity && (it->second.crc32 != expect_identity->first ||
+                            it->second.code_length != expect_identity->second)) {
+        if (identity_mismatch) {
+            *identity_mismatch = true;
+        }
         return {};
     }
     const auto code = VideoCore::ReadShaderCode(index, it->second);
@@ -802,16 +867,36 @@ std::vector<u32> PipelineCache::RebuildStageSpv(
         }
         Shader::Gcn::g_synthetic_vs_sharps = &vs_sharps;
     }
+    // SHADPS4_CACHE_REBUILD_SIM_PROFILE=1 (with =2 VERIFY only): translate with an AMD-like
+    // profile (subgroup 64, the needs_* / image-lod flags flipped) to count how many stages would
+    // keep the cached binding layout on another GPU (study sec. 5 finding 2). Never with =1.
+    static const Shader::Profile sim_profile = [this] {
+        Shader::Profile p = profile;
+        p.subgroup_size = 64;
+        p.needs_clip_distance_emulation = !p.needs_clip_distance_emulation;
+        p.needs_buffer_offsets = !p.needs_buffer_offsets;
+        p.needs_manual_interpolation = !p.needs_manual_interpolation;
+        p.needs_lds_barriers = !p.needs_lds_barriers;
+        p.supports_image_load_store_lod = !p.supports_image_load_store_lod;
+        return p;
+    }();
+    static const bool sim = [] {
+        const char* value = std::getenv("SHADPS4_CACHE_REBUILD_SIM_PROFILE");
+        return value && value[0] == '1';
+    }();
+    const Shader::Profile& use_profile = sim && expect_identity == nullptr ? sim_profile : profile;
+    Shader::Pools& use_pools = thread_pools ? *thread_pools : pools;
     Shader::g_synthetic_flat = &cached.flattened_ud_buf;
     Shader::Gcn::g_synthetic_fetch = fetch ? &*fetch : nullptr;
-    const auto program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
-    auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, program, binding);
+    const auto program = Shader::TranslateProgram(code, use_pools, info, runtime_info, use_profile);
+    auto spv = Shader::Backend::SPIRV::EmitSPIRV(use_profile, runtime_info, program, binding);
     Shader::g_synthetic_flat = nullptr;
     Shader::Gcn::g_synthetic_fetch = nullptr;
     Shader::Gcn::g_synthetic_vs_sharps = nullptr;
     if (same_layout) {
-        // The pipeline binds through the cached Info: the new translation must agree with it.
-        *same_layout = SameBindingLayout(info, cached);
+        // The pipeline binds through the cached Info: the new translation must agree with it,
+        // field by field (SameResourceFields), not only in counts and kinds.
+        *same_layout = SameResourceFields(info, cached);
     }
     return spv;
 }

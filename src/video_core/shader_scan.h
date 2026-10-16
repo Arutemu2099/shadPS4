@@ -19,6 +19,7 @@ struct ShaderLocation {
     u64 offset{};      ///< file offset of the first code dword (the 0xBEEB03FF token)
     u32 code_length{}; ///< bytes (BinaryInfo::length)
     u32 type{};        ///< BinaryInfo::type: 0 pixel, 1 vertex, 4 compute
+    u32 crc32{};       ///< BinaryInfo::crc32 (a seed stamp checks it, with code_length)
 };
 
 struct ShaderIndex {

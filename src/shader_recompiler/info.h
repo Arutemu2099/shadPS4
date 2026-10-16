@@ -85,8 +85,9 @@ struct InfoPersistent {
 
 /// SHADPS4_PRECOMPILE (video_core/renderer_vulkan/vk_pipeline_precompile.cpp): while set,
 /// RefreshFlatBuf takes the flattened user data from this image instead of walking the guest
-/// pointers in user data. Set only by WarmUp on the main thread, before the game runs.
-inline const std::vector<u32>* g_synthetic_flat = nullptr;
+/// pointers in user data. Set only by WarmUp, before the game runs; thread_local (study sec. 5
+/// finding 6) so a rebuild on a boot thread never leaks into another thread's translation.
+inline thread_local const std::vector<u32>* g_synthetic_flat = nullptr;
 
 /// q9b: SHADPS4_ASC_NODMA=1 (see Info::nodma_pinned).
 inline bool NoDmaMode() {

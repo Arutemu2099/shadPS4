@@ -183,8 +183,10 @@ public:
     // SHADPS4_CACHE_REBUILD (2026-10-16, vk_pipeline_precompile.cpp): a cached stage's SPIR-V made
     // again from the game's own code (VideoCore::BuildShaderIndex) and its cached meta (user data,
     // flattened sharps, fetch data, runtime info, start bindings). Empty if the code is not found.
-    // Main thread, WarmUp only (synthetic flat / fetch globals). `same_layout`: the new
-    // translation's binding layout equals the cached Info's (SameBindingLayout).
+    // WarmUp only; the synthetic flat / fetch inputs are thread_local, so boot threads may run it
+    // with their own `thread_pools`. `same_layout`: the new translation binds exactly as the
+    // cached Info (SameResourceFields). `expect_identity`: the seed stamp's (crc32, code length)
+    // for this hash; a different game file sets `identity_mismatch` and returns empty.
     // `vs_conv`: per fetch attribute a number-conversion code (0 = the spec's number class, 1
     // Uscaled, 2 Sscaled, 3 SnormNz 8-bit, 4 SnormNz 16-bit, 5 Unorm 32-bit): the cached spec
     // keeps only the class, the conversion comes from the vs-formats table (ANNOTATE).
@@ -192,7 +194,10 @@ public:
                                      const std::optional<Shader::Gcn::FetchShaderData>& fetch,
                                      const Shader::StageSpecialization& spec,
                                      bool* same_layout = nullptr,
-                                     const std::vector<u8>* vs_conv = nullptr);
+                                     const std::vector<u8>* vs_conv = nullptr,
+                                     const std::pair<u32, u32>* expect_identity = nullptr,
+                                     bool* identity_mismatch = nullptr,
+                                     Shader::Pools* thread_pools = nullptr);
     // SHADPS4_CACHE_REBUILD ANNOTATE (bit 8, with VERIFY): the conversion codes that make a cached
     // vertex shader's rebuild word-equal, or empty. vs_formats: (hash, perm) -> codes, read from /
     // written to the cache folder's vs-formats.bin.
@@ -205,8 +210,34 @@ public:
     struct RebuildStats {
         u32 equal[8]{}, differ[8]{}, no_code[8]{}, rebuilt[8]{}, reused[8]{}, layout_mismatch[8]{};
         u32 annotated[8]{}, annotate_failed[8]{};
+        u32 not_stamped[8]{}, identity_mismatch[8]{}, kind_refused[8]{}, prebuilt[8]{};
+        u32 bad_spv{};
     };
     RebuildStats rebuild_stats{};
+    // SHADPS4_CACHE_REBUILD seed stamp (seed-stamp.bin, written by a =2 VERIFY run; study sec. 5
+    // findings 1-4): =1 rebuilds only for the game serial / version and emulator build the seed was
+    // verified with; graphics only on the same GPU profile + dynamic vertex input, else compute
+    // only; per shader only when the game file's crc32 + length match the stamp.
+    struct SeedStamp {
+        bool compute{};
+        bool graphics{};
+        std::unordered_map<u64, std::pair<u32, u32>> shaders; // hash -> (crc32, code length)
+    };
+    SeedStamp seed_stamp{};
+    void ReadSeedStamp();
+    void WriteSeedStamp() const;
+    // SHADPS4_CACHE_REBUILD_THREADS: every meta in the folder without a .spv whose rebuild the
+    // stamp allows, translated on `num_threads` (own Pools each) into prebuilt_spv.
+    void PrebuildMissingStages(u32 num_threads);
+    std::unordered_set<u64> stamp_hashes; // =2: hashes rebuilt word-equal, the stamp's content
+    // SHADPS4_CACHE_REBUILD_THREADS=N: stages translated on N boot threads before the serial
+    // preload, by spv file name ("{hash:#018x}_{perm}"); LoadPipelineStage takes them from here.
+    std::unordered_map<std::string, std::pair<std::vector<u32>, bool>> prebuilt_spv;
+    // WarmUp time split (SHADPS4_CACHE_REBUILD set): ns spent in each part on the main thread.
+    struct WarmUpTimes {
+        u64 meta_load{}, spv_load{}, rebuild{}, compile_spv{}, compute_ctor{}, prepass{};
+    };
+    WarmUpTimes warmup_times{};
     // SHADPS4_PRECOMPILE, Fable finding 1: a precompiled program whose first live dispatch matched
     // none of its guessed permutations leaves program_cache with its compute pipelines; both are
     // parked (a pool compile of such a pipeline may still be running), never destroyed early.

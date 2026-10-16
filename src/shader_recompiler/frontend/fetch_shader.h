@@ -17,8 +17,9 @@ namespace Shader::Gcn {
 /// SHADPS4_CACHE_REBUILD (2026-10-16): V#s standing in for the guest vertex-buffer table while a
 /// vertex shader is re-translated at WarmUp (the table is not in memory yet), keyed by
 /// (sgpr_base << 8) | dword_offset; made from the cached VS attribute specialization (number
-/// class, swizzle). Main thread only.
-inline const std::vector<std::pair<u32, AmdGpu::Buffer>>* g_synthetic_vs_sharps = nullptr;
+/// class, swizzle). Per thread (thread_local), set around one translation.
+inline thread_local const std::vector<std::pair<u32, AmdGpu::Buffer>>* g_synthetic_vs_sharps =
+    nullptr;
 
 struct VertexAttribute {
     enum InstanceIdType : u8 {
@@ -92,8 +93,8 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base);
 
 /// SHADPS4_CACHE_REBUILD (2026-10-16): while set, ParseFetchShader returns this instead of
 /// decoding guest memory - a vertex shader re-translated at WarmUp from the game's files has no
-/// fetch subroutine in memory yet; its cached FetchShaderData stands in (main thread only).
-inline const FetchShaderData* g_synthetic_fetch = nullptr;
+/// fetch subroutine in memory yet; its cached FetchShaderData stands in (per thread).
+inline thread_local const FetchShaderData* g_synthetic_fetch = nullptr;
 
 std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info);
 

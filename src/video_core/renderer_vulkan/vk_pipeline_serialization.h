@@ -43,5 +43,12 @@ bool SameBindingLayout(const Shader::Info& a, const Shader::Info& b);
 // Boot passes on the main thread (vk_pipeline_precompile.cpp): window title progress + event pump
 // at most every 250 ms; total == ~0ull puts the title back.
 void ShowBootProgress(std::string_view what, u64 done, u64 total);
+// SHADPS4_CACHE_REBUILD seed stamp (vk_pipeline_precompile.cpp): the game file's OrbShdr crc32 and
+// code length of a shader, from the game folder's shader index (built on first use, main thread).
+bool GameShaderIdentity(u64 pgm_hash, u32* crc32, u32* code_length);
+// SHADPS4_CACHE_REBUILD: SameBindingLayout plus every field of each buffer / image / sampler /
+// fmask resource and the flattened user-data size (study sec. 5 finding 2: the rebuilt
+// translation must bind exactly as the cached Info it is bound through).
+bool SameResourceFields(const Shader::Info& a, const Shader::Info& b);
 
 } // namespace Vulkan

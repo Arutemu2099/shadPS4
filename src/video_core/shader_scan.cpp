@@ -31,7 +31,7 @@ constexpr size_t RecordSize = 32;
 constexpr size_t SearchBack = 0x10000 * 4; // as tools/shaders.py (the emulator scans 0x4000 dwords)
 constexpr size_t ChunkSize = 32ull << 20;
 constexpr u32 IndexMagic = 0x58494853; // "SHIX"
-constexpr u32 IndexVersion = 1;
+constexpr u32 IndexVersion = 2; // 2: ShaderLocation::crc32
 
 struct Fingerprint {
     u64 files{};
@@ -116,6 +116,7 @@ void ScanFile(const FileEntry& file, u32 file_idx, std::unordered_map<u64, Shade
                 const u32 length = bits >> 8;
                 u64 hash;
                 std::memcpy(&hash, record + 16, sizeof(hash));
+                const u32 crc32 = Load32(record + 24);
                 // The nearest token before the record whose literal points exactly at it.
                 const size_t low = pos > SearchBack ? pos - SearchBack : 0;
                 size_t code = SIZE_MAX;
@@ -132,7 +133,8 @@ void ScanFile(const FileEntry& file, u32 file_idx, std::unordered_map<u64, Shade
                 if (code == SIZE_MAX || length == 0 || length > pos - code || (length & 3) != 0) {
                     ++no_code;
                 } else if (!out.contains(hash)) {
-                    out.emplace(hash, ShaderLocation{file_idx, buf_base + code, length, type});
+                    out.emplace(hash,
+                                ShaderLocation{file_idx, buf_base + code, length, type, crc32});
                 }
                 ++pos;
             }
