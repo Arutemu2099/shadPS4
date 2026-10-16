@@ -537,7 +537,9 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         // A stage the pre-pass made is taken from `prebuilt` below, not read back from the file
         // the pre-pass saved meanwhile (s1325: 7,630 modules made twice that way).
         if (prebuilt.contains(spv_name)) {
-        } else if (spv_path.empty() || std::filesystem::exists(spv_path, ec)) {
+        } else if (spv_path.empty() ||
+                   Storage::DataBase::Instance().Prefetched(spv_name + ".spv") != nullptr ||
+                   std::filesystem::exists(spv_path, ec)) {
             Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary, spv_name, spv);
         }
         warmup_times.spv_load += NsSince(t_spv);
@@ -1077,10 +1079,14 @@ void PipelineCache::PrebuildMissingStages(u32 num_threads) {
         }
     } // joins
     drain(); // results pushed after the last check
+    const auto t_compact = WarmClock::now();
+    const size_t largest_free = VideoCore::CompactProcessHeap();
     LOG_INFO(Render,
              "CacheRebuild: pre-pass on {} threads: {} metas, {} stages translated and saved, {} "
-             "refused for their layout, {} failed (left to the serial preload)",
-             num_threads, metas.size(), made, refused_layout, failed.load());
+             "refused for their layout, {} failed (left to the serial preload); heap compacted in "
+             "{} ms (largest free block {} KiB)",
+             num_threads, metas.size(), made, refused_layout, failed.load(),
+             NsSince(t_compact) / 1000000, largest_free >> 10);
 }
 
 void PipelineCache::WarmUp() {

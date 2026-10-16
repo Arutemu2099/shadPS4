@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstdlib>
+#include <cstring>
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/polyfill_thread.h"
@@ -266,6 +267,14 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u32>& da
     if (!opened) {
         return;
     }
+    if (!g_prefetched.empty()) {
+        if (const auto it = g_prefetched.find(BlobFileName(name, GetBlobFileExtension(type)));
+            it != g_prefetched.end()) {
+            data.resize(it->second.size() / sizeof(u32));
+            std::memcpy(data.data(), it->second.data(), data.size() * sizeof(u32));
+            return;
+        }
+    }
 
     auto path = EmulatorSettings.IsPipelineCacheArchived() ? std::filesystem::path{name}
                                                            : cache_path / name;
@@ -321,7 +330,8 @@ void DataBase::Prefetch() {
         EmulatorSettings.IsPipelineCacheArchived()) {
         return;
     }
-    const bool keep = env[0] == '2';
+    const bool keep = env[0] == '2' || env[0] == '3';
+    const bool keep_spv = env[0] == '3';
     const auto t_start = std::chrono::steady_clock::now();
     std::vector<std::filesystem::path> files;
     std::error_code ec;
@@ -339,7 +349,7 @@ void DataBase::Prefetch() {
     if (keep) {
         for (size_t i = 0; i < files.size(); ++i) {
             const auto ext = files[i].extension();
-            keep_file[i] = ext == ".key" || ext == ".meta";
+            keep_file[i] = ext == ".key" || ext == ".meta" || (keep_spv && ext == ".spv");
         }
     }
     {
@@ -381,8 +391,8 @@ void DataBase::Prefetch() {
                 g_prefetched.emplace(files[i].filename().string(), std::move(kept[i]));
             }
         }
-        LOG_INFO(Render, "Pipeline cache prefetch: {} key / meta files kept in memory",
-                 g_prefetched.size());
+        LOG_INFO(Render, "Pipeline cache prefetch: {} files kept in memory ({})", g_prefetched.size(),
+                 keep_spv ? "keys, metas, SPIR-V" : "keys, metas");
     }
     LOG_INFO(Render, "Pipeline cache prefetch: {} files, {} MB read on {} threads in {} ms",
              files.size(), bytes.load() >> 20, NumThreads,

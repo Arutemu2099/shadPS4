@@ -36,6 +36,12 @@ struct ShaderIndex {
 ShaderIndex BuildShaderIndex(const std::filesystem::path& game_folder,
                              const std::filesystem::path& index_file);
 
+/// HeapCompact of the process heap (Windows; no-op elsewhere): coalesces the free blocks a burst of
+/// boot threads left behind (2026-10-16: after the 16-thread rebuild pre-pass, freeing the A2
+/// recorder's SubBatch vectors took 60% of VkRecorder's time and the rooftop ran at 31-45 FPS).
+/// Returns the largest free block in bytes (0 on failure or elsewhere).
+size_t CompactProcessHeap();
+
 /// xxh3 of the running emulator EXE file (0 if unreadable): with the scm description, the seed
 /// stamp's build id (uncommitted builds share one description).
 u64 ExecutableHash();

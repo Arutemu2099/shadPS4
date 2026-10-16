@@ -320,6 +320,14 @@ ShaderIndex BuildShaderIndex(const std::filesystem::path& game_folder,
     return index;
 }
 
+size_t CompactProcessHeap() {
+#ifdef _WIN32
+    return HeapCompact(GetProcessHeap(), 0);
+#else
+    return 0;
+#endif
+}
+
 u64 ExecutableHash() {
     std::filesystem::path exe;
 #ifdef _WIN32

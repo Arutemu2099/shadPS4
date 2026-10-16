@@ -35,7 +35,8 @@ public:
     void FinishPreload();
     // SHADPS4_CACHE_PREFETCH=1: read every cache file once on several threads (folder mode).
     // =2 also keeps every .key and .meta file's bytes until FinishPreload, so WarmUp's loads open
-    // no file (2026-10-16: s1322 spent 104.5 s opening the seed's metas one by one).
+    // no file (2026-10-16: s1322 spent 104.5 s opening the seed's metas one by one); =3 keeps the
+    // .spv files too (s1330: 95 s opening 22 k SPIR-V files; ~0.8 GB held until FinishPreload).
     void Prefetch();
     // =2: the kept bytes of a cache file ("<name>.<ext>"), or null. Read-only between Prefetch
     // and FinishPreload, so boot threads may call it concurrently.
