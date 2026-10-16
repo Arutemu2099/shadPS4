@@ -827,22 +827,38 @@ std::vector<u32> PipelineCache::RebuildStageSpv(
         for (size_t i = 0; i < fetch->attributes.size(); ++i) {
             const auto& attrib = fetch->attributes[i];
             const auto& vs = spec.vs_attribs[i];
+            // vs-formats.bin v3 (scratch/vs-formats-from-spv-20261016.py, read from the cached SPIR-V):
+            // per attribute SEMANTIC the conversion code, the number class and the swizzle the cached
+            // module used; 0xFF = take the spec's. A permutation first compiled while an attribute's V#
+            // was empty keeps only defaults in its spec (s1341: 45 vs permutations, an attribute read
+            // as float 0000 instead of uint X000).
+            const u8* rec = vs_conv && (size_t{attrib.semantic} + 1) * 6 <= vs_conv->size()
+                                ? vs_conv->data() + size_t{attrib.semantic} * 6
+                                : nullptr;
+            const AmdGpu::NumberClass num_class =
+                rec && rec[1] <= 2 ? static_cast<AmdGpu::NumberClass>(rec[1]) : vs.num_class;
+            AmdGpu::CompMapping dst_select = vs.dst_select;
+            if (rec && rec[2] != 0xFF && rec[3] != 0xFF && rec[4] != 0xFF && rec[5] != 0xFF) {
+                dst_select.r = static_cast<AmdGpu::CompSwizzle>(rec[2]);
+                dst_select.g = static_cast<AmdGpu::CompSwizzle>(rec[3]);
+                dst_select.b = static_cast<AmdGpu::CompSwizzle>(rec[4]);
+                dst_select.a = static_cast<AmdGpu::CompSwizzle>(rec[5]);
+            }
             AmdGpu::Buffer sharp{};
             sharp.base_address = 0x10000;
             sharp.stride = 16;
             sharp.num_records = 1;
             sharp.data_format = static_cast<u32>(AmdGpu::DataFormat::Format32_32_32_32);
             sharp.num_format = static_cast<u32>(
-                vs.num_class == AmdGpu::NumberClass::Sint   ? AmdGpu::NumberFormat::Sint
-                : vs.num_class == AmdGpu::NumberClass::Uint ? AmdGpu::NumberFormat::Uint
-                                                            : AmdGpu::NumberFormat::Float);
+                num_class == AmdGpu::NumberClass::Sint   ? AmdGpu::NumberFormat::Sint
+                : num_class == AmdGpu::NumberClass::Uint ? AmdGpu::NumberFormat::Uint
+                                                         : AmdGpu::NumberFormat::Float);
             // The conversion (GetNumberConversion) of an attribute: the spec does not keep it
             // (s1300: a SnormNz 16-bit position rebuilt as plain, 108 words less). vs-formats.bin
             // (scratch/vs-formats-from-spv-20261016.py, read from the cached SPIR-V) gives a code per
             // attribute SEMANTIC; the raw formats are set as the real V# had them, so GetNumberFmt
             // remaps them exactly as it did (SnormNz reads as the integer class).
-            const u8 conv =
-                vs_conv && attrib.semantic < vs_conv->size() ? (*vs_conv)[attrib.semantic] : 0;
+            const u8 conv = rec ? rec[0] : 0;
             if (conv != 0) {
                 using AmdGpu::DataFormat;
                 using AmdGpu::NumberFormat;
@@ -859,10 +875,10 @@ std::vector<u32> PipelineCache::RebuildStageSpv(
                     sharp.data_format = static_cast<u32>(ConvFormats[conv].second);
                 }
             }
-            sharp.dst_sel_x = static_cast<u32>(vs.dst_select.r);
-            sharp.dst_sel_y = static_cast<u32>(vs.dst_select.g);
-            sharp.dst_sel_z = static_cast<u32>(vs.dst_select.b);
-            sharp.dst_sel_w = static_cast<u32>(vs.dst_select.a);
+            sharp.dst_sel_x = static_cast<u32>(dst_select.r);
+            sharp.dst_sel_y = static_cast<u32>(dst_select.g);
+            sharp.dst_sel_z = static_cast<u32>(dst_select.b);
+            sharp.dst_sel_w = static_cast<u32>(dst_select.a);
             vs_sharps.emplace_back((u32{attrib.sgpr_base} << 8) | attrib.dword_offset, sharp);
         }
         Shader::Gcn::g_synthetic_vs_sharps = &vs_sharps;

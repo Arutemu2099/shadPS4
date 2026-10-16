@@ -363,7 +363,9 @@ u64 VsFormatKey(u64 pgm_hash, size_t perm_idx) {
 }
 
 constexpr u32 VsFormatsMagic = 0x4d465356; // "VSFM"
-constexpr u32 VsFormatsVersion = 2; // codes per attribute semantic
+// 3: per attribute semantic 6 bytes - conversion code, number class, swizzle x y z w (0xFF = use the spec)
+constexpr u32 VsFormatsVersion = 3;
+constexpr u32 VsFormatsRecord = 6;
 
 /// seed-stamp.bin (2026-10-16, study sec. 5 findings 1-4): written by a =2 VERIFY run, shipped with
 /// a seed: game serial + APP_VER, emulator build (scm description), the Shader::Profile and dynamic
@@ -1188,8 +1190,8 @@ void PipelineCache::WarmUp() {
                 u8 n{};
                 in.read(reinterpret_cast<char*>(&key), 8);
                 in.read(reinterpret_cast<char*>(&n), 1);
-                std::vector<u8> codes(n);
-                in.read(reinterpret_cast<char*>(codes.data()), n);
+                std::vector<u8> codes(size_t{n} * VsFormatsRecord);
+                in.read(reinterpret_cast<char*>(codes.data()), codes.size());
                 if (in) {
                     vs_formats[key] = std::move(codes);
                 }
@@ -1354,10 +1356,10 @@ void PipelineCache::WarmUp() {
             out.write(reinterpret_cast<const char*>(&VsFormatsVersion), 4);
             out.write(reinterpret_cast<const char*>(&count), 4);
             for (const auto& [key, codes] : vs_formats) {
-                const u8 n = static_cast<u8>(std::min<size_t>(codes.size(), 255));
+                const u8 n = static_cast<u8>(std::min<size_t>(codes.size() / VsFormatsRecord, 255));
                 out.write(reinterpret_cast<const char*>(&key), 8);
                 out.write(reinterpret_cast<const char*>(&n), 1);
-                out.write(reinterpret_cast<const char*>(codes.data()), n);
+                out.write(reinterpret_cast<const char*>(codes.data()), size_t{n} * VsFormatsRecord);
             }
             LOG_INFO(Render, "CacheRebuild: vs-formats.bin written, {} entries", count);
         }
