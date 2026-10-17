@@ -757,8 +757,7 @@ bool Instance::CreateDevice() {
         // anti-aliasing - never a failed start. Measured 10-17 (driver 617.14): VK_NVX_binary_import
         // made vkCreateDevice fail here.
         LOG_INFO(Render_Vulkan, "DLSS: creating the device with {} extensions", enabled_extensions.size());
-        std::fprintf(stderr, "DLSS-MARK probe start (%u extensions)
-",
+        std::fprintf(stderr, "DLSS-MARK probe start (%u extensions)\n",
                      static_cast<unsigned>(enabled_extensions.size()));
         std::fflush(stderr);
         VkDevice probe = VK_NULL_HANDLE;
@@ -766,8 +765,7 @@ bool Instance::CreateDevice() {
             static_cast<VkPhysicalDevice>(physical_device),
             reinterpret_cast<const VkDeviceCreateInfo*>(&device_chain.get<vk::DeviceCreateInfo>()),
             nullptr, &probe);
-        std::fprintf(stderr, "DLSS-MARK probe vkCreateDevice -> %d
-", static_cast<int>(probe_result));
+        std::fprintf(stderr, "DLSS-MARK probe vkCreateDevice -> %d\n", static_cast<int>(probe_result));
         std::fflush(stderr);
         LOG_INFO(Render_Vulkan, "DLSS: device probe {}", vk::to_string(vk::Result(probe_result)));
         if (probe_result == VK_SUCCESS) {
