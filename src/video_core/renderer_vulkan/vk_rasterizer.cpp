@@ -1646,19 +1646,25 @@ void Rasterizer::ExecuteFilteredDraw(DrawClass draw_class) {
 }
 
 void Rasterizer::DlssResolve() {
-    // Step 1 (plumbing, vk_dlss.h): the un-anti-aliased tonemap output goes into the resolve's
-    // target (the game without its temporal AA). Both are 1920x1080 RGBA8 (study sec. 1.2).
+    // SHADPS4_DLSS (vk_dlss.h): the game's T2x resolve replaced. =1: DLAA from the tonemap output
+    // 0x2f9e10000 + motion vectors + depth into the resolve's target; =2 or any failure this frame:
+    // a plain copy of the tonemap output (the game without its temporal AA for that frame).
     ++dlss_calls;
     ++dlss_phases[dlss_phase_in & 3];
     const auto& regs = liverpool->BackRegs();
     VideoCore::TextureCache::ImageDesc out_desc{regs.color_buffers[0], liverpool->BackCbExtent(0)};
     auto& out = texture_cache.GetImage(texture_cache.FindImage(out_desc, true));
-    const VideoCore::ImageId in_id = texture_cache.FindImageFromRange(
-        Dlss::ColorInAddr, size_t{1920} * 1080 * 4, true);
-    VideoCore::Image* in = in_id ? &texture_cache.GetImage(in_id) : nullptr;
-    if (!in || in->info.size.width != out.info.size.width ||
-        in->info.size.height != out.info.size.height ||
-        in->info.pixel_format != out.info.pixel_format) [[unlikely]] {
+    const auto find = [&](VAddr address) -> VideoCore::Image* {
+        const VideoCore::ImageId id =
+            texture_cache.FindImageFromRange(address, size_t{1920} * 1080 * 4, true);
+        VideoCore::Image* image = id ? &texture_cache.GetImage(id) : nullptr;
+        return image && image->info.size.width == out.info.size.width &&
+                       image->info.size.height == out.info.size.height
+                   ? image
+                   : nullptr;
+    };
+    VideoCore::Image* in = find(Dlss::ColorInAddr);
+    if (!in || in->info.pixel_format != out.info.pixel_format) [[unlikely]] {
         if (++dlss_missing <= 8) {
             LOG_WARNING(Render_Vulkan, "DLSS: no matching input at {:#x} for output {:#x} ({}x{}); "
                                        "the resolve's target keeps last frame's picture",
@@ -1668,15 +1674,80 @@ void Rasterizer::DlssResolve() {
         return;
     }
     scheduler.EndRendering();
-    out.CopyImage(*in);
+    bool evaluated = false;
+    if (Dlss::Mode() == 1) {
+        VideoCore::Image* motion = find(Dlss::MotionAddr);
+        VideoCore::Image* depth = find(Dlss::DepthAddr);
+        if (motion && depth) [[likely]] {
+            in->Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {});
+            motion->Transit(vk::ImageLayout::eShaderReadOnlyOptimal,
+                            vk::AccessFlagBits2::eShaderRead, {});
+            depth->Transit(vk::ImageLayout::eDepthStencilReadOnlyOptimal,
+                           vk::AccessFlagBits2::eShaderRead, {});
+            out.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite, {});
+            const auto eval_image = [](VideoCore::Image& image, vk::ImageLayout layout,
+                                       bool storage, bool is_depth) {
+                VideoCore::ImageViewInfo view_info{};
+                view_info.type = AmdGpu::ImageType::Color2D;
+                view_info.format = image.info.pixel_format;
+                view_info.is_storage = storage;
+                const auto& view = image.FindView(view_info);
+                return Dlss::EvalImage{
+                    .image = image.GetImage(),
+                    .view = *view.image_view,
+                    .format = image.info.pixel_format,
+                    .layout = Vulkan::GuestLayout(layout),
+                    .usage = image.usage_flags,
+                    .width = image.info.size.width,
+                    .height = image.info.size.height,
+                    .depth = is_depth,
+                };
+            };
+            // The game's two jitter phases are +-0.25 px diagonally (study sec. 1.4); which sign
+            // goes with which phase is calibrated live (Page Up cycles the four combinations).
+            float jx = 0.0f, jy = 0.0f;
+            if (dlss_phase_in == 1 || dlss_phase_in == 2) {
+                const float j = dlss_phase_in == 1 ? 0.25f : -0.25f;
+                const u32 combo = Dlss::g_jitter_combo.load(std::memory_order_relaxed);
+                jx = (combo & 1) ? -j : j;
+                jy = (combo & 2) ? -j : j;
+                const bool combo_changed = combo != dlss_last_combo;
+                dlss_last_combo = combo;
+                dlss_reset_pending |= combo_changed;
+            }
+            const auto cmdbuf = scheduler.AcquireCommandBuffer().Handle();
+            evaluated = Dlss::Evaluate(
+                cmdbuf, dlss_calls,
+                eval_image(*in, vk::ImageLayout::eShaderReadOnlyOptimal, false, false),
+                eval_image(*motion, vk::ImageLayout::eShaderReadOnlyOptimal, false, false),
+                eval_image(*depth, vk::ImageLayout::eDepthStencilReadOnlyOptimal, false, true),
+                eval_image(out, vk::ImageLayout::eGeneral, true, false), jx, jy,
+                dlss_reset_pending);
+            dlss_reset_pending = false;
+            // Streamline / NGX bind their own compute state into this command buffer (checklist
+            // sec. 4): nothing the next draw relies on may be assumed still bound.
+            scheduler.GetDynamicState().Invalidate();
+            GraphicsBindTracker::Invalidate();
+        } else if (++dlss_missing <= 8) {
+            LOG_WARNING(Render_Vulkan, "DLSS: motion vectors {:#x} {} / depth {:#x} {} - copy this frame",
+                        Dlss::MotionAddr, motion ? "found" : "missing", Dlss::DepthAddr,
+                        depth ? "found" : "missing");
+        }
+    }
+    if (evaluated) {
+        ++dlss_evaluated;
+    } else {
+        out.CopyImage(*in);
+    }
     out.flags |= VideoCore::ImageFlagBits::GpuModified;
     out.flags &= ~VideoCore::ImageFlagBits::Dirty;
     if ((dlss_calls & 1023) == 1) {
         LOG_INFO(Render_Vulkan,
-                 "DLSS: resolve actions {} (no input {}), output {:#x}; jitter phase 1 {} / 2 {} "
-                 "/ T2x off {} / unknown {}",
-                 dlss_calls, dlss_missing, regs.color_buffers[0].Address(), dlss_phases[1],
-                 dlss_phases[2], dlss_phases[3], dlss_phases[0]);
+                 "DLSS: resolve actions {} (evaluated {}, no input {}), output {:#x}; jitter phase "
+                 "1 {} / 2 {} / T2x off {} / unknown {}, signs {}",
+                 dlss_calls, dlss_evaluated, dlss_missing, regs.color_buffers[0].Address(),
+                 dlss_phases[1], dlss_phases[2], dlss_phases[3], dlss_phases[0],
+                 Dlss::g_jitter_combo.load(std::memory_order_relaxed));
     }
 }
 

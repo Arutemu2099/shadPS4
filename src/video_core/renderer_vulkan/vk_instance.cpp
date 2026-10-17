@@ -15,6 +15,7 @@
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
@@ -177,6 +178,11 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
 }
 
 Instance::~Instance() {
+    if (Dlss::Mode() == 1 && device) {
+        // Streamline goes before the device (its rule); the GPU must be done with its work.
+        (void)device->waitIdle();
+        Dlss::Shutdown();
+    }
     ImGui::Core::Shutdown(GetDevice());
     vmaDestroyAllocator(allocator);
 }
@@ -228,7 +234,7 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 32> enabled_extensions;
+    boost::container::static_vector<const char*, 48> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -368,6 +374,24 @@ bool Instance::CreateDevice() {
     }
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
+
+    // SHADPS4_DLSS=1 (vk_dlss.h): the device extensions Streamline asked for, when DLSS runs on
+    // this GPU. VK_EXT_buffer_device_address is left out: the core bufferDeviceAddress feature
+    // (enabled below) must not be combined with that name.
+    bool dlss_device = Dlss::DeviceSupported(physical_device);
+    if (dlss_device) {
+        for (const char* ext : Dlss::DeviceExtensions()) {
+            const bool present = std::ranges::any_of(
+                enabled_extensions, [ext](const char* e) { return std::strcmp(e, ext) == 0; });
+            if (present || std::strcmp(ext, "VK_EXT_buffer_device_address") == 0) {
+                continue;
+            }
+            if (!add_extension(ext)) {
+                dlss_device = false;
+            }
+        }
+        LOG_INFO(Render_Vulkan, "DLSS: device extensions {}", dlss_device ? "enabled" : "missing");
+    }
 
     // Opt-in descriptor heap experiment. Nothing below is touched unless
     // SHADPS4_NATIVE_BINDINGS=1 and the device passes every capability check.
@@ -535,7 +559,8 @@ bool Instance::CreateDevice() {
             .shaderSharedInt64Atomics = vk12_features.shaderSharedInt64Atomics,
             .shaderFloat16 = vk12_features.shaderFloat16,
             .shaderInt8 = vk12_features.shaderInt8,
-            .descriptorIndexing = bindless_supported,
+            .descriptorIndexing =
+                bindless_supported || (dlss_device && vk12_features.descriptorIndexing),
             .shaderSampledImageArrayNonUniformIndexing = bindless_supported,
             .descriptorBindingSampledImageUpdateAfterBind = bindless_supported,
             .descriptorBindingUpdateUnusedWhilePending = bindless_supported,
@@ -759,6 +784,9 @@ bool Instance::CreateDevice() {
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
+    if (dlss_device || Dlss::Mode() == 2) {
+        Dlss::DeviceCreated(*instance, physical_device, *device, queue_family_index, 0);
+    }
     if (has_readback_queue) {
         const u32 index = readback_queue_family == queue_family_index ? 1u : 0u;
         readback_queue = device->getQueue(readback_queue_family, index);

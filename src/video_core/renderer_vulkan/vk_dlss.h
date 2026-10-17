@@ -6,18 +6,23 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 #include "common/types.h"
 #include "shader_recompiler/info.h"
 #include "video_core/amdgpu/regs.h"
+#include "video_core/renderer_vulkan/vk_common.h"
 
-// SHADPS4_DLSS=1 (2026-10-17, LATER-PLAN 2; plan: notes/study-dlss-plan-2026-10-14.md, build D1).
+// SHADPS4_DLSS (2026-10-17, LATER-PLAN 2; plan: notes/study-dlss-plan-2026-10-14.md, build D1;
+// Streamline facts: notes/dlss-streamline-checklist-2026-10-17.md).
 // Second Son's SMAA T2x temporal resolve (fs_a6d23116) reads exactly DLSS's inputs and writes the
 // anti-aliased frame the HUD is drawn onto; that one draw per frame becomes a back-side action
 // (Rasterizer::DrawClass::DlssResolve), so the worker paths carry it like a resolve or a depth copy
 // and nothing is added per draw beyond one address compare in ClassifyDraw.
-// Step 1 (plumbing, this file's first version): the action copies the un-anti-aliased tonemap
-// output into the resolve's target - the game without temporal AA - to prove the class reaches
-// the back in order. The DLSS evaluate replaces that copy in step 2.
+//   =1: DLAA through NVIDIA Streamline. The player's own signed DLLs are loaded from dlss\ next to
+//       the EXE (sl.interposer, sl.common, sl.dlss, nvngx_dlss); only MIT headers are compiled in.
+//       Missing / unsigned DLLs, a GPU without DLSS or any failure: the draw stays the game's own.
+//   =2: diagnostic - the action copies the un-anti-aliased tonemap output (the game without T2x).
+// Live keys: Home = DLSS on / off (instant A/B with the game's AA), Page Up = jitter sign combination.
 namespace Vulkan::Dlss {
 
 constexpr u64 ResolvePsHash = 0xa6d23116; ///< T2x temporal resolve (writes 0x26bd70000)
@@ -26,13 +31,23 @@ constexpr VAddr ColorInAddr = 0x2f9e10000; ///< tonemap output, RGBA8 1920x1080,
 constexpr VAddr MotionAddr = 0x3059b0000;  ///< RG16F motion vectors (UV, current minus previous)
 constexpr VAddr DepthAddr = 0x26b200000;   ///< D32S8, reversed Z
 
-inline bool Enabled() {
-    static const bool on = [] {
+inline int Mode() {
+    static const int mode = [] {
         const char* v = std::getenv("SHADPS4_DLSS");
-        return v && v[0] == '1';
+        return v && (v[0] == '1' || v[0] == '2') ? v[0] - '0' : 0;
     }();
-    return on;
+    return mode;
 }
+inline bool Enabled() {
+    return Mode() != 0;
+}
+
+/// Streamline is up and the feature exists on this device (=1), or the diagnostic copy (=2).
+inline std::atomic<bool> g_ready{false};
+/// Home key: the player's on / off (the game's own T2x runs while off).
+inline std::atomic<bool> g_user_on{true};
+/// Page Up: jitter sign combination (bit 0 flips x, bit 1 flips y).
+inline std::atomic<u32> g_jitter_combo{0};
 
 /// Guest code address of fs_a6d23116 once a pipeline lookup has met it (0 = not yet / off).
 inline std::atomic<u64> g_resolve_ps{0};
@@ -44,10 +59,11 @@ inline void NoteProgram(bool fragment, u64 hash, VAddr base) {
     }
 }
 
-/// ClassifyDraw: is this draw's pixel shader the resolve?
+/// ClassifyDraw: is this draw's pixel shader the resolve, and is DLSS to replace it now?
 inline bool IsResolve(VAddr ps_address) {
     const u64 a = g_resolve_ps.load(std::memory_order_relaxed);
-    return a != 0 && a == ps_address;
+    return a != 0 && a == ps_address && g_ready.load(std::memory_order_relaxed) &&
+           g_user_on.load(std::memory_order_relaxed);
 }
 
 // The frame's jitter phase (study sec. 1.4): the game alternates two quarter-pixel offsets and
@@ -95,7 +111,45 @@ inline void NoteDraw(const AmdGpu::Regs& regs) {
     }
     float f;
     std::memcpy(&f, reinterpret_cast<const void*>(vsharp.base_address + 48), sizeof(f));
-    t_phase = (f > 0.5f && f < 1.5f) ? 1 : (f > 1.5f && f < 2.5f) ? 2 : (f > -0.5f && f < 0.5f) ? 3 : 0;
+    t_phase = (f > 0.5f && f < 1.5f)   ? 1
+              : (f > 1.5f && f < 2.5f) ? 2
+              : (f > -0.5f && f < 0.5f) ? 3
+                                        : 0;
 }
+
+// ---- Streamline (vk_dlss.cpp; Windows only, stubs elsewhere) ----
+
+/// vk_platform GetInstanceExtensions: loads + verifies the interposer, slInit, and appends the
+/// instance extensions DLSS needs. Before vkCreateInstance (Streamline's required order).
+void AddInstanceExtensions(std::vector<const char*>& extensions);
+/// vk_instance, device selection: slIsFeatureSupported for this GPU; false = DLSS stays off.
+bool DeviceSupported(vk::PhysicalDevice physical_device);
+/// The device extensions DLSS asked for (valid until Shutdown).
+const std::vector<const char*>& DeviceExtensions();
+/// vk_instance, after the device and its queues exist: slSetVulkanInfo, present proxy, DLSS
+/// functions; sets g_ready on success.
+void DeviceCreated(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Device device,
+                   u32 graphics_family, u32 graphics_index);
+/// vk_swapchain: the present to use (Streamline's proxy runs its per-frame bookkeeping and
+/// forwards); null = present as usual.
+PFN_vkQueuePresentKHR PresentFunction();
+/// Instance destruction (GPU idle): slShutdown before the device goes.
+void Shutdown();
+
+struct EvalImage {
+    vk::Image image;
+    vk::ImageView view;
+    vk::Format format;
+    vk::ImageLayout layout;
+    vk::ImageUsageFlags usage;
+    u32 width;
+    u32 height;
+    bool depth;
+};
+/// One DLAA evaluate into `cmdbuf` (outside rendering; the images already in `layout`, with
+/// their producer barriers). jitter in pixels. False = not run (the caller falls back).
+bool Evaluate(vk::CommandBuffer cmdbuf, u64 frame, const EvalImage& color, const EvalImage& motion,
+              const EvalImage& depth, const EvalImage& output, float jitter_x, float jitter_y,
+              bool reset);
 
 } // namespace Vulkan::Dlss

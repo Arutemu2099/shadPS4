@@ -25,6 +25,7 @@
 #include "core/emulator_settings.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/vk_dlss.h"
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -206,6 +207,9 @@ std::vector<const char*> GetInstanceExtensions(Frontend::WindowSystemType window
     if (enable_debug_utils) {
         extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     }
+
+    // SHADPS4_DLSS=1: Streamline starts here, before vkCreateInstance, and adds what it needs.
+    Dlss::AddInstanceExtensions(extensions);
 
     // Sanitize extension list
     std::erase_if(extensions, [&](const char* extension) -> bool {

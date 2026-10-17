@@ -13,6 +13,7 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 
 namespace Vulkan {
@@ -194,7 +195,16 @@ bool Swapchain::Present() {
         .pImageIndices = &image_index,
     };
 
-    auto result = instance.GetPresentQueue().presentKHR(present_info);
+    // SHADPS4_DLSS=1: through Streamline's proxy, which runs its per-frame bookkeeping and
+    // forwards (vk_dlss.h); otherwise as usual.
+    vk::Result result;
+    if (const auto dlss_present = Dlss::PresentFunction()) [[unlikely]] {
+        const VkPresentInfoKHR raw = present_info;
+        result = static_cast<vk::Result>(
+            dlss_present(static_cast<VkQueue>(instance.GetPresentQueue()), &raw));
+    } else {
+        result = instance.GetPresentQueue().presentKHR(present_info);
+    }
     if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR) {
         needs_recreation = true;
     } else {

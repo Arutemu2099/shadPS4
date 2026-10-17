@@ -29,6 +29,7 @@
 #include "input/input_mouse.h"
 #include "sdl_window.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/vk_dlss.h"
 
 #ifdef __APPLE__
 #include <SDL3/SDL_metal.h>
@@ -278,6 +279,26 @@ void WindowSDL::WaitEvent() {
             // SHADPS4_SYNTH_MOTION: R = rattle, Z = tilt (held).
             (event.key.key == SDLK_R ? Input::g_synth_rattle : Input::g_synth_tilt)
                 .store(event.type == SDL_EVENT_KEY_DOWN, std::memory_order_relaxed);
+        }
+        if (Vulkan::Dlss::Enabled() && event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
+            (event.key.key == SDLK_HOME || event.key.key == SDLK_PAGEUP)) {
+            // SHADPS4_DLSS (vk_dlss.h): Home = DLSS on / off, Page Up = jitter sign combination.
+            if (!Vulkan::Dlss::g_ready.load(std::memory_order_relaxed)) {
+                Overlay::ShowNotice("DLSS not available (see the log)");
+            } else if (event.key.key == SDLK_HOME) {
+                const bool on = !Vulkan::Dlss::g_user_on.load(std::memory_order_relaxed);
+                Vulkan::Dlss::g_user_on.store(on, std::memory_order_relaxed);
+                LOG_INFO(Render_Vulkan, "DLSS: {} (Home)", on ? "on" : "off - the game's own AA");
+                Overlay::ShowNotice(on ? "DLSS: ON (DLAA)" : "DLSS: OFF (game's own anti-aliasing)");
+            } else {
+                const u32 combo =
+                    (Vulkan::Dlss::g_jitter_combo.load(std::memory_order_relaxed) + 1) & 3;
+                Vulkan::Dlss::g_jitter_combo.store(combo, std::memory_order_relaxed);
+                LOG_INFO(Render_Vulkan, "DLSS: jitter signs {} (Page Up)", combo);
+                static const char* const names[] = {"DLSS jitter: A (+x +y)", "DLSS jitter: B (-x +y)",
+                                                    "DLSS jitter: C (+x -y)", "DLSS jitter: D (-x -y)"};
+                Overlay::ShowNotice(names[combo]);
+            }
         }
         if (Input::g_stick_smoothing_toggle && event.type == SDL_EVENT_KEY_DOWN &&
             event.key.key == SDLK_F1 && !event.key.repeat) {

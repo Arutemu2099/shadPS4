@@ -329,6 +329,9 @@ public:
     u64 dlss_missing{};
     u8 dlss_phase_in{};                   ///< the phase of the action being executed
     std::array<u64, 4> dlss_phases{};     ///< by phase: unknown / 1 / 2 / T2x off
+    u64 dlss_evaluated{};
+    u32 dlss_last_combo{};
+    bool dlss_reset_pending{true};
     struct NeoIdDerive;
     std::shared_ptr<NeoIdDerive> neo_id_derive;
     VAddr neo_depth_addr{};
