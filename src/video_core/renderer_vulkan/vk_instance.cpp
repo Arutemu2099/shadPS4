@@ -752,7 +752,36 @@ bool Instance::CreateDevice() {
     }
 
     if (dlss_device) {
+        // SHADPS4_DLSS: try the device once with Streamline's extensions (a raw call: no result
+        // assert). A driver that refuses them gets the device without them - the game's own
+        // anti-aliasing - never a failed start. Measured 10-17 (driver 617.14): VK_NVX_binary_import
+        // made vkCreateDevice fail here.
         LOG_INFO(Render_Vulkan, "DLSS: creating the device with {} extensions", enabled_extensions.size());
+        VkDevice probe = VK_NULL_HANDLE;
+        const VkResult probe_result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateDevice(
+            static_cast<VkPhysicalDevice>(physical_device),
+            reinterpret_cast<const VkDeviceCreateInfo*>(&device_chain.get<vk::DeviceCreateInfo>()),
+            nullptr, &probe);
+        LOG_INFO(Render_Vulkan, "DLSS: device probe {}", vk::to_string(vk::Result(probe_result)));
+        if (probe_result == VK_SUCCESS) {
+            VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyDevice(probe, nullptr);
+        } else {
+            for (const char* ext : Dlss::DeviceExtensions()) {
+                if (std::strcmp(ext, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME) == 0) {
+                    continue; // the emulator's own
+                }
+                enabled_extensions.erase(
+                    std::remove_if(enabled_extensions.begin(), enabled_extensions.end(),
+                                   [ext](const char* e) { return std::strcmp(e, ext) == 0; }),
+                    enabled_extensions.end());
+            }
+            auto& dci = device_chain.get<vk::DeviceCreateInfo>();
+            dci.enabledExtensionCount = static_cast<u32>(enabled_extensions.size());
+            dci.ppEnabledExtensionNames = enabled_extensions.data();
+            dlss_device = false;
+            LOG_WARNING(Render_Vulkan, "DLSS: the driver refused the device with the DLSS extensions "
+                                       "- DLSS off, the game's own anti-aliasing stays");
+        }
     }
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
     if (dlss_device) {
