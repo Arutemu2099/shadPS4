@@ -154,7 +154,9 @@ bool Startup() {
     static const sl::Feature features[] = {sl::kFeatureDLSS};
     sl::Preferences prefs{};
     prefs.showConsole = false;
-    prefs.logLevel = sl::LogLevel::eDefault;
+    // SHADPS4_DLSS_VERBOSE=1: Streamline's verbose log (start-up diagnosis).
+    const char* verbose = std::getenv("SHADPS4_DLSS_VERBOSE");
+    prefs.logLevel = verbose && verbose[0] == '1' ? sl::LogLevel::eVerbose : sl::LogLevel::eDefault;
     prefs.pathsToPlugins = plugin_paths;
     prefs.numPathsToPlugins = 1;
     prefs.pathToLogsAndData = nullptr; // messages go to our log through the callback
@@ -254,7 +256,10 @@ void DeviceCreated(vk::Instance instance, vk::PhysicalDevice physical_device, vk
     info.graphicsQueueIndex = graphics_index;
     info.computeQueueFamily = graphics_family;
     info.computeQueueIndex = graphics_index;
+    LOG_INFO(Render_Vulkan, "DLSS: slSetVulkanInfo (graphics family {} queue {})", graphics_family,
+             graphics_index);
     const sl::Result r = g_api.set_vulkan_info(info);
+    LOG_INFO(Render_Vulkan, "DLSS: slSetVulkanInfo returned {}", static_cast<int>(r));
     if (r != sl::Result::eOk) {
         LOG_ERROR(Render_Vulkan, "DLSS: slSetVulkanInfo failed ({})", static_cast<int>(r));
         return;

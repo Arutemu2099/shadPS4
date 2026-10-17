@@ -737,7 +737,13 @@ bool Instance::CreateDevice() {
         device_ci.pNext = &bind_report_features;
     }
 
+    if (dlss_device) {
+        LOG_INFO(Render_Vulkan, "DLSS: creating the device with {} extensions", enabled_extensions.size());
+    }
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
+    if (dlss_device) {
+        LOG_INFO(Render_Vulkan, "DLSS: device created ({})", vk::to_string(device_result));
+    }
     if (device_result != vk::Result::eSuccess) {
         LOG_CRITICAL(Render_Vulkan, "Failed to create device: {}", vk::to_string(device_result));
         return false;
