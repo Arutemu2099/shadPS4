@@ -99,6 +99,7 @@ public:
         AmdGpu::CpSplit::DrawArgs args{};
         DrawClass draw_class{DrawClass::Draw};
         bool skip{};                         ///< SHADPS4_EMPTY_DRAWS=2 dropped it on the front.
+        u8 dlss_phase{};                     ///< DlssResolve: the frame's jitter (vk_dlss.h).
         const GraphicsPipeline* pipeline{};  ///< Null: the lookup failed or was not reached.
     };
     /// Front thread: classification, hazard note, empty-draw skip and pipeline lookup, reading
@@ -326,6 +327,8 @@ public:
     void DlssResolve();
     u64 dlss_calls{};
     u64 dlss_missing{};
+    u8 dlss_phase_in{};                   ///< the phase of the action being executed
+    std::array<u64, 4> dlss_phases{};     ///< by phase: unknown / 1 / 2 / T2x off
     struct NeoIdDerive;
     std::shared_ptr<NeoIdDerive> neo_id_derive;
     VAddr neo_depth_addr{};

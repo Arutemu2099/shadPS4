@@ -2459,6 +2459,7 @@ PipelineCache::Result PipelineCache::GetProgram(const AmdGpu::Regs& regs, Stage 
         RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
         program->AddPermut(module, std::move(spec));
         NoteStageSelection(l_stage, program.get(), 0, true);
+        Dlss::NoteWeightsInfo(program->info, params.Base());
         lookup_translate_ms += MsSince(t_translate);
         return std::make_tuple(&program->info, module, SharedFetchMetadata(program->modules[0]),
                                perm_hash);
@@ -2466,6 +2467,7 @@ PipelineCache::Result PipelineCache::GetProgram(const AmdGpu::Regs& regs, Stage 
 
     auto& program = it_pgm.value();
     auto& info = program->info;
+    Dlss::NoteWeightsInfo(info, params.Base());
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
     info.RefreshFlatBuf();
@@ -2894,6 +2896,7 @@ PipelineCache::Resolve PipelineCache::ResolveStageReadOnly(
         return Resolve::Miss;
     }
     const Program& program = *it->second;
+    Dlss::NoteWeightsInfo(program.info, params.Base());
     if (program.precompiled && !program.precompiled_seen) [[unlikely]] {
         out.miss = Miss::PrecompiledFirstUse; // the front records the use, may retire
         return Resolve::Miss;

@@ -1649,6 +1649,7 @@ void Rasterizer::DlssResolve() {
     // Step 1 (plumbing, vk_dlss.h): the un-anti-aliased tonemap output goes into the resolve's
     // target (the game without its temporal AA). Both are 1920x1080 RGBA8 (study sec. 1.2).
     ++dlss_calls;
+    ++dlss_phases[dlss_phase_in & 3];
     const auto& regs = liverpool->BackRegs();
     VideoCore::TextureCache::ImageDesc out_desc{regs.color_buffers[0], liverpool->BackCbExtent(0)};
     auto& out = texture_cache.GetImage(texture_cache.FindImage(out_desc, true));
@@ -1671,8 +1672,11 @@ void Rasterizer::DlssResolve() {
     out.flags |= VideoCore::ImageFlagBits::GpuModified;
     out.flags &= ~VideoCore::ImageFlagBits::Dirty;
     if ((dlss_calls & 1023) == 1) {
-        LOG_INFO(Render_Vulkan, "DLSS: resolve actions {} (no input {}), output {:#x}", dlss_calls,
-                 dlss_missing, regs.color_buffers[0].Address());
+        LOG_INFO(Render_Vulkan,
+                 "DLSS: resolve actions {} (no input {}), output {:#x}; jitter phase 1 {} / 2 {} "
+                 "/ T2x off {} / unknown {}",
+                 dlss_calls, dlss_missing, regs.color_buffers[0].Address(), dlss_phases[1],
+                 dlss_phases[2], dlss_phases[3], dlss_phases[0]);
     }
 }
 
@@ -1680,9 +1684,11 @@ bool Rasterizer::FilterDraw() {
     // The classifier reads the front's registers (it runs where the pipeline lookup runs); the
     // actions read the back's through BackRegs().
     const DrawClass draw_class = ClassifyDraw(liverpool->regs);
+    Dlss::NoteDraw(liverpool->regs);
     if (draw_class == DrawClass::Draw) {
         return true;
     }
+    dlss_phase_in = Dlss::t_phase;
     ExecuteFilteredDraw(draw_class);
     return false;
 }
@@ -2157,7 +2163,9 @@ void Rasterizer::PrepareDrawFront(SplitDraw& draw) {
     // SPLIT-TODO: confirm the pipeline constructor does not depend on BeginDraw (heap backend).
     front_capture_valid = false;
     draw.draw_class = ClassifyDraw(liverpool->regs);
+    Dlss::NoteDraw(liverpool->regs);
     if (draw.draw_class != DrawClass::Draw) {
+        draw.dlss_phase = Dlss::t_phase;
         return;
     }
     if (!draw.args.is_indirect) {
@@ -2195,6 +2203,7 @@ bool Rasterizer::PrepareMemberFront(SplitDraw& draw, const GraphicsPipeline* pip
     // As PrepareDrawFront for a direct draw, without the lookup: the job thread proved the
     // shaders, vertex layout, specialization and context equal to the run head's.
     draw.draw_class = ClassifyDraw(liverpool->regs);
+    Dlss::NoteDraw(liverpool->regs);
     if (draw.draw_class != DrawClass::Draw || draw.args.is_indirect) {
         return false;
     }
@@ -2242,6 +2251,7 @@ void Rasterizer::ExecuteDraw(const SplitDraw& draw,
             native_bindings->BeginDraw();
         }
         if (draw.draw_class != DrawClass::Draw) {
+            dlss_phase_in = draw.dlss_phase;
             ExecuteFilteredDraw(draw.draw_class);
             return false;
         }

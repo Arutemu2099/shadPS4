@@ -80,6 +80,7 @@
 #include "video_core/native_census.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace AmdGpu::Lean {
@@ -356,6 +357,8 @@ Stop Parser::DecideDraw(const PM4Header* header, std::span<const u32> dcb, u32 o
     }
     // Rasterizer::PrepareDrawFront.
     plan.draw.draw_class = Rasterizer::ClassifyDraw(regs);
+    Vulkan::Dlss::NoteDraw(regs);
+    plan.draw.dlss_phase = Vulkan::Dlss::t_phase;
     if (plan.draw.draw_class == Rasterizer::DrawClass::Draw) {
         if (!args.is_indirect) {
             // SplitHazard::NoteDraw: front-global statistics, off by configuration (Config stop).
