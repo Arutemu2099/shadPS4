@@ -34,6 +34,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_bindless.h"
+#include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_pipeline_compile_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -2443,6 +2444,7 @@ PipelineCache::Result PipelineCache::GetProgram(const AmdGpu::Regs& regs, Stage 
                                                 LogicalStage l_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
+    Dlss::NoteProgram(stage == Stage::Fragment, params.hash, params.Base());
     auto runtime_info = BuildRuntimeInfo(regs, stage, l_stage);
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
     if (new_program) {
@@ -2884,6 +2886,7 @@ PipelineCache::Resolve PipelineCache::ResolveStageReadOnly(
         return Resolve::Miss;
     }
     const auto params = pre ? *out.pre_params[out_idx] : AmdGpu::GetParams(*pgm);
+    Dlss::NoteProgram(stage_in == Stage::Fragment, params.hash, params.Base());
     const auto it = program_cache.find(params.hash);
     if (it == program_cache.end() || (pre && out.pre_missing[out_idx])) {
         out.miss = Miss::NoProgram; // the front would translate and compile it (or: published

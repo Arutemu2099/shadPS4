@@ -85,6 +85,7 @@ public:
         DepthCopy,          ///< CB disabled + forced depth dirty/valid: DepthStencilCopy(1, 0).
         StencilCopy,        ///< Same for stencil: DepthStencilCopy(0, 1).
         DepthStencilCopy,   ///< Both: DepthStencilCopy(1, 1).
+        DlssResolve,        ///< SHADPS4_DLSS: the game's T2x resolve -> DlssResolve() (vk_dlss.h).
     };
     /// Pure: reads only `regs`, touches no cache, scheduler or Rasterizer member, so the CP front
     /// can call it.
@@ -321,6 +322,10 @@ public:
     void ScanRegistersForValue();
     /// SHADPS4_NEO_IDBUF_DERIVE=1: fill the Pro ID buffer from the last 2-sample scene depth.
     void DeriveNeoIdBuffer(VideoCore::Image& id_image);
+    /// SHADPS4_DLSS: the back-side action that replaces the T2x resolve draw.
+    void DlssResolve();
+    u64 dlss_calls{};
+    u64 dlss_missing{};
     struct NeoIdDerive;
     std::shared_ptr<NeoIdDerive> neo_id_derive;
     VAddr neo_depth_addr{};

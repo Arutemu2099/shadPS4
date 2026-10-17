@@ -39,6 +39,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/amdgpu/mtb_census.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/amdgpu/native_rec.h"
 #include "video_core/amdgpu/lean_front_api.h"
 #include "video_core/renderer_vulkan/vk_a2.h"
@@ -1592,6 +1593,11 @@ Rasterizer::DrawClass Rasterizer::ClassifyDraw(const AmdGpu::Regs& regs) {
                                           : DrawClass::StencilCopy;
     }
 
+    // SHADPS4_DLSS (vk_dlss.h): the T2x resolve; one relaxed load + compare (0 while off).
+    if (Dlss::IsResolve(regs.ps_program.Address<VAddr>())) [[unlikely]] {
+        return DrawClass::DlssResolve;
+    }
+
     return DrawClass::Draw;
 }
 
@@ -1633,6 +1639,40 @@ void Rasterizer::ExecuteFilteredDraw(DrawClass draw_class) {
         DepthStencilCopy(draw_class != DrawClass::StencilCopy,
                          draw_class != DrawClass::DepthCopy);
         break;
+    case DrawClass::DlssResolve:
+        DlssResolve();
+        break;
+    }
+}
+
+void Rasterizer::DlssResolve() {
+    // Step 1 (plumbing, vk_dlss.h): the un-anti-aliased tonemap output goes into the resolve's
+    // target (the game without its temporal AA). Both are 1920x1080 RGBA8 (study sec. 1.2).
+    ++dlss_calls;
+    const auto& regs = liverpool->BackRegs();
+    VideoCore::TextureCache::ImageDesc out_desc{regs.color_buffers[0], liverpool->BackCbExtent(0)};
+    auto& out = texture_cache.GetImage(texture_cache.FindImage(out_desc, true));
+    const VideoCore::ImageId in_id = texture_cache.FindImageFromRange(
+        Dlss::ColorInAddr, size_t{1920} * 1080 * 4, true);
+    VideoCore::Image* in = in_id ? &texture_cache.GetImage(in_id) : nullptr;
+    if (!in || in->info.size.width != out.info.size.width ||
+        in->info.size.height != out.info.size.height ||
+        in->info.pixel_format != out.info.pixel_format) [[unlikely]] {
+        if (++dlss_missing <= 8) {
+            LOG_WARNING(Render_Vulkan, "DLSS: no matching input at {:#x} for output {:#x} ({}x{}); "
+                                       "the resolve's target keeps last frame's picture",
+                        Dlss::ColorInAddr, regs.color_buffers[0].Address(), out.info.size.width,
+                        out.info.size.height);
+        }
+        return;
+    }
+    scheduler.EndRendering();
+    out.CopyImage(*in);
+    out.flags |= VideoCore::ImageFlagBits::GpuModified;
+    out.flags &= ~VideoCore::ImageFlagBits::Dirty;
+    if ((dlss_calls & 1023) == 1) {
+        LOG_INFO(Render_Vulkan, "DLSS: resolve actions {} (no input {}), output {:#x}", dlss_calls,
+                 dlss_missing, regs.color_buffers[0].Address());
     }
 }
 
