@@ -14,6 +14,7 @@
 #include "common/logging/log.h"
 #include "common/memory_patcher.h"
 #include "common/path_util.h"
+#include "common/release_mode.h"
 #include "core/debugger.h"
 #include "core/emulator_settings.h"
 #include "core/emulator_state.h"
@@ -33,6 +34,10 @@ int main(int argc, char* argv[]) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
 #endif
+    // Release mode (common/release_mode.h): started by a double-click, the console is ours alone.
+    if (Common::ReleaseMode::Active()) {
+        Common::ReleaseMode::HideOwnConsole();
+    }
 
 #if defined(__APPLE__) && defined(ARCH_X86_64)
     // KosmicKrisp only supports Apple Silicon. Check that we are not running on an Intel Mac.
@@ -104,7 +109,15 @@ int main(int argc, char* argv[]) {
     });
 
     // ---- No-args behavior ----
-    if (argc == 1) {
+    // Release mode: the saved game folder, or a folder picker on the first launch.
+    std::optional<std::filesystem::path> releaseGame;
+    if (argc == 1 && Common::ReleaseMode::Active()) {
+        releaseGame = Common::ReleaseMode::GamePath();
+        if (!releaseGame) {
+            return 0; // picker cancelled
+        }
+        gamePath = Common::FS::PathToUTF8String(*releaseGame);
+    } else if (argc == 1) {
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "shadPS4",
                                  "This is a CLI application. Please use the QTLauncher for a GUI:\n"
                                  "https://github.com/shadps4-emu/shadps4-qtlauncher/releases",
@@ -126,6 +139,11 @@ int main(int argc, char* argv[]) {
     Common::Log::Setup("shadps4.log");
 
     LOG_INFO(Debug, "Run: {}", std::span(argv, argc));
+    if (Common::ReleaseMode::Active()) {
+        LOG_INFO(Config, "Release mode: {} variables from {} ({} already set by the environment)",
+                 Common::ReleaseMode::FlagsApplied(), Common::ReleaseMode::FlagsFilePath(),
+                 Common::ReleaseMode::FlagsOverridden());
+    }
 
     IPC::Instance().Init();
 
@@ -211,7 +229,8 @@ int main(int argc, char* argv[]) {
         EmulatorSettings.SetConfigMode(ConfigMode::Global);
 
     // ---- Resolve game path or ID ----
-    std::filesystem::path ebootPath(*gamePath);
+    // The picked path keeps its wide characters (a narrow string is read in the ANSI code page).
+    std::filesystem::path ebootPath = releaseGame ? *releaseGame : std::filesystem::path(*gamePath);
     const auto archive_component_exists = [](const std::filesystem::path& p) -> bool {
         std::filesystem::path accum;
         for (const auto& comp : p) {
