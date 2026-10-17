@@ -212,7 +212,14 @@ void WindowSDL::WaitEvent() {
         return;
     }
 
-    if (ImGui::Core::ProcessEvent(&event)) {
+    // SHADPS4_TOUCHPAD_BLOCK_FIX=1: while the mouse drives the pad, overlay windows (the FPS
+    // counter in the top right) never see its presses / motion, so a touch can't start a window
+    // drag that swallows the keyboard. Button-up still goes to ImGui (ends a drag begun earlier).
+    const bool mouse_to_pad =
+        Input::MouseEventsBelongToPad() &&
+        (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == SDL_EVENT_MOUSE_MOTION ||
+         event.type == SDL_EVENT_MOUSE_WHEEL);
+    if (!mouse_to_pad && ImGui::Core::ProcessEvent(&event)) {
         return;
     }
 

@@ -41,8 +41,9 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 // order, images, samplers, fmasks). Permutations share one Info, so they must agree on these.
 bool SameBindingLayout(const Shader::Info& a, const Shader::Info& b);
 // Boot passes on the main thread (vk_pipeline_precompile.cpp): window title progress + event pump
-// at most every 250 ms; total == ~0ull puts the title back.
-void ShowBootProgress(std::string_view what, u64 done, u64 total);
+// at most every 250 ms; total == ~0ull puts the title back. one_time: "Preparing shaders (one
+// time)" (stages are rebuilt this boot) instead of "Loading shaders".
+void ShowBootProgress(std::string_view what, u64 done, u64 total, bool one_time = true);
 // SHADPS4_CACHE_REBUILD seed stamp (vk_pipeline_precompile.cpp): the game file's OrbShdr crc32 and
 // code length of a shader, from the game folder's shader index (built on first use, main thread).
 bool GameShaderIdentity(u64 pgm_hash, u32* crc32, u32* code_length);

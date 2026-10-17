@@ -88,7 +88,7 @@ namespace Vulkan {
 /// "Not responding". Done() puts the title back.
 class BootProgress {
 public:
-    void Show(std::string_view what, u64 done, u64 total) {
+    void Show(std::string_view what, u64 done, u64 total, bool one_time) {
         const auto now = std::chrono::steady_clock::now();
         if (now - last < std::chrono::milliseconds{250}) {
             return;
@@ -101,9 +101,12 @@ public:
                 old_title = title ? title : "";
                 saved = true;
             }
-            const auto text = total ? fmt::format("Preparing shaders (one time): {} {} / {}", what,
-                                                  done, total)
-                                    : fmt::format("Preparing shaders (one time): {} {}", what, done);
+            // 2026-10-17 (user): "(one time)" only while this boot really prepares shaders; a
+            // normal launch reads its cache and says so.
+            const std::string_view head =
+                one_time ? "Preparing shaders (one time)" : "Loading shaders";
+            const auto text = total ? fmt::format("{}: {} {} / {}", head, what, done, total)
+                                    : fmt::format("{}: {} {}", head, what, done);
             SDL_SetWindowTitle(window, text.c_str());
         }
         SDL_PumpEvents();
@@ -122,13 +125,13 @@ private:
     bool saved{};
 };
 
-void ShowBootProgress(std::string_view what, u64 done, u64 total) {
+void ShowBootProgress(std::string_view what, u64 done, u64 total, bool one_time) {
     static BootProgress* shared = new BootProgress{}; // WarmUp's main thread only
     if (total == ~0ull) {
         shared->Done();
         return;
     }
-    shared->Show(what, done, total);
+    shared->Show(what, done, total, one_time);
 }
 
 namespace {

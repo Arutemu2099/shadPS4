@@ -120,14 +120,27 @@ void EmulateTouchpad(GameController* controller, u32 interval) {
                        (mouse_buttons & SDL_BUTTON_RMASK) != 0);
 }
 
-void ApplyMouseInputBlockers() {
-    // SHADPS4_TOUCHPAD_BLOCK_FIX=1 (2026-10-14, input study): block only the MOUSE buttons. The
-    // ids 1 / 3 are also a pad's LEFT-Y / RIGHT-Y axes and Circle / Triangle, which touchpad mode
-    // used to swallow.
+static bool TouchpadBlockFix() {
     static const bool block_fix = [] {
         const char* v = std::getenv("SHADPS4_TOUCHPAD_BLOCK_FIX");
         return v && v[0] == '1';
     }();
+    return block_fix;
+}
+
+bool MouseEventsBelongToPad() {
+    // 2026-10-17 (user: keyboard O = R2 ignored while holding the touchpad in the pad's upper
+    // right): the click landed on the FPS counter (top right). ImGui started a window drag
+    // (ActiveId != 0 -> WantCaptureKeyboard), so every keyboard key-down went to ImGui while the
+    // button was held; a real pad's R2 still passed.
+    return TouchpadBlockFix() && mouse_mode != MouseMode::Off;
+}
+
+void ApplyMouseInputBlockers() {
+    // SHADPS4_TOUCHPAD_BLOCK_FIX=1 (2026-10-14, input study): block only the MOUSE buttons. The
+    // ids 1 / 3 are also a pad's LEFT-Y / RIGHT-Y axes and Circle / Triangle, which touchpad mode
+    // used to swallow.
+    const bool block_fix = TouchpadBlockFix();
     switch (mouse_mode) {
     case MouseMode::Touchpad:
         for (auto& k : pressed_keys) {

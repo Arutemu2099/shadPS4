@@ -1125,6 +1125,20 @@ void PipelineCache::WarmUp() {
     // Check if cache is compatible
     std::vector<u8> profile_data{};
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderProfile, "profile", profile_data);
+    // Boot title (2026-10-17, user): "Preparing shaders (one time)" only on a seeded folder's first
+    // launch or while stages are really rebuilt; any other launch says "Loading shaders".
+    const bool fresh_folder = profile_data.empty();
+    const auto preparing = [&] {
+        if (fresh_folder) {
+            return true;
+        }
+        for (size_t s = 0; s < 8; ++s) {
+            if (rebuild_stats.rebuilt[s] + rebuild_stats.prebuilt[s] != 0) {
+                return true;
+            }
+        }
+        return false;
+    };
     if (profile_data.empty()) {
         std::vector<u8> fresh(sizeof(profile));
         std::memcpy(fresh.data(), &profile, sizeof(profile));
@@ -1216,7 +1230,7 @@ void PipelineCache::WarmUp() {
         Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
             ++num_total_pipelines;
             if (CacheRebuildMode() != 0) {
-                ShowBootProgress("pipelines read", num_total_pipelines, 0);
+                ShowBootProgress("pipelines read", num_total_pipelines, 0, preparing());
             }
 
             Serialization::Archive ar{std::move(data)};
@@ -1307,7 +1321,7 @@ void PipelineCache::WarmUp() {
             const auto t_wait = std::chrono::steady_clock::now();
             while (const size_t left =
                        PipelineCompilePool::WaitIdleFor(std::chrono::milliseconds{250})) {
-                ShowBootProgress("pipelines left", left, 0);
+                ShowBootProgress("pipelines left", left, 0, preparing());
             }
             LOG_INFO(Render, "CacheRebuild: waited {} ms for the compile pool to drain",
                      std::chrono::duration_cast<std::chrono::milliseconds>(
