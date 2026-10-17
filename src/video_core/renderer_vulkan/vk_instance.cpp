@@ -235,7 +235,16 @@ bool Instance::CreateDevice() {
     }
 
     boost::container::static_vector<const char*, 48> enabled_extensions;
+    // SHADPS4_SKIP_DEVICE_EXT=a,b (2026-10-17, diagnosis): treat these extensions as unavailable.
+    static const std::string skip_device_ext = [] {
+        const char* v = std::getenv("SHADPS4_SKIP_DEVICE_EXT");
+        return std::string{v ? v : ""};
+    }();
     const auto add_extension = [&](std::string_view extension) -> bool {
+        if (!skip_device_ext.empty() && skip_device_ext.find(extension) != std::string::npos) {
+            LOG_WARNING(Render_Vulkan, "Extension {} skipped (SHADPS4_SKIP_DEVICE_EXT)", extension);
+            return false;
+        }
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
                          [&](const std::string& name) { return name == extension; });
