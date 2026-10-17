@@ -88,7 +88,7 @@ namespace Vulkan {
 /// "Not responding". Done() puts the title back.
 class BootProgress {
 public:
-    void Show(std::string_view what, u64 done, u64 total, bool one_time) {
+    void Show(std::string_view what, u64 done, u64 total, bool one_time = true) {
         const auto now = std::chrono::steady_clock::now();
         if (now - last < std::chrono::milliseconds{250}) {
             return;
