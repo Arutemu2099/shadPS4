@@ -383,7 +383,12 @@ bool Instance::CreateDevice() {
         for (const char* ext : Dlss::DeviceExtensions()) {
             const bool present = std::ranges::any_of(
                 enabled_extensions, [ext](const char* e) { return std::strcmp(e, ext) == 0; });
-            if (present || std::strcmp(ext, "VK_EXT_buffer_device_address") == 0) {
+            // SHADPS4_DLSS_SKIP_EXT=a,b: leave these out (start-up diagnosis, 2026-10-17).
+            const char* skip = std::getenv("SHADPS4_DLSS_SKIP_EXT");
+            if (present || std::strcmp(ext, "VK_EXT_buffer_device_address") == 0 ||
+                (skip && std::strstr(skip, ext))) {
+                LOG_INFO(Render_Vulkan, "DLSS: device extension {} {}", ext,
+                         present ? "already enabled" : "left out");
                 continue;
             }
             if (!add_extension(ext)) {
