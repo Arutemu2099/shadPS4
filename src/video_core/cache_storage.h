@@ -37,7 +37,11 @@ public:
     // =2 also keeps every .key and .meta file's bytes until FinishPreload, so WarmUp's loads open
     // no file (2026-10-16: s1322 spent 104.5 s opening the seed's metas one by one); =3 keeps the
     // .spv files too (s1330: 95 s opening 22 k SPIR-V files; ~0.8 GB held until FinishPreload).
-    void Prefetch();
+    // progress (2026-10-17, boot screen): called on the calling thread about every 50 ms with the
+    // files taken so far and the total, while the reader threads work.
+    void Prefetch(const std::function<void(u64 done, u64 total)>& progress = {});
+    // Number of blobs of one type in the folder (the prefetched names when kept, else a scan).
+    [[nodiscard]] size_t CountBlobs(BlobType type) const;
     // =2: the kept bytes of a cache file ("<name>.<ext>"), or null. Read-only between Prefetch
     // and FinishPreload, so boot threads may call it concurrently.
     [[nodiscard]] const std::vector<u8>* Prefetched(const std::string& file_name) const;

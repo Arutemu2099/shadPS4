@@ -502,14 +502,139 @@ static void SavePendingScreenshots(const std::vector<ScreenshotReadback>& readba
     }
 }
 
+namespace {
+// SHADPS4_BOOT_SCREEN (2026-10-17, user: the first launch's preparation is too easy to miss): the
+// presenter whose rasterizer is being built - WarmUp runs inside that, on the main thread.
+Presenter* g_booting_presenter = nullptr;
+
+bool BootScreenEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("SHADPS4_BOOT_SCREEN");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+} // namespace
+
+void PresentBootScreen(std::string_view headline, std::string_view detail, float fraction,
+                       bool one_time) {
+    if (g_booting_presenter && BootScreenEnabled()) {
+        g_booting_presenter->DrawBootScreen(headline, detail, fraction, one_time);
+    }
+}
+
+void Presenter::DrawBootScreen(std::string_view headline, std::string_view detail,
+                               float fraction, bool one_time) {
+    if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight()) {
+        swapchain.Recreate(window.GetWidth(), window.GetHeight());
+    }
+    if (!swapchain.AcquireNextImage()) {
+        swapchain.Recreate(window.GetWidth(), window.GetHeight());
+        if (!swapchain.AcquireNextImage()) {
+            return;
+        }
+    }
+
+    ImGui::Core::NewFrame(false);
+    {
+        const ImGuiViewport* vp = ImGui::GetMainViewport();
+        const float width = std::min(vp->WorkSize.x * 0.7f, 1100.0f * ImGui::GetIO().FontGlobalScale);
+        ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(width, 0.0f), ImGuiCond_Always);
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.95f, 0.45f, 0.10f, 1.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+        if (ImGui::Begin("##boot_screen", nullptr,
+                         ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
+                             ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoMove)) {
+            ImGui::SetWindowFontScale(2.0f);
+            ImGui::TextUnformatted(headline.data(), headline.data() + headline.size());
+            ImGui::SetWindowFontScale(1.2f);
+            ImGui::Spacing();
+            if (one_time) {
+                ImGui::TextWrapped("This happens only on the first launch and takes a few minutes "
+                                   "(about 2-4, depending on CPU and disk). Closing the game now is "
+                                   "safe: the next launch continues where this one stopped.");
+                ImGui::Spacing();
+            }
+            const float f = std::clamp(fraction, 0.0f, 1.0f);
+            const auto percent = fmt::format("{:.0f} %", f * 100.0f);
+            ImGui::ProgressBar(f, ImVec2(-1.0f, 0.0f), percent.c_str());
+            ImGui::Spacing();
+            ImGui::TextDisabled("%.*s", static_cast<int>(detail.size()), detail.data());
+        }
+        ImGui::End();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(2);
+    }
+
+    auto& scheduler = present_scheduler;
+    auto command_access = scheduler.AcquireCommandBuffer();
+    const auto cmdbuf = command_access.Handle();
+    const vk::ImageSubresourceRange range{
+        .aspectMask = vk::ImageAspectFlagBits::eColor,
+        .baseMipLevel = 0,
+        .levelCount = 1,
+        .baseArrayLayer = 0,
+        .layerCount = VK_REMAINING_ARRAY_LAYERS,
+    };
+    const vk::ImageMemoryBarrier to_attachment{
+        .srcAccessMask = vk::AccessFlagBits::eNone,
+        .dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+        .oldLayout = vk::ImageLayout::eUndefined,
+        .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = swapchain.Image(),
+        .subresourceRange = range,
+    };
+    cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+                           vk::PipelineStageFlagBits::eColorAttachmentOutput,
+                           vk::DependencyFlagBits::eByRegion, {}, {}, to_attachment);
+    ImGui::Core::Render(cmdbuf, swapchain.ImageView(), swapchain.GetExtent());
+    const vk::ImageMemoryBarrier to_present{
+        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+        .dstAccessMask = vk::AccessFlagBits::eNone,
+        .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+        .newLayout = vk::ImageLayout::ePresentSrcKHR,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = swapchain.Image(),
+        .subresourceRange = range,
+    };
+    cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+                           vk::PipelineStageFlagBits::eBottomOfPipe,
+                           vk::DependencyFlagBits::eByRegion, {}, {}, to_present);
+
+    SubmitInfo info{};
+    info.AddWait(swapchain.GetImageAcquiredSemaphore());
+    info.AddSignal(swapchain.GetPresentReadySemaphore());
+    scheduler.Flush(info);
+    ImGui::Core::TextureManager::NotePresented();
+    bool recreate = false;
+    {
+        std::scoped_lock submit_lock{Scheduler::submit_mutex};
+        recreate = !swapchain.Present();
+    }
+    if (recreate) {
+        swapchain.Recreate(window.GetWidth(), window.GetHeight());
+    }
+    // A few frames a second: wait, so the next one (or the game's first) starts from idle.
+    scheduler.Finish();
+}
+
 Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_)
     : window{window_}, liverpool{liverpool_},
       instance{window, EmulatorSettings.GetGpuId(), EmulatorSettings.IsVkValidationEnabled(),
                EmulatorSettings.IsVkCrashDiagnosticEnabled()},
       draw_scheduler{instance, true}, present_scheduler{instance}, flip_scheduler{instance},
       swapchain{instance, window},
-      rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, liverpool)},
+      // SHADPS4_BOOT_SCREEN: WarmUp (inside the Rasterizer) may draw boot frames through `this`.
+      rasterizer{(g_booting_presenter = this,
+                  std::make_unique<Rasterizer>(instance, draw_scheduler, liverpool))},
       texture_cache{rasterizer->GetTextureCache()} {
+    g_booting_presenter = nullptr;
     // q5 (SHADPS4_PRESENT_FRAMES=N): more presentation frames than swapchain images, so the
     // back's flip (PrepareFrame -> GetRenderFrame) does not wait for an older frame's GPU work.
     const u32 num_images = [&] {

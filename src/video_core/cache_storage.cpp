@@ -319,7 +319,7 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
     }
 }
 
-void DataBase::Prefetch() {
+void DataBase::Prefetch(const std::function<void(u64 done, u64 total)>& progress) {
     // The first open of a cache file is slow (~3.7 ms each on the user's PC, 2026-10-07: 38,368
     // files took 141 s on one thread and 13.2 s on 16; a second pass 3.0 s). WarmUp opens every blob
     // one by one, so a build's first launch, or any launch after the files' scan results expired,
@@ -383,6 +383,13 @@ void DataBase::Prefetch() {
                 }
             });
         }
+        // Boot screen (2026-10-17): the caller's thread reports progress while the readers work.
+        if (progress) {
+            for (size_t taken = next.load(); taken < files.size(); taken = next.load()) {
+                progress(taken, files.size());
+                std::this_thread::sleep_for(std::chrono::milliseconds{50});
+            }
+        }
     } // joins
     if (keep) {
         g_prefetched.reserve(files.size());
@@ -399,6 +406,25 @@ void DataBase::Prefetch() {
              std::chrono::duration_cast<std::chrono::milliseconds>(
                  std::chrono::steady_clock::now() - t_start)
                  .count());
+}
+
+size_t DataBase::CountBlobs(BlobType type) const {
+    if (!opened || EmulatorSettings.IsPipelineCacheArchived()) {
+        return 0;
+    }
+    const auto ext = GetBlobFileExtension(type);
+    size_t count = 0;
+    if (!g_prefetched.empty() && (ext == "key" || ext == "meta")) {
+        for (const auto& [name, bytes] : g_prefetched) {
+            count += name.ends_with(ext) ? 1 : 0;
+        }
+        return count;
+    }
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(cache_path, ec)) {
+        count += entry.path().extension().string().ends_with(ext) ? 1 : 0;
+    }
+    return count;
 }
 
 std::filesystem::path DataBase::SidecarPath(std::string_view file_name) const {

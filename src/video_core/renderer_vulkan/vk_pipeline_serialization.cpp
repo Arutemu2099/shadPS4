@@ -1120,9 +1120,8 @@ void PipelineCache::WarmUp() {
     }
 
     Storage::DataBase::Instance().Open(instance.IsNativeBindingsActive());
-    Storage::DataBase::Instance().Prefetch();
-
-    // Check if cache is compatible
+    // Check if cache is compatible (read before the prefetch: the boot title / screen says from
+    // the start whether this launch prepares shaders)
     std::vector<u8> profile_data{};
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderProfile, "profile", profile_data);
     // Boot title (2026-10-17, user): "Preparing shaders (one time)" only on a seeded folder's first
@@ -1139,6 +1138,18 @@ void PipelineCache::WarmUp() {
         }
         return false;
     };
+    // Boot progress for SHADPS4_BOOT_SCREEN: the phases weighted by rc22's cold first launch
+    // (s1348: prefetch 16.6 s, read + rebuild 61.0 s, compile drain 33.8 s) as 0-15 / 15-70 /
+    // 70-100 %; inside a phase the real counts.
+    const bool show_boot = CacheRebuildMode() != 0;
+    Storage::DataBase::Instance().Prefetch([&](u64 done, u64 total) {
+        if (show_boot) {
+            ShowBootProgress("cache files read", done, total, fresh_folder,
+                             total ? 0.15f * static_cast<float>(done) / static_cast<float>(total)
+                                   : 0.0f);
+        }
+    });
+
     if (profile_data.empty()) {
         std::vector<u8> fresh(sizeof(profile));
         std::memcpy(fresh.data(), &profile, sizeof(profile));
@@ -1226,11 +1237,18 @@ void PipelineCache::WarmUp() {
     }
     std::vector<DeferredComputeLoad> deferred_marked;
     defer_marked_compute = &deferred_marked;
+    const size_t total_keys =
+        show_boot ? Storage::DataBase::Instance().CountBlobs(Storage::BlobType::PipelineKey) : 0;
     Storage::DataBase::Instance().ForEachBlob(
         Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
             ++num_total_pipelines;
-            if (CacheRebuildMode() != 0) {
-                ShowBootProgress("pipelines read", num_total_pipelines, 0, preparing());
+            if (show_boot) {
+                const float read =
+                    total_keys ? std::min(1.0f, static_cast<float>(num_total_pipelines) /
+                                                    static_cast<float>(total_keys))
+                               : 0.0f;
+                ShowBootProgress("pipelines read", num_total_pipelines, total_keys, preparing(),
+                                 0.15f + 0.55f * read);
             }
 
             Serialization::Archive ar{std::move(data)};
@@ -1319,15 +1337,22 @@ void PipelineCache::WarmUp() {
         const char* wait_env = std::getenv("SHADPS4_PRECOMPILE_WAIT");
         if ((CacheRebuildMode() & 1) && wait_env && wait_env[0] == '1') {
             const auto t_wait = std::chrono::steady_clock::now();
+            size_t left_max = 0;
             while (const size_t left =
                        PipelineCompilePool::WaitIdleFor(std::chrono::milliseconds{250})) {
-                ShowBootProgress("pipelines left", left, 0, preparing());
+                left_max = std::max(left_max, left);
+                ShowBootProgress("pipelines left", left, 0, preparing(),
+                                 0.70f + 0.30f * (1.0f - static_cast<float>(left) /
+                                                             static_cast<float>(left_max)));
             }
             LOG_INFO(Render, "CacheRebuild: waited {} ms for the compile pool to drain",
                      std::chrono::duration_cast<std::chrono::milliseconds>(
                          std::chrono::steady_clock::now() - t_wait)
                          .count());
         }
+        // The last boot frame stays up until the game's first one.
+        PresentBootScreen(preparing() ? "Preparing shaders (one time)" : "Loading shaders",
+                          "Starting the game", 1.0f, false);
         ShowBootProgress({}, 0, ~0ull);
         const auto& rs = rebuild_stats;
         for (size_t s = 0; s < 8; ++s) {

@@ -88,12 +88,18 @@ namespace Vulkan {
 /// "Not responding". Done() puts the title back.
 class BootProgress {
 public:
-    void Show(std::string_view what, u64 done, u64 total, bool one_time = true) {
+    void Show(std::string_view what, u64 done, u64 total, bool one_time = true,
+              float fraction = -1.0f) {
         const auto now = std::chrono::steady_clock::now();
         if (now - last < std::chrono::milliseconds{250}) {
             return;
         }
         last = now;
+        // 2026-10-17 (user): "(one time)" only while this boot really prepares shaders; a
+        // normal launch reads its cache and says so.
+        const std::string_view head = one_time ? "Preparing shaders (one time)" : "Loading shaders";
+        const auto detail = total ? fmt::format("{} {} / {}", what, done, total)
+                                  : fmt::format("{} {}", what, done);
         SDL_Window* window = g_window ? g_window->GetSDLWindow() : nullptr;
         if (window) {
             if (!saved) {
@@ -101,13 +107,11 @@ public:
                 old_title = title ? title : "";
                 saved = true;
             }
-            // 2026-10-17 (user): "(one time)" only while this boot really prepares shaders; a
-            // normal launch reads its cache and says so.
-            const std::string_view head =
-                one_time ? "Preparing shaders (one time)" : "Loading shaders";
-            const auto text = total ? fmt::format("{}: {} {} / {}", head, what, done, total)
-                                    : fmt::format("{}: {} {}", head, what, done);
+            const auto text = fmt::format("{}: {}", head, detail);
             SDL_SetWindowTitle(window, text.c_str());
+        }
+        if (fraction >= 0.0f) {
+            PresentBootScreen(head, detail, fraction, one_time);
         }
         SDL_PumpEvents();
     }
@@ -125,13 +129,13 @@ private:
     bool saved{};
 };
 
-void ShowBootProgress(std::string_view what, u64 done, u64 total, bool one_time) {
+void ShowBootProgress(std::string_view what, u64 done, u64 total, bool one_time, float fraction) {
     static BootProgress* shared = new BootProgress{}; // WarmUp's main thread only
     if (total == ~0ull) {
         shared->Done();
         return;
     }
-    shared->Show(what, done, total, one_time);
+    shared->Show(what, done, total, one_time, fraction);
 }
 
 namespace {

@@ -42,8 +42,14 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 bool SameBindingLayout(const Shader::Info& a, const Shader::Info& b);
 // Boot passes on the main thread (vk_pipeline_precompile.cpp): window title progress + event pump
 // at most every 250 ms; total == ~0ull puts the title back. one_time: "Preparing shaders (one
-// time)" (stages are rebuilt this boot) instead of "Loading shaders".
-void ShowBootProgress(std::string_view what, u64 done, u64 total, bool one_time = true);
+// time)" (stages are rebuilt this boot) instead of "Loading shaders". fraction >= 0: the whole
+// boot's progress (0..1) for the SHADPS4_BOOT_SCREEN screen.
+void ShowBootProgress(std::string_view what, u64 done, u64 total, bool one_time = true,
+                      float fraction = -1.0f);
+// SHADPS4_BOOT_SCREEN=1 (vk_presenter.cpp): draws and presents one boot frame (headline, note,
+// progress bar) while a Presenter is building its rasterizer; a no-op otherwise.
+void PresentBootScreen(std::string_view headline, std::string_view detail, float fraction,
+                       bool one_time);
 // SHADPS4_CACHE_REBUILD seed stamp (vk_pipeline_precompile.cpp): the game file's OrbShdr crc32 and
 // code length of a shader, from the game folder's shader index (built on first use, main thread).
 bool GameShaderIdentity(u64 pgm_hash, u32* crc32, u32* code_length);

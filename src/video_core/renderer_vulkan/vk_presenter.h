@@ -105,6 +105,11 @@ public:
     void Present(Frame* frame, bool is_reusing_frame = false);
     Frame* PrepareLastFrame();
 
+    /// SHADPS4_BOOT_SCREEN: one overlay-only frame during WarmUp (inside this constructor, main
+    /// thread); uses only the members built before the rasterizer. Waits for it on the GPU.
+    void DrawBootScreen(std::string_view headline, std::string_view detail, float fraction,
+                        bool one_time);
+
 private:
     Frame* GetRenderFrame();
 
