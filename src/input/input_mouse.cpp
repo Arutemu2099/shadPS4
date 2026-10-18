@@ -39,6 +39,10 @@ bool ToggleMouseModeTo(MouseMode m) {
     return mouse_mode == m;
 }
 
+MouseMode GetMouseMode() {
+    return mouse_mode;
+}
+
 void SetMouseToJoystick(int joystick) {
     mouse_joystick_binding = joystick;
 }

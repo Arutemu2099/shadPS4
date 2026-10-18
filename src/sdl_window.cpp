@@ -233,8 +233,26 @@ void WindowSDL::WaitEvent() {
         }
         const bool on = Input::IsMouseGyroMode();
         controllers[0]->SetSyntheticMotion(on);
-        Overlay::ShowNotice(on ? "Mouse = motion sensor (hold R rattle, Z tilt; F6 off)"
+        Overlay::ShowNotice(on ? "Mouse = motion sensor (X rattle, hold Z tilt)"
                                : "Mouse motion sensor off");
+    };
+
+    // Touchpad / motion modes hand the mouse back to the camera (mouse aim) when they are toggled
+    // off, if it had it before (user 2026-10-17: the finger scanner, the DUP core, the spray can).
+    const auto ToggleSpecialMouseMode = [this](Input::MouseMode m) {
+        static Input::MouseMode before = Input::MouseMode::Off;
+        const Input::MouseMode prev = Input::GetMouseMode();
+        if (Input::ToggleMouseModeTo(m)) {
+            if (prev == Input::MouseMode::Joystick) {
+                before = prev;
+            }
+        } else if (before == Input::MouseMode::Joystick) {
+            Input::ToggleMouseModeTo(Input::MouseMode::Joystick);
+            before = Input::MouseMode::Off;
+        }
+        const Input::MouseMode now = Input::GetMouseMode();
+        SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(), now == Input::MouseMode::Joystick ||
+                                                                 now == Input::MouseMode::Gyro);
     };
 
     switch (event.type) {
@@ -280,9 +298,10 @@ void WindowSDL::WaitEvent() {
         if (Input::g_synth_motion &&
             (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) &&
             !event.key.repeat &&
-            (event.key.key == SDLK_R || event.key.key == SDLK_Z)) {
-            // SHADPS4_SYNTH_MOTION: R = rattle, Z = tilt (held).
-            (event.key.key == SDLK_R ? Input::g_synth_rattle : Input::g_synth_tilt)
+            (event.key.key == SDLK_X || event.key.key == SDLK_Z)) {
+            // SHADPS4_SYNTH_MOTION: X = rattle, Z = tilt (held). X was R until 2026-10-17: R is the
+            // touchpad in the PC layout; X also toggles the mouse motion mode there (global.ini).
+            (event.key.key == SDLK_X ? Input::g_synth_rattle : Input::g_synth_tilt)
                 .store(event.type == SDL_EVENT_KEY_DOWN, std::memory_order_relaxed);
         }
         if (Vulkan::Dlss::Enabled() && event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
@@ -391,20 +410,20 @@ void WindowSDL::WaitEvent() {
         SyncSyntheticMotion();
         if (Core::MouseAim::Installed()) {
             Overlay::ShowNotice(Input::MouseAimActive()
-                                    ? "Mouse aim ON (- / = sensitivity, F7 off)"
+                                    ? "Mouse aim ON (- / = sensitivity)"
                                     : "Mouse aim off");
         }
         break;
     case SDL_EVENT_MOUSE_TO_GYRO:
-        SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(),
-                                       Input::ToggleMouseModeTo(Input::MouseMode::Gyro));
+        ToggleSpecialMouseMode(Input::MouseMode::Gyro);
         SyncSyntheticMotion();
         break;
     case SDL_EVENT_MOUSE_TO_TOUCHPAD:
-        SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(),
-                                       Input::ToggleMouseModeTo(Input::MouseMode::Touchpad));
-        SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(), false);
+        ToggleSpecialMouseMode(Input::MouseMode::Touchpad);
         SyncSyntheticMotion();
+        if (Core::MouseAim::Installed() && Input::MouseAimActive()) {
+            Overlay::ShowNotice("Mouse aim ON (- / = sensitivity)");
+        }
         break;
     case SDL_EVENT_ADD_VIRTUAL_USER:
         for (int i = 0; i < 4; i++) {
@@ -451,6 +470,11 @@ void WindowSDL::InitTimers() {
         SDL_AddTimer(4, &PollController, controllers[i]);
     }
     SDL_AddTimer(33, Input::MousePolling, (void*)controllers[0]);
+    if (Core::MouseAim::Enabled()) {
+        // SHADPS4_MOUSE_AIM: the mouse turns the camera from the start (the hotkey still toggles).
+        Input::ToggleMouseModeTo(Input::MouseMode::Joystick);
+        SDL_SetWindowRelativeMouseMode(window, true);
+    }
 }
 
 void WindowSDL::RequestKeyboard() {
