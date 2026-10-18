@@ -43,7 +43,7 @@ struct Settings {
     bool skin_follows = true;    ///< skin uses the local-structure value (the model's default)
     float skin_structure = 1.0f; ///< used when skin_follows is off
     bool auto_mask = true;       ///< the model decides where it may edit
-    int preset = 0;              ///< 0 = the model's default
+    int preset = 0;              ///< network: 0 = the DLL default, 1 = A (first model), 2 = B (newer)
     bool ui_correction = false;  ///< off: the frame it gets has no HUD in it
     int mv_mode = 0;             ///< motion vectors: 0 pixels (default), 1 normalised, 2 none
     int model = 2; ///< loads at the NEXT launch: the model1 (NBA 2K27) or model2 subfolder

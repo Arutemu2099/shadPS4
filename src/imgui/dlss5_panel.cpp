@@ -36,6 +36,7 @@ private:
     void Slider(const char* label, float* value, const char* tip);
     void StyleButton(const char* label, int style);
     void ModelButton(const char* label, int model, const D5::Status& status);
+    void PresetButton(const char* label, int preset, const char* tip);
 
     D5::Settings edit{};
 };
@@ -68,6 +69,24 @@ void Panel::StyleButton(const char* label, int style) {
     }
 }
 
+void Panel::PresetButton(const char* label, int preset, const char* tip) {
+    const bool selected = edit.preset == preset;
+    if (selected) {
+        ImGui::PushStyleColor(ImGuiCol_Button, Accent);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, Accent);
+    }
+    const float w = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 2) / 3.0f;
+    if (ImGui::Button(label, ImVec2(preset == 2 ? ImGui::GetContentRegionAvail().x : w, 0)) &&
+        !selected) {
+        edit.preset = preset;
+        Commit();
+    }
+    if (selected) {
+        ImGui::PopStyleColor(2);
+    }
+    ImGui::SetItemTooltip("%s", tip);
+}
+
 void Panel::ModelButton(const char* label, int model, const D5::Status& status) {
     const bool present = status.has_model[model];
     const bool selected = edit.model == model;
@@ -89,10 +108,10 @@ void Panel::ModelButton(const char* label, int model, const D5::Status& status) 
     const char* tip =
         !present     ? (model == 1 ? "Not found: dlss5\\model1\\nvngx_dlssnr.dll"
                                    : "Not found: dlss5\\model2\\nvngx_dlssnr.dll")
-        : model == 1 ? "The first release (NBA 2K27): NVIDIA's original signed file.\n"
-                       "It may need an RTX 50 card."
-                     : "The newer release: reported 20-30 percent faster and a subtler look\n"
-                       "(the RTX 40 conversion).";
+        : model == 1 ? "The first release's file (NBA 2K27). NVIDIA's original signed file\n"
+                       "may need an RTX 50 card; an RTX 40 conversion runs here."
+                     : "The newer file. It holds both networks (Network: A and B), so this\n"
+                       "is usually all you need.";
     ImGui::SetItemTooltip("%s", tip);
 }
 
@@ -188,6 +207,19 @@ void Panel::Draw() {
         ImGui::SetItemTooltip("The model's own looks: Standard is its default, Natural keeps "
                               "closer to the game,\nCinematic pushes light and contrast further.");
 
+        // ---- network preset ----
+        ImGui::SeparatorText("Network");
+        PresetButton("Default", 0,
+                     "The DLL's shipping default (in the newer file most likely B).");
+        ImGui::SameLine();
+        PresetButton("A: first model", 1,
+                     "Preset A: the first release's network (NBA 2K27). Reported to add more\n"
+                     "screen-space lighting - worth a look with the power effects.");
+        ImGui::SameLine();
+        PresetButton("B: newer model", 2,
+                     "Preset B: the newer network - reported 20-30 percent faster and a\n"
+                     "subtler look.");
+
         // ---- strength ----
         ImGui::SeparatorText("Strength");
         Slider("Intensity", &edit.intensity,
@@ -213,13 +245,14 @@ void Panel::Draw() {
             ImGui::SetItemTooltip("Let the model decide which parts of the picture it may edit "
                                   "(default on).");
             ImGui::SetNextItemWidth(160.0f);
-            ImGui::SliderInt("Preset", &edit.preset, 0, 15, edit.preset == 0 ? "default" : "%d",
-                             ImGuiSliderFlags_AlwaysClamp);
+            ImGui::SliderInt("Preset number", &edit.preset, 0, 15,
+                             edit.preset == 0 ? "default" : "%d", ImGuiSliderFlags_AlwaysClamp);
             if (ImGui::IsItemDeactivatedAfterEdit()) {
                 Commit();
             }
-            ImGui::SetItemTooltip("The model's internal preset. 0 = its default. A value it does "
-                                  "not know is refused (the status line says so).");
+            ImGui::SetItemTooltip("The same choice as Network, by number (0 default, 1 A, 2 B, "
+                                  "...). A number this DLL\ndoes not have falls back to its "
+                                  "default network (the model's own rule).");
             if (ImGui::Checkbox("UI correction", &edit.ui_correction)) {
                 Commit();
             }
@@ -238,12 +271,13 @@ void Panel::Draw() {
 
         // ---- model (usable whenever the folder was found, also after a failed start) ----
         if (!status.folder.empty()) {
-            ImGui::SeparatorText("Model (next launch)");
-            ModelButton("Model 1 (NBA 2K27)", 1, status);
+            ImGui::SeparatorText("Model file (next launch)");
+            ModelButton("NBA 2K27 file (model1)", 1, status);
             ImGui::SameLine();
-            ModelButton("Model 2 (newer)", 2, status);
+            ModelButton("Newer file (model2)", 2, status);
             const std::string loaded =
-                status.loaded_model > 0 ? "Loaded now: model " + std::to_string(status.loaded_model)
+                status.loaded_model > 0 ? "Loaded now: the model" + std::to_string(status.loaded_model) +
+                                          " folder's file"
                 : status.loaded_model == 0 ? std::string{"Loaded now: the file next to the forwarder"}
                                            : std::string{"Loaded now: none"};
             ImGui::TextDisabled("%s%s", loaded.c_str(),
