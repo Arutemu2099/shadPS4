@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
 #include "common/arch.h"
 #include "common/assert.h"
 #include "emulator.h"
@@ -14,6 +15,8 @@
 #endif
 
 void assert_fail_impl() {
+    std::fprintf(stderr, "FATAL-ASSERT-IMPL\n");
+    std::fflush(stderr);
     Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     Crash();
 }
@@ -24,6 +27,9 @@ void assert_fail_impl() {
 }
 
 void assert_fail_debug_msg(const char* msg) {
+    // 2026-10-17: Shutdown() ends the process before the asynchronous log writes the line below.
+    std::fprintf(stderr, "FATAL-ASSERT %s\n", msg);
+    std::fflush(stderr);
     LOG_CRITICAL(Debug, "Assertion Failed!\n{}", msg);
     assert_fail_impl();
 }
