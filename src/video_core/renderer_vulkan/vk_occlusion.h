@@ -105,13 +105,15 @@ public:
         // SHADPS4_OCCLUSION_TRACE=1 (2026-10-18, the headlamp flicker): the order of the guest's
         // dumps for 400 dumps after the 3,000th (block, begin / end, presented frame, the last
         // resolved count of the block).
-        static const bool trace = [] {
+        // =N: start after the Nth dump (1 = 3,000).
+        static const u64 trace = [] {
             const char* v = std::getenv("SHADPS4_OCCLUSION_TRACE");
-            return v && v[0] == '1';
+            const u64 n = v ? std::strtoull(v, nullptr, 10) : 0;
+            return n == 1 ? u64{3000} : n;
         }();
-        if (trace) [[unlikely]] {
+        if (trace != 0) [[unlikely]] {
             static u64 n = 0;
-            if (++n > 3000 && n <= 3400) {
+            if (++n > trace && n <= trace + 400) {
                 const u64 block = addr & ~u64{8};
                 const auto it = last_count.find(block);
                 LOG_INFO(Render_Vulkan, "OcclusionTrace: #{} {:#x} {} frame {} last {}", n, block,
