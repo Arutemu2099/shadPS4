@@ -206,7 +206,7 @@ void Panel::Draw() {
         ImGui::SetItemTooltip("Most story cutscenes are videos with no depth or motion data, so "
                               "DLSS 5 can only guess:\non them it mostly acts like colour "
                               "correction. Off by default. Subtitles are part of\nthe video, so the "
-                              "model sees them too.
+                              "model sees them too.");
         if (status.video_frames > 0) {
             ImGui::TextDisabled("Video frames so far: %llu",
                                 static_cast<unsigned long long>(status.video_frames));
