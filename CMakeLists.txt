@@ -956,6 +956,8 @@ if (ARCHITECTURE STREQUAL "x86_64")
     set(CORE ${CORE}
              src/core/cpu_patches.cpp
              src/core/cpu_patches.h
+             src/core/mouse_aim.cpp
+             src/core/mouse_aim.h
              ${FIBER_LIB})
 endif()
 

@@ -27,6 +27,8 @@ void ApplyMouseInputBlockers();
 /// SHADPS4_TOUCHPAD_BLOCK_FIX=1: while the mouse drives the pad (touchpad / gyro / stick), its
 /// presses and motion belong to the game, not to the ImGui overlay windows.
 bool MouseEventsBelongToPad();
+/// F7 (mouse to joystick) is on; with SHADPS4_MOUSE_AIM=1 the mouse turns the camera directly.
+bool IsMouseJoystickMode();
 /// SHADPS4_SYNTH_MOTION helpers.
 bool IsMouseGyroMode();
 bool IsMouseGyroRollMode();

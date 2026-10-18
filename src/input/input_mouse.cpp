@@ -6,6 +6,7 @@
 
 #include "common/assert.h"
 #include "common/types.h"
+#include "core/mouse_aim.h"
 #include "input/controller.h"
 #include "input/input_handler.h"
 #include "input_mouse.h"
@@ -55,11 +56,18 @@ bool IsMouseGyroMode() {
     return mouse_mode == MouseMode::Gyro;
 }
 
+bool IsMouseJoystickMode() {
+    return mouse_mode == MouseMode::Joystick;
+}
+
 bool IsMouseGyroRollMode() {
     return mouse_gyro_roll_mode;
 }
 
 void EmulateJoystick(GameController* controller, u32 interval) {
+    if (Core::MouseAim::Installed() && mouse_joystick_binding != 1) {
+        return; // SHADPS4_MOUSE_AIM: the mouse turns the camera itself (sdl_window.cpp)
+    }
 
     Axis axis_x, axis_y;
     switch (mouse_joystick_binding) {

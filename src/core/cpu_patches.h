@@ -51,6 +51,10 @@ struct RedZonePatchResult {
 void RegisterPatchModule(void* module_ptr, u64 module_size, void* trampoline_area_ptr,
                          u64 trampoline_area_size);
 
+/// Reserves `size` bytes (64-byte aligned, read / write / execute) in the trampoline area of the
+/// module containing `module_address`, within a near jump of its code. nullptr when full.
+u8* AllocateTrampolineSpace(const void* module_address, u64 size);
+
 /// Applies CPU patches that need to be done before beginning executions.
 void PrePatchInstructions(u64 segment_addr, u64 segment_size);
 

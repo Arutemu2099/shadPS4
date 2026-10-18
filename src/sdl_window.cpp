@@ -21,6 +21,7 @@
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/pad/pad.h"
 #include "core/libraries/system/userservice.h"
+#include "core/mouse_aim.h"
 #include "core/user_settings.h"
 #include "imgui/friends_layer.h"
 #include "imgui/renderer/imgui_core.h"
@@ -250,6 +251,10 @@ void WindowSDL::WaitEvent() {
         OnResize();
         break;
     case SDL_EVENT_MOUSE_MOTION:
+        if (Core::MouseAim::Installed() && Input::IsMouseJoystickMode()) {
+            // SHADPS4_MOUSE_AIM: every pixel goes straight to the camera's pan / tilt.
+            Core::MouseAim::OnMouseMotion(event.motion.xrel, event.motion.yrel);
+        }
         if (Input::g_synth_motion && Input::IsMouseGyroMode()) {
             // SHADPS4_SYNTH_MOTION: every pixel counts, consumed by the 4 ms pushes.
             Input::g_synth_dx.fetch_add(event.motion.xrel, std::memory_order_relaxed);
@@ -299,6 +304,14 @@ void WindowSDL::WaitEvent() {
                                                     "DLSS jitter: C (+x -y)", "DLSS jitter: D (-x -y)"};
                 Overlay::ShowNotice(names[combo]);
             }
+        }
+        if (Core::MouseAim::Installed() && Input::IsMouseJoystickMode() &&
+            event.type == SDL_EVENT_KEY_DOWN &&
+            (event.key.key == SDLK_LEFTBRACKET || event.key.key == SDLK_RIGHTBRACKET)) {
+            // SHADPS4_MOUSE_AIM: [ / ] = mouse sensitivity down / up.
+            const float s =
+                Core::MouseAim::ScaleSensitivity(event.key.key == SDLK_LEFTBRACKET ? 0.8f : 1.25f);
+            Overlay::ShowNotice(fmt::format("Mouse aim: {:.1f} degrees per 100 px", s).c_str());
         }
         if (Input::g_stick_smoothing_toggle && event.type == SDL_EVENT_KEY_DOWN &&
             event.key.key == SDLK_F1 && !event.key.repeat) {
@@ -365,6 +378,11 @@ void WindowSDL::WaitEvent() {
         SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(),
                                        Input::ToggleMouseModeTo(Input::MouseMode::Joystick));
         SyncSyntheticMotion();
+        if (Core::MouseAim::Installed()) {
+            Overlay::ShowNotice(Input::IsMouseJoystickMode()
+                                    ? "Mouse aim ON ([ ] sensitivity, F7 off)"
+                                    : "Mouse aim off");
+        }
         break;
     case SDL_EVENT_MOUSE_TO_GYRO:
         SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(),

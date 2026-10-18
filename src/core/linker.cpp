@@ -25,6 +25,7 @@
 #include "core/libraries/sysmodule/sysmodule.h"
 #include "core/linker.h"
 #include "core/memory.h"
+#include "core/mouse_aim.h"
 #include "core/tls.h"
 #include "ipc/ipc.h"
 
@@ -223,6 +224,11 @@ void Linker::Execute(const std::vector<std::string>& args) {
                 &addr, 0x10000, 0x13, 0, phys_addr, 0x10000, "SceGnmDriver");
         }
         ASSERT_MSG(result == 0, "Unable to emulate libSceGnmDriver initialization");
+
+#ifdef ARCH_X86_64
+        // SHADPS4_MOUSE_AIM=1: the camera hook goes into the eboot before its entry runs.
+        Core::MouseAim::InstallCameraHook(module->GetBaseAddress(), module->aligned_base_size);
+#endif
 
         // Add all guest arguments, we will always have the executable path in argv[0]
         EntryParams& params = Libraries::Kernel::entry_params;
