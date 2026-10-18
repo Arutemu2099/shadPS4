@@ -39,6 +39,14 @@ float g_sign_x = -1.0f; // mouse right -> turn right (user live, 10-17; SHADPS4_
 float g_sign_y = 1.0f; // mouse up -> look up with the in-game invert off (user live, 10-17)
 /// Tick (timer thread): the camera hook ran within the last StaleAfter.
 std::atomic<bool> g_live{false};
+/// The game's "no auto-follow" byte (eboot .bss 0x800e16c40, read only at 0x80014936e: when set,
+/// FUN_800149360 turns the camera's auto-follow off through the game's own off path). The right
+/// stick turns follow off through the ManualCamera event (pad+0x1c > 0); the mouse never sets it,
+/// so without this the camera keeps swinging behind the player (user live test, 2026-10-17;
+/// trace scratch/autocam-20261017). Set while the mouse moves, cleared FollowHold after the last
+/// movement so the game's own follow comes back.
+volatile u8* g_no_follow = nullptr;
+std::atomic<s64> g_last_motion_ns{0};
 constexpr auto StaleAfter = std::chrono::milliseconds(250);
 
 #ifdef MOUSE_AIM_SUPPORTED
@@ -47,6 +55,7 @@ constexpr auto StaleAfter = std::chrono::milliseconds(250);
 constexpr u64 StoreOffset = 0x14ebce;   ///< vmovups [r13+0x330], xmm0 (9 bytes)
 constexpr u64 InvertXOffset = 0xefb3cd; ///< options +0x6d5: invert camera X
 constexpr u64 InvertYOffset = 0xefb3ce; ///< options +0x6d6: invert camera Y
+constexpr u64 NoFollowOffset = 0xe16c40; ///< .bss byte read by FUN_800149360
 // The two stores before and the one after, as the game ships them: the patch only goes in
 // when all 27 bytes match.
 constexpr u8 Expected[27] = {
@@ -184,14 +193,18 @@ void InstallCameraHook(VAddr eboot_base, u64 eboot_size) {
     VirtualProtect(site, sizeof(patch), old_protect, &old_protect);
     FlushInstructionCache(GetCurrentProcess(), site, sizeof(patch));
 
+    if (eboot_size > NoFollowOffset) {
+        g_no_follow = reinterpret_cast<volatile u8*>(eboot_base + NoFollowOffset);
+    }
     g_invert_x = reinterpret_cast<const volatile u8*>(eboot_base + InvertXOffset);
     g_invert_y = reinterpret_cast<const volatile u8*>(eboot_base + InvertYOffset);
     g_mailbox.store(mailbox, std::memory_order_release);
     LOG_INFO(Core,
              "Mouse aim: camera hook at {:#x} -> cave {} ({} bytes), mailbox {}, {:.1f} deg per "
-             "100 px, signs x {} y {}, tilt clamp {}",
+             "100 px, signs x {} y {}, tilt clamp {}, follow byte {}",
              eboot_base + StoreOffset, fmt::ptr(cave_code), cave_size, fmt::ptr(mailbox),
-             g_sens_deg.load(), g_sign_x, g_sign_y, clamp_tilt);
+             g_sens_deg.load(), g_sign_x, g_sign_y, clamp_tilt,
+             fmt::ptr(const_cast<u8*>(g_no_follow)));
 #else
     (void)eboot_base;
     (void)eboot_size;
@@ -222,6 +235,25 @@ void Tick() {
         // camera in one jump when gameplay resumes.
         std::atomic_ref<u64>{mb->delta}.store(0, std::memory_order_relaxed);
     }
+    // SHADPS4_MOUSE_AIM_FOLLOW_HOLD = seconds the game's auto-follow stays off after the last
+    // mouse movement (default 1.5; 0 = never touch it).
+    static const s64 hold_ns = [] {
+        const char* v = std::getenv("SHADPS4_MOUSE_AIM_FOLLOW_HOLD");
+        const double s = v ? std::atof(v) : 1.5;
+        return static_cast<s64>(std::clamp(s, 0.0, 100000.0) * 1e9);
+    }();
+    if (g_no_follow != nullptr && hold_ns > 0) {
+        const s64 now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               now.time_since_epoch())
+                               .count();
+        const s64 last = g_last_motion_ns.load(std::memory_order_relaxed);
+        const u8 want = last != 0 && now_ns - last < hold_ns ? 1 : 0;
+        static u8 written = 0;
+        if (want != written) { // only on changes: the game itself never writes it (measured)
+            *g_no_follow = want;
+            written = want;
+        }
+    }
     if (live != g_live.load(std::memory_order_relaxed)) {
         g_live.store(live, std::memory_order_relaxed);
         LOG_DEBUG(Core, "Mouse aim: camera {}", live ? "live" : "idle");
@@ -234,6 +266,10 @@ void OnMouseMotion(float xrel, float yrel) {
         !g_live.load(std::memory_order_relaxed)) {
         return;
     }
+    g_last_motion_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count(),
+                           std::memory_order_relaxed);
     const float k = g_sens_deg.load(std::memory_order_relaxed) *
                     (std::numbers::pi_v<float> / 180.0f) / 100.0f;
     float yaw = xrel * k * g_sign_x;
