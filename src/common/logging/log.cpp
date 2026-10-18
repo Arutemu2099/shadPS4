@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -250,14 +251,20 @@ void Terminate() {
             std::rethrow_exception(eptr);
         }
 
+        std::fprintf(stderr, "FATAL-TERMINATE without exception\n");
+        std::fflush(stderr);
         LOG_CRITICAL(Debug, "Exiting without exception");
 
         std::quick_exit(std::to_underlying(ShadPs4ReturnCode::TERMINATE_WITHOUT_EXCEPTION));
     } catch (const std::exception& exception) {
+        std::fprintf(stderr, "FATAL-TERMINATE exception: %s\n", exception.what());
+        std::fflush(stderr);
         LOG_CRITICAL(Debug, "Exception: {}", exception);
 
         std::quick_exit(std::to_underlying(ShadPs4ReturnCode::TERMINATE_WITH_EXCEPTION));
     } catch (...) {
+        std::fprintf(stderr, "FATAL-TERMINATE unknown exception\n");
+        std::fflush(stderr);
         LOG_CRITICAL(Debug, "Unknown exception caught");
 
         std::quick_exit(std::to_underlying(ShadPs4ReturnCode::TERMINATE_WITH_UNKNOWN_EXCEPTION));

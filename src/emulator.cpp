@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
 #include <algorithm>
 #include <ctime>
 #include <filesystem>
@@ -690,6 +691,8 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     UpdatePlayTime(id);
     Storage::DataBase::Instance().Close();
 
+    std::fprintf(stderr, "EXIT-PATH the main loop ended (window closed)\n");
+    std::fflush(stderr);
     std::quick_exit(0);
 }
 
