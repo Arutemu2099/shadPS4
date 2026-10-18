@@ -250,6 +250,28 @@ void WindowSDL::WaitEvent() {
         Input::MouseEventsBelongToPad() &&
         (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == SDL_EVENT_MOUSE_MOTION ||
          event.type == SDL_EVENT_MOUSE_WHEEL);
+    // DLSS 5 (vk_dlss5.h): End = on / off, Page Up = its panel (2026-10-18; Page Up was the
+    // jitter cycle, whose pick D is fixed now - Page Down still cycles). Handled before ImGui and
+    // consumed: once the panel has the keyboard ImGui swallowed Page Up, so the key could not
+    // close it (user 2026-10-18). Not with Ctrl: Ctrl+Shift+End is the quit hotkey.
+    if (Vulkan::Dlss::Enabled() && event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
+        (event.key.key == SDLK_END || event.key.key == SDLK_PAGEUP) &&
+        !(event.key.mod & SDL_KMOD_CTRL)) {
+        if (event.key.key == SDLK_PAGEUP) {
+            Dlss5Panel::Toggle();
+        } else if (Vulkan::Dlss5::GetStatus().state != Vulkan::Dlss5::State::Ready) {
+            const auto status = Vulkan::Dlss5::GetStatus();
+            Overlay::ShowNotice(status.state == Vulkan::Dlss5::State::NotFound
+                                    ? "DLSS 5 not found (dlss5 folder)"
+                                    : "DLSS 5 not available (Page Up shows why)");
+        } else {
+            const bool on = Vulkan::Dlss5::ToggleEnabled();
+            LOG_INFO(Render_Vulkan, "DLSS 5: {} (End)", on ? "on" : "off");
+            Overlay::ShowNotice(on ? "DLSS 5: ON" : "DLSS 5: OFF (DLSS 4.5 only)");
+        }
+        return;
+    }
+
     if (!mouse_to_pad && ImGui::Core::ProcessEvent(&event)) {
         return;
     }
@@ -332,25 +354,6 @@ void WindowSDL::WaitEvent() {
             // touchpad in the PC layout; X also toggles the mouse motion mode there (global.ini).
             (event.key.key == SDLK_X ? Input::g_synth_rattle : Input::g_synth_tilt)
                 .store(event.type == SDL_EVENT_KEY_DOWN, std::memory_order_relaxed);
-        }
-        if (Vulkan::Dlss::Enabled() && event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
-            (event.key.key == SDLK_END || event.key.key == SDLK_PAGEUP) &&
-            !(event.key.mod & SDL_KMOD_CTRL)) {
-            // DLSS 5 (vk_dlss5.h): End = on / off, Page Up = its panel (2026-10-18; Page Up was
-            // the jitter cycle, whose pick D is fixed now - Page Down still cycles). Not with Ctrl:
-            // Ctrl+Shift+End is the quit hotkey.
-            if (event.key.key == SDLK_PAGEUP) {
-                Dlss5Panel::Toggle();
-            } else if (Vulkan::Dlss5::GetStatus().state != Vulkan::Dlss5::State::Ready) {
-                const auto status = Vulkan::Dlss5::GetStatus();
-                Overlay::ShowNotice(status.state == Vulkan::Dlss5::State::NotFound
-                                        ? "DLSS 5 not found (dlss5 folder)"
-                                        : "DLSS 5 not available (Page Up shows why)");
-            } else {
-                const bool on = Vulkan::Dlss5::ToggleEnabled();
-                LOG_INFO(Render_Vulkan, "DLSS 5: {} (End)", on ? "on" : "off");
-                Overlay::ShowNotice(on ? "DLSS 5: ON" : "DLSS 5: OFF (DLSS 4.5 only)");
-            }
         }
         if (Vulkan::Dlss::Enabled() && event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
             (event.key.key == SDLK_HOME || event.key.key == SDLK_PAGEDOWN ||

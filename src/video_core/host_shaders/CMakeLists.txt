@@ -13,6 +13,7 @@ set(SHADER_FILES
     detilers/micro_8bpp.comp
     color_to_ms_depth.frag
     dlss_composite.comp
+    dlss5_compose.comp
     ms_image_blit.frag
     fault_buffer_process.comp
     fs_tri.vert

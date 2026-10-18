@@ -7,6 +7,8 @@
 //   CreateFeature / EvaluateFeature / ReleaseFeature, reached through the forwarder's
 //   dlssnr_vk_probe / _init / _create / _evaluate / _release;
 // - inputs colour, depth, motion vectors, one output; the tuning is read at create;
+// - multi-pass = one feature per pass on the previous answer, a new pass used from the next frame
+//   (DlssNr_Menu.cpp "Model passes"); never rebuild every frame (the driver stops answering);
 // - the device needs VK_NVX_binary_import and VK_NVX_image_view_handle (plus push descriptors and
 //   buffer device address, which the emulator enables anyway).
 
@@ -22,6 +24,8 @@
 
 #include <algorithm>
 #include <array>
+#include <initializer_list>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -38,11 +42,15 @@
 
 #include <fmt/format.h>
 
+#include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "core/libraries/videodec/video_activity.h"
+#include "video_core/host_shaders/dlss5_compose_comp.h"
 #include "video_core/renderer_vulkan/vk_dlss5.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/texture_cache/image.h"
 
 namespace Vulkan::Dlss5 {
@@ -317,6 +325,7 @@ struct Forwarder {
 struct OwnedImage {
     VideoCore::UniqueImage image;
     vk::UniqueImageView view;
+    vk::Format format;
 };
 
 constexpr vk::ImageUsageFlags OwnedUsage =
@@ -328,9 +337,46 @@ constexpr vk::ImageSubresourceRange ColorRange{
     .levelCount = 1,
     .layerCount = 1,
 };
+constexpr int MaxPasses = 3;
 
-// Everything below runs on the thread that records the DLSS resolve, except the settings and
-// the status, which the panel reads and writes from the ImGui thread (under g_mutex).
+/// One chain of model features and its images: gameplay (1-3 passes) or video (1 pass).
+struct Lane {
+    std::array<void*, MaxPasses> features{};
+    std::array<u32, MaxPasses> feature_gen{~0u, ~0u, ~0u};
+    std::array<u64, MaxPasses> built_at{}; ///< g.applies when created
+    std::unique_ptr<OwnedImage> input;     ///< the frame for the model: encoded true colour
+    std::array<std::unique_ptr<OwnedImage>, MaxPasses> out; ///< each pass's answer
+    std::unique_ptr<OwnedImage> composed;  ///< what goes on (DLSS 4.5 / the post pass)
+    u32 width = 0;
+    u32 height = 0;
+    u32 failed_gen = ~0u; ///< the model refused these settings; wait for a change
+    u32 eval_failures = 0;
+    bool was_off = true;
+};
+
+struct ComposeParams {
+    u32 mode;
+    u32 src_linear;
+    u32 compare;
+    float split;
+    float transfer;
+    float colour;
+    float max_ratio;
+    float saturation;
+};
+static_assert(sizeof(ComposeParams) == 32);
+
+struct ComposePipeline {
+    vk::UniqueSampler sampler;
+    vk::UniqueDescriptorSetLayout set_layout;
+    vk::UniquePipelineLayout layout;
+    vk::UniquePipeline pipeline;
+};
+
+// The model state below is used by the thread that records the DLSS resolve (gameplay) and by
+// the presenter's recording (video), which may be another thread: every use holds g_model_mutex
+// (the fork's "one lock" rule). The settings and the status are read by the panel and the window
+// thread too (under g_mutex).
 struct Context {
     Forwarder fwd;
     NgxParameters params;
@@ -338,19 +384,19 @@ struct Context {
     vk::Device device;
     float timestamp_period = 0.0f;
 
-    void* feature = nullptr;
-    u32 feature_gen = ~0u;
-    u32 failed_gen = ~0u; ///< the model refused these settings; wait for a change
-    u32 eval_failures = 0;
-    bool was_off = true;
-    u64 applies = 0;
+    u64 applies = 0; ///< every lane's runs: the clock retired objects wait on
     std::deque<std::pair<u64, void*>> retired_features;
     std::deque<std::pair<u64, std::unique_ptr<OwnedImage>>> retired_images;
 
-    std::unique_ptr<OwnedImage> input;  ///< the game's frame, RGBA16F (sRGB-encoded values)
-    std::unique_ptr<OwnedImage> output; ///< the model's answer, RGBA16F
-    u32 width = 0;
-    u32 height = 0;
+    Lane game;
+    Lane video;
+    std::unique_ptr<OwnedImage> video_depth;  ///< R32F, one flat value
+    std::unique_ptr<OwnedImage> video_motion; ///< RG16F, zero
+    float video_depth_value = -1.0f;
+    u64 game_frames = 0;
+    u64 video_frames = 0;
+
+    std::unique_ptr<ComposePipeline> compose;
 
     VkQueryPool query_pool = VK_NULL_HANDLE;
     bool slot_written[TimingSlots]{};
@@ -360,8 +406,9 @@ struct Context {
 };
 
 Context g;
-std::mutex g_mutex;      ///< g_settings, g_status
-std::mutex g_file_mutex; ///< dlss5-settings.ini
+std::mutex g_model_mutex; ///< g (the model, its features and images)
+std::mutex g_mutex;       ///< g_settings, g_status
+std::mutex g_file_mutex;  ///< dlss5-settings.ini
 Settings g_settings;
 Status g_status;
 std::atomic<u32> g_generation{1};
@@ -399,20 +446,10 @@ std::filesystem::path ExeDir() {
 #endif
 }
 
-/// Where model `n` lives: 0 = next to the forwarder, 1 / 2 = model1\ / model2\ (name kept).
-std::filesystem::path ModelFile(const std::filesystem::path& dir, int n) {
-    return n == 0 ? dir / ModelName : dir / (n == 1 ? "model1" : "model2") / ModelName;
-}
-
-bool HasModel(const std::filesystem::path& dir, int n) {
-    std::error_code ec;
-    return std::filesystem::is_regular_file(ModelFile(dir, n), ec);
-}
-
 bool HasBoth(const std::filesystem::path& dir) {
     std::error_code ec;
     return !dir.empty() && std::filesystem::is_regular_file(dir / ForwarderName, ec) &&
-           (HasModel(dir, 0) || HasModel(dir, 1) || HasModel(dir, 2));
+           std::filesystem::is_regular_file(dir / ModelName, ec);
 }
 
 // ---- settings file (key = value, one per line) ---------------------------------------------
@@ -457,8 +494,24 @@ void LoadSettingsFile() {
             s.ui_correction = i != 0;
         } else if (key == "mv_mode") {
             s.mv_mode = std::clamp(i, 0, 2);
-        } else if (key == "model") {
-            s.model = std::clamp(i, 1, 2);
+        } else if (key == "video") {
+            s.video = i != 0;
+        } else if (key == "video_depth") {
+            s.video_depth = std::clamp(f, 0.0f, 1.0f);
+        } else if (key == "passes") {
+            s.passes = std::clamp(i, 1, MaxPasses);
+        } else if (key == "transfer") {
+            s.transfer = std::clamp(f, 0.0f, 1.5f);
+        } else if (key == "colour") {
+            s.colour = std::clamp(f, 0.0f, 1.0f);
+        } else if (key == "saturation") {
+            s.saturation = std::clamp(f, 0.5f, 1.5f);
+        } else if (key == "max_ratio") {
+            s.max_ratio = std::clamp(f, 1.1f, 8.0f);
+        } else if (key == "compare") {
+            s.compare = i != 0;
+        } else if (key == "split") {
+            s.split = std::clamp(f, 0.0f, 1.0f);
         }
     }
     std::scoped_lock lock{g_mutex};
@@ -486,8 +539,15 @@ void SaveSettingsFile(const Settings& s) {
         << "preset = " << s.preset << "\n"
         << "ui_correction = " << (s.ui_correction ? 1 : 0) << "\n"
         << "mv_mode = " << s.mv_mode << "\n"
-        << "# model: 1 = model1 folder, 2 = model2 folder (read at launch)\n"
-        << "model = " << s.model << "\n";
+        << "video = " << (s.video ? 1 : 0) << "\n"
+        << "video_depth = " << s.video_depth << "\n"
+        << "passes = " << s.passes << "\n"
+        << "transfer = " << s.transfer << "\n"
+        << "colour = " << s.colour << "\n"
+        << "saturation = " << s.saturation << "\n"
+        << "max_ratio = " << s.max_ratio << "\n"
+        << "compare = " << (s.compare ? 1 : 0) << "\n"
+        << "split = " << s.split << "\n";
 }
 
 // ---- start-up -----------------------------------------------------------------------------
@@ -540,15 +600,16 @@ bool SelfTest() {
     return true;
 }
 
-// ---- per frame helpers --------------------------------------------------------------------
+// ---- images, features, timing ---------------------------------------------------------------
 
 std::unique_ptr<OwnedImage> MakeImage(const Instance& instance, u32 width, u32 height,
-                                      const char* name) {
+                                      vk::Format format, const char* name) {
     auto t = std::make_unique<OwnedImage>();
+    t->format = format;
     t->image = VideoCore::UniqueImage(g.device, instance.GetAllocator());
     t->image.Create(vk::ImageCreateInfo{
         .imageType = vk::ImageType::e2D,
-        .format = OwnedFormat,
+        .format = format,
         .extent{width, height, 1},
         .mipLevels = 1,
         .arrayLayers = 1,
@@ -560,7 +621,7 @@ std::unique_ptr<OwnedImage> MakeImage(const Instance& instance, u32 width, u32 h
     t->view = Check<"create dlss5 view">(g.device.createImageViewUnique({
         .image = t->image,
         .viewType = vk::ImageViewType::e2D,
-        .format = OwnedFormat,
+        .format = format,
         .subresourceRange = ColorRange,
     }));
     return t;
@@ -570,7 +631,7 @@ Dlss::EvalImage AsEval(const OwnedImage& img, u32 width, u32 height) {
     return Dlss::EvalImage{
         .image = img.image,
         .view = img.view.get(),
-        .format = OwnedFormat,
+        .format = img.format,
         .layout = vk::ImageLayout::eGeneral,
         .usage = OwnedUsage,
         .width = width,
@@ -579,11 +640,28 @@ Dlss::EvalImage AsEval(const OwnedImage& img, u32 width, u32 height) {
     };
 }
 
-void RetireFeature() {
-    if (g.feature) {
-        g.retired_features.emplace_back(g.applies, g.feature);
-        g.feature = nullptr;
+void Retire(std::unique_ptr<OwnedImage>& img) {
+    if (img) {
+        g.retired_images.emplace_back(g.applies, std::move(img));
     }
+}
+
+void RetireFeature(Lane& lane, int pass) {
+    if (lane.features[pass]) {
+        g.retired_features.emplace_back(g.applies, lane.features[pass]);
+        lane.features[pass] = nullptr;
+    }
+}
+
+void RetireLane(Lane& lane) {
+    for (int k = 0; k < MaxPasses; ++k) {
+        RetireFeature(lane, k);
+        Retire(lane.out[k]);
+    }
+    Retire(lane.input);
+    Retire(lane.composed);
+    lane.width = 0;
+    lane.height = 0;
 }
 
 void FreeRetired(bool all) {
@@ -598,12 +676,224 @@ void FreeRetired(bool all) {
     }
 }
 
+/// The lane's images at w x h: input, `passes` answers, composed (made / remade as needed).
+void EnsureImages(const Instance& instance, Lane& lane, u32 w, u32 h, int passes,
+                  const char* name) {
+    if (lane.input && (lane.width != w || lane.height != h)) {
+        RetireLane(lane);
+    }
+    if (!lane.input) {
+        lane.input = MakeImage(instance, w, h, OwnedFormat, "DLSS 5 input");
+        lane.composed = MakeImage(instance, w, h, OwnedFormat, "DLSS 5 composed");
+        lane.width = w;
+        lane.height = h;
+        LOG_INFO(Render_Vulkan, "DLSS 5: {} images {}x{}", name, w, h);
+    }
+    for (int k = 0; k < passes; ++k) {
+        if (!lane.out[k]) {
+            lane.out[k] = MakeImage(instance, w, h, OwnedFormat, "DLSS 5 pass");
+        }
+    }
+}
+
+void EnsureCompose() {
+    if (g.compose) {
+        return;
+    }
+    auto c = std::make_unique<ComposePipeline>();
+    c->sampler = Check<"create dlss5 sampler">(g.device.createSamplerUnique(vk::SamplerCreateInfo{
+        .magFilter = vk::Filter::eNearest,
+        .minFilter = vk::Filter::eNearest,
+        .mipmapMode = vk::SamplerMipmapMode::eNearest,
+        .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+        .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+        .addressModeW = vk::SamplerAddressMode::eClampToEdge,
+        .maxAnisotropy = 1.0f,
+        .minLod = 0.0f,
+        .maxLod = 0.0f,
+    }));
+    const vk::Sampler sampler = c->sampler.get();
+    const std::array<vk::DescriptorSetLayoutBinding, 5> bindings{{
+        {.binding = 0,
+         .descriptorType = vk::DescriptorType::eSampledImage,
+         .descriptorCount = 1,
+         .stageFlags = vk::ShaderStageFlagBits::eCompute},
+        {.binding = 1,
+         .descriptorType = vk::DescriptorType::eStorageImage,
+         .descriptorCount = 1,
+         .stageFlags = vk::ShaderStageFlagBits::eCompute},
+        {.binding = 2,
+         .descriptorType = vk::DescriptorType::eStorageImage,
+         .descriptorCount = 1,
+         .stageFlags = vk::ShaderStageFlagBits::eCompute},
+        {.binding = 3,
+         .descriptorType = vk::DescriptorType::eStorageImage,
+         .descriptorCount = 1,
+         .stageFlags = vk::ShaderStageFlagBits::eCompute},
+        {.binding = 4,
+         .descriptorType = vk::DescriptorType::eSampler,
+         .descriptorCount = 1,
+         .stageFlags = vk::ShaderStageFlagBits::eCompute,
+         .pImmutableSamplers = &sampler},
+    }};
+    c->set_layout = Check<"create dlss5 set layout">(g.device.createDescriptorSetLayoutUnique({
+        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptor,
+        .bindingCount = static_cast<u32>(bindings.size()),
+        .pBindings = bindings.data(),
+    }));
+    const vk::PushConstantRange push{
+        .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        .offset = 0,
+        .size = sizeof(ComposeParams),
+    };
+    c->layout = Check<"create dlss5 layout">(g.device.createPipelineLayoutUnique({
+        .setLayoutCount = 1,
+        .pSetLayouts = &c->set_layout.get(),
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &push,
+    }));
+    const auto module = Compile(HostShaders::DLSS5_COMPOSE_COMP, vk::ShaderStageFlagBits::eCompute,
+                                g.device);
+    ASSERT(module);
+    c->pipeline = Check<"create dlss5 pipeline">(g.device.createComputePipelineUnique(
+        {}, vk::ComputePipelineCreateInfo{
+                .stage{
+                    .stage = vk::ShaderStageFlagBits::eCompute,
+                    .module = module,
+                    .pName = "main",
+                },
+                .layout = c->layout.get(),
+            }));
+    g.device.destroyShaderModule(module);
+    g.compose = std::move(c);
+}
+
+/// One pass of dlss5_compose.comp. `src` is sampled in `src_layout`; the three storage images
+/// are in GENERAL. Unused bindings get valid views anyway (the shader declares them all).
+void Dispatch(vk::CommandBuffer cmd, const ComposeParams& params, vk::ImageView src,
+              vk::ImageLayout src_layout, vk::ImageView original, vk::ImageView model,
+              vk::ImageView dst, u32 w, u32 h) {
+    const vk::DescriptorImageInfo src_info{.imageView = src, .imageLayout = src_layout};
+    const vk::DescriptorImageInfo original_info{.imageView = original,
+                                                .imageLayout = vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo model_info{.imageView = model,
+                                             .imageLayout = vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo dst_info{.imageView = dst,
+                                           .imageLayout = vk::ImageLayout::eGeneral};
+    const std::array<vk::WriteDescriptorSet, 4> writes{{
+        {.dstBinding = 0,
+         .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eSampledImage,
+         .pImageInfo = &src_info},
+        {.dstBinding = 1,
+         .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eStorageImage,
+         .pImageInfo = &original_info},
+        {.dstBinding = 2,
+         .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eStorageImage,
+         .pImageInfo = &model_info},
+        {.dstBinding = 3,
+         .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eStorageImage,
+         .pImageInfo = &dst_info},
+    }};
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, g.compose->pipeline.get());
+    cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g.compose->layout.get(), 0, writes);
+    cmd.pushConstants(g.compose->layout.get(), vk::ShaderStageFlagBits::eCompute, 0,
+                      sizeof(ComposeParams), &params);
+    cmd.dispatch((w + 7) / 8, (h + 7) / 8, 1);
+}
+
+/// Everything written before is visible to everything after (one global barrier: these passes
+/// are a handful per frame).
+void FullBarrier(vk::CommandBuffer cmd) {
+    const vk::MemoryBarrier2 barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+    };
+    cmd.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &barrier,
+    });
+}
+
+/// The images about to be fully rewritten: discard into GENERAL after all earlier use.
+void ToGeneral(vk::CommandBuffer cmd, std::initializer_list<const OwnedImage*> images) {
+    std::array<vk::ImageMemoryBarrier2, MaxPasses + 4> barriers{};
+    u32 n = 0;
+    for (const OwnedImage* img : images) {
+        if (!img || n >= barriers.size()) {
+            continue;
+        }
+        barriers[n++] = vk::ImageMemoryBarrier2{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eNone,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead |
+                             vk::AccessFlagBits2::eTransferWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .image = img->image,
+            .subresourceRange = ColorRange,
+        };
+    }
+    cmd.pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = n,
+        .pImageMemoryBarriers = barriers.data(),
+    });
+}
+
+ComposeParams MakeParams(u32 mode, const Settings& s, bool src_linear) {
+    return ComposeParams{
+        .mode = mode,
+        .src_linear = src_linear ? 1u : 0u,
+        .compare = s.compare ? 1u : 0u,
+        .split = s.split,
+        .transfer = s.transfer,
+        .colour = s.colour,
+        .max_ratio = s.max_ratio,
+        .saturation = s.saturation,
+    };
+}
+
+void* CreateFeature(vk::CommandBuffer cmd, const Settings& s, u32 w, u32 h) {
+    const float skin = s.skin_follows ? -1.0f : s.skin_structure;
+    return g.fwd.create(static_cast<VkCommandBuffer>(cmd), &g.params, w, h, s.preset, s.intensity,
+                        s.style, s.local_structure, s.local_tone, skin, s.auto_mask ? 1 : 0,
+                        s.ui_correction ? 1 : 0);
+}
+
+/// One model run. False = refused (logged by the caller).
+bool Evaluate(vk::CommandBuffer cmd, void* feature, const Settings& s, const Dlss::EvalImage& color,
+              const Dlss::EvalImage& depth, const Dlss::EvalImage& motion,
+              const Dlss::EvalImage& output, float mv_x, float mv_y, bool reset, int* result) {
+    const float skin = s.skin_follows ? -1.0f : s.skin_structure;
+    NgxResourceVk res_color = MakeResource(color, false);
+    NgxResourceVk res_depth = MakeResource(depth, false);
+    NgxResourceVk res_motion = MakeResource(motion, false);
+    NgxResourceVk res_output = MakeResource(output, true);
+    *result = g.fwd.evaluate(static_cast<VkCommandBuffer>(cmd), feature, &g.params, &res_color,
+                             &res_depth, &res_motion, &res_output, color.width, color.height,
+                             depth.width, depth.height, /*depth inverted*/ 1, reset ? 1 : 0,
+                             s.intensity, s.style, s.local_structure, s.local_tone, skin,
+                             s.auto_mask ? 1 : 0, mv_x, mv_y);
+    // The block outlives this call and the four resources live on this stack: a later create
+    // must not find them.
+    for (const char* name : {"DLSSNR.Color", "DLSSNR.Depth", "DLSSNR.MVec", "DLSSNR.Output"}) {
+        g.params.SetPtr(name, nullptr);
+    }
+    return *result == 1;
+}
+
 void ReadTiming() {
     if (g.query_pool == VK_NULL_HANDLE) {
         return;
     }
-    // The oldest slot: written TimingSlots - 1 frames ago, long executed.
-    const u32 slot = static_cast<u32>((g.applies + 1) % TimingSlots);
+    // The oldest slot: written TimingSlots - 1 gameplay frames ago, long executed.
+    const u32 slot = static_cast<u32>((g.game_frames + 1) % TimingSlots);
     if (!g.slot_written[slot]) {
         return;
     }
@@ -626,9 +916,9 @@ void ReadTiming() {
             g_status.gpu_ms_avg = avg;
             g_status.gpu_ms_max = g.window_max;
         }
-        if ((g.applies / 120) % 5 == 0) {
-            LOG_INFO(Render_Vulkan, "DLSS 5: model GPU time {:.2f} ms avg, {:.2f} ms max ({} frames)",
-                     avg, g.window_max, g.applies);
+        if ((g.game_frames / 120) % 5 == 0) {
+            LOG_INFO(Render_Vulkan, "DLSS 5: GPU time {:.2f} ms avg, {:.2f} ms max ({} frames)", avg,
+                     g.window_max, g.game_frames);
         }
         g.window_sum = 0.0f;
         g.window_max = 0.0f;
@@ -636,12 +926,65 @@ void ReadTiming() {
     }
 }
 
-void SetRunning(bool running) {
+void SetRunning(bool running, int passes) {
     std::scoped_lock lock{g_mutex};
     g_status.running = running;
-    g_status.frames = g.applies;
-    g_status.width = g.width;
-    g_status.height = g.height;
+    g_status.passes_running = running ? passes : 0;
+    g_status.frames = g.game_frames;
+    g_status.width = g.game.width;
+    g_status.height = g.game.height;
+}
+
+void SetVideoRunning(bool running) {
+    std::scoped_lock lock{g_mutex};
+    g_status.video_running = running;
+    g_status.video_frames = g.video_frames;
+}
+
+/// Builds / rebuilds the lane's pass-`k` feature for this generation. Pass 0 is used the frame
+/// it is built; a later pass only from the next frame (the fork's rule: building one and running
+/// it in the same command buffer hung the GPU in multi-pass). False = refused.
+bool EnsureFeature(vk::CommandBuffer cmd, Lane& lane, int k, const Settings& s, u32 gen, u32 w,
+                   u32 h, const char* name) {
+    if (lane.features[k] && lane.feature_gen[k] == gen) {
+        return true;
+    }
+    RetireFeature(lane, k);
+    lane.features[k] = CreateFeature(cmd, s, w, h);
+    if (!lane.features[k]) {
+        const int code = g.fwd.last_create ? *g.fwd.last_create : 0;
+        LOG_ERROR(Render_Vulkan, "DLSS 5: the model would not build {} pass {} ({:#x}) at {}x{}",
+                  name, k + 1, static_cast<u32>(code), w, h);
+        lane.failed_gen = gen;
+        SetMessage(fmt::format("The model refused these settings (code {:#x}). Change a setting "
+                               "or press Defaults.",
+                               static_cast<u32>(code)));
+        return false;
+    }
+    lane.feature_gen[k] = gen;
+    lane.built_at[k] = g.applies;
+    lane.eval_failures = 0;
+    LOG_INFO(Render_Vulkan,
+             "DLSS 5: {} pass {} up at {}x{} (style {}, network {}, intensity {:.2f}, structure "
+             "{:.2f}, tone {:.2f}, skin {:.2f}, auto mask {})",
+             name, k + 1, w, h, s.style, s.preset, s.intensity, s.local_structure, s.local_tone,
+             s.skin_follows ? -1.0f : s.skin_structure, s.auto_mask);
+    return true;
+}
+
+void EvalFailed(Lane& lane, u32 gen, int result, const char* name) {
+    if (++lane.eval_failures <= 8) {
+        LOG_ERROR(Render_Vulkan, "DLSS 5: {} evaluate failed ({:#x})", name,
+                  static_cast<u32>(result));
+    }
+    if (lane.eval_failures >= 8) {
+        for (int k = 0; k < MaxPasses; ++k) {
+            RetireFeature(lane, k);
+        }
+        lane.failed_gen = gen;
+        SetMessage(fmt::format("The model stopped (evaluate {:#x}). Change a setting to retry.",
+                               static_cast<u32>(result)));
+    }
 }
 
 } // namespace
@@ -678,20 +1021,15 @@ bool Wanted() {
             }
         }
         if (g.dir.empty()) {
-            LOG_INFO(Render_Vulkan, "DLSS 5: not found - DLSS 4.5 alone (put {} in {} and {} in "
-                                    "its model1 / model2 subfolder)",
-                     ForwarderName, Common::FS::PathToUTF8String(exe / "dlss5"), ModelName);
-            SetStatus(State::NotFound, "Not found: put nvngx.dll_dlssnr.dll in the dlss5 folder "
-                                       "next to shadPS4.exe and nvngx_dlssnr.dll in its model1 or "
-                                       "model2 subfolder.");
+            LOG_INFO(Render_Vulkan, "DLSS 5: not found - DLSS 4.5 alone (put {} and {} in {})",
+                     ModelName, ForwarderName, Common::FS::PathToUTF8String(exe / "dlss5"));
+            SetStatus(State::NotFound, "Not found: put nvngx_dlssnr.dll and nvngx.dll_dlssnr.dll "
+                                       "in the dlss5 folder next to shadPS4.exe.");
             return false;
         }
         {
             std::scoped_lock lock{g_mutex};
             g_status.folder = Common::FS::PathToUTF8String(g.dir);
-            for (int n = 0; n < 3; ++n) {
-                g_status.has_model[n] = HasModel(g.dir, n);
-            }
         }
         LoadSettingsFile();
         LOG_INFO(Render_Vulkan, "DLSS 5: found in {} (unofficial model - private use)",
@@ -718,33 +1056,18 @@ void DeviceCreated(vk::Instance instance, vk::PhysicalDevice physical_device, vk
     if (!Wanted() || g_state.load(std::memory_order_acquire) != State::Starting) {
         return;
     }
+    std::scoped_lock model_lock{g_model_mutex};
     const auto fail = [](const std::string& why) {
         LOG_ERROR(Render_Vulkan, "DLSS 5: {} - DLSS 4.5 alone", why);
         SetStatus(State::Failed, why);
     };
     const std::filesystem::path forwarder = g.dir / ForwarderName;
-    // The panel's pick (dlss5-settings.ini), else the other subfolder, else the loose file.
-    const int wanted = GetSettings().model;
-    int which = -1;
-    for (const int n : {wanted, 3 - wanted, 0}) {
-        if (HasModel(g.dir, n)) {
-            which = n;
-            break;
-        }
-    }
-    const std::filesystem::path model = ModelFile(g.dir, which);
-    {
-        std::scoped_lock lock{g_mutex};
-        g_status.loaded_model = which;
-    }
-    if (which != wanted) {
-        LOG_WARNING(Render_Vulkan, "DLSS 5: model {} not found - loading {}", wanted,
-                    which == 0 ? std::string{"the loose file"} : fmt::format("model {}", which));
-    }
+    const std::filesystem::path model = g.dir / ModelName;
     g.fwd.module = LoadLibraryExW(forwarder.wstring().c_str(), nullptr,
                                   LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!g.fwd.module) {
-        fail(fmt::format("could not load {} (error {})", Common::FS::PathToUTF8String(forwarder), GetLastError()));
+        fail(fmt::format("could not load {} (error {})", Common::FS::PathToUTF8String(forwarder),
+                         GetLastError()));
         return;
     }
     bool ok = Resolve(g.fwd.probe, "dlssnr_vk_probe") && Resolve(g.fwd.init, "dlssnr_vk_init") &&
@@ -764,7 +1087,7 @@ void DeviceCreated(vk::Instance instance, vk::PhysicalDevice physical_device, vk
         fail("the parameter block layout check failed");
         return;
     }
-    LOG_INFO(Render_Vulkan, "DLSS 5: loading model {} ({})", which, Common::FS::PathToUTF8String(model));
+    LOG_INFO(Render_Vulkan, "DLSS 5: loading the model ({})", Common::FS::PathToUTF8String(model));
     const int probe = g.fwd.probe(model.wstring().c_str());
     if (probe != 15) {
         fail(fmt::format("the model's Vulkan entry points are incomplete (probe {})", probe));
@@ -778,16 +1101,8 @@ void DeviceCreated(vk::Instance instance, vk::PhysicalDevice physical_device, vk
                                 static_cast<VkPhysicalDevice>(physical_device),
                                 static_cast<VkDevice>(device), NgxSdkVersion);
     if (init != 1) {
-        // Model 1 is NVIDIA's original signed file (officially RTX 50 only); model 2 is the RTX 40
-        // conversion.
-        fail(fmt::format("model {} would not start on this GPU (init {:#x}){}", which,
-                         static_cast<u32>(init),
-                         which == 1 ? ". Model 1 may need an RTX 50 card: pick model 2 and restart."
-                                    : ""));
-        {
-            std::scoped_lock lock{g_mutex};
-            g_status.loaded_model = -1;
-        }
+        fail(fmt::format("the model would not start on this GPU (init {:#x})",
+                         static_cast<u32>(init)));
         return;
     }
     if (g.fwd.populate) {
@@ -824,17 +1139,21 @@ void Shutdown() {
     if (g_state.load(std::memory_order_acquire) != State::Ready) {
         return;
     }
-    RetireFeature();
+    std::scoped_lock model_lock{g_model_mutex};
+    RetireLane(g.game);
+    RetireLane(g.video);
+    Retire(g.video_depth);
+    Retire(g.video_motion);
     FreeRetired(true);
-    g.input.reset();
-    g.output.reset();
+    g.compose.reset();
     if (g.query_pool != VK_NULL_HANDLE) {
         VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyQueryPool(static_cast<VkDevice>(g.device),
                                                          g.query_pool, nullptr);
         g.query_pool = VK_NULL_HANDLE;
     }
     SetStatus(State::Failed, "Shut down");
-    LOG_INFO(Render_Vulkan, "DLSS 5: shut down after {} frames", g.applies);
+    LOG_INFO(Render_Vulkan, "DLSS 5: shut down after {} gameplay / {} video frames", g.game_frames,
+             g.video_frames);
 }
 
 Status GetStatus() {
@@ -847,25 +1166,28 @@ Settings GetSettings() {
     return g_settings;
 }
 
-void SetSettings(const Settings& settings, bool rebuild) {
+void SetSettings(const Settings& settings, bool rebuild, bool save) {
     bool tuning_changed = rebuild;
     {
         std::scoped_lock lock{g_mutex};
         const Settings& o = g_settings;
-        // Everything but on / off is read when the feature is built: a change rebuilds it.
+        // What the model reads when a feature is built: a change rebuilds it.
         tuning_changed |= o.style != settings.style || o.intensity != settings.intensity ||
-                         o.local_structure != settings.local_structure ||
-                         o.local_tone != settings.local_tone ||
-                         o.skin_follows != settings.skin_follows ||
-                         o.skin_structure != settings.skin_structure ||
-                         o.auto_mask != settings.auto_mask || o.preset != settings.preset ||
-                         o.ui_correction != settings.ui_correction || o.mv_mode != settings.mv_mode;
+                          o.local_structure != settings.local_structure ||
+                          o.local_tone != settings.local_tone ||
+                          o.skin_follows != settings.skin_follows ||
+                          o.skin_structure != settings.skin_structure ||
+                          o.auto_mask != settings.auto_mask || o.preset != settings.preset ||
+                          o.ui_correction != settings.ui_correction ||
+                          o.mv_mode != settings.mv_mode;
         g_settings = settings;
     }
     if (tuning_changed) {
         g_generation.fetch_add(1, std::memory_order_acq_rel);
     }
-    SaveSettingsFile(settings);
+    if (save) {
+        SaveSettingsFile(settings);
+    }
 }
 
 bool ToggleEnabled() {
@@ -875,7 +1197,7 @@ bool ToggleEnabled() {
         g_settings.enabled = !g_settings.enabled;
         s = g_settings;
     }
-    SaveSettingsFile(s); // on / off only: the feature stays as built
+    SaveSettingsFile(s); // on / off only: the features stay as built
     return s.enabled;
 }
 
@@ -885,212 +1207,205 @@ std::optional<Dlss::EvalImage> Apply(const Instance& instance, vk::CommandBuffer
     if (g_state.load(std::memory_order_acquire) != State::Ready) {
         return std::nullopt;
     }
+    std::scoped_lock model_lock{g_model_mutex};
+    Lane& lane = g.game;
     ++g.applies;
     FreeRetired(false);
     ReadTiming();
 
     const u32 gen = g_generation.load(std::memory_order_acquire);
     const Settings s = GetSettings();
-    if (!s.enabled) {
-        g.was_off = true;
-        SetRunning(false);
+    if (!s.enabled || gen == lane.failed_gen) {
+        lane.was_off = true;
+        SetRunning(false, 0);
         return std::nullopt;
     }
-    if (gen == g.failed_gen) {
-        SetRunning(false);
-        return std::nullopt; // the model refused these settings; the panel shows why
-    }
-
     const u32 w = color.width;
     const u32 h = color.height;
-    if (!g.input || w != g.width || h != g.height) {
-        RetireFeature();
-        if (g.input) {
-            g.retired_images.emplace_back(g.applies, std::move(g.input));
-        }
-        if (g.output) {
-            g.retired_images.emplace_back(g.applies, std::move(g.output));
-        }
-        g.input = MakeImage(instance, w, h, "DLSS 5 input");
-        g.output = MakeImage(instance, w, h, "DLSS 5 output");
-        g.width = w;
-        g.height = h;
-        LOG_INFO(Render_Vulkan, "DLSS 5: images {}x{} (input format {})", w, h,
-                 vk::to_string(color.format));
+    const int wanted = std::clamp(s.passes, 1, MaxPasses);
+    EnsureImages(instance, lane, w, h, wanted, "gameplay");
+    EnsureCompose();
+    for (int k = wanted; k < MaxPasses; ++k) {
+        RetireFeature(lane, k); // fewer passes than before
     }
-    if (g.feature && g.feature_gen != gen) {
-        RetireFeature();
-    }
-    const float skin = s.skin_follows ? -1.0f : s.skin_structure;
-    if (!g.feature) {
-        g.feature = g.fwd.create(static_cast<VkCommandBuffer>(cmdbuf), &g.params, w, h, s.preset,
-                                 s.intensity, s.style, s.local_structure, s.local_tone, skin,
-                                 s.auto_mask ? 1 : 0, s.ui_correction ? 1 : 0);
-        if (!g.feature) {
-            const int code = g.fwd.last_create ? *g.fwd.last_create : 0;
-            LOG_ERROR(Render_Vulkan, "DLSS 5: the model would not build a feature ({:#x}) at {}x{}",
-                      static_cast<u32>(code), w, h);
-            g.failed_gen = gen;
-            SetMessage(fmt::format("The model refused these settings (code {:#x}). Change a "
-                                   "setting or press Defaults.",
-                                   static_cast<u32>(code)));
-            SetRunning(false);
-            return std::nullopt;
+    // Pass 0 runs the frame it is built; a later pass from the frame after (EnsureFeature).
+    int passes = 0;
+    for (int k = 0; k < wanted; ++k) {
+        if (!EnsureFeature(cmdbuf, lane, k, s, gen, w, h, "gameplay")) {
+            break;
         }
-        g.feature_gen = gen;
-        g.eval_failures = 0;
+        if (k > 0 && lane.built_at[k] == g.applies) {
+            break;
+        }
+        passes = k + 1;
+    }
+    if (passes == 0) {
+        SetRunning(false, 0);
+        return std::nullopt;
+    }
+    if (lane.built_at[0] == g.applies || lane.was_off) {
         reset = true;
-        LOG_INFO(Render_Vulkan,
-                 "DLSS 5: feature up at {}x{} (style {}, intensity {:.2f}, structure {:.2f}, "
-                 "tone {:.2f}, skin {:.2f}, auto mask {}, preset {})",
-                 w, h, s.style, s.intensity, s.local_structure, s.local_tone, skin, s.auto_mask,
-                 s.preset);
-        SetMessage("Running");
-    }
-    if (g.was_off) {
-        reset = true;
-        g.was_off = false;
+        lane.was_off = false;
     }
 
-    // The game's frame -> the model's input (RGBA8 UNORM holding sRGB-encoded values -> RGBA16F,
-    // same values); the game's image goes back to its layout.
-    const vk::ImageSubresourceRange color_range = ColorRange;
-    const std::array<vk::ImageMemoryBarrier2, 3> before{{
-        {
-            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
-            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-            .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
-            .oldLayout = color.layout,
-            .newLayout = vk::ImageLayout::eTransferSrcOptimal,
-            .image = color.image,
-            .subresourceRange = color_range,
-        },
-        {
-            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .srcAccessMask = vk::AccessFlagBits2::eNone,
-            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
-            .oldLayout = vk::ImageLayout::eUndefined, // fully overwritten
-            .newLayout = vk::ImageLayout::eTransferDstOptimal,
-            .image = g.input->image,
-            .subresourceRange = ColorRange,
-        },
-        {
-            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .srcAccessMask = vk::AccessFlagBits2::eNone,
-            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .dstAccessMask = vk::AccessFlagBits2::eShaderWrite |
-                             vk::AccessFlagBits2::eShaderRead |
-                             vk::AccessFlagBits2::eTransferWrite,
-            .oldLayout = vk::ImageLayout::eUndefined, // the model writes all of it
-            .newLayout = vk::ImageLayout::eGeneral,
-            .image = g.output->image,
-            .subresourceRange = ColorRange,
-        },
-    }};
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .imageMemoryBarrierCount = static_cast<u32>(before.size()),
-        .pImageMemoryBarriers = before.data(),
-    });
-    vk::ImageBlit blit{};
-    blit.srcSubresource = vk::ImageSubresourceLayers{
-        .aspectMask = vk::ImageAspectFlagBits::eColor, .mipLevel = 0, .baseArrayLayer = 0,
-        .layerCount = 1};
-    blit.srcOffsets[1] = vk::Offset3D{static_cast<s32>(w), static_cast<s32>(h), 1};
-    blit.dstSubresource = blit.srcSubresource;
-    blit.dstOffsets[1] = blit.srcOffsets[1];
-    cmdbuf.blitImage(color.image, vk::ImageLayout::eTransferSrcOptimal, g.input->image,
-                     vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eNearest);
-    const std::array<vk::ImageMemoryBarrier2, 2> after_copy{{
-        {
-            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
-            .srcAccessMask = vk::AccessFlagBits2::eNone,
-            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
-            .oldLayout = vk::ImageLayout::eTransferSrcOptimal,
-            .newLayout = color.layout,
-            .image = color.image,
-            .subresourceRange = color_range,
-        },
-        {
-            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
-            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
-            .oldLayout = vk::ImageLayout::eTransferDstOptimal,
-            .newLayout = vk::ImageLayout::eGeneral,
-            .image = g.input->image,
-            .subresourceRange = ColorRange,
-        },
-    }};
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .imageMemoryBarrierCount = static_cast<u32>(after_copy.size()),
-        .pImageMemoryBarriers = after_copy.data(),
-    });
-
-    const u32 slot = static_cast<u32>(g.applies % TimingSlots);
+    const u32 slot = static_cast<u32>(g.game_frames % TimingSlots);
     if (g.query_pool != VK_NULL_HANDLE) {
         cmdbuf.resetQueryPool(vk::QueryPool{g.query_pool}, slot * 2, 2);
         cmdbuf.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, vk::QueryPool{g.query_pool},
                                slot * 2);
     }
-    NgxResourceVk res_color = MakeResource(AsEval(*g.input, w, h), false);
-    NgxResourceVk res_depth = MakeResource(depth, false);
-    NgxResourceVk res_motion = MakeResource(motion, false);
-    NgxResourceVk res_output = MakeResource(AsEval(*g.output, w, h), true);
+    ToGeneral(cmdbuf, {lane.input.get(), lane.out[0].get(), lane.out[1].get(), lane.out[2].get(),
+                       lane.composed.get()});
+    // The game's frame -> the model's input in true colour (the game keeps red / blue swapped).
+    Dispatch(cmdbuf, MakeParams(0, s, false), color.view, color.layout, lane.input->view.get(),
+             lane.input->view.get(), lane.input->view.get(), w, h);
+    FullBarrier(cmdbuf);
+
     // The game's vectors are screen UV, current minus previous (vk_dlss.cpp): the model wants
     // the offset to the previous position in pixels -> -size (DLSS SR's NGX scale, study 10-14).
     const float mv_x = s.mv_mode == 0 ? -static_cast<float>(w) : s.mv_mode == 1 ? -1.0f : 0.0f;
     const float mv_y = s.mv_mode == 0 ? -static_cast<float>(h) : s.mv_mode == 1 ? -1.0f : 0.0f;
-    const int result = g.fwd.evaluate(
-        static_cast<VkCommandBuffer>(cmdbuf), g.feature, &g.params, &res_color, &res_depth,
-        &res_motion, &res_output, w, h, depth.width, depth.height, /*depth inverted*/ 1,
-        reset ? 1 : 0, s.intensity, s.style, s.local_structure, s.local_tone, skin,
-        s.auto_mask ? 1 : 0, mv_x, mv_y);
-    // The block outlives this call and the four resources live on this frame's stack: a later
-    // create must not find them.
-    for (const char* name : {"DLSSNR.Color", "DLSSNR.Depth", "DLSSNR.MVec", "DLSSNR.Output"}) {
-        g.params.SetPtr(name, nullptr);
+    for (int k = 0; k < passes; ++k) {
+        const OwnedImage& in = k == 0 ? *lane.input : *lane.out[k - 1];
+        int result = 0;
+        if (!Evaluate(cmdbuf, lane.features[k], s, AsEval(in, w, h), depth, motion,
+                      AsEval(*lane.out[k], w, h), mv_x, mv_y, reset, &result)) {
+            EvalFailed(lane, gen, result, "gameplay");
+            SetRunning(false, 0);
+            return std::nullopt;
+        }
+        FullBarrier(cmdbuf);
     }
+    lane.eval_failures = 0;
+    // Composed once against the game's frame (detail builds up over passes, colour does not
+    // compound), back in the game's channel order for DLSS 4.5.
+    Dispatch(cmdbuf, MakeParams(2, s, false), lane.input->view.get(), vk::ImageLayout::eGeneral,
+             lane.input->view.get(), lane.out[passes - 1]->view.get(), lane.composed->view.get(),
+             w, h);
+    FullBarrier(cmdbuf);
     if (g.query_pool != VK_NULL_HANDLE) {
         cmdbuf.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, vk::QueryPool{g.query_pool},
                                slot * 2 + 1);
         g.slot_written[slot] = true;
     }
-    if (result != 1) {
-        if (++g.eval_failures <= 8) {
-            LOG_ERROR(Render_Vulkan, "DLSS 5: evaluate failed ({:#x})", static_cast<u32>(result));
-        }
-        if (g.eval_failures >= 8) {
-            RetireFeature();
-            g.failed_gen = gen;
-            SetMessage(fmt::format("The model stopped (evaluate {:#x}). Change a setting to retry.",
-                                   static_cast<u32>(result)));
-        }
-        SetRunning(false);
+    ++g.game_frames;
+    if (g.game_frames == 1 || (g.game_frames % 1800) == 0) {
+        LOG_INFO(Render_Vulkan, "DLSS 5: running ({} gameplay frames, {} passes)", g.game_frames,
+                 passes);
+    }
+    SetRunning(true, passes);
+    return AsEval(*lane.composed, w, h);
+}
+
+bool VideoFrame(u64 resolves_at_last_flip) {
+    // Diagnostics for the next round: video frames, and game frames without the T2x resolve
+    // (an in-engine scene that bypasses the hook would show as the second kind).
+    static int last_kind = 0; // 0 game-rendered, 1 video, 2 no resolve and no video
+    static u64 run = 0;
+    if (g_state.load(std::memory_order_acquire) != State::Ready ||
+        !Dlss::g_user_on.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    const bool resolved = g_resolves.load(std::memory_order_acquire) != resolves_at_last_flip;
+    const s64 now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    const bool decoding =
+        now_ms - Libraries::Videodec::g_last_decode_ms.load(std::memory_order_relaxed) < 250;
+    const int kind = resolved ? 0 : decoding ? 1 : 2;
+    if (kind != last_kind) {
+        static const char* const names[] = {"game-rendered", "video cutscene",
+                                            "no T2x resolve, no video"};
+        LOG_INFO(Render_Vulkan, "DLSS 5: frames now {} (after {} {} flips)", names[kind], run,
+                 names[last_kind]);
+        last_kind = kind;
+        run = 0;
+    }
+    ++run;
+    if (kind != 1) {
+        return false;
+    }
+    const Settings s = GetSettings();
+    return s.enabled && s.video;
+}
+
+std::optional<vk::ImageView> ApplyVideo(const Instance& instance, vk::CommandBuffer cmdbuf,
+                                        vk::ImageView frame_view, u32 width, u32 height,
+                                        bool linear) {
+    if (g_state.load(std::memory_order_acquire) != State::Ready) {
         return std::nullopt;
     }
-    g.eval_failures = 0;
-    const vk::ImageMemoryBarrier2 written{
-        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+    std::scoped_lock model_lock{g_model_mutex};
+    Lane& lane = g.video;
+    ++g.applies;
+    FreeRetired(false);
+    const u32 gen = g_generation.load(std::memory_order_acquire);
+    const Settings s = GetSettings();
+    if (gen == lane.failed_gen) {
+        SetVideoRunning(false);
+        return std::nullopt;
+    }
+    const u32 w = width;
+    const u32 h = height;
+    const bool resized = !lane.input || lane.width != w || lane.height != h;
+    EnsureImages(instance, lane, w, h, 1, "video");
+    EnsureCompose();
+    // No depth or motion in a video: a flat depth and zero motion, made at the frame size.
+    if (resized || !g.video_depth || g.video_depth_value != s.video_depth) {
+        Retire(g.video_depth);
+        Retire(g.video_motion);
+        g.video_depth = MakeImage(instance, w, h, vk::Format::eR32Sfloat, "DLSS 5 video depth");
+        g.video_motion = MakeImage(instance, w, h, vk::Format::eR16G16Sfloat, "DLSS 5 video motion");
+        ToGeneral(cmdbuf, {g.video_depth.get(), g.video_motion.get()});
+        const vk::ClearColorValue depth_value{std::array{s.video_depth, 0.0f, 0.0f, 0.0f}};
+        const vk::ClearColorValue zero{std::array{0.0f, 0.0f, 0.0f, 0.0f}};
+        cmdbuf.clearColorImage(g.video_depth->image, vk::ImageLayout::eGeneral, depth_value,
+                               ColorRange);
+        cmdbuf.clearColorImage(g.video_motion->image, vk::ImageLayout::eGeneral, zero, ColorRange);
+        g.video_depth_value = s.video_depth;
+    }
+    if (!EnsureFeature(cmdbuf, lane, 0, s, gen, w, h, "video")) {
+        SetVideoRunning(false);
+        return std::nullopt;
+    }
+    ToGeneral(cmdbuf, {lane.input.get(), lane.out[0].get(), lane.composed.get()});
+    Dispatch(cmdbuf, MakeParams(1, s, linear), frame_view, vk::ImageLayout::eShaderReadOnlyOptimal,
+             lane.input->view.get(), lane.input->view.get(), lane.input->view.get(), w, h);
+    FullBarrier(cmdbuf);
+    // Spatial only: every frame starts a new history (zero motion would smear a moving shot).
+    int result = 0;
+    if (!Evaluate(cmdbuf, lane.features[0], s, AsEval(*lane.input, w, h),
+                  AsEval(*g.video_depth, w, h), AsEval(*g.video_motion, w, h),
+                  AsEval(*lane.out[0], w, h), 0.0f, 0.0f, /*reset*/ true, &result)) {
+        EvalFailed(lane, gen, result, "video");
+        SetVideoRunning(false);
+        return std::nullopt;
+    }
+    lane.eval_failures = 0;
+    FullBarrier(cmdbuf);
+    Dispatch(cmdbuf, MakeParams(3, s, false), lane.input->view.get(), vk::ImageLayout::eGeneral,
+             lane.input->view.get(), lane.out[0]->view.get(), lane.composed->view.get(), w, h);
+    // The post pass samples it.
+    const vk::ImageMemoryBarrier2 to_read{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
         .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
         .oldLayout = vk::ImageLayout::eGeneral,
-        .newLayout = vk::ImageLayout::eGeneral,
-        .image = g.output->image,
+        .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        .image = lane.composed->image,
         .subresourceRange = ColorRange,
     };
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .imageMemoryBarrierCount = 1,
-        .pImageMemoryBarriers = &written,
+        .pImageMemoryBarriers = &to_read,
     });
-    if (g.applies == 1 || (g.applies % 1800) == 0) {
-        LOG_INFO(Render_Vulkan, "DLSS 5: running ({} frames)", g.applies);
+    ++g.video_frames;
+    if (g.video_frames == 1 || (g.video_frames % 1800) == 0) {
+        LOG_INFO(Render_Vulkan, "DLSS 5: video frames {} ({}x{})", g.video_frames, w, h);
     }
-    SetRunning(true);
-    return AsEval(*g.output, w, h);
+    SetVideoRunning(true);
+    return lane.composed->view.get();
 }
 
 } // namespace Vulkan::Dlss5

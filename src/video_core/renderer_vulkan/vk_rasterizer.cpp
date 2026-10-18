@@ -1653,6 +1653,7 @@ void Rasterizer::DlssResolve() {
     // a plain copy of the tonemap output (the game without its temporal AA for that frame).
     ++dlss_calls;
     ++dlss_phases[dlss_phase_in & 3];
+    Dlss5::g_resolves.fetch_add(1, std::memory_order_release); // a game-rendered frame
     const auto& regs = liverpool->BackRegs();
     VideoCore::TextureCache::ImageDesc out_desc{regs.color_buffers[0], liverpool->BackCbExtent(0)};
     auto& out = texture_cache.GetImage(texture_cache.FindImage(out_desc, true));

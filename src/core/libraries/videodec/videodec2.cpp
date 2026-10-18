@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "core/libraries/libs.h"
+#include "core/libraries/videodec/video_activity.h"
 #include "core/libraries/videodec/videodec2.h"
 #include "core/libraries/videodec/videodec2_impl.h"
 #include "core/libraries/videodec/videodec_error.h"
@@ -136,6 +137,7 @@ s32 PS4_SYSV_ABI sceVideodec2Decode(OrbisVideodec2Decoder decoder,
                                     OrbisVideodec2FrameBuffer* frameBuffer,
                                     OrbisVideodec2OutputInfo* outputInfo) {
     LOG_TRACE(Lib_Vdec2, "called");
+    Videodec::NoteDecode(); // DLSS 5: a video is playing (video_activity.h)
 
     if (!decoder) {
         LOG_ERROR(Lib_Vdec2, "Invalid decoder instance");

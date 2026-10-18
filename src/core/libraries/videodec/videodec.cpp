@@ -4,6 +4,7 @@
 #include "common/alignment.h"
 #include "common/logging/log.h"
 #include "core/libraries/libs.h"
+#include "core/libraries/videodec/video_activity.h"
 #include "core/libraries/videodec/videodec.h"
 #include "core/libraries/videodec/videodec_error.h"
 #include "core/libraries/videodec/videodec_impl.h"
@@ -91,6 +92,7 @@ int PS4_SYSV_ABI sceVideodecDecode(OrbisVideodecCtrl* pCtrlIn,
         LOG_ERROR(Lib_Videodec, "Invalid decoder handle");
         return ORBIS_VIDEODEC_ERROR_HANDLE;
     }
+    NoteDecode(); // DLSS 5: a video is playing (video_activity.h)
     return decoder->Decode(*pInputDataIn, *pFrameBufferInOut, *pPictureInfoOut);
 }
 

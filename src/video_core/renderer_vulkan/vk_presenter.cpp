@@ -29,6 +29,7 @@
 #include "sdl_window.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/vk_dlss5.h"
 #include "video_core/renderer_vulkan/vk_dlss_upscale.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
@@ -921,6 +922,15 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         upscaler->SetOutputSize(frame->width, frame->height);
     }
 
+    // DLSS 5 on video cutscenes (vk_dlss5.h): a frame the game did not render through the T2x
+    // pass while its video decoder runs goes through the model here, before the post pass.
+    static u64 dlss5_resolves = 0;
+    const bool dlss5_video = !dlss_job && !frame->is_hdr && Dlss5::VideoFrame(dlss5_resolves);
+    dlss5_resolves = Dlss5::g_resolves.load(std::memory_order_acquire);
+    const bool frame_linear = view_info.format == vk::Format::eR8G8B8A8Srgb ||
+                              view_info.format == vk::Format::eB8G8R8A8Srgb ||
+                              view_info.format == vk::Format::eA8B8G8R8SrgbPack32;
+
     const u32 capture_game_only_count = VideoCore::ConsumeGameOnlyScreenshotRequests();
     // q6 (SHADPS4_PRESENT_ASYNC=1): no synchronous borrow - AcquireCommandBuffer drains the
     // recording lanes (s620: ~1.5 ms per flip on the back). The display image's Transit goes
@@ -938,8 +948,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         draw_scheduler.EndRendering();
         // q6b (2): ordered (FsrPass keeps state across flips); the Frame by value.
         draw_scheduler.RecordOrdered([this, pre_barrier, image_view, image_size, fc = *frame,
-                                      fsr = fsr_settings, pp = pp_settings,
-                                      dlss_job](vk::CommandBuffer cb) mutable {
+                                      fsr = fsr_settings, pp = pp_settings, dlss_job, dlss5_video,
+                                      frame_linear](vk::CommandBuffer cb) mutable {
             cb.pipelineBarrier2(vk::DependencyInfo{
                 .imageMemoryBarrierCount = 1,
                 .pImageMemoryBarriers = &pre_barrier,
@@ -949,8 +959,15 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                 pp_pass.Render(cb, dlss_job->out_view, dlss_job->size, fc, pp);
                 return;
             }
+            vk::ImageView source = image_view;
+            if (dlss5_video) {
+                if (const auto v = Dlss5::ApplyVideo(instance, cb, image_view, image_size.width,
+                                                     image_size.height, frame_linear)) {
+                    source = *v;
+                }
+            }
             const auto view =
-                fsr_pass.Render(cb, image_view, image_size, {fc.width, fc.height}, fsr, fc.is_hdr);
+                fsr_pass.Render(cb, source, image_size, {fc.width, fc.height}, fsr, fc.is_hdr);
             pp_pass.Render(cb, view, image_size, fc, pp);
         });
         DebugState.game_resolution = {image_size.width, image_size.height};
@@ -993,6 +1010,12 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         Dlss::RecordComposite(cmdbuf, *dlss_job);
         pp_pass.Render(cmdbuf, dlss_job->out_view, dlss_job->size, *frame, pp_settings);
     } else {
+        if (dlss5_video) {
+            if (const auto v = Dlss5::ApplyVideo(instance, cmdbuf, image_view, image_size.width,
+                                                 image_size.height, frame_linear)) {
+                image_view = *v;
+            }
+        }
         image_view = fsr_pass.Render(cmdbuf, image_view, image_size,
                                      {frame->width, frame->height}, fsr_settings, frame->is_hdr);
         pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
