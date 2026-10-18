@@ -22,6 +22,7 @@
 #include "core/libraries/pad/pad.h"
 #include "core/libraries/system/userservice.h"
 #include "core/mouse_aim.h"
+#include "imgui/big_picture/settings_dialog_layer.h"
 #include "core/user_settings.h"
 #include "imgui/friends_layer.h"
 #include "imgui/renderer/imgui_core.h"
@@ -208,6 +209,31 @@ void WindowSDL::WaitEvent() {
 
     if (!SDL_WaitEvent(&event)) {
         return;
+    }
+
+    // The emulator's settings menu (F3) needs a free cursor: any mouse mode (aim, touchpad, motion)
+    // is switched off while it is open and comes back when it closes (user 2026-10-17: mouse aim
+    // kept the cursor captured, the menu could not be left without Alt+F4).
+    {
+        static bool saved = false;
+        static Input::MouseMode before = Input::MouseMode::Off;
+        const bool open = ImGuiEmuSettings::IsInGameSettingsDialogOpen();
+        if (open && !saved) {
+            before = Input::GetMouseMode();
+            if (before != Input::MouseMode::Off) {
+                Input::ToggleMouseModeTo(before); // the same mode again = off
+            }
+            SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(), false);
+            saved = true;
+        } else if (!open && saved) {
+            if (before != Input::MouseMode::Off) {
+                Input::ToggleMouseModeTo(before);
+            }
+            SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(),
+                                           before == Input::MouseMode::Joystick ||
+                                               before == Input::MouseMode::Gyro);
+            saved = false;
+        }
     }
 
     if (Libraries::Mouse::PushSDLEvent(event)) {

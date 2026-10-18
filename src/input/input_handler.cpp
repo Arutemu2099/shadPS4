@@ -841,7 +841,7 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
             PushSDLEvent(SDL_EVENT_QUIT_DIALOG);
             break;
         case HOTKEY_OPEN_EMULATOR_SETTINGS:
-            ImGuiEmuSettings::OpenInGameSettingsDialog();
+            ImGuiEmuSettings::ToggleInGameSettingsDialog();
             break;
         case HOTKEY_TOGGLE_FRIENDS:
             PushSDLEvent(SDL_EVENT_TOGGLE_FRIENDS);

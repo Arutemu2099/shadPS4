@@ -23,5 +23,9 @@ private:
 };
 
 void OpenInGameSettingsDialog();
+/// F3: opens the dialog, or closes it when open.
+void ToggleInGameSettingsDialog();
+/// The window thread frees the mouse while it is open and gives it back afterwards.
+bool IsInGameSettingsDialogOpen();
 
 }; // namespace  ImGuiEmuSettings
