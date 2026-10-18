@@ -349,9 +349,16 @@ struct Lane {
     std::unique_ptr<OwnedImage> composed;  ///< what goes on (DLSS 4.5 / the post pass)
     u32 width = 0;
     u32 height = 0;
-    u32 failed_gen = ~0u; ///< the model refused these settings; wait for a change
+    u32 failed_gen = ~0u; ///< the model refused pass 1 with these settings; wait for a change
     u32 eval_failures = 0;
     bool was_off = true;
+    /// A later pass was refused / failed: run fewer until the settings or the pass count change
+    /// (never rebuild it every frame - the fork measured that the driver stops answering).
+    u32 extra_failed_gen = ~0u;
+    int extra_failed_passes = 0;
+    int pass_cap = MaxPasses;
+    u64 last_apply = 0;                        ///< g.applies of this lane's previous run
+    std::array<bool, MaxPasses> fresh{};       ///< the pass has not been evaluated yet
 };
 
 struct ComposeParams {
@@ -929,6 +936,7 @@ void ReadTiming() {
 void SetRunning(bool running, int passes) {
     std::scoped_lock lock{g_mutex};
     g_status.running = running;
+    g_status.video_running = false; // a gameplay frame: not a video frame
     g_status.passes_running = running ? passes : 0;
     g_status.frames = g.game_frames;
     g_status.width = g.game.width;
@@ -938,6 +946,7 @@ void SetRunning(bool running, int passes) {
 void SetVideoRunning(bool running) {
     std::scoped_lock lock{g_mutex};
     g_status.video_running = running;
+    g_status.running = false;
     g_status.video_frames = g.video_frames;
 }
 
@@ -955,14 +964,22 @@ bool EnsureFeature(vk::CommandBuffer cmd, Lane& lane, int k, const Settings& s, 
         const int code = g.fwd.last_create ? *g.fwd.last_create : 0;
         LOG_ERROR(Render_Vulkan, "DLSS 5: the model would not build {} pass {} ({:#x}) at {}x{}",
                   name, k + 1, static_cast<u32>(code), w, h);
-        lane.failed_gen = gen;
-        SetMessage(fmt::format("The model refused these settings (code {:#x}). Change a setting "
-                               "or press Defaults.",
-                               static_cast<u32>(code)));
+        if (k == 0) {
+            lane.failed_gen = gen;
+            SetMessage(fmt::format("The model refused these settings (code {:#x}). Change a "
+                                   "setting or press Defaults.",
+                                   static_cast<u32>(code)));
+        } else {
+            // A later pass only: keep the passes that work (review 2).
+            lane.extra_failed_gen = gen;
+            lane.extra_failed_passes = s.passes;
+            lane.pass_cap = k;
+        }
         return false;
     }
     lane.feature_gen[k] = gen;
     lane.built_at[k] = g.applies;
+    lane.fresh[k] = true;
     lane.eval_failures = 0;
     LOG_INFO(Render_Vulkan,
              "DLSS 5: {} pass {} up at {}x{} (style {}, network {}, intensity {:.2f}, structure "
@@ -1228,9 +1245,18 @@ std::optional<Dlss::EvalImage> Apply(const Instance& instance, vk::CommandBuffer
     for (int k = wanted; k < MaxPasses; ++k) {
         RetireFeature(lane, k); // fewer passes than before
     }
-    // Pass 0 runs the frame it is built; a later pass from the frame after (EnsureFeature).
+    // A later pass that failed stays off until the settings or the pass count change.
+    if (lane.extra_failed_gen != gen || lane.extra_failed_passes != s.passes) {
+        lane.extra_failed_gen = ~0u;
+        lane.pass_cap = MaxPasses;
+    }
+    // Pass 0 runs the frame it is built; pass k is built only once pass k-1 existed before this
+    // frame, and used from the frame after it is built (the fork's rule against multi-pass hangs).
     int passes = 0;
-    for (int k = 0; k < wanted; ++k) {
+    for (int k = 0; k < std::min(wanted, lane.pass_cap); ++k) {
+        if (k > 0 && lane.built_at[k - 1] == g.applies) {
+            break;
+        }
         if (!EnsureFeature(cmdbuf, lane, k, s, gen, w, h, "gameplay")) {
             break;
         }
@@ -1243,7 +1269,10 @@ std::optional<Dlss::EvalImage> Apply(const Instance& instance, vk::CommandBuffer
         SetRunning(false, 0);
         return std::nullopt;
     }
-    if (lane.built_at[0] == g.applies || lane.was_off) {
+    // A new history after a gap (a cutscene, DLSS 5 or DLSS off, a loading screen) or a new pass 1.
+    const bool gap = lane.last_apply + 1 != g.applies;
+    lane.last_apply = g.applies;
+    if (lane.built_at[0] == g.applies || lane.was_off || gap) {
         reset = true;
         lane.was_off = false;
     }
@@ -1268,8 +1297,24 @@ std::optional<Dlss::EvalImage> Apply(const Instance& instance, vk::CommandBuffer
     for (int k = 0; k < passes; ++k) {
         const OwnedImage& in = k == 0 ? *lane.input : *lane.out[k - 1];
         int result = 0;
+        const bool pass_reset = reset || lane.fresh[k];
+        lane.fresh[k] = false;
         if (!Evaluate(cmdbuf, lane.features[k], s, AsEval(in, w, h), depth, motion,
-                      AsEval(*lane.out[k], w, h), mv_x, mv_y, reset, &result)) {
+                      AsEval(*lane.out[k], w, h), mv_x, mv_y, pass_reset, &result)) {
+            if (k > 0) {
+                // A later pass: drop it (and the ones after) and compose what ran (review 2).
+                LOG_ERROR(Render_Vulkan, "DLSS 5: gameplay pass {} evaluate failed ({:#x}) - "
+                                         "running {} pass(es)",
+                          k + 1, static_cast<u32>(result), k);
+                for (int j = k; j < MaxPasses; ++j) {
+                    RetireFeature(lane, j);
+                }
+                lane.extra_failed_gen = gen;
+                lane.extra_failed_passes = s.passes;
+                lane.pass_cap = k;
+                passes = k;
+                break;
+            }
             EvalFailed(lane, gen, result, "gameplay");
             SetRunning(false, 0);
             return std::nullopt;
@@ -1306,7 +1351,10 @@ bool VideoFrame(u64 resolves_at_last_flip) {
     static int candidate = 0;
     static int streak = 0;
     static u64 run = 0;
+    // DLSS 4.5 up and on: otherwise no frame has a T2x replacement and every flip during a
+    // decode (an in-world TV) would look like a video frame.
     if (g_state.load(std::memory_order_acquire) != State::Ready ||
+        !Dlss::g_ready.load(std::memory_order_relaxed) ||
         !Dlss::g_user_on.load(std::memory_order_relaxed)) {
         return false;
     }

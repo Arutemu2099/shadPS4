@@ -94,7 +94,8 @@ void main() {
         const float yo = dot(o, Luma);
         const float ym = dot(m, Luma);
         const float ratio = (ym + 1e-4) / (yo + 1e-4);
-        const float r = clamp(1.0 + transfer * (ratio - 1.0), 1.0 / max_ratio, max_ratio);
+        const float r0 = max(1.0 + transfer * (ratio - 1.0), 0.0);
+        const float r = max_ratio >= 7.99 ? r0 : clamp(r0, 1.0 / max_ratio, max_ratio); // 8 = off
         const vec3 lit = o * r;
         // Colour: the hue / chroma moves toward the model's by `colour` (scaled by transfer, so
         // transfer 0 is the game's frame exactly).

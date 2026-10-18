@@ -927,9 +927,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     static u64 dlss5_resolves = 0;
     const bool dlss5_video = !dlss_job && !frame->is_hdr && Dlss5::VideoFrame(dlss5_resolves);
     dlss5_resolves = Dlss5::g_resolves.load(std::memory_order_acquire);
-    const bool frame_linear = view_info.format == vk::Format::eR8G8B8A8Srgb ||
-                              view_info.format == vk::Format::eB8G8R8A8Srgb ||
-                              view_info.format == vk::Format::eA8B8G8R8SrgbPack32;
+    // The post pass treats what it samples as linear for every SDR frame (an sRGB view decodes,
+    // a UNORM one is taken as is), so DLSS 5 does the same (review 2).
+    const bool frame_linear = true;
 
     const u32 capture_game_only_count = VideoCore::ConsumeGameOnlyScreenshotRequests();
     // q6 (SHADPS4_PRESENT_ASYNC=1): no synchronous borrow - AcquireCommandBuffer drains the
