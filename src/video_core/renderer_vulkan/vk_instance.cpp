@@ -802,6 +802,14 @@ bool Instance::CreateDevice() {
             auto& dci = device_chain.get<vk::DeviceCreateInfo>();
             dci.enabledExtensionCount = static_cast<u32>(enabled_extensions.size());
             dci.ppEnabledExtensionNames = enabled_extensions.data();
+            for (const char* ext : Dlss5::DeviceExtensions()) {
+                enabled_extensions.erase(
+                    std::remove_if(enabled_extensions.begin(), enabled_extensions.end(),
+                                   [ext](const char* e) { return std::strcmp(e, ext) == 0; }),
+                    enabled_extensions.end());
+            }
+            dci.enabledExtensionCount = static_cast<u32>(enabled_extensions.size());
+            dci.ppEnabledExtensionNames = enabled_extensions.data();
             dlss_device = false;
             Dlss5::Disable("the driver refused the DLSS device extensions");
             LOG_WARNING(Render_Vulkan, "DLSS: the driver refused the device with the DLSS extensions "

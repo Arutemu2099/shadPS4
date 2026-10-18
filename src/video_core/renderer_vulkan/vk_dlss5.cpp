@@ -39,6 +39,7 @@
 #include <fmt/format.h>
 
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "video_core/renderer_vulkan/vk_dlss5.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -295,6 +296,7 @@ using PFN_Evaluate = int (*)(void*, void*, void*, void*, void*, void*, void*, un
 using PFN_Release = void (*)(void*);
 using PFN_SetFloatSlot = void (*)(int);
 using PFN_ProbeFloat = void (*)(void*, const char*, float, int);
+using PFN_Populate = int (*)(void*);
 
 struct Forwarder {
 #ifdef _WIN32
@@ -307,6 +309,7 @@ struct Forwarder {
     PFN_Release release{};
     PFN_SetFloatSlot set_float_slot{};
     PFN_ProbeFloat probe_float{};
+    PFN_Populate populate{}; ///< optional (our forwarder build); null = skipped
     const int* last_init{};
     const int* last_create{};
 };
@@ -357,7 +360,8 @@ struct Context {
 };
 
 Context g;
-std::mutex g_mutex; ///< g_settings, g_status
+std::mutex g_mutex;      ///< g_settings, g_status
+std::mutex g_file_mutex; ///< dlss5-settings.ini
 Settings g_settings;
 Status g_status;
 std::atomic<u32> g_generation{1};
@@ -465,6 +469,7 @@ void SaveSettingsFile(const Settings& s) {
     if (g.dir.empty()) {
         return;
     }
+    std::scoped_lock lock{g_file_mutex};
     std::ofstream out{g.dir / SettingsName, std::ios::trunc};
     if (!out) {
         return;
@@ -675,7 +680,7 @@ bool Wanted() {
         if (g.dir.empty()) {
             LOG_INFO(Render_Vulkan, "DLSS 5: not found - DLSS 4.5 alone (put {} in {} and {} in "
                                     "its model1 / model2 subfolder)",
-                     ForwarderName, (exe / "dlss5").string(), ModelName);
+                     ForwarderName, Common::FS::PathToUTF8String(exe / "dlss5"), ModelName);
             SetStatus(State::NotFound, "Not found: put nvngx.dll_dlssnr.dll in the dlss5 folder "
                                        "next to shadPS4.exe and nvngx_dlssnr.dll in its model1 or "
                                        "model2 subfolder.");
@@ -683,14 +688,14 @@ bool Wanted() {
         }
         {
             std::scoped_lock lock{g_mutex};
-            g_status.folder = g.dir.string();
+            g_status.folder = Common::FS::PathToUTF8String(g.dir);
             for (int n = 0; n < 3; ++n) {
                 g_status.has_model[n] = HasModel(g.dir, n);
             }
         }
         LoadSettingsFile();
         LOG_INFO(Render_Vulkan, "DLSS 5: found in {} (unofficial model - private use)",
-                 g.dir.string());
+                 Common::FS::PathToUTF8String(g.dir));
         SetStatus(State::Starting, "Starting...");
         return true;
     }();
@@ -739,7 +744,7 @@ void DeviceCreated(vk::Instance instance, vk::PhysicalDevice physical_device, vk
     g.fwd.module = LoadLibraryExW(forwarder.wstring().c_str(), nullptr,
                                   LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!g.fwd.module) {
-        fail(fmt::format("could not load {} (error {})", forwarder.string(), GetLastError()));
+        fail(fmt::format("could not load {} (error {})", Common::FS::PathToUTF8String(forwarder), GetLastError()));
         return;
     }
     bool ok = Resolve(g.fwd.probe, "dlssnr_vk_probe") && Resolve(g.fwd.init, "dlssnr_vk_init") &&
@@ -754,11 +759,12 @@ void DeviceCreated(vk::Instance instance, vk::PhysicalDevice physical_device, vk
         fail("the forwarder is missing entry points (wrong build?)");
         return;
     }
+    g.fwd.populate = reinterpret_cast<PFN_Populate>(GetProcAddress(g.fwd.module, "dlssnr_vk_populate"));
     if (!SelfTest()) {
         fail("the parameter block layout check failed");
         return;
     }
-    LOG_INFO(Render_Vulkan, "DLSS 5: loading model {} ({})", which, model.string());
+    LOG_INFO(Render_Vulkan, "DLSS 5: loading model {} ({})", which, Common::FS::PathToUTF8String(model));
     const int probe = g.fwd.probe(model.wstring().c_str());
     if (probe != 15) {
         fail(fmt::format("the model's Vulkan entry points are incomplete (probe {})", probe));
@@ -783,6 +789,14 @@ void DeviceCreated(vk::Instance instance, vk::PhysicalDevice physical_device, vk
             g_status.loaded_model = -1;
         }
         return;
+    }
+    if (g.fwd.populate) {
+        const int populated = g.fwd.populate(&g.params);
+        LOG_INFO(Render_Vulkan, "DLSS 5: the model filled its parameter defaults ({:#x})",
+                 static_cast<u32>(populated));
+    } else {
+        LOG_WARNING(Render_Vulkan, "DLSS 5: the forwarder has no dlssnr_vk_populate (an upstream "
+                                   "build?) - the parameter block starts empty");
     }
     g.device = device;
     g.timestamp_period = physical_device.getProperties().limits.timestampPeriod;
@@ -855,9 +869,13 @@ void SetSettings(const Settings& settings, bool rebuild) {
 }
 
 bool ToggleEnabled() {
-    Settings s = GetSettings();
-    s.enabled = !s.enabled;
-    SetSettings(s);
+    Settings s;
+    {
+        std::scoped_lock lock{g_mutex};
+        g_settings.enabled = !g_settings.enabled;
+        s = g_settings;
+    }
+    SaveSettingsFile(s); // on / off only: the feature stays as built
     return s.enabled;
 }
 
@@ -1030,6 +1048,11 @@ std::optional<Dlss::EvalImage> Apply(const Instance& instance, vk::CommandBuffer
         &res_motion, &res_output, w, h, depth.width, depth.height, /*depth inverted*/ 1,
         reset ? 1 : 0, s.intensity, s.style, s.local_structure, s.local_tone, skin,
         s.auto_mask ? 1 : 0, mv_x, mv_y);
+    // The block outlives this call and the four resources live on this frame's stack: a later
+    // create must not find them.
+    for (const char* name : {"DLSSNR.Color", "DLSSNR.Depth", "DLSSNR.MVec", "DLSSNR.Output"}) {
+        g.params.SetPtr(name, nullptr);
+    }
     if (g.query_pool != VK_NULL_HANDLE) {
         cmdbuf.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, vk::QueryPool{g.query_pool},
                                slot * 2 + 1);
@@ -1051,7 +1074,7 @@ std::optional<Dlss::EvalImage> Apply(const Instance& instance, vk::CommandBuffer
     g.eval_failures = 0;
     const vk::ImageMemoryBarrier2 written{
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
         .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
         .oldLayout = vk::ImageLayout::eGeneral,

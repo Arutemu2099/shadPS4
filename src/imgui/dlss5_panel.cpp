@@ -285,8 +285,8 @@ void Panel::Draw() {
     ImGui::PopStyleVar(3);
 
     if (!keep_open && !closing.exchange(true)) {
+        ImGui::Layer::RemoveLayer(this); // before IsOpen() turns false (Page Up race)
         g_open.store(false, std::memory_order_release);
-        ImGui::Layer::RemoveLayer(this);
     }
 }
 
