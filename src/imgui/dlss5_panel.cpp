@@ -35,6 +35,7 @@ private:
     /// A slider that applies when it is let go (each apply rebuilds the model).
     void Slider(const char* label, float* value, const char* tip);
     void StyleButton(const char* label, int style);
+    void ModelButton(const char* label, int model, const D5::Status& status);
 
     D5::Settings edit{};
 };
@@ -65,6 +66,34 @@ void Panel::StyleButton(const char* label, int style) {
     if (selected) {
         ImGui::PopStyleColor(2);
     }
+}
+
+void Panel::ModelButton(const char* label, int model, const D5::Status& status) {
+    const bool present = status.has_model[model];
+    const bool selected = edit.model == model;
+    if (selected) {
+        ImGui::PushStyleColor(ImGuiCol_Button, Accent);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, Accent);
+    }
+    ImGui::BeginDisabled(!present);
+    const float w = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2.0f;
+    if (ImGui::Button(label, ImVec2(model == 2 ? ImGui::GetContentRegionAvail().x : w, 0)) &&
+        !selected) {
+        edit.model = model;
+        Commit(); // saved only; read at the next launch
+    }
+    ImGui::EndDisabled();
+    if (selected) {
+        ImGui::PopStyleColor(2);
+    }
+    const char* tip =
+        !present     ? (model == 1 ? "Not found: dlss5\\model1\\nvngx_dlssnr.dll"
+                                   : "Not found: dlss5\\model2\\nvngx_dlssnr.dll")
+        : model == 1 ? "The first release (NBA 2K27): NVIDIA's original signed file.\n"
+                       "It may need an RTX 50 card."
+                     : "The newer release: reported 20-30 percent faster and a subtler look\n"
+                       "(the RTX 40 conversion).";
+    ImGui::SetItemTooltip("%s", tip);
 }
 
 void Panel::Draw() {
@@ -205,12 +234,33 @@ void Panel::Draw() {
                                   "testing: if moving shots smear or flicker, try another.");
         }
 
+        ImGui::EndDisabled();
+
+        // ---- model (usable whenever the folder was found, also after a failed start) ----
+        if (!status.folder.empty()) {
+            ImGui::SeparatorText("Model (next launch)");
+            ModelButton("Model 1 (NBA 2K27)", 1, status);
+            ImGui::SameLine();
+            ModelButton("Model 2 (newer)", 2, status);
+            const std::string loaded =
+                status.loaded_model > 0 ? "Loaded now: model " + std::to_string(status.loaded_model)
+                : status.loaded_model == 0 ? std::string{"Loaded now: the file next to the forwarder"}
+                                           : std::string{"Loaded now: none"};
+            ImGui::TextDisabled("%s%s", loaded.c_str(),
+                                status.loaded_model >= 0 && edit.model != status.loaded_model
+                                    ? " - restart the game to switch"
+                                    : "");
+        }
+
+        ImGui::BeginDisabled(!usable);
         ImGui::Spacing();
         if (ImGui::Button("Defaults")) {
             const bool on = edit.enabled;
+            const int model = edit.model;
             edit = D5::DefaultSettings();
             edit.enabled = on;
-            Commit();
+            edit.model = model;
+            D5::SetSettings(edit, true); // also the way out after the model refused a setting
         }
         ImGui::EndDisabled();
         ImGui::SameLine();

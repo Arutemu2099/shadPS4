@@ -15,8 +15,10 @@
 // The same deal as DLSS 4.5: the player's own files are looked for, and anything missing or any
 // failure leaves the frame exactly as DLSS 4.5 alone makes it. Looked for, first match wins:
 // SHADPS4_DLSS5_DIR, dlss5\ next to the EXE, and ..\..\dlss5 (a test bundle in artifacts\).
-// The folder holds the model (nvngx_dlssnr.dll, not public yet) and the forwarder
-// nvngx.dll_dlssnr.dll built from github.com/Skynizz/optiscaler-dlss5 (GPL-3, dlss5\forwarder-src):
+// The folder holds the forwarder nvngx.dll_dlssnr.dll and the model nvngx_dlssnr.dll (not public
+// yet) in model1\ and / or model2\ (or loose next to the forwarder); the panel picks which one
+// loads at the next launch. The forwarder is built from github.com/Skynizz/optiscaler-dlss5
+// (GPL-3, dlss5\forwarder-src):
 // the model only accepts calls from a module whose path contains "nvngx.dll", and the forwarder
 // is that module. SHADPS4_DLSS5=0 never loads them.
 //
@@ -44,6 +46,7 @@ struct Settings {
     int preset = 0;              ///< 0 = the model's default
     bool ui_correction = false;  ///< off: the frame it gets has no HUD in it
     int mv_mode = 0;             ///< motion vectors: 0 pixels (default), 1 normalised, 2 none
+    int model = 2; ///< loads at the NEXT launch: the model1 (NBA 2K27) or model2 subfolder
 };
 
 enum class State : int {
@@ -64,6 +67,8 @@ struct Status {
     u32 width = 0;
     u32 height = 0;
     bool running = false; ///< ran on the last DLSS frame
+    int loaded_model = -1; ///< 1 / 2 = that subfolder, 0 = the loose file, -1 = none loaded
+    bool has_model[3]{};   ///< [0] loose file, [1] model1\, [2] model2\ present
 };
 
 /// SHADPS4_DLSS=1, SHADPS4_DLSS5 not "0" and both DLLs found (decided once).
@@ -81,7 +86,8 @@ void Shutdown();
 Status GetStatus();
 Settings GetSettings();
 /// Any thread (the panel): takes effect on the next frame and is saved to dlss5-settings.ini.
-void SetSettings(const Settings& settings);
+/// A tuning change rebuilds the feature; `rebuild` forces that (Defaults after a refusal).
+void SetSettings(const Settings& settings, bool rebuild = false);
 Settings DefaultSettings();
 /// End key: returns the new on / off state.
 bool ToggleEnabled();

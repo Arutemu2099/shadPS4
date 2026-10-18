@@ -395,10 +395,20 @@ std::filesystem::path ExeDir() {
 #endif
 }
 
+/// Where model `n` lives: 0 = next to the forwarder, 1 / 2 = model1\ / model2\ (name kept).
+std::filesystem::path ModelFile(const std::filesystem::path& dir, int n) {
+    return n == 0 ? dir / ModelName : dir / (n == 1 ? "model1" : "model2") / ModelName;
+}
+
+bool HasModel(const std::filesystem::path& dir, int n) {
+    std::error_code ec;
+    return std::filesystem::is_regular_file(ModelFile(dir, n), ec);
+}
+
 bool HasBoth(const std::filesystem::path& dir) {
     std::error_code ec;
     return !dir.empty() && std::filesystem::is_regular_file(dir / ForwarderName, ec) &&
-           std::filesystem::is_regular_file(dir / ModelName, ec);
+           (HasModel(dir, 0) || HasModel(dir, 1) || HasModel(dir, 2));
 }
 
 // ---- settings file (key = value, one per line) ---------------------------------------------
@@ -443,6 +453,8 @@ void LoadSettingsFile() {
             s.ui_correction = i != 0;
         } else if (key == "mv_mode") {
             s.mv_mode = std::clamp(i, 0, 2);
+        } else if (key == "model") {
+            s.model = std::clamp(i, 1, 2);
         }
     }
     std::scoped_lock lock{g_mutex};
@@ -468,7 +480,9 @@ void SaveSettingsFile(const Settings& s) {
         << "auto_mask = " << (s.auto_mask ? 1 : 0) << "\n"
         << "preset = " << s.preset << "\n"
         << "ui_correction = " << (s.ui_correction ? 1 : 0) << "\n"
-        << "mv_mode = " << s.mv_mode << "\n";
+        << "mv_mode = " << s.mv_mode << "\n"
+        << "# model: 1 = model1 folder, 2 = model2 folder (read at launch)\n"
+        << "model = " << s.model << "\n";
 }
 
 // ---- start-up -----------------------------------------------------------------------------
@@ -659,15 +673,20 @@ bool Wanted() {
             }
         }
         if (g.dir.empty()) {
-            LOG_INFO(Render_Vulkan, "DLSS 5: not found - DLSS 4.5 alone (put {} and {} in {})",
-                     ModelName, ForwarderName, (exe / "dlss5").string());
-            SetStatus(State::NotFound, "Not found: put nvngx_dlssnr.dll and nvngx.dll_dlssnr.dll "
-                                       "in the dlss5 folder next to shadPS4.exe.");
+            LOG_INFO(Render_Vulkan, "DLSS 5: not found - DLSS 4.5 alone (put {} in {} and {} in "
+                                    "its model1 / model2 subfolder)",
+                     ForwarderName, (exe / "dlss5").string(), ModelName);
+            SetStatus(State::NotFound, "Not found: put nvngx.dll_dlssnr.dll in the dlss5 folder "
+                                       "next to shadPS4.exe and nvngx_dlssnr.dll in its model1 or "
+                                       "model2 subfolder.");
             return false;
         }
         {
             std::scoped_lock lock{g_mutex};
             g_status.folder = g.dir.string();
+            for (int n = 0; n < 3; ++n) {
+                g_status.has_model[n] = HasModel(g.dir, n);
+            }
         }
         LoadSettingsFile();
         LOG_INFO(Render_Vulkan, "DLSS 5: found in {} (unofficial model - private use)",
@@ -699,7 +718,24 @@ void DeviceCreated(vk::Instance instance, vk::PhysicalDevice physical_device, vk
         SetStatus(State::Failed, why);
     };
     const std::filesystem::path forwarder = g.dir / ForwarderName;
-    const std::filesystem::path model = g.dir / ModelName;
+    // The panel's pick (dlss5-settings.ini), else the other subfolder, else the loose file.
+    const int wanted = GetSettings().model;
+    int which = -1;
+    for (const int n : {wanted, 3 - wanted, 0}) {
+        if (HasModel(g.dir, n)) {
+            which = n;
+            break;
+        }
+    }
+    const std::filesystem::path model = ModelFile(g.dir, which);
+    {
+        std::scoped_lock lock{g_mutex};
+        g_status.loaded_model = which;
+    }
+    if (which != wanted) {
+        LOG_WARNING(Render_Vulkan, "DLSS 5: model {} not found - loading {}", wanted,
+                    which == 0 ? std::string{"the loose file"} : fmt::format("model {}", which));
+    }
     g.fwd.module = LoadLibraryExW(forwarder.wstring().c_str(), nullptr,
                                   LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!g.fwd.module) {
@@ -722,7 +758,7 @@ void DeviceCreated(vk::Instance instance, vk::PhysicalDevice physical_device, vk
         fail("the parameter block layout check failed");
         return;
     }
-    LOG_INFO(Render_Vulkan, "DLSS 5: loading the model ({})", model.string());
+    LOG_INFO(Render_Vulkan, "DLSS 5: loading model {} ({})", which, model.string());
     const int probe = g.fwd.probe(model.wstring().c_str());
     if (probe != 15) {
         fail(fmt::format("the model's Vulkan entry points are incomplete (probe {})", probe));
@@ -736,8 +772,16 @@ void DeviceCreated(vk::Instance instance, vk::PhysicalDevice physical_device, vk
                                 static_cast<VkPhysicalDevice>(physical_device),
                                 static_cast<VkDevice>(device), NgxSdkVersion);
     if (init != 1) {
-        fail(fmt::format("the model would not start on this GPU (init {:#x})",
-                         static_cast<u32>(init)));
+        // Model 1 is NVIDIA's original signed file (officially RTX 50 only); model 2 is the RTX 40
+        // conversion.
+        fail(fmt::format("model {} would not start on this GPU (init {:#x}){}", which,
+                         static_cast<u32>(init),
+                         which == 1 ? ". Model 1 may need an RTX 50 card: pick model 2 and restart."
+                                    : ""));
+        {
+            std::scoped_lock lock{g_mutex};
+            g_status.loaded_model = -1;
+        }
         return;
     }
     g.device = device;
@@ -789,13 +833,13 @@ Settings GetSettings() {
     return g_settings;
 }
 
-void SetSettings(const Settings& settings) {
-    bool tuning_changed = false;
+void SetSettings(const Settings& settings, bool rebuild) {
+    bool tuning_changed = rebuild;
     {
         std::scoped_lock lock{g_mutex};
         const Settings& o = g_settings;
         // Everything but on / off is read when the feature is built: a change rebuilds it.
-        tuning_changed = o.style != settings.style || o.intensity != settings.intensity ||
+        tuning_changed |= o.style != settings.style || o.intensity != settings.intensity ||
                          o.local_structure != settings.local_structure ||
                          o.local_tone != settings.local_tone ||
                          o.skin_follows != settings.skin_follows ||
