@@ -1300,7 +1300,11 @@ std::optional<Dlss::EvalImage> Apply(const Instance& instance, vk::CommandBuffer
 bool VideoFrame(u64 resolves_at_last_flip) {
     // Diagnostics for the next round: video frames, and game frames without the T2x resolve
     // (an in-engine scene that bypasses the hook would show as the second kind).
+    // A kind counts once it held for 3 flips in a row: a game that shows one frame twice (a 30 FPS
+    // scene at 60 flips) must not flip-flop between kinds, nor DLSS 5 between the two paths.
     static int last_kind = 0; // 0 game-rendered, 1 video, 2 no resolve and no video
+    static int candidate = 0;
+    static int streak = 0;
     static u64 run = 0;
     if (g_state.load(std::memory_order_acquire) != State::Ready ||
         !Dlss::g_user_on.load(std::memory_order_relaxed)) {
@@ -1312,7 +1316,10 @@ bool VideoFrame(u64 resolves_at_last_flip) {
                            .count();
     const bool decoding =
         now_ms - Libraries::Videodec::g_last_decode_ms.load(std::memory_order_relaxed) < 250;
-    const int kind = resolved ? 0 : decoding ? 1 : 2;
+    const int seen = resolved ? 0 : decoding ? 1 : 2;
+    streak = seen == candidate ? streak + 1 : 1;
+    candidate = seen;
+    const int kind = streak >= 3 ? candidate : last_kind;
     if (kind != last_kind) {
         static const char* const names[] = {"game-rendered", "video cutscene",
                                             "no T2x resolve, no video"};
