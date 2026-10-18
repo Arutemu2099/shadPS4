@@ -21,6 +21,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_a2.h"
 #include "video_core/renderer_vulkan/vk_bindless.h"
+#include "video_core/renderer_vulkan/vk_dlss_upscale.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
@@ -400,7 +401,14 @@ bool ComputeDynamicState(DynamicState& ds, const Instance& instance, const AmdGp
     }
     ds.SetLineWidth(regs.line_control.Width());
     ds.SetBlendConstants(regs.blend_constants);
-    ds.SetColorWriteMasks(pipeline->GetGraphicsKey().write_masks);
+    if (Dlss::Mode() == 1) [[unlikely]] {
+        // SHADPS4_DLSS_UPSCALE: HUD draws into the HUD layer also write coverage.
+        auto masks = pipeline->GetGraphicsKey().write_masks;
+        Dlss::ApplyHudLayerMask(masks, regs.color_buffers[0].Address());
+        ds.SetColorWriteMasks(masks);
+    } else {
+        ds.SetColorWriteMasks(pipeline->GetGraphicsKey().write_masks);
+    }
     ds.SetAttachmentFeedbackLoopEnabled(false);
     return true;
 }

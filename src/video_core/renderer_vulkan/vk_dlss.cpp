@@ -13,6 +13,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -48,6 +49,7 @@ struct Api {
     PFun_slFreeResources* free_resources{};
     PFN_vkGetDeviceProcAddr get_device_proc_addr{};
     PFun_slDLSSSetOptions* dlss_set_options{};
+    PFun_slDLSSGetOptimalSettings* dlss_get_optimal{};
     PFN_vkQueuePresentKHR present{};
 };
 
@@ -56,6 +58,8 @@ bool g_initialized = false; // slInit succeeded
 bool g_device_ok = false;   // slSetVulkanInfo succeeded and the DLSS functions exist
 std::vector<const char*> g_device_extensions;
 u32 g_options_preset = ~0u; // the preset the options were last set with
+u32 g_options_width = 0;     // ... and the output size
+u32 g_options_height = 0;
 std::chrono::steady_clock::time_point g_last_eval{};
 u64 g_evaluated = 0;
 u64 g_failed = 0;
@@ -272,6 +276,11 @@ void DeviceCreated(vk::Instance instance, vk::PhysicalDevice physical_device, vk
         return;
     }
     g_api.dlss_set_options = reinterpret_cast<PFun_slDLSSSetOptions*>(fn);
+    fn = nullptr;
+    if (g_api.get_feature_function(sl::kFeatureDLSS, "slDLSSGetOptimalSettings", fn) ==
+        sl::Result::eOk) {
+        g_api.dlss_get_optimal = reinterpret_cast<PFun_slDLSSGetOptimalSettings*>(fn);
+    }
     g_api.present = reinterpret_cast<PFN_vkQueuePresentKHR>(
         g_api.get_device_proc_addr(static_cast<VkDevice>(device), "vkQueuePresentKHR"));
     if (!g_api.present) {
@@ -315,11 +324,40 @@ bool Evaluate(vk::CommandBuffer cmdbuf, u64 frame, const EvalImage& color, const
         const char* v = std::getenv("SHADPS4_DLSS_PRESET");
         return v ? static_cast<u32>(std::atoi(v)) : 0u; // 0 = default (K for DLAA)
     }();
-    if (preset != g_options_preset) {
+    if (preset != g_options_preset || output.width != g_options_width ||
+        output.height != g_options_height) {
         sl::DLSSOptions options{};
         options.mode = sl::DLSSMode::eDLAA;
         options.outputWidth = output.width;
         options.outputHeight = output.height;
+        if (output.width != color.width || output.height != color.height) {
+            // SHADPS4_DLSS_UPSCALE: the game's 1920x1080 into the window size - the first mode
+            // whose render range holds it (1080p -> 1440p is 0.75: Quality, inferred).
+            constexpr std::array modes{sl::DLSSMode::eMaxQuality, sl::DLSSMode::eUltraQuality,
+                                       sl::DLSSMode::eBalanced, sl::DLSSMode::eMaxPerformance};
+            options.mode = sl::DLSSMode::eMaxQuality;
+            for (const sl::DLSSMode m : modes) {
+                options.mode = m;
+                sl::DLSSOptimalSettings opt{};
+                if (!g_api.dlss_get_optimal ||
+                    g_api.dlss_get_optimal(options, opt) != sl::Result::eOk) {
+                    options.mode = sl::DLSSMode::eMaxQuality;
+                    break;
+                }
+                LOG_INFO(Render_Vulkan,
+                         "DLSS: mode {} for {}x{}: render {}x{} (min {}x{}, max {}x{})",
+                         static_cast<u32>(m), output.width, output.height, opt.optimalRenderWidth,
+                         opt.optimalRenderHeight, opt.renderWidthMin, opt.renderHeightMin,
+                         opt.renderWidthMax, opt.renderHeightMax);
+                if (opt.renderWidthMin <= color.width && color.width <= opt.renderWidthMax &&
+                    opt.renderHeightMin <= color.height && color.height <= opt.renderHeightMax) {
+                    break;
+                }
+            }
+        }
+        options.qualityPreset = static_cast<sl::DLSSPreset>(preset);
+        options.ultraQualityPreset = static_cast<sl::DLSSPreset>(preset);
+        options.balancedPreset = static_cast<sl::DLSSPreset>(preset);
         options.colorBuffersHDR = sl::Boolean::eFalse; // the tonemapped LDR frame
         options.preExposure = 1.0f;
         options.exposureScale = 1.0f;
@@ -333,6 +371,11 @@ bool Evaluate(vk::CommandBuffer cmdbuf, u64 frame, const EvalImage& color, const
             return false;
         }
         g_options_preset = preset;
+        g_options_width = output.width;
+        g_options_height = output.height;
+        LOG_INFO(Render_Vulkan, "DLSS: options set: mode {} {}x{} -> {}x{}, preset {}",
+                 static_cast<u32>(options.mode), color.width, color.height, output.width,
+                 output.height, preset);
         reset = true;
     }
 

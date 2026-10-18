@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #ifdef _MSC_VER
+#include <optional>
 #include <intrin.h>
 #else
 #include <x86intrin.h>
@@ -28,6 +29,7 @@
 #include "sdl_window.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/vk_dlss_upscale.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -898,6 +900,28 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     const vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
 
+    // SHADPS4_DLSS_UPSCALE (vk_dlss_upscale.h): this frame's DLSS output at the window size with
+    // the game's HUD layer over it replaces the display buffer as the post pass's input. The
+    // layer's image is found and moved here (stream order: after this frame's HUD draws, before
+    // the next frame's resolve clears it).
+    std::optional<Dlss::CompositeJob> dlss_job;
+    if (Dlss::Upscaler* upscaler = Dlss::GetUpscaler(instance)) {
+        if (upscaler->Ready()) {
+            const auto hud_id = texture_cache.FindImageFromRange(
+                Dlss::HudLayerAddr, size_t{1920} * 1080 * 4, true);
+            if (hud_id) {
+                auto& hud = texture_cache.GetImage(hud_id);
+                hud.Transit(vk::ImageLayout::eShaderReadOnlyOptimal,
+                            vk::AccessFlagBits2::eShaderRead, {});
+                VideoCore::ImageViewInfo hud_view_info{};
+                hud_view_info.type = AmdGpu::ImageType::Color2D;
+                hud_view_info.format = hud.info.pixel_format;
+                dlss_job = upscaler->TakeJob(*hud.FindView(hud_view_info).image_view);
+            }
+        }
+        upscaler->SetOutputSize(frame->width, frame->height);
+    }
+
     const u32 capture_game_only_count = VideoCore::ConsumeGameOnlyScreenshotRequests();
     // q6 (SHADPS4_PRESENT_ASYNC=1): no synchronous borrow - AcquireCommandBuffer drains the
     // recording lanes (s620: ~1.5 ms per flip on the back). The display image's Transit goes
@@ -915,12 +939,17 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         draw_scheduler.EndRendering();
         // q6b (2): ordered (FsrPass keeps state across flips); the Frame by value.
         draw_scheduler.RecordOrdered([this, pre_barrier, image_view, image_size, fc = *frame,
-                                      fsr = fsr_settings,
-                                      pp = pp_settings](vk::CommandBuffer cb) mutable {
+                                      fsr = fsr_settings, pp = pp_settings,
+                                      dlss_job](vk::CommandBuffer cb) mutable {
             cb.pipelineBarrier2(vk::DependencyInfo{
                 .imageMemoryBarrierCount = 1,
                 .pImageMemoryBarriers = &pre_barrier,
             });
+            if (dlss_job) {
+                Dlss::RecordComposite(cb, *dlss_job);
+                pp_pass.Render(cb, dlss_job->out_view, dlss_job->size, fc, pp);
+                return;
+            }
             const auto view =
                 fsr_pass.Render(cb, image_view, image_size, {fc.width, fc.height}, fsr, fc.is_hdr);
             pp_pass.Render(cb, view, image_size, fc, pp);
@@ -961,9 +990,14 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {},
                   cmdbuf);
 
-    image_view = fsr_pass.Render(cmdbuf, image_view, image_size, {frame->width, frame->height},
-                                 fsr_settings, frame->is_hdr);
-    pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+    if (dlss_job) {
+        Dlss::RecordComposite(cmdbuf, *dlss_job);
+        pp_pass.Render(cmdbuf, dlss_job->out_view, dlss_job->size, *frame, pp_settings);
+    } else {
+        image_view = fsr_pass.Render(cmdbuf, image_view, image_size,
+                                     {frame->width, frame->height}, fsr_settings, frame->is_hdr);
+        pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+    }
 
     DebugState.game_resolution = {image_size.width, image_size.height};
     DebugState.output_resolution = {frame->width, frame->height};

@@ -40,6 +40,7 @@
 #include "video_core/amdgpu/mtb_census.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
+#include "video_core/renderer_vulkan/vk_dlss_upscale.h"
 #include "video_core/amdgpu/native_rec.h"
 #include "video_core/amdgpu/lean_front_api.h"
 #include "video_core/renderer_vulkan/vk_a2.h"
@@ -1675,6 +1676,7 @@ void Rasterizer::DlssResolve() {
     }
     scheduler.EndRendering();
     bool evaluated = false;
+    bool hud_layer = false;
     if (Dlss::Mode() == 1) {
         VideoCore::Image* motion = find(Dlss::MotionAddr);
         VideoCore::Image* depth = find(Dlss::DepthAddr);
@@ -1716,14 +1718,24 @@ void Rasterizer::DlssResolve() {
                 dlss_reset_pending |= combo_changed;
             }
             const auto cmdbuf = scheduler.AcquireCommandBuffer().Handle();
+            // SHADPS4_DLSS_UPSCALE (vk_dlss_upscale.h): DLSS writes the window size into its own
+            // image; this target becomes the HUD layer below.
+            Dlss::Upscaler* const upscaler =
+                Dlss::HudLayerActive() ? Dlss::GetUpscaler(instance) : nullptr;
+            const Dlss::EvalImage target =
+                upscaler ? upscaler->SceneTarget(cmdbuf)
+                         : eval_image(out, vk::ImageLayout::eGeneral, true, false);
             evaluated = Dlss::Evaluate(
                 cmdbuf, dlss_calls,
                 eval_image(*in, vk::ImageLayout::eShaderReadOnlyOptimal, false, false),
                 eval_image(*motion, vk::ImageLayout::eShaderReadOnlyOptimal, false, false),
                 eval_image(*depth, vk::ImageLayout::eDepthStencilReadOnlyOptimal, false, true),
-                eval_image(out, vk::ImageLayout::eGeneral, true, false), jx, jy,
-                dlss_reset_pending);
+                target, jx, jy, dlss_reset_pending);
             dlss_reset_pending = false;
+            if (upscaler && evaluated) {
+                upscaler->SceneWritten(cmdbuf);
+                hud_layer = true;
+            }
             // Streamline / NGX bind their own compute state into this command buffer (checklist
             // sec. 4): nothing the next draw relies on may be assumed still bound.
             scheduler.GetDynamicState().Invalidate();
@@ -1734,7 +1746,13 @@ void Rasterizer::DlssResolve() {
                         depth ? "found" : "missing");
         }
     }
-    if (evaluated) {
+    if (hud_layer) {
+        // The HUD draws blend premultiplied onto 0 and write alpha (ApplyHudLayerMask): this
+        // target ends as HUD colour + coverage; the presenter lays it over the DLSS output.
+        ++dlss_evaluated;
+        out.Clear(vk::ClearValue{.color = vk::ClearColorValue{std::array{0.0f, 0.0f, 0.0f, 0.0f}}},
+                  VideoCore::SubresourceRange{});
+    } else if (evaluated) {
         ++dlss_evaluated;
     } else {
         out.CopyImage(*in);
@@ -14209,7 +14227,13 @@ void Rasterizer::UpdateColorBlendingState(const GraphicsPipeline* pipeline) cons
     const auto& regs = liverpool->BackRegs();
     auto& dynamic_state = scheduler.GetDynamicState();
     dynamic_state.SetBlendConstants(regs.blend_constants);
-    dynamic_state.SetColorWriteMasks(pipeline->GetGraphicsKey().write_masks);
+    if (Dlss::Mode() == 1) [[unlikely]] {
+        auto masks = pipeline->GetGraphicsKey().write_masks;
+        Dlss::ApplyHudLayerMask(masks, regs.color_buffers[0].Address());
+        dynamic_state.SetColorWriteMasks(masks);
+    } else {
+        dynamic_state.SetColorWriteMasks(pipeline->GetGraphicsKey().write_masks);
+    }
     dynamic_state.SetAttachmentFeedbackLoopEnabled(attachment_feedback_loop);
 }
 
