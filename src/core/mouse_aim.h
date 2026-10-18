@@ -12,7 +12,7 @@
 // motion bypasses the stick curve, sensitivity, acceleration and aim assist while a pad's stick
 // keeps the game's feel. notes/study-input-kbm-2026-10-14.md sec. 6 (design A).
 // Mouse aim is on while the mouse is captured with F7 (mouse-to-joystick mode).
-// SHADPS4_MOUSE_AIM_SENS = degrees per 100 px (default 8); SHADPS4_MOUSE_AIM_FLIP = x, y or xy.
+// SHADPS4_MOUSE_AIM_SENS = degrees per 100 px (default 5.12); SHADPS4_MOUSE_AIM_FLIP = x, y or xy.
 namespace Core::MouseAim {
 
 bool Enabled();

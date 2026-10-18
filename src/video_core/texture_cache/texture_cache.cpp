@@ -1308,6 +1308,25 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
     return {};
 }
 
+ImageId TextureCache::FindImageAtSize(VAddr address, u32 width, u32 height) {
+    ImageId best{};
+    u64 best_tick = 0;
+    if (const auto it = page_table.find(address >> Traits::PageBits); it != nullptr) {
+        for (const ImageId image_id : *it) {
+            const Image& image = slot_images[image_id];
+            if (image.info.guest_address != address || image.info.size.width != width ||
+                image.info.size.height != height) {
+                continue;
+            }
+            if (!best || image.tick_accessed_last >= best_tick) {
+                best = image_id;
+                best_tick = image.tick_accessed_last;
+            }
+        }
+    }
+    return best;
+}
+
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {

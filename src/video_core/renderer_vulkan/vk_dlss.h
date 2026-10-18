@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include "common/logging/log.h"
 #include "common/types.h"
 #include "shader_recompiler/info.h"
 #include "video_core/amdgpu/regs.h"
@@ -74,7 +75,11 @@ inline bool IsResolve(VAddr ps_address) {
 // loading screen could flip.
 constexpr u64 WeightsPsHash = 0x961c93ba; ///< SMAA blend weights
 inline std::atomic<u64> g_weights_ps{0};
-inline std::atomic<u32> g_weights_ud{~0u}; ///< user-data dword of its CB's V# (direct only)
+inline std::atomic<u32> g_weights_ud{~0u}; ///< dword of its CB's V# in the flattened user data
+/// When the V# is not in the 16 user-data registers: the shader's SRT walker (it reads the guest
+/// pointer tables into the flattened buffer, as binding does) and that buffer's size.
+inline std::atomic<Shader::PFN_SrtWalker> g_weights_walker{nullptr};
+inline std::atomic<u32> g_weights_flat_dw{0};
 /// The parsing thread's last weights draw: 1 / 2 = subsample index, 3 = T2x off, 0 = unknown.
 inline thread_local u8 t_phase = 0;
 
@@ -84,12 +89,37 @@ inline void NoteWeightsInfo(const Shader::Info& info, VAddr base) {
         [[likely]] {
         return;
     }
+    if (g_weights_ps.load(std::memory_order_relaxed) == base) {
+        return;
+    }
     for (const auto& b : info.buffers) {
-        if (!b.IsSpecial() && !b.inline_cbuf && b.sharp_idx + 4 <= 16) {
-            g_weights_ud.store(b.sharp_idx, std::memory_order_relaxed);
-            g_weights_ps.store(base, std::memory_order_relaxed);
-            return;
+        if (b.IsSpecial() || b.inline_cbuf) {
+            continue;
         }
+        if (b.sharp_idx + 4 <= 16) {
+            g_weights_walker.store(nullptr, std::memory_order_relaxed);
+        } else if (info.srt_info.walker_func != nullptr &&
+                   b.sharp_idx + 4 <= info.srt_info.flattened_bufsize_dw &&
+                   info.srt_info.flattened_bufsize_dw <= 1024) {
+            // Play log 2026-10-17: the phase stayed "unknown" on every frame - the V# comes
+            // through a pointer table, not the 16 registers.
+            g_weights_flat_dw.store(info.srt_info.flattened_bufsize_dw, std::memory_order_relaxed);
+            g_weights_walker.store(info.srt_info.walker_func, std::memory_order_relaxed);
+        } else {
+            continue;
+        }
+        g_weights_ud.store(b.sharp_idx, std::memory_order_relaxed);
+        g_weights_ps.store(base, std::memory_order_release);
+        LOG_INFO(Render_Vulkan, "DLSS: jitter source fs_961c93ba at {:#x}, CB V# at dword {} ({})",
+                 base, b.sharp_idx,
+                 b.sharp_idx + 4 <= 16 ? "user data" : "pointer table");
+        return;
+    }
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true)) {
+        LOG_WARNING(Render_Vulkan, "DLSS: fs_961c93ba has no readable CB ({} buffers) - jitter "
+                                   "phase unknown",
+                    info.buffers.size());
     }
 }
 
@@ -100,11 +130,22 @@ inline void NoteDraw(const AmdGpu::Regs& regs) {
         return;
     }
     const u32 ud = g_weights_ud.load(std::memory_order_relaxed);
-    if (ud + 4 > 16) {
-        return;
-    }
     AmdGpu::Buffer vsharp;
-    std::memcpy(&vsharp, &regs.ps_program.user_data[ud], sizeof(vsharp));
+    if (ud + 4 <= 16) {
+        std::memcpy(&vsharp, &regs.ps_program.user_data[ud], sizeof(vsharp));
+    } else {
+        const auto walker = g_weights_walker.load(std::memory_order_relaxed);
+        const u32 flat_dw = g_weights_flat_dw.load(std::memory_order_relaxed);
+        if (walker == nullptr || ud + 4 > flat_dw) {
+            t_phase = 0;
+            return;
+        }
+        thread_local std::vector<u32> flat;
+        flat.assign(flat_dw, 0u);
+        std::memcpy(flat.data(), regs.ps_program.user_data.data(), 16 * sizeof(u32));
+        walker(regs.ps_program.user_data.data(), flat.data());
+        std::memcpy(&vsharp, &flat[ud], sizeof(vsharp));
+    }
     if (vsharp.base_address == 0 || vsharp.GetSize() < 52) {
         t_phase = 0;
         return;

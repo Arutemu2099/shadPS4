@@ -114,6 +114,11 @@ public:
     /// Retrieves image whose address matches provided
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
 
+    /// SHADPS4_DLSS: the image at exactly `address` with this size, the most recently used one
+    /// when several alias it (0x26b200000 holds the 1920x1080 scene depth and, after the AA, the
+    /// minimap's 768x768 depth: FindImageFromRange's byte-size test matches neither).
+    [[nodiscard]] ImageId FindImageAtSize(VAddr address, u32 width, u32 height);
+
     /// SHADPS4_DRAW_REPEAT_HEAP: any image whose guest address is exactly `address` (the
     /// candidates FindImageFromRange considers, without its size test or log).
     [[nodiscard]] bool AnyImageAt(VAddr address);

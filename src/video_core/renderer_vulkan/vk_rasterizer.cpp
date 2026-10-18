@@ -1655,14 +1655,12 @@ void Rasterizer::DlssResolve() {
     const auto& regs = liverpool->BackRegs();
     VideoCore::TextureCache::ImageDesc out_desc{regs.color_buffers[0], liverpool->BackCbExtent(0)};
     auto& out = texture_cache.GetImage(texture_cache.FindImage(out_desc, true));
+    // By address and size: 0x26b200000 also holds the minimap's 768x768 depth after the AA
+    // (play log 2026-10-17: depth "missing" on 109,135 of 109,569 resolves).
     const auto find = [&](VAddr address) -> VideoCore::Image* {
-        const VideoCore::ImageId id =
-            texture_cache.FindImageFromRange(address, size_t{1920} * 1080 * 4, true);
-        VideoCore::Image* image = id ? &texture_cache.GetImage(id) : nullptr;
-        return image && image->info.size.width == out.info.size.width &&
-                       image->info.size.height == out.info.size.height
-                   ? image
-                   : nullptr;
+        const VideoCore::ImageId id = texture_cache.FindImageAtSize(
+            address, out.info.size.width, out.info.size.height);
+        return id ? &texture_cache.GetImage(id) : nullptr;
     };
     VideoCore::Image* in = find(Dlss::ColorInAddr);
     if (!in || in->info.pixel_format != out.info.pixel_format) [[unlikely]] {

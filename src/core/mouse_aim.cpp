@@ -34,7 +34,7 @@ struct Mailbox {
 std::atomic<Mailbox*> g_mailbox{nullptr}; ///< published last (release), after everything below
 const volatile u8* g_invert_x = nullptr;
 const volatile u8* g_invert_y = nullptr;
-std::atomic<float> g_sens_deg{8.0f};
+std::atomic<float> g_sens_deg{5.12f}; // the user's pick, 2026-10-17 (8 x 0.8 x 0.8)
 float g_sign_x = -1.0f; // mouse right -> pan decreases (guess; SHADPS4_MOUSE_AIM_FLIP=x flips)
 float g_sign_y = -1.0f; // mouse up (negative yrel) -> tilt increases (guess)
 /// Tick (timer thread): the camera hook ran within the last StaleAfter.
