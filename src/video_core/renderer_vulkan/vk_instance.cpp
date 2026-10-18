@@ -12,6 +12,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/types.h"
+#include "core/address_space.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -755,11 +756,14 @@ bool Instance::CreateDevice() {
         // SHADPS4_DLSS: try the device once with Streamline's extensions (a raw call: no result
         // assert). A driver that refuses them gets the device without them - the game's own
         // anti-aliasing - never a failed start. Measured 10-17 (driver 617.14): VK_NVX_binary_import
-        // made vkCreateDevice fail here.
+        // made vkCreateDevice crash here while the guest held all address space below 1 TB.
         LOG_INFO(Render_Vulkan, "DLSS: creating the device with {} extensions", enabled_extensions.size());
         std::fprintf(stderr, "DLSS-MARK probe start (%u extensions)\n",
                      static_cast<unsigned>(enabled_extensions.size()));
         std::fflush(stderr);
+        // VK_NVX_binary_import needs ~56 GB of free address space below 1 TB (the driver crashes
+        // without it); the address space has held it out of the guest's map until now.
+        Core::ReleaseDriverVaHole();
         VkDevice probe = VK_NULL_HANDLE;
         const VkResult probe_result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateDevice(
             static_cast<VkPhysicalDevice>(physical_device),

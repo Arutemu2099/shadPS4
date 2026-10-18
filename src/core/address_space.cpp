@@ -1,8 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <map>
 #include <shared_mutex>
+#include <vector>
 #include "common/scope_exit.h"
 #include "common/alignment.h"
 #include "common/arch.h"
@@ -105,6 +109,29 @@ struct MemoryRegion {
     bool is_mapped;
 };
 
+// SHADPS4_DLSS=1: address space held for NVIDIA's driver below 1 TB (see Impl()).
+// SHADPS4_DLSS_VA_HOLE_GB sets its size (default 128, 0 = none).
+static std::atomic<void*> g_driver_va_hole{nullptr};
+
+static u64 DriverVaHoleSize() {
+    const char* dlss = std::getenv("SHADPS4_DLSS");
+    if (dlss == nullptr || dlss[0] != '1') {
+        return 0;
+    }
+    u64 gb = 128;
+    if (const char* v = std::getenv("SHADPS4_DLSS_VA_HOLE_GB")) {
+        gb = std::strtoull(v, nullptr, 10);
+    }
+    return std::min<u64>(gb, 512) << 30;
+}
+
+void ReleaseDriverVaHole() {
+    if (void* hole = g_driver_va_hole.exchange(nullptr)) {
+        VirtualFree(hole, 0, MEM_RELEASE);
+        LOG_INFO(Core, "DLSS: address space released for the driver at {}", fmt::ptr(hole));
+    }
+}
+
 struct AddressSpace::Impl {
     Impl() : process{GetCurrentProcess()} {
         // Determine the system's page alignment
@@ -172,6 +199,36 @@ struct AddressSpace::Impl {
             }
         }
 
+        // SHADPS4_DLSS=1 (2026-10-17, measured with scratch/dlss-vaprobe-20261017): with
+        // VK_NVX_binary_import, NVIDIA's driver reserves ~56 GB of host address space below 1 TB
+        // during vkCreateDevice (it shrinks to fit, down to ~9 GB) and crashes inside the call when
+        // none is free. Keep [1 TB - hole, 1 TB) out of the guest's regions (the guest maps first
+        // fit from 8 GB) and hold it as our own reservation until ReleaseDriverVaHole().
+        const u64 hole_size = DriverVaHoleSize();
+        const VAddr hole_hi = 0x10000000000ULL;
+        const VAddr hole_lo = hole_hi - hole_size;
+        if (hole_size != 0) {
+            std::vector<MemoryRegion> parts;
+            for (auto it = regions.begin(); it != regions.end();) {
+                const VAddr b = it->second.base;
+                const VAddr e = b + it->second.size;
+                if (e <= hole_lo || b >= hole_hi) {
+                    ++it;
+                    continue;
+                }
+                if (b < hole_lo) {
+                    parts.push_back({b, PAddr(-1), hole_lo - b, PAGE_NOACCESS, -1, false});
+                }
+                if (e > hole_hi) {
+                    parts.push_back({hole_hi, PAddr(-1), e - hole_hi, PAGE_NOACCESS, -1, false});
+                }
+                it = regions.erase(it);
+            }
+            for (const auto& part : parts) {
+                regions.emplace(part.base, part);
+            }
+        }
+
         // Reserve all detected free regions.
         for (auto region : regions) {
             auto addr = static_cast<u8*>(VirtualAlloc2(
@@ -180,6 +237,20 @@ struct AddressSpace::Impl {
             // All marked regions should reserve fine since they're free.
             ASSERT_MSG(addr, "Unable to reserve virtual address space: {}",
                        Common::GetLastErrorMsg());
+        }
+        if (hole_size != 0) {
+            void* hole = VirtualAlloc2(process, reinterpret_cast<PVOID>(hole_lo), hole_size,
+                                       MEM_RESERVE, PAGE_NOACCESS, nullptr, 0);
+            if (hole) {
+                g_driver_va_hole.store(hole);
+                LOG_INFO(Core, "DLSS: {:#x} - {:#x} ({} GB) held for the driver", hole_lo, hole_hi,
+                         hole_size >> 30);
+            } else {
+                // Part of the range was taken before we got here: it stays out of the guest's
+                // map, the free parts stay free.
+                LOG_WARNING(Core, "DLSS: could not hold {:#x} - {:#x} for the driver: {}", hole_lo,
+                            hole_hi, Common::GetLastErrorMsg());
+            }
         }
 
         // Set these constants to ensure code relying on them works.
@@ -602,6 +673,8 @@ struct AddressSpace::Impl {
     std::map<VAddr, MemoryRegion> regions;
 };
 #else
+
+void ReleaseDriverVaHole() {}
 
 enum PosixPageProtection {
     PAGE_NOACCESS = 0,

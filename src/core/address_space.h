@@ -126,4 +126,8 @@ private:
     u64 user_size{};
 };
 
+/// SHADPS4_DLSS=1: frees the address space held below 1 TB for NVIDIA's driver; call right before
+/// vkCreateDevice with VK_NVX_binary_import (address_space.cpp). No-op otherwise.
+void ReleaseDriverVaHole();
+
 } // namespace Core
