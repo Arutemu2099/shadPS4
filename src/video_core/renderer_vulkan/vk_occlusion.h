@@ -111,6 +111,17 @@ public:
             } else {
                 ++stats.unresolved_at_end;
             }
+            // Per block (2026-10-18, the headlamp flicker): the begin word is ours (ValidBit) until
+            // the guest zeroes the block for its next query - zero here means the guest moved on
+            // before this end dump, so it read this block while it held no valid result.
+            BlockStats& bs = block_stats[addr - 8];
+            ++bs.ends;
+            bs.late += results[-1] == 0 ? 1 : 0;
+            if (bs.ends > 1 && (count == 0) != (bs.last_published == 0)) {
+                ++bs.flips;
+            }
+            bs.zero += count == 0 ? 1 : 0;
+            bs.last_published = count;
             // The per-render-backend counters are summed by the guest: all of it goes in pair 0.
             results[0] = (count & ~ValidBit) | ValidBit;
             for (s32 i = 1; i < pairs; ++i) {
@@ -261,6 +272,15 @@ private:
                 counts += fmt::format(" {:#x}:{}", base, count);
             }
             LOG_INFO(Render_Vulkan, "OcclusionQ: real: last counts (block:samples){}", counts);
+            std::string blocks;
+            for (const auto& [base, b] : block_stats) {
+                blocks += fmt::format(" {:#x}: ends {} late {} zero {} flips {} |", base, b.ends,
+                                      b.late, b.zero, b.flips);
+            }
+            LOG_INFO(Render_Vulkan, "OcclusionQ: real: per block (late = the guest re-zeroed the "
+                                    "block before the end dump; flips = published 0 <-> nonzero){}",
+                     blocks);
+            block_stats.clear();
             stats = Stats{};
         }
     }
@@ -282,6 +302,15 @@ private:
         u64 incomplete{};
         u64 dropped{};
     };
+
+    struct BlockStats {
+        u64 ends{};
+        u64 late{};
+        u64 zero{};
+        u64 flips{};
+        u64 last_published{};
+    };
+    std::unordered_map<u64, BlockStats> block_stats;
 
     const Instance& instance;
     Scheduler& scheduler;
