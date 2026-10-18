@@ -299,6 +299,12 @@ void Panel::Draw() {
             ImGui::SetItemTooltip("Videos have no depth, so the model gets one flat value "
                                   "(0 = far ... 1 = near).\nTry it if video cutscenes change "
                                   "too little or too much.");
+            if (ImGui::Checkbox("Video: fresh every frame", &edit.video_fresh)) {
+                Commit();
+            }
+            ImGui::SetItemTooltip("Off (default): the model keeps its history through a video - "
+                                  "steady, a moving shot may\nghost a little. On: every frame "
+                                  "starts fresh - no ghosting, but details flicker.");
         }
 
         ImGui::Spacing();

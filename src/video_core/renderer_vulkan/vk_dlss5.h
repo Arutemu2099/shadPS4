@@ -52,6 +52,7 @@ struct Settings {
     // Not read by the model (live):
     bool video = true;        ///< also on video cutscenes
     float video_depth = 0.5f; ///< the flat depth a video frame is given (reversed Z, 0 = far)
+    bool video_fresh = false; ///< a new history on every video frame (round 2's way; flickered)
     int passes = 1;           ///< 1-3 model passes (layering)
     float transfer = 1.0f;    ///< how much of the model's light change reaches the frame (0-1.5)
     float colour = 1.0f;      ///< how much of the model's colour change reaches it (0-1)

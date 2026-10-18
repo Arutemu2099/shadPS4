@@ -505,6 +505,8 @@ void LoadSettingsFile() {
             s.video = i != 0;
         } else if (key == "video_depth") {
             s.video_depth = std::clamp(f, 0.0f, 1.0f);
+        } else if (key == "video_fresh") {
+            s.video_fresh = i != 0;
         } else if (key == "passes") {
             s.passes = std::clamp(i, 1, MaxPasses);
         } else if (key == "transfer") {
@@ -548,6 +550,7 @@ void SaveSettingsFile(const Settings& s) {
         << "mv_mode = " << s.mv_mode << "\n"
         << "video = " << (s.video ? 1 : 0) << "\n"
         << "video_depth = " << s.video_depth << "\n"
+        << "video_fresh = " << (s.video_fresh ? 1 : 0) << "\n"
         << "passes = " << s.passes << "\n"
         << "transfer = " << s.transfer << "\n"
         << "colour = " << s.colour << "\n"
@@ -1229,6 +1232,12 @@ std::optional<Dlss::EvalImage> Apply(const Instance& instance, vk::CommandBuffer
     ++g.applies;
     FreeRetired(false);
     ReadTiming();
+    // One lane's features alive at a time (2026-10-18: the device was lost ~2 s into the first
+    // gameplay after the intro video, the first time a video feature and a gameplay feature
+    // lived together; round 1 ran 20k+ frames with one). Retired = released 64 runs later.
+    for (int k = 0; k < MaxPasses; ++k) {
+        RetireFeature(g.video, k);
+    }
 
     const u32 gen = g_generation.load(std::memory_order_acquire);
     const Settings s = GetSettings();
@@ -1380,8 +1389,14 @@ bool VideoFrame(u64 resolves_at_last_flip) {
     if (kind != 1) {
         return false;
     }
+    // SHADPS4_DLSS5_VIDEO=0: never the video path, whatever the panel says (a bisect launcher
+    // that leaves the saved settings alone).
+    static const bool video_env_off = [] {
+        const char* v = std::getenv("SHADPS4_DLSS5_VIDEO");
+        return v && v[0] == '0';
+    }();
     const Settings s = GetSettings();
-    return s.enabled && s.video;
+    return s.enabled && s.video && !video_env_off;
 }
 
 std::optional<vk::ImageView> ApplyVideo(const Instance& instance, vk::CommandBuffer cmdbuf,
@@ -1394,6 +1409,9 @@ std::optional<vk::ImageView> ApplyVideo(const Instance& instance, vk::CommandBuf
     Lane& lane = g.video;
     ++g.applies;
     FreeRetired(false);
+    for (int k = 0; k < MaxPasses; ++k) {
+        RetireFeature(g.game, k); // one lane's features alive at a time (see Apply)
+    }
     const u32 gen = g_generation.load(std::memory_order_acquire);
     const Settings s = GetSettings();
     if (gen == lane.failed_gen) {
@@ -1427,11 +1445,18 @@ std::optional<vk::ImageView> ApplyVideo(const Instance& instance, vk::CommandBuf
     Dispatch(cmdbuf, MakeParams(1, s, linear), frame_view, vk::ImageLayout::eShaderReadOnlyOptimal,
              lane.input->view.get(), lane.input->view.get(), lane.input->view.get(), w, h);
     FullBarrier(cmdbuf);
-    // Spatial only: every frame starts a new history (zero motion would smear a moving shot).
+    // History kept across a video (round 2 reset every frame: the model redrew its detail from
+    // scratch each frame and the intro flickered); a new one when a video starts (a gap in the
+    // lane's runs), on a new feature, or every frame with `video_fresh`. Zero motion: a moving
+    // shot may ghost a little.
+    const bool gap = lane.last_apply + 1 != g.applies;
+    lane.last_apply = g.applies;
+    const bool reset = s.video_fresh || gap || lane.fresh[0];
+    lane.fresh[0] = false;
     int result = 0;
     if (!Evaluate(cmdbuf, lane.features[0], s, AsEval(*lane.input, w, h),
                   AsEval(*g.video_depth, w, h), AsEval(*g.video_motion, w, h),
-                  AsEval(*lane.out[0], w, h), 0.0f, 0.0f, /*reset*/ true, &result)) {
+                  AsEval(*lane.out[0], w, h), 0.0f, 0.0f, reset, &result)) {
         EvalFailed(lane, gen, result, "video");
         SetVideoRunning(false);
         return std::nullopt;
