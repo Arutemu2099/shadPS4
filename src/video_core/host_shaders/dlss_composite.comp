@@ -31,5 +31,7 @@ void main() {
     const vec4 hud = texture(sampler2D(hud_layer, linear_sampler), uv);
     const vec3 base = texelFetch(sampler2D(scene, linear_sampler), pos, 0).rgb;
     const vec3 encoded = clamp(hud.rgb + (1.0 - hud.a) * base, 0.0, 1.0);
-    imageStore(frame_out, pos, vec4(SrgbToLinear(encoded), 1.0));
+    // The game's frame is red / blue swapped in its own images; its final copy (fs_529286b5)
+    // swaps them back on the way to the display buffer, which this pass replaces (s1364 picture).
+    imageStore(frame_out, pos, vec4(SrgbToLinear(encoded.bgr), 1.0));
 }
