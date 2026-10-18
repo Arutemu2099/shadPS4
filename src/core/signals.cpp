@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/decoder.h"
@@ -461,6 +462,25 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
                                       ? static_protection_exception
                                       : code != EXCEPTION_BREAKPOINT;
     if (report_unhandled) { // Windows static guest red-zone protection
+        // 2026-10-17: the buffered file log loses its tail when the process ends here; one
+        // unbuffered stderr line keeps the code, address and module of the fatal fault.
+        {
+            HMODULE fault_module = nullptr;
+            wchar_t module_name[MAX_PATH] = L"<no module>";
+            if (address != nullptr &&
+                GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   static_cast<LPCWSTR>(address), &fault_module)) {
+                GetModuleFileNameW(fault_module, module_name, MAX_PATH);
+            }
+            std::fprintf(stderr, "FATAL-FAULT code %#lx at %p in %ls (offset %#llx)\n",
+                         static_cast<unsigned long>(code), address, module_name,
+                         fault_module ? static_cast<unsigned long long>(
+                                            reinterpret_cast<uintptr_t>(address) -
+                                            reinterpret_cast<uintptr_t>(fault_module))
+                                      : 0ULL);
+            std::fflush(stderr);
+        }
         // Windows hands us the access type and the faulting data address in ExceptionInformation;
         // the POSIX path already logs both, so report them here too rather than just the RIP.
         // Only decode the instruction for read/write faults: on an execute violation the RIP is
@@ -499,6 +519,31 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     }
 
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// 2026-10-17: a fault nobody handles (e.g. inside a driver DLL) ends the process without a
+// Critical line and the buffered log loses its tail; print its code and module first.
+static LONG WINAPI LastChanceFilter(PEXCEPTION_POINTERS pExp) {
+    const DWORD code = pExp && pExp->ExceptionRecord ? pExp->ExceptionRecord->ExceptionCode : 0;
+    void* const address =
+        pExp && pExp->ExceptionRecord ? pExp->ExceptionRecord->ExceptionAddress : nullptr;
+    HMODULE fault_module = nullptr;
+    wchar_t module_name[MAX_PATH] = L"<no module>";
+    if (address != nullptr &&
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<LPCWSTR>(address), &fault_module)) {
+        GetModuleFileNameW(fault_module, module_name, MAX_PATH);
+    }
+    std::fprintf(stderr, "FATAL-UNHANDLED code %#lx at %p in %ls (offset %#llx) thread %lu\n",
+                 static_cast<unsigned long>(code), address, module_name,
+                 fault_module ? static_cast<unsigned long long>(
+                                    reinterpret_cast<uintptr_t>(address) -
+                                    reinterpret_cast<uintptr_t>(fault_module))
+                              : 0ULL,
+                 GetCurrentThreadId());
+    std::fflush(stderr);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -556,6 +601,7 @@ SignalDispatch::SignalDispatch() {
 #if defined(_WIN32)
     ASSERT_MSG(handle = AddVectoredExceptionHandler(0, SignalHandler),
                "Failed to register exception handler.");
+    SetUnhandledExceptionFilter(LastChanceFilter);
 #else
     struct sigaction action{};
     action.sa_sigaction = SignalHandler;
