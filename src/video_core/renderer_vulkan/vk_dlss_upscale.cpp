@@ -16,6 +16,9 @@ namespace Vulkan::Dlss {
 namespace {
 constexpr u32 GameWidth = 1920;
 constexpr u32 GameHeight = 1080;
+constexpr vk::ImageUsageFlags SceneUsage =
+    vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
+    vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc;
 constexpr vk::ImageSubresourceRange ColorRange{
     .aspectMask = vk::ImageAspectFlagBits::eColor,
     .levelCount = 1,
@@ -139,12 +142,10 @@ void Upscaler::Resize(vk::Extent2D size) {
         }));
         return t;
     };
-    scene = make(vk::Format::eR8G8B8A8Unorm,
-                 vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
-                 "DLSS output");
-    out = make(vk::Format::eR16G16B16A16Sfloat,
-               vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
-               "DLSS composite");
+    // Transfer usage too: NGX clears its output with vkCmdClearColorImage (validation run s1359,
+    // VUID-vkCmdClearColorImage-image-00002 on the storage + sampled image).
+    scene = make(vk::Format::eR8G8B8A8Unorm, SceneUsage, "DLSS output");
+    out = make(vk::Format::eR16G16B16A16Sfloat, SceneUsage, "DLSS composite");
     scene_layout = vk::ImageLayout::eUndefined;
     image_size = size;
     LOG_INFO(Render_Vulkan, "DLSS upscale: output images {}x{}", size.width, size.height);
@@ -175,7 +176,7 @@ EvalImage Upscaler::SceneTarget(vk::CommandBuffer cmdbuf) {
         .view = scene->view.get(),
         .format = vk::Format::eR8G8B8A8Unorm,
         .layout = vk::ImageLayout::eGeneral,
-        .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
+        .usage = SceneUsage,
         .width = image_size.width,
         .height = image_size.height,
         .depth = false,
