@@ -666,6 +666,9 @@ std::unique_ptr<OwnedImage> MakeImage(const Instance& instance, u32 width, u32 h
         .initialLayout = vk::ImageLayout::eUndefined,
     });
     SetObjectName(g.device, static_cast<vk::Image>(t->image), "{}", name);
+    // For SHADPS4_ADDR_BIND_REPORT's device-fault dump (which object held a faulting address).
+    LOG_INFO(Render_Vulkan, "DLSS 5: {} {}x{} = image {:#x}", name, width, height,
+             reinterpret_cast<u64>(static_cast<VkImage>(t->image.image)));
     t->view = Check<"create dlss5 view">(g.device.createImageViewUnique({
         .image = t->image,
         .viewType = vk::ImageViewType::e2D,
