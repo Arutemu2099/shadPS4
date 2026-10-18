@@ -1954,10 +1954,13 @@ std::optional<vk::ImageView> ApplyVideo(const Instance& instance, vk::CommandBuf
     }
     Dispatch(cmdbuf, MakeParams(3, s, false), enc.view.get(), vk::ImageLayout::eGeneral,
              enc.view.get(), answer->view.get(), lane.composed->view.get(), w, h);
-    // The post pass samples it.
+    // The post pass samples it. Written by our draw (or the compute dispatch with
+    // SHADPS4_DLSS5_COMPUTE=1): both writers are in the source scope.
     const vk::ImageMemoryBarrier2 to_read{
-        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+        .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput |
+                        vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite |
+                         vk::AccessFlagBits2::eShaderWrite,
         .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
         .oldLayout = vk::ImageLayout::eGeneral,
