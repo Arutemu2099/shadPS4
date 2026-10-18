@@ -568,9 +568,11 @@ void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
 }
 
 void Image::Upload(std::span<const vk::BufferImageCopy> upload_copies, vk::Buffer buffer,
-                   u64 offset) {
+                   u64 offset, u64 barrier_size) {
     SetBackingSamples(info.num_samples, false);
     scheduler->EndRendering();
+    // barrier_size: the source range when it is not the guest-sized upload (TexReplace pictures).
+    const u64 range_size = barrier_size ? barrier_size : info.guest_size;
 
     const vk::BufferMemoryBarrier2 pre_barrier{
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -579,7 +581,7 @@ void Image::Upload(std::span<const vk::BufferImageCopy> upload_copies, vk::Buffe
         .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
         .buffer = buffer,
         .offset = offset,
-        .size = info.guest_size,
+        .size = range_size,
     };
     const vk::BufferMemoryBarrier2 post_barrier{
         .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
@@ -588,7 +590,7 @@ void Image::Upload(std::span<const vk::BufferImageCopy> upload_copies, vk::Buffe
         .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
         .buffer = buffer,
         .offset = offset,
-        .size = info.guest_size,
+        .size = range_size,
     };
     const auto image_barriers =
         GetBarriers(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,

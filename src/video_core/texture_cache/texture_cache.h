@@ -182,6 +182,9 @@ public:
     /// Reuploads image contents.
     void RefreshImage(Image& image);
 
+    /// SHADPS4_TEX_REPLACE: the user's pictures over parts of a just-uploaded texture.
+    void ApplyTexReplace(Image& image);
+
     /// Retrieves the sampler that matches the provided S# descriptor. When native_index is
     /// provided, it also receives the sampler's descriptor heap slot; the sampler object may
     /// move in its map, so the slot is resolved here under the same lock.

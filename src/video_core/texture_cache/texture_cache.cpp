@@ -4,6 +4,7 @@
 #include <unordered_map>
 #include <boost/container/small_vector.hpp>
 #include <cstdlib>
+#include <cstring>
 #include <immintrin.h>
 #include <thread>
 #include <limits>
@@ -26,6 +27,7 @@
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/amdgpu/mtb_census.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "video_core/texture_cache/tex_replace.h"
 #include "video_core/texture_cache/tile_manager.h"
 
 namespace VideoCore {
@@ -1488,6 +1490,53 @@ void TextureCache::NoteTargetUse(ImageId image_id, bool is_depth) {
     UpdateImage(image_id);
 }
 
+/// SHADPS4_TEX_REPLACE (2026-10-18, LATER-PLAN 11): copies the user's pictures over their rectangles
+/// of a texture that was just uploaded (tex_replace.h). Runs again after every re-upload of mip 0,
+/// so the game's own data never shows through.
+void TextureCache::ApplyTexReplace(Image& image) {
+    const auto* target = TexReplace::Find(image.info);
+    if (!target) {
+        return;
+    }
+    auto& stream = buffer_cache.GetUtilityBuffer(MemoryUsage::Stream);
+    const bool swap = TexReplace::SwapRedBlue(image.info);
+    boost::container::small_vector<vk::BufferImageCopy, 32> copies;
+    std::vector<u8> swapped;
+    u64 lo = std::numeric_limits<u64>::max();
+    u64 hi = 0;
+    for (const auto& p : target->patches) {
+        const u8* src = p.rgba.data();
+        if (swap) {
+            swapped = p.rgba;
+            for (size_t i = 0; i + 3 < swapped.size(); i += 4) {
+                std::swap(swapped[i], swapped[i + 2]);
+            }
+            src = swapped.data();
+        }
+        const auto [data, off] = stream.Map(p.rgba.size(), 16);
+        std::memcpy(data, src, p.rgba.size());
+        stream.Commit();
+        lo = std::min<u64>(lo, off);
+        hi = std::max<u64>(hi, off + p.rgba.size());
+        copies.push_back({
+            .bufferOffset = off,
+            .bufferRowLength = 0,
+            .bufferImageHeight = 0,
+            .imageSubresource{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .imageOffset = {static_cast<s32>(p.x), static_cast<s32>(p.y), 0},
+            .imageExtent = {p.width, p.height, 1},
+        });
+    }
+    if (!copies.empty()) {
+        image.Upload(copies, stream.Handle(), lo, hi - lo);
+    }
+}
+
 void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
@@ -1615,6 +1664,9 @@ void TextureCache::RefreshImage(Image& image) {
     rc_lap(3);
 
     image.Upload(image_copies, buffer, offset);
+    if (TexReplace::Enabled() && image_copies.front().imageSubresource.mipLevel == 0) [[unlikely]] {
+        ApplyTexReplace(image);
+    }
     rc_lap(4);
     if (g_refresh_cost && rc_t - rc_t0 + g_refresh_lock_cyc > 350000) {
         static thread_local std::unordered_map<u64, u32> logged;
