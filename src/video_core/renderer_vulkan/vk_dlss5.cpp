@@ -47,6 +47,8 @@
 #include "common/path_util.h"
 #include "core/libraries/videodec/video_activity.h"
 #include "video_core/host_shaders/dlss5_compose_comp.h"
+#include "video_core/host_shaders/dlss5_compose_frag.h"
+#include "video_core/host_shaders/fs_tri_vert.h"
 #include "video_core/renderer_vulkan/vk_dlss5.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -79,10 +81,13 @@ constexpr u32 TimingSlots = 8;
 //                           contents between frames (no per-frame discard).
 //   SHADPS4_DLSS5_NOMODEL=1 neither DLL is loaded: every model run is a plain copy, so our passes
 //                           run alone (a test that needs no unsigned code).
+//   SHADPS4_DLSS5_COMPUTE=1 our passes as compute dispatches again (rounds 2-3; they crashed even
+//                           with no model - NOMODEL test 2026-10-18) instead of full-screen draws.
 struct Switches {
     bool reset = false;
     int path = 0;
     bool no_model = false;
+    bool compute = false;
 };
 
 const Switches& Test() {
@@ -94,6 +99,7 @@ const Switches& Test() {
         Switches x;
         x.reset = on("SHADPS4_DLSS5_RESET");
         x.no_model = on("SHADPS4_DLSS5_NOMODEL");
+        x.compute = on("SHADPS4_DLSS5_COMPUTE");
         if (const char* v = std::getenv("SHADPS4_DLSS5_PATH"); v && (v[0] == '1' || v[0] == '2')) {
             x.path = v[0] - '0';
         }
@@ -366,7 +372,8 @@ struct OwnedImage {
 
 constexpr vk::ImageUsageFlags OwnedUsage =
     vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
-    vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc;
+    vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc |
+    vk::ImageUsageFlagBits::eColorAttachment; // our passes draw into them
 constexpr vk::Format OwnedFormat = vk::Format::eR16G16B16A16Sfloat;
 constexpr vk::ImageSubresourceRange ColorRange{
     .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -415,7 +422,12 @@ struct ComposePipeline {
     vk::UniqueSampler sampler;
     vk::UniqueDescriptorSetLayout set_layout;
     vk::UniquePipelineLayout layout;
-    vk::UniquePipeline pipeline;
+    vk::UniquePipeline pipeline; ///< compute (SHADPS4_DLSS5_COMPUTE=1)
+    // The default: dlss5_compose.frag as a full-screen draw, built like the post-process pass
+    // (push descriptors of combined image samplers, fragment push constants, dynamic rendering).
+    vk::UniqueDescriptorSetLayout gfx_set_layout;
+    vk::UniquePipelineLayout gfx_layout;
+    vk::UniquePipeline gfx_pipeline;
 };
 
 // The model state below is used by the thread that records the DLSS resolve (gameplay) and by
@@ -824,14 +836,112 @@ void EnsureCompose() {
                 .layout = c->layout.get(),
             }));
     g.device.destroyShaderModule(module);
+
+    const std::array<vk::DescriptorSetLayoutBinding, 3> gfx_bindings{{
+        {.binding = 0,
+         .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+         .descriptorCount = 1,
+         .stageFlags = vk::ShaderStageFlagBits::eFragment},
+        {.binding = 1,
+         .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+         .descriptorCount = 1,
+         .stageFlags = vk::ShaderStageFlagBits::eFragment},
+        {.binding = 2,
+         .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+         .descriptorCount = 1,
+         .stageFlags = vk::ShaderStageFlagBits::eFragment},
+    }};
+    c->gfx_set_layout = Check<"create dlss5 draw set layout">(g.device.createDescriptorSetLayoutUnique({
+        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptor,
+        .bindingCount = static_cast<u32>(gfx_bindings.size()),
+        .pBindings = gfx_bindings.data(),
+    }));
+    const vk::PushConstantRange gfx_push{
+        .stageFlags = vk::ShaderStageFlagBits::eFragment,
+        .offset = 0,
+        .size = sizeof(ComposeParams),
+    };
+    c->gfx_layout = Check<"create dlss5 draw layout">(g.device.createPipelineLayoutUnique({
+        .setLayoutCount = 1,
+        .pSetLayouts = &c->gfx_set_layout.get(),
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &gfx_push,
+    }));
+    const auto vs = Compile(HostShaders::FS_TRI_VERT, vk::ShaderStageFlagBits::eVertex, g.device);
+    const auto fs =
+        Compile(HostShaders::DLSS5_COMPOSE_FRAG, vk::ShaderStageFlagBits::eFragment, g.device);
+    ASSERT(vs && fs);
+    const std::array stages{
+        vk::PipelineShaderStageCreateInfo{
+            .stage = vk::ShaderStageFlagBits::eVertex, .module = vs, .pName = "main"},
+        vk::PipelineShaderStageCreateInfo{
+            .stage = vk::ShaderStageFlagBits::eFragment, .module = fs, .pName = "main"},
+    };
+    const vk::Format color_format = OwnedFormat;
+    const vk::PipelineRenderingCreateInfo rendering{
+        .colorAttachmentCount = 1,
+        .pColorAttachmentFormats = &color_format,
+    };
+    const vk::PipelineVertexInputStateCreateInfo vertex_input{};
+    const vk::PipelineInputAssemblyStateCreateInfo input_assembly{
+        .topology = vk::PrimitiveTopology::eTriangleList,
+    };
+    const vk::PipelineViewportStateCreateInfo viewport_state{
+        .viewportCount = 1,
+        .scissorCount = 1,
+    };
+    const vk::PipelineRasterizationStateCreateInfo raster{
+        .depthClampEnable = false,
+        .rasterizerDiscardEnable = false,
+        .polygonMode = vk::PolygonMode::eFill,
+        .cullMode = vk::CullModeFlagBits::eNone,
+        .frontFace = vk::FrontFace::eClockwise,
+        .depthBiasEnable = false,
+        .lineWidth = 1.0f,
+    };
+    const vk::PipelineMultisampleStateCreateInfo multisample{
+        .rasterizationSamples = vk::SampleCountFlagBits::e1,
+    };
+    const vk::PipelineColorBlendAttachmentState blend_attachment{
+        .blendEnable = false,
+        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
+    };
+    const vk::PipelineColorBlendStateCreateInfo blend{
+        .logicOpEnable = false,
+        .attachmentCount = 1,
+        .pAttachments = &blend_attachment,
+    };
+    const std::array dynamic_states{vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+    const vk::PipelineDynamicStateCreateInfo dynamic{
+        .dynamicStateCount = static_cast<u32>(dynamic_states.size()),
+        .pDynamicStates = dynamic_states.data(),
+    };
+    c->gfx_pipeline = Check<"create dlss5 draw pipeline">(g.device.createGraphicsPipelineUnique(
+        {}, vk::GraphicsPipelineCreateInfo{
+                .pNext = &rendering,
+                .stageCount = static_cast<u32>(stages.size()),
+                .pStages = stages.data(),
+                .pVertexInputState = &vertex_input,
+                .pInputAssemblyState = &input_assembly,
+                .pViewportState = &viewport_state,
+                .pRasterizationState = &raster,
+                .pMultisampleState = &multisample,
+                .pColorBlendState = &blend,
+                .pDynamicState = &dynamic,
+                .layout = c->gfx_layout.get(),
+            }));
+    g.device.destroyShaderModule(vs);
+    g.device.destroyShaderModule(fs);
     g.compose = std::move(c);
 }
 
-/// One pass of dlss5_compose.comp. `src` is sampled in `src_layout`; the three storage images
-/// are in GENERAL. Unused bindings get valid views anyway (the shader declares them all).
-void Dispatch(vk::CommandBuffer cmd, const ComposeParams& params, vk::ImageView src,
-              vk::ImageLayout src_layout, vk::ImageView original, vk::ImageView model,
-              vk::ImageView dst, u32 w, u32 h) {
+/// One pass of dlss5_compose.comp (SHADPS4_DLSS5_COMPUTE=1). `src` is sampled in `src_layout`;
+/// the three storage images are in GENERAL. Unused bindings get valid views anyway (the shader
+/// declares them all).
+void DispatchCompute(vk::CommandBuffer cmd, const ComposeParams& params, vk::ImageView src,
+                     vk::ImageLayout src_layout, vk::ImageView original, vk::ImageView model,
+                     vk::ImageView dst, u32 w, u32 h) {
     const vk::DescriptorImageInfo src_info{.imageView = src, .imageLayout = src_layout};
     const vk::DescriptorImageInfo original_info{.imageView = original,
                                                 .imageLayout = vk::ImageLayout::eGeneral};
@@ -864,6 +974,80 @@ void Dispatch(vk::CommandBuffer cmd, const ComposeParams& params, vk::ImageView 
     cmd.dispatch((w + 7) / 8, (h + 7) / 8, 1);
 }
 
+/// One pass of dlss5_compose.frag: a full-screen triangle into `dst` (GENERAL), recorded exactly
+/// like the post-process pass that runs in the same command buffers (pipeline, viewport, scissor,
+/// push descriptors, push constants, then the rendering). `src` is sampled in `src_layout`,
+/// `original` / `model` in GENERAL; the encode modes read `src` only, so every binding gets it
+/// (dst must not be bound while it is drawn into).
+void DrawPass(vk::CommandBuffer cmd, const ComposeParams& params, vk::ImageView src,
+              vk::ImageLayout src_layout, vk::ImageView original, vk::ImageView model,
+              vk::ImageView dst, u32 w, u32 h) {
+    const bool encode = params.mode <= 1;
+    const vk::Sampler sampler = g.compose->sampler.get();
+    const vk::DescriptorImageInfo src_info{
+        .sampler = sampler, .imageView = src, .imageLayout = src_layout};
+    const vk::DescriptorImageInfo original_info{
+        .sampler = sampler,
+        .imageView = encode ? src : original,
+        .imageLayout = encode ? src_layout : vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo model_info{
+        .sampler = sampler,
+        .imageView = encode ? src : model,
+        .imageLayout = encode ? src_layout : vk::ImageLayout::eGeneral};
+    const std::array<vk::WriteDescriptorSet, 3> writes{{
+        {.dstBinding = 0,
+         .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+         .pImageInfo = &src_info},
+        {.dstBinding = 1,
+         .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+         .pImageInfo = &original_info},
+        {.dstBinding = 2,
+         .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+         .pImageInfo = &model_info},
+    }};
+    const vk::RenderingAttachmentInfo attachment{
+        .imageView = dst,
+        .imageLayout = vk::ImageLayout::eGeneral,
+        .loadOp = vk::AttachmentLoadOp::eDontCare, // every pixel is drawn
+        .storeOp = vk::AttachmentStoreOp::eStore,
+    };
+    const vk::RenderingInfo rendering{
+        .renderArea{.extent{.width = w, .height = h}},
+        .layerCount = 1,
+        .colorAttachmentCount = 1,
+        .pColorAttachments = &attachment,
+    };
+    cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, g.compose->gfx_pipeline.get());
+    cmd.setViewport(0, vk::Viewport{.x = 0.0f,
+                                    .y = 0.0f,
+                                    .width = static_cast<float>(w),
+                                    .height = static_cast<float>(h),
+                                    .minDepth = 0.0f,
+                                    .maxDepth = 1.0f});
+    cmd.setScissor(0, vk::Rect2D{.extent{.width = w, .height = h}});
+    cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, g.compose->gfx_layout.get(), 0,
+                             writes);
+    cmd.pushConstants(g.compose->gfx_layout.get(), vk::ShaderStageFlagBits::eFragment, 0,
+                      sizeof(ComposeParams), &params);
+    cmd.beginRendering(rendering);
+    cmd.draw(3, 1, 0, 0);
+    cmd.endRendering();
+}
+
+/// One of our passes: a full-screen draw (default) or the old compute dispatch.
+void Dispatch(vk::CommandBuffer cmd, const ComposeParams& params, vk::ImageView src,
+              vk::ImageLayout src_layout, vk::ImageView original, vk::ImageView model,
+              vk::ImageView dst, u32 w, u32 h) {
+    if (Test().compute) {
+        DispatchCompute(cmd, params, src, src_layout, original, model, dst, w, h);
+    } else {
+        DrawPass(cmd, params, src, src_layout, original, model, dst, w, h);
+    }
+}
+
 /// Everything written before is visible to everything after (one global barrier: these passes
 /// are a handful per frame).
 void FullBarrier(vk::CommandBuffer cmd) {
@@ -892,7 +1076,9 @@ void ToGeneral(vk::CommandBuffer cmd, std::initializer_list<const OwnedImage*> i
             .srcAccessMask = vk::AccessFlagBits2::eNone,
             .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
             .dstAccessMask = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead |
-                             vk::AccessFlagBits2::eTransferWrite,
+                             vk::AccessFlagBits2::eTransferWrite |
+                             vk::AccessFlagBits2::eColorAttachmentWrite |
+                             vk::AccessFlagBits2::eColorAttachmentRead,
             .oldLayout = vk::ImageLayout::eUndefined,
             .newLayout = vk::ImageLayout::eGeneral,
             .image = img->image,
@@ -1373,9 +1559,11 @@ void DeviceCreated(vk::Instance instance, vk::PhysicalDevice physical_device, vk
     }
     std::scoped_lock model_lock{g_model_mutex};
     const Switches& t = Test();
-    if (t.reset || t.path != 0 || t.no_model) {
-        LOG_WARNING(Render_Vulkan, "DLSS 5: test switches - reset every run {}, path {}, no model {}",
-                    t.reset, t.path, t.no_model);
+    if (t.reset || t.path != 0 || t.no_model || t.compute) {
+        LOG_WARNING(Render_Vulkan,
+                    "DLSS 5: test switches - reset every run {}, path {}, no model {}, compute "
+                    "passes {}",
+                    t.reset, t.path, t.no_model, t.compute);
     }
     if (t.no_model) {
         LOG_WARNING(Render_Vulkan, "DLSS 5: NO-MODEL test (SHADPS4_DLSS5_NOMODEL=1) - nothing "

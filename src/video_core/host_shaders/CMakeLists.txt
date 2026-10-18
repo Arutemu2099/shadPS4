@@ -14,6 +14,7 @@ set(SHADER_FILES
     color_to_ms_depth.frag
     dlss_composite.comp
     dlss5_compose.comp
+    dlss5_compose.frag
     ms_image_blit.frag
     fault_buffer_process.comp
     fs_tri.vert
