@@ -443,6 +443,10 @@ struct Context {
 
     u64 applies = 0; ///< every lane's runs: the clock retired objects wait on
     std::deque<std::pair<u64, void*>> retired_features;
+    vk::PhysicalDevice physical_device;
+    u32 features_alive = 0;         ///< created and not yet released
+    std::deque<s64> build_times_ms; ///< recent model builds (the rebuild guard)
+    s64 builds_paused_until_ms = 0;
     std::deque<std::pair<u64, std::unique_ptr<OwnedImage>>> retired_images;
 
     Lane game;
@@ -735,6 +739,7 @@ void FreeRetired(bool all) {
         if (g.fwd.release) { // null in the no-model test
             g.fwd.release(g.retired_features.front().second);
         }
+        --g.features_alive;
         g.retired_features.pop_front();
     }
     while (!g.retired_images.empty() &&
@@ -1135,6 +1140,61 @@ void CopyWhole(vk::CommandBuffer cmd, vk::Image src, vk::Image dst, u32 w, u32 h
     cmd.copyImage(src, vk::ImageLayout::eGeneral, dst, vk::ImageLayout::eGeneral, region);
 }
 
+s64 NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+/// Device-local VRAM in use / budget in MB (VK_EXT_memory_budget, which the instance enables),
+/// also put into the status for the panel.
+std::pair<u32, u32> UpdateVram() {
+    if (!g.physical_device) {
+        return {0, 0};
+    }
+    vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    vk::PhysicalDeviceMemoryProperties2 props{.pNext = &budget};
+    g.physical_device.getMemoryProperties2(&props);
+    u64 used = 0;
+    u64 total = 0;
+    for (u32 i = 0; i < props.memoryProperties.memoryHeapCount; ++i) {
+        if (props.memoryProperties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+            used += budget.heapUsage[i];
+            total += budget.heapBudget[i];
+        }
+    }
+    const std::pair<u32, u32> mb{static_cast<u32>(used >> 20), static_cast<u32>(total >> 20)};
+    std::scoped_lock lock{g_mutex};
+    g_status.vram_used_mb = mb.first;
+    g_status.vram_budget_mb = mb.second;
+    g_status.features_alive = g.features_alive;
+    return mb;
+}
+
+/// The rebuild guard (2026-10-18: at cutscene exits the two lanes rebuilt each other ~40 times in
+/// 10 s; VRAM ran over budget - Streamline warned on every frame for the rest of the session and
+/// the game fell to ~8 FPS). More than 12 builds in 10 s pause new builds for 10 s; the frame
+/// goes through untouched meanwhile. False = do not build now.
+bool BuildAllowed() {
+    const s64 now = NowMs();
+    if (now < g.builds_paused_until_ms) {
+        return false;
+    }
+    while (!g.build_times_ms.empty() && now - g.build_times_ms.front() > 10000) {
+        g.build_times_ms.pop_front();
+    }
+    if (g.build_times_ms.size() >= 12) {
+        g.builds_paused_until_ms = now + 10000;
+        g.build_times_ms.clear();
+        LOG_WARNING(Render_Vulkan, "DLSS 5: 12 model builds in 10 s - new builds paused for 10 s "
+                                   "(each one holds VRAM until it is released)");
+        SetMessage("Paused 10 s: too many rebuilds in a row (they fill the graphics memory).");
+        return false;
+    }
+    g.build_times_ms.push_back(now);
+    return true;
+}
+
 ComposeParams MakeParams(u32 mode, const Settings& s, bool src_linear) {
     return ComposeParams{
         .mode = mode,
@@ -1250,8 +1310,14 @@ bool EnsureFeature(vk::CommandBuffer cmd, Lane& lane, int k, const Settings& s, 
     if (lane.features[k] && lane.feature_gen[k] == gen) {
         return true;
     }
+    if (!BuildAllowed()) {
+        return false; // paused, not refused: no failure bookkeeping
+    }
     RetireFeature(lane, k);
     lane.features[k] = CreateFeature(cmd, s, w, h);
+    if (lane.features[k]) {
+        ++g.features_alive;
+    }
     if (!lane.features[k]) {
         const int code = g.fwd.last_create ? *g.fwd.last_create : 0;
         LOG_ERROR(Render_Vulkan, "DLSS 5: the model would not build {} pass {} ({:#x}) at {}x{}",
@@ -1273,11 +1339,14 @@ bool EnsureFeature(vk::CommandBuffer cmd, Lane& lane, int k, const Settings& s, 
     lane.built_at[k] = g.applies;
     lane.fresh[k] = true;
     lane.eval_failures = 0;
+    const auto [vram_used, vram_budget] = UpdateVram();
     LOG_INFO(Render_Vulkan,
              "DLSS 5: {} pass {} up at {}x{} (style {}, network {}, intensity {:.2f}, structure "
-             "{:.2f}, tone {:.2f}, skin {:.2f}, auto mask {})",
+             "{:.2f}, tone {:.2f}, skin {:.2f}, auto mask {}) | model copies alive {}, VRAM {} / "
+             "{} MB",
              name, k + 1, w, h, s.style, s.preset, s.intensity, s.local_structure, s.local_tone,
-             s.skin_follows ? -1.0f : s.skin_structure, s.auto_mask);
+             s.skin_follows ? -1.0f : s.skin_structure, s.auto_mask, g.features_alive, vram_used,
+             vram_budget);
     return true;
 }
 
@@ -1572,6 +1641,7 @@ void DeviceCreated(vk::Instance instance, vk::PhysicalDevice physical_device, vk
         return;
     }
     g.device = device;
+    g.physical_device = physical_device;
     g.timestamp_period = physical_device.getProperties().limits.timestampPeriod;
     if (g.timestamp_period > 0.0f) {
         const VkQueryPoolCreateInfo info{
@@ -1670,11 +1740,17 @@ std::optional<Dlss::EvalImage> Apply(const Instance& instance, vk::CommandBuffer
     ++g.applies;
     FreeRetired(false);
     ReadTiming();
-    // One lane's features alive at a time (2026-10-18: the device was lost ~2 s into the first
-    // gameplay after the intro video, the first time a video feature and a gameplay feature
-    // lived together; round 1 ran 20k+ frames with one). Retired = released 64 runs later.
-    for (int k = 0; k < MaxPasses; ++k) {
-        RetireFeature(g.video, k);
+    // The video lane's model goes once no video frame came for 600 runs (~5 s of gameplay): it
+    // holds VRAM. Both lanes' models may live at once - round 3's "one lane at a time" rested on
+    // a wrong crash theory (the crash was our compute passes), and at cutscene exits the lanes
+    // then rebuilt each other ~40 times in 10 s (2026-10-18 runs 13:38 / 14:07).
+    if (g.video.features[0] && g.applies - g.video.last_apply > 600) {
+        for (int k = 0; k < MaxPasses; ++k) {
+            RetireFeature(g.video, k);
+        }
+    }
+    if ((g.applies & 127) == 0) {
+        UpdateVram();
     }
 
     const u32 gen = g_generation.load(std::memory_order_acquire);
@@ -1806,8 +1882,11 @@ std::optional<Dlss::EvalImage> Apply(const Instance& instance, vk::CommandBuffer
     }
     ++g.game_frames;
     if (g.game_frames == 1 || (g.game_frames % 1800) == 0) {
-        LOG_INFO(Render_Vulkan, "DLSS 5: running ({} gameplay frames, {} passes)", g.game_frames,
-                 passes);
+        const auto [vram_used, vram_budget] = UpdateVram();
+        LOG_INFO(Render_Vulkan,
+                 "DLSS 5: running ({} gameplay frames, {} passes) | model copies alive {}, VRAM "
+                 "{} / {} MB",
+                 g.game_frames, passes, g.features_alive, vram_used, vram_budget);
     }
     SetRunning(true, passes);
     return AsEval(*lane.composed, w, h);
@@ -1881,8 +1960,8 @@ std::optional<vk::ImageView> ApplyVideo(const Instance& instance, vk::CommandBuf
     Lane& lane = g.video;
     ++g.applies;
     FreeRetired(false);
-    for (int k = 0; k < MaxPasses; ++k) {
-        RetireFeature(g.game, k); // one lane's features alive at a time (see Apply)
+    if ((g.applies & 127) == 0) {
+        UpdateVram();
     }
     const u32 gen = g_generation.load(std::memory_order_acquire);
     const Settings s = GetSettings();

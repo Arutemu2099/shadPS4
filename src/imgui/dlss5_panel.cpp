@@ -147,6 +147,21 @@ void Panel::DrawStatus(const D5::Status& status) {
         ImGui::SetItemTooltip("Time DLSS 5 takes on the graphics card each game frame, all passes "
                               "included.\nAt 120 FPS a whole frame has 8.3 ms.");
     }
+    if (status.state == D5::State::Ready && status.vram_budget_mb > 0) {
+        const bool over = status.vram_used_mb > status.vram_budget_mb;
+        if (over) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.45f, 0.35f, 1.0f));
+        }
+        ImGui::Text("Graphics memory: %.1f / %.1f GB (%u model copies)",
+                    status.vram_used_mb / 1024.0f, status.vram_budget_mb / 1024.0f,
+                    status.features_alive);
+        if (over) {
+            ImGui::PopStyleColor();
+        }
+        ImGui::SetItemTooltip("The whole game's use of the graphics card's memory. Over the limit "
+                              "(red), the game stutters.\nEach model pass is one copy; a changed "
+                              "setting builds new copies and frees the old ones a moment later.");
+    }
 }
 
 void Panel::Draw() {
@@ -185,13 +200,13 @@ void Panel::Draw() {
             Commit();
         }
         ImGui::SameLine(250.0f);
-        if (ImGui::Checkbox("Video cutscenes too", &edit.video)) {
+        if (ImGui::Checkbox("Video cutscenes too (experimental)", &edit.video)) {
             Commit();
         }
-        ImGui::SetItemTooltip("Most story cutscenes are videos (no depth or motion), so DLSS 4.5 "
-                              "cannot touch them.\nDLSS 5 can: it runs on the video frame on its "
-                              "own, without history. Subtitles are\npart of the video, so the model "
-                              "sees them too.");
+        ImGui::SetItemTooltip("Most story cutscenes are videos with no depth or motion data, so "
+                              "DLSS 5 can only guess:\non them it mostly acts like colour "
+                              "correction. Off by default. Subtitles are part of\nthe video, so the "
+                              "model sees them too.
         if (status.video_frames > 0) {
             ImGui::TextDisabled("Video frames so far: %llu",
                                 static_cast<unsigned long long>(status.video_frames));

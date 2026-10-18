@@ -50,7 +50,8 @@ struct Settings {
     bool ui_correction = false;   ///< off: the frame it gets has no HUD in it
     int mv_mode = 0;              ///< motion vectors: 0 pixels (default), 1 normalised, 2 none
     // Not read by the model (live):
-    bool video = true;        ///< also on video cutscenes
+    bool video = false;       ///< also on video cutscenes (off by default since 10-18: without
+                              ///< depth or motion it mostly acts like colour correction)
     float video_depth = 0.5f; ///< the flat depth a video frame is given (reversed Z, 0 = far)
     bool video_fresh = false; ///< a new history on every video frame (round 2's way; flickered)
     int passes = 1;           ///< 1-3 model passes (layering)
@@ -83,6 +84,9 @@ struct Status {
     int passes_running = 0;
     u64 video_frames = 0;   ///< video cutscene frames the model ran on
     bool video_running = false;
+    u32 vram_used_mb = 0;   ///< the GPU's device-local memory in use (whole process), last check
+    u32 vram_budget_mb = 0; ///< what the driver allows before it starts paging
+    u32 features_alive = 0; ///< model copies alive (each pass of each lane, plus retiring ones)
 };
 
 /// SHADPS4_DLSS=1, SHADPS4_DLSS5 not "0" and both DLLs found (decided once).
