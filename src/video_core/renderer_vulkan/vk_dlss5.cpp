@@ -1835,15 +1835,17 @@ bool VideoFrame(u64 resolves_at_last_flip) {
                            .count();
     const bool decoding =
         now_ms - Libraries::Videodec::g_last_decode_ms.load(std::memory_order_relaxed) < 250;
-    // A video frame only after 250 ms without the T2x pass: in the city an in-world TV decodes all
-    // the time, and a short stall (a few flips without a resolve) made game frames count as video
-    // - both lanes then took turns and rebuilt the model every frame (NOMODEL test 2026-10-18,
-    // 14 flips). A cutscene video lasts seconds; DLSS 5 joins it a quarter second in.
+    // A video frame only after 500 ms without the T2x pass, and never within 500 ms of one: in the
+    // city an in-world TV decodes all the time, and a stall (a few flips without a resolve) made
+    // game frames count as video - both lanes then took turns and rebuilt the model every frame
+    // (NOMODEL tests 2026-10-18: 14 flips at full speed, 12 under the validation layer with a
+    // 250 ms rule). A cutscene video lasts many seconds; DLSS 5 joins it half a second in.
     static s64 last_resolve_ms = 0;
     if (resolved) {
         last_resolve_ms = now_ms;
     }
-    const int seen = resolved ? 0 : (decoding && now_ms - last_resolve_ms >= 250) ? 1 : 2;
+    const bool quiet = now_ms - last_resolve_ms >= 500;
+    const int seen = resolved ? 0 : (decoding && quiet) ? 1 : 2;
     streak = seen == candidate ? streak + 1 : 1;
     candidate = seen;
     const int kind = streak >= 3 ? candidate : last_kind;
@@ -1856,7 +1858,7 @@ bool VideoFrame(u64 resolves_at_last_flip) {
         run = 0;
     }
     ++run;
-    if (kind != 1) {
+    if (kind != 1 || !quiet) {
         return false;
     }
     // SHADPS4_DLSS5_VIDEO=0: never the video path, whatever the panel says (a bisect launcher
