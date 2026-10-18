@@ -1,9 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <atomic>
-#include <cstdlib>
-#include <filesystem>
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/decoder.h"
@@ -460,30 +457,6 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     }
 
     // Windows static guest red-zone protection
-    // SHADPS4_DLSS (2026-10-17): with DLSS on, a fault raised by code in another module (not
-    // shadPS4.exe, not guest memory - e.g. NVIDIA's driver while it sets up VK_NVX_binary_import)
-    // goes on to that module's own handlers instead of shutting the emulator down.
-    static const bool pass_foreign = [] {
-        const char* v = std::getenv("SHADPS4_DLSS");
-        return v && v[0] == '1';
-    }();
-    if (pass_foreign && address != nullptr) {
-        HMODULE module = nullptr;
-        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                               static_cast<LPCWSTR>(address), &module) &&
-            module != GetModuleHandleW(nullptr)) {
-            static std::atomic<u32> passed{0};
-            if (passed.fetch_add(1, std::memory_order_relaxed) < 8) {
-                wchar_t name[MAX_PATH] = {};
-                GetModuleFileNameW(module, name, MAX_PATH);
-                LOG_WARNING(Debug, "Exception {:#x} at {} in {} passed to its own handlers", code,
-                            fmt::ptr(address), Common::FS::PathToUTF8String(std::filesystem::path{name}));
-            }
-            return EXCEPTION_CONTINUE_SEARCH;
-        }
-    }
-
     const bool report_unhandled = use_static_windows_guest_red_zone_protection
                                       ? static_protection_exception
                                       : code != EXCEPTION_BREAKPOINT;
