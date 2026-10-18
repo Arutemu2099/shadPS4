@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include "common/assert.h"
@@ -43,6 +44,13 @@ u32 UpscaleTestBits() {
 }
 
 Upscaler::Upscaler(const Instance& instance_) : instance{instance_}, device{instance_.GetDevice()} {
+    // SHADPS4_DLSS_OUTPUT_SCALE=1.5: start with the supersampled output (Insert toggles it).
+    if (const char* v = std::getenv("SHADPS4_DLSS_OUTPUT_SCALE")) {
+        const float scale = static_cast<float>(std::atof(v));
+        if (scale >= 1.0f && scale <= 2.0f) {
+            g_output_scale.store(scale, std::memory_order_relaxed);
+        }
+    }
     sampler = Check<"create dlss composite sampler">(device.createSamplerUnique(vk::SamplerCreateInfo{
         .magFilter = vk::Filter::eLinear,
         .minFilter = vk::Filter::eLinear,
@@ -110,7 +118,11 @@ void Upscaler::SetOutputSize(u32 width, u32 height) {
         const char* v = std::getenv("SHADPS4_DLSS_UPSCALE_FORCE");
         return v != nullptr && v[0] == '1';
     }();
-    output_size = force ? vk::Extent2D{GameWidth, GameHeight} : vk::Extent2D{width, height};
+    // Insert: 1.5x the window (supersampling), scaled down to the window by the post pass.
+    const float scale = force ? 1.0f : g_output_scale.load(std::memory_order_relaxed);
+    const u32 out_w = std::min<u32>(static_cast<u32>(width * scale + 0.5f), 7680);
+    const u32 out_h = std::min<u32>(static_cast<u32>(height * scale + 0.5f), 4320);
+    output_size = force ? vk::Extent2D{GameWidth, GameHeight} : vk::Extent2D{out_w, out_h};
     // DLSS needs an output larger than its input; smaller windows keep DLAA in place.
     const bool on = (force || (width > GameWidth && height > GameHeight)) && g_ready.load() &&
                     instance.IsDynamicColorWriteMaskSupported();

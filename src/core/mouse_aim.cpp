@@ -236,10 +236,10 @@ void Tick() {
         std::atomic_ref<u64>{mb->delta}.store(0, std::memory_order_relaxed);
     }
     // SHADPS4_MOUSE_AIM_FOLLOW_HOLD = seconds the game's auto-follow stays off after the last
-    // mouse movement (default 1.5; 0 = never touch it).
+    // mouse movement (default 5, the user's pick 2026-10-17; 0 = never touch it).
     static const s64 hold_ns = [] {
         const char* v = std::getenv("SHADPS4_MOUSE_AIM_FOLLOW_HOLD");
-        const double s = v ? std::atof(v) : 1.5;
+        const double s = v ? std::atof(v) : 5.0;
         return static_cast<s64>(std::clamp(s, 0.0, 100000.0) * 1e9);
     }();
     if (g_no_follow != nullptr && hold_ns > 0) {

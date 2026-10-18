@@ -48,7 +48,10 @@ inline std::atomic<bool> g_ready{false};
 /// Home key: the player's on / off (the game's own T2x runs while off).
 inline std::atomic<bool> g_user_on{true};
 /// Page Up: jitter sign combination (bit 0 flips x, bit 1 flips y).
-inline std::atomic<u32> g_jitter_combo{0};
+inline std::atomic<u32> g_jitter_combo{3}; ///< D (-x -y): the user's live pick, 2026-10-17
+/// Insert (SHADPS4_DLSS_UPSCALE): 1 = DLSS writes the window size, 1.5 = 1.5x the window (3840x2160
+/// on a 1440p screen), scaled down by the post pass (supersampling; user idea 2026-10-17).
+inline std::atomic<float> g_output_scale{1.0f};
 
 /// Guest code address of fs_a6d23116 once a pipeline lookup has met it (0 = not yet / off).
 inline std::atomic<u64> g_resolve_ps{0};

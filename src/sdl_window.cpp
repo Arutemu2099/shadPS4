@@ -286,20 +286,31 @@ void WindowSDL::WaitEvent() {
                 .store(event.type == SDL_EVENT_KEY_DOWN, std::memory_order_relaxed);
         }
         if (Vulkan::Dlss::Enabled() && event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
-            (event.key.key == SDLK_HOME || event.key.key == SDLK_PAGEUP)) {
-            // SHADPS4_DLSS (vk_dlss.h): Home = DLSS on / off, Page Up = jitter sign combination.
+            (event.key.key == SDLK_HOME || event.key.key == SDLK_PAGEUP ||
+             event.key.key == SDLK_PAGEDOWN || event.key.key == SDLK_INSERT)) {
+            // SHADPS4_DLSS (vk_dlss.h): Home = DLSS on / off, Page Up / Page Down = jitter sign
+            // combination forward / back, Insert = output at the window size / 1.5x (upscale mode).
             if (!Vulkan::Dlss::g_ready.load(std::memory_order_relaxed)) {
                 Overlay::ShowNotice("DLSS not available (see the log)");
             } else if (event.key.key == SDLK_HOME) {
                 const bool on = !Vulkan::Dlss::g_user_on.load(std::memory_order_relaxed);
                 Vulkan::Dlss::g_user_on.store(on, std::memory_order_relaxed);
                 LOG_INFO(Render_Vulkan, "DLSS: {} (Home)", on ? "on" : "off - the game's own AA");
-                Overlay::ShowNotice(on ? "DLSS: ON (DLAA)" : "DLSS: OFF (game's own anti-aliasing)");
+                Overlay::ShowNotice(on ? "DLSS: ON" : "DLSS: OFF (game's own anti-aliasing)");
+            } else if (event.key.key == SDLK_INSERT) {
+                const float scale =
+                    Vulkan::Dlss::g_output_scale.load(std::memory_order_relaxed) > 1.0f ? 1.0f
+                                                                                       : 1.5f;
+                Vulkan::Dlss::g_output_scale.store(scale, std::memory_order_relaxed);
+                LOG_INFO(Render_Vulkan, "DLSS: output scale {} (Insert)", scale);
+                Overlay::ShowNotice(scale > 1.0f ? "DLSS output: 1.5x the screen, scaled down"
+                                                 : "DLSS output: the screen size");
             } else {
+                const u32 step = event.key.key == SDLK_PAGEDOWN ? 3 : 1;
                 const u32 combo =
-                    (Vulkan::Dlss::g_jitter_combo.load(std::memory_order_relaxed) + 1) & 3;
+                    (Vulkan::Dlss::g_jitter_combo.load(std::memory_order_relaxed) + step) & 3;
                 Vulkan::Dlss::g_jitter_combo.store(combo, std::memory_order_relaxed);
-                LOG_INFO(Render_Vulkan, "DLSS: jitter signs {} (Page Up)", combo);
+                LOG_INFO(Render_Vulkan, "DLSS: jitter signs {} (Page Up / Down)", combo);
                 static const char* const names[] = {"DLSS jitter: A (+x +y)", "DLSS jitter: B (-x +y)",
                                                     "DLSS jitter: C (+x -y)", "DLSS jitter: D (-x -y)"};
                 Overlay::ShowNotice(names[combo]);
