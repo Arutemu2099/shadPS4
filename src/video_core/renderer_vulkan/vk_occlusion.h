@@ -102,6 +102,24 @@ public:
     void Dump(u64* results, s32 pairs) {
         const u64 addr = reinterpret_cast<u64>(results);
         Poll();
+        // SHADPS4_OCCLUSION_TRACE=1 (2026-10-18, the headlamp flicker): the order of the guest's
+        // dumps for 400 dumps after the 3,000th (block, begin / end, presented frame, the last
+        // resolved count of the block).
+        static const bool trace = [] {
+            const char* v = std::getenv("SHADPS4_OCCLUSION_TRACE");
+            return v && v[0] == '1';
+        }();
+        if (trace) [[unlikely]] {
+            static u64 n = 0;
+            if (++n > 3000 && n <= 3400) {
+                const u64 block = addr & ~u64{8};
+                const auto it = last_count.find(block);
+                LOG_INFO(Render_Vulkan, "OcclusionTrace: #{} {:#x} {} frame {} last {}", n, block,
+                         (addr & 8) ? "end" : "begin",
+                         Common::FaultMonitor::presented_frames.load(std::memory_order_relaxed),
+                         it != last_count.end() ? static_cast<s64>(it->second) : -1);
+            }
+        }
         if (open && addr == cur.base + 8) {
             // End dump: close the query; publish the last resolved count of this result block.
             Close();
