@@ -26,7 +26,7 @@ bool Installed();
 /// Main thread: relative mouse motion in pixels while mouse aim is on.
 void OnMouseMotion(float xrel, float yrel);
 
-/// [ / ] keys: multiplies the sensitivity; returns the new degrees per 100 px.
+/// - / = keys: multiplies the sensitivity; returns the new degrees per 100 px.
 float ScaleSensitivity(float factor);
 
 } // namespace Core::MouseAim

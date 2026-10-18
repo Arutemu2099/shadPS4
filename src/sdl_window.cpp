@@ -307,10 +307,11 @@ void WindowSDL::WaitEvent() {
         }
         if (Core::MouseAim::Installed() && Input::IsMouseJoystickMode() &&
             event.type == SDL_EVENT_KEY_DOWN &&
-            (event.key.key == SDLK_LEFTBRACKET || event.key.key == SDLK_RIGHTBRACKET)) {
-            // SHADPS4_MOUSE_AIM: [ / ] = mouse sensitivity down / up.
+            (event.key.key == SDLK_MINUS || event.key.key == SDLK_EQUALS)) {
+            // SHADPS4_MOUSE_AIM: - / = = mouse sensitivity down / up (keys no shipped config binds;
+            // the brackets are the default touchpad halves).
             const float s =
-                Core::MouseAim::ScaleSensitivity(event.key.key == SDLK_LEFTBRACKET ? 0.8f : 1.25f);
+                Core::MouseAim::ScaleSensitivity(event.key.key == SDLK_MINUS ? 0.8f : 1.25f);
             Overlay::ShowNotice(fmt::format("Mouse aim: {:.1f} degrees per 100 px", s).c_str());
         }
         if (Input::g_stick_smoothing_toggle && event.type == SDL_EVENT_KEY_DOWN &&
@@ -380,7 +381,7 @@ void WindowSDL::WaitEvent() {
         SyncSyntheticMotion();
         if (Core::MouseAim::Installed()) {
             Overlay::ShowNotice(Input::IsMouseJoystickMode()
-                                    ? "Mouse aim ON ([ ] sensitivity, F7 off)"
+                                    ? "Mouse aim ON (- / = sensitivity, F7 off)"
                                     : "Mouse aim off");
         }
         break;

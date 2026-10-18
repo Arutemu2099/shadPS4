@@ -26,6 +26,7 @@ float mouse_deadzone_offset = 0.5, mouse_speed = 1, mouse_speed_offset = 0.1250;
 bool mouse_gyro_roll_mode = false;
 Uint32 mouse_polling_id = 0;
 MouseMode mouse_mode = MouseMode::Off;
+bool g_mouse_aim_clicks = false;
 
 // Switches mouse to a set mode or turns mouse emulation off if it was already in that mode.
 // Returns whether the mode is turned on.
@@ -149,6 +150,17 @@ void ApplyMouseInputBlockers() {
     // ids 1 / 3 are also a pad's LEFT-Y / RIGHT-Y axes and Circle / Triangle, which touchpad mode
     // used to swallow.
     const bool block_fix = TouchpadBlockFix();
+    if (g_mouse_aim_clicks && mouse_mode == MouseMode::Off) {
+        // SHADPS4_MOUSE_AIM: the click bindings count only while the mouse is captured, so a
+        // click that focuses the window never shoots.
+        for (auto& k : pressed_keys) {
+            if (k.first.input.type == InputType::KeyboardMouse &&
+                (k.first.input.sdl_id == SDL_BUTTON_LEFT ||
+                 k.first.input.sdl_id == SDL_BUTTON_RIGHT)) {
+                k.second = true;
+            }
+        }
+    }
     switch (mouse_mode) {
     case MouseMode::Touchpad:
         for (auto& k : pressed_keys) {

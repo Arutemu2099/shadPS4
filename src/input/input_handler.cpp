@@ -3,6 +3,7 @@
 
 #include "input_handler.h"
 
+#include <algorithm>
 #include <fstream>
 #include <iostream>
 #include <list>
@@ -25,6 +26,7 @@
 #include "core/devtools/layer.h"
 #include "core/emulator_settings.h"
 #include "core/emulator_state.h"
+#include "core/mouse_aim.h"
 #include "imgui/big_picture/settings_dialog_layer.h"
 #include "input/controller.h"
 #include "input/input_mouse.h"
@@ -610,6 +612,28 @@ void ParseInputConfig(const std::string game_id = "") {
         ProcessLine();
     }
     config_stream.close();
+    // SHADPS4_MOUSE_AIM=1 (user 2026-10-17): R2 = left click (shoot), L2 = right click (aim),
+    // added beside the keys unless the config already uses those buttons; they count only while
+    // F7 captures the mouse (input_mouse.cpp ApplyMouseInputBlockers).
+    g_mouse_aim_clicks = false;
+    if (Core::MouseAim::Enabled()) {
+        const bool config_uses_buttons =
+            std::ranges::any_of(connections, [](const BindingConnection& c) {
+                return std::ranges::any_of(c.binding.keys, [](const InputID& k) {
+                    return k.type == InputType::KeyboardMouse &&
+                           (k.sdl_id == SDL_BUTTON_LEFT || k.sdl_id == SDL_BUTTON_RIGHT);
+                });
+            });
+        if (!config_uses_buttons) {
+            line = "r2 = leftbutton";
+            ProcessLine();
+            line = "l2 = rightbutton";
+            ProcessLine();
+            g_mouse_aim_clicks = true;
+        }
+        LOG_INFO(Input, "Mouse aim: R2 / L2 on the left / right button {}",
+                 config_uses_buttons ? "skipped (the config binds the mouse buttons)" : "added");
+    }
     std::sort(connections.begin(), connections.end());
     for (auto& c : connections) {
         LOG_DEBUG(Input, "Binding: {} : {}", c.output->ToString(), c.binding.ToString());
