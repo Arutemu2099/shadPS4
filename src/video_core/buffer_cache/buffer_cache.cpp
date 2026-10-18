@@ -7768,6 +7768,12 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                 // q36: the sort replacement's invalid-width exits (0 = never; the hang guard did not fire).
                 LOG_INFO(Render, "q36 SortGuard: invalid-width exits {} (last first {} last {}), overflow exits {}",
                          g[0], g[1], g[2], g[3]);
+                if (g[4] != 0) { // SHADPS4_SORT_VERIFY=1
+                    LOG_INFO(Render,
+                             "SortVerify: dispatches {} | input out of order: lanes {} groups {} (worst "
+                             "first width {}, count {}) | own output out of order: lanes {}",
+                             g[4], g[5], g[6], g[8], g[9], g[7]);
+                }
             }
         }
     }

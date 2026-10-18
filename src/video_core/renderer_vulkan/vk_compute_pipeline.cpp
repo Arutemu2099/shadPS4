@@ -35,7 +35,7 @@ VideoCore::Buffer* SortGuardBuffer(const Instance& instance, Scheduler& schedule
             LOG_WARNING(Render_Vulkan, "q36: sort guard buffer not host-mapped; guard counts off");
             return nullptr;
         }
-        std::memset(b->mapped_data.data(), 0, 16);
+        std::memset(b->mapped_data.data(), 0, 64); // + the SORT_VERIFY words 4..9
         VideoCore::g_sort_guard_words = reinterpret_cast<volatile u32*>(b->mapped_data.data());
         return b;
     }();
@@ -77,6 +77,15 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
             const u64 addr = guard->BufferDeviceAddress(); // q36: invalid-width guard counter
             defines.push_back(fmt::format("SORT_GUARD_LO={}u", static_cast<u32>(addr)));
             defines.push_back(fmt::format("SORT_GUARD_HI={}u", static_cast<u32>(addr >> 32)));
+            // SHADPS4_SORT_VERIFY=1 (2026-10-18, the particle flicker hunt): each dispatch checks
+            // that its input runs are sorted and its own in-group output (counters in the guard).
+            static const bool verify = [] {
+                const char* v = std::getenv("SHADPS4_SORT_VERIFY");
+                return v && v[0] == '1';
+            }();
+            if (verify) {
+                defines.push_back("SORT_VERIFY=1");
+            }
         }
         synchronized_module = Compile(HostShaders::INFAMOUS_PARTICLE_SORT_COMP,
                                       vk::ShaderStageFlagBits::eCompute, device, defines);
