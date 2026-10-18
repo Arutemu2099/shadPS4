@@ -1135,6 +1135,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_dlss.cpp
                src/video_core/renderer_vulkan/vk_dlss_upscale.h
                src/video_core/renderer_vulkan/vk_dlss_upscale.cpp
+               src/video_core/renderer_vulkan/vk_dlss5.h
+               src/video_core/renderer_vulkan/vk_dlss5.cpp
                src/video_core/renderer_vulkan/vk_resource_pool.cpp
                src/video_core/renderer_vulkan/vk_resource_pool.h
                src/video_core/renderer_vulkan/vk_scheduler.cpp
@@ -1209,6 +1211,8 @@ set(IMGUI src/imgui/imgui_config.h
           src/imgui/big_picture/settings_dialog_imgui.h
           src/imgui/big_picture/settings_dialog_layer.cpp
           src/imgui/big_picture/settings_dialog_layer.h
+          src/imgui/dlss5_panel.cpp
+          src/imgui/dlss5_panel.h
           src/imgui/big_picture/imgui_impl_sdl3_big_picture.cpp
           src/imgui/big_picture/imgui_impl_sdl3_big_picture.h
           src/imgui/big_picture/imgui_impl_sdlrenderer3.cpp

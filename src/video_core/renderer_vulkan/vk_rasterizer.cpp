@@ -41,6 +41,7 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_dlss_upscale.h"
+#include "video_core/renderer_vulkan/vk_dlss5.h"
 #include "video_core/amdgpu/native_rec.h"
 #include "video_core/amdgpu/lean_front_api.h"
 #include "video_core/renderer_vulkan/vk_a2.h"
@@ -1723,12 +1724,20 @@ void Rasterizer::DlssResolve() {
             const Dlss::EvalImage target =
                 upscaler ? upscaler->SceneTarget(cmdbuf)
                          : eval_image(out, vk::ImageLayout::eGeneral, true, false);
-            evaluated = Dlss::Evaluate(
-                cmdbuf, dlss_calls,
-                eval_image(*in, vk::ImageLayout::eShaderReadOnlyOptimal, false, false),
-                eval_image(*motion, vk::ImageLayout::eShaderReadOnlyOptimal, false, false),
-                eval_image(*depth, vk::ImageLayout::eDepthStencilReadOnlyOptimal, false, true),
-                target, jx, jy, dlss_reset_pending);
+            const Dlss::EvalImage motion_eval =
+                eval_image(*motion, vk::ImageLayout::eShaderReadOnlyOptimal, false, false);
+            const Dlss::EvalImage depth_eval =
+                eval_image(*depth, vk::ImageLayout::eDepthStencilReadOnlyOptimal, false, true);
+            Dlss::EvalImage color_eval =
+                eval_image(*in, vk::ImageLayout::eShaderReadOnlyOptimal, false, false);
+            // DLSS 5 (vk_dlss5.h): the model edits the 1080p frame first (no HUD in it yet) and
+            // DLSS 4.5 takes its answer; off / missing / failed = the game's frame as before.
+            if (const auto nr = Dlss5::Apply(instance, cmdbuf, color_eval, motion_eval,
+                                             depth_eval, dlss_reset_pending)) {
+                color_eval = *nr;
+            }
+            evaluated = Dlss::Evaluate(cmdbuf, dlss_calls, color_eval, motion_eval, depth_eval,
+                                       target, jx, jy, dlss_reset_pending);
             dlss_reset_pending = false;
             if (upscaler && evaluated) {
                 upscaler->SceneWritten(cmdbuf);

@@ -17,6 +17,7 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
+#include "video_core/renderer_vulkan/vk_dlss5.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
@@ -182,6 +183,7 @@ Instance::~Instance() {
     if (Dlss::Mode() == 1 && device) {
         // Streamline goes before the device (its rule); the GPU must be done with its work.
         (void)device->waitIdle();
+        Dlss5::Shutdown();
         Dlss::Shutdown();
     }
     ImGui::Core::Shutdown(GetDevice());
@@ -406,6 +408,19 @@ bool Instance::CreateDevice() {
             }
         }
         LOG_INFO(Render_Vulkan, "DLSS: device extensions {}", dlss_device ? "enabled" : "missing");
+        // DLSS 5 (vk_dlss5.h): the model's two vendor extensions; Streamline's DLSS list has
+        // them already on NVIDIA drivers, so this normally only logs.
+        if (dlss_device && Dlss5::Wanted()) {
+            for (const char* ext : Dlss5::DeviceExtensions()) {
+                if (std::ranges::any_of(enabled_extensions, [ext](const char* e) {
+                        return std::strcmp(e, ext) == 0;
+                    })) {
+                    LOG_INFO(Render_Vulkan, "DLSS 5: device extension {} enabled", ext);
+                } else if (!add_extension(ext)) {
+                    Dlss5::Disable("the GPU driver lacks a Vulkan extension the model needs");
+                }
+            }
+        }
     }
 
     // Opt-in descriptor heap experiment. Nothing below is touched unless
@@ -788,6 +803,7 @@ bool Instance::CreateDevice() {
             dci.enabledExtensionCount = static_cast<u32>(enabled_extensions.size());
             dci.ppEnabledExtensionNames = enabled_extensions.data();
             dlss_device = false;
+            Dlss5::Disable("the driver refused the DLSS device extensions");
             LOG_WARNING(Render_Vulkan, "DLSS: the driver refused the device with the DLSS extensions "
                                        "- DLSS off, the game's own anti-aliasing stays");
         }
@@ -844,6 +860,11 @@ bool Instance::CreateDevice() {
     present_queue = device->getQueue(queue_family_index, 0);
     if (dlss_device || Dlss::Mode() == 2) {
         Dlss::DeviceCreated(*instance, physical_device, *device, queue_family_index, 0);
+    }
+    if (dlss_device && Dlss::g_ready.load(std::memory_order_relaxed)) {
+        Dlss5::DeviceCreated(*instance, physical_device, *device);
+    } else if (Dlss::Mode() == 1) {
+        Dlss5::Disable("DLSS 4.5 did not start");
     }
     if (has_readback_queue) {
         const u32 index = readback_queue_family == queue_family_index ? 1u : 0u;

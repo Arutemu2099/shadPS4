@@ -23,6 +23,7 @@
 #include "core/libraries/system/userservice.h"
 #include "core/mouse_aim.h"
 #include "imgui/big_picture/settings_dialog_layer.h"
+#include "imgui/dlss5_panel.h"
 #include "core/user_settings.h"
 #include "imgui/friends_layer.h"
 #include "imgui/renderer/imgui_core.h"
@@ -32,6 +33,7 @@
 #include "sdl_window.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
+#include "video_core/renderer_vulkan/vk_dlss5.h"
 
 #ifdef __APPLE__
 #include <SDL3/SDL_metal.h>
@@ -213,11 +215,12 @@ void WindowSDL::WaitEvent() {
 
     // The emulator's settings menu (F3) needs a free cursor: any mouse mode (aim, touchpad, motion)
     // is switched off while it is open and comes back when it closes (user 2026-10-17: mouse aim
-    // kept the cursor captured, the menu could not be left without Alt+F4).
+    // kept the cursor captured, the menu could not be left without Alt+F4). The DLSS 5 panel
+    // (Page Up) too.
     {
         static bool saved = false;
         static Input::MouseMode before = Input::MouseMode::Off;
-        const bool open = ImGuiEmuSettings::IsInGameSettingsDialogOpen();
+        const bool open = ImGuiEmuSettings::IsInGameSettingsDialogOpen() || Dlss5Panel::IsOpen();
         if (open && !saved) {
             before = Input::GetMouseMode();
             if (before != Input::MouseMode::Off) {
@@ -331,10 +334,29 @@ void WindowSDL::WaitEvent() {
                 .store(event.type == SDL_EVENT_KEY_DOWN, std::memory_order_relaxed);
         }
         if (Vulkan::Dlss::Enabled() && event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
-            (event.key.key == SDLK_HOME || event.key.key == SDLK_PAGEUP ||
-             event.key.key == SDLK_PAGEDOWN || event.key.key == SDLK_INSERT)) {
-            // SHADPS4_DLSS (vk_dlss.h): Home = DLSS on / off, Page Up / Page Down = jitter sign
-            // combination forward / back, Insert = output at the window size / 1.5x (upscale mode).
+            (event.key.key == SDLK_END || event.key.key == SDLK_PAGEUP) &&
+            !(event.key.mod & SDL_KMOD_CTRL)) {
+            // DLSS 5 (vk_dlss5.h): End = on / off, Page Up = its panel (2026-10-18; Page Up was
+            // the jitter cycle, whose pick D is fixed now - Page Down still cycles). Not with Ctrl:
+            // Ctrl+Shift+End is the quit hotkey.
+            if (event.key.key == SDLK_PAGEUP) {
+                Dlss5Panel::Toggle();
+            } else if (Vulkan::Dlss5::GetStatus().state != Vulkan::Dlss5::State::Ready) {
+                const auto status = Vulkan::Dlss5::GetStatus();
+                Overlay::ShowNotice(status.state == Vulkan::Dlss5::State::NotFound
+                                        ? "DLSS 5 not found (dlss5 folder)"
+                                        : "DLSS 5 not available (Page Up shows why)");
+            } else {
+                const bool on = Vulkan::Dlss5::ToggleEnabled();
+                LOG_INFO(Render_Vulkan, "DLSS 5: {} (End)", on ? "on" : "off");
+                Overlay::ShowNotice(on ? "DLSS 5: ON" : "DLSS 5: OFF (DLSS 4.5 only)");
+            }
+        }
+        if (Vulkan::Dlss::Enabled() && event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
+            (event.key.key == SDLK_HOME || event.key.key == SDLK_PAGEDOWN ||
+             event.key.key == SDLK_INSERT)) {
+            // SHADPS4_DLSS (vk_dlss.h): Home = DLSS on / off, Page Down = jitter sign combination
+            // (D is the pick), Insert = output at the window size / 1.5x (upscale mode).
             if (!Vulkan::Dlss::g_ready.load(std::memory_order_relaxed)) {
                 Overlay::ShowNotice("DLSS not available (see the log)");
             } else if (event.key.key == SDLK_HOME) {
