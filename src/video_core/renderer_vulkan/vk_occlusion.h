@@ -6,8 +6,10 @@
 #include <algorithm>
 #include <cstdlib>
 #include <deque>
+#include <map>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <boost/container/small_vector.hpp>
 
 #include "common/fault_monitor.h"
@@ -37,6 +39,14 @@ namespace Vulkan {
  * the command stream where the fake was written, so guest-visible timing is unchanged. Results are
  * collected later on the same thread (Poll: when the tick of the query's commands is complete).
  *
+ * Results are kept per QUERY, not per result block (2026-10-18, the headlamp flicker): the game
+ * runs 12 queries per frame on 8 blocks - blocks 0x000-0x300 twice (two different draws), then
+ * 0x400-0x700 - and a per-block "last resolved count" handed each of the two queries whichever of
+ * them the GPU had finished last (published 0 <-> nonzero 30-180 times per 4 s on three blocks;
+ * timing-dependent, so GPU load and SHADPS4_PARTICLE_LATE_READ changed how often). A query is
+ * identified by its block and its first draw's signature (pipeline, depth and colour target), so
+ * each one publishes its own previous result. SHADPS4_OCCLUSION_PER_BLOCK=1 restores per block.
+ *
  * Threading: every method runs on the command processor thread that executes draws (the back
  * thread with SHADPS4_CP_SPLIT). The recorder thread only sees the pool handle and slot numbers
  * captured in recorded commands.
@@ -52,6 +62,15 @@ public:
     static bool Requested() {
         static const bool on = [] {
             const char* value = std::getenv("SHADPS4_OCCLUSION_QUERIES");
+            return value && value[0] == '1';
+        }();
+        return on;
+    }
+
+    /// SHADPS4_OCCLUSION_PER_BLOCK=1: results keyed by result block only (the pre-10-18 behaviour).
+    static bool PerBlock() {
+        static const bool on = [] {
+            const char* value = std::getenv("SHADPS4_OCCLUSION_PER_BLOCK");
             return value && value[0] == '1';
         }();
         return on;
@@ -115,18 +134,20 @@ public:
             static u64 n = 0;
             if (++n > trace && n <= trace + 400) {
                 const u64 block = addr & ~u64{8};
-                const auto it = last_count.find(block);
-                LOG_INFO(Render_Vulkan, "OcclusionTrace: #{} {:#x} {} frame {} last {}", n, block,
-                         (addr & 8) ? "end" : "begin",
+                const auto it = last_count_block.find(block);
+                LOG_INFO(Render_Vulkan, "OcclusionTrace: #{} {:#x} {} frame {} last {} sig {:#x}", n,
+                         block, (addr & 8) ? "end" : "begin",
                          Common::FaultMonitor::presented_frames.load(std::memory_order_relaxed),
-                         it != last_count.end() ? static_cast<s64>(it->second) : -1);
+                         it != last_count_block.end() ? static_cast<s64>(it->second) : -1,
+                         (addr & 8) ? cur.sig : u64{0});
             }
         }
         if (open && addr == cur.base + 8) {
-            // End dump: close the query; publish the last resolved count of this result block.
+            // End dump: close the query; publish the last resolved count of the same query.
+            const auto key = KeyOf(cur);
             Close();
             u64 count = 0;
-            if (const auto it = last_count.find(addr - 8); it != last_count.end()) {
+            if (const auto it = last_count.find(key); it != last_count.end()) {
                 count = it->second * Scale();
             } else {
                 ++stats.unresolved_at_end;
@@ -154,7 +175,7 @@ public:
             // the end u64 is the odd one): publish what is known and leave the state alone.
             ++stats.orphan_end;
             u64 count = 0;
-            if (const auto it = last_count.find(addr - 8); it != last_count.end()) {
+            if (const auto it = last_count_block.find(addr - 8); it != last_count_block.end()) {
                 count = it->second;
             }
             results[0] = (count & ~ValidBit) | ValidBit;
@@ -179,7 +200,10 @@ public:
 
     /// Slot for the next draw of the open query, or NoSlot (the draw is then not counted).
     /// Call only while Open().
-    [[nodiscard]] u32 DrawSlot() {
+    [[nodiscard]] u32 DrawSlot(u64 draw_sig) {
+        if (cur.draws++ == 0) {
+            cur.sig = draw_sig; // the query's identity (with its block): its first draw
+        }
         if (cur.slots.size() >= MaxDrawsPerQuery) {
             ++stats.capped_draws;
             cur.incomplete = true;
@@ -203,6 +227,8 @@ public:
 private:
     struct Query {
         u64 base{};
+        u64 sig{};   ///< the first draw's signature (KeyOf)
+        u32 draws{}; ///< draws seen while open (counted or not)
         u64 tick{};
         u64 frame{};
         /// A draw of the query was not counted: its sum is a lower bound, not published.
@@ -263,7 +289,8 @@ private:
                 pending.pop_front();
                 continue;
             }
-            last_count[query.base] = sum;
+            last_count[KeyOf(query)] = sum;
+            last_count_block[query.base] = sum;
             ++stats.resolved;
             if (sum == 0) {
                 ++stats.zero;
@@ -288,9 +315,10 @@ private:
                      stats.incomplete, stats.dropped, pending.size(),
                      last_count.size());
             std::string counts;
-            for (const auto& [base, count] : last_count) {
+            for (const auto& [base, count] : last_count_block) {
                 counts += fmt::format(" {:#x}:{}", base, count);
             }
+            counts += fmt::format(" | queries tracked {}", last_count.size());
             LOG_INFO(Render_Vulkan, "OcclusionQ: real: last counts (block:samples){}", counts);
             std::string blocks;
             for (const auto& [base, b] : block_stats) {
@@ -339,7 +367,14 @@ private:
     bool open{};
     Query cur;
     std::deque<Query> pending;
-    std::unordered_map<u64, u64> last_count;
+    /// Last resolved count per query (block, first draw's signature).
+    std::map<std::pair<u64, u64>, u64> last_count;
+    /// ... and per block (orphan ends, the log).
+    std::unordered_map<u64, u64> last_count_block;
+
+    static std::pair<u64, u64> KeyOf(const Query& query) {
+        return {query.base, PerBlock() ? u64{0} : query.sig};
+    }
     u32 next{};
     u32 in_flight{};
     Stats stats;

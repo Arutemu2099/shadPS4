@@ -346,6 +346,8 @@ public:
     void ScopeMarkerBegin(const std::string_view& str, bool from_guest = false);
     void ScopeMarkerEnd(bool from_guest = false);
 
+    /// SHADPS4_OCCLUSION_QUERIES: the identity of a query's draw (pipeline and targets).
+    u64 OcclusionDrawSig(const Pipeline* pipeline) const;
     /// SHADPS4_OCCLUSION_QUERIES: a ZPASS counter dump of the guest (command processor thread, in
     /// order with the draws). Returns false when the feature is off: the caller writes the fake.
     bool OcclusionDump(u64* results, s32 pairs) {

@@ -8351,7 +8351,7 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
     // own occlusion query, recorded right around the draw (same render pass, same command buffer).
     u32 occlusion_slot = OcclusionQueries::NoSlot;
     if (occlusion && occlusion->Open()) [[unlikely]] {
-        occlusion_slot = occlusion->DrawSlot();
+        occlusion_slot = occlusion->DrawSlot(OcclusionDrawSig(pipeline));
         AmdGpu::MtbCensus::Note(AmdGpu::MtbCensus::OcclusionSlot);
         if (occlusion_slot != OcclusionQueries::NoSlot) {
             scheduler.Record([query_pool = occlusion->Pool(), occlusion_slot,
@@ -8649,7 +8649,7 @@ void Rasterizer::DrawIndirectTail(const GraphicsPipeline* pipeline, bool is_inde
            stride);
     u32 occlusion_slot = OcclusionQueries::NoSlot;
     if (occlusion && occlusion->Open()) [[unlikely]] {
-        occlusion_slot = occlusion->DrawSlot();
+        occlusion_slot = occlusion->DrawSlot(OcclusionDrawSig(pipeline));
         AmdGpu::MtbCensus::Note(AmdGpu::MtbCensus::OcclusionSlot);
         if (occlusion_slot != OcclusionQueries::NoSlot) {
             scheduler.Record([query_pool = occlusion->Pool(), occlusion_slot,
@@ -11891,6 +11891,18 @@ bool Rasterizer::EmitPipelineResourcesOrPacket(const Pipeline* pipeline, bool oc
     st.packet_bytes +=
         DrawPacketRecordBytes(num_barriers, num_writes, num_buffer_infos, num_image_infos);
     return true;
+}
+
+u64 Rasterizer::OcclusionDrawSig(const Pipeline* pipeline) const {
+    // SHADPS4_OCCLUSION_QUERIES: what tells two queries on one result block apart (vk_occlusion.h):
+    // the pipeline and the targets the draw tests against - stable from frame to frame.
+    const auto& regs = liverpool->BackRegs();
+    u64 h = reinterpret_cast<u64>(static_cast<VkPipeline>(pipeline->Handle()));
+    const auto mix = [&h](u64 v) { h = (h ^ v) * 0x100000001B3ULL + (h >> 29); };
+    mix(regs.depth_buffer.DepthAddress());
+    mix(regs.color_buffers[0].Address());
+    mix(std::bit_cast<u32>(regs.depth_control));
+    return h;
 }
 
 void Rasterizer::RecordPacket(const Pipeline* pipeline, const DrawPacketHeader& tail) {
