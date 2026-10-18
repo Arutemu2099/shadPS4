@@ -1750,8 +1750,13 @@ void Rasterizer::DlssResolve() {
         // The HUD draws blend premultiplied onto 0 and write alpha (ApplyHudLayerMask): this
         // target ends as HUD colour + coverage; the presenter lays it over the DLSS output.
         ++dlss_evaluated;
-        out.Clear(vk::ClearValue{.color = vk::ClearColorValue{std::array{0.0f, 0.0f, 0.0f, 0.0f}}},
-                  VideoCore::SubresourceRange{});
+        if (Dlss::UpscaleTestBits() & 4) {
+            out.CopyImage(*in);
+        } else {
+            out.Clear(
+                vk::ClearValue{.color = vk::ClearColorValue{std::array{0.0f, 0.0f, 0.0f, 0.0f}}},
+                VideoCore::SubresourceRange{});
+        }
     } else if (evaluated) {
         ++dlss_evaluated;
     } else {

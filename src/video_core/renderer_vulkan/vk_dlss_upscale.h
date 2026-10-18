@@ -30,6 +30,10 @@ constexpr VAddr HudLayerAddr = 0x26bd70000;
 
 bool UpscaleWanted();
 
+/// SHADPS4_DLSS_UPSCALE_TEST bits (crash bisect, 2026-10-17): 1 = no composite at the flip (the
+/// display buffer is shown), 2 = no alpha on HUD draws, 4 = no clear of the resolve target.
+u32 UpscaleTestBits();
+
 /// The HUD-layer mode is on for this frame's draws (the presenter decides it each flip).
 inline std::atomic<bool> g_hud_layer{false};
 
@@ -44,7 +48,8 @@ inline void ApplyHudLayerMask(Masks& masks, VAddr cb0_address) {
     constexpr vk::ColorComponentFlags rgb =
         vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
         vk::ColorComponentFlagBits::eB;
-    if (cb0_address == HudLayerAddr && masks[0] == rgb && HudLayerActive()) {
+    if (cb0_address == HudLayerAddr && masks[0] == rgb && HudLayerActive() &&
+        !(UpscaleTestBits() & 2)) {
         masks[0] = rgb | vk::ColorComponentFlagBits::eA;
     }
 }

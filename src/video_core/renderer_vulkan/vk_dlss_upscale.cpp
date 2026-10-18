@@ -34,6 +34,14 @@ bool UpscaleWanted() {
     return wanted;
 }
 
+u32 UpscaleTestBits() {
+    static const u32 bits = [] {
+        const char* v = std::getenv("SHADPS4_DLSS_UPSCALE_TEST");
+        return v ? static_cast<u32>(std::atoi(v)) : 0u;
+    }();
+    return bits;
+}
+
 Upscaler::Upscaler(const Instance& instance_) : instance{instance_}, device{instance_.GetDevice()} {
     sampler = Check<"create dlss composite sampler">(device.createSamplerUnique(vk::SamplerCreateInfo{
         .magFilter = vk::Filter::eLinear,

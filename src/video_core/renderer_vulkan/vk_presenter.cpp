@@ -906,7 +906,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // the next frame's resolve clears it).
     std::optional<Dlss::CompositeJob> dlss_job;
     if (Dlss::Upscaler* upscaler = Dlss::GetUpscaler(instance)) {
-        if (upscaler->Ready()) {
+        if (upscaler->Ready() && !(Dlss::UpscaleTestBits() & 1)) {
             const auto hud_id = texture_cache.FindImageFromRange(
                 Dlss::HudLayerAddr, size_t{1920} * 1080 * 4, true);
             if (hud_id) {
