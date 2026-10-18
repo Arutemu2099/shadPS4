@@ -1748,6 +1748,11 @@ void Rasterizer::DlssResolve() {
             // sec. 4): nothing the next draw relies on may be assumed still bound.
             scheduler.GetDynamicState().Invalidate();
             GraphicsBindTracker::Invalidate();
+            // DLSS 5's passes push descriptors, which unbind the native descriptor heaps (as the
+            // scheduler's own push descriptors do): the next native draw must bind them again.
+            // Without this the GPU read / wrote through stale heap descriptors - device lost
+            // ~2 s into gameplay, 2026-10-18 runs 02:43 / 03:09 (fault: invalid read / write).
+            scheduler.InvalidateNativeHeaps();
         } else if (++dlss_missing <= 8) {
             LOG_WARNING(Render_Vulkan, "DLSS: motion vectors {:#x} {} / depth {:#x} {} - copy this frame",
                         Dlss::MotionAddr, motion ? "found" : "missing", Dlss::DepthAddr,
