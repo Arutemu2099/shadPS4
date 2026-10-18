@@ -23,6 +23,10 @@ void InstallCameraHook(VAddr eboot_base, u64 eboot_size);
 /// The hook is in place (the game's code matched).
 bool Installed();
 
+/// Mouse timer (33 ms): notices when the camera stops / resumes updating; parked motion is
+/// cleared while it does not run (menus, cut-scenes).
+void Tick();
+
 /// Main thread: relative mouse motion in pixels while mouse aim is on.
 void OnMouseMotion(float xrel, float yrel);
 

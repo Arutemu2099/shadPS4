@@ -251,7 +251,7 @@ void WindowSDL::WaitEvent() {
         OnResize();
         break;
     case SDL_EVENT_MOUSE_MOTION:
-        if (Core::MouseAim::Installed() && Input::IsMouseJoystickMode()) {
+        if (Input::MouseAimActive()) {
             // SHADPS4_MOUSE_AIM: every pixel goes straight to the camera's pan / tilt.
             Core::MouseAim::OnMouseMotion(event.motion.xrel, event.motion.yrel);
         }
@@ -305,8 +305,7 @@ void WindowSDL::WaitEvent() {
                 Overlay::ShowNotice(names[combo]);
             }
         }
-        if (Core::MouseAim::Installed() && Input::IsMouseJoystickMode() &&
-            event.type == SDL_EVENT_KEY_DOWN &&
+        if (Input::MouseAimActive() && event.type == SDL_EVENT_KEY_DOWN &&
             (event.key.key == SDLK_MINUS || event.key.key == SDLK_EQUALS)) {
             // SHADPS4_MOUSE_AIM: - / = = mouse sensitivity down / up (keys no shipped config binds;
             // the brackets are the default touchpad halves).
@@ -380,7 +379,7 @@ void WindowSDL::WaitEvent() {
                                        Input::ToggleMouseModeTo(Input::MouseMode::Joystick));
         SyncSyntheticMotion();
         if (Core::MouseAim::Installed()) {
-            Overlay::ShowNotice(Input::IsMouseJoystickMode()
+            Overlay::ShowNotice(Input::MouseAimActive()
                                     ? "Mouse aim ON (- / = sensitivity, F7 off)"
                                     : "Mouse aim off");
         }

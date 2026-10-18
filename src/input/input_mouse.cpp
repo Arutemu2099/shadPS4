@@ -61,13 +61,22 @@ bool IsMouseJoystickMode() {
     return mouse_mode == MouseMode::Joystick;
 }
 
+bool MouseAimActive() {
+    return Core::MouseAim::Installed() && mouse_mode == MouseMode::Joystick &&
+           mouse_joystick_binding != 1;
+}
+
 bool IsMouseGyroRollMode() {
     return mouse_gyro_roll_mode;
 }
 
 void EmulateJoystick(GameController* controller, u32 interval) {
-    if (Core::MouseAim::Installed() && mouse_joystick_binding != 1) {
-        return; // SHADPS4_MOUSE_AIM: the mouse turns the camera itself (sdl_window.cpp)
+    if (MouseAimActive()) {
+        // SHADPS4_MOUSE_AIM: the mouse turns the camera itself (sdl_window.cpp); drain SDL's
+        // relative motion so another mouse mode does not start with one big jump.
+        float dx = 0, dy = 0;
+        SDL_GetRelativeMouseState(&dx, &dy);
+        return;
     }
 
     Axis axis_x, axis_y;
@@ -180,6 +189,7 @@ void ApplyMouseInputBlockers() {
 
 Uint32 MousePolling(void* param, Uint32 id, Uint32 interval) {
     auto* controller = (GameController*)param;
+    Core::MouseAim::Tick();
     switch (mouse_mode) {
     case MouseMode::Joystick:
         EmulateJoystick(controller, interval);

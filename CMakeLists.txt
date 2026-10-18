@@ -935,6 +935,8 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/memory.h
          src/core/module.cpp
          src/core/module.h
+         src/core/mouse_aim.cpp
+         src/core/mouse_aim.h
          src/core/platform.h
          src/core/signals.cpp
          src/core/signals.h
@@ -956,8 +958,6 @@ if (ARCHITECTURE STREQUAL "x86_64")
     set(CORE ${CORE}
              src/core/cpu_patches.cpp
              src/core/cpu_patches.h
-             src/core/mouse_aim.cpp
-             src/core/mouse_aim.h
              ${FIBER_LIB})
 endif()
 

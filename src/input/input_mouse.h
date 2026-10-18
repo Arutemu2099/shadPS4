@@ -31,6 +31,8 @@ bool MouseEventsBelongToPad();
 extern bool g_mouse_aim_clicks;
 /// F7 (mouse to joystick) is on; with SHADPS4_MOUSE_AIM=1 the mouse turns the camera directly.
 bool IsMouseJoystickMode();
+/// SHADPS4_MOUSE_AIM: the hook is in, F7 is on and the mouse is not bound to the left stick.
+bool MouseAimActive();
 /// SHADPS4_SYNTH_MOTION helpers.
 bool IsMouseGyroMode();
 bool IsMouseGyroRollMode();

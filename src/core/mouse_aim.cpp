@@ -4,17 +4,19 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cstdlib>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <numbers>
-#include <xbyak/xbyak.h>
+#include "common/arch.h"
 #include "common/logging/log.h"
-#include "core/cpu_patches.h"
 #include "core/mouse_aim.h"
 
-#ifdef _WIN32
+#if defined(ARCH_X86_64) && defined(_WIN32)
+#define MOUSE_AIM_SUPPORTED 1
 #include <windows.h>
+#include <xbyak/xbyak.h>
+#include "core/cpu_patches.h"
 #endif
 
 namespace Core::MouseAim {
@@ -29,10 +31,20 @@ struct Mailbox {
     u32 frames; ///< +16: camera updates seen by the cave
 };
 
+std::atomic<Mailbox*> g_mailbox{nullptr}; ///< published last (release), after everything below
+const volatile u8* g_invert_x = nullptr;
+const volatile u8* g_invert_y = nullptr;
+std::atomic<float> g_sens_deg{8.0f};
+float g_sign_x = -1.0f; // mouse right -> pan decreases (guess; SHADPS4_MOUSE_AIM_FLIP=x flips)
+float g_sign_y = -1.0f; // mouse up (negative yrel) -> tilt increases (guess)
+/// Tick (timer thread): the camera hook ran within the last StaleAfter.
+std::atomic<bool> g_live{false};
+constexpr auto StaleAfter = std::chrono::milliseconds(250);
+
+#ifdef MOUSE_AIM_SUPPORTED
 // eboot offsets (measured 2026-10-17 on scratch/eboot-prepatch.elf, notes/study-input-kbm-2026-10-14.md
 // sec. 6 and EXPERIMENTS "2026-10-17 late session").
-constexpr u64 StoreOffset = 0x14ebce;  ///< vmovups [r13+0x330], xmm0 (9 bytes)
-constexpr u64 ReturnOffset = 0x14ebd7; ///< vmovdqu [r13+0x340], xmm1 (the turn speeds)
+constexpr u64 StoreOffset = 0x14ebce;   ///< vmovups [r13+0x330], xmm0 (9 bytes)
 constexpr u64 InvertXOffset = 0xefb3cd; ///< options +0x6d5: invert camera X
 constexpr u64 InvertYOffset = 0xefb3ce; ///< options +0x6d6: invert camera Y
 // The two stores before and the one after, as the game ships them: the patch only goes in
@@ -44,20 +56,11 @@ constexpr u8 Expected[27] = {
 };
 constexpr u64 ExpectedStart = 0x14ebc5;
 
-Mailbox* g_mailbox = nullptr;
-const volatile u8* g_invert_x = nullptr;
-const volatile u8* g_invert_y = nullptr;
-std::atomic<float> g_sens_deg{8.0f};
-float g_sign_x = -1.0f; // mouse right -> pan decreases (guess; SHADPS4_MOUSE_AIM_FLIP=x flips)
-float g_sign_y = -1.0f; // mouse up (negative yrel) -> tilt increases (guess)
-u32 g_last_frames = 0;
-std::chrono::steady_clock::time_point g_last_change{};
-
-// The cave, at the camera's pan / tilt store. Registers (from the disassembly): xmm0 = (pan,
-// tilt, 0, 0) to store, xmm1 = the turn speeds stored next (kept), r13 = camera, r12 = camera
-// data, [rsp+0x50] = the context whose +0x1c0 pair limits the tilt with the data's +0x1c0 pair
-// (FUN_80014a810). rax, r11, xmm2-xmm5 and the flags are dead here (written before they are read,
-// or clobbered by the call at 14ebfa): the cave needs no stack (no red-zone hazard).
+// The cave, at the camera's pan / tilt store. Registers (from the disassembly; Opus review
+// 2026-10-17): xmm0 = (pan, tilt, 0, 0) to store, xmm1 = the turn speeds stored next (kept),
+// r13 = camera, r12 = camera data, [rsp+0x50] = the context whose +0x1c0 pair limits the tilt
+// with the data's +0x1c0 pair (FUN_80014a810). rax, r11, xmm2-xmm5 and the flags are dead here
+// (the call at 14ebfa is an import stub): the cave needs no stack (no red-zone hazard).
 class CameraCave : public Xbyak::CodeGenerator {
 public:
     CameraCave(u8* code, size_t size, Mailbox* mailbox, const void* return_to, bool clamp_tilt)
@@ -86,7 +89,7 @@ public:
         vminps(xmm5, xmm5, xmm0);    // lo = min(lower, current)
         vmaxps(xmm4, xmm4, xmm0);    // hi = max(upper, current)
         vminps(xmm2, xmm4, xmm3);
-        vmaxps(xmm2, xmm2, xmm5);       // clamp(candidate, lo, hi)
+        vmaxps(xmm2, xmm2, xmm5);        // clamp(candidate, lo, hi)
         vblendps(xmm0, xmm3, xmm2, 0x2); // pan from the candidate, tilt clamped
         L(store);
         vmovq(qword[rax + offsetof(Mailbox, pan)], xmm0);
@@ -95,6 +98,7 @@ public:
         jmp(return_to, T_NEAR);
     }
 };
+#endif
 
 } // namespace
 
@@ -107,12 +111,16 @@ bool Enabled() {
 }
 
 bool Installed() {
-    return g_mailbox != nullptr;
+    return g_mailbox.load(std::memory_order_acquire) != nullptr;
 }
 
 void InstallCameraHook(VAddr eboot_base, u64 eboot_size) {
-#if defined(_WIN32)
-    if (!Enabled() || g_mailbox != nullptr || eboot_size < InvertYOffset + 1) {
+#ifdef MOUSE_AIM_SUPPORTED
+    if (!Enabled() || Installed()) {
+        return;
+    }
+    if (eboot_size < InvertYOffset + 1) {
+        LOG_WARNING(Core, "Mouse aim: the eboot is smaller than expected ({:#x}) - off", eboot_size);
         return;
     }
     u8* const site = reinterpret_cast<u8*>(eboot_base + StoreOffset);
@@ -149,7 +157,14 @@ void InstallCameraHook(VAddr eboot_base, u64 eboot_size) {
     // SHADPS4_MOUSE_AIM_CLAMP=0: no tilt limit from the cave (if the limit fields misbehave).
     const char* clamp_env = std::getenv("SHADPS4_MOUSE_AIM_CLAMP");
     const bool clamp_tilt = clamp_env == nullptr || clamp_env[0] != '0';
-    CameraCave cave(cave_code, CaveSize, mailbox, site + 9, clamp_tilt);
+    size_t cave_size = 0;
+    try {
+        CameraCave cave(cave_code, CaveSize, mailbox, site + 9, clamp_tilt);
+        cave_size = cave.getSize();
+    } catch (const Xbyak::Error& e) {
+        LOG_WARNING(Core, "Mouse aim: cave generation failed ({}) - off", static_cast<int>(e));
+        return;
+    }
 
     // jmp rel32 to the cave + a 4-byte nop over the 9-byte store (the game has not started).
     const s64 rel = reinterpret_cast<s64>(cave_code) - reinterpret_cast<s64>(site + 5);
@@ -171,11 +186,11 @@ void InstallCameraHook(VAddr eboot_base, u64 eboot_size) {
 
     g_invert_x = reinterpret_cast<const volatile u8*>(eboot_base + InvertXOffset);
     g_invert_y = reinterpret_cast<const volatile u8*>(eboot_base + InvertYOffset);
-    g_mailbox = mailbox;
+    g_mailbox.store(mailbox, std::memory_order_release);
     LOG_INFO(Core,
              "Mouse aim: camera hook at {:#x} -> cave {} ({} bytes), mailbox {}, {:.1f} deg per "
              "100 px, signs x {} y {}, tilt clamp {}",
-             eboot_base + StoreOffset, fmt::ptr(cave_code), cave.getSize(), fmt::ptr(mailbox),
+             eboot_base + StoreOffset, fmt::ptr(cave_code), cave_size, fmt::ptr(mailbox),
              g_sens_deg.load(), g_sign_x, g_sign_y, clamp_tilt);
 #else
     (void)eboot_base;
@@ -183,26 +198,40 @@ void InstallCameraHook(VAddr eboot_base, u64 eboot_size) {
 #endif
 }
 
-void OnMouseMotion(float xrel, float yrel) {
-    Mailbox* const mb = g_mailbox;
-    if (mb == nullptr || (xrel == 0.0f && yrel == 0.0f)) {
+void Tick() {
+    Mailbox* const mb = g_mailbox.load(std::memory_order_acquire);
+    if (mb == nullptr) {
         return;
     }
-    std::atomic_ref<u64> delta{mb->delta};
-    // Only while the gameplay camera runs (menus, cut-scenes, pause: the cave's counter stops):
-    // motion made meanwhile must not pile up into one jump.
+    // Only the timer thread keeps these.
+    static u32 last_frames = 0;
+    static std::chrono::steady_clock::time_point last_change{};
     const u32 frames = std::atomic_ref<u32>{mb->frames}.load(std::memory_order_relaxed);
     const auto now = std::chrono::steady_clock::now();
-    if (frames != g_last_frames) {
-        if (g_last_frames == 0) {
+    if (frames != last_frames) {
+        if (last_frames == 0) {
             LOG_INFO(Core, "Mouse aim: the camera hook runs (pan {:.3f}, tilt {:.3f})", mb->pan,
                      mb->tilt);
         }
-        g_last_frames = frames;
-        g_last_change = now;
+        last_frames = frames;
+        last_change = now;
     }
-    if (now - g_last_change > std::chrono::milliseconds(100)) {
-        delta.store(0, std::memory_order_relaxed);
+    const bool live = now - last_change <= StaleAfter;
+    if (!live) {
+        // Menus, cut-scenes, pause, a long load: motion parked in the mailbox must not turn the
+        // camera in one jump when gameplay resumes.
+        std::atomic_ref<u64>{mb->delta}.store(0, std::memory_order_relaxed);
+    }
+    if (live != g_live.load(std::memory_order_relaxed)) {
+        g_live.store(live, std::memory_order_relaxed);
+        LOG_DEBUG(Core, "Mouse aim: camera {}", live ? "live" : "idle");
+    }
+}
+
+void OnMouseMotion(float xrel, float yrel) {
+    Mailbox* const mb = g_mailbox.load(std::memory_order_acquire);
+    if (mb == nullptr || (xrel == 0.0f && yrel == 0.0f) ||
+        !g_live.load(std::memory_order_relaxed)) {
         return;
     }
     const float k = g_sens_deg.load(std::memory_order_relaxed) *
@@ -215,6 +244,7 @@ void OnMouseMotion(float xrel, float yrel) {
     if (*g_invert_y != 0) {
         pitch = -pitch;
     }
+    std::atomic_ref<u64> delta{mb->delta};
     u64 old = delta.load(std::memory_order_relaxed);
     u64 next;
     do {
