@@ -1,6 +1,7 @@
 ﻿// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -455,6 +456,23 @@ void GameControllers::TryOpenSDLControllers() {
             controllers[0]->user_id = u->user_id;
             controllers[0]->ConnectController(nullptr);
             UserManagement.LoginUser(u, 1);
+        }
+    }
+    // SHADPS4_PAD_KEYBOARD_FALLBACK=1 (2026-10-18, user report): when the last controller is
+    // unplugged, player 1's pad goes back to the keyboard, as at a boot without controllers.
+    // Without it the pad stays disconnected and the game's "reconnect the controller, press X"
+    // screen cannot be answered from the keyboard (only a restart or the controller helped).
+    static const bool keyboard_fallback = [] {
+        const char* v = std::getenv("SHADPS4_PAD_KEYBOARD_FALLBACK");
+        return v && v[0] == '1';
+    }();
+    if (keyboard_fallback && controller_count == 0 && controllers[0]->m_sdl_gamepad == nullptr &&
+        controllers[0]->user_id == -1) {
+        if (auto u = UserManagement.GetUserByPlayerIndex(1)) {
+            controllers[0]->user_id = u->user_id;
+            controllers[0]->ConnectController(nullptr);
+            UserManagement.LoginUser(u, 1);
+            LOG_INFO(Input, "Last controller removed: player 1's pad is the keyboard again");
         }
     }
     SDL_free(new_joysticks);
