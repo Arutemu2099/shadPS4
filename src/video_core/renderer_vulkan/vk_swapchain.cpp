@@ -280,15 +280,8 @@ void Swapchain::FindPresentMode() {
     }
 
     if (std::ranges::find(modes, present_mode) == modes.cend()) {
-        // 2026-10-19 (v1.0 player reports: "locked to 60 FPS"): Mailbox is missing on many AMD /
-        // Intel / laptop drivers, and FIFO is vsync - the game is then capped at the monitor's
-        // refresh rate. Mailbox falls back to Immediate (uncapped, may tear) when that exists;
-        // FIFO stays the last resort (guaranteed by the Vulkan spec).
-        const bool immediate_ok =
-            std::ranges::find(modes, vk::PresentModeKHR::eImmediate) != modes.cend();
-        const auto fallback = present_mode == vk::PresentModeKHR::eMailbox && immediate_ok
-                                  ? vk::PresentModeKHR::eImmediate
-                                  : vk::PresentModeKHR::eFifo;
+        // FIFO is guaranteed to be supported by the Vulkan spec.
+        constexpr auto fallback = vk::PresentModeKHR::eFifo;
         LOG_WARNING(Render, "Requested present mode {} is not supported, falling back to {}.",
                     vk::to_string(present_mode), vk::to_string(fallback));
         present_mode = fallback;
