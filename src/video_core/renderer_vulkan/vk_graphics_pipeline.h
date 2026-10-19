@@ -122,6 +122,11 @@ public:
         std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
         const Shader::Gcn::FetchShaderData* fetch_shader, SerializationSupport& sdata);
 
+    /// False only for a preloaded pipeline the driver refused (the constructor logged it).
+    bool IsCreated() const noexcept {
+        return static_cast<bool>(pipeline);
+    }
+
     const Shader::Gcn::FetchShaderData* GetFetchShader() const noexcept {
         return fetch_shader.get();
     }

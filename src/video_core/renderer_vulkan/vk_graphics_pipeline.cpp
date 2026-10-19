@@ -461,6 +461,17 @@ GraphicsPipeline::GraphicsPipeline(
 
     auto [pipeline_result, pipe] =
         device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
+    if (pipeline_result != vk::Result::eSuccess && preloading) {
+        // A cached pipeline the driver refuses is left out of the preload (IsCreated() false);
+        // the draw that needs it compiles it from its own state at play time. 2026-10-19: an
+        // RX 7800 XT returned ErrorInitializationFailed in the boot preload and the assert below
+        // ended the game on every launch after the first.
+        LOG_WARNING(Render_Vulkan,
+                    "Cached graphics pipeline {} refused by the driver ({}): left to compile at "
+                    "play time",
+                    debug_str, vk::to_string(pipeline_result));
+        return;
+    }
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);

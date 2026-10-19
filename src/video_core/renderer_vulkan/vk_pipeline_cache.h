@@ -225,6 +225,14 @@ public:
         std::unordered_set<u64> perms; // (hash << 8) | perm of every permutation verified equal
     };
     SeedStamp seed_stamp{};
+    // seed-graphics-keys.txt (2026-10-19): the g_ key names a seed shipped with. Unless the stamp
+    // allows graphics on this GPU, these keys are not preloaded: once this GPU has compiled its own
+    // permutations, which reuse the seed's index-based meta and .spv names, a seed key would pair
+    // the seed machine's pipeline state with this GPU's modules.
+    std::unordered_set<u64> seed_graphics_keys;
+    u32 seed_graphics_keys_skipped{};
+    u32 preload_refused{};
+    void ReadSeedGraphicsKeys();
     void ReadSeedStamp();
     void WriteSeedStamp() const;
     // SHADPS4_CACHE_REBUILD_THREADS: every meta in the folder without a .spv whose rebuild the

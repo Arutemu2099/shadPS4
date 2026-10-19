@@ -382,6 +382,8 @@ const std::string& BuildId() {
     return id;
 }
 constexpr std::string_view SeedStampFile = "seed-stamp.bin";
+/// The seed's g_ key names (scratch/make-release script; PipelineCache::seed_graphics_keys).
+constexpr std::string_view SeedGraphicsKeysFile = "seed-graphics-keys.txt";
 
 /// A cached .spv is used only when whole: SPIR-V magic, every instruction inside the file, the
 /// last one OpFunctionEnd. A first boot killed while the IO thread wrote a file can leave it
@@ -446,6 +448,12 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     modules.fill(nullptr);
     fetch_shader.reset();
     graphics_key.Deserialize(ar);
+    // A seed key preloads only where the stamp allows graphics (seed_graphics_keys).
+    if (!seed_stamp.graphics &&
+        seed_graphics_keys.contains(std::hash<GraphicsPipelineKey>{}(graphics_key))) {
+        ++seed_graphics_keys_skipped;
+        return false;
+    }
 
     GraphicsPipeline::SerializationSupport sdata{};
     sdata.Deserialize(ar);
@@ -498,6 +506,11 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     modules.fill(nullptr);
     fetch_shader.reset();
 
+    if (!it.value()->IsCreated()) {
+        graphics_pipelines.erase(it);
+        ++preload_refused;
+        return false;
+    }
     return true;
 }
 
@@ -792,6 +805,22 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     modules[stage] = module;
 
     return true;
+}
+
+void PipelineCache::ReadSeedGraphicsKeys() {
+    seed_graphics_keys.clear();
+    std::ifstream in{Storage::DataBase::Instance().SidecarPath(SeedGraphicsKeysFile)};
+    std::string line;
+    while (std::getline(in, line)) {
+        // One key file name per line, without ".key": g_0x<16 hex digits>.
+        if (line.size() >= 20 && line.starts_with("g_0x")) {
+            seed_graphics_keys.insert(std::strtoull(line.c_str() + 4, nullptr, 16));
+        }
+    }
+    if (!seed_graphics_keys.empty()) {
+        LOG_INFO(Render, "CacheRebuild: {} lists {} seed graphics keys", SeedGraphicsKeysFile,
+                 seed_graphics_keys.size());
+    }
 }
 
 void PipelineCache::ReadSeedStamp() {
@@ -1227,6 +1256,7 @@ void PipelineCache::WarmUp() {
     // SHADPS4_PRECOMPILE fix A (any build of this branch, whatever the flag: the cache may hold
     // marked metas from an earlier PRECOMPILE launch).
     precompile_retired = ReadPrecompileHashes(PrecompileRetiredFile);
+    ReadSeedGraphicsKeys(); // any rebuild mode: seed keys stay out unless the stamp allows them
     if (CacheRebuildMode() & 1) {
         ReadSeedStamp();
         if (RebuildThreads() > 0 && (seed_stamp.compute || seed_stamp.graphics)) {
@@ -1313,13 +1343,20 @@ void PipelineCache::WarmUp() {
                 });
             }
         } // joins
+        u32 refused = 0;
         for (auto& job : preload_jobs) {
+            if (!job.pipeline->IsCreated()) {
+                ++refused;
+                continue;
+            }
             const auto [it, is_new] = graphics_pipelines.try_emplace(job.key);
             ASSERT(is_new);
             it.value() = std::move(job.pipeline);
         }
+        preload_refused += refused;
+        num_pipelines -= refused;
         LOG_INFO(Render, "WarmUp: {} graphics pipelines built on {} threads in {} ms",
-                 preload_jobs.size(), num_threads,
+                 preload_jobs.size() - refused, num_threads,
                  std::chrono::duration_cast<std::chrono::milliseconds>(
                      std::chrono::steady_clock::now() - t_build)
                      .count());
@@ -1330,6 +1367,12 @@ void PipelineCache::WarmUp() {
                  .count());
 
     LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
+    if (seed_graphics_keys_skipped != 0 || preload_refused != 0) {
+        LOG_INFO(Render,
+                 "WarmUp: {} seed graphics keys not preloaded (stamp allows graphics: {}), {} "
+                 "cached graphics pipelines refused by the driver",
+                 seed_graphics_keys_skipped, seed_stamp.graphics, preload_refused);
+    }
     if (CacheRebuildMode() != 0) {
         // SHADPS4_PRECOMPILE_WAIT=1 with a rebuild: the boot also waits for the compute pipelines
         // the preload deferred to the compile pool (cold driver: ~17 k x ~50 ms), so the first
