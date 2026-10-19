@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <fmt/chrono.h>
 #include <imgui.h>
 #include <magic_enum/magic_enum.hpp>
@@ -45,6 +46,18 @@ static std::string SpaceSizeToString(size_t size) {
 }
 
 namespace Libraries::SaveData::Dialog {
+
+/// SHADPS4_SAVEDIALOG_NO_BUTTON=1 (2026-10-18, LATER-PLAN 7): "No" in a Yes / No dialog always answers
+/// NO. Without it, games below firmware 4.50 get USER_CANCELED for "No"; Second Son then aborts its
+/// "save first?" step of Load instead of opening the load list (user test 10-18, log: USER_MSG ->
+/// GetResult -> nothing).
+static bool NoButtonAlwaysNo() {
+    static const bool on = [] {
+        const char* v = std::getenv("SHADPS4_SAVEDIALOG_NO_BUTTON");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
 
 void SaveDialogResult::CopyTo(OrbisSaveDataDialogResult& result) const {
     result.mode = this->mode;
@@ -697,7 +710,7 @@ void SaveDialogUi::DrawUser() {
             }
             SameLine();
             if (Button("No", BUTTON_SIZE)) {
-                if (ElfInfo::Instance().FirmwareVer() < ElfInfo::FW_450) {
+                if (ElfInfo::Instance().FirmwareVer() < ElfInfo::FW_450 && !NoButtonAlwaysNo()) {
                     Finish(ButtonId::INVALID, Result::USER_CANCELED);
                 } else {
                     Finish(ButtonId::NO);
@@ -771,7 +784,7 @@ void SaveDialogUi::DrawSystemMessage() {
     SameLine();
     if (sys_state.show_no) {
         if (Button("No", BUTTON_SIZE)) {
-            if (ElfInfo::Instance().FirmwareVer() < ElfInfo::FW_450) {
+            if (ElfInfo::Instance().FirmwareVer() < ElfInfo::FW_450 && !NoButtonAlwaysNo()) {
                 Finish(ButtonId::INVALID, Result::USER_CANCELED);
             } else {
                 Finish(ButtonId::NO);
