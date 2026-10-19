@@ -145,6 +145,23 @@ static void MoveFolder(fs::path const& _from, fs::path const& _to) {
     }
 }
 
+/// Saves in the pre-0.13 location (user\savedata\1) or trophy files under user\game_data\*\TrophyFiles:
+/// the two things CheckAndMigrateSaves / CheckAndMigrateTrophies would move.
+static bool HasOldSavesOrTrophies() {
+    std::error_code ec;
+    const auto user_dir = Common::FS::GetUserPath(Common::FS::PathType::UserDir);
+    const auto old_save_dir = user_dir / "savedata" / "1";
+    if (fs::exists(old_save_dir, ec) && !fs::is_empty(old_save_dir, ec)) {
+        return true;
+    }
+    for (const auto& entry : fs::directory_iterator(user_dir / "game_data", ec)) {
+        if (entry.is_directory(ec) && fs::exists(entry.path() / "TrophyFiles", ec)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void CheckAndMigrateSaves(TransferOption option) {
     auto const new_save_dir = EmulatorSettings.GetHomeDir() / "1000" / "savedata";
     auto const old_save_dir =
@@ -296,7 +313,9 @@ Users UserManager::CreateDefaultUsers() {
             std::filesystem::create_directory(user_dir / "savedata");
             std::filesystem::create_directory(user_dir / "trophy");
             std::filesystem::create_directory(user_dir / "inputs");
-            if (u.user_id == 1000) {
+            // Ask only when there is something to migrate (2026-10-19: every fresh install showed
+            // "save/trophy files have been detected in the old location" with nothing there).
+            if (u.user_id == 1000 && HasOldSavesOrTrophies()) {
                 TransferOption user_choice = AskMigrationOption();
                 CheckAndMigrateSaves(user_choice);
                 CheckAndMigrateTrophies(user_choice);
