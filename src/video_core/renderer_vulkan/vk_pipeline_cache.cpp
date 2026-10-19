@@ -2173,9 +2173,16 @@ void PipelineCache::GraphicsKeySecondPass(const AmdGpu::Regs& regs, GraphicsPipe
             using Factor = AmdGpu::BlendControl::BlendFactor;
             auto& bc = key.blend_controls[0];
             const Factor src = bc.color_src_factor;
-            const bool reads_dst = src == Factor::DstColor || src == Factor::OneMinusDstColor ||
-                                   src == Factor::DstAlpha || src == Factor::OneMinusDstAlpha;
             const Factor dst = bc.color_dst_factor;
+            // The karma-choice panel (RenderDoc 10-18, karmachoiceLaggy): DST_COLOR / ONE_MINUS_
+            // SRC_ALPHA, i.e. C = Cd (Cs + 1 - As), a dark brush darkening what is below. The layer
+            // colour gets the same factor from the game's own blend; for the scene below it is "over"
+            // with coverage As (exact for a black brush, slightly darker for a lighter one).
+            const bool darken_over = src == Factor::DstColor && dst == Factor::OneMinusSrcAlpha;
+            const bool reads_dst = !darken_over && (src == Factor::DstColor ||
+                                                    src == Factor::OneMinusDstColor ||
+                                                    src == Factor::DstAlpha ||
+                                                    src == Factor::OneMinusDstAlpha);
             if (!reads_dst && (dst == Factor::OneMinusSrcAlpha || dst == Factor::One ||
                                dst == Factor::Zero)) {
                 bc.separate_alpha_blend = 1;
