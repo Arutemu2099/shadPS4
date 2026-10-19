@@ -75,6 +75,7 @@
 #include "video_core/shader_scan.h"
 
 #include <SDL3/SDL_events.h>
+#include <SDL3/SDL_init.h>
 #include <SDL3/SDL_video.h>
 #include "sdl_window.h"
 
@@ -725,9 +726,18 @@ const VideoCore::ShaderIndex& GameShaderIndex() {
     static bool built = false;
     if (!built) {
         built = true;
+        // v1.0.2: the scan reports progress on the boot screen (it sat frozen at 15% on a
+        // player's first start until they closed it, PERF-PLAN 14.1); main thread only.
+        const bool main_thread = SDL_IsMainThread();
         index = VideoCore::BuildShaderIndex(
             Common::ElfInfo::Instance().GetGameFolder(),
-            Storage::DataBase::Instance().SidecarPath("shader-index.bin"));
+            Storage::DataBase::Instance().SidecarPath("shader-index.bin"),
+            [main_thread](u64 done, u64 total) {
+                if (main_thread) {
+                    ShowBootProgress("Reading the game's shader files (first start), MB",
+                                     done >> 20, total >> 20, true, 0.15f);
+                }
+            });
     }
     return index;
 }

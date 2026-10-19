@@ -210,34 +210,53 @@ bool SaveIndex(const std::filesystem::path& path, const std::filesystem::path& f
     return static_cast<bool>(out);
 }
 
+/// What a saved index gave for this folder's listing (v1.0.2).
+struct LoadedIndex {
+    bool exact{};            ///< every file the same: nothing to read
+    std::vector<bool> known; ///< per listed file: same relative path and size as saved
+    u64 reused{};            ///< shaders kept (their file is unchanged)
+    u64 lost{};              ///< shaders whose saved file is gone or changed
+};
+
+/// Reads the saved index. Shaders whose file has the same relative path and size here are kept in
+/// `index.shaders` (file numbers mapped to this listing); `out.known` marks those files.
+/// v1.0.1 needed the whole listing equal, so a player's dump with a few extra or different files
+/// (a player's EU copy: 1,874 files against the seed's 1,866) read all 29.7 GB again on the first
+/// start - 13.7 s on an NVMe drive, minutes on a hard drive, with a frozen screen at 15%.
 bool LoadIndex(const std::filesystem::path& path, const std::filesystem::path& folder,
-               const Fingerprint& fp, const std::vector<FileEntry>& entries,
-               ShaderIndex& index) {
+               const std::vector<FileEntry>& entries, ShaderIndex& index, LoadedIndex& out) {
     std::ifstream in{path, std::ios::binary};
     u32 magic{}, version{}, num_files{}, num_shaders{};
     Fingerprint saved{};
     if (!Get(in, magic) || !Get(in, version) || magic != IndexMagic || version != IndexVersion ||
-        !Get(in, saved) || saved.files != fp.files || saved.bytes != fp.bytes ||
-        !Get(in, num_files) || num_files > (1u << 24) || num_files != entries.size()) {
+        !Get(in, saved) || !Get(in, num_files) || num_files > (1u << 24)) {
         return false;
     }
-    for (u32 i = 0; i < num_files; ++i) {
+    std::unordered_map<std::u8string, u32> listed;
+    listed.reserve(entries.size());
+    for (u32 i = 0; i < entries.size(); ++i) {
+        listed.emplace(std::filesystem::relative(entries[i].path, folder).generic_u8string(), i);
+    }
+    out.known.assign(entries.size(), false);
+    std::vector<u32> saved_to_listed(num_files, UINT32_MAX);
+    u32 matched = 0;
+    for (u32 j = 0; j < num_files; ++j) {
         u32 len{};
         if (!Get(in, len) || len > 4096) {
             return false;
         }
         std::u8string rel(len, u8'\0');
         in.read(reinterpret_cast<char*>(rel.data()), len);
-        if (in.gcount() != static_cast<std::streamsize>(len)) {
-            return false;
-        }
         u64 size{};
-        // The same relative path and size as this folder's listing (sorted the same way).
-        if (!Get(in, size) || size != entries[i].size ||
-            std::filesystem::relative(entries[i].path, folder).generic_u8string() != rel) {
+        if (in.gcount() != static_cast<std::streamsize>(len) || !Get(in, size)) {
             return false;
         }
-        index.files.push_back(folder / std::filesystem::path{rel});
+        const auto it = listed.find(rel);
+        if (it != listed.end() && entries[it->second].size == size && !out.known[it->second]) {
+            saved_to_listed[j] = it->second;
+            out.known[it->second] = true;
+            ++matched;
+        }
     }
     if (!Get(in, num_shaders) || num_shaders > (1u << 24)) {
         return false;
@@ -248,15 +267,23 @@ bool LoadIndex(const std::filesystem::path& path, const std::filesystem::path& f
         if (!Get(in, hash) || !Get(in, loc) || loc.file >= num_files) {
             return false;
         }
+        if (saved_to_listed[loc.file] == UINT32_MAX) {
+            ++out.lost;
+            continue;
+        }
+        loc.file = saved_to_listed[loc.file];
         index.shaders.emplace(hash, loc);
+        ++out.reused;
     }
+    out.exact = matched == num_files && matched == entries.size();
     return true;
 }
 
 } // Anonymous namespace
 
 ShaderIndex BuildShaderIndex(const std::filesystem::path& game_folder,
-                             const std::filesystem::path& index_file) {
+                             const std::filesystem::path& index_file,
+                             const std::function<void(u64, u64)>& progress) {
     using Clock = std::chrono::steady_clock;
     const auto t0 = Clock::now();
     auto ms = [&] {
@@ -265,42 +292,88 @@ ShaderIndex BuildShaderIndex(const std::filesystem::path& game_folder,
     Fingerprint fp{};
     const auto files = ListFiles(game_folder, fp);
     ShaderIndex index;
-    if (!index_file.empty() && LoadIndex(index_file, game_folder, fp, files, index)) {
+    for (const auto& file : files) {
+        index.files.push_back(file.path);
+    }
+    // The files to read: all, or (v1.0.2) only the new / changed ones when the saved index keeps
+    // every shader of the rest.
+    std::vector<u32> to_scan;
+    LoadedIndex loaded;
+    const bool have_saved =
+        !index_file.empty() && LoadIndex(index_file, game_folder, files, index, loaded);
+    if (have_saved && loaded.exact) {
         LOG_INFO(Render_Vulkan, "ShaderScan: index {} read: {} shaders in {} files ({:.0f} ms)",
                  index_file.string(), index.shaders.size(), index.files.size(), ms());
         return index;
     }
-    index = {};
-    for (const auto& file : files) {
-        index.files.push_back(file.path);
+    if (have_saved && loaded.lost == 0) {
+        for (u32 i = 0; i < files.size(); ++i) {
+            if (!loaded.known[i]) {
+                to_scan.push_back(i);
+            }
+        }
+        LOG_INFO(Render_Vulkan,
+                 "ShaderScan: index {} kept {} shaders of the unchanged files; reading the {} new "
+                 "or changed files of {}",
+                 index_file.string(), loaded.reused, to_scan.size(), files.size());
+    } else {
+        if (have_saved) {
+            LOG_INFO(Render_Vulkan,
+                     "ShaderScan: index {} does not fit this game folder ({} shaders sat in files "
+                     "that are gone or changed); reading every file",
+                     index_file.string(), loaded.lost);
+        }
+        index.shaders.clear();
+        to_scan.resize(files.size());
+        for (u32 i = 0; i < files.size(); ++i) {
+            to_scan[i] = i;
+        }
+    }
+    u64 scan_bytes = 0;
+    for (const u32 i : to_scan) {
+        scan_bytes += files[i].size;
     }
     const u32 hw = std::max(2u, std::thread::hardware_concurrency());
     const u32 num_threads = std::clamp(hw / 2, 2u, 8u);
     std::atomic<size_t> next{0};
+    std::atomic<size_t> files_done{0};
+    std::atomic<u64> bytes_done{0};
     std::mutex merge_mutex;
-    std::vector<std::unordered_map<u64, ShaderLocation>> found(files.size() > 0 ? num_threads : 0);
+    std::vector<std::unordered_map<u64, ShaderLocation>> found(to_scan.size() > 0 ? num_threads
+                                                                                  : 0);
     std::atomic<u64> records{0}, no_code{0};
     std::vector<std::thread> threads;
-    for (u32 t = 0; t < num_threads; ++t) {
+    for (u32 t = 0; t < num_threads && !to_scan.empty(); ++t) {
         threads.emplace_back([&, t] {
             std::unordered_map<u64, ShaderLocation> mine;
             u64 my_records = 0, my_no_code = 0;
-            for (size_t i = next++; i < files.size(); i = next++) {
+            for (size_t k = next++; k < to_scan.size(); k = next++) {
+                const u32 i = to_scan[k];
                 // A per-file map keeps "first file wins" independent of the thread order.
                 std::unordered_map<u64, ShaderLocation> local;
-                ScanFile(files[i], static_cast<u32>(i), local, my_records, my_no_code);
+                ScanFile(files[i], i, local, my_records, my_no_code);
                 for (auto& [hash, loc] : local) {
                     const auto [it, inserted] = mine.try_emplace(hash, loc);
                     if (!inserted && loc.file < it->second.file) {
                         it->second = loc;
                     }
                 }
+                bytes_done += files[i].size;
+                ++files_done;
             }
             records += my_records;
             no_code += my_no_code;
             std::scoped_lock lk{merge_mutex};
             found[t] = std::move(mine);
         });
+    }
+    // v1.0.2: the caller's thread (the boot's main thread) waits in short steps and reports
+    // progress, so the boot screen moves and Windows never marks the window "Not responding".
+    while (files_done.load() < to_scan.size()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        if (progress) {
+            progress(bytes_done.load(), scan_bytes);
+        }
     }
     for (auto& thread : threads) {
         thread.join();
@@ -320,9 +393,10 @@ ShaderIndex BuildShaderIndex(const std::filesystem::path& game_folder,
     const bool saved =
         !index_file.empty() && SaveIndex(index_file, game_folder, fp, files, index);
     LOG_INFO(Render_Vulkan,
-             "ShaderScan: {} files, {} MiB, {} records ({} without a code start) -> {} shaders "
-             "(cs {}, ps {}, vs {}, other {}) on {} threads in {:.0f} ms; index {}",
-             files.size(), fp.bytes >> 20, records.load(), no_code.load(), index.shaders.size(),
+             "ShaderScan: {} of {} files read ({} of {} MiB), {} records ({} without a code start) "
+             "-> {} shaders (cs {}, ps {}, vs {}, other {}) on {} threads in {:.0f} ms; index {}",
+             to_scan.size(), files.size(), scan_bytes >> 20, fp.bytes >> 20, records.load(),
+             no_code.load(), index.shaders.size(),
              by_type[4], by_type[0], by_type[1],
              index.shaders.size() - by_type[4] - by_type[0] - by_type[1], num_threads, ms(),
              saved ? index_file.string() : std::string{"not saved"});

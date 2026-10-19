@@ -4,6 +4,7 @@
 #pragma once
 
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -33,8 +34,12 @@ struct ShaderIndex {
 /// `index_file` with the folder's file list (relative path + size per file) and read back while
 /// the list is the same. Write times are not compared (v3, 2026-10-16), so an index shipped with a
 /// seed fits any copy of the same game version; ReadShaderCode checks every shader's own record.
+/// v1.0.2: when only some files differ (a player's dump with extra or other files), the shaders of
+/// the unchanged files are kept and only the new / changed files are read. `progress(done, total)`
+/// (bytes) is called on the calling thread about every 100 ms while files are read.
 ShaderIndex BuildShaderIndex(const std::filesystem::path& game_folder,
-                             const std::filesystem::path& index_file);
+                             const std::filesystem::path& index_file,
+                             const std::function<void(u64, u64)>& progress = {});
 
 /// HeapCompact of the process heap (Windows; no-op elsewhere): coalesces the free blocks a burst of
 /// boot threads left behind (2026-10-16: after the 16-thread rebuild pre-pass, freeing the A2
