@@ -3,6 +3,8 @@
 
 #include "videodec_impl.h"
 
+#include <cstdlib>
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -12,6 +14,18 @@
 #include "common/support/avdec.h"
 
 namespace Libraries::Videodec {
+
+/// SHADPS4_VIDEODEC_PTS=1 (2026-10-18, LATER-PLAN 12, port of upstream #4833's VDEC part): every output
+/// picture carries ITS frame's ptsData and attachedData (passed through the codec as packet / frame
+/// opaque), not the input AU's attachedData and an unset ptsData. Second Son's in-world TV feeds
+/// (art/movies/tv/*.bsf) decoded fine but showed nothing; cutscene videos played.
+static bool VideodecPts() {
+    static const bool on = [] {
+        const char* v = std::getenv("SHADPS4_VIDEODEC_PTS");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
 
 VdecDecoder::VdecDecoder(const OrbisVideodecConfigInfo& pCfgInfoIn,
                          const OrbisVideodecResourceInfo& pRsrcInfoIn) {
@@ -23,6 +37,9 @@ VdecDecoder::VdecDecoder(const OrbisVideodecConfigInfo& pCfgInfoIn,
     ASSERT(mCodecContext);
     mCodecContext->width = pCfgInfoIn.maxFrameWidth;
     mCodecContext->height = pCfgInfoIn.maxFrameHeight;
+    if (VideodecPts()) {
+        mCodecContext->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
+    }
 
     avcodec_open2(mCodecContext, codec, nullptr);
 }
@@ -54,6 +71,9 @@ s32 VdecDecoder::Decode(const OrbisVideodecInputData& pInputDataIn,
     packet->size = pInputDataIn.auSize;
     packet->pts = pInputDataIn.ptsData;
     packet->dts = pInputDataIn.dtsData;
+    if (VideodecPts()) {
+        packet->opaque = reinterpret_cast<void*>(pInputDataIn.attachedData);
+    }
 
     int ret = avcodec_send_packet(mCodecContext, packet);
     if (ret < 0) {
@@ -113,7 +133,13 @@ s32 VdecDecoder::Decode(const OrbisVideodecInputData& pInputDataIn,
     pPictureInfoOut.codec.avc.frameCropLeftOffset = 0;
     pPictureInfoOut.codec.avc.frameCropRightOffset = pitch - frame->width;
     pPictureInfoOut.codec.avc.frameCropBottomOffset = height - frame->height;
-    pPictureInfoOut.attachedData = pInputDataIn.attachedData;
+    if (VideodecPts()) {
+        pPictureInfoOut.ptsData = frame->pts;
+        pPictureInfoOut.attachedData = reinterpret_cast<u64>(frame->opaque);
+        pPictureInfoOut.codec.avc.colourPrimaries = static_cast<u8>(frame->color_primaries);
+    } else {
+        pPictureInfoOut.attachedData = pInputDataIn.attachedData;
+    }
 
     av_packet_free(&packet);
     av_frame_free(&frame);
@@ -172,6 +198,11 @@ s32 VdecDecoder::Flush(OrbisVideodecFrameBuffer& pFrameBufferInOut,
     pPictureInfoOut.codec.avc.frameCropLeftOffset = 0;
     pPictureInfoOut.codec.avc.frameCropRightOffset = pitch - frame->width;
     pPictureInfoOut.codec.avc.frameCropBottomOffset = height - frame->height;
+    if (VideodecPts()) {
+        pPictureInfoOut.ptsData = frame->pts;
+        pPictureInfoOut.attachedData = reinterpret_cast<u64>(frame->opaque);
+        pPictureInfoOut.codec.avc.colourPrimaries = static_cast<u8>(frame->color_primaries);
+    }
 
     av_frame_free(&frame);
     return ORBIS_OK;
@@ -194,6 +225,7 @@ AVFrame* VdecDecoder::ConvertNV12Frame(AVFrame& frame) {
     nv12_frame->crop_bottom = frame.crop_bottom;
     nv12_frame->crop_left = frame.crop_left;
     nv12_frame->crop_right = frame.crop_right;
+    nv12_frame->opaque = frame.opaque;
 
     av_frame_get_buffer(nv12_frame, 0);
 
