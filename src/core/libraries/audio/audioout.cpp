@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <algorithm>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -142,6 +144,26 @@ static int AllocatePort(OrbisAudioOutPort type) {
     return -1;
 }
 
+/// SHADPS4_PADSPK_VOLUME=<percent> (2026-10-18, user): sounds the game sends to the controller's own
+/// speaker (its audio engine opens a PadSpk port: the phone ringtone, the spray-can rattle, draining a
+/// power source) are balanced for that tiny speaker and play far too loud through the PC's speakers.
+/// Scales that port's volume; unset = 100 (as before).
+static std::array<int, 8> PortVolumes(const PortOut& port) {
+    static const int pct = [] {
+        const char* v = std::getenv("SHADPS4_PADSPK_VOLUME");
+        return v && v[0] ? std::clamp(std::atoi(v), 0, 200) : 100;
+    }();
+    std::array<int, 8> vol;
+    for (size_t i = 0; i < vol.size(); ++i) {
+        vol[i] = port.volume[i];
+        if (port.type == OrbisAudioOutPort::PadSpk && pct != 100) {
+            vol[i] = static_cast<int>(static_cast<s64>(vol[i]) * pct / 100);
+        }
+    }
+    return vol;
+}
+
+
 void AdjustVol() {
     if (lazy_init.load(std::memory_order_relaxed) == 0 && audio == nullptr) {
         return;
@@ -152,7 +174,7 @@ void AdjustVol() {
         if (auto port = port_table[i]) {
             std::unique_lock lock{port->mutex, std::try_to_lock};
             if (lock.owns_lock()) {
-                port->impl->SetVolume(port->volume);
+                port->impl->SetVolume(PortVolumes(*port));
             }
         }
     }
@@ -333,7 +355,7 @@ s32 PS4_SYSV_ABI sceAudioOutOpen(UserService::OrbisUserServiceUserId user_id,
             [port](const std::stop_token& stop) { AudioOutputThread(port, stop); });
 
         // Set initial volume
-        port->impl->SetVolume(port->volume);
+        port->impl->SetVolume(PortVolumes(*port));
 
     } catch (const std::bad_alloc&) {
         return ORBIS_AUDIO_OUT_ERROR_OUT_OF_MEMORY;
@@ -726,7 +748,7 @@ s32 PS4_SYSV_ABI sceAudioOutSetVolume(s32 handle, s32 flag, s32* vol) {
     if (flag & ORBIS_AUDIO_VOLUME_FLAG_RE_CH)
         port->volume[7] = *vol;
 
-    port->impl->SetVolume(port->volume);
+    port->impl->SetVolume(PortVolumes(*port));
 
     return ORBIS_OK;
 }
