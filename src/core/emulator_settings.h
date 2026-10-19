@@ -332,6 +332,9 @@ struct InputSettings {
     Setting<bool> is_circle_enter{false};             // specific
     Setting<s32> camera_id{-1};
     Setting<bool> use_mice_as_mice{false};
+    // v1.0.2: round stick deadzone in percent of full tilt (core/libraries/pad/pad.cpp).
+    Setting<int> stick_deadzone_left{10};  // specific
+    Setting<int> stick_deadzone_right{10}; // specific
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -349,7 +352,11 @@ struct InputSettings {
                                          &InputSettings::ime_url_mail_short_panel),
             make_override<InputSettings>("is_circle_enter", &InputSettings::is_circle_enter),
             make_override<InputSettings>("camera_id", &InputSettings::camera_id),
-            make_override<InputSettings>("use_mice_as_mice", &InputSettings::use_mice_as_mice)};
+            make_override<InputSettings>("use_mice_as_mice", &InputSettings::use_mice_as_mice),
+            make_override<InputSettings>("stick_deadzone_left",
+                                         &InputSettings::stick_deadzone_left),
+            make_override<InputSettings>("stick_deadzone_right",
+                                         &InputSettings::stick_deadzone_right)};
     }
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(InputSettings, cursor_state, cursor_hide_timeout,
@@ -357,7 +364,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(InputSettings, cursor_state, cursor_hide_time
                                    motion_controls_enabled, use_unified_input_config,
                                    default_controller_id, background_controller_input,
                                    ime_accessibility_enabled, ime_url_mail_short_panel, camera_id,
-                                   is_circle_enter, use_mice_as_mice)
+                                   is_circle_enter, use_mice_as_mice, stick_deadzone_left,
+                                   stick_deadzone_right)
 // -------------------------------
 // Audio settings
 // -------------------------------
@@ -783,6 +791,8 @@ public:
     SETTING_FORWARD(m_input, CameraId, camera_id)
     SETTING_FORWARD_BOOL(m_input, CircleEnter, is_circle_enter)
     SETTING_FORWARD_BOOL(m_input, MiceUsedAsMice, use_mice_as_mice)
+    SETTING_FORWARD(m_input, StickDeadzoneLeft, stick_deadzone_left)
+    SETTING_FORWARD(m_input, StickDeadzoneRight, stick_deadzone_right)
 
     // Vulkan settings
     SETTING_FORWARD(m_vulkan, GpuId, gpu_id)

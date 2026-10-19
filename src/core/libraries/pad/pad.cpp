@@ -13,6 +13,8 @@
 #include "pad.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <array>
 #include <optional>
 
@@ -365,6 +367,64 @@ int PS4_SYSV_ABI scePadOutputReport() {
     return ORBIS_OK;
 }
 
+namespace {
+
+// v1.0.2 (user 2026-10-19: "the deadzones are a bit too sensitive on controller"). The game has
+// its own round deadzone (inner = the deadZone scePadGetControllerInformation reports / 127; the
+// stick code 0x249170, REFERENCE game map), but it reads that value only when a pad connects, and
+// the emulator reports 1 (other PS4 emulators 2: a DualShock 4 barely drifts), so PC controllers
+// feel twitchy. The emulator now applies a round deadzone to each stick before the game reads it:
+// inside the radius the stick reads centred; outside, the remaining travel is stretched back to the
+// full range, so there is no jump at the edge. Percent of full tilt, per stick: the F3 settings
+// sliders (saved with the other settings, live after Save), or SHADPS4_STICK_DEADZONE=<both>,
+// SHADPS4_STICK_DEADZONE_LEFT / _RIGHT in shadps4-flags-user.txt, which win over the sliders.
+int EnvDeadzonePercent(const char* name) {
+    const char* e = std::getenv(name);
+    if (!e || !*e) {
+        return -1;
+    }
+    return std::clamp(std::atoi(e), 0, 90);
+}
+
+int StickDeadzonePercent(bool left) {
+    static const int env_both = EnvDeadzonePercent("SHADPS4_STICK_DEADZONE");
+    static const int env_left = EnvDeadzonePercent("SHADPS4_STICK_DEADZONE_LEFT");
+    static const int env_right = EnvDeadzonePercent("SHADPS4_STICK_DEADZONE_RIGHT");
+    const int env_one = left ? env_left : env_right;
+    if (env_one >= 0) {
+        return env_one;
+    }
+    if (env_both >= 0) {
+        return env_both;
+    }
+    const int setting =
+        left ? EmulatorSettings.GetStickDeadzoneLeft() : EmulatorSettings.GetStickDeadzoneRight();
+    return std::clamp(setting, 0, 90);
+}
+
+template <typename Stick>
+void ApplyRoundDeadzone(Stick& stick, int percent) {
+    if (percent <= 0) {
+        return;
+    }
+    const float x = std::clamp((stick.x - 128.0f) / 127.0f, -1.0f, 1.0f);
+    const float y = std::clamp((stick.y - 128.0f) / 127.0f, -1.0f, 1.0f);
+    const float m = std::sqrt(x * x + y * y);
+    const float dz = percent / 100.0f;
+    if (m <= dz) {
+        stick.x = 128;
+        stick.y = 128;
+        return;
+    }
+    // Not clamped to the unit circle: the corners of a square stick gate stay where they were
+    // (the game learns the reach per 45-degree sector itself).
+    const float scale = (m - dz) / (1.0f - dz) / m;
+    stick.x = static_cast<u8>(std::clamp(std::lround(128.0f + x * scale * 127.0f), 0L, 255L));
+    stick.y = static_cast<u8>(std::clamp(std::lround(128.0f + y * scale * 127.0f), 0L, 255L));
+}
+
+} // namespace
+
 int ProcessStates(OrbisPadData* pData, const Input::State* states, s32 num) {
     if (num > 0 && !states[0].connected) {
         pData[0] = {};
@@ -393,6 +453,8 @@ int ProcessStates(OrbisPadData* pData, const Input::State* states, s32 num) {
         pData[i].leftStick.y = states[i].axes[static_cast<int>(Input::Axis::LeftY)];
         pData[i].rightStick.x = states[i].axes[static_cast<int>(Input::Axis::RightX)];
         pData[i].rightStick.y = states[i].axes[static_cast<int>(Input::Axis::RightY)];
+        ApplyRoundDeadzone(pData[i].leftStick, StickDeadzonePercent(true));
+        ApplyRoundDeadzone(pData[i].rightStick, StickDeadzonePercent(false));
         pData[i].analogButtons.l2 = states[i].axes[static_cast<int>(Input::Axis::TriggerLeft)];
         pData[i].analogButtons.r2 = states[i].axes[static_cast<int>(Input::Axis::TriggerRight)];
         pData[i].acceleration.x = states[i].acceleration.x * 0.098;

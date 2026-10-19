@@ -64,6 +64,8 @@ void SettingsWindow::LoadSettings(std::string profile) {
     backgroundControllerSetting = EmulatorSettings.IsBackgroundControllerInput();
     cursorStateSetting = EmulatorSettings.GetCursorState();
     cursorTimeoutSetting = EmulatorSettings.GetCursorHideTimeout();
+    stickDeadzoneLeftSetting = EmulatorSettings.GetStickDeadzoneLeft();
+    stickDeadzoneRightSetting = EmulatorSettings.GetStickDeadzoneRight();
 
     /////////// Trophy Tab
     trophyPopupDisabledSetting = EmulatorSettings.IsTrophyPopupDisabled();
@@ -129,6 +131,8 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetBackgroundControllerInput(backgroundControllerSetting, isSpecific);
     EmulatorSettings.SetCursorState(cursorStateSetting, isSpecific);
     EmulatorSettings.SetCursorHideTimeout(cursorTimeoutSetting, isSpecific);
+    EmulatorSettings.SetStickDeadzoneLeft(stickDeadzoneLeftSetting, isSpecific);
+    EmulatorSettings.SetStickDeadzoneRight(stickDeadzoneRightSetting, isSpecific);
 
     /////////// Trophy Tab
     EmulatorSettings.SetTrophyPopupDisabled(trophyPopupDisabledSetting, isSpecific);
@@ -712,6 +716,10 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
 
             AddSettingCheckbox("Enable Motion Controls", motionControlsSetting);
             AddSettingCheckbox("Enable Background Controller Input", backgroundControllerSetting);
+            // v1.0.2: round deadzone the emulator applies before the game reads the sticks
+            // (pad.cpp); live after Save. SHADPS4_STICK_DEADZONE* in shadps4-flags-user.txt wins.
+            AddSettingSliderInt("Left Stick Deadzone (%)", stickDeadzoneLeftSetting, 0, 40);
+            AddSettingSliderInt("Right Stick Deadzone (%)", stickDeadzoneRightSetting, 0, 40);
             AddSettingCombo("Hide Cursor", cursorStateSetting, hideCursorOptions);
 
             if (cursorStateSetting == 1) {

@@ -145,6 +145,8 @@ private:
     bool backgroundControllerSetting;
     int cursorStateSetting;
     int cursorTimeoutSetting;
+    int stickDeadzoneLeftSetting;
+    int stickDeadzoneRightSetting;
 
     // Trophy tab
     bool trophyPopupDisabledSetting;
