@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <cstdlib>
 #include "common/alignment.h"
 #include "common/logging/log.h"
 #include "core/libraries/libs.h"
@@ -173,6 +175,29 @@ int PS4_SYSV_ABI sceVideodecQueryResourceInfo(const OrbisVideodecConfigInfo* pCf
 
         cpu_gpu_size = (padded_frame * surfaces) + 8_MB;
         cpu_size = 16_MB;
+    }
+
+    // SHADPS4_VIDEODEC_SMALL_RES=1 (2026-10-18, LATER-PLAN 12): the decoder here is ffmpeg and never
+    // touches the game-provided memory, so ask for little. Second Son's in-world TVs queried the
+    // sizes for v_ustv_wt01.bsf and never created a decoder (log: QueryResourceInfo, then nothing),
+    // while cutscenes did (inferred: the TV player's own pool cannot hold 16 MB + 8 MB).
+    static const bool small_res = [] {
+        const char* v = std::getenv("SHADPS4_VIDEODEC_SMALL_RES");
+        return v && v[0] == '1';
+    }();
+    if (small_res && frame_size != 0) {
+        cpu_size = 256_KB;
+        cpu_gpu_size = Common::AlignUp<u64>(frame_size, 256) + 0x4000;
+    }
+    static std::atomic<u32> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+        LOG_INFO(Lib_Videodec,
+                 "QueryResourceInfo: codec {} profile {} level {} max {}x{} dpb {} flags {:#x} -> cpu {} KB, "
+                 "cpu+gpu {} KB, max frame buffer {} KB",
+                 pCfgInfoIn->codecType, pCfgInfoIn->profile, pCfgInfoIn->maxLevel,
+                 pCfgInfoIn->maxFrameWidth, pCfgInfoIn->maxFrameHeight, pCfgInfoIn->maxDpbFrameCount,
+                 pCfgInfoIn->videodecFlags, cpu_size >> 10, cpu_gpu_size >> 10,
+                 max_frame_buffer >> 10);
     }
 
     pRsrcInfoOut->thisSize = sizeof(OrbisVideodecResourceInfo);
