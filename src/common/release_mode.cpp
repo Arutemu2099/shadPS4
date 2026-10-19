@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <windows.h>
 #include <shobjidl.h>
@@ -178,6 +179,14 @@ void HideOwnConsole() {
     DWORD pids[2];
     if (GetConsoleWindow() != nullptr && GetConsoleProcessList(pids, 2) == 1) {
         FreeConsole();
+        // 2026-10-18: with the console gone, the last-words lines the emulator writes to stderr on a
+        // crash (FATAL-FAULT / FATAL-UNHANDLED in signals.cpp, asserts, terminate) would be lost.
+        // Keep them in user/log/fatal.txt (one file per session) for players' bug reports.
+        std::error_code ec;
+        const auto dir = std::filesystem::path{ExeDir()} / L"user" / L"log";
+        std::filesystem::create_directories(dir, ec);
+        FILE* f = nullptr;
+        _wfreopen_s(&f, (dir / L"fatal.txt").c_str(), L"w", stderr);
     }
 }
 
