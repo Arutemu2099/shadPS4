@@ -31,6 +31,7 @@
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_dlss5.h"
 #include "video_core/renderer_vulkan/vk_dlss_upscale.h"
+#include "video_core/renderer_vulkan/vk_memory_budget.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -724,7 +725,7 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
                  vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eSampled,
     };
 
-    const VmaAllocationCreateInfo alloc_info = {
+    VmaAllocationCreateInfo alloc_info = {
         .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         .requiredFlags = 0,
@@ -736,8 +737,13 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     VkImage unsafe_image{};
     VkImageCreateInfo unsafe_image_info = static_cast<VkImageCreateInfo>(image_info);
 
-    VkResult result = vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &alloc_info,
-                                     &unsafe_image, &frame->allocation, nullptr);
+    // v1.0.2: over VMA's budget, retry without it (vk_memory_budget.h) instead of asserting.
+    VkResult result = AllocateWithBudgetRetry(
+        instance.GetAllocator(), alloc_info, "frame image", u64{width} * height * 4,
+        fmt::format("{}x{}", width, height), [&](const VmaAllocationCreateInfo& ci) {
+            return vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &ci, &unsafe_image,
+                                  &frame->allocation, nullptr);
+        });
     if (result != VK_SUCCESS) [[unlikely]] {
         LOG_CRITICAL(Render_Vulkan, "Failed allocating texture with error {}",
                      vk::to_string(vk::Result{result}));

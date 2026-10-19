@@ -7,6 +7,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_memory_budget.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -88,7 +89,7 @@ void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usa
     const bool with_bda = bool(buffer_ci.usage & vk::BufferUsageFlagBits::eShaderDeviceAddress);
     const VmaAllocationCreateFlags bda_flag =
         with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
-    const VmaAllocationCreateInfo alloc_ci = {
+    VmaAllocationCreateInfo alloc_ci = {
         .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | MemoryUsageVmaFlags(usage),
         .usage = MemoryUsageVma(usage),
         .requiredFlags = 0,
@@ -99,10 +100,15 @@ void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usa
 
     const VkBufferCreateInfo buffer_ci_unsafe = static_cast<VkBufferCreateInfo>(buffer_ci);
     VkBuffer unsafe_buffer{};
-    VkResult result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
-                                      &allocation, out_alloc_info);
-    ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",
-               vk::to_string(vk::Result{result}));
+    // v1.0.2: over VMA's budget, retry without it (vk_memory_budget.h) instead of asserting.
+    VkResult result = Vulkan::AllocateWithBudgetRetry(
+        allocator, alloc_ci, "buffer", buffer_ci.size, BufferTypeName(usage).data(),
+        [&](const VmaAllocationCreateInfo& ci) {
+            return vmaCreateBuffer(allocator, &buffer_ci_unsafe, &ci, &unsafe_buffer, &allocation,
+                                   out_alloc_info);
+        });
+    ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer of {} MB ({}) with error {}",
+               buffer_ci.size >> 20, BufferTypeName(usage), vk::to_string(vk::Result{result}));
     buffer = vk::Buffer{unsafe_buffer};
 
     if (with_bda) {

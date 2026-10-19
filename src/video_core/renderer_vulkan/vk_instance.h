@@ -17,6 +17,7 @@ class WindowSDL;
 }
 
 VK_DEFINE_HANDLE(VmaAllocator)
+VK_DEFINE_HANDLE(VmaAllocation)
 
 namespace Vulkan {
 
@@ -537,6 +538,18 @@ public:
         return total_memory_budget;
     }
 
+    /// SHADPS4_SIM_VRAM_MB (test switch, v1.0.2): the video memory size this run pretends to have
+    /// (0 = off). The BIG_GROW size choice reads it in place of the real heap size.
+    [[nodiscard]] u64 SimVramBytes() const {
+        return sim_vram_bytes;
+    }
+
+    /// The ballast buffers of SHADPS4_SIM_VRAM_MB; the buffer cache fills them once on the GPU so
+    /// the driver makes them resident.
+    [[nodiscard]] const std::vector<vk::Buffer>& SimBallastBuffers() const {
+        return sim_ballast_buffers;
+    }
+
     /// Determines if a format is supported for a set of feature flags.
     [[nodiscard]] bool IsFormatSupported(vk::Format format, vk::FormatFeatureFlags2 flags) const;
 
@@ -554,6 +567,7 @@ private:
     /// Collects various information from the device.
     void CollectDeviceParameters();
     void CollectPhysicalMemoryInfo();
+    void CreateSimBallast();
     void CollectImageFormatInfo();
     void CollectToolingInfo() const;
 
@@ -635,6 +649,9 @@ private:
     NativeApi::Functions native_api{};
     u64 total_memory_budget{};
     std::vector<size_t> valid_heaps;
+    u64 sim_vram_bytes{};
+    std::vector<vk::Buffer> sim_ballast_buffers;
+    std::vector<VmaAllocation> sim_ballast_allocations;
 };
 
 } // namespace Vulkan

@@ -175,6 +175,7 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
 
     CreateDevice();
     CollectPhysicalMemoryInfo();
+    CreateSimBallast();
     CollectImageFormatInfo();
     CollectToolingInfo();
 }
@@ -187,6 +188,9 @@ Instance::~Instance() {
         Dlss::Shutdown();
     }
     ImGui::Core::Shutdown(GetDevice());
+    for (size_t i = 0; i < sim_ballast_buffers.size(); ++i) {
+        vmaDestroyBuffer(allocator, sim_ballast_buffers[i], sim_ballast_allocations[i]);
+    }
     vmaDestroyAllocator(allocator);
 }
 
@@ -1203,6 +1207,62 @@ void Instance::CollectPhysicalMemoryInfo() {
     const s64 available_memory = static_cast<s64>(total_memory_budget - device_initial_usage);
     total_memory_budget =
         static_cast<u64>(std::max<s64>(available_memory - 8_GB, static_cast<s64>(local_memory)));
+}
+
+void Instance::CreateSimBallast() {
+    // SHADPS4_SIM_VRAM_MB=N (test switch, v1.0.2): run as if the card had N MiB of video memory.
+    // VMA's budget here is 80% of the heap size against VMA's own allocations (vk_memory_budget.h),
+    // so a ballast of 80% of (real heap - N), allocated through VMA, leaves the game exactly the
+    // VMA budget an N MiB card has (7956 MiB -> 6365 MiB, the 8 GB player's ceiling). The buffer
+    // cache fills the ballast once on the GPU, so it also takes real video memory (the driver's
+    // heap usage counts it, which the texture / buffer cache GC thresholds read).
+    const char* e = std::getenv("SHADPS4_SIM_VRAM_MB");
+    if (!e || !*e) {
+        return;
+    }
+    const u64 sim_mb = std::strtoull(e, nullptr, 10);
+    u64 heap = 0;
+    for (u32 i = 0; i < memory_properties.memoryHeapCount; ++i) {
+        if (memory_properties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+            heap = std::max<u64>(heap, memory_properties.memoryHeaps[i].size);
+        }
+    }
+    if (sim_mb == 0 || (sim_mb << 20) >= heap) {
+        LOG_WARNING(Render_Vulkan, "SHADPS4_SIM_VRAM_MB={}: not below the real {} MiB, ignored",
+                    sim_mb, heap >> 20);
+        return;
+    }
+    sim_vram_bytes = sim_mb << 20;
+    const u64 ballast = (heap - sim_vram_bytes) * 8 / 10;
+    constexpr u64 Chunk = 512ull << 20;
+    u64 made = 0;
+    while (made < ballast) {
+        const u64 size = std::min(Chunk, ballast - made);
+        const VkBufferCreateInfo ci = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = size,
+            .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        };
+        const VmaAllocationCreateInfo aci = {
+            .flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
+            .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+            .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        };
+        VkBuffer buffer{};
+        VmaAllocation allocation{};
+        if (vmaCreateBuffer(allocator, &ci, &aci, &buffer, &allocation, nullptr) != VK_SUCCESS) {
+            break;
+        }
+        sim_ballast_buffers.push_back(vk::Buffer{buffer});
+        sim_ballast_allocations.push_back(allocation);
+        made += size;
+    }
+    LOG_WARNING(Render_Vulkan,
+                "SHADPS4_SIM_VRAM_MB={}: TEST MODE - real heap {} MiB, ballast {} MiB of {} wanted "
+                "({} buffers) through VMA; VMA budget left for the game {} MiB",
+                sim_mb, heap >> 20, made >> 20, ballast >> 20, sim_ballast_buffers.size(),
+                ((heap * 8 / 10) - made) >> 20);
 }
 
 void Instance::CollectImageFormatInfo() {

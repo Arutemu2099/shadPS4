@@ -34,6 +34,7 @@
 #include "video_core/renderer_vulkan/vk_gpu_batch_timer.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_memory_budget.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
 
@@ -727,6 +728,20 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     }
 
     std::memset(gds_buffer.mapped_data.data(), 0, DataShareBufferSize);
+
+    // SHADPS4_SIM_VRAM_MB (test switch, vk_instance.cpp CreateSimBallast): fill the ballast once
+    // on the GPU so the driver makes it resident and counts it as used video memory.
+    if (!instance.SimBallastBuffers().empty()) {
+        {
+            auto access = scheduler.AcquireCommandBuffer();
+            for (const vk::Buffer ballast : instance.SimBallastBuffers()) {
+                access.Handle().fillBuffer(ballast, 0, VK_WHOLE_SIZE, 0x5a5a5a5au);
+            }
+        }
+        scheduler.Finish();
+        LOG_WARNING(Render_Vulkan, "SHADPS4_SIM_VRAM_MB: ballast filled; {}",
+                    Vulkan::DescribeDeviceLocalBudgets(instance.GetAllocator()));
+    }
 
     // Set up garbage collection parameters
     if (!instance.CanReportMemoryUsage()) {
@@ -7246,12 +7261,12 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
             }
         }
     }
-    // The one mesh buffer BIG_GROW creates at the first big join.
-    constexpr u64 BigGrowBytes = 0xF0000000ull; // 3.75 GB
-    static const bool big_grow = [this] {
+    // The one mesh buffer BIG_GROW creates at the first big join; its size is chosen once from
+    // the video memory size (0 = BIG_GROW off).
+    static const u64 big_grow_bytes = [this]() -> u64 {
         const char* e = std::getenv("SHADPS4_BIG_GROW");
         if (!e || e[0] != '1') {
-            return false;
+            return 0;
         }
         // Release check (2026-10-15, study-release-readiness sec. 1.3): the 3.75 GB buffer must fit.
         // BIG_GROW stays on only when the largest DEVICE_LOCAL heap is >= 11 GiB (this PC, 16 GB:
@@ -7260,6 +7275,17 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
         // old growth path (stream-leap expansion only: the mesh memory regrows as blocks stream in).
         // SHADPS4_BIG_GROW_MIN_VRAM_MB overrides the 11264 MiB threshold (a huge value forces the
         // fallback for testing).
+        //
+        // v1.0.2 (2026-10-19; an 8 GB RTX 4060 Laptop ended with ErrorOutOfDeviceMemory loading a
+        // save): below the threshold the old growth path re-created the ~2.5 GB mesh buffer at
+        // each growth, the old one alive until the GPU finished the copy (2491 -> 2492 -> 2496 MB
+        // within 17 submissions, ~5 GB of mesh buffers at once against VMA's 6365 MiB budget).
+        // Smaller cards now get one buffer sized once too, by tier: >= the threshold 3.75 GB
+        // (unchanged), >= 7 GiB (8 GB cards) 3 GB, below 2.75 GB. The game's mesh memory reached
+        // 2491-2515 MB in every measured load (r14 s1041 / s1042, the player's log), so 2.75 GB
+        // still covers it; a growth past the size takes the old copy path (the allocation then
+        // may go over budget, vk_memory_budget.h). SHADPS4_BIG_GROW_TIERS=0 restores the v1.0.1
+        // rule (old growth path below the threshold); SHADPS4_SIM_VRAM_MB stands in for the heap.
         u64 heap = 0;
         const auto& mp = instance.GetMemoryProperties();
         for (u32 i = 0; i < mp.memoryHeapCount; ++i) {
@@ -7267,19 +7293,38 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
                 heap = std::max<u64>(heap, mp.memoryHeaps[i].size);
             }
         }
+        const bool simulated = instance.SimVramBytes() != 0;
+        if (simulated) {
+            heap = std::min<u64>(heap, instance.SimVramBytes());
+        }
         u64 min_mb = 11264;
         if (const char* m = std::getenv("SHADPS4_BIG_GROW_MIN_VRAM_MB")) {
             min_mb = std::strtoull(m, nullptr, 10);
         }
+        const char* t = std::getenv("SHADPS4_BIG_GROW_TIERS");
+        const bool tiers = !(t && t[0] == '0');
+        u64 size = 0;
+        if (heap >= (min_mb << 20)) {
+            size = 0xF0000000ull; // 3.75 GB
+        } else if (tiers && heap >= (7168ull << 20)) {
+            size = 0xC0000000ull; // 3 GB
+        } else if (tiers) {
+            size = 0xB0000000ull; // 2.75 GB
+        }
         const u64 max_alloc = instance.MaxMemoryAllocationSize();
-        const bool fits = heap >= (min_mb << 20) && max_alloc >= BigGrowBytes;
+        if (size > max_alloc) {
+            size = max_alloc >= 0xB0000000ull ? 0xB0000000ull : 0;
+        }
         LOG_INFO(Render_Vulkan,
-                 "BIG_GROW: largest device-local heap {} MiB (needs >= {} MiB), max allocation {} MiB "
-                 "(needs >= {} MiB) -> {}",
-                 heap >> 20, min_mb, max_alloc >> 20, BigGrowBytes >> 20,
-                 fits ? "on (one 3.75 GB mesh buffer)" : "OFF - fallback to the old growth path");
-        return fits;
+                 "BIG_GROW: largest device-local heap {} MiB{} (3.75 GB needs >= {} MiB, tiers {}), "
+                 "max allocation {} MiB -> {} MB{}",
+                 heap >> 20, simulated ? " (SIMULATED, SHADPS4_SIM_VRAM_MB)" : "", min_mb,
+                 tiers ? "on" : "off", max_alloc >> 20, size >> 20,
+                 size != 0 ? " - one mesh buffer sized once"
+                           : " - OFF: fallback to the old growth path");
+        return size;
     }();
+    const bool big_grow = big_grow_bytes != 0;
     // r15e: only joins of >= 1 GB (the mesh memory) - growing the 542 MB heap buffer over the
     // particle arena put CPU-written pages under tracking: write faults 35 k -> 57-60 k/s (s1051-s1056).
     if (big_grow && !overlap_ids.empty() && end - begin >= (1ull << 30)) {
@@ -7292,7 +7337,7 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
         const u64 cur = end - begin;
         // r15d: straight to the cap (3.75 GB) at the first big join - normally the load - so the
         // region never grows again in the scene (r15b: an in-scene growth's coherent upload stalled ~1 s).
-        const u64 want = BigGrowBytes;
+        const u64 want = big_grow_bytes;
         const u64 mapped = memory->TryClampRangeSize(begin, want);
         VAddr grow_end = Common::AlignDown(begin + mapped, CACHING_PAGESIZE);
         if (mapped > cur && grow_end > end) {
@@ -7438,10 +7483,11 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
         LOG_INFO(Render_Vulkan,
                  "BigJoin: new buffer [{:#x}, +{:#x}) ({} MB) from {} joined (largest {} MB, copy {} "
                  "MB on the GPU), wanted [{:#x}, +{:#x}), stream leap {}, CPU {:.2f} ms, tick {}, "
-                 "grown ahead so far {}",
+                 "grown ahead so far {}; VMA {}",
                  overlap.begin, size, size >> 20, overlap.ids.size(), big_old >> 20,
                  big_copy >> 20, device_addr, wanted_size, overlap.has_stream_leap, ms,
-                 scheduler.CurrentTick(), big_grow_count);
+                 scheduler.CurrentTick(), big_grow_count,
+                 Vulkan::DescribeDeviceLocalBudgets(instance.GetAllocator()));
     }
     Register(new_buffer_id);
     if (g_native_coherent != 0 && coherent_live &&
@@ -8550,6 +8596,31 @@ void BufferCache::RunGarbageCollector() {
     };
     if (instance.CanReportMemoryUsage()) {
         total_used_memory = instance.GetDeviceMemoryUsage();
+    }
+    {
+        // v1.0.2: video memory in players' logs - VMA's device-local usage (the number its budget
+        // check compares), its peak, and the driver's process usage, every 60 s.
+        VmaBudget budgets[VK_MAX_MEMORY_HEAPS]{};
+        vmaGetHeapBudgets(instance.GetAllocator(), budgets);
+        const auto& mp = instance.GetMemoryProperties();
+        u64 vma_local = 0;
+        for (u32 i = 0; i < mp.memoryHeapCount; ++i) {
+            if (mp.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+                vma_local += budgets[i].usage;
+            }
+        }
+        vram_peak_vma = std::max(vram_peak_vma, vma_local);
+        vram_peak_driver = std::max(vram_peak_driver, total_used_memory);
+        const auto now = std::chrono::steady_clock::now();
+        if (now - vram_last_log >= std::chrono::seconds{60}) {
+            vram_last_log = now;
+            LOG_INFO(Render_Vulkan,
+                     "VideoMemory: VMA video {} MB (peak {} MB); driver process usage {} MB (peak "
+                     "{} MB), GC trigger {} MB; {}",
+                     vma_local >> 20, vram_peak_vma >> 20, total_used_memory >> 20,
+                     vram_peak_driver >> 20, trigger_gc_memory >> 20,
+                     Vulkan::DescribeDeviceLocalBudgets(instance.GetAllocator()));
+        }
     }
     if (total_used_memory < trigger_gc_memory) {
         return;

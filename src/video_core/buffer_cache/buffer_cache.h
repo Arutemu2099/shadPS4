@@ -1125,6 +1125,9 @@ private:
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;
     u64 critical_gc_memory = 0;
+    u64 vram_peak_vma = 0;    ///< v1.0.2 VideoMemory log line: VMA device-local peak
+    u64 vram_peak_driver = 0; ///< and the driver's process-usage peak
+    std::chrono::steady_clock::time_point vram_last_log{};
     u64 gc_tick = 0;
     Common::LeastRecentlyUsedCache<BufferId, u64> lru_cache;
     GpuRangeSet gpu_modified_ranges;

@@ -10,6 +10,7 @@
 #include "common/scope_exit.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_memory_budget.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
@@ -113,7 +114,7 @@ void UniqueImage::Destroy() {
 void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     this->image_ci = image_ci;
     ASSERT(!image);
-    const VmaAllocationCreateInfo alloc_info = {
+    VmaAllocationCreateInfo alloc_info = {
         .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         .requiredFlags = 0,
@@ -124,9 +125,20 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
 
     const VkImageCreateInfo image_ci_unsafe = static_cast<VkImageCreateInfo>(image_ci);
     VkImage unsafe_image{};
-    VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_info, &unsafe_image,
-                                     &allocation, nullptr);
-    ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",
+    // v1.0.2: over VMA's budget, retry without it (vk_memory_budget.h) instead of asserting.
+    const u64 approx_bytes = u64{image_ci.extent.width} * image_ci.extent.height *
+                             image_ci.extent.depth * image_ci.arrayLayers * 4;
+    VkResult result = Vulkan::AllocateWithBudgetRetry(
+        allocator, alloc_info, "image", approx_bytes,
+        fmt::format("{}x{}x{} layers {} mips {} {} (size ~ at 4 bytes per texel)",
+                    image_ci.extent.width, image_ci.extent.height, image_ci.extent.depth,
+                    image_ci.arrayLayers, image_ci.mipLevels, vk::to_string(image_ci.format)),
+        [&](const VmaAllocationCreateInfo& ci) {
+            return vmaCreateImage(allocator, &image_ci_unsafe, &ci, &unsafe_image, &allocation,
+                                  nullptr);
+        });
+    ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image {}x{} {} with error {}",
+               image_ci.extent.width, image_ci.extent.height, vk::to_string(image_ci.format),
                vk::to_string(vk::Result{result}));
     image = vk::Image{unsafe_image};
 }
