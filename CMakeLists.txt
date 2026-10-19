@@ -1406,6 +1406,9 @@ endif()
 
 if (WIN32)
     target_sources(shadps4 PRIVATE src/dist/shadps4.rc)
+    # 2026-10-19: UTF-8 process code page (non-ANSI folder names); CMake merges .manifest sources
+    # into the embedded manifest.
+    target_sources(shadps4 PRIVATE src/dist/shadps4.manifest)
 endif()
 
 add_compile_definitions(BOOST_ASIO_STANDALONE)

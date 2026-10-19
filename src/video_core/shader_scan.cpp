@@ -59,12 +59,21 @@ struct FileEntry {
 std::vector<FileEntry> ListFiles(const std::filesystem::path& folder, Fingerprint& fp) {
     std::vector<FileEntry> files;
     std::error_code ec;
+    // follow_directory_symlink (2026-10-19): a game folder whose subfolders are junctions / links
+    // (for example data kept on another drive) was indexed without them, so the seed found "no code
+    // in the game index" and rebuilt nothing. The depth limit stops a link that loops.
     for (std::filesystem::recursive_directory_iterator it{
-             folder, std::filesystem::directory_options::skip_permission_denied, ec},
+             folder,
+             std::filesystem::directory_options::skip_permission_denied |
+                 std::filesystem::directory_options::follow_directory_symlink,
+             ec},
          end;
          it != end; it.increment(ec)) {
         if (ec) {
             break;
+        }
+        if (it.depth() > 16) {
+            it.disable_recursion_pending();
         }
         if (!it->is_regular_file(ec)) {
             continue;

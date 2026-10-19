@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- 2026-10-19: UTF-8 as the process code page (Windows 10 1903+). std::filesystem::path::string() and the "A"
+     Win32 APIs then use UTF-8: a folder name the system's ANSI code page cannot hold (Cyrillic letters on an English
+     Windows) ended the v1.0.1 candidate at start-up with "No mapping for the Unicode character exists in the target
+     multi-byte code page". Older Windows ignores this element. Merged with the linker's default manifest. -->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>
