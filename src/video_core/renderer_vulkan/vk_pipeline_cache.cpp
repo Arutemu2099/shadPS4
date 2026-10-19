@@ -35,6 +35,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_bindless.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
+#include "video_core/renderer_vulkan/vk_dlss_upscale.h"
 #include "video_core/renderer_vulkan/vk_pipeline_compile_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -2157,6 +2158,34 @@ void PipelineCache::GraphicsKeySecondPass(const AmdGpu::Regs& regs, GraphicsPipe
         // Apply swizzle to target mask
         key.write_masks[cb] =
             vk::ColorComponentFlags{key.color_buffers[cb].swizzle.ApplyMask(target_mask)};
+
+        // SHADPS4_DLSS_UPSCALE (2026-10-18, user: the dark panel behind the karma-choice text
+        // vanished with DLSS): HUD draws into the HUD layer also write alpha (ApplyHudLayerMask),
+        // but their alpha blend was whatever the game set for a channel it never wrote. The layer's
+        // alpha must be its coverage, consistent with the colour equation: the scene below keeps
+        // the colour dst factor's share. ONE_MINUS_SRC_ALPHA -> A = As + Ad (1 - As); ONE (additive)
+        // -> A unchanged; ZERO -> A = As. Draws that read the destination colour (multiply) stay as
+        // they were. Static per mode (UpscaleWanted), so lookup memos see one key; without the HUD
+        // layer the alpha channel is masked off and the change has no effect.
+        if (cb == 0 && key.blend_controls[0].enable && Dlss::UpscaleWanted() &&
+            col_buf.Address() == Dlss::HudLayerAddr &&
+            !(key.write_masks[0] & vk::ColorComponentFlagBits::eA)) {
+            using Factor = AmdGpu::BlendControl::BlendFactor;
+            auto& bc = key.blend_controls[0];
+            const Factor src = bc.color_src_factor;
+            const bool reads_dst = src == Factor::DstColor || src == Factor::OneMinusDstColor ||
+                                   src == Factor::DstAlpha || src == Factor::OneMinusDstAlpha;
+            const Factor dst = bc.color_dst_factor;
+            if (!reads_dst && (dst == Factor::OneMinusSrcAlpha || dst == Factor::One ||
+                               dst == Factor::Zero)) {
+                bc.separate_alpha_blend = 1;
+                bc.alpha_src_factor = dst == Factor::One ? Factor::Zero : Factor::One;
+                bc.alpha_dst_factor = dst == Factor::Zero ? Factor::Zero : dst == Factor::One
+                                                                            ? Factor::One
+                                                                            : Factor::OneMinusSrcAlpha;
+                bc.alpha_func = AmdGpu::BlendControl::BlendFunc::Add;
+            }
+        }
 
         // Fill color samples
         const u8 prev_color_samples = std::exchange(color_samples, col_buf.NumSamples());
