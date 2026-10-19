@@ -307,7 +307,7 @@ void WindowSDL::WaitEvent() {
         }
         const bool on = Input::IsMouseGyroMode();
         controllers[0]->SetSyntheticMotion(on);
-        Overlay::ShowNotice(on ? "Mouse = motion sensor (X rattle, hold Z tilt)"
+        Overlay::ShowNotice(on ? "Mouse = motion sensor (hold Z tilt, tap Z rattle)"
                                : "Mouse motion sensor off");
     };
 
@@ -372,11 +372,18 @@ void WindowSDL::WaitEvent() {
         if (Input::g_synth_motion &&
             (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) &&
             !event.key.repeat &&
-            (event.key.key == SDLK_X || event.key.key == SDLK_Z)) {
-            // SHADPS4_SYNTH_MOTION: X = rattle, Z = tilt (held). X was R until 2026-10-17: R is the
-            // touchpad in the PC layout; X also toggles the mouse motion mode there (global.ini).
-            (event.key.key == SDLK_X ? Input::g_synth_rattle : Input::g_synth_tilt)
-                .store(event.type == SDL_EVENT_KEY_DOWN, std::memory_order_relaxed);
+            event.key.key == SDLK_Z) {
+            // SHADPS4_SYNTH_MOTION (user 2026-10-18): hold Z = tilt the pad sideways; a quick tap of Z
+            // (released within 250 ms) = a 600 ms rattle burst. X only toggles the mouse motion mode
+            // (global.ini); it used to rattle while held as well.
+            static u64 z_down_ms = 0;
+            const bool down = event.type == SDL_EVENT_KEY_DOWN;
+            Input::g_synth_tilt.store(down, std::memory_order_relaxed);
+            if (down) {
+                z_down_ms = SDL_GetTicks();
+            } else if (SDL_GetTicks() - z_down_ms < 250) {
+                Input::g_synth_rattle_until.store(SDL_GetTicks() + 600, std::memory_order_relaxed);
+            }
         }
         if (Vulkan::Dlss::Enabled() && event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
             (event.key.key == SDLK_HOME || event.key.key == SDLK_PAGEDOWN ||

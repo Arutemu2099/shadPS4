@@ -185,7 +185,8 @@ void GameController::SyntheticMotionLocked(u64 timestamp) {
                          ? std::min(static_cast<float>(timestamp - s.last_t) / 1e6f, 0.1f)
                          : 0.0f;
     const bool rattle = g_synth_rattle.load(std::memory_order_relaxed) ||
-                        g_synth_rattle_btn.load(std::memory_order_relaxed);
+                        g_synth_rattle_btn.load(std::memory_order_relaxed) ||
+                        SDL_GetTicks() < g_synth_rattle_until.load(std::memory_order_relaxed);
     const bool tilt = rattle || g_synth_tilt.load(std::memory_order_relaxed) ||
                       g_synth_tilt_btn.load(std::memory_order_relaxed);
     // Roll toward 90 degrees while tilted (eased over ~80 ms: a turn, not a jump).

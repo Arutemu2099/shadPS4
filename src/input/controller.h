@@ -57,6 +57,8 @@ inline std::atomic<float> g_synth_dx{0.0f};
 inline std::atomic<float> g_synth_dy{0.0f};
 inline std::atomic<bool> g_synth_tilt{false};       ///< Z held
 inline std::atomic<bool> g_synth_rattle{false};     ///< R held
+/// 2026-10-18 (user): a quick tap of Z rattles until this SDL_GetTicks() time (ms).
+inline std::atomic<u64> g_synth_rattle_until{0};
 inline std::atomic<bool> g_synth_tilt_btn{false};   ///< mouse forward button held
 inline std::atomic<bool> g_synth_rattle_btn{false}; ///< mouse back button held
 
