@@ -333,8 +333,8 @@ struct InputSettings {
     Setting<s32> camera_id{-1};
     Setting<bool> use_mice_as_mice{false};
     // v1.0.2: round stick deadzone in percent of full tilt (core/libraries/pad/pad.cpp).
-    Setting<int> stick_deadzone_left{10};  // specific
-    Setting<int> stick_deadzone_right{10}; // specific
+    Setting<float> stick_deadzone_left{7.5f};  // specific
+    Setting<float> stick_deadzone_right{7.5f}; // specific
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{

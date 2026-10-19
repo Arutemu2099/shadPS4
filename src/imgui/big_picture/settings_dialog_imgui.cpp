@@ -718,8 +718,8 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             AddSettingCheckbox("Enable Background Controller Input", backgroundControllerSetting);
             // v1.0.2: round deadzone the emulator applies before the game reads the sticks
             // (pad.cpp); live after Save. SHADPS4_STICK_DEADZONE* in shadps4-flags-user.txt wins.
-            AddSettingSliderInt("Left Stick Deadzone (%)", stickDeadzoneLeftSetting, 0, 40);
-            AddSettingSliderInt("Right Stick Deadzone (%)", stickDeadzoneRightSetting, 0, 40);
+            AddSettingSliderFloat("Left Stick Deadzone (%)", stickDeadzoneLeftSetting, 0, 40, 1);
+            AddSettingSliderFloat("Right Stick Deadzone (%)", stickDeadzoneRightSetting, 0, 40, 1);
             AddSettingCombo("Hide Cursor", cursorStateSetting, hideCursorOptions);
 
             if (cursorStateSetting == 1) {

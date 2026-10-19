@@ -378,37 +378,43 @@ namespace {
 // full range, so there is no jump at the edge. Percent of full tilt, per stick: the F3 settings
 // sliders (saved with the other settings, live after Save), or SHADPS4_STICK_DEADZONE=<both>,
 // SHADPS4_STICK_DEADZONE_LEFT / _RIGHT in shadps4-flags-user.txt, which win over the sliders.
-int EnvDeadzonePercent(const char* name) {
+float EnvDeadzonePercent(const char* name) {
     const char* e = std::getenv(name);
     if (!e || !*e) {
-        return -1;
+        return -1.0f;
     }
-    return std::clamp(std::atoi(e), 0, 90);
+    return std::clamp(static_cast<float>(std::atof(e)), 0.0f, 90.0f);
 }
 
-int StickDeadzonePercent(bool left) {
-    static const int env_both = EnvDeadzonePercent("SHADPS4_STICK_DEADZONE");
-    static const int env_left = EnvDeadzonePercent("SHADPS4_STICK_DEADZONE_LEFT");
-    static const int env_right = EnvDeadzonePercent("SHADPS4_STICK_DEADZONE_RIGHT");
-    const int env_one = left ? env_left : env_right;
-    if (env_one >= 0) {
+float StickDeadzonePercent(bool left) {
+    static const float env_both = EnvDeadzonePercent("SHADPS4_STICK_DEADZONE");
+    static const float env_left = EnvDeadzonePercent("SHADPS4_STICK_DEADZONE_LEFT");
+    static const float env_right = EnvDeadzonePercent("SHADPS4_STICK_DEADZONE_RIGHT");
+    const float env_one = left ? env_left : env_right;
+    if (env_one >= 0.0f) {
         return env_one;
     }
-    if (env_both >= 0) {
+    if (env_both >= 0.0f) {
         return env_both;
     }
-    const int setting =
+    const float setting =
         left ? EmulatorSettings.GetStickDeadzoneLeft() : EmulatorSettings.GetStickDeadzoneRight();
-    return std::clamp(setting, 0, 90);
+    return std::clamp(setting, 0.0f, 90.0f);
 }
 
 template <typename Stick>
-void ApplyRoundDeadzone(Stick& stick, int percent) {
-    if (percent <= 0) {
+void ApplyRoundDeadzone(Stick& stick, float percent) {
+    if (percent <= 0.0f) {
         return;
     }
-    const float x = std::clamp((stick.x - 128.0f) / 127.0f, -1.0f, 1.0f);
-    const float y = std::clamp((stick.y - 128.0f) / 127.0f, -1.0f, 1.0f);
+    // 128 steps below the centre, 127 above, so both ends map to -1 / 1 and back exactly.
+    const auto to_unit = [](u8 v) { return (v - 128.0f) / (v < 128 ? 128.0f : 127.0f); };
+    const auto to_byte = [](float u) {
+        return static_cast<u8>(
+            std::clamp(std::lround(128.0f + u * (u < 0.0f ? 128.0f : 127.0f)), 0L, 255L));
+    };
+    const float x = to_unit(stick.x);
+    const float y = to_unit(stick.y);
     const float m = std::sqrt(x * x + y * y);
     const float dz = percent / 100.0f;
     if (m <= dz) {
@@ -419,8 +425,8 @@ void ApplyRoundDeadzone(Stick& stick, int percent) {
     // Not clamped to the unit circle: the corners of a square stick gate stay where they were
     // (the game learns the reach per 45-degree sector itself).
     const float scale = (m - dz) / (1.0f - dz) / m;
-    stick.x = static_cast<u8>(std::clamp(std::lround(128.0f + x * scale * 127.0f), 0L, 255L));
-    stick.y = static_cast<u8>(std::clamp(std::lround(128.0f + y * scale * 127.0f), 0L, 255L));
+    stick.x = to_byte(x * scale);
+    stick.y = to_byte(y * scale);
 }
 
 } // namespace
