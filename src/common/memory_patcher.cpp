@@ -233,13 +233,8 @@ static void ApplyParticleLateRead() {
     if (!env || env[0] != '1') {
         return;
     }
-    const auto app_version =
-        std::string(Common::Singleton<PSF>::Instance()->GetString("APP_VER").value_or(""));
-    if (g_game_serial != "CUSA00004" || app_version != "01.07") {
-        LOG_ERROR(Loader, "SHADPS4_PARTICLE_LATE_READ: refused, game {} version {} (needs CUSA00004 01.07)",
-                  g_game_serial, app_version);
-        return;
-    }
+    // No serial / APP_VER check (2026-10-19): a DLC param.sfo in a player's game folder read as
+    // "Unknown version" and switched this off; the byte compare below is the gate.
     struct Bytes {
         u64 offset;
         std::vector<u8> bytes;
@@ -379,13 +374,7 @@ static void ApplyHouseSplit() {
     if (!mask_on && chunk == 0) {
         return;
     }
-    const auto app_version =
-        std::string(Common::Singleton<PSF>::Instance()->GetString("APP_VER").value_or(""));
-    if (g_game_serial != "CUSA00004" || app_version != "01.07") {
-        LOG_ERROR(Loader, "SHADPS4_HOUSE_SPLIT: refused, game {} version {} (needs CUSA00004 01.07)",
-                  g_game_serial, app_version);
-        return;
-    }
+    // No serial / APP_VER check (2026-10-19, as PARTICLE_LATE_READ): the byte compare is the gate.
     // FUN_800197130 (split mask by pass) and FUN_800197050 (chunk by pass), whole functions.
     static constexpr u8 mask_fn[58] = {
         0xba, 0x01, 0x00, 0x00, 0x00, 0x40, 0x88, 0xf9, 0xb8, 0x00, 0x00, 0xff, 0x7f, 0x48, 0xbe,

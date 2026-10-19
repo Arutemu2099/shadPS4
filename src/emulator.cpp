@@ -12,6 +12,7 @@
 #include <fmt/core.h>
 #include <fmt/xchar.h>
 #include <hwinfo/hwinfo.h>
+#include <xxhash.h>
 
 #include "common/debug.h"
 #include "common/fault_monitor.h"
@@ -124,6 +125,39 @@ s32 ReadCompiledSdkVersion(const std::string& guest_or_host_path) {
         return param.sdk_version;
     }
     return 0;
+}
+
+/// XXH3 of the eboot's executable segments as stored in the file, before any load-time patching:
+/// the game's identity where param.sfo cannot be trusted (2026-10-19: a player's DLC param.sfo in
+/// the game folder read as "Unknown version" and switched the shader seed off). 0 if unreadable.
+u64 ReadEbootCodeHash(const std::string& guest_or_host_path) {
+    auto* mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
+    std::unique_ptr<Core::FileSys::IFile> handle;
+    if (!guest_or_host_path.empty() && guest_or_host_path.front() == '/') {
+        handle = mnt->Open(guest_or_host_path, /*writable=*/false);
+    }
+
+    Core::Loader::Elf elf;
+    if (handle) {
+        elf.Open(std::move(handle));
+    } else {
+        elf.Open(std::filesystem::path{guest_or_host_path});
+    }
+
+    if (!elf.IsElfFile()) {
+        return 0;
+    }
+    u64 hash = 0;
+    std::vector<u8> code;
+    for (const auto& phdr : elf.GetProgramHeader()) {
+        if (phdr.p_type != PT_LOAD || (phdr.p_flags & PF_EXEC) == 0 || phdr.p_filesz == 0) {
+            continue;
+        }
+        code.resize(phdr.p_filesz);
+        elf.LoadSegment(u64(code.data()), phdr.p_offset, phdr.p_filesz);
+        hash = XXH3_64bits_withSeed(code.data(), code.size(), hash);
+    }
+    return hash;
 }
 
 std::map<s32, std::string> ExtractTrophies(std::string_view npbind_guest,
@@ -451,6 +485,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     game_info.firmware_ver = fw_version & 0xFFF00000;
     game_info.raw_firmware_ver = fw_version;
     game_info.sdk_ver = ReadCompiledSdkVersion(guest_eboot_path);
+    game_info.eboot_code_hash = ReadEbootCodeHash(guest_eboot_path);
     game_info.psf_attributes = psf_attributes;
 
     if (auto splash = mnt->ReadFile("/app0/sce_sys/pic1.png")) {
@@ -523,6 +558,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         LOG_INFO(Loader, "Fw: {:#x} App Version: {}", fw_version, app_version);
         LOG_INFO(Loader, "param.sfo SDK version: {:#x}", sdk_version);
         LOG_INFO(Loader, "eboot SDK version: {:#x}", game_info.sdk_ver);
+        LOG_INFO(Loader, "eboot code hash: {:#018x}", game_info.eboot_code_hash);
         LOG_INFO(Loader, "PSVR Supported: {}", (bool)psf_attributes.support_ps_vr.Value());
         LOG_INFO(Loader, "PSVR Required: {}", (bool)psf_attributes.require_ps_vr.Value());
     }

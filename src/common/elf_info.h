@@ -71,6 +71,7 @@ class ElfInfo {
     u32 firmware_ver = 0;
     u32 raw_firmware_ver = 0;
     u32 sdk_ver = 0;
+    u64 eboot_code_hash = 0;
     PSFAttributes psf_attributes{};
 
     std::vector<u8> splash_data{};
@@ -116,6 +117,12 @@ public:
     [[nodiscard]] std::string_view AppVer() const {
         ASSERT(initialized);
         return app_ver;
+    }
+
+    /// XXH3 of the eboot's executable segments in the file (Emulator ReadEbootCodeHash); 0 if unread.
+    [[nodiscard]] u64 EbootCodeHash() const {
+        ASSERT(initialized);
+        return eboot_code_hash;
     }
 
     [[nodiscard]] u32 FirmwareVer() const {

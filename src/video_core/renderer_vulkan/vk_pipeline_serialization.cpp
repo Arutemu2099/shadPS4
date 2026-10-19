@@ -368,11 +368,12 @@ constexpr u32 VsFormatsVersion = 3;
 constexpr u32 VsFormatsRecord = 6;
 
 /// seed-stamp.bin (2026-10-16, study sec. 5 findings 1-4): written by a =2 VERIFY run, shipped with
-/// a seed: game serial + APP_VER, emulator build (scm description), the Shader::Profile and dynamic
+/// a seed: game serial + APP_VER (logged only), emulator build (scm description), the eboot code hash
+/// (v3, 2026-10-19: the game identity), the Shader::Profile and dynamic
 /// vertex input of the machine that verified it, and per shader hash the game file's OrbShdr crc32
 /// and code length.
 constexpr u32 SeedStampMagic = 0x50545353; // "SSTP"
-constexpr u32 SeedStampVersion = 2; // 2: permutations per hash, EXE hash in the build id
+constexpr u32 SeedStampVersion = 3; // 2: permutations per hash, EXE hash in the build id; 3: eboot code hash
 
 /// The emulator build a seed was verified with: the scm description plus the running EXE file's
 /// hash (Opus review D: s1300 and s1309-s1312, five different builds, shared one description).
@@ -830,6 +831,7 @@ void PipelineCache::ReadSeedStamp() {
     const std::streamoff file_size = in ? static_cast<std::streamoff>(in.tellg()) : 0;
     in.seekg(0);
     u32 magic{}, version{}, profile_size{}, count{};
+    u64 code_hash{};
     std::string serial, app_ver, build;
     std::vector<u8> profile_bytes;
     u8 dynamic_vertex_input{};
@@ -840,6 +842,7 @@ void PipelineCache::ReadSeedStamp() {
     bool ok = in && magic == SeedStampMagic && version == SeedStampVersion &&
               GetString(in, serial) && GetString(in, app_ver) && GetString(in, build);
     if (ok) {
+        in.read(reinterpret_cast<char*>(&code_hash), 8);
         in.read(reinterpret_cast<char*>(&profile_size), 4);
         ok = in && profile_size <= 4096;
     }
@@ -879,13 +882,23 @@ void PipelineCache::ReadSeedStamp() {
                     SeedStampFile);
         return;
     }
+    // The game is identified by its eboot code, not by param.sfo (2026-10-19: a DLC param.sfo in a
+    // player's game folder read as "Unknown version"); every rebuilt stage is also checked against
+    // the game file's shader crc32 + length.
     const auto& elf = Common::ElfInfo::Instance();
-    if (serial != elf.GameSerial() || app_ver != elf.AppVer()) {
+    if (code_hash == 0 || code_hash != elf.EbootCodeHash()) {
         LOG_WARNING(Render,
-                    "CacheRebuild: the seed was made for {} {}, this game is {} {}: no stage is "
-                    "rebuilt",
-                    serial, app_ver, elf.GameSerial(), elf.AppVer());
+                    "CacheRebuild: the seed was made for game code {:#018x} ({} {}), this game's "
+                    "code is {:#018x} ({} {}): no stage is rebuilt",
+                    code_hash, serial, app_ver, elf.EbootCodeHash(), elf.GameSerial(),
+                    elf.AppVer());
         return;
+    }
+    if (serial != elf.GameSerial() || app_ver != elf.AppVer()) {
+        LOG_INFO(Render,
+                 "CacheRebuild: param.sfo says {} {}, the seed's says {} {}; the game code matches "
+                 "the seed's ({:#018x}), so the seed applies",
+                 elf.GameSerial(), elf.AppVer(), serial, app_ver, code_hash);
     }
     if (build != BuildId()) {
         LOG_WARNING(Render,
@@ -954,6 +967,8 @@ void PipelineCache::WriteSeedStamp() const {
     PutString(out, elf.GameSerial());
     PutString(out, elf.AppVer());
     PutString(out, BuildId());
+    const u64 code_hash = elf.EbootCodeHash();
+    out.write(reinterpret_cast<const char*>(&code_hash), 8);
     const u32 profile_size = sizeof(profile);
     out.write(reinterpret_cast<const char*>(&profile_size), 4);
     out.write(reinterpret_cast<const char*>(&profile), profile_size);
@@ -971,9 +986,10 @@ void PipelineCache::WriteSeedStamp() const {
     }
     LOG_INFO(Render,
              "CacheRebuild: {} written: {} shaders, {} permutations verified word-equal ({} programs "
-             "with a differing permutation left out), game {} {}, build {}, dynamic vertex input {}",
-             SeedStampFile, count, total_perms, left_out, elf.GameSerial(), elf.AppVer(), BuildId(),
-             dynamic_vertex_input);
+             "with a differing permutation left out), game {} {} (code {:#018x}), build {}, dynamic "
+             "vertex input {}",
+             SeedStampFile, count, total_perms, left_out, elf.GameSerial(), elf.AppVer(), code_hash,
+             BuildId(), dynamic_vertex_input);
 }
 
 void PipelineCache::PrebuildMissingStages(u32 num_threads) {
