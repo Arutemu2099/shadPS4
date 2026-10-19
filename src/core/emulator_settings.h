@@ -801,3 +801,14 @@ public:
 #undef SETTING_FORWARD_BOOL
 #undef SETTING_FORWARD_BOOL_READONLY
 };
+
+/// The Vulkan device index to use: SHADPS4_GPU_ID (the environment / shadps4-flags.txt) wins over the
+/// config's gpu_id; -1 = automatic (Vulkan 1.3 first, then a discrete GPU, then the most video memory).
+/// 2026-10-19: v1.0 shipped gpu_id 0 from the test PC's config, which picked an integrated GPU on PCs
+/// that list it first; an update keeps the player's config, so the release fixes it through its flags.
+inline s32 EffectiveGpuId() {
+    if (const char* v = std::getenv("SHADPS4_GPU_ID"); v && *v) {
+        return static_cast<s32>(std::strtol(v, nullptr, 10));
+    }
+    return EmulatorSettings.GetGpuId();
+}
