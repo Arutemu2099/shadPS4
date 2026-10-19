@@ -5,6 +5,7 @@
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/decoder.h"
+#include "common/fatal_stack.h"
 #include "common/signal_context.h"
 #include "common/path_util.h"
 #include "common/singleton.h"
@@ -544,6 +545,10 @@ static LONG WINAPI LastChanceFilter(PEXCEPTION_POINTERS pExp) {
                               : 0ULL,
                  GetCurrentThreadId());
     std::fflush(stderr);
+    if (code != EXCEPTION_BREAKPOINT) {
+        // v1.0.2: the stack through the exception dispatch (an assert's int 3 printed its own).
+        Common::PrintStackToStderr(0);
+    }
     return EXCEPTION_CONTINUE_SEARCH;
 }
 

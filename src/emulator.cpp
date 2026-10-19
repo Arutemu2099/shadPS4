@@ -14,6 +14,7 @@
 #include <hwinfo/hwinfo.h>
 #include <xxhash.h>
 
+#include "common/assert.h"
 #include "common/debug.h"
 #include "common/fault_monitor.h"
 #include "common/logging/log.h"
@@ -521,6 +522,10 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 #endif
     LOG_INFO(Config, "GPU isNullGpu: {}", EmulatorSettings.IsNullGPU());
     LOG_INFO(Config, "GPU readbacksMode: {}", EmulatorSettings.GetReadbacksMode());
+    // v1.0.2 test switch: a forced assert, to check that fatal.txt carries its text and stack.
+    if (const char* t = std::getenv("SHADPS4_TEST_ASSERT"); t && t[0] == '1') {
+        ASSERT_MSG(false, "SHADPS4_TEST_ASSERT=1: forced assert (fatal.txt test)");
+    }
     // Periodic handled-fault vs. presented-frame reporting; see common/fault_monitor.h.
     Common::FaultMonitor::Start();
     LOG_INFO(Config, "GPU readbackLinearImages: {}",

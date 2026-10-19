@@ -32,6 +32,28 @@ bool g_should_append = false;
 static std::shared_ptr<spdlog_stdout> g_console_sink;
 static std::shared_ptr<LogFileSink> g_shad_file_sink;
 
+/// v1.0.2 (PERF-PLAN 14.5): Critical lines go straight to stderr as well - in release mode that is
+/// user/log/fatal.txt - before the asynchronous log writes them: an assert or a lost device ends
+/// the process right after its Critical line, and players often send only fatal.txt (two reports
+/// on 10-19 said "FATAL-ASSERT-IMPL" and nothing else).
+class FatalStderrSink final : public spdlog::sinks::sink {
+public:
+    void log(const spdlog::details::log_msg& msg) override {
+        if (msg.log_level < spdlog::level::critical) {
+            return;
+        }
+        std::fwrite(msg.payload.data(), 1, msg.payload.size(), stderr);
+        std::fputc('\n', stderr);
+        std::fflush(stderr);
+    }
+    void flush() override {
+        std::fflush(stderr);
+    }
+    void set_pattern(const std::string&) override {}
+    void set_formatter(std::unique_ptr<spdlog::formatter>) override {}
+};
+static std::shared_ptr<FatalStderrSink> g_fatal_sink = std::make_shared<FatalStderrSink>();
+
 std::unordered_map<std::string_view, std::shared_ptr<spdlog::logger>> ALL_LOGGERS{
     {Class::Common, nullptr},
     {Class::Common_Filesystem, nullptr},
@@ -286,6 +308,7 @@ void UpdateSinks() {
         logger->sinks() = EmulatorSettings.IsLogSkipDuplicate()
                               ? dup_filter
                               : (EmulatorSettings.IsLogSync() ? sinks : async_sink);
+        logger->sinks().push_back(g_fatal_sink);
     }
 }
 
