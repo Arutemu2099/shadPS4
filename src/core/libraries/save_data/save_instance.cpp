@@ -198,10 +198,17 @@ void SaveInstance::Umount() {
         return;
     }
     mounted = false;
-    const bool ok = param_sfo.Encode(param_sfo_path);
-    if (!ok) {
-        throw fs::filesystem_error("Failed to write param.sfo", param_sfo_path,
-                                   std::make_error_code(std::errc::permission_denied));
+    // 2026-10-18 (not env-gated): a read-only mount leaves param.sfo alone. Rewriting it gave the
+    // file a new time, and sceSaveDataDirNameSearch sorts MTIME by that time - so a slot the game
+    // only read (Second Son's boot read, the Load menu) became the "newest" save. Second Son boots
+    // from the newest slot (MTIME, DESCENT) and replaces its live options and state with that slot's,
+    // so an old slot's settings came back (LATER-PLAN 10; Ghidra: FUN_8001e52a0 / FUN_8001e1b10).
+    if (!read_only) {
+        const bool ok = param_sfo.Encode(param_sfo_path);
+        if (!ok) {
+            throw fs::filesystem_error("Failed to write param.sfo", param_sfo_path,
+                                       std::make_error_code(std::errc::permission_denied));
+        }
     }
     param_sfo = PSF();
 
