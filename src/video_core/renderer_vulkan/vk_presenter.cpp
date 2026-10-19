@@ -740,7 +740,8 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     // v1.0.2: over VMA's budget, retry without it (vk_memory_budget.h) instead of asserting.
     VkResult result = AllocateWithBudgetRetry(
         instance.GetAllocator(), alloc_info, "frame image", u64{width} * height * 4,
-        fmt::format("{}x{}", width, height), [&](const VmaAllocationCreateInfo& ci) {
+        [&] { return fmt::format("{}x{}", width, height); },
+        [&](const VmaAllocationCreateInfo& ci) {
             return vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &ci, &unsafe_image,
                                   &frame->allocation, nullptr);
         });

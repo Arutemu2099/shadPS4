@@ -42,8 +42,7 @@ public:
         if (msg.log_level < spdlog::level::critical) {
             return;
         }
-        std::fwrite(msg.payload.data(), 1, msg.payload.size(), stderr);
-        std::fputc('\n', stderr);
+        std::fprintf(stderr, "%.*s\n", static_cast<int>(msg.payload.size()), msg.payload.data());
         std::fflush(stderr);
     }
     void flush() override {

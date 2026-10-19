@@ -130,9 +130,12 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
                              image_ci.extent.depth * image_ci.arrayLayers * 4;
     VkResult result = Vulkan::AllocateWithBudgetRetry(
         allocator, alloc_info, "image", approx_bytes,
-        fmt::format("{}x{}x{} layers {} mips {} {} (size ~ at 4 bytes per texel)",
-                    image_ci.extent.width, image_ci.extent.height, image_ci.extent.depth,
-                    image_ci.arrayLayers, image_ci.mipLevels, vk::to_string(image_ci.format)),
+        [&] {
+            return fmt::format("{}x{}x{} layers {} mips {} {} (size ~ at 4 bytes per texel)",
+                               image_ci.extent.width, image_ci.extent.height,
+                               image_ci.extent.depth, image_ci.arrayLayers, image_ci.mipLevels,
+                               vk::to_string(image_ci.format));
+        },
         [&](const VmaAllocationCreateInfo& ci) {
             return vmaCreateImage(allocator, &image_ci_unsafe, &ci, &unsafe_image, &allocation,
                                   nullptr);

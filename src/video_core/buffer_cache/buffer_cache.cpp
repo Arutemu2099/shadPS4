@@ -7313,7 +7313,7 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
         }
         const u64 max_alloc = instance.MaxMemoryAllocationSize();
         if (size > max_alloc) {
-            size = max_alloc >= 0xB0000000ull ? 0xB0000000ull : 0;
+            size = tiers && max_alloc >= 0xB0000000ull ? 0xB0000000ull : 0;
         }
         LOG_INFO(Render_Vulkan,
                  "BIG_GROW: largest device-local heap {} MiB{} (3.75 GB needs >= {} MiB, tiers {}), "

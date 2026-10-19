@@ -102,7 +102,8 @@ void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usa
     VkBuffer unsafe_buffer{};
     // v1.0.2: over VMA's budget, retry without it (vk_memory_budget.h) instead of asserting.
     VkResult result = Vulkan::AllocateWithBudgetRetry(
-        allocator, alloc_ci, "buffer", buffer_ci.size, BufferTypeName(usage).data(),
+        allocator, alloc_ci, "buffer", buffer_ci.size,
+        [&] { return std::string{BufferTypeName(usage)}; },
         [&](const VmaAllocationCreateInfo& ci) {
             return vmaCreateBuffer(allocator, &buffer_ci_unsafe, &ci, &unsafe_buffer, &allocation,
                                    out_alloc_info);

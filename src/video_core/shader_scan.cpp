@@ -197,7 +197,9 @@ bool SaveIndex(const std::filesystem::path& path, const std::filesystem::path& f
     Put(out, fp);
     Put(out, static_cast<u32>(index.files.size()));
     for (size_t i = 0; i < index.files.size(); ++i) {
-        const auto rel = std::filesystem::relative(index.files[i], folder).generic_u8string();
+        // Lexical (review 10-19): relative() resolves junctions, so files behind a junction to
+        // another drive all became "" and the index never matched again.
+        const auto rel = index.files[i].lexically_relative(folder).generic_u8string();
         Put(out, static_cast<u32>(rel.size()));
         out.write(reinterpret_cast<const char*>(rel.data()), rel.size());
         Put(out, i < entries.size() ? entries[i].size : u64{0});
@@ -235,7 +237,7 @@ bool LoadIndex(const std::filesystem::path& path, const std::filesystem::path& f
     std::unordered_map<std::u8string, u32> listed;
     listed.reserve(entries.size());
     for (u32 i = 0; i < entries.size(); ++i) {
-        listed.emplace(std::filesystem::relative(entries[i].path, folder).generic_u8string(), i);
+        listed.emplace(entries[i].path.lexically_relative(folder).generic_u8string(), i);
     }
     out.known.assign(entries.size(), false);
     std::vector<u32> saved_to_listed(num_files, UINT32_MAX);

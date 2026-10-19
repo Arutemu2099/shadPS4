@@ -545,7 +545,7 @@ static LONG WINAPI LastChanceFilter(PEXCEPTION_POINTERS pExp) {
                               : 0ULL,
                  GetCurrentThreadId());
     std::fflush(stderr);
-    if (code != EXCEPTION_BREAKPOINT) {
+    if (code != EXCEPTION_BREAKPOINT && code != EXCEPTION_STACK_OVERFLOW) {
         // v1.0.2: the stack through the exception dispatch (an assert's int 3 printed its own).
         Common::PrintStackToStderr(0);
     }

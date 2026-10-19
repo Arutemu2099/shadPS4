@@ -50,12 +50,11 @@ inline std::string DescribeDeviceLocalBudgets(VmaAllocator allocator) {
 }
 
 /// Runs `alloc(create_info)`; on VK_ERROR_OUT_OF_DEVICE_MEMORY with the budget bit set, retries
-/// once without it. Logs the first retries of each kind and every final failure (with the size
-/// and VMA's budgets, so a player's log says what did not fit).
-template <typename F>
+/// once without it. Logs the first retries of each kind and every final failure (with the size,
+/// `detail()` and VMA's budgets, so a player's log says what did not fit).
+template <typename D, typename F>
 VkResult AllocateWithBudgetRetry(VmaAllocator allocator, VmaAllocationCreateInfo& create_info,
-                                 const char* what, u64 bytes, const std::string& detail,
-                                 F&& alloc) {
+                                 const char* what, u64 bytes, D&& detail, F&& alloc) {
     VkResult result = alloc(create_info);
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY &&
         (create_info.flags & VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT) != 0 && AllowOverBudget()) {
@@ -67,14 +66,14 @@ VkResult AllocateWithBudgetRetry(VmaAllocator allocator, VmaAllocationCreateInfo
             LOG_WARNING(Render_Vulkan,
                         "Video memory over budget: {} of {} MB {} allocated without the budget "
                         "check ({}) - retry #{}; {}",
-                        what, bytes >> 20, detail,
+                        what, bytes >> 20, detail(),
                         result == VK_SUCCESS ? "ok" : "still failed", n,
                         DescribeDeviceLocalBudgets(allocator));
         }
     }
     if (result != VK_SUCCESS) {
         LOG_CRITICAL(Render_Vulkan, "Allocation failed: {} of {} bytes ({} MB) {}: error {}; {}",
-                     what, bytes, bytes >> 20, detail, static_cast<int>(result),
+                     what, bytes, bytes >> 20, detail(), static_cast<int>(result),
                      DescribeDeviceLocalBudgets(allocator));
     }
     return result;
