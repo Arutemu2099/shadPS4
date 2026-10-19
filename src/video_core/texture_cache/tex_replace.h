@@ -45,5 +45,13 @@ const Target* Find(const ImageInfo& info);
 /// Whether the image's Vulkan format stores blue first (the pictures are RGBA).
 bool SwapRedBlue(const ImageInfo& info);
 
+/// Device switch (SHADPS4_TEX_REPLACE_AUTO, on unless set to 0): the pictures show while the
+/// keyboard / mouse was used last; a pad button or a stick / trigger past half way brings the game's
+/// own glyphs back, a key or mouse click the pictures. A switch invalidates the matched textures'
+/// guest memory as a CPU write would (any thread may call it), so the next use re-uploads them.
+bool AutoSwitch();
+void NoteInputDevice(bool gamepad);
+bool PicturesActive();
+
 } // namespace TexReplace
 } // namespace VideoCore

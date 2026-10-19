@@ -34,6 +34,7 @@
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_dlss5.h"
+#include "video_core/texture_cache/tex_replace.h"
 
 #ifdef __APPLE__
 #include <SDL3/SDL_metal.h>
@@ -236,6 +237,28 @@ void WindowSDL::WaitEvent() {
                                            before == Input::MouseMode::Joystick ||
                                                before == Input::MouseMode::Gyro);
             saved = false;
+        }
+    }
+
+    // SHADPS4_TEX_REPLACE: the button icons follow the device used last (tex_replace.h).
+    if (VideoCore::TexReplace::AutoSwitch()) [[unlikely]] {
+        switch (event.type) {
+        case SDL_EVENT_KEY_DOWN:
+        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+            VideoCore::TexReplace::NoteInputDevice(false);
+            break;
+        case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+            VideoCore::TexReplace::NoteInputDevice(true);
+            break;
+        case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+            // Firm pushes only (Opus review 10-18): a drifting stick must not flip the icons back
+            // on every key press.
+            if (event.gaxis.value > 26000 || event.gaxis.value < -26000) {
+                VideoCore::TexReplace::NoteInputDevice(true);
+            }
+            break;
+        default:
+            break;
         }
     }
 

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -9,6 +10,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <xxhash.h>
 
 #ifdef _WIN32
@@ -17,6 +19,7 @@
 
 #include "common/logging/log.h"
 #include "common/stb.h"
+#include "core/memory.h"
 #include "video_core/amdgpu/resource.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/tex_replace.h"
@@ -33,6 +36,14 @@ const bool g_flag = [] {
 std::vector<Target> g_targets;
 std::once_flag g_load_once;
 std::atomic<u32> g_logged{0};
+
+const bool g_auto = [] {
+    const char* v = std::getenv("SHADPS4_TEX_REPLACE_AUTO");
+    return !(v && v[0] == '0');
+}();
+std::atomic<bool> g_gamepad{false};
+std::mutex g_seen_mutex;
+std::vector<std::pair<VAddr, u32>> g_seen; ///< guest ranges of matched textures
 
 std::filesystem::path ExeDir() {
 #ifdef _WIN32
@@ -174,6 +185,13 @@ const Target* Find(const ImageInfo& info) {
             found = &t;
         }
     }
+    if (found) {
+        std::scoped_lock lk{g_seen_mutex};
+        const std::pair<VAddr, u32> range{info.guest_address, info.guest_size};
+        if (std::find(g_seen.begin(), g_seen.end(), range) == g_seen.end()) {
+            g_seen.push_back(range);
+        }
+    }
     if (g_logged.fetch_add(1, std::memory_order_relaxed) < 32) {
         LOG_INFO(Render_Vulkan, "TexReplace: {}x{} texture at {:#x} ({} bytes, vk format {}) key {:016x}: {}",
                  info.size.width, info.size.height, info.guest_address, info.guest_size,
@@ -181,6 +199,40 @@ const Target* Find(const ImageInfo& info) {
                  found ? fmt::format("{} pictures applied", found->patches.size()) : "no match");
     }
     return found;
+}
+
+bool AutoSwitch() {
+    return g_flag && g_auto;
+}
+
+bool PicturesActive() {
+    return !g_gamepad.load(std::memory_order_relaxed);
+}
+
+void NoteInputDevice(bool gamepad) {
+    if (g_gamepad.load(std::memory_order_relaxed) == gamepad ||
+        g_gamepad.exchange(gamepad, std::memory_order_relaxed) == gamepad) {
+        return;
+    }
+    std::vector<std::pair<VAddr, u32>> ranges;
+    {
+        std::scoped_lock lk{g_seen_mutex};
+        ranges = g_seen;
+    }
+    LOG_INFO(Render_Vulkan, "TexReplace: {} input - {} glyphs ({} textures re-uploaded)",
+             gamepad ? "pad" : "keyboard / mouse", gamepad ? "game's own" : "replaced",
+             ranges.size());
+    if (ranges.empty()) {
+        return;
+    }
+    // On a thread of its own, like a game thread's CPU write (Opus review 10-18): the invalidation
+    // may wait on the command processor (a GPU-written range), and the caller is the SDL thread,
+    // which the present thread can wait on (ImGui IME callback) - a cycle. Nobody waits on this one.
+    std::thread([ranges = std::move(ranges)] {
+        for (const auto& [addr, size] : ranges) {
+            Core::Memory::Instance()->InvalidateMemory(addr, size);
+        }
+    }).detach();
 }
 
 bool SwapRedBlue(const ImageInfo& info) {

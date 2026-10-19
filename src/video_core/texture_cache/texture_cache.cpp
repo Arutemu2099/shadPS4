@@ -1494,8 +1494,8 @@ void TextureCache::NoteTargetUse(ImageId image_id, bool is_depth) {
 /// of a texture that was just uploaded (tex_replace.h). Runs again after every re-upload of mip 0,
 /// so the game's own data never shows through.
 void TextureCache::ApplyTexReplace(Image& image) {
-    const auto* target = TexReplace::Find(image.info);
-    if (!target) {
+    const auto* target = TexReplace::Find(image.info); // also remembers the range for switches
+    if (!target || !TexReplace::PicturesActive()) {
         return;
     }
     auto& stream = buffer_cache.GetUtilityBuffer(MemoryUsage::Stream);
