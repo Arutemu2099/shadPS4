@@ -140,9 +140,12 @@ int main(int argc, char* argv[]) {
 
     LOG_INFO(Debug, "Run: {}", std::span(argv, argc));
     if (Common::ReleaseMode::Active()) {
-        LOG_INFO(Config, "Release mode: {} variables from {} ({} already set by the environment)",
+        LOG_INFO(Config,
+                 "Release mode: {} variables from {} ({} already set by the environment or "
+                 "shadps4-flags-user.txt), {} from shadps4-flags-user.txt, {} default files copied",
                  Common::ReleaseMode::FlagsApplied(), Common::ReleaseMode::FlagsFilePath(),
-                 Common::ReleaseMode::FlagsOverridden());
+                 Common::ReleaseMode::FlagsOverridden(), Common::ReleaseMode::UserFlagsApplied(),
+                 Common::ReleaseMode::DefaultsCopied());
     }
 
     IPC::Instance().Init();

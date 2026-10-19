@@ -22,6 +22,10 @@ bool Active();
 /// Variables taken from the file / lines skipped because the environment already set them.
 int FlagsApplied();
 int FlagsOverridden();
+/// Variables from shadps4-flags-user.txt (read first; never shipped) / files copied from the
+/// defaults folder because they were missing (2026-10-19: an update over an old folder keeps them).
+int UserFlagsApplied();
+int DefaultsCopied();
 std::string FlagsFilePath();
 
 /// Hides the console window when this process is its only user (started by a double-click).
