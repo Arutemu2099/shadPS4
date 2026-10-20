@@ -386,9 +386,9 @@ void SetScreenSize(int width, int height) {
 // buffers, the video-out buffers, the HUD (anchored to the edges) and the camera follow (Hor+: the
 // vertical view stays, wider screens see more at the sides). Measured on 21:9 (s1426): round
 // shapes, more picture left and right, HUD at the new edges, 0 Critical.
-//   auto (default): only screens wider than 16:9 (narrow ones keep 16:9 with bars until the camera
-//        can add picture above / below instead of cutting the sides); crop: narrow screens too
-//        (Hor+: the sides are cut); W:H (e.g. 21:9, 32:9, 4:3): that shape; off.
+//   auto (default): wider screens see more at the sides, narrower ones (16:10, 4:3, 1:1) more above
+//        and below (the 16:9 width is kept); crop: narrow screens cut the sides instead; W:H (e.g.
+//        21:9, 32:9, 4:3): that shape; off.
 // Decided once at boot (the size setup runs once): a new window shape needs a restart. DLSS steps
 // aside at a non-1080p frame (vk_rasterizer DlssResolve).
 static void ApplyAspectRatio() {
@@ -411,10 +411,19 @@ static void ApplyAspectRatio() {
         return; // 16:9 or unknown: nothing to do
     }
     const bool narrow = aspect < base;
-    if (narrow && mode == "auto") {
-        LOG_INFO(Loader, "SHADPS4_ASPECT: the screen ({}x{}) is narrower than 16:9; the game keeps "
-                         "16:9 with bars (SHADPS4_ASPECT=crop fills it by cutting the sides)",
-                 g_screen_w, g_screen_h);
+    // Narrow screens (not crop): the camera keeps the 16:9 horizontal view and gains picture above
+    // and below. The projection builder 0x800581c90 computes P00 = 2 / (r - l) / tanX and
+    // P11 = 2 / (t - b) / tanY from ONE load of 2.0 (0x581d10, used by those two divisions only);
+    // it is pointed at 2 / k (k = (16/9) / aspect) placed in the 12 padding bytes before the
+    // function (0x581c84, after a ret: never executed). With the camera aspect = the screen's
+    // (screen space below), tanX x k = the 16:9 tanX, tanY x k = the taller view.
+    const bool add_vertical = narrow && mode != "crop";
+    static constexpr u8 two_load[8] = {0xc5, 0xfa, 0x10, 0x1d, 0x98, 0x27, 0x56, 0x00};
+    static constexpr u8 pad[4] = {0x90, 0x90, 0x90, 0x90};
+    if (add_vertical &&
+        (std::memcmp(reinterpret_cast<const void*>(g_eboot_address + 0x581d10), two_load, 8) != 0 ||
+         std::memcmp(reinterpret_cast<const void*>(g_eboot_address + 0x581c84), pad, 4) != 0)) {
+        LOG_ERROR(Loader, "SHADPS4_ASPECT: refused, the projection builder differs (eboot 01.07)");
         return;
     }
     // Multiples of 8; wide: height 1080, narrow: width 1920 (at most 3840 x 1920).
@@ -448,8 +457,15 @@ static void ApplyAspectRatio() {
     }
     g_render_w = w;
     g_render_h = h;
-    LOG_INFO(Loader, "SHADPS4_ASPECT: the game renders {}x{} (aspect {:.3f}, screen {}x{}, {})", w,
-             h, aspect, g_screen_w, g_screen_h, mode);
+    if (add_vertical) {
+        const float two_over_k = float(2.0 / (base / aspect));
+        std::memcpy(reinterpret_cast<void*>(g_eboot_address + 0x581c84), &two_over_k, 4);
+        const s32 disp = s32(0x581c84 - (0x581d10 + 8)); // rip-relative from the next instruction
+        std::memcpy(reinterpret_cast<void*>(g_eboot_address + 0x581d10 + 4), &disp, 4);
+    }
+    LOG_INFO(Loader, "SHADPS4_ASPECT: the game renders {}x{} (aspect {:.3f}, screen {}x{}, {}{})", w,
+             h, aspect, g_screen_w, g_screen_h, mode,
+             add_vertical ? ", 16:9 width kept, more picture above / below" : "");
 }
 
 // SHADPS4_HUD (1.1, user 2026-10-20): where the HUD is drawn, to taste - e.g. a 16:9 HUD on a 21:9
