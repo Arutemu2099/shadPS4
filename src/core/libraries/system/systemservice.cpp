@@ -3,6 +3,7 @@
 
 #include <cstdlib>
 #include "common/elf_info.h"
+#include "common/memory_patcher.h"
 #include "common/singleton.h"
 #include "core/emulator_settings.h"
 #include "core/file_sys/fs.h"
