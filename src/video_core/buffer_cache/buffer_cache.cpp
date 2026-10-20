@@ -8663,6 +8663,24 @@ void BufferCache::RunGarbageCollector() {
                              "MemProbe: private before {} MB, with a filled 2 GB upload buffer {} "
                              "MB, after freeing it {} MB",
                              p0 >> 20, p1 >> 20, p2 >> 20);
+                    // The same with 2 GB of video memory (device-local, written on the GPU):
+                    // does the driver hold system RAM for video-memory allocations?
+                    u64 d0 = 0, d1 = 0, d2 = 0;
+                    Common::ProcessMemory(d0, w);
+                    {
+                        Buffer probe{instance, scheduler, MemoryUsage::DeviceLocal, 0,
+                                     vk::BufferUsageFlagBits::eTransferDst, 2_GB};
+                        scheduler.EndRendering();
+                        const auto cmdbuf = scheduler.AcquireCommandBuffer().Handle();
+                        cmdbuf.fillBuffer(probe.Handle(), 0, VK_WHOLE_SIZE, 0x01010101);
+                        scheduler.Finish();
+                        Common::ProcessMemory(d1, w);
+                    }
+                    Common::ProcessMemory(d2, w);
+                    LOG_INFO(Render_Vulkan,
+                             "MemProbe: private before {} MB, with a filled 2 GB video-memory buffer "
+                             "{} MB, after freeing it {} MB",
+                             d0 >> 20, d1 >> 20, d2 >> 20);
                 }
                 const auto cc = Common::WalkCommitted();
                 std::string top;
