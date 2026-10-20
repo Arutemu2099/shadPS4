@@ -27,12 +27,15 @@ bool Enabled() {
     return on;
 }
 
-/// Degrees of aim per second at a full push of the right stick (SHADPS4_PAD_SENSOR_AIM_DEG).
+/// Degrees of aim per second at a full push of the right stick (SHADPS4_PAD_SENSOR_AIM_DEG,
+/// default 35). The spray cursor spans 40 degrees of pad yaw and 28.6 of pitch (input study 10-14
+/// sec. 2, measured: cursor = yaw_rel / 0.35 rad, pitch_rel / 0.25 rad), so 35 crosses the screen
+/// in ~1.1 s. Past the edge the game drags its reference along: the cursor never lags behind.
 float AimRadPerSecond() {
     static const float rad = [] {
         const char* v = std::getenv("SHADPS4_PAD_SENSOR_AIM_DEG");
-        const float deg = v ? static_cast<float>(std::atof(v)) : 90.0f;
-        return (deg > 0.0f ? deg : 90.0f) * 3.14159265f / 180.0f;
+        const float deg = v ? static_cast<float>(std::atof(v)) : 35.0f;
+        return (deg > 0.0f ? deg : 35.0f) * 3.14159265f / 180.0f;
     }();
     return rad;
 }
@@ -50,7 +53,16 @@ bool g_l3{}, g_r3{};
 /// one's press already reached the game; its release passes too, so no binding is left held.
 int g_chord_button{-1};
 u64 g_a_down_ms{};
-SDL_Gamepad* g_mode_pad{}; ///< the pad the mode was entered with (another pad = the mode ends)
+bool g_a_swallowed{}; ///< A's press was kept from the game, so its release is too (review 10-20)
+/// The pad the mode was entered with, by SDL's instance ID (never reused, unlike a freed
+/// SDL_Gamepad pointer - review 10-20): another pad on controller 0 ends the mode.
+SDL_JoystickID g_mode_pad{};
+
+SDL_JoystickID PadId(GameController* controller0) {
+    return controller0 != nullptr && controller0->m_sdl_gamepad != nullptr
+               ? SDL_GetGamepadID(controller0->m_sdl_gamepad)
+               : 0;
+}
 
 // Timer thread only.
 bool g_finger_down{};
@@ -79,7 +91,7 @@ void SetMode(bool on, GameController* controller0) {
         if (!has_gyro) {
             controller0->SetPadMotion(true); // a fresh, level pose in the middle
         }
-        g_mode_pad = pad;
+        g_mode_pad = SDL_GetGamepadID(pad);
         g_on.store(true, std::memory_order_release);
         std::string text = "Controller sensor mode:";
         if (!has_gyro) {
@@ -95,11 +107,14 @@ void SetMode(bool on, GameController* controller0) {
                  has_touch ? "the pad's own" : "from the left stick");
     } else {
         g_on.store(false, std::memory_order_release);
-        g_mode_pad = nullptr;
+        g_mode_pad = 0;
+        g_a_swallowed = false;
         if (g_emulate_gyro.exchange(false, std::memory_order_relaxed)) {
             g_synth_pad_tilt.store(false, std::memory_order_relaxed);
             g_synth_rattle_until.store(0, std::memory_order_relaxed);
-            controller0->SetPadMotion(false); // tilt and aim reset
+            if (controller0 != nullptr) {
+                controller0->SetPadMotion(false); // tilt and aim reset
+            }
         }
         g_emulate_touch.store(false, std::memory_order_relaxed); // Tick lifts the finger
         Overlay::ShowNotice("Controller sensor mode off");
@@ -119,16 +134,19 @@ float AimRate(float v) {
 
 } // namespace
 
+void PadsChanged(GameController* controller0) {
+    if (Enabled() && g_on.load(std::memory_order_acquire) && PadId(controller0) != g_mode_pad) {
+        SetMode(false, controller0);
+    }
+}
+
 bool FilterEvent(SDL_Event& event, GameController* controller0) {
     if (!Enabled()) {
         return false;
     }
     // Another pad took controller 0's place (an Xbox pad swapped for a DualSense): the mode ends,
     // so the new pad's own sensors and buttons work again.
-    if (g_on.load(std::memory_order_acquire) &&
-        (controller0 == nullptr || controller0->m_sdl_gamepad != g_mode_pad)) {
-        SetMode(false, controller0);
-    }
+    PadsChanged(controller0);
     switch (event.type) {
     case SDL_EVENT_GAMEPAD_AXIS_MOTION: {
         if (!g_on.load(std::memory_order_acquire) || !IsController0(event.gaxis.which, controller0)) {
@@ -184,17 +202,22 @@ bool FilterEvent(SDL_Event& event, GameController* controller0) {
             }
             return false;
         }
-        if (button == SDL_GAMEPAD_BUTTON_SOUTH && g_on.load(std::memory_order_acquire) &&
+        if (button == SDL_GAMEPAD_BUTTON_SOUTH && !down && g_a_swallowed) {
+            g_a_swallowed = false;
+            g_synth_pad_tilt.store(false, std::memory_order_relaxed);
+            if (SDL_GetTicks() - g_a_down_ms < 250) {
+                g_synth_rattle_until.store(SDL_GetTicks() + 600, std::memory_order_relaxed);
+            }
+            return true;
+        }
+        if (button == SDL_GAMEPAD_BUTTON_SOUTH && down && g_on.load(std::memory_order_acquire) &&
             g_emulate_gyro.load(std::memory_order_relaxed)) {
             // Keyboard Z's rule (sdl_window): hold = the pad on its side; released within 250 ms
             // = a 600 ms rattle burst.
-            g_synth_pad_tilt.store(down, std::memory_order_relaxed);
-            const u64 now = SDL_GetTicks();
-            if (down) {
-                g_a_down_ms = now;
-            } else if (now - g_a_down_ms < 250) {
-                g_synth_rattle_until.store(now + 600, std::memory_order_relaxed);
-            }
+            // A press that reached the game before the mode began keeps its release for the game.
+            g_synth_pad_tilt.store(true, std::memory_order_relaxed);
+            g_a_down_ms = SDL_GetTicks();
+            g_a_swallowed = true;
             return true;
         }
         return false;

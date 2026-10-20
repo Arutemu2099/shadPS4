@@ -30,6 +30,10 @@ namespace Input::PadSensorMode {
 /// A stick the mode uses is passed on centred, so the game's stick stops instead of sticking.
 bool FilterEvent(SDL_Event& event, GameController* controller0);
 
+/// After a pad was added or removed (event thread): the mode ends when controller 0's pad is not
+/// the one it began with (unplugged, or swapped for a DualSense).
+void PadsChanged(GameController* controller0);
+
 /// 4 ms SDL timer (WindowSDL::InitTimers): stick aim into the pose, the stick finger.
 Uint32 Tick(void* controller0, Uint32 id, Uint32 interval);
 

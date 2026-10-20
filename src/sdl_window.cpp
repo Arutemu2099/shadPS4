@@ -446,6 +446,7 @@ void WindowSDL::WaitEvent() {
     case SDL_EVENT_GAMEPAD_ADDED:
     case SDL_EVENT_GAMEPAD_REMOVED:
         controllers.TryOpenSDLControllers();
+        Input::PadSensorMode::PadsChanged(controllers[0]);
         break;
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
     case SDL_EVENT_GAMEPAD_BUTTON_UP:
