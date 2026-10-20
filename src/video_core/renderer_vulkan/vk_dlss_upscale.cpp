@@ -124,7 +124,16 @@ void Upscaler::SetOutputSize(u32 width, u32 height) {
     // resolution patch made it; learned from the resolve, vk_dlss.h).
     const u32 game_w = g_game_width.load(std::memory_order_relaxed);
     const u32 game_h = g_game_height.load(std::memory_order_relaxed);
-    output_size = force ? vk::Extent2D{game_w, game_h} : vk::Extent2D{out_w, out_h};
+    // At most 2x the game's size (DLSS Performance's floor; s1452: Ultra Performance takes only
+    // one exact size, 853x478 for 2560x1435, not SHADPS4_RENDER_HEIGHT=480's 856x480): the post
+    // pass scales the rest to the window, as it scales the 1.5x output down.
+    double fit = 1.0;
+    if (game_w > 0 && game_h > 0 && (out_w > 2 * game_w || out_h > 2 * game_h)) {
+        fit = std::min(2.0 * game_w / out_w, 2.0 * game_h / out_h);
+    }
+    const u32 fit_w = std::max<u32>(game_w, static_cast<u32>(out_w * fit));
+    const u32 fit_h = std::max<u32>(game_h, static_cast<u32>(out_h * fit));
+    output_size = force ? vk::Extent2D{game_w, game_h} : vk::Extent2D{fit_w, fit_h};
     // DLSS needs an output larger than its input; smaller windows keep DLAA in place.
     const bool on = (force || (width > game_w && height > game_h)) && g_ready.load() &&
                     instance.IsDynamicColorWriteMaskSupported();
