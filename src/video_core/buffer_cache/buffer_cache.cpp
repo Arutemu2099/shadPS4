@@ -8642,6 +8642,28 @@ void BufferCache::RunGarbageCollector() {
                 const auto img = texture_cache.MemoryCensus();
                 u64 priv = 0, ws = 0;
                 Common::ProcessMemory(priv, ws);
+                // SHADPS4_MEM_PROBE=1 (once): does freed host-visible upload memory return to
+                // Windows? A 2 GB Upload buffer as UploadCopies' large branch makes, filled, freed.
+                static bool probed = false;
+                if (const char* pv = std::getenv("SHADPS4_MEM_PROBE"); pv && pv[0] == '1' &&
+                                                                        !probed) {
+                    probed = true;
+                    u64 p0 = 0, p1 = 0, p2 = 0, w = 0;
+                    Common::ProcessMemory(p0, w);
+                    {
+                        Buffer probe{instance, scheduler, MemoryUsage::Upload, 0,
+                                     vk::BufferUsageFlagBits::eTransferSrc, 2_GB};
+                        if (!probe.mapped_data.empty()) {
+                            std::memset(probe.mapped_data.data(), 1, probe.mapped_data.size());
+                        }
+                        Common::ProcessMemory(p1, w);
+                    }
+                    Common::ProcessMemory(p2, w);
+                    LOG_INFO(Render_Vulkan,
+                             "MemProbe: private before {} MB, with a filled 2 GB upload buffer {} "
+                             "MB, after freeing it {} MB",
+                             p0 >> 20, p1 >> 20, p2 >> 20);
+                }
                 const auto cc = Common::WalkCommitted();
                 std::string top;
                 for (int i = 0; i < 8 && cc.top_bytes[i] != 0; ++i) {
