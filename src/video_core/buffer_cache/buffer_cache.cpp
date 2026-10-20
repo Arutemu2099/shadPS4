@@ -656,7 +656,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       // eShaderDeviceAddress: SHADPS4_NATIVE_PT reads a page-table miss from the table itself.
       bda_pagetable_buffer{instance, scheduler, MemoryUsage::DeviceLocal,
                            0,        AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress,
-                           BDA_PAGETABLE_SIZE} {
+                           BdaPageTableSize()} {
     g_discard_cache = this; // SHADPS4_PARTICLE_ARENA_DISCARD hook
     g_lane_on = scheduler.HasLane();
     g_lane_counters = &scheduler.lane_c;
@@ -7564,8 +7564,20 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
             vk::DeviceAddress addr = buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS);
             bda_addrs.push_back(addr);
         }
-        WriteDataBuffer(bda_pagetable_buffer, page_begin * sizeof(vk::DeviceAddress),
-                        bda_addrs.data(), bda_addrs.size() * sizeof(vk::DeviceAddress));
+        // SHADPS4_PT_BITS: entries above the table are not written (that range reads as a miss).
+        const u64 table_pages = BdaNumPages();
+        if (page_begin < table_pages) {
+            const u64 n = std::min<u64>(bda_addrs.size(), table_pages - page_begin);
+            WriteDataBuffer(bda_pagetable_buffer, page_begin * sizeof(vk::DeviceAddress),
+                            bda_addrs.data(), n * sizeof(vk::DeviceAddress));
+        } else {
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true)) {
+                LOG_WARNING(Render_Vulkan, "GPU page table: a buffer at {:#x} is above the table "
+                                           "(SHADPS4_PT_BITS) - GPU pointer reads there see a miss",
+                            device_addr_begin);
+            }
+        }
         if (g_buffer_ranges_lock) {
             std::unique_lock lk{buffer_ranges_mutex};
             buffer_ranges.Add(buffer.CpuAddr(), buffer.SizeBytes(), buffer_id);
@@ -7575,8 +7587,13 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
     } else {
         total_used_memory -= Common::AlignUp(size, CACHING_PAGESIZE);
         lru_cache.Free(buffer.LRUId());
-        const u64 offset = bda_pagetable_buffer.Offset(page_begin * sizeof(vk::DeviceAddress));
-        bda_pagetable_buffer.Fill(offset, size_pages * sizeof(vk::DeviceAddress), 0);
+        if (const u64 table_pages = BdaNumPages(); page_begin < table_pages) {
+            const u64 offset =
+                bda_pagetable_buffer.Offset(page_begin * sizeof(vk::DeviceAddress));
+            bda_pagetable_buffer.Fill(
+                offset, std::min<u64>(size_pages, table_pages - page_begin) * sizeof(vk::DeviceAddress),
+                0);
+        }
         if (g_buffer_ranges_lock) {
             std::unique_lock lk{buffer_ranges_mutex};
             buffer_ranges.Subtract(buffer.CpuAddr(), buffer.SizeBytes());

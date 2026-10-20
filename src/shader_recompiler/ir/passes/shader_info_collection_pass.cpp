@@ -213,7 +213,7 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
     if (info.uses_dma) {
         info.buffers.push_back({
             .used_types = IR::Type::U64,
-            .inline_cbuf = AmdGpu::Buffer::Placeholder(VideoCore::BufferCache::BDA_PAGETABLE_SIZE),
+            .inline_cbuf = AmdGpu::Buffer::Placeholder(VideoCore::BufferCache::BdaPageTableSize()),
             .buffer_type = BufferType::BdaPagetable,
             .is_written = true,
         });
