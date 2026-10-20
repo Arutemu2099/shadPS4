@@ -1,0 +1,94 @@
+# SPDX-FileCopyrightText: 2026 axylpup
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+name: Bug report - crash, freeze, graphics or speed
+description: Something goes wrong in inFAMOUS Second Son with this build.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! **Please attach the logs** - without them most crashes cannot be found.
+        This page is for the inFAMOUS Second Son build only. Problems with other games or the official
+        shadPS4 builds belong on [shadPS4's own page](https://github.com/shadps4-emu/shadPS4).
+  - type: input
+    id: build
+    attributes:
+      label: Build version
+      description: The version in the zip's name, for example inFAMOUS-SecondSon-shadPS4-v1.0.2-win64.zip
+      placeholder: v1.0.2
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you saw, and what you were doing (first start, loading a save, a mission, a menu...).
+    validations:
+      required: true
+  - type: textarea
+    id: repeat
+    attributes:
+      label: Does it happen again?
+      description: Every time, sometimes, or once? Anything that makes it go away?
+  - type: dropdown
+    id: region
+    attributes:
+      label: Game version
+      options:
+        - EU (CUSA00004)
+        - US (CUSA00223)
+        - Other / not sure
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: Graphics card, its video memory and driver version
+      placeholder: RTX 3060 Ti, 8 GB, driver 581.57
+    validations:
+      required: true
+  - type: input
+    id: cpu
+    attributes:
+      label: CPU
+      placeholder: Ryzen 5 5600
+    validations:
+      required: true
+  - type: input
+    id: ram
+    attributes:
+      label: RAM (GB) and Windows version
+      placeholder: 16 GB, Windows 11
+  - type: dropdown
+    id: dlss
+    attributes:
+      label: DLSS files installed?
+      options:
+        - "No"
+        - "Yes"
+        - Not sure
+  - type: textarea
+    id: flags
+    attributes:
+      label: Your own settings (optional)
+      description: The lines in shadps4-flags-user.txt, if you changed it.
+      render: text
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Drag these files into this box (they are in the build's folder):
+        - user\log\shad_log.txt
+        - user\log\fatal.txt (only there after a crash)
+    validations:
+      required: true
+  - type: checkboxes
+    id: dump
+    attributes:
+      label: Game files
+      options:
+        - label: I play my own copy of the game, and I am not sharing any game files here.
+          required: true
