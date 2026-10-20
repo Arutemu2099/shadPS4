@@ -552,6 +552,19 @@ CommitCensus WalkCommitted() {
         a = base + size;
     }
     flush();
+    // Heaps: the default process heap carries the CRT's malloc / new (ours); a driver or other
+    // module heap shows up among the others. HeapSummary needs Windows 10.
+    HANDLE heaps[256];
+    const DWORD n = GetProcessHeaps(256, heaps);
+    const HANDLE def = GetProcessHeap();
+    for (DWORD i = 0; i < n && i < 256; ++i) {
+        HEAP_SUMMARY hs{};
+        hs.cb = sizeof(hs);
+        if (HeapSummary(heaps[i], 0, &hs)) {
+            (heaps[i] == def ? c.default_heap : c.other_heaps) += hs.cbCommitted;
+        }
+    }
+    c.heaps = n;
     return c;
 }
 

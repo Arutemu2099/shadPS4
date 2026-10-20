@@ -8672,9 +8672,11 @@ void BufferCache::RunGarbageCollector() {
                 LOG_INFO(Render_Vulkan,
                          "MemCensus: committed - private in the guest range {} MB, private "
                          "outside {} MB in {} allocations (largest:{}), mapped in the guest range "
-                         "{} MB, mapped outside {} MB, modules {} MB",
+                         "{} MB, mapped outside {} MB, modules {} MB | heaps: process heap {} MB, "
+                         "{} other heaps {} MB",
                          cc.private_guest >> 20, cc.private_host >> 20, cc.host_blocks, top,
-                         cc.mapped_guest >> 20, cc.mapped_host >> 20, cc.image >> 20);
+                         cc.mapped_guest >> 20, cc.mapped_host >> 20, cc.image >> 20,
+                         cc.default_heap >> 20, cc.heaps - 1, cc.other_heaps >> 20);
                 LOG_INFO(Render_Vulkan,
                          "MemCensus: buffers {} MB in {} (largest {} MB) | render targets / depth {} "
                          "MB in {} | textures {} MB in {} (largest image {} MB) | process RAM "

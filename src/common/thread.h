@@ -63,6 +63,8 @@ struct CommitCensus {
     u64 private_guest{}, private_host{}, mapped_guest{}, mapped_host{}, image{};
     u32 host_blocks{};             ///< private allocations outside the guest range
     u64 top_base[8]{}, top_bytes[8]{}; ///< the largest of them (committed bytes per allocation)
+    u64 default_heap{}, other_heaps{}; ///< committed bytes: the process heap (malloc / new), others
+    u32 heaps{};
 };
 CommitCensus WalkCommitted();
 /// SHADPS4_GUEST_PCORE=<mask> (2026-10-15, notes/gamemain-saturation-2026-10-15.md): bit 0 the game's
