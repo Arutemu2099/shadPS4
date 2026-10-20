@@ -400,7 +400,8 @@ static void ApplyAspectRatio() {
         aspect = double(g_screen_w) / double(g_screen_h);
     }
     constexpr double base = 16.0 / 9.0;
-    if (aspect <= 0.0 || std::abs(aspect - base) < 0.01) {
+    // 3%: a "1280x720" window reports a client area like 1279x724 (measured, s1427).
+    if (aspect <= 0.0 || std::abs(aspect - base) < 0.03 * base) {
         return; // 16:9 or unknown: nothing to do
     }
     const bool narrow = aspect < base;

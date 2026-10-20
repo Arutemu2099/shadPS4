@@ -70,11 +70,14 @@ void StartUpdateNotice() {
             return;
         }
         const std::string latest = json["tag_name"].get<std::string>();
-        if (ParseTag(latest) <= ParseTag(ReleaseTag)) {
-            LOG_INFO(Common, "UpdateCheck: {} is the latest release ({})", ReleaseTag, latest);
+        // SHADPS4_UPDATE_TEST_TAG=second-son-v1.0.0 (test): this build pretends to be that release.
+        const char* test_tag = std::getenv("SHADPS4_UPDATE_TEST_TAG");
+        const std::string_view mine = test_tag ? test_tag : ReleaseTag;
+        if (ParseTag(latest) <= ParseTag(mine)) {
+            LOG_INFO(Common, "UpdateCheck: {} is the latest release ({})", mine, latest);
             return;
         }
-        LOG_INFO(Common, "UpdateCheck: {} is out (this build: {})", latest, ReleaseTag);
+        LOG_INFO(Common, "UpdateCheck: {} is out (this build: {})", latest, mine);
         // After the boot screens; a notice is drawn only once the overlay exists.
         std::this_thread::sleep_for(std::chrono::seconds(45));
         const std::string_view name = std::string_view(latest).substr(latest.rfind('v'));
