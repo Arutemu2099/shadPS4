@@ -7,8 +7,8 @@
 //     memory (0x200000000 - 0x1000000000) for 4x4 float matrices whose [0] and [5] are positive with
 //     [5] / [0] within 1% of 16:9 and [1..4] zero (a perspective projection; [5] / [0] = aspect),
 //     and logs up to 32 of them.
-//  2. Puts a hardware write watch (DR0, 4 bytes) on the first hit's [0] in every thread of the
-//     process for SHADPS4_FIND_PROJ_WATCH_S seconds (default 5) and logs the distinct code
+//  2. Puts a hardware write watch (DR0, 4 bytes) on each hit's [0] in turn, in every thread of the
+//     process, for SHADPS4_FIND_PROJ_WATCH_S seconds each (default 2), and logs the distinct code
 //     addresses that wrote it (the instruction after the store).
 // Not for players: it suspends every thread briefly to set the debug registers.
 
@@ -125,7 +125,7 @@ void StartProjectionFinder() {
         return v ? std::atoi(v) : def;
     };
     const int at_s = env_int("SHADPS4_FIND_PROJ_AT_S", 70);
-    const int watch_s = env_int("SHADPS4_FIND_PROJ_WATCH_S", 5);
+    const int watch_s = env_int("SHADPS4_FIND_PROJ_WATCH_S", 2);
     std::thread([at_s, watch_s] {
         SetCurrentThreadName("FindProj");
         std::this_thread::sleep_for(std::chrono::seconds(at_s));
@@ -180,9 +180,6 @@ void StartProjectionFinder() {
                 if (const u64 rip = slot.load(std::memory_order_relaxed)) {
                     LOG_INFO(Common, "FindProj:   writer (next instruction) {:#x}", rip);
                 }
-            }
-            if (g_rip_hits.load(std::memory_order_relaxed) > 0) {
-                break; // the first written candidate is enough for one run
             }
         }
     }).detach();
