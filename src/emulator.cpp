@@ -632,6 +632,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
                                                    window_title);
 
     g_window = window.get();
+    MemoryPatcher::SetScreenSize(window->GetWidth(), window->GetHeight()); // SHADPS4_ASPECT
     Common::StartProjectionFinder(); // SHADPS4_FIND_PROJ=1 diagnostic (aspect ratio work)
     Common::StartUpdateNotice(); // 1.1: GitHub latest-release check (SHADPS4_UPDATE_CHECK=0 off)
 

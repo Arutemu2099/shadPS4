@@ -41,6 +41,10 @@ struct patchInfo {
 std::string convertValueToHex(const std::string type, const std::string valueStr);
 
 void OnGameLoaded();
+
+/// emulator.cpp, right after the window exists: the screen / window size in pixels, for the
+/// dynamic aspect ratio (SHADPS4_ASPECT, ApplyAspectRatio).
+void SetScreenSize(int width, int height);
 void AddPatchToQueue(const patchInfo& patchToAdd);
 
 void PatchMemory(const patchInfo& patch);

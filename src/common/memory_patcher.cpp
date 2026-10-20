@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <codecvt>
 #include <fstream>
 #include <sstream>
@@ -362,6 +365,84 @@ static void ApplyParticleLightOneSubmit() {
 // cut that run into ~5 jobs recorded in parallel. SHADPS4_HOUSE_CHUNK=N also sets the 1000-item chunk
 // (FUN_800197050's imm32). Refused unless every original byte matches. The game's context pool has
 // no bounds check (at most 254 per frame): the census in gnmdriver logs the count per frame.
+static int g_screen_w = 0, g_screen_h = 0;
+
+void SetScreenSize(int width, int height) {
+    g_screen_w = width;
+    g_screen_h = height;
+}
+
+// SHADPS4_ASPECT (1.1, user 2026-10-20; EXPERIMENTS "v1.1 C"): the game fills the screen's shape.
+// The renderer's size setup FUN_8001eff00 stores the render size (+0xc / +0x10), the output size
+// ([0] / [4]) and the 2D screen space (globals 0x801d0ccc0 / ccc4: HUD layout, and the camera's
+// aspect = ccc0 / ccc4 at camera creation, 0x80058030c); the mode toggle FUN_8001f0be0 re-applies
+// render / output from esi / edi. All eight 1920 / 1080 immediates get the target size: the
+// buffers, the video-out buffers, the HUD (anchored to the edges) and the camera follow (Hor+: the
+// vertical view stays, wider screens see more at the sides). Measured on 21:9 (s1426): round
+// shapes, more picture left and right, HUD at the new edges, 0 Critical.
+//   auto (default): only screens wider than 16:9 (narrow ones keep 16:9 with bars until the camera
+//        can add picture above / below instead of cutting the sides); crop: narrow screens too
+//        (Hor+: the sides are cut); W:H (e.g. 21:9, 32:9, 4:3): that shape; off.
+// Decided once at boot (the size setup runs once): a new window shape needs a restart. DLSS steps
+// aside at a non-1080p frame (vk_rasterizer DlssResolve).
+static void ApplyAspectRatio() {
+    const char* env = std::getenv("SHADPS4_ASPECT");
+    const std::string mode = env ? env : "auto";
+    if (mode == "off" || mode == "0") {
+        return;
+    }
+    double aspect = 0.0;
+    if (const auto colon = mode.find(':'); colon != std::string::npos) {
+        const double w = std::atof(mode.substr(0, colon).c_str());
+        const double h = std::atof(mode.substr(colon + 1).c_str());
+        aspect = h > 0.0 ? w / h : 0.0;
+    } else if (g_screen_w > 0 && g_screen_h > 0) {
+        aspect = double(g_screen_w) / double(g_screen_h);
+    }
+    constexpr double base = 16.0 / 9.0;
+    if (aspect <= 0.0 || std::abs(aspect - base) < 0.01) {
+        return; // 16:9 or unknown: nothing to do
+    }
+    const bool narrow = aspect < base;
+    if (narrow && mode == "auto") {
+        LOG_INFO(Loader, "SHADPS4_ASPECT: the screen ({}x{}) is narrower than 16:9; the game keeps "
+                         "16:9 with bars (SHADPS4_ASPECT=crop fills it by cutting the sides)",
+                 g_screen_w, g_screen_h);
+        return;
+    }
+    // Multiples of 8; wide: height 1080, narrow: width 1920 (at most 3840 x 1920).
+    const auto round8 = [](double v) { return u32(std::lround(v / 8.0) * 8); };
+    const u32 w = narrow ? 1920u : std::min(3840u, round8(1080.0 * aspect));
+    const u32 h = narrow ? std::min(1920u, round8(1920.0 / aspect)) : 1080u;
+    struct Imm {
+        u64 offset;
+        u32 original;
+        bool width;
+    };
+    // Eboot 01.07 offsets (byte-compared before any write; FUN_8001eff00, FUN_8001f0be0).
+    static constexpr Imm imms[] = {
+        {0x1eff4a, 0x780, true},  {0x1eff51, 0x438, false}, // render size
+        {0x1eff57, 0x780, true},  {0x1eff5e, 0x438, false}, // output size
+        {0x1f0403, 0x780, true},  {0x1f03fb, 0x438, false}, // 2D screen space = camera aspect
+        {0x1f0d3e, 0x780, true},  {0x1f0d4d, 0x438, false}, // mode toggle (normal mode)
+    };
+    for (const auto& imm : imms) {
+        u32 live;
+        std::memcpy(&live, reinterpret_cast<const void*>(g_eboot_address + imm.offset), 4);
+        if (live != imm.original) {
+            LOG_ERROR(Loader, "SHADPS4_ASPECT: refused, eboot+{:#x} holds {:#x} (not {:#x})",
+                      imm.offset, live, imm.original);
+            return;
+        }
+    }
+    for (const auto& imm : imms) {
+        const u32 value = imm.width ? w : h;
+        std::memcpy(reinterpret_cast<void*>(g_eboot_address + imm.offset), &value, 4);
+    }
+    LOG_INFO(Loader, "SHADPS4_ASPECT: the game renders {}x{} (aspect {:.3f}, screen {}x{}, {})", w,
+             h, aspect, g_screen_w, g_screen_h, mode);
+}
+
 static void ApplyHouseSplit() {
     const char* env = std::getenv("SHADPS4_HOUSE_SPLIT");
     const char* chunk_env = std::getenv("SHADPS4_HOUSE_CHUNK");
@@ -423,6 +504,7 @@ void OnGameLoaded() {
     ApplyParticleLateRead();
     ApplyParticleLightOneSubmit();
     ApplyHouseSplit();
+    ApplyAspectRatio();
     std::filesystem::path patch_dir = Common::FS::GetUserPath(Common::FS::PathType::PatchesDir);
     if (!patch_file.empty()) {
 
