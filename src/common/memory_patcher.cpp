@@ -446,17 +446,27 @@ static void ApplyAspectRatio() {
     // (3840 x 1080) and 1:1 (1920 x 1920).
     const u32 w = narrow ? w0 : std::min(round8(h0 * 32.0 / 9.0), round8(h0 * aspect));
     const u32 h = narrow ? std::min(w0, round8(w0 / aspect)) : h0;
+    // The 2D screen space (HUD layout; its ratio = the camera aspect) stays at the 1080-line scale
+    // when the render height differs (s1440 rh720: at 1280x720 screen space the minimap drew ~1.2x
+    // too large and the skyline strip above it broke - some HUD parts are sized in 1080p pixels).
+    // SHADPS4_RENDER_HUD=native keeps the screen space at the render size (that look).
+    const char* hud_env = std::getenv("SHADPS4_RENDER_HUD");
+    const bool hud_native = hud_env && std::string{hud_env} == "native";
+    const double hud_scale = hud_native ? 1.0 : 1080.0 / h0;
+    const u32 sw = u32(std::lround(w * hud_scale));
+    const u32 sh = u32(std::lround(h * hud_scale));
     struct Imm {
         u64 offset;
         u32 original;
         bool width;
+        bool screen_space;
     };
     // Eboot 01.07 offsets (byte-compared before any write; FUN_8001eff00, FUN_8001f0be0).
     static constexpr Imm imms[] = {
-        {0x1eff4a, 0x780, true},  {0x1eff51, 0x438, false}, // render size
-        {0x1eff57, 0x780, true},  {0x1eff5e, 0x438, false}, // output size
-        {0x1f0403, 0x780, true},  {0x1f03fb, 0x438, false}, // 2D screen space = camera aspect
-        {0x1f0d3e, 0x780, true},  {0x1f0d4d, 0x438, false}, // mode toggle (normal mode)
+        {0x1eff4a, 0x780, true, false},  {0x1eff51, 0x438, false, false}, // render size
+        {0x1eff57, 0x780, true, false},  {0x1eff5e, 0x438, false, false}, // output size
+        {0x1f0403, 0x780, true, true},   {0x1f03fb, 0x438, false, true},  // 2D screen space
+        {0x1f0d3e, 0x780, true, false},  {0x1f0d4d, 0x438, false, false}, // mode toggle
     };
     for (const auto& imm : imms) {
         u32 live;
@@ -468,7 +478,7 @@ static void ApplyAspectRatio() {
         }
     }
     for (const auto& imm : imms) {
-        const u32 value = imm.width ? w : h;
+        const u32 value = imm.screen_space ? (imm.width ? sw : sh) : (imm.width ? w : h);
         std::memcpy(reinterpret_cast<void*>(g_eboot_address + imm.offset), &value, 4);
     }
     g_render_w = w;
@@ -480,7 +490,8 @@ static void ApplyAspectRatio() {
         std::memcpy(reinterpret_cast<void*>(g_eboot_address + 0x581d10 + 4), &disp, 4);
     }
     LOG_INFO(Loader, "SHADPS4_ASPECT: the game renders {}x{} (aspect {:.3f}, screen {}x{}, {}, "
-             "render height {}{})", w, h, aspect, g_screen_w, g_screen_h, mode, h0,
+             "render height {}, HUD space {}x{}{})", w, h, aspect, g_screen_w, g_screen_h, mode, h0,
+             sw, sh,
              add_vertical ? ", 16:9 width kept, more picture above / below" : "");
 }
 
@@ -540,6 +551,86 @@ static void ApplyHudWidth() {
     g_hud_ratio = ratio;
     LOG_INFO(Loader, "SHADPS4_HUD={}: HUD {} px wide of {} (safe-area ratio {:.3f}, sides only)", v,
              u32(width + 0.5), g_render_w, ratio);
+}
+
+// SHADPS4_PERF_MODE (1.1 prototype, user 2026-10-20: "cut back on particles, drop the render or
+// LOD distance" with the game's own assets; study notes/study-performance-mode-2026-10-20.md).
+// The game ships a 21-row quality ladder at 0x800da08c0 (20 bytes per row: LOD scale for its 7 LOD
+// distance bands, sun-shadow cascade offset, a distance with no known reader, a screen-size cull,
+// random thinning) that it climbs only when a frame overflows its GPU command memory; level 0 =
+// row 0 in normal play. A preset is written INTO row 0, so the game's own path runs it (the
+// harsher rows stay for overflow). Plus: the engine's low-res particle pass forced (it steps down
+// only on a GPU timer that means nothing under emulation), the streamer's high-res texture slots
+// (4 nearest blocks) and, in "office", the ambient pedestrian ratio.
+//   low:    LOD 0.7, one sun-shadow cascade less (= the game's row 3), particles at half
+//           resolution, 2 high-res texture blocks.
+//   office: LOD 0.5, one cascade less (row 5's values, its unknown distance column kept at row
+//           0's), particles at quarter resolution, no high-res texture blocks, half the pedestrians.
+// Decided at boot; every site byte-compared first (eboot 01.07), all or nothing.
+static void ApplyPerfMode() {
+    const char* env = std::getenv("SHADPS4_PERF_MODE");
+    const std::string mode = env ? env : "off";
+    const bool low = mode == "low" || mode == "1";
+    const bool office = mode == "office" || mode == "2";
+    if (!low && !office) {
+        return;
+    }
+    struct Site {
+        u64 offset;
+        std::vector<u8> original;
+        std::vector<u8> value;
+        const char* what;
+    };
+    const std::vector<u8> row0 = {0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x24,
+                                  0x74, 0x49, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    std::vector<u8> row = row0;
+    const float lod = low ? 0.7f : 0.5f;
+    std::memcpy(row.data(), &lod, 4);
+    const s32 cascades = -1;
+    std::memcpy(row.data() + 4, &cascades, 4);
+    const u8 particle_level = low ? 1 : 2; // resolution 1.0 / 0.5 / 0.25 (table 0x800aaa918)
+    const u8 hires_slots = low ? 2 : 0;
+    std::vector<Site> sites = {
+        {0xda08c0, row0, row, "quality ladder row 0"},
+        // FUN_8003ed6a0: je over the "set level" store -> 2 nops, and the stored level.
+        {0x3ed6b0, {0x74, 0x0f}, {0x90, 0x90}, "particle level: always set"},
+        {0x3ed6b8, {0x00, 0x00, 0x00, 0x00}, {particle_level, 0x00, 0x00, 0x00}, "particle level"},
+        // FUN_8000fd890: mov r12d, 4 / cmp eax, 4 (the 4 nearest blocks get .hires.xpps).
+        {0xfe9a2, {0x04}, {hires_slots}, "high-res texture slots (mov)"},
+        {0xfe9b2, {0x04}, {hires_slots}, "high-res texture slots (cmp)"},
+    };
+    if (office) {
+        // Pedestrian count per class = level count x ratio[world state] (0x40ee42): 1.0 -> 0.5.
+        sites.push_back({0x40ca01, {0x00, 0x00, 0x80, 0x3f}, {0x00, 0x00, 0x00, 0x3f},
+                         "pedestrian ratio 0"});
+        sites.push_back({0x40c83f, {0x00, 0x00, 0x80, 0x3f}, {0x00, 0x00, 0x00, 0x3f},
+                         "pedestrian ratio 1"});
+    }
+    for (const auto& s : sites) {
+        if (std::memcmp(reinterpret_cast<const void*>(g_eboot_address + s.offset),
+                        s.original.data(), s.original.size()) != 0) {
+            LOG_ERROR(Loader, "SHADPS4_PERF_MODE: refused, {} at eboot+{:#x} differs (eboot 01.07 "
+                              "only)", s.what, s.offset);
+            return;
+        }
+    }
+    for (const auto& s : sites) {
+        std::memcpy(reinterpret_cast<void*>(g_eboot_address + s.offset), s.value.data(),
+                    s.value.size());
+    }
+    LOG_INFO(Loader, "SHADPS4_PERF_MODE={}: LOD scale {:.1f}, one sun-shadow cascade less, "
+                     "particles at {} resolution, {} high-res texture blocks{}",
+             mode, lod, low ? "half" : "quarter", hires_slots,
+             office ? ", half the pedestrians" : "");
+}
+
+int GameQualityLevel() {
+    if (g_eboot_address == 0) {
+        return -1;
+    }
+    s32 level;
+    std::memcpy(&level, reinterpret_cast<const void*>(g_eboot_address + 0xf39978), 4);
+    return level;
 }
 
 static void ApplyHouseSplit() {
@@ -605,6 +696,7 @@ void OnGameLoaded() {
     ApplyHouseSplit();
     ApplyAspectRatio();
     ApplyHudWidth();
+    ApplyPerfMode();
     std::filesystem::path patch_dir = Common::FS::GetUserPath(Common::FS::PathType::PatchesDir);
     if (!patch_file.empty()) {
 

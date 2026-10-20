@@ -8690,10 +8690,11 @@ void BufferCache::RunGarbageCollector() {
                 LOG_INFO(Render_Vulkan,
                          "MemCensus: buffers {} MB in {} (largest {} MB) | render targets / depth {} "
                          "MB in {} | textures {} MB in {} (largest image {} MB) | process RAM "
-                         "private {} MB, working set {} MB",
+                         "private {} MB, working set {} MB | game quality level {}",
                          buf_bytes >> 20, bufs, buf_largest >> 20, img.targets_bytes >> 20,
                          img.targets, img.textures_bytes >> 20, img.textures,
-                         img.largest_bytes >> 20, priv >> 20, ws >> 20);
+                         img.largest_bytes >> 20, priv >> 20, ws >> 20,
+                         MemoryPatcher::GameQualityLevel());
             }
         }
     }

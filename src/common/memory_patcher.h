@@ -49,6 +49,10 @@ void SetScreenSize(int width, int height);
 /// sceSystemServiceGetDisplaySafeAreaInfo: the safe-area ratio the game gets (1.0 unless
 /// SHADPS4_HUD narrows the HUD; ApplyHudWidth).
 float HudSafeAreaRatio();
+
+/// The game's own quality ladder level (0 = full quality ... 20; SHADPS4_PERF_MODE notes), read
+/// live from the renderer (0x800f39978); -1 before the game is loaded. For the memory census.
+int GameQualityLevel();
 void AddPatchToQueue(const patchInfo& patchToAdd);
 
 void PatchMemory(const patchInfo& patch);

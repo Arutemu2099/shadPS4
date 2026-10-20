@@ -62,6 +62,7 @@ u32 g_options_width = 0;     // ... and the output size
 u32 g_options_height = 0;
 std::chrono::steady_clock::time_point g_last_eval{};
 u64 g_evaluated = 0;
+u64 g_refused_key = 0; ///< input / output sizes no mode takes (asked once)
 u64 g_failed = 0;
 
 // A fixed id for this project (Streamline uses it with engineVersion instead of an NVIDIA id).
@@ -327,6 +328,11 @@ bool Evaluate(vk::CommandBuffer cmdbuf, u64 frame, const EvalImage& color, const
         options.mode = sl::DLSSMode::eDLAA;
         options.outputWidth = output.width;
         options.outputHeight = output.height;
+        const u64 key = (u64(color.width) << 48) | (u64(color.height) << 32) |
+                        (u64(output.width) << 16) | u64(output.height);
+        if (key == g_refused_key) {
+            return false;
+        }
         if (output.width != color.width || output.height != color.height) {
             // SHADPS4_DLSS_UPSCALE: the game's 1920x1080 into the window size - the first mode
             // whose render range holds it (1080p -> 1440p is 0.75: Quality, inferred).
@@ -334,14 +340,16 @@ bool Evaluate(vk::CommandBuffer cmdbuf, u64 frame, const EvalImage& color, const
             constexpr std::array modes{sl::DLSSMode::eMaxQuality, sl::DLSSMode::eUltraQuality,
                                        sl::DLSSMode::eBalanced, sl::DLSSMode::eMaxPerformance,
                                        sl::DLSSMode::eUltraPerformance};
-            options.mode = sl::DLSSMode::eMaxQuality;
+            // A mode the driver refuses is skipped (s1440 rh480: Ultra Quality failed and the old
+            // loop stopped at Quality, whose floor is 1280x718 - DLSS drew garbage from 856x480).
+            // No mode whose range holds the input: no evaluate (the caller shows the game's frame).
+            bool fits = false;
             for (const sl::DLSSMode m : modes) {
                 options.mode = m;
                 sl::DLSSOptimalSettings opt{};
                 if (!g_api.dlss_get_optimal ||
                     g_api.dlss_get_optimal(options, opt) != sl::Result::eOk) {
-                    options.mode = sl::DLSSMode::eMaxQuality;
-                    break;
+                    continue;
                 }
                 LOG_INFO(Render_Vulkan,
                          "DLSS: mode {} for {}x{}: render {}x{} (min {}x{}, max {}x{})",
@@ -350,8 +358,16 @@ bool Evaluate(vk::CommandBuffer cmdbuf, u64 frame, const EvalImage& color, const
                          opt.renderWidthMax, opt.renderHeightMax);
                 if (opt.renderWidthMin <= color.width && color.width <= opt.renderWidthMax &&
                     opt.renderHeightMin <= color.height && color.height <= opt.renderHeightMax) {
+                    fits = true;
                     break;
                 }
+            }
+            if (!fits) {
+                g_refused_key = key;
+                LOG_WARNING(Render_Vulkan, "DLSS: no mode takes {}x{} to {}x{} - not run",
+                            color.width, color.height, output.width, output.height);
+                ++g_failed;
+                return false;
             }
         }
         options.qualityPreset = static_cast<sl::DLSSPreset>(preset);
