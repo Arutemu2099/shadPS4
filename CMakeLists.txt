@@ -1234,6 +1234,8 @@ set(INPUT src/input/controller.cpp
           src/input/input_mouse.h
           src/input/pad_sensor_mode.cpp
           src/input/pad_sensor_mode.h
+          src/input/test_vpad.cpp
+          src/input/test_vpad.h
 )
 
 set(EMULATOR src/emulator.cpp

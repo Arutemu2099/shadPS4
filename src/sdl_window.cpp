@@ -31,6 +31,7 @@
 #include "input/input_handler.h"
 #include "input/input_mouse.h"
 #include "input/pad_sensor_mode.h"
+#include "input/test_vpad.h"
 #include "sdl_window.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
@@ -554,6 +555,7 @@ void WindowSDL::WaitEvent() {
 }
 
 void WindowSDL::InitTimers() {
+    Input::TestVpad::Start(); // SHADPS4_TEST_VPAD only (test_vpad.h)
     for (int i = 0; i < 4; ++i) {
         SDL_AddTimer(4, &PollController, controllers[i]);
     }
