@@ -30,6 +30,7 @@
 #include "input/controller.h"
 #include "input/input_handler.h"
 #include "input/input_mouse.h"
+#include "input/pad_sensor_mode.h"
 #include "sdl_window.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
@@ -556,6 +557,8 @@ void WindowSDL::InitTimers() {
         SDL_AddTimer(4, &PollController, controllers[i]);
     }
     SDL_AddTimer(33, Input::MousePolling, (void*)controllers[0]);
+    // Controller sensor mode (input/pad_sensor_mode.h): stick aim and the stick finger.
+    SDL_AddTimer(4, &Input::PadSensorMode::Tick, (void*)controllers[0]);
     if (Core::MouseAim::Enabled()) {
         // SHADPS4_MOUSE_AIM: the mouse turns the camera from the start (the hotkey still toggles).
         Input::ToggleMouseModeTo(Input::MouseMode::Joystick);
@@ -620,6 +623,13 @@ void WindowSDL::OnKeyboardMouseInput(const SDL_Event* event) {
 }
 
 void WindowSDL::OnGamepadEvent(const SDL_Event* event) {
+    // Controller sensor mode (input/pad_sensor_mode.h): L3 + R3, and on a pad without a gyro /
+    // touchpad the sticks and A while the mode is on, before the bindings see them.
+    SDL_Event filtered = *event;
+    if (Input::PadSensorMode::FilterEvent(filtered, controllers[0])) {
+        return;
+    }
+    event = &filtered;
     bool input_down = event->type == SDL_EVENT_GAMEPAD_AXIS_MOTION ||
                       event->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
     Input::InputEvent input_event = Input::InputBinding::GetInputEventFromSDLEvent(*event);

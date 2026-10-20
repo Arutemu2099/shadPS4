@@ -61,6 +61,8 @@ inline std::atomic<bool> g_synth_rattle{false};     ///< R held
 inline std::atomic<u64> g_synth_rattle_until{0};
 inline std::atomic<bool> g_synth_tilt_btn{false};   ///< mouse forward button held
 inline std::atomic<bool> g_synth_rattle_btn{false}; ///< mouse back button held
+/// Controller sensor mode (input/pad_sensor_mode): A held on a pad without a gyro = tilt.
+inline std::atomic<bool> g_synth_pad_tilt{false};
 
 enum class Axis {
     LeftX = 0,
@@ -146,6 +148,9 @@ public:
     void ResetOrientation();
     /// SHADPS4_SYNTH_MOTION: turns the mouse motion source on / off (F6 Gyro mode).
     void SetSyntheticMotion(bool active);
+    /// Controller sensor mode (input/pad_sensor_mode): the same pose for a pad without a gyro,
+    /// aimed by its right stick. Either source makes the pose synthetic; each toggle recentres it.
+    void SetPadMotion(bool active);
     void SetLightBarRGB(u8 const r, u8 const g, u8 const b);
     void SetLightBarRGB(Colour const c);
     Colour GetLightBarRGB();
@@ -160,12 +165,14 @@ public:
 private:
     /// SHADPS4_SYNTH_MOTION state (m_state_mutex).
     struct SyntheticMotion {
-        bool active{};
+        bool active{}; ///< the mouse source (F6 / SHADPS4_SYNTH_MOTION)
+        bool pad{};    ///< the controller sensor mode's source
         float yaw{}, pitch{}, roll{}, phi{};
         u64 t0{}, last_t{};
         Libraries::Pad::OrbisFQuaternion last_q{0.0f, 0.0f, 0.0f, 1.0f};
     };
     SyntheticMotion m_synth{};
+    void SetSyntheticSourceLocked(bool pad_source, bool active);
     void SyntheticMotionLocked(u64 timestamp);
 
     // m_state_mutex must be held by the caller.

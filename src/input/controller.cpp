@@ -111,7 +111,7 @@ void GameController::Axis(Input::Axis axis, int value, bool smooth) {
 
 void GameController::UpdateGyro(const float gyro[3]) {
     std::lock_guard lock{m_state_mutex};
-    if (m_synth.active) {
+    if (m_synth.active || m_synth.pad) {
         return; // SHADPS4_SYNTH_MOTION: the mouse is the sensor; a real pad's events are ignored
     }
     std::memcpy(gyro_buf, gyro, sizeof(gyro_buf));
@@ -119,7 +119,7 @@ void GameController::UpdateGyro(const float gyro[3]) {
 
 void GameController::UpdateAcceleration(const float acceleration[3]) {
     std::lock_guard lock{m_state_mutex};
-    if (m_synth.active) {
+    if (m_synth.active || m_synth.pad) {
         return;
     }
     std::memcpy(accel_buf, acceleration, sizeof(accel_buf));
@@ -127,21 +127,34 @@ void GameController::UpdateAcceleration(const float acceleration[3]) {
 
 void GameController::SetSyntheticMotion(bool active) {
     std::lock_guard lock{m_state_mutex};
-    if (m_synth.active == active) {
+    SetSyntheticSourceLocked(false, active);
+}
+
+void GameController::SetPadMotion(bool active) {
+    std::lock_guard lock{m_state_mutex};
+    SetSyntheticSourceLocked(true, active);
+}
+
+void GameController::SetSyntheticSourceLocked(bool pad_source, bool active) {
+    if ((pad_source ? m_synth.pad : m_synth.active) == active) {
         return;
     }
-    m_synth = {};
-    m_synth.active = active;
+    const bool mouse = pad_source ? m_synth.active : active;
+    const bool pad = pad_source ? active : m_synth.pad;
+    m_synth = {}; // a fresh, level pose in the middle
+    m_synth.active = mouse;
+    m_synth.pad = pad;
     g_synth_dx.store(0.0f, std::memory_order_relaxed);
     g_synth_dy.store(0.0f, std::memory_order_relaxed);
-    if (!active) {
+    if (!mouse && !pad) {
         m_state.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
         std::fill(gyro_buf, gyro_buf + 3, 0.0f);
         std::fill(accel_buf, accel_buf + 3, 0.0f);
         accel_buf[1] = 9.81f;
     }
     m_last_orientation_update = 0;
-    LOG_INFO(Input, "SynthMotion: mouse motion sensor {}", active ? "ON" : "off");
+    LOG_INFO(Input, "SynthMotion: {} {}", pad_source ? "controller sensor mode" : "mouse motion sensor",
+             active ? "ON" : "off");
     PushStateLocked();
 }
 
@@ -188,6 +201,7 @@ void GameController::SyntheticMotionLocked(u64 timestamp) {
                         g_synth_rattle_btn.load(std::memory_order_relaxed) ||
                         SDL_GetTicks() < g_synth_rattle_until.load(std::memory_order_relaxed);
     const bool tilt = rattle || g_synth_tilt.load(std::memory_order_relaxed) ||
+                      g_synth_pad_tilt.load(std::memory_order_relaxed) ||
                       g_synth_tilt_btn.load(std::memory_order_relaxed);
     // Roll toward 90 degrees while tilted (eased over ~80 ms: a turn, not a jump).
     const float target = tilt ? pi * 0.5f : 0.0f;
@@ -309,7 +323,7 @@ void GameController::PushStateLocked(u64 timestamp) {
         timestamp = Libraries::Kernel::sceKernelGetProcessTime();
     }
     m_state.UpdateAxisSmoothing(timestamp);
-    if (m_synth.active) [[unlikely]] {
+    if (m_synth.active || m_synth.pad) [[unlikely]] {
         SyntheticMotionLocked(timestamp);
     } else {
         m_state.OnGyro(gyro_buf);
