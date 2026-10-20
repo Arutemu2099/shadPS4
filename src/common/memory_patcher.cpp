@@ -366,6 +366,12 @@ static void ApplyParticleLightOneSubmit() {
 // (FUN_800197050's imm32). Refused unless every original byte matches. The game's context pool has
 // no bounds check (at most 254 per frame): the census in gnmdriver logs the count per frame.
 static int g_screen_w = 0, g_screen_h = 0;
+static u32 g_render_w = 1920, g_render_h = 1080; // the game's render size after ApplyAspectRatio
+static float g_hud_ratio = 1.0f;
+
+float HudSafeAreaRatio() {
+    return g_hud_ratio;
+}
 
 void SetScreenSize(int width, int height) {
     g_screen_w = width;
@@ -440,8 +446,66 @@ static void ApplyAspectRatio() {
         const u32 value = imm.width ? w : h;
         std::memcpy(reinterpret_cast<void*>(g_eboot_address + imm.offset), &value, 4);
     }
+    g_render_w = w;
+    g_render_h = h;
     LOG_INFO(Loader, "SHADPS4_ASPECT: the game renders {}x{} (aspect {:.3f}, screen {}x{}, {})", w,
              h, aspect, g_screen_w, g_screen_h, mode);
+}
+
+// SHADPS4_HUD (1.1, user 2026-10-20): where the HUD is drawn, to taste - e.g. a 16:9 HUD on a 21:9
+// picture. The game places its HUD inside the console's "display safe area": FUN_8001eff00 asks
+// sceSystemServiceGetDisplaySafeAreaInfo for a ratio r (clamped to 0.85 - 1.0) and sets the HUD
+// margins 0x801d0ccc8 / cccc = (W - W r) / 2 and (H - H r) / 2 (at least 16 px). Here r = the HUD
+// width / the render width, the 0.85 floor is lifted and the vertical margin keeps r = 1, in all
+// three copies of that code: the HUD narrows sideways only.
+//   full (default) = the whole width; 16:9 / 21:9 / any W:H = that shape, centred; NN% = NN percent
+//   of the width. Decided at boot, as SHADPS4_ASPECT.
+static void ApplyHudWidth() {
+    const char* env = std::getenv("SHADPS4_HUD");
+    if (!env || std::string(env) == "full") {
+        return;
+    }
+    const std::string v = env;
+    double width = 0.0;
+    if (const auto colon = v.find(':'); colon != std::string::npos) {
+        const double a = std::atof(v.substr(0, colon).c_str());
+        const double b = std::atof(v.substr(colon + 1).c_str());
+        width = b > 0.0 ? double(g_render_h) * a / b : 0.0;
+    } else if (!v.empty() && v.back() == '%') {
+        width = double(g_render_w) * std::atof(v.c_str()) / 100.0;
+    }
+    const float ratio = float(std::clamp(width / double(g_render_w), 0.2, 1.0));
+    if (width <= 0.0 || ratio >= 0.999f) {
+        LOG_INFO(Loader, "SHADPS4_HUD={}: the full width ({}x{})", v, g_render_w, g_render_h);
+        return;
+    }
+    // The margin code exists three times (the size setup and two refreshes): per copy the floor
+    // load vmovss disp(%rip), %xmm2 -> vxorps xmm2, xmm2, xmm2 + 4-byte nop (followed by
+    // vminss / vcmpltss), and vmulss %xmm0, %xmm2, %xmm0 (H * r) -> vmovaps %xmm2, %xmm0 (H).
+    static constexpr u64 floors[3] = {0x1f042f, 0x1f2aae, 0x1f2bae};
+    static constexpr u64 ymuls[3] = {0x1f0471, 0x1f2afb, 0x1f2bfb};
+    static constexpr u8 floor_head[4] = {0xc5, 0xfa, 0x10, 0x15};
+    static constexpr u8 floor_tail[9] = {0xc5, 0xf2, 0x5d, 0xc8, 0xc5, 0xfa, 0xc2, 0xc2, 0x01};
+    static constexpr u8 floor_new[8] = {0xc5, 0xe8, 0x57, 0xd2, 0x0f, 0x1f, 0x40, 0x00};
+    static constexpr u8 ymul_old[4] = {0xc5, 0xea, 0x59, 0xc0};
+    static constexpr u8 ymul_new[4] = {0xc5, 0xf8, 0x28, 0xc2};
+    const auto at = [](u64 offset) { return reinterpret_cast<u8*>(g_eboot_address + offset); };
+    for (int i = 0; i < 3; ++i) {
+        if (std::memcmp(at(floors[i]), floor_head, 4) != 0 ||
+            std::memcmp(at(floors[i] + 8), floor_tail, 9) != 0 ||
+            std::memcmp(at(ymuls[i]), ymul_old, 4) != 0) {
+            LOG_ERROR(Loader, "SHADPS4_HUD: refused, the safe-area code differs at copy {} "
+                              "(eboot 01.07 only)", i);
+            return;
+        }
+    }
+    for (int i = 0; i < 3; ++i) {
+        std::memcpy(at(floors[i]), floor_new, 8);
+        std::memcpy(at(ymuls[i]), ymul_new, 4);
+    }
+    g_hud_ratio = ratio;
+    LOG_INFO(Loader, "SHADPS4_HUD={}: HUD {} px wide of {} (safe-area ratio {:.3f}, sides only)", v,
+             u32(width + 0.5), g_render_w, ratio);
 }
 
 static void ApplyHouseSplit() {
@@ -506,6 +570,7 @@ void OnGameLoaded() {
     ApplyParticleLightOneSubmit();
     ApplyHouseSplit();
     ApplyAspectRatio();
+    ApplyHudWidth();
     std::filesystem::path patch_dir = Common::FS::GetUserPath(Common::FS::PathType::PatchesDir);
     if (!patch_file.empty()) {
 

@@ -45,6 +45,10 @@ void OnGameLoaded();
 /// emulator.cpp, right after the window exists: the screen / window size in pixels, for the
 /// dynamic aspect ratio (SHADPS4_ASPECT, ApplyAspectRatio).
 void SetScreenSize(int width, int height);
+
+/// sceSystemServiceGetDisplaySafeAreaInfo: the safe-area ratio the game gets (1.0 unless
+/// SHADPS4_HUD narrows the HUD; ApplyHudWidth).
+float HudSafeAreaRatio();
 void AddPatchToQueue(const patchInfo& patchToAdd);
 
 void PatchMemory(const patchInfo& patch);

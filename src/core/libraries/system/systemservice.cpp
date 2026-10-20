@@ -1730,7 +1730,7 @@ sceSystemServiceGetDisplaySafeAreaInfo(OrbisSystemServiceDisplaySafeAreaInfo* in
         LOG_ERROR(Lib_SystemService, "OrbisSystemServiceDisplaySafeAreaInfo is null");
         return ORBIS_SYSTEM_SERVICE_ERROR_PARAMETER;
     }
-    info->ratio = 1.0f;
+    info->ratio = MemoryPatcher::HudSafeAreaRatio(); // 1.0 unless SHADPS4_HUD narrows the HUD
     return ORBIS_OK;
 }
 
