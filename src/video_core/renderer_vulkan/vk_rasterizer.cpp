@@ -1657,6 +1657,22 @@ void Rasterizer::DlssResolve() {
     const auto& regs = liverpool->BackRegs();
     VideoCore::TextureCache::ImageDesc out_desc{regs.color_buffers[0], liverpool->BackCbExtent(0)};
     auto& out = texture_cache.GetImage(texture_cache.FindImage(out_desc, true));
+    // The inputs are found at the 1080p frame's fixed addresses (vk_dlss.h). A game patch that
+    // changes the render size (e.g. "Render resolution 2560x1440") moves them: no input is found
+    // and the target would keep stale memory (RTX 5070 Ti report, 10-20: a yellow picture). DLSS
+    // then steps aside for the session: g_ready off stops the classification (the game's own T2x
+    // resolve runs from the next frame on, on every path), the upscaler and DLSS 5.
+    if (out.info.size.width != 1920 || out.info.size.height != 1080) [[unlikely]] {
+        // Resolves already classified before the switch land here too: one line is enough.
+        if (!Dlss::g_ready.exchange(false, std::memory_order_relaxed)) {
+            return;
+        }
+        LOG_WARNING(Render_Vulkan,
+                    "DLSS steps aside: the game renders at {}x{} (a resolution patch?); the "
+                    "game's own anti-aliasing runs",
+                    out.info.size.width, out.info.size.height);
+        return;
+    }
     // By address and size: 0x26b200000 also holds the minimap's 768x768 depth after the AA
     // (play log 2026-10-17: depth "missing" on 109,135 of 109,569 resolves).
     const auto find = [&](VAddr address) -> VideoCore::Image* {
