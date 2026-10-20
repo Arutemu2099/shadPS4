@@ -57,6 +57,9 @@ void ApplyCommandProcessorPlacement();
 /// SHADPS4_MEM_CENSUS: this process's private bytes and working set (0 / 0 where unknown).
 void ProcessMemory(u64& private_bytes, u64& working_set);
 
+/// Installed physical memory in bytes (0 where unknown). SHADPS4_SIM_RAM_MB stands in for it.
+u64 PhysicalRamBytes();
+
 /// SHADPS4_MEM_CENSUS: committed bytes by kind and place (VirtualQuery walk): private / mapped,
 /// inside the guest range 0x200000000 - 0x1000000000 or outside it (emulator, driver, heaps).
 struct CommitCensus {

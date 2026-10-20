@@ -504,6 +504,15 @@ void ProcessMemory(u64& private_bytes, u64& working_set) {
     }
 }
 
+u64 PhysicalRamBytes() {
+    if (const char* sim = std::getenv("SHADPS4_SIM_RAM_MB")) {
+        return std::strtoull(sim, nullptr, 10) << 20;
+    }
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof(ms);
+    return GlobalMemoryStatusEx(&ms) ? ms.ullTotalPhys : 0;
+}
+
 CommitCensus WalkCommitted() {
     CommitCensus c{};
     u64 cur_base = 0, cur_bytes = 0;
@@ -829,6 +838,10 @@ void ProcessMemory(u64& private_bytes, u64& working_set) {
 }
 CommitCensus WalkCommitted() {
     return {};
+}
+u64 PhysicalRamBytes() {
+    const char* sim = std::getenv("SHADPS4_SIM_RAM_MB");
+    return sim ? std::strtoull(sim, nullptr, 10) << 20 : 0;
 }
 void ApplyHotThreadPlacement(HotThread) {}
 void ApplyCriticalThreadPriority(HotThread) {}

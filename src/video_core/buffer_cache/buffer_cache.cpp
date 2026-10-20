@@ -7303,8 +7303,14 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
         }
         const char* t = std::getenv("SHADPS4_BIG_GROW_TIERS");
         const bool tiers = !(t && t[0] == '0');
+        // 1.1 (PERF-PLAN 11): with < 24 GB of RAM the big tier is 2.75 GB too. Every byte of video
+        // memory also commits a byte of system memory (s1436: a 2 GB device-local buffer added
+        // 2 GB of private RAM), and the game's mesh memory measured 2491-2515 MB: the 3.75 GB
+        // buffer's spare 1.25 GB costs a 16 GB PC RAM it needs.
+        const u64 ram = Common::PhysicalRamBytes();
+        const bool low_ram = ram != 0 && ram < (24ull << 30);
         u64 size = 0;
-        if (heap >= (min_mb << 20)) {
+        if (heap >= (min_mb << 20) && !(tiers && low_ram)) {
             size = 0xF0000000ull; // 3.75 GB
         } else if (tiers && heap >= (7168ull << 20)) {
             size = 0xC0000000ull; // 3 GB
@@ -7316,9 +7322,9 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
             size = tiers && max_alloc >= 0xB0000000ull ? 0xB0000000ull : 0;
         }
         LOG_INFO(Render_Vulkan,
-                 "BIG_GROW: largest device-local heap {} MiB{} (3.75 GB needs >= {} MiB, tiers {}), "
-                 "max allocation {} MiB -> {} MB{}",
-                 heap >> 20, simulated ? " (SIMULATED, SHADPS4_SIM_VRAM_MB)" : "", min_mb,
+                 "BIG_GROW: largest device-local heap {} MiB{} (3.75 GB needs >= {} MiB and >= 24 GB "
+                 "RAM, RAM {} MB, tiers {}), max allocation {} MiB -> {} MB{}",
+                 heap >> 20, simulated ? " (SIMULATED, SHADPS4_SIM_VRAM_MB)" : "", min_mb, ram >> 20,
                  tiers ? "on" : "off", max_alloc >> 20, size >> 20,
                  size != 0 ? " - one mesh buffer sized once"
                            : " - OFF: fallback to the old growth path");
