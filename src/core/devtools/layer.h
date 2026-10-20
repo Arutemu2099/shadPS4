@@ -32,8 +32,8 @@ void ToggleSimpleFps();
 void SetSimpleFps(bool enabled);
 void ToggleQuitWindow();
 void ShowVolume();
-/// A short text line in the top-right corner for 3 seconds (any thread).
-void ShowNotice(const char* text);
+/// A short text line in the top-right corner for `seconds` (default 3; any thread).
+void ShowNotice(const char* text, double seconds = 3.0);
 
 void TextCentered(const std::string& text);
 

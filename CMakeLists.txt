@@ -824,6 +824,8 @@ set(COMMON src/common/logging/classes.h
            src/common/string_util.h
            src/common/thread.cpp
            src/common/thread.h
+           src/common/update_notice.cpp
+           src/common/update_notice.h
            src/common/types.h
            src/common/uint128.h
            src/common/unique_function.h

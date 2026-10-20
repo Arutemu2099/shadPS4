@@ -40,6 +40,7 @@ static float volume_start_time;
 static std::mutex notice_mutex;
 static std::string notice_text;
 static double notice_start_time = -100.0;
+static double notice_seconds = 3.0;
 
 static float fps_scale = 1.0f;
 static int dump_frame_count = 1;
@@ -502,7 +503,7 @@ void L::Draw() {
         std::string text;
         {
             std::scoped_lock lk{notice_mutex};
-            if (ImGui::GetTime() - notice_start_time < 3.0) {
+            if (ImGui::GetTime() - notice_start_time < notice_seconds) {
                 text = notice_text;
             }
         }
@@ -554,13 +555,14 @@ void ShowVolume() {
     show_volume = true;
 }
 
-void ShowNotice(const char* text) {
+void ShowNotice(const char* text, double seconds) {
     if (!ImGui::GetCurrentContext()) {
         return; // before the overlay exists (review 2026-10-14)
     }
     std::scoped_lock lk{notice_mutex};
     notice_text = text;
     notice_start_time = ImGui::GetTime();
+    notice_seconds = seconds;
 }
 
 } // namespace Overlay
