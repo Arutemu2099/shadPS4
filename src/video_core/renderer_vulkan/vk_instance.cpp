@@ -1126,10 +1126,18 @@ void Instance::CreateAllocator() {
         .vkGetDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr,
     };
 
+    // SHADPS4_VMA_BLOCK_MB (PERF-PLAN 11, 2026-10-20): VMA's block size for large heaps (default
+    // 256 MB). City 1080p (s1456): 620 MB of the 6.9 GB VMA holds was empty space inside blocks
+    // (video 340 MB of 736, the host-visible video type 282 MB of 480).
+    u64 block_bytes = 0;
+    if (const char* v = std::getenv("SHADPS4_VMA_BLOCK_MB"); v && std::atoi(v) >= 16) {
+        block_bytes = u64(std::min(std::atoi(v), 1024)) << 20;
+    }
     const VmaAllocatorCreateInfo allocator_info = {
         .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
         .physicalDevice = physical_device,
         .device = *device,
+        .preferredLargeHeapBlockSize = block_bytes,
         .pVulkanFunctions = &functions,
         .instance = *instance,
         .vulkanApiVersion = TargetVulkanApiVersion,

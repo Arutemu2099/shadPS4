@@ -22,6 +22,7 @@
 #include "common/scope_exit.h"
 #include "common/thread.h"
 #include "common/memory_patcher.h"
+#include "common/path_util.h"
 #include "core/memory.h"
 #include "shader_recompiler/native_emit.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -8622,7 +8623,7 @@ void BufferCache::RunGarbageCollector() {
         // SHADPS4_MEM_CENSUS=1: every 10 s (the census below rides on this line).
         static const bool census_fast = [] {
             const char* v = std::getenv("SHADPS4_MEM_CENSUS");
-            return v && v[0] == '1';
+            return v && (v[0] == '1' || v[0] == '2');
         }();
         if (now - vram_last_log >= std::chrono::seconds{census_fast ? 10 : 60}) {
             vram_last_log = now;
@@ -8636,7 +8637,7 @@ void BufferCache::RunGarbageCollector() {
             // image sizes are guest sizes (host allocations add alignment / tiling: inferred).
             static const bool census = [] {
                 const char* v = std::getenv("SHADPS4_MEM_CENSUS");
-                return v && v[0] == '1';
+                return v && (v[0] == '1' || v[0] == '2');
             }();
             if (census) {
                 u64 buf_bytes = 0, buf_largest = 0;
@@ -8695,6 +8696,44 @@ void BufferCache::RunGarbageCollector() {
                          img.targets, img.textures_bytes >> 20, img.textures,
                          img.largest_bytes >> 20, priv >> 20, ws >> 20,
                          MemoryPatcher::GameQualityLevel());
+                // What VMA itself holds in video memory (blocks / live allocations) vs the
+                // driver's count for the process (budget usage): the rest is driver-internal
+                // (NGX, shader code, swapchain, command memory: inferred).
+                u64 vma_blocks = 0, vma_allocs = 0;
+                u32 vma_count = 0;
+                for (u32 i = 0; i < mp.memoryHeapCount; ++i) {
+                    if (mp.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+                        vma_blocks += budgets[i].statistics.blockBytes;
+                        vma_allocs += budgets[i].statistics.allocationBytes;
+                        vma_count += budgets[i].statistics.allocationCount;
+                    }
+                }
+                LOG_INFO(Render_Vulkan,
+                         "MemCensus: video memory - VMA blocks {} MB, VMA allocations {} MB in {}, "
+                         "process usage {} MB (outside VMA {} MB)",
+                         vma_blocks >> 20, vma_allocs >> 20, vma_count, vma_local >> 20,
+                         (vma_local > vma_blocks ? vma_local - vma_blocks : 0) >> 20);
+                // SHADPS4_MEM_CENSUS=2: once, at the 6th census (~60 s), every VMA allocation (size,
+                // type, usage flags) to vma-stats.json in the log folder.
+                static u32 census_n = 0;
+                static const bool dump = [] {
+                    const char* v = std::getenv("SHADPS4_MEM_CENSUS");
+                    return v && v[0] == '2';
+                }();
+                if (dump && ++census_n == 6) {
+                    char* stats = nullptr;
+                    vmaBuildStatsString(instance.GetAllocator(), &stats, VK_TRUE);
+                    if (stats) {
+                        const auto path =
+                            Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "vma-stats.json";
+                        if (std::FILE* f = std::fopen(path.string().c_str(), "wb")) {
+                            std::fwrite(stats, 1, std::strlen(stats), f);
+                            std::fclose(f);
+                        }
+                        vmaFreeStatsString(instance.GetAllocator(), stats);
+                        LOG_INFO(Render_Vulkan, "MemCensus: VMA map written to {}", path.string());
+                    }
+                }
             }
         }
     }

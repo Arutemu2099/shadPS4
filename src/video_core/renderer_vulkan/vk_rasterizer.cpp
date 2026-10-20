@@ -13913,6 +13913,14 @@ bool Rasterizer::MappedInterval(VAddr addr, VAddr& lo, VAddr& hi) {
 }
 
 void Rasterizer::MapMemory(VAddr addr, u64 size) {
+    // PERF-PLAN 11 (2026-10-20): the GPU page table (BDA_PAGETABLE_SIZE, 512 MB of video memory)
+    // covers 40 bits; how high does the game map GPU memory? Each new highest end is logged.
+    static std::atomic<VAddr> highest_end{0};
+    if (const VAddr end = addr + size; end > highest_end.load(std::memory_order_relaxed)) {
+        highest_end.store(end, std::memory_order_relaxed);
+        LOG_INFO(Render_Vulkan, "GPU map: highest mapped end now {:#x} ({} GB; map {:#x} + {:#x})",
+                 end, end >> 30, addr, size);
+    }
     {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges += boost::icl::interval_set<VAddr>::interval_type::right_open(addr, addr + size);
