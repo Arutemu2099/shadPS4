@@ -458,14 +458,16 @@ static void ApplyAspectRatio() {
 // margins 0x801d0ccc8 / cccc = (W - W r) / 2 and (H - H r) / 2 (at least 16 px). Here r = the HUD
 // width / the render width, the 0.85 floor is lifted and the vertical margin keeps r = 1, in all
 // three copies of that code: the HUD narrows sideways only.
-//   full (default) = the whole width; 16:9 / 21:9 / any W:H = that shape, centred; NN% = NN percent
+//   default 16:9 on a widened picture, else full; full = the whole width; 16:9 / 21:9 / any W:H = that shape, centred; NN% = NN percent
 //   of the width. Decided at boot, as SHADPS4_ASPECT.
 static void ApplyHudWidth() {
+    // Default: 16:9 on a widened picture (the HUD art is made for 16:9; at full width the minimap
+    // ends partly off the right edge, s1427), the full width otherwise.
     const char* env = std::getenv("SHADPS4_HUD");
-    if (!env || std::string(env) == "full") {
+    const std::string v = env ? env : (g_render_w > 1920 ? "16:9" : "full");
+    if (v == "full") {
         return;
     }
-    const std::string v = env;
     double width = 0.0;
     if (const auto colon = v.find(':'); colon != std::string::npos) {
         const double a = std::atof(v.substr(0, colon).c_str());
