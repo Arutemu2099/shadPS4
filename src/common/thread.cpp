@@ -25,6 +25,7 @@
 #include <pthread.h>
 #elif defined(_WIN32)
 #include <windows.h>
+#include <psapi.h>
 #include <bit>
 #include <intrin.h>
 #include "common/string_util.h"
@@ -491,6 +492,41 @@ void ApplyHelperThreadPlacement(const char* name) {
              name, n, ok);
 }
 
+void ProcessMemory(u64& private_bytes, u64& working_set) {
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    pmc.cb = sizeof(pmc);
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc),
+                                sizeof(pmc))) {
+        private_bytes = pmc.PrivateUsage;
+        working_set = pmc.WorkingSetSize;
+    } else {
+        private_bytes = working_set = 0;
+    }
+}
+
+CommitCensus WalkCommitted() {
+    CommitCensus c{};
+    u64 a = 0x10000;
+    MEMORY_BASIC_INFORMATION mbi{};
+    while (a < 0x7fffffff0000ull &&
+           VirtualQuery(reinterpret_cast<void*>(a), &mbi, sizeof(mbi)) == sizeof(mbi)) {
+        const u64 base = reinterpret_cast<u64>(mbi.BaseAddress);
+        const u64 size = mbi.RegionSize;
+        if (mbi.State == MEM_COMMIT) {
+            const bool guest = base >= 0x200000000ull && base < 0x1000000000ull;
+            if (mbi.Type == MEM_PRIVATE) {
+                (guest ? c.private_guest : c.private_host) += size;
+            } else if (mbi.Type == MEM_MAPPED) {
+                (guest ? c.mapped_guest : c.mapped_host) += size;
+            } else {
+                c.image += size;
+            }
+        }
+        a = base + size;
+    }
+    return c;
+}
+
 void ApplyCommandProcessorPlacement() {
     const char* value = std::getenv("SHADPS4_CP_QOS");
     int mode = value ? value[0] - '0' : 0;
@@ -747,6 +783,12 @@ u32 AutoPoolWorkers(bool) {
 void ApplyGuestThreadPlacement(void*, const char*) {}
 void ApplyHelperThreadPlacement(const char*) {}
 void ApplyCommandProcessorPlacement() {}
+void ProcessMemory(u64& private_bytes, u64& working_set) {
+    private_bytes = working_set = 0;
+}
+CommitCensus WalkCommitted() {
+    return {};
+}
 void ApplyHotThreadPlacement(HotThread) {}
 void ApplyCriticalThreadPriority(HotThread) {}
 void SampleCommandProcessorCore() {}

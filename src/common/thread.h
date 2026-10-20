@@ -53,6 +53,16 @@ std::string GetCurrentThreadName();
 /// THREAD_PRIORITY_HIGHEST; =2 additionally restricts it to the performance cores (highest CPU
 /// set efficiency class). Default off. Windows only; call on the thread itself.
 void ApplyCommandProcessorPlacement();
+
+/// SHADPS4_MEM_CENSUS: this process's private bytes and working set (0 / 0 where unknown).
+void ProcessMemory(u64& private_bytes, u64& working_set);
+
+/// SHADPS4_MEM_CENSUS: committed bytes by kind and place (VirtualQuery walk): private / mapped,
+/// inside the guest range 0x200000000 - 0x1000000000 or outside it (emulator, driver, heaps).
+struct CommitCensus {
+    u64 private_guest{}, private_host{}, mapped_guest{}, mapped_host{}, image{};
+};
+CommitCensus WalkCommitted();
 /// SHADPS4_GUEST_PCORE=<mask> (2026-10-15, notes/gamemain-saturation-2026-10-15.md): bit 0 the game's
 /// JobWorker* threads, bit 1 Game:Main get every performance logical processor (minus reserved
 /// cores) as selected CPU sets and power throttling off. Called with the thread's handle and name.

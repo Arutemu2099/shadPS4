@@ -416,6 +416,27 @@ public:
     /// Runs the garbage collector.
     void RunGarbageCollector();
 
+    /// SHADPS4_MEM_CENSUS (PERF-PLAN 11): guest bytes of the cached images by kind - render
+    /// targets / depth (attachment usage) and the rest (textures). Takes the cache mutex.
+    struct ImageCensus {
+        u64 targets_bytes{}, textures_bytes{}, largest_bytes{};
+        u32 targets{}, textures{};
+    };
+    ImageCensus MemoryCensus() {
+        std::scoped_lock lock{mutex};
+        ImageCensus c{};
+        for (const auto& image : slot_images) {
+            const u64 bytes = image.info.guest_size;
+            const bool target =
+                bool(image.usage_flags & (vk::ImageUsageFlagBits::eColorAttachment |
+                                          vk::ImageUsageFlagBits::eDepthStencilAttachment));
+            (target ? c.targets_bytes : c.textures_bytes) += bytes;
+            ++(target ? c.targets : c.textures);
+            c.largest_bytes = std::max(c.largest_bytes, bytes);
+        }
+        return c;
+    }
+
     template <typename Func>
     void ForEachImageInRegion(VAddr cpu_addr, size_t size, Func&& func) {
         using FuncReturn = typename std::invoke_result<Func, ImageId, Image&>::type;

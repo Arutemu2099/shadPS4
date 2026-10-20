@@ -8620,6 +8620,38 @@ void BufferCache::RunGarbageCollector() {
                      vma_local >> 20, vram_peak_vma >> 20, total_used_memory >> 20,
                      vram_peak_driver >> 20, trigger_gc_memory >> 20,
                      Vulkan::DescribeDeviceLocalBudgets(instance.GetAllocator()));
+            // SHADPS4_MEM_CENSUS=1 (PERF-PLAN 11, diagnostic): where the memory goes. Buffer and
+            // image sizes are guest sizes (host allocations add alignment / tiling: inferred).
+            static const bool census = [] {
+                const char* v = std::getenv("SHADPS4_MEM_CENSUS");
+                return v && v[0] == '1';
+            }();
+            if (census) {
+                u64 buf_bytes = 0, buf_largest = 0;
+                u32 bufs = 0;
+                for (const auto& buffer : slot_buffers) {
+                    buf_bytes += buffer.SizeBytes();
+                    buf_largest = std::max<u64>(buf_largest, buffer.SizeBytes());
+                    ++bufs;
+                }
+                const auto img = texture_cache.MemoryCensus();
+                u64 priv = 0, ws = 0;
+                Common::ProcessMemory(priv, ws);
+                const auto cc = Common::WalkCommitted();
+                LOG_INFO(Render_Vulkan,
+                         "MemCensus: committed - private in the guest range {} MB, private "
+                         "outside {} MB, mapped in the guest range {} MB, mapped outside {} MB, "
+                         "modules {} MB",
+                         cc.private_guest >> 20, cc.private_host >> 20, cc.mapped_guest >> 20,
+                         cc.mapped_host >> 20, cc.image >> 20);
+                LOG_INFO(Render_Vulkan,
+                         "MemCensus: buffers {} MB in {} (largest {} MB) | render targets / depth {} "
+                         "MB in {} | textures {} MB in {} (largest image {} MB) | process RAM "
+                         "private {} MB, working set {} MB",
+                         buf_bytes >> 20, bufs, buf_largest >> 20, img.targets_bytes >> 20,
+                         img.targets, img.textures_bytes >> 20, img.textures,
+                         img.largest_bytes >> 20, priv >> 20, ws >> 20);
+            }
         }
     }
     if (total_used_memory < trigger_gc_memory) {
