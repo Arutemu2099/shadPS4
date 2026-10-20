@@ -8612,7 +8612,12 @@ void BufferCache::RunGarbageCollector() {
         vram_peak_vma = std::max(vram_peak_vma, vma_local);
         vram_peak_driver = std::max(vram_peak_driver, total_used_memory);
         const auto now = std::chrono::steady_clock::now();
-        if (now - vram_last_log >= std::chrono::seconds{60}) {
+        // SHADPS4_MEM_CENSUS=1: every 10 s (the census below rides on this line).
+        static const bool census_fast = [] {
+            const char* v = std::getenv("SHADPS4_MEM_CENSUS");
+            return v && v[0] == '1';
+        }();
+        if (now - vram_last_log >= std::chrono::seconds{census_fast ? 10 : 60}) {
             vram_last_log = now;
             LOG_INFO(Render_Vulkan,
                      "VideoMemory: VMA video {} MB (peak {} MB); driver process usage {} MB (peak "
@@ -8638,12 +8643,16 @@ void BufferCache::RunGarbageCollector() {
                 u64 priv = 0, ws = 0;
                 Common::ProcessMemory(priv, ws);
                 const auto cc = Common::WalkCommitted();
+                std::string top;
+                for (int i = 0; i < 8 && cc.top_bytes[i] != 0; ++i) {
+                    top += fmt::format(" {:#x}:{}MB", cc.top_base[i], cc.top_bytes[i] >> 20);
+                }
                 LOG_INFO(Render_Vulkan,
                          "MemCensus: committed - private in the guest range {} MB, private "
-                         "outside {} MB, mapped in the guest range {} MB, mapped outside {} MB, "
-                         "modules {} MB",
-                         cc.private_guest >> 20, cc.private_host >> 20, cc.mapped_guest >> 20,
-                         cc.mapped_host >> 20, cc.image >> 20);
+                         "outside {} MB in {} allocations (largest:{}), mapped in the guest range "
+                         "{} MB, mapped outside {} MB, modules {} MB",
+                         cc.private_guest >> 20, cc.private_host >> 20, cc.host_blocks, top,
+                         cc.mapped_guest >> 20, cc.mapped_host >> 20, cc.image >> 20);
                 LOG_INFO(Render_Vulkan,
                          "MemCensus: buffers {} MB in {} (largest {} MB) | render targets / depth {} "
                          "MB in {} | textures {} MB in {} (largest image {} MB) | process RAM "

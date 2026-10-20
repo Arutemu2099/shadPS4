@@ -506,6 +506,25 @@ void ProcessMemory(u64& private_bytes, u64& working_set) {
 
 CommitCensus WalkCommitted() {
     CommitCensus c{};
+    u64 cur_base = 0, cur_bytes = 0;
+    const auto flush = [&] {
+        if (cur_bytes == 0) {
+            return;
+        }
+        ++c.host_blocks;
+        for (int i = 0; i < 8; ++i) {
+            if (cur_bytes > c.top_bytes[i]) {
+                for (int j = 7; j > i; --j) {
+                    c.top_bytes[j] = c.top_bytes[j - 1];
+                    c.top_base[j] = c.top_base[j - 1];
+                }
+                c.top_bytes[i] = cur_bytes;
+                c.top_base[i] = cur_base;
+                break;
+            }
+        }
+        cur_bytes = 0;
+    };
     u64 a = 0x10000;
     MEMORY_BASIC_INFORMATION mbi{};
     while (a < 0x7fffffff0000ull &&
@@ -516,6 +535,14 @@ CommitCensus WalkCommitted() {
             const bool guest = base >= 0x200000000ull && base < 0x1000000000ull;
             if (mbi.Type == MEM_PRIVATE) {
                 (guest ? c.private_guest : c.private_host) += size;
+                if (!guest) {
+                    const u64 alloc = reinterpret_cast<u64>(mbi.AllocationBase);
+                    if (alloc != cur_base) {
+                        flush();
+                        cur_base = alloc;
+                    }
+                    cur_bytes += size;
+                }
             } else if (mbi.Type == MEM_MAPPED) {
                 (guest ? c.mapped_guest : c.mapped_host) += size;
             } else {
@@ -524,6 +551,7 @@ CommitCensus WalkCommitted() {
         }
         a = base + size;
     }
+    flush();
     return c;
 }
 

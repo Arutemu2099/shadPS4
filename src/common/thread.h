@@ -61,6 +61,8 @@ void ProcessMemory(u64& private_bytes, u64& working_set);
 /// inside the guest range 0x200000000 - 0x1000000000 or outside it (emulator, driver, heaps).
 struct CommitCensus {
     u64 private_guest{}, private_host{}, mapped_guest{}, mapped_host{}, image{};
+    u32 host_blocks{};             ///< private allocations outside the guest range
+    u64 top_base[8]{}, top_bytes[8]{}; ///< the largest of them (committed bytes per allocation)
 };
 CommitCensus WalkCommitted();
 /// SHADPS4_GUEST_PCORE=<mask> (2026-10-15, notes/gamemain-saturation-2026-10-15.md): bit 0 the game's
