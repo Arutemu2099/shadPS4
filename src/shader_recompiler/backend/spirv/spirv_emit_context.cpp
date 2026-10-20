@@ -1871,7 +1871,10 @@ void EmitContext::DefineSharedMemory() {
             return std::make_tuple(Id{}, Id{}, Id{});
         }
 
-        const u32 num_elements{Common::DivCeil(shared_memory_size, element_size)};
+        // A dispatch may use DS instructions with LDS_SIZE 0 (the accesses fall outside the
+        // allocation on hardware). A zero-length OpTypeArray is invalid SPIR-V (VUID 08737); AMD's
+        // RDNA1 driver divides by the length and crashes in vkCreateComputePipelines (GitHub #5).
+        const u32 num_elements{std::max(1u, Common::DivCeil(shared_memory_size, element_size))};
         const Id array_type{TypeArray(element_type, ConstU32(num_elements))};
 
         const auto mem_type = [&] {
