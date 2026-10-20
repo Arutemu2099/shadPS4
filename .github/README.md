@@ -113,8 +113,17 @@ for this build only - problems with other games or the official shadPS4 builds b
   [Windows build guide](https://github.com/axylpup/shadPS4/blob/second-son/documents/building-windows.md). Release
   builds use the profile-guided optimisation data in [`pgo/`](https://github.com/axylpup/shadPS4/tree/second-son/pgo).
 
+## How this was made
+
+This build was made with AI. I'm a 3D artist, not a programmer: I directed the project - set the goals, chose what to
+work on, played and tested every build, judged what looked and felt right, and made the release calls. The code, the
+tests and measurements and most of the documentation were written by AI models: most of it by Anthropic's Claude Opus
+5.5, earlier parts by other Claude models and by OpenAI's GPT models. Announcement images are made with ChatGPT. All of
+it stands on shadPS4, written by its team and contributors over years.
+
 ## Credits and licence
 
-Built on [shadPS4](https://github.com/shadps4-emu/shadPS4) - thanks to its team and contributors. GPL-2.0-or-later.
+Directed and tested by Axylpup - code by AI (mostly Claude Opus 5.5, Anthropic) - built on
+[shadPS4](https://github.com/shadps4-emu/shadPS4), thanks to its team and contributors. GPL-2.0-or-later.
 NVIDIA Streamline headers are MIT; the DLSS runtime files are NVIDIA's and come from your own download. inFAMOUS
 Second Son (c) Sony Interactive Entertainment / Sucker Punch Productions.
