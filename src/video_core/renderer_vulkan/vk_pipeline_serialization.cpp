@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "shader_recompiler/spirv_variants.h"
+#include "common/thread.h"
 #include "common/elf_info.h"
 #include "common/hash.h"
 #include "common/scm_rev.h"
@@ -1323,6 +1324,24 @@ void PipelineCache::WarmUp() {
     defer_marked_compute = nullptr;
     // Fix A: guessed permutations after every live one (counted as loaded above).
     u32 deferred_failed = 0;
+    // 1.1 (PERF-PLAN 11): below 24 GB of RAM the guessed permutations are not preloaded. Each
+    // preloaded pipeline costs ~160 KB of driver memory (s1434 / s1435: 20,683 pipelines = ~3.3 GB
+    // outside the process heap); the ~10,000 guesses are the largest group and only cover first
+    // uses (a live miss compiles as before). SHADPS4_PRELOAD_GUESSES=1 / =0 forces either way.
+    const bool skip_guesses = [] {
+        if (const char* v = std::getenv("SHADPS4_PRELOAD_GUESSES")) {
+            return v[0] == '0';
+        }
+        const u64 ram = Common::PhysicalRamBytes();
+        return ram != 0 && ram < (24ull << 30);
+    }();
+    if (skip_guesses && !deferred_marked.empty()) {
+        LOG_INFO(Render, "WarmUp: {} guessed compute permutations not preloaded (RAM {} MB < 24 GB; "
+                         "SHADPS4_PRELOAD_GUESSES=1 loads them)",
+                 deferred_marked.size(), Common::PhysicalRamBytes() >> 20);
+        num_pipelines -= static_cast<u32>(deferred_marked.size());
+        deferred_marked.clear();
+    }
     for (auto& load : deferred_marked) {
         if (!BuildComputePipeline(load.key, load.sdata, std::move(load.meta))) {
             --num_pipelines;

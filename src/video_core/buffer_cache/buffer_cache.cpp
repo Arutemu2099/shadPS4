@@ -7303,10 +7303,11 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
         }
         const char* t = std::getenv("SHADPS4_BIG_GROW_TIERS");
         const bool tiers = !(t && t[0] == '0');
-        // 1.1 (PERF-PLAN 11): with < 24 GB of RAM the big tier is 2.75 GB too. Every byte of video
+        // 1.1 (PERF-PLAN 11): with < 24 GB of RAM the 3.75 GB tier is skipped (3 GB / 2.75 GB by VRAM). Every byte of video
         // memory also commits a byte of system memory (s1436: a 2 GB device-local buffer added
         // 2 GB of private RAM), and the game's mesh memory measured 2491-2515 MB: the 3.75 GB
-        // buffer's spare 1.25 GB costs a 16 GB PC RAM it needs.
+        // buffer's spare memory costs a 16 GB PC RAM it needs (s1438, 16 GB simulated: VRAM 6.89 ->
+        // 6.12 GB, private RAM 14.3 -> 13.5 GB).
         const u64 ram = Common::PhysicalRamBytes();
         const bool low_ram = ram != 0 && ram < (24ull << 30);
         u64 size = 0;
