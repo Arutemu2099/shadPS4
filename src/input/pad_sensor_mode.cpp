@@ -215,8 +215,9 @@ bool FilterEvent(SDL_Event& event, GameController* controller0) {
             // Keyboard Z's rule (sdl_window): hold = the pad on its side; released within 250 ms
             // = a 600 ms rattle burst.
             // A press that reached the game before the mode began keeps its release for the game.
-            g_synth_pad_tilt.store(true, std::memory_order_relaxed);
             g_a_down_ms = SDL_GetTicks();
+            g_synth_tilt_since.store(g_a_down_ms, std::memory_order_relaxed);
+            g_synth_pad_tilt.store(true, std::memory_order_relaxed);
             g_a_swallowed = true;
             return true;
         }

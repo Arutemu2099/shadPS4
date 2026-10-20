@@ -63,6 +63,9 @@ inline std::atomic<bool> g_synth_tilt_btn{false};   ///< mouse forward button he
 inline std::atomic<bool> g_synth_rattle_btn{false}; ///< mouse back button held
 /// Controller sensor mode (input/pad_sensor_mode): A held on a pad without a gyro = tilt.
 inline std::atomic<bool> g_synth_pad_tilt{false};
+/// SDL_GetTicks() when the current tilt hold began (Z, mouse forward, sensor-mode A). The turn
+/// starts once the hold outlasts a tap (user 10-20: "only need to tap it and it still registers").
+inline std::atomic<u64> g_synth_tilt_since{0};
 
 enum class Axis {
     LeftX = 0,

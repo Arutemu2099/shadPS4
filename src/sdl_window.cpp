@@ -369,6 +369,9 @@ void WindowSDL::WaitEvent() {
             (event.button.button == SDL_BUTTON_X1 ? Input::g_synth_rattle_btn
                                                   : Input::g_synth_tilt_btn)
                 .store(down, std::memory_order_relaxed);
+            if (down && event.button.button == SDL_BUTTON_X2) {
+                Input::g_synth_tilt_since.store(SDL_GetTicks(), std::memory_order_relaxed);
+            }
         }
         OnKeyboardMouseInput(&event);
         break;
@@ -388,6 +391,7 @@ void WindowSDL::WaitEvent() {
             Input::g_synth_tilt.store(down, std::memory_order_relaxed);
             if (down) {
                 z_down_ms = SDL_GetTicks();
+                Input::g_synth_tilt_since.store(z_down_ms, std::memory_order_relaxed);
             } else if (SDL_GetTicks() - z_down_ms < 250) {
                 Input::g_synth_rattle_until.store(SDL_GetTicks() + 600, std::memory_order_relaxed);
             }

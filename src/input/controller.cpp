@@ -197,15 +197,26 @@ void GameController::SyntheticMotionLocked(u64 timestamp) {
     const float dt = s.last_t != 0 && timestamp > s.last_t
                          ? std::min(static_cast<float>(timestamp - s.last_t) / 1e6f, 0.1f)
                          : 0.0f;
+    const u64 now_ms = SDL_GetTicks();
     const bool rattle = g_synth_rattle.load(std::memory_order_relaxed) ||
                         g_synth_rattle_btn.load(std::memory_order_relaxed) ||
-                        SDL_GetTicks() < g_synth_rattle_until.load(std::memory_order_relaxed);
-    const bool tilt = rattle || g_synth_tilt.load(std::memory_order_relaxed) ||
+                        now_ms < g_synth_rattle_until.load(std::memory_order_relaxed);
+    const bool held = g_synth_tilt.load(std::memory_order_relaxed) ||
                       g_synth_pad_tilt.load(std::memory_order_relaxed) ||
                       g_synth_tilt_btn.load(std::memory_order_relaxed);
-    // Roll toward 90 degrees while tilted (eased over ~80 ms: a turn, not a jump).
-    const float target = tilt ? pi * 0.5f : 0.0f;
-    s.phi += (target - s.phi) * (1.0f - std::exp(-dt / 0.08f));
+    // User 10-20: a hold must feel like turning the pad, and a tap must not pass "Hold Wireless
+    // Controller Sideways". A hold turns only after the 250 ms tap window, then steadily to 90
+    // degrees in 0.4 s (sideways ~0.65 s after the press). A rattle alone tips the pad 45 degrees:
+    // enough for the game's shake test (rolled > 30 degrees, input study 10-14 sec. 2), short of
+    // sideways. Back to level, or onto a rattle's 45, eased over ~80 ms as before.
+    const bool turning =
+        held && now_ms - g_synth_tilt_since.load(std::memory_order_relaxed) >= 250;
+    const float target = turning ? pi * 0.5f : rattle ? pi * 0.25f : 0.0f;
+    if (turning && s.phi < target) {
+        s.phi = std::min(target, s.phi + dt * (pi * 0.5f) / 0.4f);
+    } else {
+        s.phi += (target - s.phi) * (1.0f - std::exp(-dt / 0.08f));
+    }
     const Quat q = QMul(QMul(QAxis(0, 1, 0, s.yaw), QAxis(1, 0, 0, s.pitch)),
                         QAxis(0, 0, 1, s.phi + s.roll));
     // Gravity reaction in the pad frame = world up projected on the pad axes (rows of q, the
