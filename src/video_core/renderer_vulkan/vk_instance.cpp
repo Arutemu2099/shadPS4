@@ -15,6 +15,7 @@
 #include "core/address_space.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
+#include "video_core/buffer_cache/pt_bits.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_dlss5.h"
@@ -176,6 +177,20 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
     CreateDevice();
     CollectPhysicalMemoryInfo();
     CreateSimBallast();
+    {
+        // The GPU page table's default coverage (pt_bits.h): the 64 MB table where video memory
+        // is short (the game maps GPU memory no higher than 63.5 GB, s1457 / s1460).
+        u64 heap = 0;
+        for (u32 i = 0; i < memory_properties.memoryHeapCount; ++i) {
+            if (memory_properties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+                heap = std::max<u64>(heap, memory_properties.memoryHeaps[i].size);
+            }
+        }
+        if (sim_vram_bytes != 0) {
+            heap = std::min<u64>(heap, sim_vram_bytes);
+        }
+        VideoCore::g_pt_auto_bits.store(heap < (10ull << 30) ? 37u : 40u);
+    }
     CollectImageFormatInfo();
     CollectToolingInfo();
 }

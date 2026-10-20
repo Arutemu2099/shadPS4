@@ -286,6 +286,10 @@ public:
     std::array<Id, NUM_BUFFERS> native_pt_miss{};  // the binding's page is not cached (loads read 0)
     std::array<Id, NUM_BUFFERS> native_guest_lo{}; // the guest address (compare entries)
     std::array<Id, NUM_BUFFERS> native_guest_hi{};
+    /// SHADPS4_PT_BITS: a page index clamped into the GPU page table (0 above it), and whether a
+    /// binding's last page is above it (a miss, never flagged). Every raw-pointer reader uses both.
+    Id PtClampPage(Id page);
+    Id PtAbove(Id last_page);
     void NativePtTranslate(u32 handle, u32 binding, Id record_word, Id inherited);
     void NativePtMismatch(u32 handle, Id rel_index, Id pt_bits, Id desc_bits, u32 width,
                           bool scalar = false);

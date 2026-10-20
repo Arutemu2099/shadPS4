@@ -686,6 +686,8 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                  host_mirror_max);
     }
     Vulkan::SetObjectName(instance.GetDevice(), gds_buffer.Handle(), "GDS Buffer");
+    LOG_INFO(Render_Vulkan, "GPU page table: {} MB (covers {} GB of guest addresses)",
+             BdaPageTableSize() >> 20, (BdaNumPages() * CACHING_PAGESIZE) >> 30);
     Vulkan::SetObjectName(instance.GetDevice(), bda_pagetable_buffer.Handle(),
                           "BDA Page Table Buffer");
 
@@ -7566,11 +7568,14 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
         }
         // SHADPS4_PT_BITS: entries above the table are not written (that range reads as a miss).
         const u64 table_pages = BdaNumPages();
-        if (page_begin < table_pages) {
-            const u64 n = std::min<u64>(bda_addrs.size(), table_pages - page_begin);
+        const u64 n = page_begin < table_pages
+                          ? std::min<u64>(bda_addrs.size(), table_pages - page_begin)
+                          : 0;
+        if (n != 0) {
             WriteDataBuffer(bda_pagetable_buffer, page_begin * sizeof(vk::DeviceAddress),
                             bda_addrs.data(), n * sizeof(vk::DeviceAddress));
-        } else {
+        }
+        if (n < bda_addrs.size()) { // wholly or partly above the table (review 10-20, item 3)
             static std::atomic<bool> warned{false};
             if (!warned.exchange(true)) {
                 LOG_WARNING(Render_Vulkan, "GPU page table: a buffer at {:#x} is above the table "

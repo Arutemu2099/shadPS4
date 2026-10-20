@@ -204,7 +204,19 @@ void FaultManager::ProcessFaultBuffer() {
         fault_ranges.Clear();
         const u64* fault_buf = std::bit_cast<const u64*>(mapped);
         const u32 fault_count = fault_buf[0];
+        // SHADPS4_PT_BITS: a page above the GPU page table can never be served (its entry is
+        // never written), so it is not turned into a buffer again every frame (review 10-20).
+        const u64 table_pages = BufferCache::BdaNumPages();
         for (u32 i = 1; i <= fault_count; ++i) {
+            if ((fault_buf[i] >> BufferCache::CACHING_PAGEBITS) >= table_pages) {
+                static std::atomic<bool> warned{false};
+                if (!warned.exchange(true)) {
+                    LOG_WARNING(Render_Vulkan, "GPU access at {:#x} above the page table "
+                                               "(SHADPS4_PT_BITS) - it reads 0",
+                                fault_buf[i]);
+                }
+                continue;
+            }
             fault_ranges.Add(fault_buf[i], caching_pagesize);
             LOG_INFO(Render_Vulkan, "Accessed non-GPU cached memory at {:#x}", fault_buf[i]);
         }

@@ -31,6 +31,7 @@
 #include "common/unique_function.h"
 #include "video_core/buffer_cache/back_clean.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/buffer_cache/pt_bits.h"
 #include "video_core/buffer_cache/submit_epoch.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/gpu_range_set.h"
@@ -142,14 +143,15 @@ public:
     static constexpr u64 CACHING_PAGESIZE = u64{1} << CACHING_PAGEBITS;
     static constexpr u64 DEVICE_PAGESIZE = 16_KB;
     static constexpr u64 CACHING_NUMPAGES = u64{1} << (40 - CACHING_PAGEBITS);
-    /// SHADPS4_PT_BITS (36-40, default 40; PERF-PLAN 11, 2026-10-20): the guest address bits the
+    /// SHADPS4_PT_BITS (36-40; default g_pt_auto_bits: 37 below 10 GiB of video memory, else 40;
+    /// PERF-PLAN 11, 2026-10-20; s1461 4 GB sim: +22% mean / +21% p1): the guest address bits the
     /// GPU page table (a device address per 16 KB page) covers. 40 = the PS4 GPU's whole range,
     /// 512 MB of video memory; the game maps GPU memory no higher than 63.5 GB (s1457), so 37 bits
     /// (128 GB) = 64 MB. Above the table: CPU entry writes are clipped, the descriptor readers get
     /// 0 (robustness2: a miss), the native pointer readers clamp to a miss (NativePtTranslate).
     static u64 BdaNumPages() {
         static const u64 pages = [] {
-            u32 bits = 40;
+            u32 bits = g_pt_auto_bits.load(std::memory_order_relaxed);
             if (const char* v = std::getenv("SHADPS4_PT_BITS"); v && std::atoi(v) >= 36 &&
                                                                 std::atoi(v) <= 40) {
                 bits = static_cast<u32>(std::atoi(v));
