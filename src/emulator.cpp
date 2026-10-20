@@ -20,6 +20,7 @@
 #include "common/logging/log.h"
 #include "common/string_util.h"
 #include "common/thread.h"
+#include "common/diag_proj_watch.h"
 #include "common/update_notice.h"
 #include "core/emulator_settings.h"
 #include "core/ipc/ipc.h"
@@ -631,6 +632,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
                                                    window_title);
 
     g_window = window.get();
+    Common::StartProjectionFinder(); // SHADPS4_FIND_PROJ=1 diagnostic (aspect ratio work)
     Common::StartUpdateNotice(); // 1.1: GitHub latest-release check (SHADPS4_UPDATE_CHECK=0 off)
 
     if (auto icon = mnt->ReadFile("/app0/sce_sys/icon0.png")) {
