@@ -277,10 +277,15 @@ void WindowSDL::WaitEvent() {
     // jitter cycle, whose pick D is fixed now - Page Down still cycles). Handled before ImGui and
     // consumed: once the panel has the keyboard ImGui swallowed Page Up, so the key could not
     // close it (user 2026-10-18). Not with Ctrl: Ctrl+Shift+End is the quit hotkey.
+    // Keys from global.ini (Input::EmuKey, user 2026-10-20); 0 = turned off ("none").
+    const auto emu_key = [&event](Input::EmuKey k) {
+        const u32 key = Input::GetEmuKey(k);
+        return key != 0 && event.key.key == key;
+    };
     if (Vulkan::Dlss::Enabled() && event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
-        (event.key.key == SDLK_END || event.key.key == SDLK_PAGEUP) &&
+        (emu_key(Input::EmuKey::Dlss5Toggle) || emu_key(Input::EmuKey::Dlss5Panel)) &&
         !(event.key.mod & SDL_KMOD_CTRL)) {
-        if (event.key.key == SDLK_PAGEUP) {
+        if (emu_key(Input::EmuKey::Dlss5Panel)) {
             Dlss5Panel::Toggle();
         } else if (Vulkan::Dlss5::GetStatus().state != Vulkan::Dlss5::State::Ready) {
             const auto status = Vulkan::Dlss5::GetStatus();
@@ -372,7 +377,7 @@ void WindowSDL::WaitEvent() {
         if (Input::g_synth_motion &&
             (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) &&
             !event.key.repeat &&
-            event.key.key == SDLK_Z) {
+            emu_key(Input::EmuKey::SprayTilt)) {
             // SHADPS4_SYNTH_MOTION (user 2026-10-18): hold Z = tilt the pad sideways; a quick tap of Z
             // (released within 250 ms) = a 600 ms rattle burst. X only toggles the mouse motion mode
             // (global.ini); it used to rattle while held as well.
@@ -386,18 +391,18 @@ void WindowSDL::WaitEvent() {
             }
         }
         if (Vulkan::Dlss::Enabled() && event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
-            (event.key.key == SDLK_HOME || event.key.key == SDLK_PAGEDOWN ||
-             event.key.key == SDLK_INSERT)) {
+            (emu_key(Input::EmuKey::DlssToggle) || emu_key(Input::EmuKey::DlssJitter) ||
+             emu_key(Input::EmuKey::DlssOutputScale))) {
             // SHADPS4_DLSS (vk_dlss.h): Home = DLSS on / off, Page Down = jitter sign combination
             // (D is the pick), Insert = output at the window size / 1.5x (upscale mode).
             if (!Vulkan::Dlss::g_ready.load(std::memory_order_relaxed)) {
                 Overlay::ShowNotice("DLSS not available (see the log)");
-            } else if (event.key.key == SDLK_HOME) {
+            } else if (emu_key(Input::EmuKey::DlssToggle)) {
                 const bool on = !Vulkan::Dlss::g_user_on.load(std::memory_order_relaxed);
                 Vulkan::Dlss::g_user_on.store(on, std::memory_order_relaxed);
                 LOG_INFO(Render_Vulkan, "DLSS: {} (Home)", on ? "on" : "off - the game's own AA");
                 Overlay::ShowNotice(on ? "DLSS: ON" : "DLSS: OFF (game's own anti-aliasing)");
-            } else if (event.key.key == SDLK_INSERT) {
+            } else if (emu_key(Input::EmuKey::DlssOutputScale)) {
                 const float scale =
                     Vulkan::Dlss::g_output_scale.load(std::memory_order_relaxed) > 1.0f ? 1.0f
                                                                                        : 1.5f;
@@ -406,7 +411,7 @@ void WindowSDL::WaitEvent() {
                 Overlay::ShowNotice(scale > 1.0f ? "DLSS output: 1.5x the screen, scaled down"
                                                  : "DLSS output: the screen size");
             } else {
-                const u32 step = event.key.key == SDLK_PAGEDOWN ? 3 : 1;
+                const u32 step = 3; // backwards, as Page Down always did
                 const u32 combo =
                     (Vulkan::Dlss::g_jitter_combo.load(std::memory_order_relaxed) + step) & 3;
                 Vulkan::Dlss::g_jitter_combo.store(combo, std::memory_order_relaxed);
@@ -417,15 +422,15 @@ void WindowSDL::WaitEvent() {
             }
         }
         if (Input::MouseAimActive() && event.type == SDL_EVENT_KEY_DOWN &&
-            (event.key.key == SDLK_MINUS || event.key.key == SDLK_EQUALS)) {
+            (emu_key(Input::EmuKey::MouseAimSlower) || emu_key(Input::EmuKey::MouseAimFaster))) {
             // SHADPS4_MOUSE_AIM: - / = = mouse sensitivity down / up (keys no shipped config binds;
             // the brackets are the default touchpad halves).
             const float s =
-                Core::MouseAim::ScaleSensitivity(event.key.key == SDLK_MINUS ? 0.8f : 1.25f);
+                Core::MouseAim::ScaleSensitivity(emu_key(Input::EmuKey::MouseAimSlower) ? 0.8f : 1.25f);
             Overlay::ShowNotice(fmt::format("Mouse aim: {:.1f} degrees per 100 px", s).c_str());
         }
         if (Input::g_stick_smoothing_toggle && event.type == SDL_EVENT_KEY_DOWN &&
-            event.key.key == SDLK_F1 && !event.key.repeat) {
+            emu_key(Input::EmuKey::StickSmoothing) && !event.key.repeat) {
             // SHADPS4_STICK_SMOOTHING_TOGGLE: F1 flips upstream #5340 live (input/controller.h).
             const bool unsmoothed =
                 !Input::g_real_axis_unsmoothed.load(std::memory_order_relaxed);

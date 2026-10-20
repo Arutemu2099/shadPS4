@@ -3,6 +3,7 @@
 
 #include "input_handler.h"
 
+#include <atomic>
 #include <algorithm>
 #include <fstream>
 #include <iostream>
@@ -185,6 +186,15 @@ std::filesystem::path GetInputConfigFile(const std::string& game_id) {
             {"hotkey_volume_down", "kpminus"},
             {"hotkey_emulator_settings", "f3"},
             {"hotkey_toggle_friends", "f2"},
+            {"hotkey_dlss_toggle", "home"},
+            {"hotkey_dlss_output_scale", "insert"},
+            {"hotkey_dlss_jitter", "pgdown"},
+            {"hotkey_dlss5_toggle", "end"},
+            {"hotkey_dlss5_panel", "pgup"},
+            {"hotkey_mouse_aim_slower", "minus"},
+            {"hotkey_mouse_aim_faster", "equals"},
+            {"hotkey_stick_smoothing", "f1"},
+            {"hotkey_spray_tilt", "z"},
         };
         std::string legacy_capture_binding;
         bool legacy_capture_binding_found = false;
@@ -223,6 +233,52 @@ std::filesystem::path GetInputConfigFile(const std::string& game_id) {
         std::filesystem::copy(default_config_file, config_file);
     }
     return config_file;
+}
+
+namespace {
+struct EmuKeyName {
+    const char* name;
+    u32 default_key;
+};
+constexpr std::array<EmuKeyName, static_cast<size_t>(EmuKey::Count)> emu_key_names{{
+    {"hotkey_dlss_toggle", SDLK_HOME},
+    {"hotkey_dlss_output_scale", SDLK_INSERT},
+    {"hotkey_dlss_jitter", SDLK_PAGEDOWN},
+    {"hotkey_dlss5_toggle", SDLK_END},
+    {"hotkey_dlss5_panel", SDLK_PAGEUP},
+    {"hotkey_mouse_aim_slower", SDLK_MINUS},
+    {"hotkey_mouse_aim_faster", SDLK_EQUALS},
+    {"hotkey_stick_smoothing", SDLK_F1},
+    {"hotkey_spray_tilt", SDLK_Z},
+}};
+constexpr u32 EmuKeyNone = ~0u; // "none" in the config; 0 = the default key
+std::array<std::atomic<u32>, static_cast<size_t>(EmuKey::Count)> emu_keys{};
+
+/// ProcessLine: a hotkey_* line naming one of the emulator's own keys (true = handled).
+bool ParseEmuKeyLine(const std::string& output, const std::string& input) {
+    for (size_t i = 0; i < emu_key_names.size(); ++i) {
+        if (output != emu_key_names[i].name) {
+            continue;
+        }
+        if (input == "none") {
+            emu_keys[i].store(EmuKeyNone, std::memory_order_relaxed);
+        } else if (const auto it = string_to_keyboard_key_map.find(input);
+                   it != string_to_keyboard_key_map.end()) {
+            emu_keys[i].store(it->second, std::memory_order_relaxed);
+        } else {
+            LOG_WARNING(Input, "{}: \"{}\" is not a single keyboard key; kept the default",
+                        output, input);
+        }
+        return true;
+    }
+    return false;
+}
+} // namespace
+
+u32 GetEmuKey(EmuKey key) {
+    const size_t i = static_cast<size_t>(key);
+    const u32 k = emu_keys[i].load(std::memory_order_relaxed);
+    return k == 0 ? emu_key_names[i].default_key : k == EmuKeyNone ? 0 : k;
 }
 
 bool leftjoystick_halfmode = false, rightjoystick_halfmode = false;
@@ -380,6 +436,9 @@ void ParseInputConfig(const std::string game_id = "") {
     lefttrigger_deadzone = default_deadzone;
     righttrigger_deadzone = default_deadzone;
 
+    for (auto& k : emu_keys) {
+        k.store(0, std::memory_order_relaxed); // a reload without the line returns to the default
+    }
     int lineCount = 0;
 
     std::ifstream config_stream(config_file);
@@ -415,6 +474,9 @@ void ParseInputConfig(const std::string game_id = "") {
 
         std::string output_string = line.substr(0, equal_pos);
         std::string input_string = line.substr(equal_pos + 1);
+        if (ParseEmuKeyLine(output_string, input_string)) {
+            return;
+        }
         s8 input_gamepad_id = -1, output_gamepad_id = -1; // -1 means it's not specified
 
         // input gamepad id is only for controllers, it's discarded otherwise

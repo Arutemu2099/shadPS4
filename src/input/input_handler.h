@@ -349,6 +349,23 @@ const std::map<std::string, u32> string_to_keyboard_key_map = {
     {"unmapped", SDL_UNMAPPED},
 };
 
+// 1.1 (user 2026-10-20): the emulator's own single-key controls, remappable in global.ini
+// (hotkey_dlss_toggle = home, ...; "none" turns one off). A laptop whose Home needs Fn could not
+// turn DLSS off. Read by sdl_window.cpp; 0 = no key.
+enum class EmuKey : u8 {
+    DlssToggle,
+    DlssOutputScale,
+    DlssJitter,
+    Dlss5Toggle,
+    Dlss5Panel,
+    MouseAimSlower,
+    MouseAimFaster,
+    StickSmoothing,
+    SprayTilt,
+    Count,
+};
+u32 GetEmuKey(EmuKey key);
+
 void ParseInputConfig(const std::string game_id);
 
 class InputBinding {
