@@ -292,7 +292,7 @@ void DeviceCreated(vk::Instance instance, vk::PhysicalDevice physical_device, vk
         g_jitter_combo.store(static_cast<u32>(std::atoi(v)) & 3, std::memory_order_relaxed);
     }
     g_ready.store(true, std::memory_order_relaxed);
-    LOG_INFO(Render_Vulkan, "DLSS: ready (DLAA 1920x1080; Home = on / off, Page Up = jitter signs)");
+    LOG_INFO(Render_Vulkan, "DLSS: ready (DLAA at the game's render size; Home = on / off)");
 }
 
 PFN_vkQueuePresentKHR PresentFunction() {
@@ -320,10 +320,7 @@ bool Evaluate(vk::CommandBuffer cmdbuf, u64 frame, const EvalImage& color, const
         return false;
     }
     const sl::ViewportHandle viewport{0u};
-    const u32 preset = [] {
-        const char* v = std::getenv("SHADPS4_DLSS_PRESET");
-        return v ? static_cast<u32>(std::atoi(v)) : 0u; // 0 = default (K for DLAA)
-    }();
+    const u32 preset = g_preset.load(std::memory_order_relaxed); // 0 = default (K for DLAA)
     if (preset != g_options_preset || output.width != g_options_width ||
         output.height != g_options_height) {
         sl::DLSSOptions options{};
@@ -333,8 +330,10 @@ bool Evaluate(vk::CommandBuffer cmdbuf, u64 frame, const EvalImage& color, const
         if (output.width != color.width || output.height != color.height) {
             // SHADPS4_DLSS_UPSCALE: the game's 1920x1080 into the window size - the first mode
             // whose render range holds it (1080p -> 1440p is 0.75: Quality, inferred).
+            // Ultra Performance last: SHADPS4_RENDER_HEIGHT=480 into a 1440p window is 0.33.
             constexpr std::array modes{sl::DLSSMode::eMaxQuality, sl::DLSSMode::eUltraQuality,
-                                       sl::DLSSMode::eBalanced, sl::DLSSMode::eMaxPerformance};
+                                       sl::DLSSMode::eBalanced, sl::DLSSMode::eMaxPerformance,
+                                       sl::DLSSMode::eUltraPerformance};
             options.mode = sl::DLSSMode::eMaxQuality;
             for (const sl::DLSSMode m : modes) {
                 options.mode = m;
@@ -358,6 +357,8 @@ bool Evaluate(vk::CommandBuffer cmdbuf, u64 frame, const EvalImage& color, const
         options.qualityPreset = static_cast<sl::DLSSPreset>(preset);
         options.ultraQualityPreset = static_cast<sl::DLSSPreset>(preset);
         options.balancedPreset = static_cast<sl::DLSSPreset>(preset);
+        options.performancePreset = static_cast<sl::DLSSPreset>(preset);
+        options.ultraPerformancePreset = static_cast<sl::DLSSPreset>(preset);
         options.colorBuffersHDR = sl::Boolean::eFalse; // the tonemapped LDR frame
         options.preExposure = 1.0f;
         options.exposureScale = 1.0f;
@@ -371,6 +372,11 @@ bool Evaluate(vk::CommandBuffer cmdbuf, u64 frame, const EvalImage& color, const
             return false;
         }
         g_options_preset = preset;
+        g_status_in_w.store(color.width, std::memory_order_relaxed);
+        g_status_in_h.store(color.height, std::memory_order_relaxed);
+        g_status_out_w.store(output.width, std::memory_order_relaxed);
+        g_status_out_h.store(output.height, std::memory_order_relaxed);
+        g_status_mode.store(static_cast<u32>(options.mode), std::memory_order_relaxed);
         g_options_width = output.width;
         g_options_height = output.height;
         LOG_INFO(Render_Vulkan, "DLSS: options set: mode {} {}x{} -> {}x{}, preset {}",
@@ -475,6 +481,7 @@ bool Evaluate(vk::CommandBuffer cmdbuf, u64 frame, const EvalImage& color, const
         return false;
     }
     ++g_evaluated;
+    g_status_evaluates.store(g_evaluated, std::memory_order_relaxed);
     return true;
 }
 

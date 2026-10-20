@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -52,9 +54,24 @@ inline std::atomic<u32> g_jitter_combo{3}; ///< D (-x -y): the user's live pick,
 /// Insert (SHADPS4_DLSS_UPSCALE): 1 = DLSS writes the window size, 1.5 = 1.5x the window (3840x2160
 /// on a 1440p screen), scaled down by the post pass (supersampling; user idea 2026-10-17).
 inline std::atomic<float> g_output_scale{1.0f};
+/// The network (sl::DLSSPreset number; 0 = the DLL's default, 11 = K, 12 = L, 13 = M): the Page Up
+/// panel, first from SHADPS4_DLSS_PRESET.
+inline std::atomic<u32> g_preset{[] {
+    const char* v = std::getenv("SHADPS4_DLSS_PRESET");
+    return v ? static_cast<u32>(std::atoi(v)) : 0u;
+}()};
+/// What the last options call set (the panel shows it): render -> output size and the mode
+/// (sl::DLSSMode: 0 off, 1 Performance, 2 Balanced, 3 Quality, 4 Ultra Performance, 5 Ultra
+/// Quality, 6 DLAA).
+inline std::atomic<u32> g_status_in_w{0}, g_status_in_h{0}, g_status_out_w{0}, g_status_out_h{0};
+inline std::atomic<u32> g_status_mode{0};
+inline std::atomic<u64> g_status_evaluates{0};
 
 /// Guest code address of fs_a6d23116 once a pipeline lookup has met it (0 = not yet / off).
 inline std::atomic<u64> g_resolve_ps{0};
+/// A frame's SMAA edges draw has told where the colour input is ("Any render size" below): until
+/// then the game's own resolve runs (the first frames of a session).
+inline std::atomic<bool> g_inputs_seen{false};
 
 /// PipelineCache::GetProgram: remembers where the resolve shader lives.
 inline void NoteProgram(bool fragment, u64 hash, VAddr base) {
@@ -67,7 +84,8 @@ inline void NoteProgram(bool fragment, u64 hash, VAddr base) {
 inline bool IsResolve(VAddr ps_address) {
     const u64 a = g_resolve_ps.load(std::memory_order_relaxed);
     return a != 0 && a == ps_address && g_ready.load(std::memory_order_relaxed) &&
-           g_user_on.load(std::memory_order_relaxed);
+           g_user_on.load(std::memory_order_relaxed) &&
+           g_inputs_seen.load(std::memory_order_relaxed);
 }
 
 // The frame's jitter phase (study sec. 1.4): the game alternates two quarter-pixel offsets and
@@ -127,9 +145,143 @@ inline void NoteWeightsInfo(const Shader::Info& info, VAddr base) {
 }
 
 /// Next to every ClassifyDraw call that parses the stream in order (front, lean workers, inline).
+// ---- Any render size (2026-10-20, v1.1 part C) ----
+// The addresses above hold at the game's 1920x1080. When the game renders at another size
+// (SHADPS4_ASPECT, SHADPS4_RENDER_HEIGHT, a community resolution patch) its targets sit elsewhere
+// (a 1440p patch: no input at 0x2f9e10000, a yellow picture - RTX 5070 Ti report, 10-20). So the
+// inputs are read every frame from the draws that use them, on the parsing thread (NoteDraw):
+//  - SMAA edges fs_abc3c768 samples the tonemap output (its RGBA8 texture) with the scene depth
+//    attached (rooftop replay EID 39235, measured);
+//  - the resolve fs_a6d23116 samples the motion vectors (its one RG16F texture; its size = the
+//    game's render size) and writes the HUD layer (its colour target).
+// Until a frame has run them, the 1080p addresses stand (the values learned at 1080p equal them).
+constexpr u64 EdgesPsHash = 0xabc3c768;
+struct ShaderTap {
+    std::atomic<u64> ps{0};
+    std::atomic<Shader::PFN_SrtWalker> walker{nullptr};
+    std::atomic<u32> flat_dw{0};
+    std::atomic<u32> count{0};
+    std::array<std::atomic<u32>, 8> sharps{}; ///< sharp_idx | 0x80000000 for a 128-bit T#
+};
+inline ShaderTap g_edges_tap;
+inline ShaderTap g_resolve_tap;
+inline std::atomic<VAddr> g_color_addr{ColorInAddr};
+inline std::atomic<VAddr> g_motion_addr{MotionAddr};
+inline std::atomic<VAddr> g_depth_addr{DepthAddr};
+inline std::atomic<VAddr> g_hud_addr{0x26bd70000}; ///< the resolve's target = the HUD layer
+inline std::atomic<u32> g_game_width{1920};
+inline std::atomic<u32> g_game_height{1080};
+
+/// Where a tapped program's Info is known: its texture slots in the (flattened) user data.
+inline void NoteTapInfo(ShaderTap& tap, const Shader::Info& info, VAddr base) {
+    if (tap.ps.load(std::memory_order_relaxed) == base) [[likely]] {
+        return;
+    }
+    const bool flat = info.srt_info.walker_func != nullptr &&
+                      info.srt_info.flattened_bufsize_dw <= 1024;
+    const u32 limit = flat ? info.srt_info.flattened_bufsize_dw : 16u;
+    u32 n = 0;
+    for (const auto& img : info.images) {
+        const u32 size_dw = img.is_r128 ? 4u : 8u;
+        if (img.sharp_idx + size_dw > limit || n >= tap.sharps.size()) {
+            continue;
+        }
+        tap.sharps[n++].store(img.sharp_idx | (img.is_r128 ? 0x80000000u : 0u),
+                              std::memory_order_relaxed);
+    }
+    tap.count.store(n, std::memory_order_relaxed);
+    tap.walker.store(flat ? info.srt_info.walker_func : nullptr, std::memory_order_relaxed);
+    tap.flat_dw.store(flat ? info.srt_info.flattened_bufsize_dw : 16u, std::memory_order_relaxed);
+    tap.ps.store(base, std::memory_order_release);
+    LOG_INFO(Render_Vulkan, "DLSS: input tap fs_{:08x} at {:#x}, {} of {} textures readable ({})",
+             info.pgm_hash, base, n, info.images.size(), flat ? "pointer table" : "user data");
+}
+
+/// The pipeline lookup's Info sites: the weights CB and the two input taps.
+inline void NoteShaderInfo(const Shader::Info& info, VAddr base) {
+    if (info.stage != Shader::Stage::Fragment || !Enabled()) [[likely]] {
+        return;
+    }
+    if (info.pgm_hash == EdgesPsHash) {
+        NoteTapInfo(g_edges_tap, info, base);
+    } else if (info.pgm_hash == ResolvePsHash) {
+        NoteTapInfo(g_resolve_tap, info, base);
+    }
+}
+
+/// A tapped draw's textures (T#), read from its user data as binding does.
+template <typename Fn>
+inline void ForEachTapImage(const ShaderTap& tap, const AmdGpu::Regs& regs, Fn&& fn) {
+    const u32 n = tap.count.load(std::memory_order_relaxed);
+    const auto walker = tap.walker.load(std::memory_order_relaxed);
+    const u32* ud = regs.ps_program.user_data.data();
+    thread_local std::vector<u32> flat;
+    if (walker != nullptr) {
+        flat.assign(std::max(tap.flat_dw.load(std::memory_order_relaxed), 16u), 0u);
+        std::memcpy(flat.data(), ud, 16 * sizeof(u32));
+        walker(ud, flat.data());
+        ud = flat.data();
+    }
+    for (u32 i = 0; i < n; ++i) {
+        const u32 s = tap.sharps[i].load(std::memory_order_relaxed);
+        AmdGpu::Image image{};
+        std::memcpy(&image, ud + (s & 0x7fffffffu), (s & 0x80000000u) ? 16 : sizeof(image));
+        if (s & 0x80000000u) {
+            image.pitch = image.width;
+        }
+        if (image.Valid() && image.Address() != 0) {
+            fn(image);
+        }
+    }
+}
+
+template <typename T>
+inline void StoreIfChanged(std::atomic<T>& a, T v) {
+    if (a.load(std::memory_order_relaxed) != v) {
+        a.store(v, std::memory_order_relaxed);
+    }
+}
+
+/// NoteDraw: the edges draw -> colour input + depth; the resolve -> motion vectors, render size,
+/// HUD layer.
+inline void NoteInputDraw(const AmdGpu::Regs& regs, VAddr ps) {
+    if (ps == g_edges_tap.ps.load(std::memory_order_acquire)) {
+        bool found = false;
+        ForEachTapImage(g_edges_tap, regs, [&](const AmdGpu::Image& image) {
+            if (!found && image.GetDataFmt() == AmdGpu::DataFormat::Format8_8_8_8) {
+                StoreIfChanged(g_color_addr, image.Address());
+                StoreIfChanged(g_inputs_seen, true);
+                found = true;
+            }
+        });
+        if (const VAddr z = regs.depth_buffer.DepthAddress(); z != 0) {
+            StoreIfChanged(g_depth_addr, z);
+        }
+    } else if (ps == g_resolve_tap.ps.load(std::memory_order_acquire)) {
+        bool found = false;
+        ForEachTapImage(g_resolve_tap, regs, [&](const AmdGpu::Image& image) {
+            if (!found && image.GetDataFmt() == AmdGpu::DataFormat::Format16_16 &&
+                image.GetNumberFmt() == AmdGpu::NumberFormat::Float) {
+                StoreIfChanged(g_motion_addr, image.Address());
+                StoreIfChanged(g_game_width, static_cast<u32>(image.width) + 1);
+                StoreIfChanged(g_game_height, static_cast<u32>(image.height) + 1);
+                found = true;
+            }
+        });
+        StoreIfChanged(g_hud_addr, static_cast<VAddr>(regs.color_buffers[0].Address()));
+    }
+}
+
 inline void NoteDraw(const AmdGpu::Regs& regs) {
+    const VAddr ps = regs.ps_program.Address<VAddr>();
     const u64 w = g_weights_ps.load(std::memory_order_relaxed);
-    if (w == 0 || regs.ps_program.Address<VAddr>() != w) [[likely]] {
+    if (w == 0 || ps != w) [[likely]] {
+        if (ps == g_edges_tap.ps.load(std::memory_order_relaxed) ||
+            ps == g_resolve_tap.ps.load(std::memory_order_relaxed)) [[unlikely]] {
+            if (ps != 0) {
+                NoteInputDraw(regs, ps);
+            }
+        }
         return;
     }
     const u32 ud = g_weights_ud.load(std::memory_order_relaxed);

@@ -8,7 +8,9 @@
 
 #include "imgui/dlss5_panel.h"
 #include "imgui/imgui_layer.h"
+#include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_dlss5.h"
+#include "video_core/renderer_vulkan/vk_dlss_upscale.h"
 
 namespace Dlss5Panel {
 
@@ -41,8 +43,13 @@ private:
     void LiveSlider(const char* label, float* value, float min, float max, const char* format,
                     const char* tip);
     /// One of a row of `count` buttons choosing `*value`.
-    void Choice(const char* label, int* value, int choice, int index, int count, const char* tip);
+    /// `commit` = false: not a DLSS 5 setting (the caller applies it).
+    void Choice(const char* label, int* value, int choice, int index, int count, const char* tip,
+                bool commit = true);
     void DrawStatus(const D5::Status& status);
+    /// DLSS 4.5 (Super Resolution / DLAA): on / off, output size, network, render size (v1.1,
+    /// user 10-20: "page up ... dlss 4.5 and 5 settings").
+    void DrawDlss45();
 
     D5::Settings edit{};
 };
@@ -71,7 +78,7 @@ void Panel::LiveSlider(const char* label, float* value, float min, float max, co
 }
 
 void Panel::Choice(const char* label, int* value, int choice, int index, int count,
-                   const char* tip) {
+                   const char* tip, bool commit) {
     if (index > 0) {
         ImGui::SameLine();
     }
@@ -87,7 +94,9 @@ void Panel::Choice(const char* label, int* value, int choice, int index, int cou
                               static_cast<float>(count - index);
     if (ImGui::Button(label, ImVec2(w, 0)) && !selected) {
         *value = choice;
-        Commit();
+        if (commit) {
+            Commit();
+        }
     }
     if (selected) {
         ImGui::PopStyleColor(2);
@@ -164,6 +173,98 @@ void Panel::DrawStatus(const D5::Status& status) {
     }
 }
 
+void Panel::DrawDlss45() {
+    namespace D = Vulkan::Dlss;
+    std::string line;
+    ImVec4 colour = Grey;
+    const bool ready = D::g_ready.load(std::memory_order_relaxed);
+    const bool on = D::g_user_on.load(std::memory_order_relaxed);
+    const u32 in_w = D::g_status_in_w.load(std::memory_order_relaxed);
+    const u32 in_h = D::g_status_in_h.load(std::memory_order_relaxed);
+    const u32 out_w = D::g_status_out_w.load(std::memory_order_relaxed);
+    const u32 out_h = D::g_status_out_h.load(std::memory_order_relaxed);
+    static const char* const mode_names[] = {"off",         "Performance", "Balanced",
+                                             "Quality",     "Ultra Performance",
+                                             "Ultra Quality", "DLAA"};
+    const u32 mode = D::g_status_mode.load(std::memory_order_relaxed);
+    if (!D::Enabled()) {
+        line = "Off in the settings (SHADPS4_DLSS=1 turns it on).";
+    } else if (!ready) {
+        colour = Red;
+        line = "Not available: an NVIDIA RTX card and the files in dlss\\ are needed (or it "
+               "stepped aside - see the log).";
+    } else if (!on) {
+        colour = Yellow;
+        line = "Off - the game's own anti-aliasing (Home or the box below).";
+    } else if (in_w == 0) {
+        colour = Yellow;
+        line = "Waiting for the first game frame.";
+    } else {
+        colour = Green;
+        line = "Running: the game's " + std::to_string(in_w) + "x" + std::to_string(in_h) +
+               (out_w == in_w && out_h == in_h
+                    ? std::string{" (DLAA, no upscale)"}
+                    : " -> " + std::to_string(out_w) + "x" + std::to_string(out_h) + " (" +
+                          (mode < 7 ? mode_names[mode] : "?") + ")");
+    }
+    ImGui::PushStyleColor(ImGuiCol_Text, colour);
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 470.0f);
+    ImGui::TextWrapped("%s", line.c_str());
+    ImGui::PopTextWrapPos();
+    ImGui::PopStyleColor();
+
+    ImGui::BeginDisabled(!ready);
+    bool user_on = on;
+    if (ImGui::Checkbox("DLSS on  (Home)", &user_on)) {
+        D::g_user_on.store(user_on, std::memory_order_relaxed);
+    }
+    ImGui::SetItemTooltip("Off = the game's own anti-aliasing (instant compare).");
+
+    ImGui::TextUnformatted("Output");
+    const bool upscaling = D::g_hud_layer.load(std::memory_order_relaxed);
+    int scale = D::g_output_scale.load(std::memory_order_relaxed) > 1.0f ? 1 : 0;
+    const int was_scale = scale;
+    ImGui::BeginDisabled(!upscaling);
+    Choice("Screen size", &scale, 0, 0, 2,
+           "DLSS draws the picture at your screen's size (Insert switches).", false);
+    Choice("1.5x screen (sharper, slower)", &scale, 1, 1, 2,
+           "DLSS draws 1.5x your screen's size and it is scaled down - a sharper picture\nfor "
+           "more graphics-card time (Insert switches).", false);
+    ImGui::EndDisabled();
+    if (!upscaling) {
+        ImGui::SetItemTooltip("Only when the window is larger than the game's render size.");
+    }
+    if (scale != was_scale) {
+        D::g_output_scale.store(scale == 1 ? 1.5f : 1.0f, std::memory_order_relaxed);
+    }
+
+    ImGui::TextUnformatted("Network");
+    int preset = static_cast<int>(D::g_preset.load(std::memory_order_relaxed));
+    const int was_preset = preset;
+    Choice("Default", &preset, 0, 0, 4, "The DLL's own choice for the mode (K for DLAA).", false);
+    Choice("K", &preset, 11, 1, 4,
+           "Preset K: the first transformer model (DLSS 4) - the usual DLAA / Quality pick.", false);
+    Choice("L", &preset, 12, 2, 4,
+           "Preset L: the newer model (DLSS 4.5) - sharper and steadier, the most GPU time.\n"
+           "NVIDIA's pick for Ultra Performance (480p).", false);
+    Choice("M", &preset, 13, 3, 4,
+           "Preset M: the newer model (DLSS 4.5), closer to K's speed.\nNVIDIA's pick for "
+           "Performance (720p).", false);
+    if (preset != was_preset) {
+        D::g_preset.store(static_cast<u32>(preset), std::memory_order_relaxed);
+    }
+    ImGui::EndDisabled();
+
+    ImGui::PushStyleColor(ImGuiCol_Text, Grey);
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 470.0f);
+    ImGui::TextWrapped("Render size: SHADPS4_RENDER_HEIGHT=720 (or 480) in shadps4-flags-user.txt "
+                       "makes the game render smaller and DLSS (or the normal scaler on other "
+                       "cards) bring it up to the screen - faster on weaker cards. Needs a "
+                       "restart.");
+    ImGui::PopTextWrapPos();
+    ImGui::PopStyleColor();
+}
+
 void Panel::Draw() {
     if (closing) {
         return;
@@ -187,10 +288,32 @@ void Panel::Draw() {
     ImGui::PushStyleColor(ImGuiCol_SliderGrab, Accent);
     ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, Accent);
     bool keep_open = true;
-    if (ImGui::Begin("DLSS 5 - Neural Rendering###dlss5panel", &keep_open,
+    if (ImGui::Begin("DLSS###dlss5panel", &keep_open,
                      ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize |
                          ImGuiWindowFlags_NoSavedSettings)) {
         ImGui::SetWindowFontScale(1.15f);
+        ImGui::SeparatorText("DLSS 4.5  (Super Resolution / DLAA)");
+        DrawDlss45();
+        ImGui::Spacing();
+        ImGui::SeparatorText("DLSS 5  (Neural Rendering)");
+        // Without the DLSS 5 files (every public build): one line, none of its controls.
+        if (status.state == D5::State::Off || status.state == D5::State::NotFound) {
+            ImGui::PushStyleColor(ImGuiCol_Text, Grey);
+            ImGui::TextUnformatted("Not installed.");
+            ImGui::PopStyleColor();
+            ImGui::Spacing();
+            if (ImGui::Button("Close  (Page Up)")) {
+                keep_open = false;
+            }
+            ImGui::End();
+            ImGui::PopStyleColor(2);
+            ImGui::PopStyleVar(3);
+            if (!keep_open && !closing.exchange(true)) {
+                ImGui::Layer::RemoveLayer(this);
+                g_open.store(false, std::memory_order_release);
+            }
+            return;
+        }
         DrawStatus(status);
 
         const bool usable = status.state == D5::State::Ready;

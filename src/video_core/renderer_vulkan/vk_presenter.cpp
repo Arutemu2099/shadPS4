@@ -915,7 +915,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     std::optional<Dlss::CompositeJob> dlss_job;
     if (Dlss::Upscaler* upscaler = Dlss::GetUpscaler(instance)) {
         if (upscaler->Ready() && !(Dlss::UpscaleTestBits() & 1)) {
-            const auto hud_id = texture_cache.FindImageAtSize(Dlss::HudLayerAddr, 1920, 1080);
+            const auto hud_id = texture_cache.FindImageAtSize(
+                Dlss::HudLayerAddr(), Dlss::g_game_width.load(std::memory_order_relaxed),
+                Dlss::g_game_height.load(std::memory_order_relaxed));
             if (hud_id) {
                 auto& hud = texture_cache.GetImage(hud_id);
                 hud.Transit(vk::ImageLayout::eShaderReadOnlyOptimal,

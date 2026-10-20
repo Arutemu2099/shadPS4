@@ -389,16 +389,29 @@ void SetScreenSize(int width, int height) {
 //   auto (default): wider screens see more at the sides, narrower ones (16:10, 4:3, 1:1) more above
 //        and below (the 16:9 width is kept); crop: narrow screens cut the sides instead; W:H (e.g.
 //        21:9, 32:9, 4:3): that shape; off.
-// Decided once at boot (the size setup runs once): a new window shape needs a restart. DLSS steps
-// aside at a non-1080p frame (vk_rasterizer DlssResolve).
+// Decided once at boot (the size setup runs once): a new window shape needs a restart. DLSS finds
+// its inputs at any size (vk_dlss.h "Any render size").
+// SHADPS4_RENDER_HEIGHT (1.1, user 2026-10-20: "720p or 480p internal" for weaker cards): the
+// height the game renders at instead of 1080 (360 - 2160; the width follows the shape). Every
+// buffer, the HUD and the camera follow as for a shape; the presenter (FSR) or DLSS scales the
+// picture to the window. E.g. 720 = 1280x720 (0.44x the pixels), 480 = 856x480 (0.2x), 1440 =
+// 2560x1440 (supersampling).
 static void ApplyAspectRatio() {
     const char* env = std::getenv("SHADPS4_ASPECT");
     const std::string mode = env ? env : "auto";
-    if (mode == "off" || mode == "0") {
-        return;
+    const auto round8 = [](double v) { return u32(std::lround(v / 8.0) * 8); };
+    u32 h0 = 1080;
+    if (const char* rh = std::getenv("SHADPS4_RENDER_HEIGHT"); rh && std::atoi(rh) > 0) {
+        h0 = std::clamp(round8(std::atof(rh)), 360u, 2160u);
     }
+    const u32 w0 = round8(h0 * 16.0 / 9.0); // the 16:9 size at that height (1920 at 1080)
     double aspect = 0.0;
-    if (const auto colon = mode.find(':'); colon != std::string::npos) {
+    if (mode == "off" || mode == "0") {
+        if (h0 == 1080) {
+            return;
+        }
+        aspect = 16.0 / 9.0;
+    } else if (const auto colon = mode.find(':'); colon != std::string::npos) {
         const double w = std::atof(mode.substr(0, colon).c_str());
         const double h = std::atof(mode.substr(colon + 1).c_str());
         aspect = h > 0.0 ? w / h : 0.0;
@@ -408,9 +421,12 @@ static void ApplyAspectRatio() {
     constexpr double base = 16.0 / 9.0;
     // 3%: a "1280x720" window reports a client area like 1279x724 (measured, s1427).
     if (aspect <= 0.0 || std::abs(aspect - base) < 0.03 * base) {
-        return; // 16:9 or unknown: nothing to do
+        if (h0 == 1080) {
+            return; // 16:9 or unknown at 1080: nothing to do
+        }
+        aspect = base;
     }
-    const bool narrow = aspect < base;
+    const bool narrow = aspect < base - 1e-6;
     // Narrow screens (not crop): the camera keeps the 16:9 horizontal view and gains picture above
     // and below. The projection builder 0x800581c90 computes P00 = 2 / (r - l) / tanX and
     // P11 = 2 / (t - b) / tanY from ONE load of 2.0 (0x581d10, used by those two divisions only);
@@ -426,10 +442,10 @@ static void ApplyAspectRatio() {
         LOG_ERROR(Loader, "SHADPS4_ASPECT: refused, the projection builder differs (eboot 01.07)");
         return;
     }
-    // Multiples of 8; wide: height 1080, narrow: width 1920 (at most 3840 x 1920).
-    const auto round8 = [](double v) { return u32(std::lround(v / 8.0) * 8); };
-    const u32 w = narrow ? 1920u : std::min(3840u, round8(1080.0 * aspect));
-    const u32 h = narrow ? std::min(1920u, round8(1920.0 / aspect)) : 1080u;
+    // Multiples of 8; wide: the height h0 (1080), narrow: its 16:9 width w0 (1920); at most 32:9
+    // (3840 x 1080) and 1:1 (1920 x 1920).
+    const u32 w = narrow ? w0 : std::min(round8(h0 * 32.0 / 9.0), round8(h0 * aspect));
+    const u32 h = narrow ? std::min(w0, round8(w0 / aspect)) : h0;
     struct Imm {
         u64 offset;
         u32 original;
@@ -463,8 +479,8 @@ static void ApplyAspectRatio() {
         const s32 disp = s32(0x581c84 - (0x581d10 + 8)); // rip-relative from the next instruction
         std::memcpy(reinterpret_cast<void*>(g_eboot_address + 0x581d10 + 4), &disp, 4);
     }
-    LOG_INFO(Loader, "SHADPS4_ASPECT: the game renders {}x{} (aspect {:.3f}, screen {}x{}, {}{})", w,
-             h, aspect, g_screen_w, g_screen_h, mode,
+    LOG_INFO(Loader, "SHADPS4_ASPECT: the game renders {}x{} (aspect {:.3f}, screen {}x{}, {}, "
+             "render height {}{})", w, h, aspect, g_screen_w, g_screen_h, mode, h0,
              add_vertical ? ", 16:9 width kept, more picture above / below" : "");
 }
 
@@ -480,7 +496,7 @@ static void ApplyHudWidth() {
     // Default: 16:9 on a widened picture (the HUD art is made for 16:9; at full width the minimap
     // ends partly off the right edge, s1427), the full width otherwise.
     const char* env = std::getenv("SHADPS4_HUD");
-    const std::string v = env ? env : (g_render_w > 1920 ? "16:9" : "full");
+    const std::string v = env ? env : (double(g_render_w) * 9.0 > double(g_render_h) * 16.0 * 1.03 ? "16:9" : "full");
     if (v == "full") {
         return;
     }

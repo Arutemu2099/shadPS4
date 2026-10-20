@@ -26,7 +26,10 @@ class Instance;
 // no dynamic colour write mask.
 namespace Vulkan::Dlss {
 
-constexpr VAddr HudLayerAddr = 0x26bd70000;
+/// The resolve's target (0x26bd70000 at 1080p; learned per frame, vk_dlss.h "Any render size").
+inline VAddr HudLayerAddr() {
+    return g_hud_addr.load(std::memory_order_relaxed);
+}
 
 bool UpscaleWanted();
 
@@ -48,7 +51,7 @@ inline void ApplyHudLayerMask(Masks& masks, VAddr cb0_address) {
     constexpr vk::ColorComponentFlags rgb =
         vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
         vk::ColorComponentFlagBits::eB;
-    if (cb0_address == HudLayerAddr && masks[0] == rgb && HudLayerActive() &&
+    if (cb0_address == HudLayerAddr() && masks[0] == rgb && HudLayerActive() &&
         !(UpscaleTestBits() & 2)) {
         masks[0] = rgb | vk::ColorComponentFlagBits::eA;
     }

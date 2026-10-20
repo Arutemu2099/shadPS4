@@ -1657,45 +1657,54 @@ void Rasterizer::DlssResolve() {
     const auto& regs = liverpool->BackRegs();
     VideoCore::TextureCache::ImageDesc out_desc{regs.color_buffers[0], liverpool->BackCbExtent(0)};
     auto& out = texture_cache.GetImage(texture_cache.FindImage(out_desc, true));
-    // The inputs are found at the 1080p frame's fixed addresses (vk_dlss.h). A game patch that
-    // changes the render size (e.g. "Render resolution 2560x1440") moves them: no input is found
-    // and the target would keep stale memory (RTX 5070 Ti report, 10-20: a yellow picture). DLSS
-    // then steps aside for the session: g_ready off stops the classification (the game's own T2x
-    // resolve runs from the next frame on, on every path), the upscaler and DLSS 5.
-    if (out.info.size.width != 1920 || out.info.size.height != 1080) [[unlikely]] {
-        // Resolves already classified before the switch land here too: one line is enough.
-        if (!Dlss::g_ready.exchange(false, std::memory_order_relaxed)) {
-            return;
-        }
-        LOG_WARNING(Render_Vulkan,
-                    "DLSS steps aside: the game renders at {}x{} (a resolution patch?); the "
-                    "game's own anti-aliasing runs",
-                    out.info.size.width, out.info.size.height);
-        return;
-    }
-    // By address and size: 0x26b200000 also holds the minimap's 768x768 depth after the AA
-    // (play log 2026-10-17: depth "missing" on 109,135 of 109,569 resolves).
+    // The inputs come from this frame's SMAA edges draw and the resolve itself (vk_dlss.h "Any
+    // render size"; the 1080p addresses until those ran). Found by address and size: 0x26b200000
+    // also holds the minimap's 768x768 depth after the AA (play log 2026-10-17: depth "missing"
+    // on 109,135 of 109,569 resolves).
+    const VAddr color_addr = Dlss::g_color_addr.load(std::memory_order_relaxed);
+    const VAddr motion_addr = Dlss::g_motion_addr.load(std::memory_order_relaxed);
+    const VAddr depth_addr = Dlss::g_depth_addr.load(std::memory_order_relaxed);
     const auto find = [&](VAddr address) -> VideoCore::Image* {
         const VideoCore::ImageId id = texture_cache.FindImageAtSize(
             address, out.info.size.width, out.info.size.height);
         return id ? &texture_cache.GetImage(id) : nullptr;
     };
-    VideoCore::Image* in = find(Dlss::ColorInAddr);
+    VideoCore::Image* in = find(color_addr);
     if (!in || in->info.pixel_format != out.info.pixel_format) [[unlikely]] {
+        // A target that keeps stale memory would show (a 1440p patch before 1.1: a yellow
+        // picture, RTX 5070 Ti report 10-20). Off the 1080p frame DLSS then steps aside for the
+        // session: g_ready off stops the classification (the game's own T2x resolve runs from the
+        // next frame on, on every path), the upscaler and DLSS 5.
+        if (out.info.size.width != 1920 || out.info.size.height != 1080) {
+            // Resolves already classified before the switch land here too: one line is enough.
+            if (Dlss::g_ready.exchange(false, std::memory_order_relaxed)) {
+                LOG_WARNING(Render_Vulkan,
+                            "DLSS steps aside: no colour input at {:#x} for the game's {}x{} "
+                            "frame; the game's own anti-aliasing runs",
+                            color_addr, out.info.size.width, out.info.size.height);
+            }
+            return;
+        }
         if (++dlss_missing <= 8) {
             LOG_WARNING(Render_Vulkan, "DLSS: no matching input at {:#x} for output {:#x} ({}x{}); "
                                        "the resolve's target keeps last frame's picture",
-                        Dlss::ColorInAddr, regs.color_buffers[0].Address(), out.info.size.width,
+                        color_addr, regs.color_buffers[0].Address(), out.info.size.width,
                         out.info.size.height);
         }
         return;
+    }
+    if (dlss_calls == 1 || (dlss_calls & 1023) == 1) {
+        LOG_INFO(Render_Vulkan, "DLSS: inputs at {}x{}: colour {:#x}, motion {:#x}, depth {:#x}, "
+                                "HUD layer {:#x}",
+                 out.info.size.width, out.info.size.height, color_addr, motion_addr, depth_addr,
+                 regs.color_buffers[0].Address());
     }
     scheduler.EndRendering();
     bool evaluated = false;
     bool hud_layer = false;
     if (Dlss::Mode() == 1) {
-        VideoCore::Image* motion = find(Dlss::MotionAddr);
-        VideoCore::Image* depth = find(Dlss::DepthAddr);
+        VideoCore::Image* motion = find(motion_addr);
+        VideoCore::Image* depth = find(depth_addr);
         if (motion && depth) [[likely]] {
             in->Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {});
             motion->Transit(vk::ImageLayout::eShaderReadOnlyOptimal,
@@ -1771,7 +1780,7 @@ void Rasterizer::DlssResolve() {
             scheduler.InvalidateNativeHeaps();
         } else if (++dlss_missing <= 8) {
             LOG_WARNING(Render_Vulkan, "DLSS: motion vectors {:#x} {} / depth {:#x} {} - copy this frame",
-                        Dlss::MotionAddr, motion ? "found" : "missing", Dlss::DepthAddr,
+                        motion_addr, motion ? "found" : "missing", depth_addr,
                         depth ? "found" : "missing");
         }
     }

@@ -15,8 +15,6 @@
 namespace Vulkan::Dlss {
 
 namespace {
-constexpr u32 GameWidth = 1920;
-constexpr u32 GameHeight = 1080;
 constexpr vk::ImageUsageFlags SceneUsage =
     vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
     vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc;
@@ -122,9 +120,13 @@ void Upscaler::SetOutputSize(u32 width, u32 height) {
     const float scale = force ? 1.0f : g_output_scale.load(std::memory_order_relaxed);
     const u32 out_w = std::min<u32>(static_cast<u32>(width * scale + 0.5f), 7680);
     const u32 out_h = std::min<u32>(static_cast<u32>(height * scale + 0.5f), 4320);
-    output_size = force ? vk::Extent2D{GameWidth, GameHeight} : vk::Extent2D{out_w, out_h};
+    // The game's render size (1920x1080, or what SHADPS4_ASPECT / SHADPS4_RENDER_HEIGHT / a
+    // resolution patch made it; learned from the resolve, vk_dlss.h).
+    const u32 game_w = g_game_width.load(std::memory_order_relaxed);
+    const u32 game_h = g_game_height.load(std::memory_order_relaxed);
+    output_size = force ? vk::Extent2D{game_w, game_h} : vk::Extent2D{out_w, out_h};
     // DLSS needs an output larger than its input; smaller windows keep DLAA in place.
-    const bool on = (force || (width > GameWidth && height > GameHeight)) && g_ready.load() &&
+    const bool on = (force || (width > game_w && height > game_h)) && g_ready.load() &&
                     instance.IsDynamicColorWriteMaskSupported();
     if (on != g_hud_layer.load(std::memory_order_relaxed)) {
         LOG_INFO(Render_Vulkan, "DLSS upscale: {} (output {}x{}{})", on ? "on" : "off",
