@@ -634,6 +634,38 @@ void ParseInputConfig(const std::string game_id = "") {
         LOG_INFO(Input, "Mouse aim: R2 / L2 on the left / right button {}",
                  config_uses_buttons ? "skipped (the config binds the mouse buttons)" : "added");
     }
+    // 1.1 (user 2026-10-20): controllers without a touchpad (Xbox and others) hold the touchpad
+    // halves with D-pad up (left; it keeps its menu action) and Back / View / Share (right): drain
+    // power sources, the two-finger intro. Added unless the config already binds a touchpad half
+    // to a controller button or uses Back; SHADPS4_PAD_TOUCH_HALVES=0 turns it off.
+    static const bool pad_touch = [] {
+        const char* v = std::getenv("SHADPS4_PAD_TOUCH_HALVES");
+        return !(v && v[0] == '0');
+    }();
+    if (pad_touch) {
+        const auto uses_pad = [](const BindingConnection& c, u32 id) {
+            return std::ranges::any_of(c.binding.keys, [id](const InputID& k) {
+                return k.type == InputType::Controller && k.sdl_id == id;
+            });
+        };
+        const bool halves_bound = std::ranges::any_of(connections, [&](const BindingConnection& c) {
+            const u32 b = c.output->button;
+            return (b == SDL_GAMEPAD_BUTTON_TOUCHPAD_LEFT || b == SDL_GAMEPAD_BUTTON_TOUCHPAD_RIGHT) &&
+                   std::ranges::any_of(c.binding.keys, [](const InputID& k) {
+                       return k.type == InputType::Controller;
+                   });
+        });
+        const bool back_used = std::ranges::any_of(
+            connections, [&](const BindingConnection& c) { return uses_pad(c, SDL_GAMEPAD_BUTTON_BACK); });
+        if (!halves_bound && !back_used) {
+            line = "touchpad_left = pad_up";
+            ProcessLine();
+            line = "touchpad_right = back";
+            ProcessLine();
+        }
+        LOG_INFO(Input, "Controller touchpad halves (D-pad up / Back): {}",
+                 halves_bound || back_used ? "skipped (the config binds them)" : "added");
+    }
     std::sort(connections.begin(), connections.end());
     for (auto& c : connections) {
         LOG_DEBUG(Input, "Binding: {} : {}", c.output->ToString(), c.binding.ToString());
@@ -1003,15 +1035,21 @@ InputEvent BindingConnection::ProcessBinding() {
 
     // Store pointers to flags in pressed_keys that need to be set if all keys are active
     std::list<bool*> flags_to_set;
+    // 1.1 (user 2026-10-20, controllers without a touchpad): a touchpad-half output shares its
+    // button with the button's own action (pad_up = pad_up and touchpad_left = pad_up both fire):
+    // it neither takes the key from other bindings nor is blocked by one that took it.
+    const bool shares_key = output->button == SDL_GAMEPAD_BUTTON_TOUCHPAD_LEFT ||
+                            output->button == SDL_GAMEPAD_BUTTON_TOUCHPAD_CENTER ||
+                            output->button == SDL_GAMEPAD_BUTTON_TOUCHPAD_RIGHT;
 
     // Check if all keys in input_keys are active
     for (InputID key : input_keys) {
         bool key_found = false;
 
         while (pressed_it != pressed_keys.end()) {
-            if (pressed_it->first.input == key && (pressed_it->second == false)) {
+            if (pressed_it->first.input == key && (pressed_it->second == false || shares_key)) {
                 key_found = true;
-                if (output->positive_axis) {
+                if (output->positive_axis && !shares_key) {
                     flags_to_set.push_back(&pressed_it->second);
                 }
                 if (pressed_it->first.input.type == InputType::Axis) {
