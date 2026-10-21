@@ -60,7 +60,8 @@ private:
     std::vector<BigPictureMode::IconInfo> profileIcons = {};
     std::vector<GameInstallDir> m_GameInstallDirs = {};
 
-    float uiScale = 1.0f;
+    float uiScale = 1.0f;   ///< in effect this frame: userScale x the window-size fit
+    float userScale = 1.0f; ///< the UI Scale slider (saved)
     SettingsCategory currentCategory = SettingsCategory::Profiles;
     std::string currentProfile = "Global";
 

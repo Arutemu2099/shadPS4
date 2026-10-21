@@ -249,12 +249,13 @@ SettingsWindow::SettingsWindow(bool gameRunning) : isGameRunning(gameRunning) {
 }
 
 void SettingsWindow::Prepare() {
-    uiScale = EmulatorSettings.GetBigPictureScale() / 1000.f;
+    userScale = EmulatorSettings.GetBigPictureScale() / 1000.f;
+    uiScale = userScale;
 }
 
 void SettingsWindow::DeInit() {
     EmulatorSettings.Load();
-    EmulatorSettings.SetBigPictureScale(static_cast<int>(uiScale * 1000));
+    EmulatorSettings.SetBigPictureScale(static_cast<int>(userScale * 1000));
     EmulatorSettings.Save();
 
     if (isGameRunning && !runningGameSerial.empty()) {
@@ -262,6 +263,10 @@ void SettingsWindow::DeInit() {
     }
 }
 void SettingsWindow::DrawSettings(bool* open, const std::function<void()>& applySettings) {
+    // The menu follows the window size (user 10-21: huge in a 720p window): sizes are for a
+    // 1080-line window, the UI Scale slider multiplies on top.
+    const float fit = std::clamp(ImGui::GetMainViewport()->WorkSize.y / 1080.0f, 0.5f, 3.0f);
+    uiScale = userScale * fit;
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.06f, 0.06f, 0.06f, 1.00f)); // black
     ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.20f, 0.40f, 0.70f, 1.00f));   // blue
     ImGui::PushStyleColor(ImGuiCol_HeaderHovered,
@@ -425,13 +430,13 @@ void SettingsWindow::DrawMainContent(bool* open, const std::function<void()>& ap
     ImGui::SetNextItemWidth(300.0f * uiScale);
     static float sliderScale2 = 1.0f;
     if (ImGui::IsWindowAppearing()) {
-        sliderScale2 = uiScale;
+        sliderScale2 = userScale;
     }
 
     ImGui::SliderFloat("UI Scale", &sliderScale2, 0.25f, 3.0f);
     // Only update when user is not interacting with slider
     if (ImGui::IsItemDeactivatedAfterEdit()) {
-        uiScale = sliderScale2;
+        userScale = sliderScale2;
     }
     ImGui::SameLine();
 
