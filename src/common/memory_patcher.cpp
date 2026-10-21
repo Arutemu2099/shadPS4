@@ -918,13 +918,16 @@ float Halton(u32 index, u32 base) {
 void JitterFrame() {
     // Off by default (user 10-21: only Delsin wobbles with it - his motion vectors likely keep
     // a 2-frame-old jitter, study-delsin-mv-ssr-2026-10-21); SHADPS4_DLSS_HALTON=1 on.
-    static const bool enabled = [] {
+    // SHADPS4_DLSS_HALTON=force (test): on without DLSS too - RenderDoc turns DLSS off, and the
+    // Delsin motion-vector question needs a capture with the Halton jitter running.
+    static const int mode = [] {
         const char* v = std::getenv("SHADPS4_DLSS_HALTON");
-        return v && v[0] == '1';
+        return !v ? 0 : v[0] == '1' ? 1 : v[0] == 'f' ? 2 : 0;
     }();
-    const bool want = enabled && !EmulatorSettings.IsNeo() && Vulkan::Dlss::Enabled() &&
-                      Vulkan::Dlss::g_ready.load(std::memory_order_relaxed) &&
-                      Vulkan::Dlss::g_user_on.load(std::memory_order_relaxed);
+    const bool dlss_on = Vulkan::Dlss::Enabled() &&
+                         Vulkan::Dlss::g_ready.load(std::memory_order_relaxed) &&
+                         Vulkan::Dlss::g_user_on.load(std::memory_order_relaxed);
+    const bool want = mode != 0 && !EmulatorSettings.IsNeo() && (dlss_on || mode == 2);
     SetJitterPatch(want);
     if (!g_jitter_patched) {
         return;
