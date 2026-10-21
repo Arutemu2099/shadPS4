@@ -17,6 +17,8 @@ namespace MemoryPatcher {
 
 extern EXPORT uintptr_t g_eboot_address;
 extern uint64_t g_eboot_image_size;
+/// 64 bytes of read-write memory near the eboot's code (module.cpp: the trampoline area's tail).
+extern uintptr_t g_eboot_scratch;
 extern std::string g_game_serial;
 extern std::string patch_file;
 

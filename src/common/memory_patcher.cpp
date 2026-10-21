@@ -24,6 +24,7 @@
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "core/emulator_settings.h"
+#include "video_core/renderer_vulkan/vk_dlss.h"
 #include "core/emulator_state.h"
 #include "core/file_format/psf.h"
 #include "memory_patcher.h"
@@ -36,6 +37,7 @@ namespace MemoryPatcher {
 
 EXPORT uintptr_t g_eboot_address;
 uint64_t g_eboot_image_size;
+uintptr_t g_eboot_scratch = 0;
 std::string g_game_serial;
 std::string patch_file;
 bool patches_applied = false;
@@ -806,6 +808,144 @@ u8 WantedOption() {
 
 } // namespace
 
+// DLSS jitter (1.1, user 10-21; notes/study-jitter-2026-10-20.md): the game's TAA moves the
+// camera between 2 sub-pixel positions (FUN_800472810: +-0.5 / the render size in NDC = +-0.25
+// render px, by frame parity). DLSS wants many: with DLSS on, five guarded edits point the
+// game's two numerator loads at a slot the emulator writes each frame (a Halton(2,3) point),
+// take the parity-0 path always, and point the SMAA subsample-index loads (which land in the
+// blend-weights CB at +48, where DlssResolve reads the phase) at the slot's (jx, jy, tag, 0) -
+// DLSS gets the exact offset of the frame it resolves. DLSS off: the original bytes come back
+// (the game's own T2x needs its 2-phase pattern and matching SMAA index). Pro mode has no jitter.
+namespace {
+
+struct CodeEdit {
+    u64 offset;    // eboot offset of the bytes changed
+    u8 size;       // 4 = a rip-relative disp32, 2 = the jz
+    u64 next_insn; // for disp32: the eboot offset of the next instruction
+    u32 slot_off;  // for disp32: the slot byte the load reads
+    u32 original;  // the original disp32 / 2 bytes (little endian)
+};
+// Measured bytes (study sec. 3): A1 y numerator, A2 x numerator, A3 jz -> nop, B1 / B2 SMAA index.
+constexpr CodeEdit JitterEdits[] = {
+    {0x47297a, 4, 0x47297e, 4, 0x0063c6aa},
+    {0x472982, 4, 0x472986, 0, 0x0063c6a6},
+    {0x472998, 2, 0, 0, 0x0674},
+    {0x472240, 4, 0x472244, 8, 0x0063cd6c},
+    {0x47224a, 4, 0x47224e, 8, 0x0063cd52},
+};
+// Whole-instruction guards (the opcode bytes before each disp32).
+constexpr u8 GuardA1[] = {0xc5, 0xfa, 0x10, 0x05};
+constexpr u8 GuardA2[] = {0xc5, 0xfa, 0x10, 0x15};
+constexpr u8 GuardB[] = {0xc5, 0xfa, 0x6f, 0x05};
+
+bool g_jitter_patched = false;
+bool g_jitter_refused = false;
+u32 g_jitter_k = 0;
+
+bool WriteCodeBytes(u64 offset, const void* data, size_t size) {
+    u8* const p = reinterpret_cast<u8*>(g_eboot_address + offset);
+#ifdef _WIN32
+    DWORD old = 0;
+    if (!VirtualProtect(p, size, PAGE_EXECUTE_READWRITE, &old)) {
+        return false;
+    }
+#endif
+    std::memcpy(p, data, size);
+#ifdef _WIN32
+    VirtualProtect(p, size, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, size);
+#endif
+    return true;
+}
+
+bool JitterBytesOriginal() {
+    const auto at = [](u64 off) { return reinterpret_cast<const u8*>(g_eboot_address + off); };
+    if (std::memcmp(at(0x472976), GuardA1, 4) != 0 || std::memcmp(at(0x47297e), GuardA2, 4) != 0 ||
+        std::memcmp(at(0x47223c), GuardB, 4) != 0 || std::memcmp(at(0x472246), GuardB, 4) != 0) {
+        return false;
+    }
+    for (const auto& e : JitterEdits) {
+        u32 live = 0;
+        std::memcpy(&live, at(e.offset), e.size);
+        if (live != e.original) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void SetJitterPatch(bool on) {
+    if (on == g_jitter_patched) {
+        return;
+    }
+    if (on && (g_eboot_scratch == 0 || !JitterBytesOriginal())) {
+        if (!g_jitter_refused) {
+            g_jitter_refused = true;
+            LOG_ERROR(Loader, "DLSS jitter: refused (eboot 01.07 bytes differ or no slot)");
+        }
+        return;
+    }
+    for (const auto& e : JitterEdits) {
+        u32 value = e.original;
+        if (on) {
+            value = e.size == 2 ? 0x9066 // 66 90: a 2-byte nop
+                                : u32(s64(g_eboot_scratch + e.slot_off) -
+                                      s64(g_eboot_address + e.next_insn));
+        }
+        if (!WriteCodeBytes(e.offset, &value, e.size)) {
+            LOG_ERROR(Loader, "DLSS jitter: VirtualProtect failed at {:#x}", e.offset);
+            return;
+        }
+    }
+    g_jitter_patched = on;
+    LOG_INFO(Loader, "DLSS jitter: {} (slot {:#x})",
+             on ? "Halton sequence, DLSS sets the sub-pixel position" : "the game's own 2 phases",
+             g_eboot_scratch);
+}
+
+float Halton(u32 index, u32 base) {
+    float f = 1.0f, r = 0.0f;
+    while (index > 0) {
+        f /= float(base);
+        r += f * float(index % base);
+        index /= base;
+    }
+    return r;
+}
+
+/// Game:Main, inside sceGnmSubmitDone (the render jobs of this frame joined; the next frame's
+/// jitter function and SMAA setup both run before the next call - study sec. 3).
+void JitterFrame() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SHADPS4_DLSS_HALTON");
+        return !(v && v[0] == '0');
+    }();
+    const bool want = enabled && !EmulatorSettings.IsNeo() && Vulkan::Dlss::Enabled() &&
+                      Vulkan::Dlss::g_ready.load(std::memory_order_relaxed) &&
+                      Vulkan::Dlss::g_user_on.load(std::memory_order_relaxed);
+    SetJitterPatch(want);
+    if (!g_jitter_patched) {
+        return;
+    }
+    // DLSS's guide: 8 x (output / render)^2 phases (8 at DLAA, 72 at 33%), here 8..64.
+    const RenderSize now = CurrentRenderSize();
+    const RenderSize ref = Reference(g_aspect);
+    const double ratio = now.width > 0 ? std::max(1.0, double(ref.width) / now.width) : 1.0;
+    const u32 phases = std::clamp(u32(std::lround(8.0 * ratio * ratio)), 8u, 64u);
+    g_jitter_k = (g_jitter_k + 1) % phases;
+    const float jx = Halton(g_jitter_k + 1, 2) - 0.5f; // render px, (-0.5, 0.5)
+    const float jy = Halton(g_jitter_k + 1, 3) - 0.5f;
+    // The image moves by (-X/2, +Y/2) px for numerators (X, Y) (study sec. 2).
+    struct Slot {
+        float x, y;
+        float cb[4]; // (jx, jy, tag, 0): the blend-weights CB floats 12-15
+    } slot{-2.0f * jx, 2.0f * jy, {jx, jy, 100.0f + float(g_jitter_k), 0.0f}};
+    std::memcpy(reinterpret_cast<void*>(g_eboot_scratch), &slot.x, 8);
+    std::memcpy(reinterpret_cast<void*>(g_eboot_scratch + 8), slot.cb, 16);
+}
+
+} // namespace
+
 /// SHADPS4_LIVE_RES_TEST=50,67,100,... (test): from 40 s after the first frame, every 8 s
 /// (SHADPS4_LIVE_RES_TEST_MS) the next percentage of the list is requested, as the panel's slider
 /// would; the list repeats.
@@ -846,6 +986,7 @@ static void LiveResTestStep() {
 }
 
 void OnSubmitDone() {
+    JitterFrame();
     LiveResTestStep();
     // Game:Main is inside this HLE call, so its frame begin (FUN_8001f0be0, the toggle) cannot run
     // meanwhile; job threads never run it (study sec. 3).

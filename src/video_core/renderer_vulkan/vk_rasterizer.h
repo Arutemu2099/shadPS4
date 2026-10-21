@@ -100,6 +100,7 @@ public:
         DrawClass draw_class{DrawClass::Draw};
         bool skip{};                         ///< SHADPS4_EMPTY_DRAWS=2 dropped it on the front.
         u8 dlss_phase{};                     ///< DlssResolve: the frame's jitter (vk_dlss.h).
+        float dlss_jitter[2]{};              ///< phase 4: the explicit offset (Halton)
         const GraphicsPipeline* pipeline{};  ///< Null: the lookup failed or was not reached.
     };
     /// Front thread: classification, hazard note, empty-draw skip and pipeline lookup, reading
@@ -328,6 +329,8 @@ public:
     u64 dlss_calls{};
     u64 dlss_missing{};
     u8 dlss_phase_in{};                   ///< the phase of the action being executed
+    float dlss_jitter_in[2]{};            ///< phase 4: its explicit offset (render px)
+    bool dlss_last_explicit{};            ///< the last resolve used an explicit offset
     std::array<u64, 4> dlss_phases{};     ///< by phase: unknown / 1 / 2 / T2x off
     u64 dlss_evaluated{};
     u32 dlss_last_combo{};

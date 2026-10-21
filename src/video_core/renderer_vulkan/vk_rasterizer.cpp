@@ -1742,7 +1742,15 @@ void Rasterizer::DlssResolve() {
             // render target's size (FUN_800472810, notes/study-jitter-2026-10-20.md); the 1/1920
             // constants have no reader. SHADPS4_DLSS_JITTER_SCALE=1 (test) scales by size / 1080p.
             float jx = 0.0f, jy = 0.0f;
-            if (dlss_phase_in == 1 || dlss_phase_in == 2) {
+            // Phase 4: the emulator's Halton offset, exact for this frame (memory_patcher.cpp
+            // JitterFrame). A switch between it and the game's 2 phases starts a new history.
+            const bool explicit_jitter = dlss_phase_in == 4;
+            dlss_reset_pending |= explicit_jitter != dlss_last_explicit;
+            dlss_last_explicit = explicit_jitter;
+            if (explicit_jitter) {
+                jx = dlss_jitter_in[0];
+                jy = dlss_jitter_in[1];
+            } else if (dlss_phase_in == 1 || dlss_phase_in == 2) {
                 const float j = dlss_phase_in == 1 ? 0.25f : -0.25f;
                 const u32 combo = Dlss::g_jitter_combo.load(std::memory_order_relaxed);
                 static const bool scale_jitter = [] {
@@ -1838,6 +1846,8 @@ bool Rasterizer::FilterDraw() {
         return true;
     }
     dlss_phase_in = Dlss::t_phase;
+    dlss_jitter_in[0] = Dlss::t_jitter[0];
+    dlss_jitter_in[1] = Dlss::t_jitter[1];
     ExecuteFilteredDraw(draw_class);
     return false;
 }
@@ -2315,6 +2325,8 @@ void Rasterizer::PrepareDrawFront(SplitDraw& draw) {
     Dlss::NoteDraw(liverpool->regs);
     if (draw.draw_class != DrawClass::Draw) {
         draw.dlss_phase = Dlss::t_phase;
+        draw.dlss_jitter[0] = Dlss::t_jitter[0];
+        draw.dlss_jitter[1] = Dlss::t_jitter[1];
         return;
     }
     if (!draw.args.is_indirect) {
@@ -2401,6 +2413,8 @@ void Rasterizer::ExecuteDraw(const SplitDraw& draw,
         }
         if (draw.draw_class != DrawClass::Draw) {
             dlss_phase_in = draw.dlss_phase;
+            dlss_jitter_in[0] = draw.dlss_jitter[0];
+            dlss_jitter_in[1] = draw.dlss_jitter[1];
             ExecuteFilteredDraw(draw.draw_class);
             return false;
         }

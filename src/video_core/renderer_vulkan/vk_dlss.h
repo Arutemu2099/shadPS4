@@ -103,8 +103,10 @@ inline std::atomic<u32> g_weights_ud{~0u}; ///< dword of its CB's V# in the flat
 /// pointer tables into the flattened buffer, as binding does) and that buffer's size.
 inline std::atomic<Shader::PFN_SrtWalker> g_weights_walker{nullptr};
 inline std::atomic<u32> g_weights_flat_dw{0};
-/// The parsing thread's last weights draw: 1 / 2 = subsample index, 3 = T2x off, 0 = unknown.
+/// The parsing thread's last weights draw: 1 / 2 = subsample index, 3 = T2x off, 0 = unknown,
+/// 4 = an explicit offset (the emulator's Halton jitter, memory_patcher.cpp: t_jitter).
 inline thread_local u8 t_phase = 0;
+inline thread_local float t_jitter[2] = {}; ///< phase 4: the frame's (jx, jy) in render px
 
 /// Where the weights program's Info is known: remember its address and its CB's user-data slot.
 inline void NoteWeightsInfo(const Shader::Info& info, VAddr base) {
@@ -303,12 +305,21 @@ inline void NoteDraw(const AmdGpu::Regs& regs) {
         walker(regs.ps_program.user_data.data(), flat.data());
         std::memcpy(&vsharp, &flat[ud], sizeof(vsharp));
     }
-    if (vsharp.base_address == 0 || vsharp.GetSize() < 52) {
+    if (vsharp.base_address == 0 || vsharp.GetSize() < 60) {
         t_phase = 0;
         return;
     }
     float f;
     std::memcpy(&f, reinterpret_cast<const void*>(vsharp.base_address + 48), sizeof(f));
+    float tag;
+    std::memcpy(&tag, reinterpret_cast<const void*>(vsharp.base_address + 56), sizeof(tag));
+    if (tag >= 99.5f) {
+        t_phase = 4;
+        t_jitter[0] = f;
+        std::memcpy(&t_jitter[1], reinterpret_cast<const void*>(vsharp.base_address + 52),
+                    sizeof(float));
+        return;
+    }
     t_phase = (f > 0.5f && f < 1.5f)   ? 1
               : (f > 1.5f && f < 2.5f) ? 2
               : (f > -0.5f && f < 0.5f) ? 3

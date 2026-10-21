@@ -361,6 +361,11 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
         if (name == "eboot.bin") {
             MemoryPatcher::g_eboot_address = base_virtual_addr;
             MemoryPatcher::g_eboot_image_size = base_size;
+#ifdef ARCH_X86_64
+            // DLSS jitter (memory_patcher.cpp): 64 bytes at the end of the trampoline area
+            // (read-write, within +-2 GB of the code; the trampolines fill it from the front).
+            MemoryPatcher::g_eboot_scratch = base_virtual_addr + aligned_base_size + 8_MB - 64;
+#endif
             MemoryPatcher::OnGameLoaded();
         }
     }
