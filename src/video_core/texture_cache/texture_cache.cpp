@@ -2164,8 +2164,9 @@ void TextureCache::PurgeOldRenderSize(u32 old_w, u32 old_h, u32 new_w, u32 new_h
     // perfect-matches the old set with its old contents. At the end of the first frame drawn at
     // the new size, the old size's targets that frame did not touch are freed: the old size and
     // its /2 /4 /8 /16 (the game's size table, study-live-resolution sec. 1; +-8 px rounding),
-    // never a size of the new family, never a display buffer; CPU-read contents downloaded first
-    // as the GC does (Opus review 10-20).
+    // never a size of the new family, never a display buffer (Opus review 10-20). No download:
+    // SafeToDownload holds for every target the GPU drew (s1518: it kept all of them), and the
+    // game re-describes and redraws these addresses at the new size - the old contents are dead.
     const auto family = [](u32 w, u32 h, u32 base_w, u32 base_h) {
         for (u32 k = 0; k <= 4; ++k) {
             const s64 fw = base_w >> k;
@@ -2210,12 +2211,6 @@ void TextureCache::PurgeOldRenderSize(u32 old_w, u32 old_h, u32 new_w, u32 new_h
         Image& image = slot_images[id];
         if (False(image.flags & ImageFlagBits::Registered)) {
             continue;
-        }
-        if (image.SafeToDownload()) {
-            if (image.info.IsTiled()) {
-                continue; // as the GC: no tiled downloads
-            }
-            DownloadImageMemory(id);
         }
         bytes += image.info.guest_size;
         FreeImage(id);
