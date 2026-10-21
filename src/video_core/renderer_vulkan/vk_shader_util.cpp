@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <cstdlib>
 #include <memory>
 #include <vector>
@@ -9,6 +10,7 @@
 #include <glslang/SPIRV/GlslangToSpv.h>
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "video_core/renderer_vulkan/ssr_dither_spv.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 namespace Vulkan {
@@ -269,6 +271,31 @@ vk::ShaderModule CompileSPV(std::span<const u32> code, vk::Device device) {
         salted.assign(code.begin(), code.end());
         salted[2] = salt;
         code = salted;
+    }
+    // The 33% street streaks (1.1, user 10-21; study-delsin-mv-ssr sec. 2): the game's reflection
+    // ray march fs_204f45fe takes 100 fixed steps with no per-pixel offset, so neighbouring rows
+    // stop at the same step and draw stripes. Its exact module (every path: fresh, cached,
+    // prebuilt) is swapped for one that starts each pixel at a dithered offset. Another GPU's
+    // SPIR-V differs and keeps the game's. SHADPS4_SSR_DITHER=0 off.
+    if (code.size() == SsrDither::OriginalWords) [[unlikely]] {
+        static const bool on = [] {
+            const char* value = std::getenv("SHADPS4_SSR_DITHER");
+            return !(value && value[0] == '0');
+        }();
+        u64 h = 0xcbf29ce484222325ull; // FNV-1a 64 over the bytes
+        for (const u32 w : code) {
+            for (u32 b = 0; b < 4; ++b) {
+                h ^= (w >> (8 * b)) & 0xffu;
+                h *= 0x100000001b3ull;
+            }
+        }
+        if (on && h == SsrDither::OriginalFnv) {
+            static std::atomic<bool> logged{false}; // compile-pool threads call this too
+            if (!logged.exchange(true)) {
+                LOG_INFO(Render_Vulkan, "SSR: the reflection ray march gets a dithered start");
+            }
+            code = SsrDither::Patched;
+        }
     }
     const vk::ShaderModuleCreateInfo shader_info = {
         .codeSize = code.size() * sizeof(u32),
