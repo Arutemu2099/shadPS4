@@ -408,10 +408,14 @@ static s64 NowMs() {
 }
 constexpr const char* RenderSizeFile = "render-size.ini";
 constexpr u32 MinLines = 96, MaxLines = 4320;
-// At most 3200x1800's pixels (the PS4 Pro's render size) in any shape: 3840x2160 lost the device
-// within seconds of the first city frame, twice (s1491 / s1493, a GPU program fault with no
-// memory address; 10-20); 3200x1800 ran clean (s1492, 97 FPS). 10% (256x144) ran too (s1490).
-constexpr u64 MaxPixels = u64(3200) * 1800;
+// At most 4K's pixels in any shape (user 10-21: native 4K in 1.1). 3840x2160 lost the device on
+// 10-20 (s1491 / s1493): the game's tile light list held only 25,600 tiles - ApplyLightListCapacity
+// now sizes it from the boot size. Was 3200x1800 (s1492 ran clean, 97 FPS); 10% (256x144) ran too.
+constexpr u64 MaxPixels = u64(3840) * 2160;
+// The live headroom (the size every run boots at for live changes) stays at 3200x1800's pixels:
+// tested on 10-20 / 10-21, and smaller cards do not draw the loading frames at 4K. A pick above it
+// boots at the pick.
+constexpr u64 HeadroomPixels = u64(3200) * 1800;
 
 float HudSafeAreaRatio() {
     return g_hud_ratio;
@@ -442,11 +446,11 @@ RenderSize SizeAt(u32 h0, double aspect) {
                   : RenderSize{std::min(Round8(h0 * 32.0 / 9.0), Round8(h0 * aspect)), h0};
 }
 
-/// Lowers h0 until the size has at most 8K's pixels (the wide and tall shapes).
-u32 CapPixels(u32 h0, double aspect) {
+/// Lowers h0 until the size has at most `max_pixels` (the wide and tall shapes).
+u32 CapPixels(u32 h0, double aspect, u64 max_pixels = MaxPixels) {
     while (h0 > MinLines) {
         const RenderSize s = SizeAt(h0, aspect);
-        if (u64(s.width) * s.height <= MaxPixels) {
+        if (u64(s.width) * s.height <= max_pixels) {
             break;
         }
         h0 -= 8;
@@ -486,6 +490,40 @@ u32 BaseHeightForPercent(float percent, double aspect) {
 
 std::filesystem::path RenderSizePath() {
     return Common::FS::GetUserPath(Common::FS::PathType::UserDir) / RenderSizeFile;
+}
+
+// Native 4K (user 10-21; notes/study-4k-crash-2026-10-20.md, measured 10-21 in the user's capture):
+// the deferred lighting cs_ce1675e0 writes up to 128 light indices per 16x16-pixel tile into one
+// u16 buffer and skips the tiles past its size; ~40 forward-lit pixel shaders walk a skipped
+// tile's list to an end marker that was never written, and the GPU hangs (device lost). The game
+// makes it 0x320000 entries (25,600 tiles: 3200x1800 needs 22,600, 3840x2160 32,400) in
+// FUN_80016bd10: the allocation (element bytes x 0x320000) and the descriptor's record count
+// (0x320000) are two immediates. Both get the boot size M's tile count x 128 (M: every target is
+// allocated at it, live sizes stay below).
+void ApplyLightListCapacity(RenderSize max) {
+    constexpr u32 Original = 0x320000;
+    const u64 tiles = u64((max.width + 15) / 16) * ((max.height + 15) / 16);
+    const u64 need = tiles * 128;
+    if (need <= Original) {
+        return;
+    }
+    const u32 entries = u32((need + 0xffff) & ~u64(0xffff));
+    const auto at = [](u64 offset) { return reinterpret_cast<u8*>(g_eboot_address + offset); };
+    static constexpr u8 imul_head[3] = {0x41, 0x69, 0xf7}; // imul esi, r15d, imm32 (0x16be04)
+    static constexpr u8 mov_head[2] = {0x41, 0xb8};        // mov r8d, imm32 (0x16be1d)
+    u32 imul_imm = 0, mov_imm = 0;
+    std::memcpy(&imul_imm, at(0x16be07), 4);
+    std::memcpy(&mov_imm, at(0x16be1f), 4);
+    if (std::memcmp(at(0x16be04), imul_head, 3) != 0 || std::memcmp(at(0x16be1d), mov_head, 2) != 0 ||
+        imul_imm != Original || mov_imm != Original) {
+        LOG_ERROR(Loader, "Light list: refused, FUN_80016bd10 differs (eboot 01.07 only) - "
+                          "sizes above 3200x1800 may hang the GPU");
+        return;
+    }
+    std::memcpy(at(0x16be07), &entries, 4);
+    std::memcpy(at(0x16be1f), &entries, 4);
+    LOG_INFO(Loader, "Light list: {} entries for {}x{} ({} tiles; the game's own fits 25,600)",
+             entries, max.width, max.height, tiles);
 }
 
 } // namespace
@@ -598,13 +636,15 @@ static void ApplyAspectRatio() {
     // from its lowest value up to the screen's size (above: after a restart).
     const char* live_env = std::getenv("SHADPS4_LIVE_RES");
     // User 10-20 ~23:40: live from the first start, no restart for any size - the game boots at
-    // the largest size (200% of the screen within the 3200x1800-pixel cap) and the first frames
+    // the largest size (200% of the screen within the 3200x1800-pixel headroom, or the pick when
+    // that is larger, up to 4K's pixels) and the first frames
     // switch it to the pick, or to its own 1080 lines without one. Only the loading frames draw
     // at the big size; the purge then frees those targets (lower-end PCs keep nothing big).
     // SHADPS4_LIVE_RES=0: boot at the pick (no live changes), SHADPS4_RENDER_HEIGHT too.
     const bool live = !g_height_from_flags && !(live_env && live_env[0] == '0') &&
                       !EmulatorSettings.IsNeo();
-    const u32 hm = live ? std::max(h0, BaseHeightForPercent(200.0f, aspect)) : h0;
+    const u32 headroom = CapPixels(BaseHeightForPercent(200.0f, aspect), aspect, HeadroomPixels);
+    const u32 hm = live ? std::max(h0, headroom) : h0;
     if (aspect == base && h0 == 1080 && hm == 1080) {
         return; // 16:9 at 1080: nothing to do
     }
@@ -680,6 +720,7 @@ static void ApplyAspectRatio() {
     g_now_size.store((u64(max.width) << 32) | max.height, std::memory_order_release);
     g_max = max;
     g_live_ok = live;
+    ApplyLightListCapacity(max);
     if (max.width != w || max.height != h) {
         // The renderer's init zeroes the mode bytes after these patches (study d2): the first
         // sceGnmSubmitDone switches the game from M to S.

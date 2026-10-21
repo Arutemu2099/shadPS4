@@ -346,10 +346,9 @@ void Panel::DrawRenderSize() {
     } else if (!from_flags && saved_once) {
         wrap(Grey, "Live. Saved for the next start too.");
     }
-    // The size cap (memory_patcher.cpp MaxPixels: 3200x1800's pixels; 4K lost the device).
-    if (pick > 100 && u64(next.width) * next.height >= u64(3200) * 1800 * 97 / 100) {
-        wrap(Grey, "Largest size: about 3200x1800 pixels - larger crashed the game's GPU work in "
-                   "testing.");
+    // The size cap (memory_patcher.cpp MaxPixels: 4K's pixels in any shape).
+    if (pick > 100 && u64(next.width) * next.height >= u64(3840) * 2160 * 97 / 100) {
+        wrap(Grey, "Largest size: 4K's pixels (3840x2160 on a 16:9 screen).");
     }
 }
 
