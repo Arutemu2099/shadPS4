@@ -226,6 +226,11 @@ public:
     u32 tab_id{}; ///< q10: its ImageId index, stored with tab_gen at insert (per-image kills)
     u64 lru_id{};
     u64 tick_accessed_last{};
+    /// The GC tick of the last use (TextureCache::TouchImage, atomic_ref store). Kept here, not
+    /// by moving the LRU list item: draws touch images from several recording threads while the
+    /// back registers / frees them, and the unlocked list moves corrupted the list (10-20
+    /// live-resize hang s1513 / double unregister s1514-s1515).
+    u64 gc_touch{};
     u64 hash{};
     /// SHADPS4_WATER_REFLECTION_SCALE: 1 = the reflection's own targets (scaled for good),
     /// 2 = a scratch target scaled only while the game's blur fs_0x6d29fb0f renders into it.

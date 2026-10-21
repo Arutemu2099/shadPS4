@@ -61,6 +61,26 @@ public:
         free_items.push_back(id);
     }
 
+    /// Every item, in list order (no tick test): for owners that keep the use tick themselves.
+    template <typename Func>
+    void ForEachItem(Func&& func) {
+        static constexpr bool RETURNS_BOOL =
+            std::is_same_v<std::invoke_result<Func, ObjectType>, bool>;
+        Item* iterator = first_item;
+        size_t budget = item_pool.size();
+        while (iterator && budget-- > 0) {
+            Item* next = iterator->next;
+            if constexpr (RETURNS_BOOL) {
+                if (func(iterator->obj)) {
+                    return;
+                }
+            } else {
+                func(iterator->obj);
+            }
+            iterator = next;
+        }
+    }
+
     template <typename Func>
     void ForEachItemBelow(TickType tick, Func&& func) {
         static constexpr bool RETURNS_BOOL =

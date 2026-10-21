@@ -1870,6 +1870,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
     LogImageChurn("Register", image);
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
+    std::atomic_ref<u64>{image.gc_touch}.store(gc_tick, std::memory_order_relaxed);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
         auto& page_ids = page_table[page];
         for (const ImageId other : page_ids) {
@@ -2092,14 +2093,21 @@ void TextureCache::GarbageCollectImages() {
         return false;
     };
 
-    // Try to remove anything old enough and not high priority.
+    // Try to remove anything old enough and not high priority. The list order is no longer the
+    // use order (TouchImage stores the tick in the image): every item is tested by its tick.
+    const auto old_enough = [&](ImageId image_id) {
+        if (UsedSince(slot_images[image_id], gc_tick - ticks_to_destroy + 1)) {
+            return false;
+        }
+        return clean_up(image_id);
+    };
     configure(false);
-    lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+    lru_cache.ForEachItem(old_enough);
 
     if (total_used_memory >= critical_gc_memory) {
         // If we are still over the critical limit, run an aggressive GC
         configure(true);
-        lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+        lru_cache.ForEachItem(old_enough);
     }
 }
 
@@ -2154,9 +2162,9 @@ void TextureCache::PurgeOldRenderSize() {
     // waits for the GPU in DeleteImage).
     CacheLock lock{*this};
     std::vector<ImageId> stale;
-    lru_cache.ForEachItemBelow(gc_tick - 1, [&](ImageId image_id) {
+    lru_cache.ForEachItem([&](ImageId image_id) {
         const Image& image = slot_images[image_id];
-        if ((image.usage.render_target || image.usage.depth_target) &&
+        if (!UsedSince(image, gc_tick) && (image.usage.render_target || image.usage.depth_target) &&
             True(image.flags & ImageFlagBits::Registered) &&
             MemoryPatcher::IsRenderShaped(image.info.size.width, image.info.size.height)) {
             stale.push_back(image_id);
@@ -2194,7 +2202,14 @@ void TextureCache::RunGarbageCollector() {
 }
 
 void TextureCache::TouchImage(const Image& image) {
-    lru_cache.Touch(image.lru_id, gc_tick);
+    std::atomic_ref<u64>{const_cast<u64&>(image.gc_touch)}.store(
+        std::atomic_ref<u64>{const_cast<u64&>(gc_tick)}.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+}
+
+bool TextureCache::UsedSince(const Image& image, u64 tick) const {
+    return std::atomic_ref<u64>{const_cast<u64&>(image.gc_touch)}.load(
+               std::memory_order_relaxed) >= tick;
 }
 
 void TextureCache::DeleteImage(ImageId image_id) {

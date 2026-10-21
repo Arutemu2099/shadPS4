@@ -546,6 +546,8 @@ private:
     }
 
     void GarbageCollectImages();
+    /// The image was touched at GC tick `tick` or later (its own gc_touch).
+    bool UsedSince(const Image& image, u64 tick) const;
     /// Live screen percentage: drops the render-shaped targets the frame did not use.
     void PurgeOldRenderSize();
     void GarbageCollectSamplers();

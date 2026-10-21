@@ -1738,18 +1738,16 @@ void Rasterizer::DlssResolve() {
             };
             // The game's two jitter phases are +-0.25 px diagonally (study sec. 1.4); which sign
             // goes with which phase is calibrated live (Page Up cycles the four combinations).
-            // The game's offsets are fixed fractions of a 1920x1080 screen (its constants
-            // 1/1920, 1/1080 at eboot file 0x9a6d60 = the jitter table's values): in render
-            // pixels they scale with the render size (856x480: +-0.11 px). Told +-0.25 at every
-            // size, DLSS drew horizontal streaks at 33% (user 10-20, s1494 tail5).
+            // +-0.25 render px at every render size: the game divides its +-0.5 by the slot-2
+            // render target's size (FUN_800472810, notes/study-jitter-2026-10-20.md); the 1/1920
+            // constants have no reader. SHADPS4_DLSS_JITTER_SCALE=1 (test) scales by size / 1080p.
             float jx = 0.0f, jy = 0.0f;
             if (dlss_phase_in == 1 || dlss_phase_in == 2) {
                 const float j = dlss_phase_in == 1 ? 0.25f : -0.25f;
                 const u32 combo = Dlss::g_jitter_combo.load(std::memory_order_relaxed);
-                // SHADPS4_DLSS_JITTER_SCALE=0 (test): the old +-0.25 at every size.
                 static const bool scale_jitter = [] {
                     const char* v = std::getenv("SHADPS4_DLSS_JITTER_SCALE");
-                    return !(v && v[0] == '0');
+                    return v && v[0] == '1';
                 }();
                 const float sx =
                     scale_jitter ? static_cast<float>(out.info.size.width) / 1920.0f : 1.0f;
