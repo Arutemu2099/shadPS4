@@ -1738,12 +1738,18 @@ void Rasterizer::DlssResolve() {
             };
             // The game's two jitter phases are +-0.25 px diagonally (study sec. 1.4); which sign
             // goes with which phase is calibrated live (Page Up cycles the four combinations).
+            // The game's offsets are fixed fractions of a 1920x1080 screen (its constants
+            // 1/1920, 1/1080 at eboot file 0x9a6d60 = the jitter table's values): in render
+            // pixels they scale with the render size (856x480: +-0.11 px). Told +-0.25 at every
+            // size, DLSS drew horizontal streaks at 33% (user 10-20, s1494 tail5).
             float jx = 0.0f, jy = 0.0f;
             if (dlss_phase_in == 1 || dlss_phase_in == 2) {
                 const float j = dlss_phase_in == 1 ? 0.25f : -0.25f;
                 const u32 combo = Dlss::g_jitter_combo.load(std::memory_order_relaxed);
-                jx = (combo & 1) ? -j : j;
-                jy = (combo & 2) ? -j : j;
+                const float sx = static_cast<float>(out.info.size.width) / 1920.0f;
+                const float sy = static_cast<float>(out.info.size.height) / 1080.0f;
+                jx = ((combo & 1) ? -j : j) * sx;
+                jy = ((combo & 2) ? -j : j) * sy;
                 const bool combo_changed = combo != dlss_last_combo;
                 dlss_last_combo = combo;
                 dlss_reset_pending |= combo_changed;
