@@ -2182,16 +2182,20 @@ void TextureCache::PurgeOldRenderSize(u32 old_w, u32 old_h, u32 new_w, u32 new_h
     bool new_size_seen = false;
     lru_cache.ForEachItem([&](ImageId image_id) {
         const Image& image = slot_images[image_id];
-        if (!(image.usage.render_target || image.usage.depth_target) ||
-            False(image.flags & ImageFlagBits::Registered)) {
+        if (False(image.flags & ImageFlagBits::Registered)) {
             return;
         }
         const u32 w = image.info.size.width;
         const u32 h = image.info.size.height;
         const bool used = UsedSince(image, gc_tick);
-        if (used && w == new_w && h == new_h) {
+        const bool target = image.usage.render_target || image.usage.depth_target;
+        if (target && used && w == new_w && h == new_h) {
             new_size_seen = true;
         }
+        // Sampled-only images of the old size go too (user 10-21 RenderDoc, study-live-resize-
+        // lighting: an R8Uint copy of the depth buffer's stencil plane from an earlier visit to
+        // a size, all zeros, matched again on return - 7 lighting / shadow passes read it and
+        // Delsin lost his shading). A texture freed here is uploaded again from guest memory.
         if (!used && !image.usage.vo_surface && family(w, h, old_w, old_h) &&
             !family(w, h, new_w, new_h)) {
             stale.push_back(image_id);
