@@ -218,7 +218,7 @@ Only for the update check: one small request to GitHub per start, shown on the l
 
 | The game asks for | On your controller |
 |---|---|
-| Touchpad, left half (for example draining power sources) | **D-pad up** (hold it like the touchpad) |
+| Touchpad, left half (for example draining power sources) | **D-pad up** (it still works as up in menus) |
 | Touchpad, right half | **View** (Back / Select) |
 | Both touchpad halves | D-pad up + View together |
 | Spray can or touchpad moments | **L3 + R3** (press both sticks) turns on **sensor mode**; a notice shows the controls. L3 + R3 again turns it off |
