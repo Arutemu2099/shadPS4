@@ -1087,13 +1087,13 @@ void RebaseHistoryJitter(RenderSize now, float jx, float jy) {
 /// Game:Main, inside sceGnmSubmitDone (the render jobs of this frame joined; the next frame's
 /// jitter function and SMAA setup both run before the next call - study sec. 3).
 void JitterFrame() {
-    // Off by default (user 10-21: only Delsin wobbles with it - his motion vectors likely keep
-    // a 2-frame-old jitter, study-delsin-mv-ssr-2026-10-21); SHADPS4_DLSS_HALTON=1 on.
+    // On by default again (10-21: the wobble - movers' motion vectors kept a 2-frame-old jitter -
+    // is fixed by RebaseHistoryJitter); SHADPS4_DLSS_HALTON=0 = the game's own 2 phases.
     // SHADPS4_DLSS_HALTON=force (test): on without DLSS too - RenderDoc turns DLSS off, and the
-    // Delsin motion-vector question needs a capture with the Halton jitter running.
+    // motion-vector checks need a capture with the Halton jitter running.
     static const int mode = [] {
         const char* v = std::getenv("SHADPS4_DLSS_HALTON");
-        return !v ? 0 : v[0] == '1' ? 1 : v[0] == 'f' ? 2 : 0;
+        return !v ? 1 : v[0] == '0' ? 0 : v[0] == 'f' ? 2 : 1;
     }();
     const bool dlss_on = Vulkan::Dlss::Enabled() &&
                          Vulkan::Dlss::g_ready.load(std::memory_order_relaxed) &&
