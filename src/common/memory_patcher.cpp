@@ -809,9 +809,12 @@ void OnSubmitDone() {
                      u32(g_live_check >> 32), u32(g_live_check), CurrentScreenPercent(),
                      g_max.width, g_max.height, g_live_tries);
             g_live_check = 0;
-        } else if (g_live_tries >= 30) {
-            LOG_ERROR(Loader, "Live render size: the game did not take {}x{} after 30 frames",
-                      u32(g_live_check >> 32), u32(g_live_check));
+        } else if (g_live_tries >= 2400) {
+            // s1494: the boot request (M -> S) is not taken through the logos and loading
+            // screens (the mode check runs in game); 2400 frames is well past them.
+            LOG_ERROR(Loader, "Live render size: the game did not take {}x{} after {} frames "
+                              "(its table: {}x{})",
+                      u32(g_live_check >> 32), u32(g_live_check), g_live_tries, table[0], table[1]);
             g_live_check = 0;
         } else {
             ++g_live_tries;
