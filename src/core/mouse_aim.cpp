@@ -321,12 +321,9 @@ float ScaleSensitivity(float factor) {
     // Kept for the next start (1.1, user 10-21; the - / = keys were session-only):
     // user/mouse-aim.ini; SHADPS4_MOUSE_AIM_SENS in the flags file still wins.
     std::ofstream out{MouseAimPath(), std::ios::trunc};
-    out << "# Written by the - / = keys: mouse-look speed in degrees per 100 pixels (default 5.12).
-"
-           "# SHADPS4_MOUSE_AIM_SENS in shadps4-flags-user.txt wins over this file.
-"
-        << "sensitivity=" << s << "
-";
+    out << "# Written by the - / = keys: mouse-look speed in degrees per 100 pixels (default 5.12).\n"
+           "# SHADPS4_MOUSE_AIM_SENS in shadps4-flags-user.txt wins over this file.\n"
+        << "sensitivity=" << s << "\n";
     LOG_INFO(Core, "Mouse aim: {:.2f} deg per 100 px (saved)", s);
     return s;
 }
