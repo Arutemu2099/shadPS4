@@ -702,7 +702,22 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             MemoryPatcher::IsRenderShaped(image_info.size.width, image_info.size.height) &&
             MemoryPatcher::IsRenderShaped(cache_image.info.size.width,
                                           cache_image.info.size.height)) {
-            if (cache_image.tick_accessed_last < AgeTick()) {
+            const bool unused = cache_image.tick_accessed_last < AgeTick();
+            // SHADPS4_LIVE_RES_LOG=1 (test): every image this rule replaces.
+            static const bool log_rule = [] {
+                const char* v = std::getenv("SHADPS4_LIVE_RES_LOG");
+                return v && v[0] == '1';
+            }();
+            if (log_rule) {
+                LOG_INFO(Render_Vulkan,
+                         "LiveResize: {} {}x{} {} at {:#x} (rt {} depth {}) for a {}x{} request",
+                         unused ? "freed" : "kept", cache_image.info.size.width,
+                         cache_image.info.size.height, vk::to_string(cache_image.info.pixel_format),
+                         cache_image.info.guest_address, +cache_image.usage.render_target,
+                         +cache_image.usage.depth_target, image_info.size.width,
+                         image_info.size.height);
+            }
+            if (unused) {
                 FreeImage(cache_image_id);
             }
             return {merged_image_id, -1, -1};
