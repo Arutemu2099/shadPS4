@@ -156,6 +156,10 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
         error = true;
     }
     if (!error) {
+        // Player logs: which refresh rate the screen runs (frame pacing without G-Sync /
+        // FreeSync, PERF-PLAN 15); vk_swapchain logs the present mode in use.
+        LOG_INFO(Frontend, "Display: {}x{} at {:.2f} Hz, vblank_frequency {}", displayMode->w,
+                 displayMode->h, displayMode->refresh_rate, EmulatorSettings.GetVblankFrequency());
         SDL_SetWindowFullscreenMode(
             window, EmulatorSettings.GetFullScreenMode() == "Fullscreen" ? displayMode : NULL);
     }
@@ -286,8 +290,10 @@ void WindowSDL::WaitEvent() {
         const u32 key = Input::GetEmuKey(k);
         return key != 0 && event.key.key == key;
     };
-    if (Vulkan::Dlss::Enabled() && event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
-        (emu_key(Input::EmuKey::Dlss5Toggle) || emu_key(Input::EmuKey::Dlss5Panel)) &&
+    // Page Up works with SHADPS4_DLSS=0 too: the panel holds the render size (any card).
+    if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
+        ((Vulkan::Dlss::Enabled() && emu_key(Input::EmuKey::Dlss5Toggle)) ||
+         emu_key(Input::EmuKey::Dlss5Panel)) &&
         !(event.key.mod & SDL_KMOD_CTRL)) {
         if (emu_key(Input::EmuKey::Dlss5Panel)) {
             Dlss5Panel::Toggle();
@@ -398,8 +404,10 @@ void WindowSDL::WaitEvent() {
                 Input::g_synth_rattle_until.store(SDL_GetTicks() + 600, std::memory_order_relaxed);
             }
         }
-        if (Vulkan::Dlss::Enabled() && event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
-            (emu_key(Input::EmuKey::DlssToggle) || emu_key(Input::EmuKey::DlssJitter) ||
+        // Insert (the render size) works with SHADPS4_DLSS=0 too.
+        if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
+            ((Vulkan::Dlss::Enabled() &&
+              (emu_key(Input::EmuKey::DlssToggle) || emu_key(Input::EmuKey::DlssJitter))) ||
              emu_key(Input::EmuKey::DlssOutputScale))) {
             // SHADPS4_DLSS (vk_dlss.h): Home = DLSS on / off, Page Down = jitter sign combination
             // (D is the pick). Insert = the render size: the Page Up pick <-> 100% of the screen
