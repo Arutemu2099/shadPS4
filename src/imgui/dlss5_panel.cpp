@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cmath>
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <string>
@@ -220,22 +222,38 @@ void Panel::DrawDlss45() {
     }
     ImGui::SetItemTooltip("Off = the game's own anti-aliasing (instant compare).");
 
-    ImGui::TextUnformatted("Output");
+    // Output size, live (user 10-20): DLSS draws this multiple of the screen and the post pass
+    // scales it down (supersampling). Insert switches between the pick and the screen size.
+    ImGui::TextUnformatted("Output  (Insert: this <-> screen size)");
     const bool upscaling = D::g_hud_layer.load(std::memory_order_relaxed);
-    int scale = D::g_output_scale.load(std::memory_order_relaxed) > 1.0f ? 1 : 0;
+    static constexpr float scales[] = {1.0f, 1.25f, 1.5f, 2.0f};
+    static const char* const scale_names[] = {"Screen", "1.25x", "1.5x", "2x"};
+    const float now_scale = D::g_output_scale.load(std::memory_order_relaxed);
+    int scale = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (std::abs(now_scale - scales[i]) < 0.01f) {
+            scale = i;
+        }
+    }
     const int was_scale = scale;
     ImGui::BeginDisabled(!upscaling);
-    Choice("Screen size", &scale, 0, 0, 2,
-           "DLSS draws the picture at your screen's size (Insert switches).", false);
-    Choice("1.5x screen (sharper, slower)", &scale, 1, 1, 2,
-           "DLSS draws 1.5x your screen's size and it is scaled down - a sharper picture\nfor "
-           "more graphics-card time (Insert switches).", false);
+    for (int i = 0; i < 4; ++i) {
+        Choice(scale_names[i], &scale, i, i, 4,
+               i == 0 ? "DLSS draws the picture at your screen's size."
+                      : "DLSS draws this much more than your screen and it is scaled down: a "
+                        "sharper picture\nfor more graphics-card time. Live; Insert switches "
+                        "back to the screen size and again to this.",
+               false);
+    }
     ImGui::EndDisabled();
     if (!upscaling) {
         ImGui::SetItemTooltip("Only when the window is larger than the game's render size.");
     }
     if (scale != was_scale) {
-        D::g_output_scale.store(scale == 1 ? 1.5f : 1.0f, std::memory_order_relaxed);
+        D::g_output_scale.store(scales[scale], std::memory_order_relaxed);
+        if (scale != 0) {
+            D::g_output_pick.store(scales[scale], std::memory_order_relaxed);
+        }
     }
 
     ImGui::TextUnformatted("Network");
@@ -259,8 +277,9 @@ void Panel::DrawDlss45() {
     ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 470.0f);
     ImGui::TextWrapped("Render size: SHADPS4_RENDER_HEIGHT=720 (or 480) in shadps4-flags-user.txt "
                        "makes the game render smaller and DLSS (or the normal scaler on other "
-                       "cards) bring it up to the screen - faster on weaker cards. Needs a "
-                       "restart.");
+                       "cards) bring it up to the screen - faster on weaker cards. The game sets "
+                       "up its render size at start, so this needs a restart (live: planned for "
+                       "1.2).");
     ImGui::PopTextWrapPos();
     ImGui::PopStyleColor();
 }
@@ -280,7 +299,10 @@ void Panel::Draw() {
                             ImGuiCond_FirstUseEver);
     // Fixed width, height follows the content (auto-resize alone would let the sliders, which
     // size themselves from the window, shrink it frame by frame).
-    ImGui::SetNextWindowSizeConstraints(ImVec2(510.0f, 0.0f), ImVec2(510.0f, 100000.0f));
+    // At most the screen's height (user 10-20: the bottom was cut off with Advanced open); the
+    // window scrolls beyond that.
+    ImGui::SetNextWindowSizeConstraints(ImVec2(510.0f, 0.0f),
+                                        ImVec2(510.0f, std::max(200.0f, vp->WorkSize.y - 110.0f)));
     ImGui::SetNextWindowBgAlpha(0.88f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
@@ -290,17 +312,30 @@ void Panel::Draw() {
     bool keep_open = true;
     if (ImGui::Begin("DLSS###dlss5panel", &keep_open,
                      ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize |
-                         ImGuiWindowFlags_NoSavedSettings)) {
+                         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking)) {
         ImGui::SetWindowFontScale(1.15f);
-        ImGui::SeparatorText("DLSS 4.5  (Super Resolution / DLAA)");
-        DrawDlss45();
+        // Each section its own ID scope: both have a "Default" button (ImGui's conflicting-ID
+        // warning, user 10-20).
+        ImGui::PushID("dlss45");
+        if (ImGui::CollapsingHeader("DLSS 4.5  (Super Resolution / DLAA)",
+                                    ImGuiTreeNodeFlags_DefaultOpen)) {
+            DrawDlss45();
+        }
+        ImGui::PopID();
         ImGui::Spacing();
-        ImGui::SeparatorText("DLSS 5  (Neural Rendering)");
+        const bool d5_installed =
+            !(status.state == D5::State::Off || status.state == D5::State::NotFound);
+        ImGui::PushID("dlss5");
+        const bool d5_open = ImGui::CollapsingHeader(
+            "DLSS 5  (Neural Rendering)", d5_installed ? ImGuiTreeNodeFlags_DefaultOpen : 0);
         // Without the DLSS 5 files (every public build): one line, none of its controls.
-        if (status.state == D5::State::Off || status.state == D5::State::NotFound) {
-            ImGui::PushStyleColor(ImGuiCol_Text, Grey);
-            ImGui::TextUnformatted("Not installed.");
-            ImGui::PopStyleColor();
+        if (!d5_installed || !d5_open) {
+            if (!d5_installed && d5_open) {
+                ImGui::PushStyleColor(ImGuiCol_Text, Grey);
+                ImGui::TextUnformatted("Not installed.");
+                ImGui::PopStyleColor();
+            }
+            ImGui::PopID();
             ImGui::Spacing();
             if (ImGui::Button("Close  (Page Up)")) {
                 keep_open = false;
@@ -469,6 +504,7 @@ void Panel::Draw() {
         }
         ImGui::PopTextWrapPos();
         ImGui::PopStyleColor();
+        ImGui::PopID();
     }
     ImGui::End();
     ImGui::PopStyleColor(2);

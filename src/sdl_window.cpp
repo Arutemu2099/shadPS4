@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_hints.h>
 #include <SDL3/SDL_init.h>
@@ -410,12 +411,15 @@ void WindowSDL::WaitEvent() {
                 Overlay::ShowNotice(on ? "DLSS: ON" : "DLSS: OFF (game's own anti-aliasing)");
             } else if (emu_key(Input::EmuKey::DlssOutputScale)) {
                 const float scale =
-                    Vulkan::Dlss::g_output_scale.load(std::memory_order_relaxed) > 1.0f ? 1.0f
-                                                                                       : 1.5f;
+                    Vulkan::Dlss::g_output_scale.load(std::memory_order_relaxed) > 1.0f
+                        ? 1.0f
+                        : Vulkan::Dlss::g_output_pick.load(std::memory_order_relaxed);
                 Vulkan::Dlss::g_output_scale.store(scale, std::memory_order_relaxed);
                 LOG_INFO(Render_Vulkan, "DLSS: output scale {} (Insert)", scale);
-                Overlay::ShowNotice(scale > 1.0f ? "DLSS output: 1.5x the screen, scaled down"
-                                                 : "DLSS output: the screen size");
+                static char notice[64];
+                std::snprintf(notice, sizeof(notice), "DLSS output: %.2gx the screen, scaled down",
+                              scale);
+                Overlay::ShowNotice(scale > 1.0f ? notice : "DLSS output: the screen size");
             } else {
                 const u32 step = 3; // backwards, as Page Down always did
                 const u32 combo =

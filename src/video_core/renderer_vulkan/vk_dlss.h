@@ -54,6 +54,8 @@ inline std::atomic<u32> g_jitter_combo{3}; ///< D (-x -y): the user's live pick,
 /// Insert (SHADPS4_DLSS_UPSCALE): 1 = DLSS writes the window size, 1.5 = 1.5x the window (3840x2160
 /// on a 1440p screen), scaled down by the post pass (supersampling; user idea 2026-10-17).
 inline std::atomic<float> g_output_scale{1.0f};
+/// The panel's last output pick above the screen size (Insert switches between it and 1.0).
+inline std::atomic<float> g_output_pick{1.5f};
 /// The network (sl::DLSSPreset number; 0 = the DLL's default, 11 = K, 12 = L, 13 = M): the Page Up
 /// panel, first from SHADPS4_DLSS_PRESET.
 inline std::atomic<u32> g_preset{[] {

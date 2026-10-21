@@ -452,7 +452,12 @@ static void ApplyAspectRatio() {
     // SHADPS4_RENDER_HUD=native keeps the screen space at the render size (that look).
     const char* hud_env = std::getenv("SHADPS4_RENDER_HUD");
     const bool hud_native = hud_env && std::string{hud_env} == "native";
-    const double hud_scale = hud_native ? 1.0 : 1080.0 / h0;
+    double hud_scale = hud_native ? 1.0 : 1080.0 / h0;
+    // SHADPS4_HUD_SPACE_SCALE (test, 10-20): scales the 2D space at the same shape (the camera
+    // aspect = its ratio stays) - how the HUD's size follows the space on narrow screens.
+    if (const char* v = std::getenv("SHADPS4_HUD_SPACE_SCALE"); v && std::atof(v) > 0.2) {
+        hud_scale *= std::atof(v);
+    }
     const u32 sw = u32(std::lround(w * hud_scale));
     const u32 sh = u32(std::lround(h * hud_scale));
     struct Imm {
