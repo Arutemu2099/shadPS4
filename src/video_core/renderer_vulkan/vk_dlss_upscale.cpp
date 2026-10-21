@@ -47,6 +47,9 @@ Upscaler::Upscaler(const Instance& instance_) : instance{instance_}, device{inst
         const float scale = static_cast<float>(std::atof(v));
         if (scale >= 1.0f && scale <= 2.0f) {
             g_output_scale.store(scale, std::memory_order_relaxed);
+            if (scale > 1.0f) {
+                g_output_pick.store(scale, std::memory_order_relaxed); // what Insert returns to
+            }
         }
     }
     sampler = Check<"create dlss composite sampler">(device.createSamplerUnique(vk::SamplerCreateInfo{
