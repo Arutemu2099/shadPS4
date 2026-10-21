@@ -7,9 +7,12 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <numbers>
+#include <string>
 #include "common/arch.h"
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "core/mouse_aim.h"
 
 #if defined(ARCH_X86_64) && defined(_WIN32)
@@ -35,6 +38,23 @@ std::atomic<Mailbox*> g_mailbox{nullptr}; ///< published last (release), after e
 const volatile u8* g_invert_x = nullptr;
 const volatile u8* g_invert_y = nullptr;
 std::atomic<float> g_sens_deg{5.12f}; // the user's pick, 2026-10-17 (8 x 0.8 x 0.8)
+
+std::filesystem::path MouseAimPath() {
+    return Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "mouse-aim.ini";
+}
+
+/// The sensitivity the - / = keys saved last (0 = none).
+float SavedSensitivity() {
+    std::ifstream in{MouseAimPath()};
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.rfind("sensitivity=", 0) == 0) {
+            return static_cast<float>(std::atof(line.c_str() + 12));
+        }
+    }
+    return 0.0f;
+}
+
 float g_sign_x = -1.0f; // mouse right -> turn right (user live, 10-17; SHADPS4_MOUSE_AIM_FLIP=x flips)
 float g_sign_y = 1.0f; // mouse up -> look up with the in-game invert off (user live, 10-17)
 /// Tick (timer thread): the camera hook ran within the last StaleAfter.
@@ -144,6 +164,8 @@ void InstallCameraHook(VAddr eboot_base, u64 eboot_size) {
         if (s > 0.0f) {
             g_sens_deg.store(std::clamp(s, 0.5f, 100.0f));
         }
+    } else if (const float saved = SavedSensitivity(); saved > 0.0f) {
+        g_sens_deg.store(std::clamp(saved, 0.5f, 100.0f));
     }
     if (const char* v = std::getenv("SHADPS4_MOUSE_AIM_FLIP")) {
         if (std::strchr(v, 'x') != nullptr) {
@@ -296,7 +318,16 @@ float ScaleSensitivity(float factor) {
     float s = g_sens_deg.load(std::memory_order_relaxed);
     s = std::clamp(s * factor, 0.5f, 100.0f);
     g_sens_deg.store(s, std::memory_order_relaxed);
-    LOG_INFO(Core, "Mouse aim: {:.2f} deg per 100 px", s);
+    // Kept for the next start (1.1, user 10-21; the - / = keys were session-only):
+    // user/mouse-aim.ini; SHADPS4_MOUSE_AIM_SENS in the flags file still wins.
+    std::ofstream out{MouseAimPath(), std::ios::trunc};
+    out << "# Written by the - / = keys: mouse-look speed in degrees per 100 pixels (default 5.12).
+"
+           "# SHADPS4_MOUSE_AIM_SENS in shadps4-flags-user.txt wins over this file.
+"
+        << "sensitivity=" << s << "
+";
+    LOG_INFO(Core, "Mouse aim: {:.2f} deg per 100 px (saved)", s);
     return s;
 }
 
