@@ -628,6 +628,12 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
                                        Common::g_scm_branch, Common::g_scm_desc, game_title);
         }
     }
+    // 1.1 (user 10-21): the fork's build version first, for players and bug reports.
+    std::string_view build_tag{Common::ReleaseTag};
+    if (build_tag.starts_with("second-son-")) {
+        build_tag.remove_prefix(11);
+    }
+    window_title = fmt::format("Second Son build {} - {}", build_tag, window_title);
     window = std::make_unique<Frontend::WindowSDL>(EmulatorSettings.GetWindowWidth(),
                                                    EmulatorSettings.GetWindowHeight(), controllers,
                                                    window_title);

@@ -25,6 +25,7 @@ public:
 private:
     enum class SettingsCategory {
         Profiles,
+        Quick, // 1.1: the settings players change, first when a game runs
         General,
         Graphics,
         Input,

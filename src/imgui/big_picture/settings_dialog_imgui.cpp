@@ -227,7 +227,7 @@ SettingsWindow::SettingsWindow(bool gameRunning) : isGameRunning(gameRunning) {
 
     currentProfile = "Global";
     m_GameInstallDirs = EmulatorSettings.GetAllGameInstallDirs();
-    currentCategory = isGameRunning ? SettingsCategory::General : SettingsCategory::Profiles;
+    currentCategory = isGameRunning ? SettingsCategory::Quick : SettingsCategory::Profiles;
 
     bool customConfigFound = false;
     if (isGameRunning) {
@@ -305,7 +305,7 @@ void SettingsWindow::SetupWindow() {
     }
 
     SettingsCategory firstCategory =
-        isGameRunning ? SettingsCategory::General : SettingsCategory::Profiles;
+        isGameRunning ? SettingsCategory::Quick : SettingsCategory::Profiles;
     SettingsCategory lastCategory =
         currentProfile != "Global" ? SettingsCategory::Experimental : SettingsCategory::Log;
 
@@ -344,6 +344,7 @@ void SettingsWindow::DrawCategoryTabs() {
         AddCategory("Profiles", profilesTexture, SettingsCategory::Profiles);
     }
 
+    AddCategory("Quick", generalTexture, SettingsCategory::Quick);
     AddCategory("General", generalTexture, SettingsCategory::General);
     AddCategory("Graphics", graphicsTexture, SettingsCategory::Graphics);
     AddCategory("Input", inputTexture, SettingsCategory::Input);
@@ -683,7 +684,37 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
     ImGui::BeginChild("ContentRegion", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), true,
                       child_flags);
 
-    if (category == SettingsCategory::General) {
+    if (category == SettingsCategory::Quick) {
+        // 1.1 (user 10-21): the settings players change, in one place (shadPS4's own tabs keep
+        // everything, these included); same values, so Save stores them as before.
+        if (ImGui::BeginTable("SettingsTable", 2)) {
+            ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, 500.0f * uiScale);
+            ImGui::TableSetupColumn("Value");
+
+            AddSettingCombo("Display Mode (F11 switches too)", fullscreenModeSetting,
+                            fullscreenModeOptions);
+            AddSettingCombo("V-Sync (Present Mode)", presentModeSetting, presentModeOptions);
+            ImGui::SetItemTooltip(
+                "Mailbox: no tearing, no frame cap (default).\n"
+                "Fifo: V-Sync, at most one new picture per screen refresh.\n"
+                "Fifo (half refresh): every picture stays two screen refreshes - even motion on "
+                "screens without G-Sync / FreeSync.\n"
+                "Immediate: no V-Sync (can tear without G-Sync / FreeSync).");
+            if (currentProfile != "Global") {
+                AddSettingSliderInt("Frame-rate cap (Vblank Frequency)", vblankFrequencySetting, 30,
+                                    360);
+                ImGui::SetItemTooltip("At most this many pictures per second (default 240).");
+            }
+            AddSettingSliderInt("Volume", volumeSetting, 0, 500);
+            AddSettingSliderFloat("Left Stick Deadzone (%)", stickDeadzoneLeftSetting, 0, 40, 1);
+            AddSettingSliderFloat("Right Stick Deadzone (%)", stickDeadzoneRightSetting, 0, 40, 1);
+
+            ImGui::EndTable();
+        }
+        ImGui::Spacing();
+        ImGui::TextWrapped("Render size and DLSS: Page Up (Insert switches your pick and 100%%). "
+                           "Mouse-look speed: - / =. Everything else: the other tabs.");
+    } else if (category == SettingsCategory::General) {
         if (ImGui::BeginTable("SettingsTable", 2)) {
             ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, 500.0f * uiScale);
             ImGui::TableSetupColumn("Value");
@@ -702,6 +733,11 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
 
             AddSettingCombo("Display Mode", fullscreenModeSetting, fullscreenModeOptions);
             AddSettingCombo("Present Mode", presentModeSetting, presentModeOptions);
+            // 1.1: the frame-rate cap next to the V-Sync choice (it was under Experimental).
+            if (currentProfile != "Global") {
+                AddSettingSliderInt("Frame-rate cap (Vblank Frequency)", vblankFrequencySetting, 30,
+                                    360);
+            }
             AddSettingSliderInt("Window Width", windowWidthSetting, 0, 8000);
             AddSettingSliderInt("Window Height", windowHeightSetting, 0, 7000);
             AddSettingCheckbox("Enable HDR", hdrAllowedSetting);
@@ -770,7 +806,6 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             ImGui::TableSetupColumn("Value");
 
             AddSettingSliderInt("Additional DMem Allocation", extraDmemSetting, 0, 20000);
-            AddSettingSliderInt("Vblank Frequency", vblankFrequencySetting, 30, 360);
             AddSettingCombo("Readbacks Mode", readbacksModeSetting, readbacksModeOptions);
             AddSettingCheckbox("Enable Readback Linear Images", readbackLinearImagesSetting);
             AddSettingCheckbox("Enable Direct Memory Access", directMemoryAccessSetting);
