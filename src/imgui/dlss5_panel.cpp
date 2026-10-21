@@ -328,9 +328,9 @@ void Panel::DrawRenderSize() {
     static constexpr int presets[] = {33, 50, 58, 67, 100};
     static const char* const preset_names[] = {"Ultra P.", "Perf.", "Balanced", "Quality", "DLAA"};
     static const char* const preset_tips[] = {
-        "Ultra Performance: 33% (1/3) - for 4K screens and weak cards. DLSS takes one exact
-size for it; where the game's size is a few pixels off (1440p screens) it runs
-Performance at 2x and a plain scale does the rest.",
+        "Ultra Performance: 33% (1/3) - for 4K screens and weak cards. DLSS takes one exact\n"
+        "size for it; where the game's size is a few pixels off (1440p screens) it runs\n"
+        "Performance at 2x and a plain scale does the rest.",
         "Performance: 50% (720p on a 1440p screen, 1080p on 4K).",
         "Balanced: 58%.",
         "Quality: 67% (2/3: 960 lines on a 1440p screen).",
