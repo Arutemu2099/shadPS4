@@ -17,6 +17,10 @@ class LeastRecentlyUsedCache {
         TickType tick;
         Item* next{};
         Item* prev{};
+        /// In the list. A freed item is not: a late Touch of a freed image's id (a per-frame
+        /// table touching it before it noticed the unregister, 10-20 live-resize hang s1513)
+        /// re-linked it, the pool handed it out again and the list closed into a loop.
+        bool linked{};
     };
 
 public:
@@ -34,7 +38,7 @@ public:
 
     void Touch(size_t id, TickType tick) {
         auto& item = item_pool[id];
-        if (item.tick >= tick) {
+        if (!item.linked || item.tick >= tick) {
             return;
         }
         item.tick = tick;
@@ -47,7 +51,11 @@ public:
 
     void Free(size_t id) {
         auto& item = item_pool[id];
+        if (!item.linked) {
+            return; // freed twice
+        }
         Detach(item);
+        item.linked = false;
         item.prev = nullptr;
         item.next = nullptr;
         free_items.push_back(id);
@@ -58,7 +66,10 @@ public:
         static constexpr bool RETURNS_BOOL =
             std::is_same_v<std::invoke_result<Func, ObjectType>, bool>;
         Item* iterator = first_item;
-        while (iterator) {
+        // A loop in the list (it cannot form any more, see Item::linked) would hang the walk:
+        // at most one visit per item.
+        size_t budget = item_pool.size();
+        while (iterator && budget-- > 0) {
             if (static_cast<s64>(tick) - static_cast<s64>(iterator->tick) < 0) {
                 return;
             }
@@ -92,6 +103,7 @@ private:
     }
 
     void Attach(Item& item) {
+        item.linked = true;
         if (!first_item) {
             first_item = &item;
         }
