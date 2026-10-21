@@ -595,9 +595,14 @@ static void ApplyAspectRatio() {
     // the Pro toggle loads other immediates): at least 100% of the screen, so the slider is live
     // from its lowest value up to the screen's size (above: after a restart).
     const char* live_env = std::getenv("SHADPS4_LIVE_RES");
-    const bool live = g_percent_now > 0.0f && !(live_env && live_env[0] == '0') &&
+    // User 10-20 ~23:40: live from the first start, no restart for any size - the game boots at
+    // the largest size (200% of the screen within the 3200x1800-pixel cap) and the first frames
+    // switch it to the pick, or to its own 1080 lines without one. Only the loading frames draw
+    // at the big size; the purge then frees those targets (lower-end PCs keep nothing big).
+    // SHADPS4_LIVE_RES=0: boot at the pick (no live changes), SHADPS4_RENDER_HEIGHT too.
+    const bool live = !g_height_from_flags && !(live_env && live_env[0] == '0') &&
                       !EmulatorSettings.IsNeo();
-    const u32 hm = live ? std::max(h0, BaseHeightForPercent(100.0f, aspect)) : h0;
+    const u32 hm = live ? std::max(h0, BaseHeightForPercent(200.0f, aspect)) : h0;
     if (aspect == base && h0 == 1080 && hm == 1080) {
         return; // 16:9 at 1080: nothing to do
     }
@@ -669,7 +674,8 @@ static void ApplyAspectRatio() {
     }
     g_render_w = w;
     g_render_h = h;
-    g_now_size.store((u64(w) << 32) | h, std::memory_order_release);
+    // Until the switch is taken the game draws at M (the purge then drops M's targets).
+    g_now_size.store((u64(max.width) << 32) | max.height, std::memory_order_release);
     g_max = max;
     g_live_ok = live;
     if (max.width != w || max.height != h) {
@@ -719,9 +725,11 @@ float ToggleNativePercent() {
     if (!g_live_ok) {
         return 0.0f;
     }
-    const float pick = SavedScreenPercent();
+    // No pick saved: the game's own 1080 lines as a percentage.
+    const float saved = SavedScreenPercent();
+    const float pick = saved > 0.0f ? saved : float(100.0 * 1080.0 / FullBaseHeight(g_aspect));
     const bool at_native = std::abs(CurrentScreenPercent() - 100.0f) < 0.5f;
-    const float to = at_native && pick > 0.0f ? pick : 100.0f;
+    const float to = at_native ? pick : 100.0f;
     return RequestScreenPercent(to) ? to : 0.0f;
 }
 
@@ -737,8 +745,9 @@ bool TakeLivePurge(u64 sizes[2]) {
 }
 
 void RequeueLivePurge() {
-    // At most ~8 frames: a newer change replaces it anyway.
-    if (g_purge_tries.fetch_add(1, std::memory_order_relaxed) < 8) {
+    // The boot switch lands during the loading screens, where the new size's targets appear
+    // only when the world draws: up to 3000 frames. A newer change replaces it anyway.
+    if (g_purge_tries.fetch_add(1, std::memory_order_relaxed) < 3000) {
         u64 expected = 0;
         g_purge_old.compare_exchange_strong(expected, g_purge_last_old,
                                             std::memory_order_acq_rel);

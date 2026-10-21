@@ -339,8 +339,8 @@ void Panel::DrawRenderSize() {
             wrap(Yellow, "%d%% = %ux%u: more than this start's %ux%u - applies after a restart.",
                  pick, next.width, next.height, max.width, max.height);
         } else {
-            wrap(Yellow, "%d%% = %ux%u: applies after a restart; from then on the slider works "
-                         "live up to 100%% (or the size you start with).",
+            wrap(Yellow, "%d%% = %ux%u: applies after a restart (live changes are off: "
+                         "SHADPS4_LIVE_RES=0 or PS4 Pro mode).",
                  pick, next.width, next.height);
         }
     } else if (!from_flags && saved_once) {
