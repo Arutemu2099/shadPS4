@@ -2144,11 +2144,41 @@ void TextureCache::GarbageCollectSamplers() {
     }
 }
 
+void TextureCache::PurgeOldRenderSize() {
+    // Live screen percentage (user 10-20 ~22:20: lighting shifts, photo-mode shadows lost after
+    // changes; s1511: the rule in ResolveOverlap fired twice in 21 changes): every size the
+    // player visits leaves a full set of the game's screen-sized targets, and a return to that
+    // size perfect-matches the old set with its old contents (history, photo-mode shadows drawn
+    // once). At the end of the first frame drawn at the new size, the render-shaped render
+    // targets / depth images that frame did not touch are the old set: freed (the Vulkan side
+    // waits for the GPU in DeleteImage).
+    CacheLock lock{*this};
+    std::vector<ImageId> stale;
+    lru_cache.ForEachItemBelow(gc_tick - 1, [&](ImageId image_id) {
+        const Image& image = slot_images[image_id];
+        if ((image.usage.render_target || image.usage.depth_target) &&
+            True(image.flags & ImageFlagBits::Registered) &&
+            MemoryPatcher::IsRenderShaped(image.info.size.width, image.info.size.height)) {
+            stale.push_back(image_id);
+        }
+    });
+    u64 bytes = 0;
+    for (const ImageId id : stale) {
+        bytes += slot_images[id].info.guest_size;
+        FreeImage(id);
+    }
+    LOG_INFO(Render_Vulkan, "LiveResize: dropped {} old-size target(s), {} MB of guest size",
+             stale.size(), bytes >> 20);
+}
+
 void TextureCache::RunGarbageCollector() {
     SCOPE_EXIT {
         ++gc_tick;
     };
 
+    if (MemoryPatcher::TakeLivePurge()) {
+        PurgeOldRenderSize();
+    }
     GarbageCollectImages();
     GarbageCollectSamplers();
 }

@@ -79,6 +79,9 @@ bool RequestScreenPercent(float percent);
 float ToggleNativePercent();
 /// sceGnmSubmitDone (Game:Main, once per frame): applies a queued size.
 void OnSubmitDone();
+/// The back, at a frame's end: true once after the game took a change (the texture cache then
+/// drops the render-shaped targets that frame did not use).
+bool TakeLivePurge();
 /// The 3 s after a change was poked: the texture cache replaces re-sized render targets.
 bool InLiveResizeWindow();
 /// A size of the render shape (+-3%): the game's screen-sized targets and their half / quarter.

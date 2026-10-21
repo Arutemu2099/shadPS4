@@ -546,6 +546,8 @@ private:
     }
 
     void GarbageCollectImages();
+    /// Live screen percentage: drops the render-shaped targets the frame did not use.
+    void PurgeOldRenderSize();
     void GarbageCollectSamplers();
 
     // Only the surviving perfect-match path is memoized. These are all its selection inputs;
