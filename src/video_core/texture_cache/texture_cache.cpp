@@ -2162,13 +2162,23 @@ void TextureCache::PurgeOldRenderSize() {
             stale.push_back(image_id);
         }
     });
+    // An image listed twice (two LRU items naming one id) is freed once.
+    std::sort(stale.begin(), stale.end(),
+              [](ImageId a, ImageId b) { return a.index < b.index; });
+    stale.erase(std::unique(stale.begin(), stale.end()), stale.end());
     u64 bytes = 0;
+    size_t freed = 0;
     for (const ImageId id : stale) {
+        // Freeing one can unregister another first (s1514: "already unregistered").
+        if (False(slot_images[id].flags & ImageFlagBits::Registered)) {
+            continue;
+        }
         bytes += slot_images[id].info.guest_size;
         FreeImage(id);
+        ++freed;
     }
-    LOG_INFO(Render_Vulkan, "LiveResize: dropped {} old-size target(s), {} MB of guest size",
-             stale.size(), bytes >> 20);
+    LOG_INFO(Render_Vulkan, "LiveResize: dropped {} old-size target(s) ({} listed), {} MB of guest size",
+             freed, stale.size(), bytes >> 20);
 }
 
 void TextureCache::RunGarbageCollector() {
