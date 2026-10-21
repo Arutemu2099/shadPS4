@@ -29,6 +29,7 @@
 #endif
 #include "common/elf_info.h"
 #include "common/memory_patcher.h"
+#include <SDL3/SDL_video.h>
 #include "common/ntapi.h"
 #include "common/path_util.h"
 #include "common/polyfill_thread.h"
@@ -633,6 +634,14 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
     g_window = window.get();
     MemoryPatcher::SetScreenSize(window->GetWidth(), window->GetHeight()); // SHADPS4_ASPECT
+    // Screen percentage: 100% = the monitor (the window often opens at 1280x720 before F11).
+    if (const SDL_DisplayID display = SDL_GetDisplayForWindow(window->GetSDLWindow())) {
+        if (const SDL_DisplayMode* desktop = SDL_GetDesktopDisplayMode(display)) {
+            const float density = desktop->pixel_density > 0.0f ? desktop->pixel_density : 1.0f;
+            MemoryPatcher::SetDisplaySize(int(desktop->w * density + 0.5f),
+                                          int(desktop->h * density + 0.5f));
+        }
+    }
     Common::StartProjectionFinder(); // SHADPS4_FIND_PROJ=1 diagnostic (aspect ratio work)
     Common::StartUpdateNotice(); // 1.1: GitHub latest-release check (SHADPS4_UPDATE_CHECK=0 off)
 

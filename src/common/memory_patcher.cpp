@@ -366,8 +366,16 @@ static void ApplyParticleLightOneSubmit() {
 // (FUN_800197050's imm32). Refused unless every original byte matches. The game's context pool has
 // no bounds check (at most 254 per frame): the census in gnmdriver logs the count per frame.
 static int g_screen_w = 0, g_screen_h = 0;
+static int g_display_w = 0, g_display_h = 0;    // the monitor the window opened on, in pixels
 static u32 g_render_w = 1920, g_render_h = 1080; // the game's render size after ApplyAspectRatio
 static float g_hud_ratio = 1.0f;
+static double g_aspect = 16.0 / 9.0; // the shape the game renders, decided at boot
+static u32 g_h0 = 1080;              // its height at 16:9 (the size setup's basis)
+static float g_percent_now = 0.0f;   // the screen percentage in effect (0 = the game's 1080 lines)
+static bool g_height_from_flags = false;
+constexpr const char* RenderSizeFile = "render-size.ini";
+constexpr u32 MinLines = 96, MaxLines = 4320; // 8K
+constexpr u64 MaxPixels = u64(7680) * 4320;   // 8K's pixels, for any shape
 
 float HudSafeAreaRatio() {
     return g_hud_ratio;
@@ -376,6 +384,116 @@ float HudSafeAreaRatio() {
 void SetScreenSize(int width, int height) {
     g_screen_w = width;
     g_screen_h = height;
+}
+
+void SetDisplaySize(int width, int height) {
+    g_display_w = width;
+    g_display_h = height;
+}
+
+namespace {
+
+u32 Round8(double v) {
+    return u32(std::lround(v / 8.0) * 8);
+}
+
+/// The render size at 16:9-basis height h0 in the shape `aspect`: wide shapes keep the height
+/// (at most 32:9), narrow ones the 16:9 width (at most 1:1).
+RenderSize SizeAt(u32 h0, double aspect) {
+    const bool narrow = aspect < 16.0 / 9.0 - 1e-6;
+    const u32 w0 = Round8(h0 * 16.0 / 9.0);
+    return narrow ? RenderSize{w0, std::min(w0, Round8(w0 / aspect))}
+                  : RenderSize{std::min(Round8(h0 * 32.0 / 9.0), Round8(h0 * aspect)), h0};
+}
+
+/// Lowers h0 until the size has at most 8K's pixels (the wide and tall shapes).
+u32 CapPixels(u32 h0, double aspect) {
+    while (h0 > MinLines) {
+        const RenderSize s = SizeAt(h0, aspect);
+        if (u64(s.width) * s.height <= MaxPixels) {
+            break;
+        }
+        h0 -= 8;
+    }
+    return h0;
+}
+
+/// 100% of the screen: the largest box of the render shape on the monitor (the boot window is
+/// often 1280x720 before F11, so the monitor is the reference; the window without one).
+RenderSize Reference(double aspect) {
+    double dw = g_display_w > 0 ? g_display_w : g_screen_w;
+    double dh = g_display_w > 0 ? g_display_h : g_screen_h;
+    if (dw <= 0.0 || dh <= 0.0) {
+        dw = 1920.0;
+        dh = 1080.0;
+    }
+    return aspect >= dw / dh ? RenderSize{u32(dw), u32(std::lround(dw / aspect))}
+                             : RenderSize{u32(std::lround(dh * aspect)), u32(dh)};
+}
+
+/// The 16:9-basis height of 100%.
+double FullBaseHeight(double aspect) {
+    const RenderSize ref = Reference(aspect);
+    return std::min<double>(ref.height, ref.width * 9.0 / 16.0);
+}
+
+/// The 16:9-basis height for `percent` of the screen, 96 lines .. 8K.
+u32 BaseHeightForPercent(float percent, double aspect) {
+    // 33 and 67 = DLSS's exact 1/3 and 2/3 (Ultra Performance takes one exact size: 4K -> 720
+    // lines, 1080p -> 640x360; 0.33 would miss it by 8 lines).
+    const int whole = int(std::lround(percent));
+    const double p = whole == 33   ? 1.0 / 3.0
+                     : whole == 67 ? 2.0 / 3.0
+                                   : std::clamp(percent, 10.0f, 200.0f) / 100.0;
+    return CapPixels(std::clamp(Round8(FullBaseHeight(aspect) * p), MinLines, MaxLines), aspect);
+}
+
+std::filesystem::path RenderSizePath() {
+    return Common::FS::GetUserPath(Common::FS::PathType::UserDir) / RenderSizeFile;
+}
+
+} // namespace
+
+float SavedScreenPercent() {
+    std::ifstream in{RenderSizePath()};
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.rfind("screen_percent=", 0) == 0) {
+            const float v = float(std::atof(line.c_str() + 15));
+            return v > 0.0f ? std::clamp(v, 10.0f, 200.0f) : 0.0f;
+        }
+    }
+    return 0.0f;
+}
+
+void SaveScreenPercent(float percent) {
+    const int value = percent > 0.0f ? int(std::lround(std::clamp(percent, 10.0f, 200.0f))) : 0;
+    std::ofstream out{RenderSizePath(), std::ios::trunc};
+    out << "# Written by the DLSS panel (Page Up): the game's render size in percent of the\n"
+           "# screen (10-200; 0 = the game's own 1080 lines), read at start. SHADPS4_RENDER_HEIGHT\n"
+           "# or SHADPS4_SCREEN_PERCENT in shadps4-flags-user.txt win over this file.\n"
+        << "screen_percent=" << value << "\n";
+    LOG_INFO(Loader, "Screen percentage {} saved (applies at the next start)", value);
+}
+
+RenderSize CurrentRenderSize() {
+    return {g_render_w, g_render_h};
+}
+
+RenderSize PercentReference() {
+    return Reference(g_aspect);
+}
+
+float CurrentScreenPercent() {
+    return g_percent_now > 0.0f ? g_percent_now : float(100.0 * g_h0 / FullBaseHeight(g_aspect));
+}
+
+RenderSize RenderSizeForPercent(float percent) {
+    return SizeAt(percent > 0.0f ? BaseHeightForPercent(percent, g_aspect) : 1080, g_aspect);
+}
+
+bool RenderHeightFromFlags() {
+    return g_height_from_flags;
 }
 
 // SHADPS4_ASPECT (1.1, user 2026-10-20; EXPERIMENTS "v1.1 C"): the game fills the screen's shape.
@@ -395,22 +513,19 @@ void SetScreenSize(int width, int height) {
 // height the game renders at instead of 1080 (360 - 2160; the width follows the shape). Every
 // buffer, the HUD and the camera follow as for a shape; the presenter (FSR) or DLSS scales the
 // picture to the window. E.g. 720 = 1280x720 (0.44x the pixels), 480 = 856x480 (0.2x), 1440 =
-// 2560x1440 (supersampling).
+// 2560x1440 (supersampling). 96 - 4320 lines (8K; at most 8K's pixel count in any shape).
+// Screen percentage (1.1, user 10-20 ~20:15; the DLSS panel's slider, saved in
+// user/render-size.ini, or SHADPS4_SCREEN_PERCENT=NN): the render size as 10-200% of the
+// screen in the render shape (the monitor's largest box of that shape), e.g. 67% of 2560x1440 =
+// 1712x968 (DLSS Quality), 150% = 3840x2160 (DLAA at 4K, the presenter scales it down).
+// SHADPS4_RENDER_HEIGHT wins over both; with neither the game keeps its 1080 lines.
 static void ApplyAspectRatio() {
     const char* env = std::getenv("SHADPS4_ASPECT");
     const std::string mode = env ? env : "auto";
-    const auto round8 = [](double v) { return u32(std::lround(v / 8.0) * 8); };
-    u32 h0 = 1080;
-    if (const char* rh = std::getenv("SHADPS4_RENDER_HEIGHT"); rh && std::atoi(rh) > 0) {
-        h0 = std::clamp(round8(std::atof(rh)), 360u, 2160u);
-    }
-    const u32 w0 = round8(h0 * 16.0 / 9.0); // the 16:9 size at that height (1920 at 1080)
+    constexpr double base = 16.0 / 9.0;
     double aspect = 0.0;
     if (mode == "off" || mode == "0") {
-        if (h0 == 1080) {
-            return;
-        }
-        aspect = 16.0 / 9.0;
+        aspect = base;
     } else if (const auto colon = mode.find(':'); colon != std::string::npos) {
         const double w = std::atof(mode.substr(0, colon).c_str());
         const double h = std::atof(mode.substr(colon + 1).c_str());
@@ -418,13 +533,28 @@ static void ApplyAspectRatio() {
     } else if (g_screen_w > 0 && g_screen_h > 0) {
         aspect = double(g_screen_w) / double(g_screen_h);
     }
-    constexpr double base = 16.0 / 9.0;
     // 3%: a "1280x720" window reports a client area like 1279x724 (measured, s1427).
     if (aspect <= 0.0 || std::abs(aspect - base) < 0.03 * base) {
-        if (h0 == 1080) {
-            return; // 16:9 or unknown at 1080: nothing to do
+        aspect = base; // 16:9 or unknown
+    }
+    u32 h0 = 1080;
+    if (const char* rh = std::getenv("SHADPS4_RENDER_HEIGHT"); rh && std::atoi(rh) > 0) {
+        h0 = CapPixels(std::clamp(Round8(std::atof(rh)), MinLines, MaxLines), aspect);
+        g_height_from_flags = true;
+    } else {
+        const char* pe = std::getenv("SHADPS4_SCREEN_PERCENT");
+        const float percent = pe && std::atof(pe) > 0.0
+                                  ? std::clamp(float(std::atof(pe)), 10.0f, 200.0f)
+                                  : SavedScreenPercent();
+        if (percent > 0.0f) {
+            h0 = BaseHeightForPercent(percent, aspect);
+            g_percent_now = percent;
         }
-        aspect = base;
+    }
+    g_aspect = aspect;
+    g_h0 = h0;
+    if (aspect == base && h0 == 1080) {
+        return; // 16:9 at 1080: nothing to do
     }
     const bool narrow = aspect < base - 1e-6;
     // Narrow screens (not crop): the camera keeps the 16:9 horizontal view and gains picture above
@@ -442,10 +572,11 @@ static void ApplyAspectRatio() {
         LOG_ERROR(Loader, "SHADPS4_ASPECT: refused, the projection builder differs (eboot 01.07)");
         return;
     }
-    // Multiples of 8; wide: the height h0 (1080), narrow: its 16:9 width w0 (1920); at most 32:9
+    // Multiples of 8; wide: the height h0 (1080), narrow: its 16:9 width (1920); at most 32:9
     // (3840 x 1080) and 1:1 (1920 x 1920).
-    const u32 w = narrow ? w0 : std::min(round8(h0 * 32.0 / 9.0), round8(h0 * aspect));
-    const u32 h = narrow ? std::min(w0, round8(w0 / aspect)) : h0;
+    const RenderSize size = SizeAt(h0, aspect);
+    const u32 w = size.width;
+    const u32 h = size.height;
     // The 2D screen space (HUD layout; its ratio = the camera aspect) stays at the 1080-line scale
     // when the render height differs (s1440 rh720: at 1280x720 screen space the minimap drew ~1.2x
     // too large and the skyline strip above it broke - some HUD parts are sized in 1080p pixels).
@@ -494,8 +625,12 @@ static void ApplyAspectRatio() {
         const s32 disp = s32(0x581c84 - (0x581d10 + 8)); // rip-relative from the next instruction
         std::memcpy(reinterpret_cast<void*>(g_eboot_address + 0x581d10 + 4), &disp, 4);
     }
-    LOG_INFO(Loader, "SHADPS4_ASPECT: the game renders {}x{} (aspect {:.3f}, screen {}x{}, {}, "
-             "render height {}, HUD space {}x{}{})", w, h, aspect, g_screen_w, g_screen_h, mode, h0,
+    LOG_INFO(Loader, "SHADPS4_ASPECT: the game renders {}x{} (aspect {:.3f}, screen {}x{}, "
+             "monitor {}x{}, {}, render height {}{}, HUD space {}x{}{})", w, h, aspect, g_screen_w,
+             g_screen_h, g_display_w, g_display_h, mode, h0,
+             g_height_from_flags    ? std::string{" from SHADPS4_RENDER_HEIGHT"}
+             : g_percent_now > 0.0f ? fmt::format(" = {:.0f}% of the screen", g_percent_now)
+                                    : std::string{},
              sw, sh,
              add_vertical ? ", 16:9 width kept, more picture above / below" : "");
 }

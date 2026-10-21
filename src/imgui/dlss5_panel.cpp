@@ -8,6 +8,7 @@
 #include <string>
 #include <imgui.h>
 
+#include "common/memory_patcher.h"
 #include "imgui/dlss5_panel.h"
 #include "imgui/imgui_layer.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
@@ -52,6 +53,9 @@ private:
     /// DLSS 4.5 (Super Resolution / DLAA): on / off, output size, network, render size (v1.1,
     /// user 10-20: "page up ... dlss 4.5 and 5 settings").
     void DrawDlss45();
+    /// Screen percentage (v1.1, user 10-20 ~20:15): the game's render size as 10-200% of the
+    /// screen, saved; the game sets its size up at start, so it applies at the next start.
+    void DrawRenderSize();
 
     D5::Settings edit{};
 };
@@ -273,15 +277,91 @@ void Panel::DrawDlss45() {
     }
     ImGui::EndDisabled();
 
-    ImGui::PushStyleColor(ImGuiCol_Text, Grey);
-    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 470.0f);
-    ImGui::TextWrapped("Render size: SHADPS4_RENDER_HEIGHT=720 (or 480) in shadps4-flags-user.txt "
-                       "makes the game render smaller and DLSS (or the normal scaler on other "
-                       "cards) bring it up to the screen - faster on weaker cards. The game sets "
-                       "up its render size at start, so this needs a restart (live: planned for "
-                       "1.2).");
-    ImGui::PopTextWrapPos();
-    ImGui::PopStyleColor();
+}
+
+void Panel::DrawRenderSize() {
+    namespace MP = MemoryPatcher;
+    // The panel's pick: the saved value, else what runs now (the game's 1080 lines as a percent).
+    static int pick = -1;
+    if (pick < 0) {
+        const float saved = MP::SavedScreenPercent();
+        pick = static_cast<int>(std::lround(saved > 0.0f ? saved : MP::CurrentScreenPercent()));
+        pick = std::clamp(pick, 10, 200);
+    }
+    static bool saved_once = false; ///< a pick was saved this run (the "after a restart" line)
+    const MP::RenderSize ref = MP::PercentReference();
+    const MP::RenderSize now = MP::CurrentRenderSize();
+    const auto wrap = [](const ImVec4& colour, const char* fmt, auto... args) {
+        ImGui::PushStyleColor(ImGuiCol_Text, colour);
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 470.0f);
+        ImGui::TextWrapped(fmt, args...);
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+    };
+    wrap(Grey, "Now: the game renders %ux%u = %.0f%% of your screen (%ux%u).", now.width,
+         now.height, MP::CurrentScreenPercent(), ref.width, ref.height);
+    const bool from_flags = MP::RenderHeightFromFlags();
+    if (from_flags) {
+        wrap(Yellow, "SHADPS4_RENDER_HEIGHT in shadps4-flags-user.txt sets the size; remove it "
+                     "to use this.");
+    }
+    ImGui::BeginDisabled(from_flags);
+    bool commit = false;
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 86.0f);
+    ImGui::SliderInt("##percent", &pick, 10, 200, "%d%%", ImGuiSliderFlags_AlwaysClamp);
+    commit |= ImGui::IsItemDeactivatedAfterEdit();
+    ImGui::SetItemTooltip("Percent of your screen's size, per side (DLSS's own measure): 50%% of "
+                          "1440p = 720p.\nBelow 100%%: DLSS (RTX cards) or the normal scaler "
+                          "brings the picture up\nto the screen - faster. Above 100%%: the game "
+                          "renders larger than the screen\n(DLAA) and it is scaled down - "
+                          "sharper, much slower.");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-1.0f);
+    int typed = pick;
+    if (ImGui::InputInt("##percent_box", &typed, 0, 0)) {
+        pick = std::clamp(typed, 10, 200);
+    }
+    commit |= ImGui::IsItemDeactivatedAfterEdit();
+    ImGui::SetItemTooltip("Type a percentage (10-200).");
+    // DLSS's own ratios per side (Ultra Performance 1/3, Performance 1/2, Balanced 0.58,
+    // Quality 2/3, DLAA 1).
+    static constexpr int presets[] = {33, 50, 58, 67, 100};
+    static const char* const preset_names[] = {"Ultra P.", "Perf.", "Balanced", "Quality", "DLAA"};
+    static const char* const preset_tips[] = {
+        "Ultra Performance: 33% (1/3) - for 4K screens and weak cards. DLSS takes one exact
+size for it; where the game's size is a few pixels off (1440p screens) it runs
+Performance at 2x and a plain scale does the rest.",
+        "Performance: 50% (720p on a 1440p screen, 1080p on 4K).",
+        "Balanced: 58%.",
+        "Quality: 67% (2/3: 960 lines on a 1440p screen).",
+        "DLAA: 100% - the game renders at your screen's size, no upscale."};
+    int chosen = pick;
+    for (int i = 0; i < 5; ++i) {
+        Choice(preset_names[i], &chosen, presets[i], i, 5, preset_tips[i], false);
+    }
+    if (chosen != pick) {
+        pick = chosen;
+        commit = true;
+    }
+    ImGui::EndDisabled();
+    if (commit) {
+        MP::SaveScreenPercent(static_cast<float>(pick));
+        saved_once = true;
+    }
+    const MP::RenderSize next = MP::RenderSizeForPercent(static_cast<float>(pick));
+    if (!from_flags && (next.width != now.width || next.height != now.height)) {
+        wrap(Yellow, "%d%% = %ux%u: applies after a restart (the game sets its render size up "
+                     "at start).", pick, next.width, next.height);
+    } else if (!from_flags && saved_once) {
+        wrap(Grey, "Saved.");
+    }
+    if (u64(next.width) * next.height > u64(3840) * 2160) {
+        // Render targets: 307 MB at 1920x1080 (measured, s1456), growing with the pixel count.
+        const double gb = 0.307 * next.width * next.height / (1920.0 * 1080.0);
+        wrap(Red, "Above 4K: very slow, and about %.1f GB more video memory for the game's "
+                  "pictures alone - it can run out and crash on most cards.",
+             gb - 0.307);
+    }
 }
 
 void Panel::Draw() {
@@ -314,6 +394,13 @@ void Panel::Draw() {
                      ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize |
                          ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking)) {
         ImGui::SetWindowFontScale(1.15f);
+        ImGui::PushID("rendersize");
+        if (ImGui::CollapsingHeader("Render size  (screen percentage)",
+                                    ImGuiTreeNodeFlags_DefaultOpen)) {
+            DrawRenderSize();
+        }
+        ImGui::PopID();
+        ImGui::Spacing();
         // Each section its own ID scope: both have a "Default" button (ImGui's conflicting-ID
         // warning, user 10-20).
         ImGui::PushID("dlss45");

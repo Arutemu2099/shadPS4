@@ -5,6 +5,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "common/types.h"
 
 #if defined(WIN32)
 #define EXPORT __declspec(dllexport)
@@ -45,6 +46,27 @@ void OnGameLoaded();
 /// emulator.cpp, right after the window exists: the screen / window size in pixels, for the
 /// dynamic aspect ratio (SHADPS4_ASPECT, ApplyAspectRatio).
 void SetScreenSize(int width, int height);
+/// The monitor the window opened on (pixels): 100% of the screen percentage.
+void SetDisplaySize(int width, int height);
+
+/// Screen percentage (1.1, the DLSS panel): the game's render size in percent of the screen,
+/// decided at boot (ApplyAspectRatio).
+struct RenderSize {
+    u32 width;
+    u32 height;
+};
+RenderSize CurrentRenderSize();
+/// 100%: the largest box of the render shape on the monitor.
+RenderSize PercentReference();
+/// The percentage in effect (the game's 1080 lines as a percentage when none is set).
+float CurrentScreenPercent();
+/// The render size `percent` gives at the next start (0 = the game's 1080 lines).
+RenderSize RenderSizeForPercent(float percent);
+/// SHADPS4_RENDER_HEIGHT sets the size (the panel's value then waits).
+bool RenderHeightFromFlags();
+/// user/render-size.ini (0 = none saved).
+float SavedScreenPercent();
+void SaveScreenPercent(float percent);
 
 /// sceSystemServiceGetDisplaySafeAreaInfo: the safe-area ratio the game gets (1.0 unless
 /// SHADPS4_HUD narrows the HUD; ApplyHudWidth).
