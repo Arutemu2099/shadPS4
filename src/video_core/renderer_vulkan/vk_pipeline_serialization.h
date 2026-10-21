@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <string_view>
 #include <unordered_set>
 
@@ -50,6 +51,10 @@ void ShowBootProgress(std::string_view what, u64 done, u64 total, bool one_time 
 // progress bar) while a Presenter is building its rasterizer; a no-op otherwise.
 void PresentBootScreen(std::string_view headline, std::string_view detail, float fraction,
                        bool one_time);
+// 1.1 (user 10-21): keeps re-presenting that last boot frame (events pumped) until min_shown has
+// passed since the first one, so the version line on it can be read; a no-op without boot frames.
+void HoldBootScreen(std::string_view headline, std::string_view detail, bool one_time,
+                    std::chrono::milliseconds min_shown);
 // SHADPS4_CACHE_REBUILD seed stamp (vk_pipeline_precompile.cpp): the game file's OrbShdr crc32 and
 // code length of a shader, from the game folder's shader index (built on first use, main thread).
 bool GameShaderIdentity(u64 pgm_hash, u32* crc32, u32* code_length);

@@ -15,6 +15,7 @@
 #include "common/io_file.h"
 #include "common/path_util.h"
 #include "common/singleton.h"
+#include "common/update_notice.h"
 #include "core/debug_state.h"
 #include "core/devtools/layer.h"
 #include "core/emulator_settings.h"
@@ -43,6 +44,8 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <thread>
+#include <SDL3/SDL_events.h>
 #include <csetjmp>
 #include <cstring>
 #include <ctime>
@@ -516,6 +519,8 @@ namespace {
 // SHADPS4_BOOT_SCREEN (2026-10-17, user: the first launch's preparation is too easy to miss): the
 // presenter whose rasterizer is being built - WarmUp runs inside that, on the main thread.
 Presenter* g_booting_presenter = nullptr;
+// 1.1 (user 10-21): when the first boot frame was shown (HoldBootScreen's 3 s minimum).
+std::chrono::steady_clock::time_point g_boot_first_frame{};
 
 bool BootScreenEnabled() {
     static const bool on = [] {
@@ -529,8 +534,33 @@ bool BootScreenEnabled() {
 void PresentBootScreen(std::string_view headline, std::string_view detail, float fraction,
                        bool one_time) {
     if (g_booting_presenter && BootScreenEnabled()) {
+        if (g_boot_first_frame == std::chrono::steady_clock::time_point{}) {
+            g_boot_first_frame = std::chrono::steady_clock::now();
+        }
         g_booting_presenter->DrawBootScreen(headline, detail, fraction, one_time);
     }
+}
+
+void HoldBootScreen(std::string_view headline, std::string_view detail, bool one_time,
+                    std::chrono::milliseconds min_shown) {
+    if (!g_booting_presenter || !BootScreenEnabled() ||
+        g_boot_first_frame == std::chrono::steady_clock::time_point{}) {
+        return;
+    }
+    // A warm cache can load in well under a second; the version line must still be readable.
+    const auto start = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - g_boot_first_frame < min_shown) {
+        g_booting_presenter->DrawBootScreen(headline, detail, 1.0f, one_time);
+        SDL_PumpEvents();
+        std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    }
+    LOG_INFO(Render_Vulkan, "Boot screen: shown {} ms, held {} ms for the version line",
+             std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - g_boot_first_frame)
+                 .count(),
+             std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - start)
+                 .count());
 }
 
 void Presenter::DrawBootScreen(std::string_view headline, std::string_view detail,
@@ -573,6 +603,22 @@ void Presenter::DrawBootScreen(std::string_view headline, std::string_view detai
             ImGui::ProgressBar(f, ImVec2(-1.0f, 0.0f), percent.c_str());
             ImGui::Spacing();
             ImGui::TextDisabled("%.*s", static_cast<int>(detail.size()), detail.data());
+            // 1.1 (user 10-21): every launch shows the latest release, so players learn about an
+            // update without a post in every thread (common/update_notice.cpp).
+            const Common::UpdateLine line = Common::GetUpdateLine();
+            if (!line.text.empty()) {
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+                if (line.newer) {
+                    ImGui::SetWindowFontScale(1.6f);
+                    ImGui::TextColored(ImVec4(0.40f, 0.95f, 0.40f, 1.0f), "%s", line.text.c_str());
+                    ImGui::SetWindowFontScale(1.2f);
+                    ImGui::TextUnformatted(line.detail.c_str());
+                } else {
+                    ImGui::TextUnformatted(line.text.c_str());
+                }
+            }
         }
         ImGui::End();
         ImGui::PopStyleVar();

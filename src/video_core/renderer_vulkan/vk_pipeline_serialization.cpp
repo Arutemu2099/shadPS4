@@ -1429,8 +1429,13 @@ void PipelineCache::WarmUp() {
                          .count());
         }
         // The last boot frame stays up until the game's first one.
-        PresentBootScreen(preparing() ? "Preparing shaders (one time)" : "Loading shaders",
-                          "Starting the game", 1.0f, false);
+        const std::string_view head =
+            preparing() ? "Preparing shaders (one time)" : "Loading shaders";
+        PresentBootScreen(head, "Starting the game", 1.0f, false);
+        // SHADPS4_BOOT_SCREEN_MIN_MS (test): another minimum than the user's 3 s.
+        const char* min_env = std::getenv("SHADPS4_BOOT_SCREEN_MIN_MS");
+        HoldBootScreen(head, "Starting the game", false,
+                       std::chrono::milliseconds{min_env ? std::atoi(min_env) : 3000});
         ShowBootProgress({}, 0, ~0ull);
         const auto& rs = rebuild_stats;
         for (size_t s = 0; s < 8; ++s) {
