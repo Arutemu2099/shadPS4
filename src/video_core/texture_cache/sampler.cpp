@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <algorithm>
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -59,6 +60,12 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
         }
     }
 
+    // SHADPS4_TEX_LOD_BIAS=-1.5 (test, 10-20): added to every sampler's mip bias - DLSS's advice
+    // for renders below the output size (log2(render / output)).
+    static const float extra_bias = [] {
+        const char* v = std::getenv("SHADPS4_TEX_LOD_BIAS");
+        return v ? static_cast<float>(std::atof(v)) : 0.0f;
+    }();
     const vk::SamplerCreateInfo sampler_ci = {
         .pNext = custom_color ? &*custom_color : nullptr,
         .magFilter = LiverpoolToVK::Filter(sampler.xy_mag_filter),
@@ -67,7 +74,8 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
         .addressModeU = LiverpoolToVK::ClampMode(sampler.clamp_x),
         .addressModeV = LiverpoolToVK::ClampMode(sampler.clamp_y),
         .addressModeW = LiverpoolToVK::ClampMode(sampler.clamp_z),
-        .mipLodBias = std::min(sampler.LodBias(), instance.MaxSamplerLodBias()),
+        .mipLodBias = std::clamp(sampler.LodBias() + extra_bias, -instance.MaxSamplerLodBias(),
+                                 instance.MaxSamplerLodBias()),
         .anisotropyEnable = anisotropy_enable,
         .maxAnisotropy = max_anisotropy,
         .compareEnable = sampler.depth_compare_func != AmdGpu::DepthCompare::Never,
