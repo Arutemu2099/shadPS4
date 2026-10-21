@@ -722,6 +722,11 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             AddSettingSliderInt("Volume", volumeSetting, 0, 500);
             AddSettingSliderFloat("Left Stick Deadzone (%)", stickDeadzoneLeftSetting, 0, 40, 1);
             AddSettingSliderFloat("Right Stick Deadzone (%)", stickDeadzoneRightSetting, 0, 40, 1);
+            // GitHub #11 / #14: players look for the language here first.
+            AddSettingCombo("Language (Console Language)", consoleLanguageSetting, languageOptions);
+            ImGui::SetItemTooltip("The game's text and voices. Applies after a restart of the game.\n"
+                                  "The game has only the languages of your copy: if it stays in\n"
+                                  "English, try the other variant (e.g. Spanish (Spain) / (Latin America)).");
 
             ImGui::EndTable();
         }
