@@ -20,7 +20,7 @@ High frame rates, DLSS, native 4K and ultrawide, real mouse aiming and a full ke
 
 Windows 10 / 11, one zip of about 75 MB. **You need your own copy of the game** - no game files are included.
 
-**[Features](#features) · [Getting started](#getting-started) · [FAQ](#faq) · [Controls](#keyboard-and-mouse) · [DLSS](#dlss-optional) · [Known issues](#known-issues)**
+**[Features](#features) · [Getting started](#getting-started) · [FAQ](#faq) · [Controls](#controls) · [DLSS](#dlss-optional) · [Known issues](#known-issues)**
 
 ![Delsin on a rooftop in Seattle, 131 FPS on the test PC](media/city-rooftop.jpg)
 
@@ -199,9 +199,37 @@ Only for the update check: one small request to GitHub per start, shown on the l
 `SHADPS4_UPDATE_CHECK=0` turns it off.
 </details>
 
-## Keyboard and mouse
+## Controls
+
+### Keyboard and mouse
 
 ![Keyboard and mouse layout](media/keyboard-mouse.png)
+
+### Controllers
+
+**DualSense / DualShock 4:** works as on the console - touchpad and motion sensor included, nothing to set up.
+
+**Xbox and other controllers** (no touchpad or motion sensor) get these extras:
+
+![Xbox and other controllers: D-pad up and View are the touchpad halves, L3 + R3 turns on sensor mode](media/controller.png)
+
+<details>
+<summary>The same as a list</summary>
+
+| The game asks for | On your controller |
+|---|---|
+| Touchpad, left half (for example draining power sources) | **D-pad up** (hold it like the touchpad) |
+| Touchpad, right half | **View** (Back / Select) |
+| Both touchpad halves | D-pad up + View together |
+| Spray can or touchpad moments | **L3 + R3** (press both sticks) turns on **sensor mode**; a notice shows the controls. L3 + R3 again turns it off |
+| In sensor mode: aim the spray can | **Right stick** |
+| In sensor mode: hold the can sideways / rattle it | **Hold A** / **tap A** (spray with the trigger as usual) |
+| In sensor mode: your finger on the touchpad (fingerprint scanners, the D.U.P. core lifts) | **Left stick** - push it to touch, its direction is where the finger goes |
+
+</details>
+
+Sensor mode only replaces what your controller is missing: a Switch Pro controller keeps its real gyro and only gets the
+left-stick finger. Sticks drifting? **F3 -> Quick -> Left / Right Stick Deadzone**.
 
 ## DLSS (optional)
 
