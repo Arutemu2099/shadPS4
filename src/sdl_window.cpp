@@ -104,6 +104,22 @@ static Uint32 SDLCALL PollControllerLightColour(void* userdata, SDL_TimerID time
     return interval;
 }
 
+// SHADPS4_FULLSCREEN=0 / 1 (the benchmark harness, which presses F11 itself): the window state at
+// start, and F11 is not remembered. Without it the start follows the saved setting (F3's Display
+// Mode or the last F11).
+static int FullscreenOverride() {
+    static const int value = [] {
+        const char* v = std::getenv("SHADPS4_FULLSCREEN");
+        return !v ? -1 : v[0] == '1' ? 1 : 0;
+    }();
+    return value;
+}
+
+static bool StartFullscreen() {
+    const int forced = FullscreenOverride();
+    return forced >= 0 ? forced == 1 : EmulatorSettings.IsFullScreen();
+}
+
 WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controllers_,
                      std::string_view window_title)
     : width{width_}, height{height_}, controllers{*controllers_} {
@@ -134,8 +150,7 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     // Creating the window directly in fullscreen avoids a visible windowed -> fullscreen
     // transition on startup. SDL sizes the window to the display and keeps the requested
     // width/height as the windowed size to restore when leaving fullscreen.
-    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN,
-                           EmulatorSettings.IsFullScreen());
+    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN, StartFullscreen());
     window = SDL_CreateWindowWithProperties(props);
     SDL_DestroyProperties(props);
     if (window == nullptr) {
@@ -163,7 +178,7 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
         SDL_SetWindowFullscreenMode(
             window, EmulatorSettings.GetFullScreenMode() == "Fullscreen" ? displayMode : NULL);
     }
-    SDL_SetWindowFullscreen(window, EmulatorSettings.IsFullScreen());
+    SDL_SetWindowFullscreen(window, StartFullscreen());
     SDL_SyncWindow(window);
     // The window geometry is only final once the fullscreen transition has settled; refresh
     // the cached size so the first swapchain and the splashscreen use the real drawable size.
@@ -484,10 +499,19 @@ void WindowSDL::WaitEvent() {
         Overlay::ToggleQuitWindow();
         break;
     case SDL_EVENT_TOGGLE_FULLSCREEN: {
-        if (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) {
-            SDL_SetWindowFullscreen(window, 0);
-        } else {
-            SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN);
+        const bool full = !(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN);
+        SDL_SetWindowFullscreen(window, full);
+        // F11 is remembered for the next start (user 10-21: a player's fullscreen did not stick):
+        // stored in the game's own config, which is what the start reads.
+        // SHADPS4_FULLSCREEN (the test harness) fixes the start state: nothing is remembered.
+        const std::string serial{Common::ElfInfo::Instance().GameSerial()};
+        if (FullscreenOverride() < 0 && !serial.empty()) {
+            EmulatorSettings.SetFullScreen(full, true);
+            if (full && EmulatorSettings.GetFullScreenMode() == "Windowed") {
+                EmulatorSettings.SetFullScreenMode("Fullscreen (Borderless)", true);
+            }
+            EmulatorSettings.Save(serial);
+            LOG_INFO(Frontend, "F11: {} (saved for the next start)", full ? "fullscreen" : "window");
         }
         break;
     }

@@ -50,8 +50,13 @@ void SettingsWindow::LoadSettings(std::string profile) {
     audioBackendSetting = EmulatorSettings.GetAudioBackend();
 
     /////////// Graphics Tab
+    // Display Mode shows what the game starts in: Windowed unless full_screen is on (the shipped
+    // game config has a borderless mode with full_screen off, which showed "Borderless" for a
+    // window); a fullscreen start with mode "Windowed" is borderless.
     fullscreenModeSetting =
-        GetComboIndex(EmulatorSettings.GetFullScreenMode(), fullscreenModeOptions);
+        !EmulatorSettings.IsFullScreen()
+            ? 0
+            : std::max(1, GetComboIndex(EmulatorSettings.GetFullScreenMode(), fullscreenModeOptions));
     presentModeSetting = GetComboIndex(EmulatorSettings.GetPresentMode(), presentModeOptions);
     windowHeightSetting = EmulatorSettings.GetWindowHeight();
     windowWidthSetting = EmulatorSettings.GetWindowWidth();
@@ -115,8 +120,10 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetAudioBackend(audioBackendSetting, isSpecific);
 
     /////////// Graphics Tab
+    // Saved with the rest of the profile (user 10-21: it went to the global config only, and the
+    // game's own config - read at start - kept full_screen off).
     bool isFullscreen = fullscreenModeSetting != 0;
-    EmulatorSettings.SetFullScreen(isFullscreen);
+    EmulatorSettings.SetFullScreen(isFullscreen, isSpecific);
     EmulatorSettings.SetFullScreenMode(fullscreenModeOptions.at(fullscreenModeSetting), isSpecific);
     EmulatorSettings.SetPresentMode(presentModeOptions.at(presentModeSetting), isSpecific);
     EmulatorSettings.SetWindowHeight(windowHeightSetting, isSpecific);
