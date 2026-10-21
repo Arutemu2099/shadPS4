@@ -26,7 +26,9 @@ vk::ShaderModule Compile(std::string_view code, vk::ShaderStageFlagBits stage, v
  */
 vk::ShaderModule CompileSPV(std::span<const u32> code, vk::Device device);
 
-/// The SSR ray-march dither (CompileSPV swaps fs_204f45fe's exact module); SHADPS4_SSR_DITHER=0 off.
+/// The SSR ray-march dither (CompileSPV swaps fs_204f45fe's exact module); SHADPS4_SSR_DITHER=0 off,
+/// 1 fixed pattern (default), 2 a pattern that moves every frame.
+int SsrDitherMode();
 bool SsrDitherEnabled();
 
 } // namespace Vulkan

@@ -258,12 +258,18 @@ vk::ShaderModule Compile(std::string_view code, vk::ShaderStageFlagBits stage, v
     return CompileSPV(out_code, device);
 }
 
-bool SsrDitherEnabled() {
-    static const bool on = [] {
+/// SHADPS4_SSR_DITHER: 0 = the game's march, 1 (default) = a fixed per-pixel start offset,
+/// 2 = the offset also moves every frame (the march's own history blend averages it).
+int SsrDitherMode() {
+    static const int mode = [] {
         const char* value = std::getenv("SHADPS4_SSR_DITHER");
-        return !(value && value[0] == '0');
+        return !value ? 1 : value[0] == '0' ? 0 : value[0] == '2' ? 2 : 1;
     }();
-    return on;
+    return mode;
+}
+
+bool SsrDitherEnabled() {
+    return SsrDitherMode() != 0;
 }
 
 vk::ShaderModule CompileSPV(std::span<const u32> code, vk::Device device) {
@@ -295,11 +301,17 @@ vk::ShaderModule CompileSPV(std::span<const u32> code, vk::Device device) {
             }
         }
         if (on && h == SsrDither::OriginalFnv) {
+            const bool temporal = SsrDitherMode() == 2;
             static std::atomic<bool> logged{false}; // compile-pool threads call this too
             if (!logged.exchange(true)) {
-                LOG_INFO(Render_Vulkan, "SSR: the reflection ray march gets a dithered start");
+                LOG_INFO(Render_Vulkan, "SSR: the reflection ray march gets a dithered start{}",
+                         temporal ? " (moving every frame)" : "");
             }
-            code = SsrDither::Patched;
+            if (temporal) {
+                code = SsrDither::PatchedTemporal;
+            } else {
+                code = SsrDither::Patched;
+            }
         }
     }
     const vk::ShaderModuleCreateInfo shader_info = {
