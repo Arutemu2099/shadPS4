@@ -954,6 +954,136 @@ float Halton(u32 index, u32 base) {
     return r;
 }
 
+/// SHADPS4_HALTON_PROBE=1 (diagnostic, 10-21; study-delsin-mv-ssr sec. 1.6): with the Halton jitter
+/// running, 60 s after its first frame, for 4 frames: every view-projection-like 4x4 (16-byte
+/// aligned rows) in the main camera object ([0x807f2d2b8], 0x2000 bytes) and in the ranges of
+/// SHADPS4_HALTON_PROBE_SCAN=<hex addr>:<hex size>,... with its jitter (A, B) = the projection's
+/// row-2 terms read back from the matrix, next to this frame's step k and steps k-1 / k-2, so the
+/// field that keeps a 2-frame-old projection shows up.
+void HaltonProbe(RenderSize now) {
+    static const bool on = [] {
+        const char* v = std::getenv("SHADPS4_HALTON_PROBE");
+        return v && v[0] == '1';
+    }();
+    if (!on || now.width == 0 || now.height == 0) {
+        return;
+    }
+    static const s64 start = NowMs();
+    static int done = 0;
+    if (done >= 4 || NowMs() - start < 60000) {
+        return;
+    }
+    ++done;
+    const auto step_ab = [&](u32 k) {
+        const float jx = Halton(k + 1, 2) - 0.5f;
+        const float jy = Halton(k + 1, 3) - 0.5f;
+        return std::pair<double, double>{2.0 * jx / now.width, -2.0 * jy / now.height};
+    };
+    // The phase count as JitterFrame derives it (k wraps there).
+    const RenderSize ref = Reference(g_aspect);
+    const double ratio = std::max(1.0, double(ref.width) / now.width);
+    const u32 phases = std::clamp(u32(std::lround(8.0 * ratio * ratio)), 8u, 64u);
+    const auto [a0, b0] = step_ab(g_jitter_k);
+    const auto [a1, b1] = step_ab((g_jitter_k + phases - 1) % phases);
+    const auto [a2, b2] = step_ab((g_jitter_k + phases - 2) % phases);
+    LOG_INFO(Loader,
+             "HaltonProbe frame {}: k={} of {} | step k A,B=({:+.4e},{:+.4e}) k-1 ({:+.4e},{:+.4e}) "
+             "k-2 ({:+.4e},{:+.4e}) (the next frame draws step k)",
+             done, g_jitter_k, phases, a0, b0, a1, b1, a2, b2);
+    const auto scan = [&](VAddr base, u64 size, const char* what) {
+        for (u64 off = 0; off + 64 <= size; off += 16) {
+            float m[16];
+            std::memcpy(m, reinterpret_cast<const void*>(base + off), sizeof(m));
+            const double c3[3] = {m[3], m[7], m[11]};
+            const double n3 = c3[0] * c3[0] + c3[1] * c3[1] + c3[2] * c3[2];
+            if (!(n3 > 0.8 && n3 < 1.2)) {
+                continue;
+            }
+            const double a = (m[0] * c3[0] + m[4] * c3[1] + m[8] * c3[2]) / n3;
+            const double b = (m[1] * c3[0] + m[5] * c3[1] + m[9] * c3[2]) / n3;
+            const double p00 = std::sqrt(std::pow(m[0] - a * c3[0], 2) +
+                                         std::pow(m[4] - a * c3[1], 2) +
+                                         std::pow(m[8] - a * c3[2], 2));
+            if (!(std::abs(a) < 0.01 && std::abs(b) < 0.01 && p00 > 0.3 && p00 < 6.0)) {
+                continue;
+            }
+            LOG_INFO(Loader, "HaltonProbe   {}+{:#x} ({:#x}): A,B=({:+.4e},{:+.4e}) P00 {:.4f}", what,
+                     off, base + off, a, b, p00);
+        }
+    };
+    const VAddr cam = *reinterpret_cast<const u64*>(g_eboot_address + 0x7f2d2b8);
+    if (cam != 0) {
+        scan(cam, 0x2000, "camera");
+    }
+    if (const char* v = std::getenv("SHADPS4_HALTON_PROBE_SCAN")) {
+        std::stringstream ss{v};
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            const auto colon = item.find(':');
+            if (colon == std::string::npos) {
+                continue;
+            }
+            const VAddr base = std::strtoull(item.substr(0, colon).c_str(), nullptr, 16);
+            const u64 size = std::strtoull(item.substr(colon + 1).c_str(), nullptr, 16);
+            scan(base, size, item.c_str());
+        }
+    }
+}
+
+/// The Halton wobble fix (10-21; study-delsin-mv-ssr sec. 1.6-1.7, probe s1539): the main camera
+/// ([0x807f2d2b8]) keeps its jittered view-projection history as (VP, unjittered VP) pairs:
+/// +0x200 this frame, +0x380 one frame back, +0x300 two back; each frame start shifts +0x380 ->
+/// +0x300 and +0x200 -> +0x380 (measured). The moving objects' velocity pass reads +0x300 as the
+/// previous VP: with the game's 2 jitter phases its jitter always equals the current one and
+/// cancels; with Halton every mover's motion vector was off by j(N) - j(N-2) (Delsin's wobble).
+/// Here, between frames, the entry about to become +0x300 gets the NEXT frame's jitter: for
+/// M = V x P (row vectors) column 0 = P00 x V.col0 + A x V.col2 and column 3 = V.col2, so
+/// col0 += dA x col3 (all 4 rows) moves exactly the jitter term A; col1 likewise for B. The view
+/// (camera motion) is untouched. SHADPS4_HALTON_REBASE=0 off.
+void RebaseHistoryJitter(RenderSize now, float jx, float jy) {
+    static const bool on = [] {
+        const char* v = std::getenv("SHADPS4_HALTON_REBASE");
+        return !(v && v[0] == '0');
+    }();
+    if (!on || now.width == 0 || now.height == 0) {
+        return;
+    }
+    const VAddr cam = *reinterpret_cast<const u64*>(g_eboot_address + 0x7f2d2b8);
+    if (cam == 0) {
+        return;
+    }
+    // The jitter terms of a VP read back from the matrix (V's rotation is orthonormal).
+    const auto terms = [](const float* m, double& a, double& b) {
+        const double n3 = double(m[3]) * m[3] + double(m[7]) * m[7] + double(m[11]) * m[11];
+        if (!(n3 > 0.8 && n3 < 1.2)) {
+            return false;
+        }
+        a = (double(m[0]) * m[3] + double(m[4]) * m[7] + double(m[8]) * m[11]) / n3;
+        b = (double(m[1]) * m[3] + double(m[5]) * m[7] + double(m[9]) * m[11]) / n3;
+        return std::abs(a) < 0.01 && std::abs(b) < 0.01;
+    };
+    float* const vp = reinterpret_cast<float*>(cam + 0x380);
+    const float* const plain = reinterpret_cast<const float*>(cam + 0x3c0);
+    double a = 0.0, b = 0.0, pa = 0.0, pb = 0.0;
+    // Layout check every frame: a jittered VP at +0x380 and its unjittered twin at +0x3c0 (another
+    // camera class or a cutscene camera fails it and is left alone).
+    if (!terms(vp, a, b) || !terms(plain, pa, pb) || std::abs(pa) > 1e-6 || std::abs(pb) > 1e-6) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LOG_WARNING(Loader, "Halton rebase: the camera history layout differs, left alone");
+        }
+        return;
+    }
+    // The game's window offset is (X / W, Y / H) with X = -2 jx, Y = 2 jy: A = 2 jx / W, B = -2 jy / H.
+    const double da = 2.0 * jx / now.width - a;
+    const double db = -2.0 * jy / now.height - b;
+    for (int r = 0; r < 4; ++r) {
+        vp[r * 4 + 0] = float(vp[r * 4 + 0] + da * vp[r * 4 + 3]);
+        vp[r * 4 + 1] = float(vp[r * 4 + 1] + db * vp[r * 4 + 3]);
+    }
+}
+
 /// Game:Main, inside sceGnmSubmitDone (the render jobs of this frame joined; the next frame's
 /// jitter function and SMAA setup both run before the next call - study sec. 3).
 void JitterFrame() {
@@ -988,6 +1118,8 @@ void JitterFrame() {
     } slot{-2.0f * jx, 2.0f * jy, {jx, jy, 100.0f + float(g_jitter_k), 0.0f}};
     std::memcpy(reinterpret_cast<void*>(g_eboot_scratch), &slot.x, 8);
     std::memcpy(reinterpret_cast<void*>(g_eboot_scratch + 8), slot.cb, 16);
+    HaltonProbe(now);
+    RebaseHistoryJitter(now, jx, jy);
 }
 
 } // namespace
