@@ -2047,6 +2047,11 @@ void TextureCache::GarbageCollectImages() {
     if (total_used_memory < trigger_gc_memory) {
         return;
     }
+    // The walk tests every image's own use tick (review 10-20: it runs every frame where the
+    // trigger is 0 - cards of <= 8 GB or no memory report): every 4th tick unless critical.
+    if ((gc_tick & 3) != 0 && total_used_memory < critical_gc_memory) {
+        return;
+    }
     CacheLock lock{*this};
     bool pressured = false;
     bool aggresive = false;
@@ -2152,41 +2157,73 @@ void TextureCache::GarbageCollectSamplers() {
     }
 }
 
-void TextureCache::PurgeOldRenderSize() {
+void TextureCache::PurgeOldRenderSize(u32 old_w, u32 old_h, u32 new_w, u32 new_h) {
     // Live screen percentage (user 10-20 ~22:20: lighting shifts, photo-mode shadows lost after
-    // changes; s1511: the rule in ResolveOverlap fired twice in 21 changes): every size the
-    // player visits leaves a full set of the game's screen-sized targets, and a return to that
-    // size perfect-matches the old set with its old contents (history, photo-mode shadows drawn
-    // once). At the end of the first frame drawn at the new size, the render-shaped render
-    // targets / depth images that frame did not touch are the old set: freed (the Vulkan side
-    // waits for the GPU in DeleteImage).
+    // changes; s1511: the ResolveOverlap rule fired twice in 21 changes): every size the player
+    // visits leaves a full set of the game's screen-sized targets, and a return to that size
+    // perfect-matches the old set with its old contents. At the end of the first frame drawn at
+    // the new size, the old size's targets that frame did not touch are freed: the old size and
+    // its /2 /4 /8 /16 (the game's size table, study-live-resolution sec. 1; +-8 px rounding),
+    // never a size of the new family, never a display buffer; CPU-read contents downloaded first
+    // as the GC does (Opus review 10-20).
+    const auto family = [](u32 w, u32 h, u32 base_w, u32 base_h) {
+        for (u32 k = 0; k <= 4; ++k) {
+            const s64 fw = base_w >> k;
+            const s64 fh = base_h >> k;
+            if (std::abs(s64(w) - fw) <= 8 && std::abs(s64(h) - fh) <= 8) {
+                return true;
+            }
+        }
+        return false;
+    };
     CacheLock lock{*this};
     std::vector<ImageId> stale;
+    bool new_size_seen = false;
     lru_cache.ForEachItem([&](ImageId image_id) {
         const Image& image = slot_images[image_id];
-        if (!UsedSince(image, gc_tick) && (image.usage.render_target || image.usage.depth_target) &&
-            True(image.flags & ImageFlagBits::Registered) &&
-            MemoryPatcher::IsRenderShaped(image.info.size.width, image.info.size.height)) {
+        if (!(image.usage.render_target || image.usage.depth_target) ||
+            False(image.flags & ImageFlagBits::Registered)) {
+            return;
+        }
+        const u32 w = image.info.size.width;
+        const u32 h = image.info.size.height;
+        const bool used = UsedSince(image, gc_tick);
+        if (used && w == new_w && h == new_h) {
+            new_size_seen = true;
+        }
+        if (!used && !image.usage.vo_surface && family(w, h, old_w, old_h) &&
+            !family(w, h, new_w, new_h)) {
             stale.push_back(image_id);
         }
     });
-    // An image listed twice (two LRU items naming one id) is freed once.
+    if (!new_size_seen) {
+        // This frame was still the old size (the back runs behind Game:Main): next frame.
+        MemoryPatcher::RequeueLivePurge();
+        return;
+    }
     std::sort(stale.begin(), stale.end(),
               [](ImageId a, ImageId b) { return a.index < b.index; });
     stale.erase(std::unique(stale.begin(), stale.end()), stale.end());
     u64 bytes = 0;
     size_t freed = 0;
     for (const ImageId id : stale) {
-        // Freeing one can unregister another first (s1514: "already unregistered").
-        if (False(slot_images[id].flags & ImageFlagBits::Registered)) {
+        Image& image = slot_images[id];
+        if (False(image.flags & ImageFlagBits::Registered)) {
             continue;
         }
-        bytes += slot_images[id].info.guest_size;
+        if (image.SafeToDownload()) {
+            if (image.info.IsTiled()) {
+                continue; // as the GC: no tiled downloads
+            }
+            DownloadImageMemory(id);
+        }
+        bytes += image.info.guest_size;
         FreeImage(id);
         ++freed;
     }
-    LOG_INFO(Render_Vulkan, "LiveResize: dropped {} old-size target(s) ({} listed), {} MB of guest size",
-             freed, stale.size(), bytes >> 20);
+    LOG_INFO(Render_Vulkan,
+             "LiveResize: dropped {} target(s) of the old {}x{} ({} listed), {} MB of guest size",
+             freed, old_w, old_h, stale.size(), bytes >> 20);
 }
 
 void TextureCache::RunGarbageCollector() {
@@ -2194,8 +2231,8 @@ void TextureCache::RunGarbageCollector() {
         ++gc_tick;
     };
 
-    if (MemoryPatcher::TakeLivePurge()) {
-        PurgeOldRenderSize();
+    if (u64 sizes[2]; MemoryPatcher::TakeLivePurge(sizes)) {
+        PurgeOldRenderSize(u32(sizes[0] >> 32), u32(sizes[0]), u32(sizes[1] >> 32), u32(sizes[1]));
     }
     GarbageCollectImages();
     GarbageCollectSamplers();

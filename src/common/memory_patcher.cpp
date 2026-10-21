@@ -391,7 +391,11 @@ static bool g_live_ok = false;             // live changes possible this run
 static std::atomic<u64> g_live_pending{0}; // S to apply at the next sceGnmSubmitDone (w << 32 | h)
 static std::atomic<u64> g_now_size{(u64(1920) << 32) | 1080}; // the size drawn (w << 32 | h)
 static std::atomic<s64> g_live_ms{0};      // steady-clock ms of the last applied change
-static std::atomic<bool> g_live_purge{false}; // a change was taken: the back drops old sizes
+// A change was taken: the back drops the old size's targets (old w << 32 | h, new; 0 = none).
+static std::atomic<u64> g_purge_old{0};
+static std::atomic<u64> g_purge_new{0};
+static std::atomic<int> g_purge_tries{0};
+static u64 g_purge_last_old = 0; // the back: the old size it is trying to drop
 static u64 g_live_check = 0; // Game:Main: the size last poked, until the game took it
 static int g_live_tries = 0; // Game:Main: pokes of g_live_check so far
 
@@ -721,8 +725,24 @@ float ToggleNativePercent() {
     return RequestScreenPercent(to) ? to : 0.0f;
 }
 
-bool TakeLivePurge() {
-    return g_live_purge.exchange(false, std::memory_order_acq_rel);
+bool TakeLivePurge(u64 sizes[2]) {
+    const u64 old_size = g_purge_old.exchange(0, std::memory_order_acq_rel);
+    if (old_size == 0) {
+        return false;
+    }
+    sizes[0] = old_size;
+    sizes[1] = g_purge_new.load(std::memory_order_relaxed);
+    g_purge_last_old = old_size;
+    return true;
+}
+
+void RequeueLivePurge() {
+    // At most ~8 frames: a newer change replaces it anyway.
+    if (g_purge_tries.fetch_add(1, std::memory_order_relaxed) < 8) {
+        u64 expected = 0;
+        g_purge_old.compare_exchange_strong(expected, g_purge_last_old,
+                                            std::memory_order_acq_rel);
+    }
 }
 
 bool InLiveResizeWindow() {
@@ -826,11 +846,15 @@ void OnSubmitDone() {
         u32 table[2];
         std::memcpy(table, reinterpret_cast<const void*>(g_eboot_address + 0x1d0cbe4), 8);
         if (table[0] == u32(g_live_check >> 32) && table[1] == u32(g_live_check)) {
-            g_now_size.store(g_live_check, std::memory_order_release);
+            const u64 old_size = g_now_size.exchange(g_live_check, std::memory_order_acq_rel);
             g_live_ms.store(NowMs(), std::memory_order_relaxed);
-            // This frame drew at S from its start (the change block runs at frame begin): at its
-            // end the back drops the render-shaped targets it did not use - the old size's set.
-            g_live_purge.store(true, std::memory_order_release);
+            // This frame drew at S from its start (the change block runs at frame begin): at the
+            // end of the back's first frame at S it drops the old size's unused targets.
+            if (old_size != g_live_check) {
+                g_purge_new.store(g_live_check, std::memory_order_relaxed);
+                g_purge_tries.store(0, std::memory_order_relaxed);
+                g_purge_old.store(old_size, std::memory_order_release);
+            }
             LOG_INFO(Loader, "Live render size: the game draws {}x{} ({:.0f}% of the screen; boot "
                              "allocation {}x{}) after {} poke(s)",
                      u32(g_live_check >> 32), u32(g_live_check), CurrentScreenPercent(),

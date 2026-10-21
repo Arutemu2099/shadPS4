@@ -548,8 +548,8 @@ private:
     void GarbageCollectImages();
     /// The image was touched at GC tick `tick` or later (its own gc_touch).
     bool UsedSince(const Image& image, u64 tick) const;
-    /// Live screen percentage: drops the render-shaped targets the frame did not use.
-    void PurgeOldRenderSize();
+    /// Live screen percentage: drops the old size's targets the frame did not use.
+    void PurgeOldRenderSize(u32 old_w, u32 old_h, u32 new_w, u32 new_h);
     void GarbageCollectSamplers();
 
     // Only the surviving perfect-match path is memoized. These are all its selection inputs;

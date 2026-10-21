@@ -81,7 +81,9 @@ float ToggleNativePercent();
 void OnSubmitDone();
 /// The back, at a frame's end: true once after the game took a change (the texture cache then
 /// drops the render-shaped targets that frame did not use).
-bool TakeLivePurge();
+bool TakeLivePurge(u64 sizes[2]); ///< sizes[0] = old, [1] = new (w << 32 | h)
+/// The frame was still the old size: try again at the next frame's end (a few times).
+void RequeueLivePurge();
 /// The 3 s after a change was poked: the texture cache replaces re-sized render targets.
 bool InLiveResizeWindow();
 /// A size of the render shape (+-3%): the game's screen-sized targets and their half / quarter.

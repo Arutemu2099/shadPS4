@@ -65,7 +65,7 @@ public:
     template <typename Func>
     void ForEachItem(Func&& func) {
         static constexpr bool RETURNS_BOOL =
-            std::is_same_v<std::invoke_result<Func, ObjectType>, bool>;
+            std::is_same_v<std::invoke_result_t<Func, ObjectType>, bool>;
         Item* iterator = first_item;
         size_t budget = item_pool.size();
         while (iterator && budget-- > 0) {
@@ -84,7 +84,7 @@ public:
     template <typename Func>
     void ForEachItemBelow(TickType tick, Func&& func) {
         static constexpr bool RETURNS_BOOL =
-            std::is_same_v<std::invoke_result<Func, ObjectType>, bool>;
+            std::is_same_v<std::invoke_result_t<Func, ObjectType>, bool>;
         Item* iterator = first_item;
         // A loop in the list (it cannot form any more, see Item::linked) would hang the walk:
         // at most one visit per item.
