@@ -54,7 +54,7 @@ private:
     /// user 10-20: "page up ... dlss 4.5 and 5 settings").
     void DrawDlss45();
     /// Screen percentage (v1.1, user 10-20 ~20:15): the game's render size as 10-200% of the
-    /// screen, saved; the game sets its size up at start, so it applies at the next start.
+    /// screen, saved; live up to the size the game started with (the game's own mode switch).
     void DrawRenderSize();
 
     D5::Settings edit{};
@@ -344,23 +344,39 @@ void Panel::DrawRenderSize() {
         commit = true;
     }
     ImGui::EndDisabled();
+    static bool pending_restart = false; ///< the last pick was more than the boot size
+    static int committed = -1;           ///< the last pick let go of
     if (commit) {
+        committed = pick;
         MP::SaveScreenPercent(static_cast<float>(pick));
         saved_once = true;
+        // Live when it fits the boot size (the game's buffers got memory for that once).
+        pending_restart = !MP::RequestScreenPercent(static_cast<float>(pick));
     }
     const MP::RenderSize next = MP::RenderSizeForPercent(static_cast<float>(pick));
+    const MP::RenderSize max = MP::LiveMaxSize();
+    const bool fits_live = MP::LiveResizeAvailable() && next.width <= max.width &&
+                           next.height <= max.height;
     if (!from_flags && (next.width != now.width || next.height != now.height)) {
-        wrap(Yellow, "%d%% = %ux%u: applies after a restart (the game sets its render size up "
-                     "at start).", pick, next.width, next.height);
+        if (pick != committed && fits_live) {
+            wrap(Grey, "%d%% = %ux%u (live when you let go)", pick, next.width, next.height);
+        } else if (fits_live && !pending_restart) {
+            wrap(Grey, "%d%% = %ux%u: changing...", pick, next.width, next.height);
+        } else if (MP::LiveResizeAvailable()) {
+            wrap(Yellow, "%d%% = %ux%u: more than this start's %ux%u - applies after a restart.",
+                 pick, next.width, next.height, max.width, max.height);
+        } else {
+            wrap(Yellow, "%d%% = %ux%u: applies after a restart; from then on the slider works "
+                         "live up to 100%% (or the size you start with).",
+                 pick, next.width, next.height);
+        }
     } else if (!from_flags && saved_once) {
-        wrap(Grey, "Saved.");
+        wrap(Grey, "Live. Saved for the next start too.");
     }
-    if (u64(next.width) * next.height > u64(3840) * 2160) {
-        // Render targets: 307 MB at 1920x1080 (measured, s1456), growing with the pixel count.
-        const double gb = 0.307 * next.width * next.height / (1920.0 * 1080.0);
-        wrap(Red, "Above 4K: very slow, and about %.1f GB more video memory for the game's "
-                  "pictures alone - it can run out and crash on most cards.",
-             gb - 0.307);
+    // The size cap (memory_patcher.cpp MaxPixels: 3200x1800's pixels; 4K lost the device).
+    if (pick > 100 && u64(next.width) * next.height >= u64(3200) * 1800 * 97 / 100) {
+        wrap(Grey, "Largest size: about 3200x1800 pixels - larger crashed the game's GPU work in "
+                   "testing.");
     }
 }
 

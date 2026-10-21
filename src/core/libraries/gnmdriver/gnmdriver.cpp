@@ -3826,6 +3826,11 @@ int PS4_SYSV_ABI sceGnmSubmitDone() {
         Common::FaultMonitor::GnmWaitScope gm_wait{7};
         WaitGpuIdle();
     }
+    // 1.1 live screen percentage: a queued size goes into the game's mode switch here, between
+    // two frames on Game:Main (memory_patcher.cpp OnSubmitDone).
+    if (Common::FaultMonitor::t_is_game_main) {
+        MemoryPatcher::OnSubmitDone();
+    }
     if (SubmitLockFix()) {
         std::unique_lock lock{m_submission};
         if (!liverpool->IsGpuIdle()) {

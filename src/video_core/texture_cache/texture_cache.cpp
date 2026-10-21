@@ -10,6 +10,7 @@
 #include <limits>
 #include <xxhash.h>
 
+#include "common/memory_patcher.h"
 #include "common/assert.h"
 #include "video_core/buffer_cache/dirty_epoch.h"
 #include "common/path_util.h"
@@ -687,6 +688,26 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             return {merged_image_id, -1, -1};
         }
 
+        // Live screen percentage (study 10-20 route A, sec. 2 / 3.4; Opus review 10-20): for 3 s
+        // after a change the game re-describes its screen-sized render targets at the new size at
+        // the same addresses. A render target / depth image of the render shape asked for at
+        // another size of that shape: a new image (smaller: no view into the old one's corner;
+        // larger: no unresolvable overlap). Only in that window and only screen-shaped sizes, so
+        // the usual aliasing (the minimap's 768x768 depth at the main depth's address) keeps its
+        // view. Freed when not used in this submission (DeleteImage defers the Vulkan side until
+        // the GPU is done; the per-frame memos revalidate on unregister); else both stay.
+        if (image_info.size != cache_image.info.size &&
+            (cache_image.usage.render_target || cache_image.usage.depth_target) &&
+            MemoryPatcher::InLiveResizeWindow() &&
+            MemoryPatcher::IsRenderShaped(image_info.size.width, image_info.size.height) &&
+            MemoryPatcher::IsRenderShaped(cache_image.info.size.width,
+                                          cache_image.info.size.height)) {
+            if (cache_image.tick_accessed_last < AgeTick()) {
+                FreeImage(cache_image_id);
+            }
+            return {merged_image_id, -1, -1};
+        }
+
         if (const auto depth_image_id = ResolveDepthOverlap(image_info, binding, cache_image_id)) {
             return {depth_image_id, -1, -1};
         }
@@ -832,6 +853,14 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                   merged_image_id.index, static_cast<int>(binding), AgeTick(),
                   AgeTick() - cache_image.tick_accessed_last);
 
+        if (MemoryPatcher::InLiveResizeWindow()) {
+            // Just after a live size change: a new image instead of stopping (the old one freed
+            // when unused, as above).
+            if (safe_to_delete || cache_image.tick_accessed_last < AgeTick()) {
+                FreeImage(cache_image_id);
+            }
+            return {merged_image_id, -1, -1};
+        }
         UNREACHABLE_MSG("Encountered unresolvable image overlap with equal memory address.");
     }
 

@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "video_core/texture_cache/tex_table.h"
+#include "common/memory_patcher.h"
 #include "common/thread.h"
 #include "common/debug.h"
 #include "common/buffer_sample_probe.h"
@@ -1675,6 +1676,11 @@ void Rasterizer::DlssResolve() {
         // picture, RTX 5070 Ti report 10-20). Off the 1080p frame DLSS then steps aside for the
         // session: g_ready off stops the classification (the game's own T2x resolve runs from the
         // next frame on, on every path), the upscaler and DLSS 5.
+        // A live screen percentage change: the 1-2 frames around it mix the sizes (the learned
+        // addresses are last frame's) - skip them, DLSS stays on.
+        if (MemoryPatcher::MsSinceLiveResize() < 1000) {
+            return;
+        }
         if (out.info.size.width != 1920 || out.info.size.height != 1080) {
             // Resolves already classified before the switch land here too: one line is enough.
             if (Dlss::g_ready.exchange(false, std::memory_order_relaxed)) {

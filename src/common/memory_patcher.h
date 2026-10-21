@@ -68,6 +68,22 @@ bool RenderHeightFromFlags();
 float SavedScreenPercent();
 void SaveScreenPercent(float percent);
 
+/// Live screen percentage (study 10-20 route A): the game boots at the largest size and a change
+/// rides its own mode switch. Available when a percentage was chosen at boot (normal mode).
+bool LiveResizeAvailable();
+/// The boot allocation: a live size is at most this per side.
+RenderSize LiveMaxSize();
+/// Queues `percent` for the next frame; false = more than the boot size (after a restart).
+bool RequestScreenPercent(float percent);
+/// sceGnmSubmitDone (Game:Main, once per frame): applies a queued size.
+void OnSubmitDone();
+/// The 3 s after a change was poked: the texture cache replaces re-sized render targets.
+bool InLiveResizeWindow();
+/// A size of the render shape (+-3%): the game's screen-sized targets and their half / quarter.
+bool IsRenderShaped(u32 width, u32 height);
+/// Milliseconds since the last change (INT64_MAX: none) - DLSS's grace window.
+s64 MsSinceLiveResize();
+
 /// sceSystemServiceGetDisplaySafeAreaInfo: the safe-area ratio the game gets (1.0 unless
 /// SHADPS4_HUD narrows the HUD; ApplyHudWidth).
 float HudSafeAreaRatio();

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -9,11 +11,19 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <vector>
 #include <nlohmann/json.hpp>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include <pugixml.hpp>
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "core/emulator_settings.h"
 #include "core/emulator_state.h"
 #include "core/file_format/psf.h"
 #include "memory_patcher.h"
@@ -373,9 +383,28 @@ static double g_aspect = 16.0 / 9.0; // the shape the game renders, decided at b
 static u32 g_h0 = 1080;              // its height at 16:9 (the size setup's basis)
 static float g_percent_now = 0.0f;   // the screen percentage in effect (0 = the game's 1080 lines)
 static bool g_height_from_flags = false;
+// Live screen percentage (1.1, user 10-20 ~21:00; notes/study-live-resolution-2026-10-20.md route
+// A): the game boots at the largest size M (its buffers get memory for M once) and draws at the
+// live size S <= M inside it; a change pokes the game's own Pro / HDR mode switch FUN_8001f0be0.
+static RenderSize g_max{1920, 1080};       // M: the boot size (the allocation)
+static bool g_live_ok = false;             // live changes possible this run
+static std::atomic<u64> g_live_pending{0}; // S to apply at the next sceGnmSubmitDone (w << 32 | h)
+static std::atomic<u64> g_now_size{(u64(1920) << 32) | 1080}; // the size drawn (w << 32 | h)
+static std::atomic<s64> g_live_ms{0};      // steady-clock ms of the last applied change
+static u64 g_live_check = 0; // Game:Main: the size last poked, until the game took it
+static int g_live_tries = 0; // Game:Main: pokes of g_live_check so far
+
+static s64 NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 constexpr const char* RenderSizeFile = "render-size.ini";
-constexpr u32 MinLines = 96, MaxLines = 4320; // 8K
-constexpr u64 MaxPixels = u64(7680) * 4320;   // 8K's pixels, for any shape
+constexpr u32 MinLines = 96, MaxLines = 4320;
+// At most 3200x1800's pixels (the PS4 Pro's render size) in any shape: 3840x2160 lost the device
+// within seconds of the first city frame, twice (s1491 / s1493, a GPU program fault with no
+// memory address; 10-20); 3200x1800 ran clean (s1492, 97 FPS). 10% (256x144) ran too (s1490).
+constexpr u64 MaxPixels = u64(3200) * 1800;
 
 float HudSafeAreaRatio() {
     return g_hud_ratio;
@@ -477,7 +506,8 @@ void SaveScreenPercent(float percent) {
 }
 
 RenderSize CurrentRenderSize() {
-    return {g_render_w, g_render_h};
+    const u64 v = g_now_size.load(std::memory_order_acquire);
+    return {u32(v >> 32), u32(v)};
 }
 
 RenderSize PercentReference() {
@@ -485,7 +515,10 @@ RenderSize PercentReference() {
 }
 
 float CurrentScreenPercent() {
-    return g_percent_now > 0.0f ? g_percent_now : float(100.0 * g_h0 / FullBaseHeight(g_aspect));
+    // From the size drawn (a live change moves it): its 16:9-basis height over 100%'s.
+    const RenderSize s = CurrentRenderSize();
+    const double h0 = g_aspect < 16.0 / 9.0 - 1e-6 ? s.width * 9.0 / 16.0 : double(s.height);
+    return float(100.0 * h0 / FullBaseHeight(g_aspect));
 }
 
 RenderSize RenderSizeForPercent(float percent) {
@@ -553,7 +586,14 @@ static void ApplyAspectRatio() {
     }
     g_aspect = aspect;
     g_h0 = h0;
-    if (aspect == base && h0 == 1080) {
+    // The boot size M (live changes, a percentage chosen, SHADPS4_LIVE_RES not 0, normal mode -
+    // the Pro toggle loads other immediates): at least 100% of the screen, so the slider is live
+    // from its lowest value up to the screen's size (above: after a restart).
+    const char* live_env = std::getenv("SHADPS4_LIVE_RES");
+    const bool live = g_percent_now > 0.0f && !(live_env && live_env[0] == '0') &&
+                      !EmulatorSettings.IsNeo();
+    const u32 hm = live ? std::max(h0, BaseHeightForPercent(100.0f, aspect)) : h0;
+    if (aspect == base && h0 == 1080 && hm == 1080) {
         return; // 16:9 at 1080: nothing to do
     }
     const bool narrow = aspect < base - 1e-6;
@@ -574,7 +614,8 @@ static void ApplyAspectRatio() {
     }
     // Multiples of 8; wide: the height h0 (1080), narrow: its 16:9 width (1920); at most 32:9
     // (3840 x 1080) and 1:1 (1920 x 1920).
-    const RenderSize size = SizeAt(h0, aspect);
+    const RenderSize size = SizeAt(h0, aspect); // S: drawn
+    const RenderSize max = SizeAt(hm, aspect);  // M: allocated (= S without live changes)
     const u32 w = size.width;
     const u32 h = size.height;
     // The 2D screen space (HUD layout; its ratio = the camera aspect) stays at the 1080-line scale
@@ -613,12 +654,24 @@ static void ApplyAspectRatio() {
             return;
         }
     }
+    // The size setup (render, output) allocates at M; the mode toggle loads S.
     for (const auto& imm : imms) {
-        const u32 value = imm.screen_space ? (imm.width ? sw : sh) : (imm.width ? w : h);
+        const bool toggle = imm.offset >= 0x1f0d3e;
+        const u32 value = imm.screen_space ? (imm.width ? sw : sh)
+                          : toggle         ? (imm.width ? w : h)
+                                           : (imm.width ? max.width : max.height);
         std::memcpy(reinterpret_cast<void*>(g_eboot_address + imm.offset), &value, 4);
     }
     g_render_w = w;
     g_render_h = h;
+    g_now_size.store((u64(w) << 32) | h, std::memory_order_release);
+    g_max = max;
+    g_live_ok = live;
+    if (max.width != w || max.height != h) {
+        // The renderer's init zeroes the mode bytes after these patches (study d2): the first
+        // sceGnmSubmitDone switches the game from M to S.
+        g_live_pending.store((u64(w) << 32) | h, std::memory_order_release);
+    }
     if (add_vertical) {
         const float two_over_k = float(2.0 / (base / aspect));
         std::memcpy(reinterpret_cast<void*>(g_eboot_address + 0x581c84), &two_over_k, 4);
@@ -626,13 +679,160 @@ static void ApplyAspectRatio() {
         std::memcpy(reinterpret_cast<void*>(g_eboot_address + 0x581d10 + 4), &disp, 4);
     }
     LOG_INFO(Loader, "SHADPS4_ASPECT: the game renders {}x{} (aspect {:.3f}, screen {}x{}, "
-             "monitor {}x{}, {}, render height {}{}, HUD space {}x{}{})", w, h, aspect, g_screen_w,
-             g_screen_h, g_display_w, g_display_h, mode, h0,
+             "monitor {}x{}, {}, render height {}{}, HUD space {}x{}{}{})", w, h, aspect,
+             g_screen_w, g_screen_h, g_display_w, g_display_h, mode, h0,
              g_height_from_flags    ? std::string{" from SHADPS4_RENDER_HEIGHT"}
              : g_percent_now > 0.0f ? fmt::format(" = {:.0f}% of the screen", g_percent_now)
                                     : std::string{},
              sw, sh,
-             add_vertical ? ", 16:9 width kept, more picture above / below" : "");
+             add_vertical ? ", 16:9 width kept, more picture above / below" : "",
+             live ? fmt::format(", live changes up to {}x{}", max.width, max.height)
+                  : std::string{});
+}
+
+bool LiveResizeAvailable() {
+    return g_live_ok;
+}
+
+RenderSize LiveMaxSize() {
+    return g_max;
+}
+
+bool RequestScreenPercent(float percent) {
+    if (!g_live_ok || percent <= 0.0f) {
+        return false;
+    }
+    const RenderSize s = SizeAt(BaseHeightForPercent(percent, g_aspect), g_aspect);
+    if (s.width > g_max.width || s.height > g_max.height) {
+        return false; // more than the boot allocation: after a restart
+    }
+    g_live_pending.store((u64(s.width) << 32) | s.height, std::memory_order_release);
+    return true;
+}
+
+bool InLiveResizeWindow() {
+    const s64 at = g_live_ms.load(std::memory_order_relaxed);
+    return at != 0 && NowMs() - at < 3000;
+}
+
+bool IsRenderShaped(u32 width, u32 height) {
+    if (height == 0) {
+        return false;
+    }
+    return std::abs(double(width) / height - g_aspect) < 0.03 * g_aspect;
+}
+
+s64 MsSinceLiveResize() {
+    const s64 at = g_live_ms.load(std::memory_order_relaxed);
+    return at == 0 ? INT64_MAX : NowMs() - at;
+}
+
+namespace {
+
+/// Writes S into the mode toggle's two imm32 (0x1f0d3e esi = width, 0x1f0d4d edi = height).
+bool WriteToggleSize(u32 w, u32 h) {
+    u8* const imm_w = reinterpret_cast<u8*>(g_eboot_address + 0x1f0d3e);
+    u8* const imm_h = reinterpret_cast<u8*>(g_eboot_address + 0x1f0d4d);
+    constexpr size_t span = 0x1f0d4d + 4 - 0x1f0d3e; // one page
+#ifdef _WIN32
+    DWORD old = 0;
+    if (!VirtualProtect(imm_w, span, PAGE_EXECUTE_READWRITE, &old)) {
+        LOG_ERROR(Loader, "Live render size: VirtualProtect failed ({})", GetLastError());
+        return false;
+    }
+#endif
+    std::memcpy(imm_w, &w, 4);
+    std::memcpy(imm_h, &h, 4);
+#ifdef _WIN32
+    VirtualProtect(imm_w, span, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), imm_w, span);
+#endif
+    return true;
+}
+
+// The trigger: the stored colour option (renderer +0xdf0f06, low byte) made to differ from the
+// wanted one (+0xdf0f11): the toggle's compare at 0x1f0d0a fails, its change block re-sizes
+// everything to S and stores the right byte back (study sec. 3, the quietest of the three).
+volatile u8* StoredOption() {
+    return reinterpret_cast<volatile u8*>(g_eboot_address + 0x1d0cbd6);
+}
+u8 WantedOption() {
+    return *reinterpret_cast<const volatile u8*>(g_eboot_address + 0x1d0cbe1);
+}
+
+} // namespace
+
+/// SHADPS4_LIVE_RES_TEST=50,67,100,... (test): from 40 s after the first frame, every 8 s the next
+/// percentage of the list is requested, as the panel's slider would.
+static void LiveResTestStep() {
+    static const std::vector<float> list = [] {
+        std::vector<float> out;
+        if (const char* v = std::getenv("SHADPS4_LIVE_RES_TEST")) {
+            std::stringstream ss{v};
+            std::string item;
+            while (std::getline(ss, item, ',')) {
+                if (std::atof(item.c_str()) > 0.0) {
+                    out.push_back(float(std::atof(item.c_str())));
+                }
+            }
+        }
+        return out;
+    }();
+    if (list.empty()) {
+        return;
+    }
+    static const s64 start = NowMs();
+    static size_t next = 0;
+    const s64 due = start + 40000 + s64(next) * 8000;
+    if (NowMs() >= due) {
+        const float p = list[next % list.size()];
+        LOG_INFO(Loader, "SHADPS4_LIVE_RES_TEST: {}% -> {}", p,
+                 RequestScreenPercent(p) ? "queued" : "refused");
+        ++next;
+    }
+}
+
+void OnSubmitDone() {
+    LiveResTestStep();
+    // Game:Main is inside this HLE call, so its frame begin (FUN_8001f0be0, the toggle) cannot run
+    // meanwhile; job threads never run it (study sec. 3).
+    if (g_live_check != 0) {
+        // The last poke: taken when the game's size table holds S (slot 0 = the output size at
+        // renderer +0xdf0f14 = 0x801d0cbe4, study sec. 1; its change block wrote it).
+        u32 table[2];
+        std::memcpy(table, reinterpret_cast<const void*>(g_eboot_address + 0x1d0cbe4), 8);
+        if (table[0] == u32(g_live_check >> 32) && table[1] == u32(g_live_check)) {
+            g_now_size.store(g_live_check, std::memory_order_release);
+            g_live_ms.store(NowMs(), std::memory_order_relaxed);
+            LOG_INFO(Loader, "Live render size: the game draws {}x{} ({:.0f}% of the screen; boot "
+                             "allocation {}x{}) after {} poke(s)",
+                     u32(g_live_check >> 32), u32(g_live_check), CurrentScreenPercent(),
+                     g_max.width, g_max.height, g_live_tries);
+            g_live_check = 0;
+        } else if (g_live_tries >= 30) {
+            LOG_ERROR(Loader, "Live render size: the game did not take {}x{} after 30 frames",
+                      u32(g_live_check >> 32), u32(g_live_check));
+            g_live_check = 0;
+        } else {
+            ++g_live_tries;
+            *StoredOption() = WantedOption() != 0 ? 0 : 1; // the renderer was not up yet
+            return;
+        }
+    }
+    const u64 pending = g_live_pending.exchange(0, std::memory_order_acq_rel);
+    if (pending == 0) {
+        return;
+    }
+    if (!WriteToggleSize(u32(pending >> 32), u32(pending))) {
+        g_live_pending.store(pending, std::memory_order_release); // next frame
+        return;
+    }
+    // Window for the texture cache and DLSS from the poke on (the back may still be recording
+    // this frame: stragglers at the old size perfect-match their old images).
+    g_live_ms.store(NowMs(), std::memory_order_relaxed);
+    *StoredOption() = WantedOption() != 0 ? 0 : 1;
+    g_live_check = pending;
+    g_live_tries = 1;
 }
 
 // SHADPS4_HUD (1.1, user 2026-10-20): where the HUD is drawn, to taste - e.g. a 16:9 HUD on a 21:9
