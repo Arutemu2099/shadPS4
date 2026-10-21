@@ -33,7 +33,7 @@ Windows 10 / 11, one zip of about 75 MB. **You need your own copy of the game** 
 > settings - reports welcome.
 
 **New in 1.1:** any screen shape (ultrawide 21:9 / 32:9, 16:10, 4:3), the render size as a percentage of your screen
-changed live, native 4K, sharper DLSS without the wobble, no more stripes in street reflections, even motion on
+changed live, native 4K, sharper DLSS without the wobble, far fewer stripes in street reflections, even motion on
 screens without G-Sync / FreeSync, a Quick settings tab, and the loading screen tells you when a new version is out.
 [All changes](https://github.com/axylpup/shadPS4/releases/latest).
 
@@ -46,7 +46,7 @@ Everything below is in the download, set up for this game - no tweaking needed.
 | Feature | What you get |
 |---|---|
 | **High frame rates** | A multithreaded renderer and faster memory handling, frame rate unlocked. On the test PC the open-world city runs at about 140 FPS (1% lows about 134) and the heaviest rooftop view at about 110 FPS (measured with 1.0; 1.1 runs the same within 2%). One PC only - see the release notes for rough numbers on smaller CPUs. |
-| **Render size, live** | 10-200% of your screen with a slider or a number (Page Up), DLSS presets 33 / 50 / 58 / 67 / 100%. Lower = faster on weaker cards, higher = sharper. No restart. Works on every graphics card. |
+| **Render size, live** | 10-200% of your screen with a slider or a number (Page Up), DLSS presets 33 / 50 / 58 / 67 / 100%. Lower = faster on weaker cards, higher = sharper. No restart up to about 3200x1800 (4K after one restart). Works on every graphics card. |
 | **Tunes itself to your PC** | CPUs with fewer threads get a better thread setup; cards under 10 GB and PCs under 24 GB of RAM use less memory, by themselves. |
 | **Shader cache included** | Shaders are prepared once on the first start, with a progress screen - far less first-time stutter. |
 | **Performance mode** | Optional: the game's own lower settings for weak PCs (+13% / +19% FPS in our heaviest view). |
@@ -58,7 +58,7 @@ Everything below is in the download, set up for this game - no tweaking needed.
 | **DLSS 4.5 (NVIDIA RTX)** | Upscaling or DLAA with a sharp HUD, 8-64 sub-pixel positions for smoother edges, with the game's motion data corrected so characters do not wobble. Bring your own NVIDIA files (2 minutes). |
 | **Any screen shape** | Ultrawide 21:9 and 32:9, 16:10, 4:3, even square - wider screens see more, nothing is stretched; the HUD stays in a 16:9 area. |
 | **Native 4K** | Renders 3840x2160 (the game's light lists are enlarged for it; before, the game crashed above 3200x1800). |
-| **Graphics fixes** | Lighting, smoke / foam / leaf flicker and hair fixed; no stripes in street reflections at low render sizes; TVs in the city play their video; sharper water reflections. |
+| **Graphics fixes** | Lighting, smoke / foam / leaf flicker and hair fixed; far fewer stripes in street reflections at low render sizes (NVIDIA for now); TVs in the city play their video; sharper water reflections. |
 | **Even motion without VRR** | V-Sync "half refresh": every picture shown for exactly two refreshes (72 FPS on 144 Hz, 120 on 240 Hz) - smooth on screens without G-Sync / FreeSync. Frame-rate cap included. |
 
 ### Controls
