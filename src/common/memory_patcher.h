@@ -75,6 +75,8 @@ bool LiveResizeAvailable();
 RenderSize LiveMaxSize();
 /// Queues `percent` for the next frame; false = more than the boot size (after a restart).
 bool RequestScreenPercent(float percent);
+/// Insert: the saved pick <-> 100% (live). Returns the percentage requested, 0 = not live.
+float ToggleNativePercent();
 /// sceGnmSubmitDone (Game:Main, once per frame): applies a queued size.
 void OnSubmitDone();
 /// The 3 s after a change was poked: the texture cache replaces re-sized render targets.

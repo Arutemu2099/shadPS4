@@ -226,39 +226,8 @@ void Panel::DrawDlss45() {
     }
     ImGui::SetItemTooltip("Off = the game's own anti-aliasing (instant compare).");
 
-    // Output size, live (user 10-20): DLSS draws this multiple of the screen and the post pass
-    // scales it down (supersampling). Insert switches between the pick and the screen size.
-    ImGui::TextUnformatted("Output  (Insert: this <-> screen size)");
-    const bool upscaling = D::g_hud_layer.load(std::memory_order_relaxed);
-    static constexpr float scales[] = {1.0f, 1.25f, 1.5f, 2.0f};
-    static const char* const scale_names[] = {"Screen", "1.25x", "1.5x", "2x"};
-    const float now_scale = D::g_output_scale.load(std::memory_order_relaxed);
-    int scale = 0;
-    for (int i = 0; i < 4; ++i) {
-        if (std::abs(now_scale - scales[i]) < 0.01f) {
-            scale = i;
-        }
-    }
-    const int was_scale = scale;
-    ImGui::BeginDisabled(!upscaling);
-    for (int i = 0; i < 4; ++i) {
-        Choice(scale_names[i], &scale, i, i, 4,
-               i == 0 ? "DLSS draws the picture at your screen's size."
-                      : "DLSS draws this much more than your screen and it is scaled down: a "
-                        "sharper picture\nfor more graphics-card time. Live; Insert switches "
-                        "back to the screen size and again to this.",
-               false);
-    }
-    ImGui::EndDisabled();
-    if (!upscaling) {
-        ImGui::SetItemTooltip("Only when the window is larger than the game's render size.");
-    }
-    if (scale != was_scale) {
-        D::g_output_scale.store(scales[scale], std::memory_order_relaxed);
-        if (scale != 0) {
-            D::g_output_pick.store(scales[scale], std::memory_order_relaxed);
-        }
-    }
+    // The output-size buttons are gone (user 10-20 ~22:25: no visible effect - at 100% the
+    // upscaler is off; Insert now switches the render size, "Render size" above).
 
     ImGui::TextUnformatted("Network");
     int preset = static_cast<int>(D::g_preset.load(std::memory_order_relaxed));
@@ -298,8 +267,9 @@ void Panel::DrawRenderSize() {
         ImGui::PopTextWrapPos();
         ImGui::PopStyleColor();
     };
-    wrap(Grey, "Now: the game renders %ux%u = %.0f%% of your screen (%ux%u).", now.width,
-         now.height, MP::CurrentScreenPercent(), ref.width, ref.height);
+    wrap(Grey, "Now: the game renders %ux%u = %.0f%% of your screen (%ux%u). Insert: your pick "
+               "<-> 100%%.", now.width, now.height, MP::CurrentScreenPercent(), ref.width,
+         ref.height);
     const bool from_flags = MP::RenderHeightFromFlags();
     if (from_flags) {
         wrap(Yellow, "SHADPS4_RENDER_HEIGHT in shadps4-flags-user.txt sets the size; remove it "
@@ -360,6 +330,9 @@ void Panel::DrawRenderSize() {
     if (!from_flags && (next.width != now.width || next.height != now.height)) {
         if (pick != committed && fits_live) {
             wrap(Grey, "%d%% = %ux%u (live when you let go)", pick, next.width, next.height);
+        } else if (fits_live && !pending_restart &&
+                   std::abs(MP::CurrentScreenPercent() - 100.0f) < 0.5f) {
+            wrap(Grey, "At 100%% now (Insert); Insert again for your %d%%.", pick);
         } else if (fits_live && !pending_restart) {
             wrap(Grey, "%d%% = %ux%u: changing...", pick, next.width, next.height);
         } else if (MP::LiveResizeAvailable()) {

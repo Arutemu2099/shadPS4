@@ -710,6 +710,16 @@ bool RequestScreenPercent(float percent) {
     return true;
 }
 
+float ToggleNativePercent() {
+    if (!g_live_ok) {
+        return 0.0f;
+    }
+    const float pick = SavedScreenPercent();
+    const bool at_native = std::abs(CurrentScreenPercent() - 100.0f) < 0.5f;
+    const float to = at_native && pick > 0.0f ? pick : 100.0f;
+    return RequestScreenPercent(to) ? to : 0.0f;
+}
+
 bool InLiveResizeWindow() {
     const s64 at = g_live_ms.load(std::memory_order_relaxed);
     return at != 0 && NowMs() - at < 3000;
@@ -762,8 +772,9 @@ u8 WantedOption() {
 
 } // namespace
 
-/// SHADPS4_LIVE_RES_TEST=50,67,100,... (test): from 40 s after the first frame, every 8 s the next
-/// percentage of the list is requested, as the panel's slider would.
+/// SHADPS4_LIVE_RES_TEST=50,67,100,... (test): from 40 s after the first frame, every 8 s
+/// (SHADPS4_LIVE_RES_TEST_MS) the next percentage of the list is requested, as the panel's slider
+/// would; the list repeats.
 static void LiveResTestStep() {
     static const std::vector<float> list = [] {
         std::vector<float> out;
@@ -782,8 +793,12 @@ static void LiveResTestStep() {
         return;
     }
     static const s64 start = NowMs();
+    static const s64 step = [] {
+        const char* v = std::getenv("SHADPS4_LIVE_RES_TEST_MS");
+        return v && std::atoi(v) > 0 ? s64(std::atoi(v)) : s64(8000);
+    }();
     static size_t next = 0;
-    const s64 due = start + 40000 + s64(next) * 8000;
+    const s64 due = start + 40000 + s64(next) * step;
     if (NowMs() >= due) {
         const float p = list[next % list.size()];
         LOG_INFO(Loader, "SHADPS4_LIVE_RES_TEST: {}% -> {}", p,

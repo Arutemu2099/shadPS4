@@ -11,6 +11,7 @@
 #include <cmrc/cmrc.hpp>
 #include <stb_image.h>
 
+#include "common/memory_patcher.h"
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
@@ -401,25 +402,27 @@ void WindowSDL::WaitEvent() {
             (emu_key(Input::EmuKey::DlssToggle) || emu_key(Input::EmuKey::DlssJitter) ||
              emu_key(Input::EmuKey::DlssOutputScale))) {
             // SHADPS4_DLSS (vk_dlss.h): Home = DLSS on / off, Page Down = jitter sign combination
-            // (D is the pick), Insert = output at the window size / 1.5x (upscale mode).
-            if (!Vulkan::Dlss::g_ready.load(std::memory_order_relaxed)) {
+            // (D is the pick). Insert = the render size: the Page Up pick <-> 100% of the screen
+            // (user 10-20: "Home is the AA toggle, Insert the custom vs native resolution"; live,
+            // any card).
+            if (emu_key(Input::EmuKey::DlssOutputScale)) {
+                const float to = MemoryPatcher::ToggleNativePercent();
+                static char notice[96];
+                if (to > 0.0f) {
+                    std::snprintf(notice, sizeof(notice), "Render size: %.0f%% of the screen", to);
+                } else {
+                    std::snprintf(notice, sizeof(notice),
+                                  "Render size: pick one in Page Up first (it needs one restart)");
+                }
+                LOG_INFO(Render_Vulkan, "Render size toggle (Insert): {}", to);
+                Overlay::ShowNotice(notice);
+            } else if (!Vulkan::Dlss::g_ready.load(std::memory_order_relaxed)) {
                 Overlay::ShowNotice("DLSS not available (see the log)");
             } else if (emu_key(Input::EmuKey::DlssToggle)) {
                 const bool on = !Vulkan::Dlss::g_user_on.load(std::memory_order_relaxed);
                 Vulkan::Dlss::g_user_on.store(on, std::memory_order_relaxed);
                 LOG_INFO(Render_Vulkan, "DLSS: {} (Home)", on ? "on" : "off - the game's own AA");
                 Overlay::ShowNotice(on ? "DLSS: ON" : "DLSS: OFF (game's own anti-aliasing)");
-            } else if (emu_key(Input::EmuKey::DlssOutputScale)) {
-                const float scale =
-                    Vulkan::Dlss::g_output_scale.load(std::memory_order_relaxed) > 1.0f
-                        ? 1.0f
-                        : Vulkan::Dlss::g_output_pick.load(std::memory_order_relaxed);
-                Vulkan::Dlss::g_output_scale.store(scale, std::memory_order_relaxed);
-                LOG_INFO(Render_Vulkan, "DLSS: output scale {} (Insert)", scale);
-                static char notice[64];
-                std::snprintf(notice, sizeof(notice), "DLSS output: %.2gx the screen, scaled down",
-                              scale);
-                Overlay::ShowNotice(scale > 1.0f ? notice : "DLSS output: the screen size");
             } else {
                 const u32 step = 3; // backwards, as Page Down always did
                 const u32 combo =

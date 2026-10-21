@@ -1746,8 +1746,15 @@ void Rasterizer::DlssResolve() {
             if (dlss_phase_in == 1 || dlss_phase_in == 2) {
                 const float j = dlss_phase_in == 1 ? 0.25f : -0.25f;
                 const u32 combo = Dlss::g_jitter_combo.load(std::memory_order_relaxed);
-                const float sx = static_cast<float>(out.info.size.width) / 1920.0f;
-                const float sy = static_cast<float>(out.info.size.height) / 1080.0f;
+                // SHADPS4_DLSS_JITTER_SCALE=0 (test): the old +-0.25 at every size.
+                static const bool scale_jitter = [] {
+                    const char* v = std::getenv("SHADPS4_DLSS_JITTER_SCALE");
+                    return !(v && v[0] == '0');
+                }();
+                const float sx =
+                    scale_jitter ? static_cast<float>(out.info.size.width) / 1920.0f : 1.0f;
+                const float sy =
+                    scale_jitter ? static_cast<float>(out.info.size.height) / 1080.0f : 1.0f;
                 jx = ((combo & 1) ? -j : j) * sx;
                 jy = ((combo & 2) ? -j : j) * sy;
                 const bool combo_changed = combo != dlss_last_combo;
