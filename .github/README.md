@@ -11,7 +11,7 @@ GitHub shows .github/README.md before the root README.md, so upstream's README.m
 # inFAMOUS Second Son on PC
 
 **A build of the [shadPS4](https://github.com/shadps4-emu/shadPS4) PlayStation 4 emulator, tuned for one game.**<br>
-High frame rates, DLSS, real mouse aiming and a full keyboard layout, on Windows.
+High frame rates, DLSS, native 4K and ultrawide, real mouse aiming and a full keyboard layout, on Windows.
 
 [![Latest build](https://img.shields.io/github/v/release/axylpup/shadPS4?label=latest%20build&style=for-the-badge)](https://github.com/axylpup/shadPS4/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/axylpup/shadPS4/total?style=for-the-badge)](https://github.com/axylpup/shadPS4/releases)
@@ -19,6 +19,8 @@ High frame rates, DLSS, real mouse aiming and a full keyboard layout, on Windows
 ### [Download the latest build](https://github.com/axylpup/shadPS4/releases/latest)
 
 Windows 10 / 11, one zip of about 75 MB. **You need your own copy of the game** - no game files are included.
+
+**[Features](#features) · [Getting started](#getting-started) · [FAQ](#faq) · [Controls](#keyboard-and-mouse) · [DLSS](#dlss-optional) · [Known issues](#known-issues)**
 
 ![Delsin on a rooftop in Seattle, 131 FPS on the test PC](media/city-rooftop.jpg)
 
@@ -30,22 +32,54 @@ Windows 10 / 11, one zip of about 75 MB. **You need your own copy of the game** 
 > shadPS4 team. Tested with the EU version (CUSA00004, update 1.07); the US version (CUSA00223) gets the same
 > settings - reports welcome.
 
-## Highlights
+**New in 1.1:** any screen shape (ultrawide 21:9 / 32:9, 16:10, 4:3), the render size as a percentage of your screen
+changed live, native 4K, sharper DLSS without the wobble, no more stripes in street reflections, even motion on
+screens without G-Sync / FreeSync, a Quick settings tab, and the loading screen tells you when a new version is out.
+[All changes](https://github.com/axylpup/shadPS4/releases/latest).
 
-- **High frame rates:** on the test PC the open-world city benchmark runs at about 140 FPS (1% lows about 134) and
-  the heaviest rooftop view at about 110 FPS (your screen shows at most its refresh rate). **One PC only** - as a very
-  rough guide, the same PC limited to fewer CPU cores gave about 95 FPS (6 cores), 60 FPS (4 cores / 8 threads) and
-  44 FPS (4 small efficiency cores). Treat these as estimates.
-- **DLSS 4.5 (NVIDIA RTX):** upscales the game's 1080p to your 1440p / 4K screen (DLAA on 1080p screens), the HUD
-  stays sharp. Bring your own NVIDIA files - 2 minutes, see below.
-- **Real 1:1 mouse aiming** - the mouse moves the camera directly; left click shoots, right click aims.
-- **Full keyboard + mouse layout**, including the spray-can (motion sensor) and touchpad parts.
-- **Keyboard / mouse button icons** in the game's prompts - they switch to PlayStation buttons when you pick up a
-  controller.
-- **Fixes:** settings stay after a restart, the Load menu's "No" works, TVs in the city play, unplugging a controller
-  hands control to the keyboard, controller-speaker sounds (ringtone, rattle) turned down to 25%.
-- **Shader cache included** with a progress screen on the first start - far less first-time stutter.
-- Sharper water reflections.
+## Features
+
+Everything below is in the download, set up for this game - no tweaking needed.
+
+### Speed
+
+| Feature | What you get |
+|---|---|
+| **High frame rates** | A multithreaded renderer and faster memory handling, frame rate unlocked. On the test PC the open-world city runs at about 140 FPS (1% lows about 134) and the heaviest rooftop view at about 110 FPS (measured with 1.0; 1.1 runs the same within 2%). One PC only - see the release notes for rough numbers on smaller CPUs. |
+| **Render size, live** | 10-200% of your screen with a slider or a number (Page Up), DLSS presets 33 / 50 / 58 / 67 / 100%. Lower = faster on weaker cards, higher = sharper. No restart. Works on every graphics card. |
+| **Tunes itself to your PC** | CPUs with fewer threads get a better thread setup; cards under 10 GB and PCs under 24 GB of RAM use less memory, by themselves. |
+| **Shader cache included** | Shaders are prepared once on the first start, with a progress screen - far less first-time stutter. |
+| **Performance mode** | Optional: the game's own lower settings for weak PCs (+13% / +19% FPS in our heaviest view). |
+
+### Picture
+
+| Feature | What you get |
+|---|---|
+| **DLSS 4.5 (NVIDIA RTX)** | Upscaling or DLAA with a sharp HUD, 8-64 sub-pixel positions for smoother edges, with the game's motion data corrected so characters do not wobble. Bring your own NVIDIA files (2 minutes). |
+| **Any screen shape** | Ultrawide 21:9 and 32:9, 16:10, 4:3, even square - wider screens see more, nothing is stretched; the HUD stays in a 16:9 area. |
+| **Native 4K** | Renders 3840x2160 (the game's light lists are enlarged for it; before, the game crashed above 3200x1800). |
+| **Graphics fixes** | Lighting, smoke / foam / leaf flicker and hair fixed; no stripes in street reflections at low render sizes; TVs in the city play their video; sharper water reflections. |
+| **Even motion without VRR** | V-Sync "half refresh": every picture shown for exactly two refreshes (72 FPS on 144 Hz, 120 on 240 Hz) - smooth on screens without G-Sync / FreeSync. Frame-rate cap included. |
+
+### Controls
+
+| Feature | What you get |
+|---|---|
+| **Real 1:1 mouse aiming** | The mouse turns the camera directly, like a PC game; left click shoots, right click aims. Speed with `-` / `=`, remembered. |
+| **Full keyboard + mouse layout** | Every move, including the spray-can (motion sensor) and touchpad moments. Picture below. |
+| **Keyboard / mouse icons in the game** | Button prompts show your keys; pick up a controller and they switch back to PlayStation buttons. |
+| **Any controller** | DualSense / DualShock 4 as on the console; Xbox and other pads get a sensor mode (L3 + R3) and touchpad buttons. Stick deadzone setting. |
+| **Every key can be changed** | Including the emulator's own keys (DLSS, panels, mouse speed) - handy on laptops. |
+
+### Comfort
+
+| Feature | What you get |
+|---|---|
+| **Quick settings tab (F3)** | Display mode, V-Sync, frame-rate cap, volume, deadzones and language in one place, applied right away; the menu fits any window. |
+| **Remembers your setup** | Fullscreen, mouse speed, render size and the game's own settings stay after a restart; the Load menu's "No" works. |
+| **Update check** | The loading screen shows the newest version every start and says so in green when an update is out. Nothing is downloaded. |
+| **Easy updates** | Unzip the new version over the old folder - saves, settings, keys and DLSS files stay. |
+| **Fixes for more PCs** | 8 GB cards (NVIDIA and AMD) load without running out of memory, AMD RX 5000 shader crash fixed, laptops start on the real graphics card, folders with non-English letters work, clear crash reports (`fatal.txt`). |
 
 ![The forest fire, 119 FPS on the test PC](media/forest-fire.jpg)
 
@@ -57,11 +91,113 @@ Windows 10 / 11, one zip of about 75 MB. **You need your own copy of the game** 
 3. The first start prepares shaders (one time, with a progress screen). Then play.
 
 A DualSense / DualShock 4 works as on the console. All keys, the special sections (T = touchpad, X = motion sensor),
-changing settings and troubleshooting are in the README inside the zip; `shadps4-flags-user-EXAMPLES.txt` lists the
+changing settings and more questions are in the README inside the zip (and in the [FAQ](#faq) below); `shadps4-flags-user-EXAMPLES.txt` lists the
 settings players usually want.
 
 **Updating:** unzip the new version over your old folder and replace the files. Saves, settings, keys, DLSS files and
 your own `shadps4-flags-user.txt` stay. The first start prepares shaders once more.
+
+## FAQ
+
+Click a question to open it. Lines like `SHADPS4_...=...` go into `shadps4-flags-user.txt` next to `shadPS4.exe`
+(create it if it is not there; restart the game after editing). The README inside the zip has more.
+
+<details>
+<summary><b>How do I bring my saves over?</b></summary>
+
+1. Close the game.
+2. Find your old saves: other shadPS4 installs keep them in `%APPDATA%\shadPS4\home\1000\savedata\CUSA00004\` (paste
+   that into the Explorer address bar), older shadPS4 versions in `user\savedata\1\CUSA00004\`. Each save is a folder
+   like `infamousssAuto0`.
+3. Copy those folders into `user\home\1000\savedata\CUSA00004\` next to this build's `shadPS4.exe` (start the game
+   once so the folders exist, or create them).
+4. US version: `CUSA00223` instead of `CUSA00004`.
+
+Updating this build keeps your saves - nothing to copy. Saves from a PS4 itself are encrypted; only saves decrypted
+with homebrew save tools can be copied the same way (untested).
+</details>
+
+<details>
+<summary><b>How do I change the language?</b></summary>
+
+**F3 -> Quick -> Language**, Save, restart the game. Text and voices change together. The game has only the languages
+of your copy; if it stays in English, try the other variant (for example Spanish (Spain) / Spanish (Latin America)).
+</details>
+
+<details>
+<summary><b>Motion stutters although the FPS is high (no G-Sync / FreeSync)</b></summary>
+
+A normal screen shows a new picture only at each refresh, so at, say, 100 FPS on 144 Hz some pictures stay one
+refresh and some two - motion jitters. **F3 -> Quick -> V-Sync -> Fifo (half refresh)**, Save: every picture stays
+exactly two refreshes (72 FPS on 144 Hz, 60 on 120 Hz, 120 on 240 Hz). If your PC holds your full refresh rate, plain
+**Fifo** is smoother still. Applies right away. With G-Sync / FreeSync none of this is needed.
+</details>
+
+<details>
+<summary><b>How do I make it run faster?</b></summary>
+
+Lower the render size: **Page Up** -> Render size, for example 67% or 50% (DLSS on RTX cards, or the normal scaler on
+any card, brings it back up to your screen). It changes live. Weaker PCs can also try `SHADPS4_PERF_MODE=low` (the
+game's own lower settings).
+</details>
+
+<details>
+<summary><b>How do I play fullscreen? Ultrawide?</b></summary>
+
+**F11** (or F3 -> Quick -> Display Mode) - remembered for the next start. Ultrawide and other screen shapes are filled
+by themselves; restart the game after resizing the window. The HUD stays in a 16:9 area in the middle
+(`SHADPS4_HUD=full` moves it to the edges); video cutscenes keep black bars.
+</details>
+
+<details>
+<summary><b>The frame rate stops at my monitor's refresh rate</b></summary>
+
+Your graphics driver has no "Mailbox" mode (AMD on Windows, some Intel and laptop drivers), so the game uses V-Sync.
+For an uncapped frame rate: **F3 -> Quick -> V-Sync -> Immediate** (can tear without FreeSync / G-Sync).
+</details>
+
+<details>
+<summary><b>Mouse too fast / stuck to the camera? Changing keys?</b></summary>
+
+**-** / **=** change the mouse speed (kept). **Y** turns mouse aiming off, **F3** frees the mouse while open. Keys:
+`user\input_config\default.ini` (game) and `global.ini` (emulator keys), then **F8** in game to reload.
+</details>
+
+<details>
+<summary><b>Xbox or other controller without a touchpad / motion sensor?</b></summary>
+
+Press **L3 + R3** (both sticks) for the spray-can and touchpad moments: the right stick aims the can, hold **A** to
+tilt, tap **A** to shake; the left stick is your finger on the touchpad. **D-pad up** / **View** are the touchpad
+halves. Sticks drifting? **F3 -> Quick -> Stick Deadzone**.
+</details>
+
+<details>
+<summary><b>DLSS does not turn on</b></summary>
+
+Check the five files (see [DLSS](#dlss-optional)): exactly Streamline **2.14.16**, from `bin\x64` (not
+`development`), and an NVIDIA RTX card. `user\log\shad_log.txt` says why - search it for `DLSS:`.
+</details>
+
+<details>
+<summary><b>The first start takes long / it asks for the game folder again</b></summary>
+
+The first start prepares shaders once (a few minutes, with a progress screen) - leave it running. To pick another
+game folder, delete `shadps4-game.txt` next to `shadPS4.exe` and choose the folder that contains `eboot.bin`.
+</details>
+
+<details>
+<summary><b>Crashes, wrong textures or out of video memory (AMD, Intel, older cards)</b></summary>
+
+Put `SHADPS4_A2=0` into `shadps4-flags-user.txt` (the multithreaded renderer off - slower, but closest to standard
+shadPS4), then [open an issue](https://github.com/axylpup/shadPS4/issues/new/choose) with your logs.
+</details>
+
+<details>
+<summary><b>Does it go online?</b></summary>
+
+Only for the update check: one small request to GitHub per start, shown on the loading screen. Nothing is downloaded.
+`SHADPS4_UPDATE_CHECK=0` turns it off.
+</details>
 
 ## Keyboard and mouse
 
@@ -75,18 +211,31 @@ NVIDIA's files are not included (licence). Download **Streamline SDK 2.14.16** f
 
 `sl.interposer.dll`, `sl.common.dll`, `sl.dlss.dll`, `sl.pcl.dll`, `nvngx_dlss.dll`
 
-Start the game: DLSS turns on by itself. **Home** switches it on / off to compare. Without the files the game uses
-its own anti-aliasing.
+Start the game: DLSS turns on by itself. **Home** switches it on / off to compare, **Page Up** opens the DLSS panel
+(render size, network, status). Without the files the game uses its own anti-aliasing.
 
 ## Requirements
 
-- Windows 10 / 11 64-bit, a Vulkan 1.3 graphics card (12 GB video memory recommended; 8 GB runs since 1.0.2), a fast
-  6+ core CPU.
+- Windows 10 / 11 64-bit, a Vulkan 1.3 graphics card (12 GB video memory recommended; 8 GB runs since 1.0.2, smaller
+  cards can lower the render size), a fast 6+ core CPU.
 - DLSS: an NVIDIA RTX card (20 series or newer) and a recent driver.
-- Tested only on Windows 11 + RTX 4070 Ti SUPER + i5-13600K. Other hardware should work (every new feature has a
-  fallback) but is untested - reports welcome.
+- Other hardware should work (every new feature has a fallback) but only the test PC below is tested - reports
+  welcome.
+
+**The test PC** - every number on this page comes from it:
+
+| Part | Model |
+|---|---|
+| CPU | Intel Core i5-13600K (6 performance + 8 efficiency cores, 20 threads) |
+| Graphics card | NVIDIA GeForce RTX 4070 Ti SUPER, 16 GB, driver 617.14 |
+| RAM | 32 GB DDR5 (2 x 16 GB, running at 4800 MT/s) |
+| Storage | WD_BLACK SN850X 4 TB NVMe (game files); Windows on a WD_BLACK SN770 1 TB NVMe |
+| Screen | MSI MPG 271QRX, 27" QD-OLED, 2560x1440, set to 240 Hz, G-Sync |
+| Windows | Windows 11 Home |
 
 ## Known issues
+
+Real bugs that are not fixed yet (stutter, language, saves and other questions with a quick fix: [FAQ](#faq)).
 
 - Touchpad prompts and the controller picture in the Options screen still show the PlayStation controller.
 - A few particle effects (smoke, fire) can flicker in places.
@@ -106,19 +255,24 @@ for this build only - problems with other games or the official shadPS4 builds b
 
 ## This repository
 
+<details>
+<summary>For developers: branches, tags and building</summary>
+
 - **`second-son`** (this branch) - the source of the builds: shadPS4 0.17 (upstream `main` of 2026-08-08) plus our
-  commits. Each release has a tag (`second-son-v1.0.2`, ...) pointing at the exact source of its zip.
+  commits. Each release has a tag (`second-son-v1.1`, ...) pointing at the exact source of its zip.
 - **`main`** - upstream shadPS4, unchanged.
 - Building: follow shadPS4's
   [Windows build guide](https://github.com/axylpup/shadPS4/blob/second-son/documents/building-windows.md). Release
   builds use the profile-guided optimisation data in [`pgo/`](https://github.com/axylpup/shadPS4/tree/second-son/pgo).
+
+</details>
 
 ## How this was made
 
 This build was made with AI. I'm a 3D artist, not a programmer: I directed the project - set the goals, chose what to
 work on, played and tested every build, judged what looked and felt right, and made the release calls. The code, the
 tests and measurements and most of the documentation were written by AI models: most of it by Anthropic's Claude Opus
-5.5, earlier parts by other Claude models and by OpenAI's GPT models. Announcement images are made with ChatGPT. All of
+5.5, earlier parts by other Claude models and by OpenAI's GPT models. Announcement images were made with ChatGPT (1.0 - 1.0.2) and Claude (1.1). All of
 it stands on shadPS4, written by its team and contributors over years.
 
 ## Credits and licence
