@@ -180,6 +180,8 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     }
     SDL_SetWindowFullscreen(window, StartFullscreen());
     SDL_SyncWindow(window);
+    LOG_INFO(Frontend, "Window at start: {}{}", StartFullscreen() ? "fullscreen" : "window",
+             FullscreenOverride() >= 0 ? " (SHADPS4_FULLSCREEN)" : "");
     // The window geometry is only final once the fullscreen transition has settled; refresh
     // the cached size so the first swapchain and the splashscreen use the real drawable size.
     SDL_GetWindowSizeInPixels(window, &width, &height);

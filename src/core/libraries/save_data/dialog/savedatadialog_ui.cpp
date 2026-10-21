@@ -50,11 +50,11 @@ namespace Libraries::SaveData::Dialog {
 /// SHADPS4_SAVEDIALOG_NO_BUTTON=1 (2026-10-18, LATER-PLAN 7): "No" in a Yes / No dialog always answers
 /// NO. Without it, games below firmware 4.50 get USER_CANCELED for "No"; Second Son then aborts its
 /// "save first?" step of Load instead of opening the load list (user test 10-18, log: USER_MSG ->
-/// GetResult -> nothing).
+/// GetResult -> nothing). On by default since 1.1 (it was only in the flags file); =0 off.
 static bool NoButtonAlwaysNo() {
     static const bool on = [] {
         const char* v = std::getenv("SHADPS4_SAVEDIALOG_NO_BUTTON");
-        return v && v[0] == '1';
+        return !(v && v[0] == '0');
     }();
     return on;
 }
