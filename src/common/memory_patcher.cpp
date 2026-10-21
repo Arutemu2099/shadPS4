@@ -797,8 +797,12 @@ static void LiveResTestStep() {
         const char* v = std::getenv("SHADPS4_LIVE_RES_TEST_MS");
         return v && std::atoi(v) > 0 ? s64(std::atoi(v)) : s64(8000);
     }();
+    static const s64 delay = [] {
+        const char* v = std::getenv("SHADPS4_LIVE_RES_TEST_DELAY_MS");
+        return v && std::atoi(v) > 0 ? s64(std::atoi(v)) : s64(40000);
+    }();
     static size_t next = 0;
-    const s64 due = start + 40000 + s64(next) * step;
+    const s64 due = start + delay + s64(next) * step;
     if (NowMs() >= due) {
         const float p = list[next % list.size()];
         LOG_INFO(Loader, "SHADPS4_LIVE_RES_TEST: {}% -> {}", p,
