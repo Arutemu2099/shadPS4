@@ -176,6 +176,12 @@ int PosixSocket::Bind(const OrbisNetSockaddr* addr, u32 addrlen) {
     std::scoped_lock lock{m_mutex};
     sockaddr addr2;
     convertOrbisNetSockaddrToPosix(addr, &addr2);
+    // Which bind opens the network to the outside (the Windows Firewall prompt per new EXE;
+    // user 10-21): address and port of every game bind.
+    const auto* in = reinterpret_cast<const sockaddr_in*>(&addr2);
+    LOG_INFO(Lib_Net, "bind {}.{}.{}.{}:{}", in->sin_addr.s_addr & 0xff,
+             (in->sin_addr.s_addr >> 8) & 0xff, (in->sin_addr.s_addr >> 16) & 0xff,
+             in->sin_addr.s_addr >> 24, ntohs(in->sin_port));
     return ConvertReturnErrorCode(::bind(sock, &addr2, sizeof(sockaddr_in)));
 }
 
