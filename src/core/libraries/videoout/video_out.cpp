@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include "common/memory_patcher.h"
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
@@ -256,6 +258,36 @@ s32 PS4_SYSV_ABI sceVideoOutGetFlipStatus(s32 handle, FlipStatus* status) {
     {
         std::unique_lock lock{port->port_mutex};
         *status = port->flip_status;
+    }
+    // A flip that never completes (user 10-20 ~22:20: the game froze in its live-resize step,
+    // which polls this until no flip is pending): one line per stall of > 3 s, then one when it
+    // clears. Cheap: two compares per call.
+    {
+        static u64 stall_count = ~0ull;
+        static u64 stall_since_ms = 0;
+        static bool stall_logged = false;
+        const u64 now_ms = static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                std::chrono::steady_clock::now().time_since_epoch())
+                                                .count());
+        if (status->flip_pending_num > 0 && status->count == stall_count) {
+            if (!stall_logged && now_ms - stall_since_ms > 3000) {
+                stall_logged = true;
+                LOG_WARNING(Lib_VideoOut,
+                            "FlipStall: {} flip(s) pending for {} ms (flip count {}, gc queue {}, "
+                            "buffer {}; ms since a live render-size change: {})",
+                            status->flip_pending_num, now_ms - stall_since_ms, status->count,
+                            status->gc_queue_num, status->current_buffer,
+                            MemoryPatcher::MsSinceLiveResize());
+            }
+        } else {
+            if (stall_logged) {
+                LOG_WARNING(Lib_VideoOut, "FlipStall: cleared after {} ms",
+                            now_ms - stall_since_ms);
+            }
+            stall_count = status->count;
+            stall_since_ms = now_ms;
+            stall_logged = false;
+        }
     }
 
     LOG_TRACE(Lib_VideoOut,
