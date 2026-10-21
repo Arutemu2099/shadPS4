@@ -61,7 +61,7 @@ Everything below is in the download, set up for this game - no tweaking needed.
 | **Graphics fixes** | Lighting, smoke / foam / leaf flicker and hair fixed; far fewer stripes in street reflections at low render sizes (NVIDIA for now); TVs in the city play their video; sharper water reflections. |
 | **Even motion without VRR** | V-Sync "half refresh": every picture shown for exactly two refreshes (72 FPS on 144 Hz, 120 on 240 Hz) - smooth on screens without G-Sync / FreeSync. Frame-rate cap included. |
 
-### Controls
+### Input
 
 | Feature | What you get |
 |---|---|
