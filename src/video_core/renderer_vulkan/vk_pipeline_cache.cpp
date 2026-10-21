@@ -1518,6 +1518,12 @@ void PipelineCache::PrepareNativeColourLocked(const GraphicsPipeline* base,
                  HasAnyShaderPatch(vs->pgm_hash, Shader::Stage::Vertex))) {
                 return "shader patch";
             }
+            // The SSR dither swaps fs_204f45fe's plain module by its exact SPIR-V; a native
+            // colour variant is emitted differently and would keep the stripes (one fullscreen
+            // draw per frame on the plain path).
+            if (fs->pgm_hash == 0x204f45fe && SsrDitherEnabled()) {
+                return "ssr dither";
+            }
             for (u32 i = 0; i < stages.size(); ++i) {
                 if (stages[i] && i != u32(LogicalStage::Vertex) &&
                     i != u32(LogicalStage::Fragment)) {

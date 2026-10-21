@@ -258,6 +258,14 @@ vk::ShaderModule Compile(std::string_view code, vk::ShaderStageFlagBits stage, v
     return CompileSPV(out_code, device);
 }
 
+bool SsrDitherEnabled() {
+    static const bool on = [] {
+        const char* value = std::getenv("SHADPS4_SSR_DITHER");
+        return !(value && value[0] == '0');
+    }();
+    return on;
+}
+
 vk::ShaderModule CompileSPV(std::span<const u32> code, vk::Device device) {
     // SHADPS4_SPIRV_SALT=<n> (diagnostic, 2026-10-07): writes n into the SPIR-V header's generator
     // word (informational only), so the driver's own shader cache misses and a run measures
@@ -278,10 +286,7 @@ vk::ShaderModule CompileSPV(std::span<const u32> code, vk::Device device) {
     // prebuilt) is swapped for one that starts each pixel at a dithered offset. Another GPU's
     // SPIR-V differs and keeps the game's. SHADPS4_SSR_DITHER=0 off.
     if (code.size() == SsrDither::OriginalWords) [[unlikely]] {
-        static const bool on = [] {
-            const char* value = std::getenv("SHADPS4_SSR_DITHER");
-            return !(value && value[0] == '0');
-        }();
+        const bool on = SsrDitherEnabled();
         u64 h = 0xcbf29ce484222325ull; // FNV-1a 64 over the bytes
         for (const u32 w : code) {
             for (u32 b = 0; b < 4; ++b) {
