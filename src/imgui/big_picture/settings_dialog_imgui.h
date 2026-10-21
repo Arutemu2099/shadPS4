@@ -113,7 +113,9 @@ private:
     const std::vector<std::string> fullscreenModeOptions = {"Windowed", "Fullscreen",
                                                             "Fullscreen (Borderless)"};
     const std::vector<std::string> audioBackendOptions = {"SDL", "OpenAL"};
-    const std::vector<std::string> presentModeOptions = {"Mailbox", "Fifo", "Immediate"};
+    // "Fifo (half refresh)": V-Sync with every frame held two screen refreshes (vk_swapchain.cpp).
+    const std::vector<std::string> presentModeOptions = {"Mailbox", "Fifo", "Fifo (half refresh)",
+                                                         "Immediate"};
     const std::vector<std::string> hideCursorOptions = {"Never", "Idle", "Always"};
     const std::vector<std::string> trophySideOptions = {"left", "right", "top", "bottom"};
     const std::vector<std::string> readbacksModeOptions = {"Disabled", "Relaxed", "Precise"};

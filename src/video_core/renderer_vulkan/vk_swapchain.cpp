@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <limits>
 #include <mutex>
@@ -256,7 +257,35 @@ void Swapchain::FindPresentFormat() {
     UNREACHABLE_MSG("Unable to find required swapchain format!");
 }
 
+static std::atomic<u32> g_vsync_divider{1};
+
+u32 VsyncDivider() {
+    return g_vsync_divider.load(std::memory_order_relaxed);
+}
+
+bool Swapchain::PresentModeChanged() {
+    if (++present_mode_checks % 30 != 0 ||
+        EmulatorSettings.GetPresentMode() == present_mode_setting) {
+        return false;
+    }
+    FindPresentMode();
+    LOG_INFO(Render_Vulkan, "Present mode changed in the settings: the swapchain is rebuilt");
+    return true;
+}
+
 void Swapchain::FindPresentMode() {
+    // Frame pacing on screens without G-Sync / FreeSync (PERF-PLAN 15): a fixed-refresh screen
+    // shows a new picture only at a refresh, so a game between half and full refresh holds some
+    // pictures one refresh and some two (uneven motion). With FIFO, presenting every game frame N
+    // times holds each exactly N refreshes, locked to the screen (no cap value to pick, no drift).
+    const auto requested_mode = EmulatorSettings.GetPresentMode();
+    present_mode_setting = requested_mode;
+    u32 divider = requested_mode == "Fifo (half refresh)" ? 2 : 1;
+    if (const char* v = std::getenv("SHADPS4_VSYNC_DIVIDER"); v && std::atoi(v) > 0) {
+        divider = std::clamp(u32(std::atoi(v)), 1u, 4u);
+    }
+    g_vsync_divider.store(divider, std::memory_order_relaxed);
+
     const auto [modes_result, modes] =
         instance.GetPhysicalDevice().getSurfacePresentModesKHR(surface);
     if (modes_result != vk::Result::eSuccess) {
@@ -266,10 +295,13 @@ void Swapchain::FindPresentMode() {
         return;
     }
 
-    const auto requested_mode = EmulatorSettings.GetPresentMode();
-    if (requested_mode == "Mailbox") {
+    if (divider > 1) {
+        present_mode = vk::PresentModeKHR::eFifo;
+        LOG_INFO(Render_Vulkan, "Present mode: Fifo, every frame held {} screen refreshes",
+                 divider);
+    } else if (requested_mode == "Mailbox") {
         present_mode = vk::PresentModeKHR::eMailbox;
-    } else if (requested_mode == "Fifo") {
+    } else if (requested_mode == "Fifo" || requested_mode == "Fifo (half refresh)") {
         present_mode = vk::PresentModeKHR::eFifo;
     } else if (requested_mode == "Immediate") {
         present_mode = vk::PresentModeKHR::eImmediate;

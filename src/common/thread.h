@@ -42,6 +42,13 @@ public:
 
     void End();
 
+    /// A new interval from the next tick (the vblank rate changed live); the accumulated
+    /// wait / overrun is dropped so the new rate starts clean.
+    void SetInterval(std::chrono::nanoseconds interval) {
+        target_interval = interval;
+        total_wait = {};
+    }
+
     std::chrono::nanoseconds GetTotalWait() const {
         return total_wait;
     }

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <mutex>
+#include <string>
 #include <vector>
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -21,6 +22,11 @@ bool SwapchainSafeWait();
 
 class Instance;
 class Scheduler;
+
+/// Screen refreshes each game frame stays up (1 = plain present). F3 Present Mode
+/// "Fifo (half refresh)" = 2, or SHADPS4_VSYNC_DIVIDER=2..4; both force FIFO (V-Sync). Set when
+/// the swapchain picks its present mode (PERF-PLAN 15).
+u32 VsyncDivider();
 
 class Swapchain {
 public:
@@ -97,6 +103,10 @@ public:
         return needs_hdr;
     }
 
+    /// F3's Present Mode changed since the swapchain chose its mode (checked every 30th call):
+    /// picks the new mode; the caller recreates the swapchain (live, no restart).
+    bool PresentModeChanged();
+
 private:
     /// Selects the best available swapchain image format
     void FindPresentFormat();
@@ -124,6 +134,8 @@ private:
     vk::SurfaceFormatKHR surface_format;
     vk::Format view_format;
     vk::PresentModeKHR present_mode;
+    std::string present_mode_setting; ///< the F3 value FindPresentMode last used
+    u32 present_mode_checks = 0;
     vk::Extent2D extent;
     vk::SurfaceTransformFlagBitsKHR transform;
     vk::CompositeAlphaFlagBitsKHR composite_alpha;

@@ -1140,8 +1140,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
         }
     };
 
-    // Recreate the swapchain if the window was resized.
-    if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight()) {
+    // Recreate the swapchain if the window was resized or F3's Present Mode changed (live).
+    if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight() ||
+        swapchain.PresentModeChanged()) {
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
     }
 
