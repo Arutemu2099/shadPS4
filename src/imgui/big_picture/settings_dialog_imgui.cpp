@@ -433,9 +433,17 @@ void SettingsWindow::DrawMainContent(bool* open, const std::function<void()>& ap
         sliderScale2 = userScale;
     }
 
-    ImGui::SliderFloat("UI Scale", &sliderScale2, 0.25f, 3.0f);
+    ImGui::SliderFloat("##UI Scale", &sliderScale2, 0.25f, 3.0f);
     // Only update when user is not interacting with slider
     if (ImGui::IsItemDeactivatedAfterEdit()) {
+        userScale = sliderScale2;
+    }
+    // A box for the exact value, as on the other sliders (user 10-21).
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(120.0f * uiScale);
+    ImGui::InputFloat("UI Scale", &sliderScale2, 0.0f, 0.0f, "%.2f");
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        sliderScale2 = std::clamp(sliderScale2, 0.25f, 3.0f);
         userScale = sliderScale2;
     }
     ImGui::SameLine();
