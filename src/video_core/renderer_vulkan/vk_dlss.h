@@ -202,7 +202,22 @@ inline void NoteTapInfo(ShaderTap& tap, const Shader::Info& info, VAddr base) {
 }
 
 /// The pipeline lookup's Info sites: the weights CB and the two input taps.
+/// SHADPS4_SKIP_PS=<hex hash> (test, 10-21): draws with this pixel shader are skipped, e.g.
+/// 204f45fe = the screen-space reflection ray march (study-delsin-mv-ssr-2026-10-21).
+inline std::atomic<u64> g_skip_ps{0};
+inline u64 SkipPsHash() {
+    static const u64 hash = [] {
+        const char* v = std::getenv("SHADPS4_SKIP_PS");
+        return v ? std::strtoull(v, nullptr, 16) : 0ull;
+    }();
+    return hash;
+}
+
 inline void NoteShaderInfo(const Shader::Info& info, VAddr base) {
+    if (info.stage == Shader::Stage::Fragment && SkipPsHash() != 0 &&
+        info.pgm_hash == SkipPsHash()) [[unlikely]] {
+        g_skip_ps.store(base, std::memory_order_relaxed);
+    }
     if (info.stage != Shader::Stage::Fragment || !Enabled()) [[likely]] {
         return;
     }

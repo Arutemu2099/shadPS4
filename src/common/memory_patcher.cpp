@@ -916,9 +916,11 @@ float Halton(u32 index, u32 base) {
 /// Game:Main, inside sceGnmSubmitDone (the render jobs of this frame joined; the next frame's
 /// jitter function and SMAA setup both run before the next call - study sec. 3).
 void JitterFrame() {
+    // Off by default (user 10-21: only Delsin wobbles with it - his motion vectors likely keep
+    // a 2-frame-old jitter, study-delsin-mv-ssr-2026-10-21); SHADPS4_DLSS_HALTON=1 on.
     static const bool enabled = [] {
         const char* v = std::getenv("SHADPS4_DLSS_HALTON");
-        return !(v && v[0] == '0');
+        return v && v[0] == '1';
     }();
     const bool want = enabled && !EmulatorSettings.IsNeo() && Vulkan::Dlss::Enabled() &&
                       Vulkan::Dlss::g_ready.load(std::memory_order_relaxed) &&

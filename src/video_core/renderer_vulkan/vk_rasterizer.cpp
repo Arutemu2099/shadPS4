@@ -1600,6 +1600,11 @@ Rasterizer::DrawClass Rasterizer::ClassifyDraw(const AmdGpu::Regs& regs) {
     if (Dlss::IsResolve(regs.ps_program.Address<VAddr>())) [[unlikely]] {
         return DrawClass::DlssResolve;
     }
+    // SHADPS4_SKIP_PS (test): that pixel shader's draws are dropped (as primitive type None).
+    if (const u64 skip = Dlss::g_skip_ps.load(std::memory_order_relaxed);
+        skip != 0 && skip == regs.ps_program.Address<VAddr>()) [[unlikely]] {
+        return DrawClass::PrimitiveNone;
+    }
 
     return DrawClass::Draw;
 }
