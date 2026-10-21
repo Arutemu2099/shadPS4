@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
-#include <chrono>
 #include <cstdlib>
 #include <mutex>
 #include <string>
@@ -14,7 +13,6 @@
 #include "common/logging/log.h"
 #include "common/thread.h"
 #include "common/update_notice.h"
-#include "core/devtools/layer.h"
 
 namespace Common {
 
@@ -117,12 +115,8 @@ void StartUpdateNotice() {
                 fmt::format("You have {}. Download: github.com/axylpup/shadPS4/releases",
                             ShortName(mine)),
                 true);
-        // After the boot screens; a notice is drawn only once the overlay exists.
-        std::this_thread::sleep_for(std::chrono::seconds(45));
-        Overlay::ShowNotice(fmt::format("Update available: v{} - github.com/axylpup/shadPS4/releases",
-                                        ShortName(latest))
-                                .c_str(),
-                            10.0);
+        // The 45 s in-game notice is gone (user 10-21: it would interrupt the game); the boot
+        // screen's line is the notice.
     }).detach();
 }
 

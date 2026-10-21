@@ -11,8 +11,8 @@ namespace Common {
 inline constexpr const char* ReleaseTag = "second-son-v1.1";
 
 /// 1.1 (LATER-PLAN 17): one background request to GitHub's latest release of axylpup/shadPS4 at
-/// every start; if it is newer than ReleaseTag, a 10 s notice after the boot screens. Nothing is
-/// downloaded. SHADPS4_UPDATE_CHECK=0 turns it off.
+/// every start, shown on the boot screen (GetUpdateLine). Nothing is downloaded.
+/// SHADPS4_UPDATE_CHECK=0 turns it off.
 void StartUpdateNotice();
 
 /// 1.1 (user 10-21): the boot screen's version line ("Latest version: 1.2 - New update out!"),
