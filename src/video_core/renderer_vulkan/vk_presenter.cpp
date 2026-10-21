@@ -1129,14 +1129,20 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     return frame;
 }
 
-void Presenter::Present(Frame* frame, bool is_reusing_frame) {
+void Presenter::ReleaseFrame(Frame* frame) {
+    std::scoped_lock fl{free_mutex};
+    free_queue.push(frame);
+    free_cv.notify_one();
+}
+
+void Presenter::Present(Frame* frame, bool is_reusing_frame, bool hold_frame) {
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {
             last_submit_frame = frame;
-            std::scoped_lock fl{free_mutex};
-            free_queue.push(frame);
-            free_cv.notify_one();
+            if (!hold_frame) {
+                ReleaseFrame(frame);
+            }
         }
     };
 

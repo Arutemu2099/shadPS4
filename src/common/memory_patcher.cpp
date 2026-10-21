@@ -24,6 +24,7 @@
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "core/emulator_settings.h"
+#include "core/memory.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
 #include "core/emulator_state.h"
 #include "core/file_format/psf.h"
@@ -991,6 +992,11 @@ void HaltonProbe(RenderSize now) {
              "k-2 ({:+.4e},{:+.4e}) (the next frame draws step k)",
              done, g_jitter_k, phases, a0, b0, a1, b1, a2, b2);
     const auto scan = [&](VAddr base, u64 size, const char* what) {
+        auto* const memory = Core::Memory::Instance();
+        if (!memory || !memory->IsMappedRange(base, size)) {
+            LOG_INFO(Loader, "HaltonProbe   {} ({:#x}, {:#x} bytes): not mapped", what, base, size);
+            return;
+        }
         for (u64 off = 0; off + 64 <= size; off += 16) {
             float m[16];
             std::memcpy(m, reinterpret_cast<const void*>(base + off), sizeof(m));
@@ -1049,7 +1055,9 @@ void RebaseHistoryJitter(RenderSize now, float jx, float jy) {
         return;
     }
     const VAddr cam = *reinterpret_cast<const u64*>(g_eboot_address + 0x7f2d2b8);
-    if (cam == 0) {
+    // A stale or not-yet-set camera pointer (loads, menus) must not fault Game:Main.
+    auto* const memory = Core::Memory::Instance();
+    if (cam == 0 || !memory || !memory->IsMappedRange(cam + 0x380, 0x80)) {
         return;
     }
     // The jitter terms of a VP read back from the matrix (V's rotation is orthonormal).

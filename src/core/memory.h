@@ -7,6 +7,7 @@
 #include <atomic>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include "common/enum.h"
@@ -200,6 +201,27 @@ public:
         // The PS4's GPU can only handle 40 bit addresses.
         const VAddr max_gpu_address{0x10000000000};
         return virtual_addr + size < max_gpu_address;
+    }
+
+    /// Every byte of [virtual_addr, +size) lies in mapped VMAs (not free / reserved), under the
+    /// shared lock - for host code that reads guest objects by pointer (memory_patcher's Halton
+    /// rebase reads the game's camera through a global pointer every frame).
+    bool IsMappedRange(VAddr virtual_addr, u64 size) {
+        std::shared_lock lk{mutex};
+        if (vma_map.empty() || virtual_addr < vma_map.begin()->first) {
+            return false;
+        }
+        auto it = FindVMA(virtual_addr);
+        VAddr addr = virtual_addr;
+        const VAddr end = virtual_addr + size;
+        while (addr < end) {
+            if (it == vma_map.end() || !it->second.IsMapped() || addr < it->second.base) {
+                return false;
+            }
+            addr = it->second.base + it->second.size;
+            ++it;
+        }
+        return true;
     }
 
     bool IsValidMapping(const VAddr virtual_addr, const u64 size = 0) {

@@ -258,12 +258,13 @@ vk::ShaderModule Compile(std::string_view code, vk::ShaderStageFlagBits stage, v
     return CompileSPV(out_code, device);
 }
 
-/// SHADPS4_SSR_DITHER: 0 = the game's march, 1 (default) = a fixed per-pixel start offset,
-/// 2 = the offset also moves every frame (the march's own history blend averages it).
+/// SHADPS4_SSR_DITHER: 0 = the game's march, 1 = a fixed per-pixel start offset, 2 (default,
+/// user 10-21) = the offset also moves every frame (the march's own history blend and DLSS
+/// average it; a fixed pattern stays glued to the screen while the street moves).
 int SsrDitherMode() {
     static const int mode = [] {
         const char* value = std::getenv("SHADPS4_SSR_DITHER");
-        return !value ? 1 : value[0] == '0' ? 0 : value[0] == '2' ? 2 : 1;
+        return !value ? 2 : value[0] == '0' ? 0 : value[0] == '1' ? 1 : 2;
     }();
     return mode;
 }

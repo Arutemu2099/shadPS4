@@ -102,7 +102,10 @@ public:
 
     Frame* PrepareBlankFrame(bool present_thread);
 
-    void Present(Frame* frame, bool is_reusing_frame = false);
+    /// hold_frame: the frame is not handed back for reuse (the caller presents it again first,
+    /// half-refresh V-Sync) - ReleaseFrame hands it back.
+    void Present(Frame* frame, bool is_reusing_frame = false, bool hold_frame = false);
+    void ReleaseFrame(Frame* frame);
     Frame* PrepareLastFrame();
 
     /// SHADPS4_BOOT_SCREEN: one overlay-only frame during WarmUp (inside this constructor, main
