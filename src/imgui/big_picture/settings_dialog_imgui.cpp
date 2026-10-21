@@ -1,6 +1,7 @@
 //  SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 //  SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <map>
 #include <ranges>
 #include <ImGuiFileDialog.h>
@@ -807,8 +808,19 @@ void SettingsWindow::AddSettingSliderInt(std::string name, int& value, int min, 
     ImGui::TableNextColumn();
     ImGui::TextWrapped("%s", name.c_str());
 
+    // A slider and a box to type the exact number (user 10-21: the window size slider cannot
+    // reach 1280 x 720 exactly).
     ImGui::TableNextColumn();
+    const float box = 140.0f * uiScale;
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - box -
+                            ImGui::GetStyle().ItemSpacing.x);
     ImGui::SliderInt(label.c_str(), &value, min, max);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(box);
+    int typed = value;
+    if (ImGui::InputInt((label + "_box").c_str(), &typed, 0, 0)) {
+        value = std::clamp(typed, min, max);
+    }
 }
 
 void SettingsWindow::AddSettingSliderFloat(std::string name, float& value, int min, int max,
@@ -821,7 +833,17 @@ void SettingsWindow::AddSettingSliderFloat(std::string name, float& value, int m
     ImGui::TextWrapped("%s", name.c_str());
 
     ImGui::TableNextColumn();
+    const float box = 140.0f * uiScale;
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - box -
+                            ImGui::GetStyle().ItemSpacing.x);
     ImGui::SliderFloat(label.c_str(), &value, min, max, precisionString.c_str());
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(box);
+    float typed = value;
+    if (ImGui::InputFloat((label + "_box").c_str(), &typed, 0.0f, 0.0f,
+                          precisionString.c_str())) {
+        value = std::clamp(typed, float(min), float(max));
+    }
 }
 
 void SettingsWindow::AddSettingCombo(std::string name, int& value,

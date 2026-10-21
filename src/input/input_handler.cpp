@@ -935,21 +935,29 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
         case HOTKEY_REMOVE_VIRTUAL_USER:
             PushSDLEvent(SDL_EVENT_REMOVE_VIRTUAL_USER);
             break;
+        // Press only (user 10-21: these ran on the release too - F3 opened the settings menu on
+        // the press and closed it on the release, so it had to be held; volume moved twice).
         case HOTKEY_VOLUME_UP:
-            EmulatorSettings.SetVolumeSlider(
-                std::clamp(EmulatorSettings.GetVolumeSlider() + 10, 0, 500));
-            Overlay::ShowVolume();
+            if (new_button_state) {
+                EmulatorSettings.SetVolumeSlider(
+                    std::clamp(EmulatorSettings.GetVolumeSlider() + 10, 0, 500));
+                Overlay::ShowVolume();
+            }
             break;
         case HOTKEY_VOLUME_DOWN:
-            EmulatorSettings.SetVolumeSlider(
-                std::clamp(EmulatorSettings.GetVolumeSlider() - 10, 0, 500));
-            Overlay::ShowVolume();
+            if (new_button_state) {
+                EmulatorSettings.SetVolumeSlider(
+                    std::clamp(EmulatorSettings.GetVolumeSlider() - 10, 0, 500));
+                Overlay::ShowVolume();
+            }
             break;
         case HOTKEY_QUIT:
             PushSDLEvent(SDL_EVENT_QUIT_DIALOG);
             break;
         case HOTKEY_OPEN_EMULATOR_SETTINGS:
-            ImGuiEmuSettings::ToggleInGameSettingsDialog();
+            if (new_button_state) {
+                ImGuiEmuSettings::ToggleInGameSettingsDialog();
+            }
             break;
         case HOTKEY_TOGGLE_FRIENDS:
             PushSDLEvent(SDL_EVENT_TOGGLE_FRIENDS);

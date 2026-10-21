@@ -122,6 +122,12 @@ static vk::Rect2D FitImage(s32 frame_width, s32 frame_height, s32 swapchain_widt
     u32 dst_width = swapchain_width;
     u32 dst_height = swapchain_height;
 
+    // Within 1% of the window's shape: fill it (user 10-21: render sizes are multiples of 8, so
+    // at some screen percentages the picture was a few pixels off the window's shape and thin
+    // black bars appeared, changing with the percentage; a 1% stretch is not visible).
+    if (std::abs(frame_aspect / swapchain_aspect - 1.0f) < 0.01f) {
+        return vk::Rect2D{{0, 0}, {dst_width, dst_height}};
+    }
     if (frame_aspect > swapchain_aspect) {
         dst_height = static_cast<s32>(swapchain_width / frame_aspect);
     } else {

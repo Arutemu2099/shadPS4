@@ -1467,6 +1467,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
         // UpdateImage above acquires/releases the mutex itself; do not cover it here.
         CacheLock lock{*this};
         ImageId stencil_id{};
+        ImageId any_stencil_id{};
         ForEachImageInRegion(desc.info.stencil_addr, desc.info.stencil_size,
                              [&](ImageId image_id, Image& image) {
                                  if (image.info.guest_address != desc.info.stencil_addr) {
@@ -1474,11 +1475,22 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
                                  }
                                  // STENCIL_PLANE_MERGE: several planes can share the address
                                  // (Pro 1600x1800 and 3200x1800); keep the one matching the depth.
-                                 if (!stencil_id || !StencilPlaneMerge() ||
-                                     image.info.size == desc.info.size) {
-                                     stencil_id = image_id;
+                                 // A live render-size change leaves a plane of the old size at
+                                 // the address too (user RenderDoc 10-21: the last one won, an
+                                 // all-zero 1280x720 copy for a 2560x1440 depth - Delsin lost
+                                 // his shading): with live changes only a same-size plane.
+                                 if (image.info.size == desc.info.size) {
+                                     if (!stencil_id || !StencilPlaneMerge() ||
+                                         slot_images[stencil_id].info.size != desc.info.size) {
+                                         stencil_id = image_id;
+                                     }
+                                 } else if (!any_stencil_id) {
+                                     any_stencil_id = image_id;
                                  }
                              });
+        if (!stencil_id && !MemoryPatcher::LiveResizeAvailable()) {
+            stencil_id = any_stencil_id; // the old pick: any plane at the address
+        }
         if (!stencil_id) {
             ImageInfo info{};
             info.guest_address = desc.info.stencil_addr;
