@@ -7321,9 +7321,22 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
         } else if (tiers) {
             size = 0xB0000000ull; // 2.75 GB
         }
-        const u64 max_alloc = instance.MaxMemoryAllocationSize();
+        u64 max_alloc = instance.MaxMemoryAllocationSize();
+        // SHADPS4_SIM_MAX_ALLOC_MB (test): a smaller reported limit, e.g. 2048 like the RX 6600.
+        if (const char* m = std::getenv("SHADPS4_SIM_MAX_ALLOC_MB")) {
+            max_alloc = std::min<u64>(max_alloc, std::strtoull(m, nullptr, 10) << 20);
+        }
         if (size > max_alloc) {
-            size = tiers && max_alloc >= 0xB0000000ull ? 0xB0000000ull : 0;
+            // 1.1 (GitHub #15, RX 6600 8 GB, reported max allocation 2048 MiB): turning BIG_GROW
+            // off below 2.75 GB did not avoid a big allocation - the old growth path made the
+            // mesh buffer 2471 MB on that card anyway, then a 2473 MB copy beside it at the next
+            // growth (6212 / 6336 MB -> out of video memory). The mesh memory needs one ~2.5 GB
+            // buffer on either path, so a reported limit below 2.75 GB keeps the card's tier, at
+            // most 3 GB (the city save's mesh memory reached 2790 MB in s1558: 2.75 GB is too
+            // tight). A limit of 2.75 GB or more is respected as before.
+            size = !tiers                        ? 0
+                   : max_alloc >= 0xB0000000ull ? 0xB0000000ull
+                                                 : std::min<u64>(size, 0xC0000000ull);
         }
         LOG_INFO(Render_Vulkan,
                  "BIG_GROW: largest device-local heap {} MiB{} (3.75 GB needs >= {} MiB and >= 24 GB "
