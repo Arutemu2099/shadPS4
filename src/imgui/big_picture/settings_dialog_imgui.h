@@ -72,6 +72,7 @@ private:
 
     std::variant<SDL_Texture*, ImGui::RefCountedTexture> profilesTexture;
     std::variant<SDL_Texture*, ImGui::RefCountedTexture> generalTexture;
+    std::variant<SDL_Texture*, ImGui::RefCountedTexture> quickTexture; ///< 1.1: sliders (drawn for this build)
     std::variant<SDL_Texture*, ImGui::RefCountedTexture> experimentalTexture;
     std::variant<SDL_Texture*, ImGui::RefCountedTexture> graphicsTexture;
     std::variant<SDL_Texture*, ImGui::RefCountedTexture> inputTexture;

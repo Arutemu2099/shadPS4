@@ -214,6 +214,7 @@ SettingsWindow::SettingsWindow(bool gameRunning) : isGameRunning(gameRunning) {
     };
 
     loadTexture("src/resources/big_picture/settings.png", generalTexture);
+    loadTexture("src/resources/big_picture/quick.png", quickTexture);
     loadTexture("src/resources/big_picture/experimental.png", experimentalTexture);
     loadTexture("src/resources/big_picture/graphics.png", graphicsTexture);
     loadTexture("src/resources/big_picture/controller.png", inputTexture);
@@ -349,7 +350,7 @@ void SettingsWindow::DrawCategoryTabs() {
         AddCategory("Profiles", profilesTexture, SettingsCategory::Profiles);
     }
 
-    AddCategory("Quick", generalTexture, SettingsCategory::Quick);
+    AddCategory("Quick", quickTexture, SettingsCategory::Quick);
     AddCategory("General", generalTexture, SettingsCategory::General);
     AddCategory("Graphics", graphicsTexture, SettingsCategory::Graphics);
     AddCategory("Input", inputTexture, SettingsCategory::Input);

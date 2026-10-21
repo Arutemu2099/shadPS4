@@ -1442,6 +1442,7 @@ cmrc_add_resource_library(embedded-resources
         src/resources/big_picture/graphics.png
         src/resources/big_picture/log.png
         src/resources/big_picture/profiles.png
+        src/resources/big_picture/quick.png
         src/resources/big_picture/settings.png
         src/resources/big_picture/trophy.png
         src/resources/bronze.png
