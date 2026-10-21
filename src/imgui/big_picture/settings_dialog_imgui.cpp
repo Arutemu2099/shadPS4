@@ -697,8 +697,8 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             ImGui::SetItemTooltip(
                 "Mailbox: no tearing, no frame cap (default).\n"
                 "Fifo: V-Sync, at most one new picture per screen refresh.\n"
-                "Fifo (half refresh): every picture stays two screen refreshes - even motion on "
-                "screens without G-Sync / FreeSync.\n"
+                "Fifo (half refresh): every picture stays two screen refreshes,\n"
+                "    for even motion on screens without G-Sync / FreeSync.\n"
                 "Immediate: no V-Sync (can tear without G-Sync / FreeSync).");
             if (currentProfile != "Global") {
                 AddSettingSliderInt("Frame-rate cap (Vblank Frequency)", vblankFrequencySetting, 30,
