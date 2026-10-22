@@ -9,7 +9,7 @@ layout (location = 0) out vec4 color;
 layout (binding = 0) uniform sampler2D texSampler;
 
 // hdr: 0 = SDR frame on an SDR screen, 1 = HDR screen (passed through), 2 = the game's HDR10 (PQ)
-// frame on an SDR screen (1.1.1, GitHub #13: decoded to SDR - the screenshot path's math).
+// frame on an SDR screen (1.1.1, GitHub #13: PQ decoded, mapped to the game's own SDR look).
 layout (push_constant) uniform settings {
     float gamma;
     uint hdr;
@@ -40,9 +40,12 @@ vec3 pq_to_sdr_linear(vec3 e) {
     vec3 n709 = vec3(dot(vec3(1.6605, -0.5876, -0.0728), n2020),
                      dot(vec3(-0.1246, 1.1329, -0.0083), n2020),
                      dot(vec3(-0.0182, -0.1006, 1.1187), n2020));
-    // 100 nits = SDR white, highlights rolled off (2x / (1 + x)).
-    vec3 x = max(n709, vec3(0.0)) / 100.0;
-    return clamp(2.0 * x / (1.0 + x), 0.0, 1.0);
+    // Fitted to the game's own SDR picture of the same frame (s1570 SDR vs s1572 HDR10, city,
+    // 34 k pixels, SDR 0.02-0.5): SDR ~ 0.0323 * nits^0.63 (2 nits -> 0.05, 9.4 -> 0.13, 35 ->
+    // 0.30; white ~233 nits), with a soft shoulder above 0.8 instead of a hard clip.
+    vec3 y = 0.0323 * pow(max(n709, vec3(0.0)), vec3(0.63));
+    vec3 over = max(y - 0.8, vec3(0.0));
+    return min(y, vec3(0.8)) + 0.2 * (1.0 - exp(-over / 0.2));
 }
 
 void main() {

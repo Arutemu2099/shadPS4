@@ -964,11 +964,12 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // the game's HUD layer over it replaces the display buffer as the post pass's input. The
     // layer's image is found and moved here (stream order: after this frame's HUD draws, before
     // the next frame's resolve clears it).
-    // 1.1.1 (GitHub #13): the game's own HDR10 output (PQ display buffers, the game's HDR option).
-    // Such a frame shows the game's own display buffer: the DLSS composite below builds its picture
-    // from DLSS's scene image and the HUD layer, not from the game's PQ encode, and on an SDR screen
-    // the post pass decodes PQ to SDR (mode 2). SHADPS4_PQ_DLSS_COMPOSITE=1 (test) keeps the
-    // composite for PQ frames too (the v1.1 behaviour).
+    // 1.1.1 (GitHub #13): the game's own HDR10 output (PQ display buffers; the game turns it on by
+    // itself when an HDR TV is reported, s1571). On an SDR screen the post pass decodes PQ (mode 2).
+    // The DLSS composite below is kept off for PQ frames: it builds its picture from DLSS's scene
+    // image, not from the game's PQ encode. Measured s1578: in the game's HDR mode the DLSS taps
+    // never fire (0 resolves), so DLSS is off there anyway - this only guards a future hook.
+    // SHADPS4_PQ_DLSS_COMPOSITE=1 (test) keeps the composite for PQ frames too (v1.1).
     const bool game_pq =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq;
     static const bool pq_composite = [] {
