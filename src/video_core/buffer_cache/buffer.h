@@ -104,6 +104,12 @@ struct UniqueBuffer {
     vk::DeviceAddress bda_addr = 0;
 };
 
+/// 1.1.1 (GitHub #5): allocates what a Buffer of `size` bytes with `flags` would (same create info
+/// and memory request, the over-budget retry included) and frees it again at once. true = it fit;
+/// `heap` = the memory heap it landed in. A refusal logs nothing: the caller steps down.
+bool ProbeBufferAllocation(const Vulkan::Instance& instance, MemoryUsage usage,
+                           vk::BufferUsageFlags flags, u64 size, u32& heap);
+
 class Buffer {
 public:
     explicit Buffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,

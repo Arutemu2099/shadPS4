@@ -5,6 +5,7 @@
 
 #ifdef _WIN32
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -249,6 +250,24 @@ void HideOwnConsole() {
     }
 }
 
+void ShowOutOfMemoryNotice(unsigned long long bytes) {
+    static std::atomic<bool> shown{false};
+    if (shown.exchange(true)) {
+        return;
+    }
+    wchar_t text[1024];
+    swprintf_s(text,
+               L"Windows could not give the game %llu MB of memory for the graphics card, so the "
+               L"game has to close.\n\nWhat usually helps:\n"
+               L"- close other programs (browser, Discord, overlays)\n"
+               L"- turn the page file on: Advanced system settings > Performance Settings > "
+               L"Advanced > Virtual memory > \"Automatically manage paging file size\"\n"
+               L"- keep at least 20 GB free on C:\n\n"
+               L"user\\log\\shad_log.txt has the details - please attach it to a bug report.",
+               bytes >> 20);
+    MessageBoxW(nullptr, text, L"shadPS4: out of memory", MB_OK | MB_ICONERROR | MB_TOPMOST);
+}
+
 std::optional<std::filesystem::path> GamePath() {
     const std::filesystem::path saved = std::filesystem::path{g_flags_file.dir} / GameFileName;
     if (auto p = ReadSavedGame(saved)) {
@@ -305,6 +324,7 @@ void HideOwnConsole() {}
 std::optional<std::filesystem::path> GamePath() {
     return std::nullopt;
 }
+void ShowOutOfMemoryNotice(unsigned long long) {}
 } // namespace Common::ReleaseMode
 
 #endif

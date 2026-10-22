@@ -6,6 +6,7 @@
 #pragma once
 
 #include <chrono>
+#include <string>
 #include "common/types.h"
 
 namespace Common {
@@ -66,6 +67,10 @@ void ProcessMemory(u64& private_bytes, u64& working_set);
 
 /// Installed physical memory in bytes (0 where unknown). SHADPS4_SIM_RAM_MB stands in for it.
 u64 PhysicalRamBytes();
+
+/// 1.1.1 (GitHub #5): Windows' memory state for an out-of-memory line - free RAM, free commit (RAM +
+/// page file) of the commit limit, this process's private bytes. Empty where unknown.
+std::string DescribeSystemMemory();
 
 /// SHADPS4_MEM_CENSUS: committed bytes by kind and place (VirtualQuery walk): private / mapped,
 /// inside the guest range 0x200000000 - 0x1000000000 or outside it (emulator, driver, heaps).

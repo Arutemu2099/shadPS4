@@ -7360,7 +7360,45 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
         const u64 cur = end - begin;
         // r15d: straight to the cap (3.75 GB) at the first big join - normally the load - so the
         // region never grows again in the scene (r15b: an in-scene growth's coherent upload stalled ~1 s).
-        const u64 want = big_grow_bytes;
+        // 1.1.1 (GitHub #5: an RTX 5050 8 GB on 16 GB of RAM - the 3 GB buffer fitted neither in
+        // video nor in system memory at the first big join, on 1.0.2 and 1.1, and the assert closed
+        // the game): the first big join tries the tier first (allocated and freed again), then the
+        // smaller tiers down to 2.75 GB, then no extension (the old growth path). The pick holds
+        // for the session. SHADPS4_BIG_GROW_PROBE_FAIL_ABOVE_MB (test): a try above it asks for
+        // 64 GB instead, which the driver really refuses.
+        static const u64 want = [this]() -> u64 {
+            u64 fail_above = ~0ull;
+            if (const char* f = std::getenv("SHADPS4_BIG_GROW_PROBE_FAIL_ABOVE_MB")) {
+                fail_above = std::strtoull(f, nullptr, 10) << 20;
+            }
+            const VmaAllocator allocator = instance.GetAllocator();
+            const vk::BufferUsageFlags flags = AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress;
+            // The tier, then the smaller tiers (3 GB, 2.75 GB) as steps down.
+            boost::container::small_vector<u64, 3> sizes{big_grow_bytes};
+            for (const u64 step : {u64{0xC0000000ull}, u64{0xB0000000ull}}) {
+                if (step < big_grow_bytes) {
+                    sizes.push_back(step);
+                }
+            }
+            for (const u64 size : sizes) {
+                const u64 ask = size > fail_above ? (64ull << 30) : size;
+                u32 heap = 0;
+                if (ProbeBufferAllocation(instance, MemoryUsage::DeviceLocal, flags, ask, heap)) {
+                    LOG_INFO(Render_Vulkan, "BIG_GROW: the {} MB mesh buffer fits (heap {}){}",
+                             size >> 20, heap, size < big_grow_bytes ? " - stepped down" : "");
+                    return size;
+                }
+                LOG_WARNING(Render_Vulkan, "BIG_GROW: a {} MB mesh buffer does not fit{}; {}; {}; {}",
+                            ask >> 20,
+                            ask != size ? " (test: SHADPS4_BIG_GROW_PROBE_FAIL_ABOVE_MB)" : "",
+                            Vulkan::DescribeDeviceLocalBudgets(allocator),
+                            Vulkan::DescribeDriverBudgets(allocator),
+                            Common::DescribeSystemMemory());
+            }
+            LOG_WARNING(Render_Vulkan, "BIG_GROW: no mesh buffer size fits - the old growth path "
+                                       "(the mesh memory regrows as blocks stream in)");
+            return 0;
+        }();
         const u64 mapped = memory->TryClampRangeSize(begin, want);
         VAddr grow_end = Common::AlignDown(begin + mapped, CACHING_PAGESIZE);
         if (mapped > cur && grow_end > end) {

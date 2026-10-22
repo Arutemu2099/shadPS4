@@ -9,7 +9,9 @@
 #include <string>
 #include <fmt/format.h>
 #include "common/logging/log.h"
+#include "common/thread.h"
 #include "common/types.h"
+#include "video_core/renderer_vulkan/vk_common.h"
 
 #include <vk_mem_alloc.h>
 
@@ -49,6 +51,30 @@ inline std::string DescribeDeviceLocalBudgets(VmaAllocator allocator) {
     return out;
 }
 
+/// 1.1.1 (GitHub #5): VK_EXT_memory_budget is on (Instance sets it), so the driver's own numbers
+/// can be read - VMA's above are its 80%-of-heap estimate against its own blocks only.
+inline std::atomic<bool> g_driver_budget{false};
+
+/// The driver's view of every heap: "driver: heap i used / budget MB". Empty without the extension.
+inline std::string DescribeDriverBudgets(VmaAllocator allocator) {
+    if (!g_driver_budget.load(std::memory_order_relaxed)) {
+        return {};
+    }
+    VmaAllocatorInfo info{};
+    vmaGetAllocatorInfo(allocator, &info);
+    vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    vk::PhysicalDeviceMemoryProperties2 props = {
+        .pNext = &budget,
+    };
+    vk::PhysicalDevice{info.physicalDevice}.getMemoryProperties2(&props);
+    std::string out = "driver:";
+    for (u32 i = 0; i < props.memoryProperties.memoryHeapCount; ++i) {
+        out += fmt::format("{} heap {} {} / {} MB", i == 0 ? "" : ",", i,
+                           budget.heapUsage[i] >> 20, budget.heapBudget[i] >> 20);
+    }
+    return out;
+}
+
 /// Runs `alloc(create_info)`; on VK_ERROR_OUT_OF_DEVICE_MEMORY with the budget bit set, retries
 /// once without it. Logs the first retries of each kind and every final failure (with the size,
 /// `detail()` and VMA's budgets, so a player's log says what did not fit).
@@ -72,9 +98,10 @@ VkResult AllocateWithBudgetRetry(VmaAllocator allocator, VmaAllocationCreateInfo
         }
     }
     if (result != VK_SUCCESS) {
-        LOG_CRITICAL(Render_Vulkan, "Allocation failed: {} of {} bytes ({} MB) {}: error {}; {}",
+        LOG_CRITICAL(Render_Vulkan, "Allocation failed: {} of {} bytes ({} MB) {}: error {}; {}; {}; {}",
                      what, bytes, bytes >> 20, detail(), static_cast<int>(result),
-                     DescribeDeviceLocalBudgets(allocator));
+                     DescribeDeviceLocalBudgets(allocator), DescribeDriverBudgets(allocator),
+                     Common::DescribeSystemMemory());
     }
     return result;
 }

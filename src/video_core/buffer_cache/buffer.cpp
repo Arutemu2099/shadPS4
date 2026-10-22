@@ -3,6 +3,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/release_mode.h"
 #include <immintrin.h>
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -108,6 +109,9 @@ void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usa
             return vmaCreateBuffer(allocator, &buffer_ci_unsafe, &ci, &unsafe_buffer, &allocation,
                                    out_alloc_info);
         });
+    if (result != VK_SUCCESS && buffer_ci.size >= (256ull << 20)) {
+        Common::ReleaseMode::ShowOutOfMemoryNotice(buffer_ci.size); // 1.1.1 (GitHub #5)
+    }
     ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer of {} MB ({}) with error {}",
                buffer_ci.size >> 20, BufferTypeName(usage), vk::to_string(vk::Result{result}));
     buffer = vk::Buffer{unsafe_buffer};
@@ -120,6 +124,52 @@ void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usa
         ASSERT_MSG(bda_result != 0, "Failed to get buffer device address");
         bda_addr = bda_result;
     }
+}
+
+bool ProbeBufferAllocation(const Vulkan::Instance& instance, MemoryUsage usage,
+                           vk::BufferUsageFlags flags, u64 size, u32& heap) {
+    // The same create info and memory request as Buffer::Buffer + UniqueBuffer::Create.
+    if (instance.IsNativeBindingsActive() &&
+        (flags & (vk::BufferUsageFlagBits::eUniformBuffer |
+                  vk::BufferUsageFlagBits::eStorageBuffer))) {
+        flags |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    }
+    const std::array<u32, 2> families = {instance.GetGraphicsQueueFamilyIndex(),
+                                         instance.GetReadbackQueueFamilyIndex()};
+    const bool concurrent = instance.BuffersShareReadbackFamily();
+    const VkBufferCreateInfo buffer_ci = static_cast<VkBufferCreateInfo>(vk::BufferCreateInfo{
+        .size = size,
+        .usage = flags,
+        .sharingMode = concurrent ? vk::SharingMode::eConcurrent : vk::SharingMode::eExclusive,
+        .queueFamilyIndexCount = concurrent ? 2u : 0u,
+        .pQueueFamilyIndices = concurrent ? families.data() : nullptr,
+    });
+    const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
+    VmaAllocationCreateInfo alloc_ci = {
+        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT |
+                 (with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0) |
+                 MemoryUsageVmaFlags(usage),
+        .usage = MemoryUsageVma(usage),
+        .requiredFlags = 0,
+        .preferredFlags = MemoryUsagePreferredVmaFlags(usage),
+    };
+    VmaAllocator allocator = instance.GetAllocator();
+    VkBuffer probe{};
+    VmaAllocation allocation{};
+    VmaAllocationInfo info{};
+    VkResult result = vmaCreateBuffer(allocator, &buffer_ci, &alloc_ci, &probe, &allocation, &info);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && Vulkan::AllowOverBudget()) {
+        alloc_ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        result = vmaCreateBuffer(allocator, &buffer_ci, &alloc_ci, &probe, &allocation, &info);
+    }
+    if (result != VK_SUCCESS) {
+        return false;
+    }
+    const VkPhysicalDeviceMemoryProperties* props{};
+    vmaGetMemoryProperties(allocator, &props);
+    heap = props->memoryTypes[info.memoryType].heapIndex;
+    vmaDestroyBuffer(allocator, probe, allocation);
+    return true;
 }
 
 Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,

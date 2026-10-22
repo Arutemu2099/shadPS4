@@ -513,6 +513,21 @@ u64 PhysicalRamBytes() {
     return GlobalMemoryStatusEx(&ms) ? ms.ullTotalPhys : 0;
 }
 
+std::string DescribeSystemMemory() {
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof(ms);
+    if (!GlobalMemoryStatusEx(&ms)) {
+        return {};
+    }
+    u64 private_bytes = 0, working_set = 0;
+    ProcessMemory(private_bytes, working_set);
+    // ullTotalPageFile is the commit limit (RAM + page files), ullAvailPageFile what is left of it.
+    return fmt::format("Windows: RAM free {} of {} MB, commit free {} of limit {} MB, this process "
+                       "{} MB private",
+                       ms.ullAvailPhys >> 20, ms.ullTotalPhys >> 20, ms.ullAvailPageFile >> 20,
+                       ms.ullTotalPageFile >> 20, private_bytes >> 20);
+}
+
 CommitCensus WalkCommitted() {
     CommitCensus c{};
     u64 cur_base = 0, cur_bytes = 0;
@@ -842,6 +857,9 @@ CommitCensus WalkCommitted() {
 u64 PhysicalRamBytes() {
     const char* sim = std::getenv("SHADPS4_SIM_RAM_MB");
     return sim ? std::strtoull(sim, nullptr, 10) << 20 : 0;
+}
+std::string DescribeSystemMemory() {
+    return {};
 }
 void ApplyHotThreadPlacement(HotThread) {}
 void ApplyCriticalThreadPriority(HotThread) {}
