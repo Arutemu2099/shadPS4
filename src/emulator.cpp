@@ -470,6 +470,13 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     // Switch to configured log
     Common::Log::Switch((!id.empty() && EmulatorSettings.IsLogSeparate()) ? id + ".log"
                                                                           : "shad_log.txt");
+    // SHADPS4_ALLOW_HDR=1 / 0 (test switch, 2026-10-22): the HDR screen path (allowHDR) for this run
+    // only, without editing the config - HDR checks from the test harness.
+    if (const char* v = std::getenv("SHADPS4_ALLOW_HDR"); v && (v[0] == '0' || v[0] == '1')) {
+        EmulatorSettings.SetHdrAllowed(v[0] == '1');
+        LOG_INFO(Config, "SHADPS4_ALLOW_HDR={}: the HDR screen path is {} for this run", v[0],
+                 v[0] == '1' ? "allowed" : "off");
+    }
 #ifdef _WIN32
     // Windows static guest red-zone protection
     if (WindowsGuestRedZoneProtection::IsStaticPatchingEnabled()) {

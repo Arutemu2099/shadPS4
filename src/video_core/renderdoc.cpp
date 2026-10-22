@@ -240,6 +240,13 @@ u32 ConsumeGameOnlyScreenshotRequests() {
         }
         return t;
     }();
+    // SHADPS4_AUTO_SHOT_DISPLAY=1 (2026-10-22, HDR checks): each auto shot also takes the displayed
+    // picture (the swapchain image after the post pass - PQ on an HDR screen), consumed later in
+    // the same Present.
+    static const bool display_too = [] {
+        const char* v = std::getenv("SHADPS4_AUTO_SHOT_DISPLAY");
+        return v && v[0] == '1';
+    }();
     if (!times.empty()) {
         static const auto t0 = std::chrono::steady_clock::now();
         static size_t next = 0;
@@ -248,6 +255,9 @@ u32 ConsumeGameOnlyScreenshotRequests() {
         while (next < times.size() && el >= times[next]) {
             ++n;
             ++next;
+            if (display_too) {
+                screenshot_with_overlays_count.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     }
     return n;

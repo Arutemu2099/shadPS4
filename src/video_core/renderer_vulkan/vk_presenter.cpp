@@ -461,6 +461,57 @@ static bool WritePng(const std::filesystem::path& path, const std::span<const u8
     return true;
 }
 
+// 1.2 HDR checks (2026-10-22): an HDR screenshot's own 10-bit values (Rec.2020 PQ code values,
+// scaled to 16 bits, RGB) beside the tone-mapped PNG - for measuring nits and making HDR10 clips.
+// A viewer shows it washed out; it is data, not a picture.
+static bool WritePq16Png(const std::filesystem::path& path, const ScreenshotReadback& readback) {
+    const bool bgr_low = readback.format == vk::Format::eA2R10G10B10UnormPack32; // B in bits 0-9
+    if (!readback.hdr_encoded || (!bgr_low && readback.format != vk::Format::eA2B10G10R10UnormPack32)) {
+        return false;
+    }
+    const u64 pixel_count = u64(readback.width) * readback.height;
+    if (readback.buffer.mapped_data.size() < pixel_count * 4) {
+        return false;
+    }
+    const u8* src = readback.buffer.mapped_data.data();
+    std::vector<u16> rgb(static_cast<size_t>(pixel_count) * 3);
+    const auto widen = [](u32 v) { return static_cast<u16>((v << 6) | (v >> 4)); };
+    for (u64 i = 0; i < pixel_count; ++i) {
+        u32 packed;
+        std::memcpy(&packed, src + i * 4, 4);
+        const u32 lo = packed & 0x3FF, mid = (packed >> 10) & 0x3FF, hi = (packed >> 20) & 0x3FF;
+        rgb[i * 3 + 0] = widen(bgr_low ? hi : lo);
+        rgb[i * 3 + 1] = widen(mid);
+        rgb[i * 3 + 2] = widen(bgr_low ? lo : hi);
+    }
+    std::vector<png_bytep> rows(readback.height); // before setjmp: a longjmp skips destructors
+    for (u32 y = 0; y < readback.height; ++y) {
+        rows[y] = reinterpret_cast<png_bytep>(rgb.data() + size_t(y) * readback.width * 3);
+    }
+    Common::FS::IOFile file(path, Common::FS::FileAccessMode::Create);
+    if (!file.IsOpen()) {
+        return false;
+    }
+    png_structp png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+    if (png_ptr == nullptr) {
+        return false;
+    }
+    png_infop info_ptr = png_create_info_struct(png_ptr);
+    if (info_ptr == nullptr || setjmp(png_jmpbuf(png_ptr)) != 0) {
+        png_destroy_write_struct(&png_ptr, info_ptr ? &info_ptr : nullptr);
+        return false;
+    }
+    png_init_io(png_ptr, file.file);
+    png_set_IHDR(png_ptr, info_ptr, readback.width, readback.height, 16, PNG_COLOR_TYPE_RGB,
+                 PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_write_info(png_ptr, info_ptr);
+    png_set_swap(png_ptr); // 16-bit samples from this little-endian buffer
+    png_write_image(png_ptr, rows.data());
+    png_write_end(png_ptr, info_ptr);
+    png_destroy_write_struct(&png_ptr, &info_ptr);
+    return true;
+}
+
 static void SavePendingScreenshots(const std::vector<ScreenshotReadback>& readbacks) {
     for (const auto& readback : readbacks) {
         if (readback.paths.empty()) {
@@ -479,6 +530,12 @@ static void SavePendingScreenshots(const std::vector<ScreenshotReadback>& readba
         }
 
         LOG_INFO(Render_Vulkan, "Saved screenshot: {}", primary_path.string());
+        if (readback.hdr_encoded) {
+            auto raw = primary_path;
+            raw.replace_filename(primary_path.stem().string() + "-pq2020-16bit.png");
+            LOG_INFO(Render_Vulkan, "Saved the HDR10 values: {} ({})", raw.string(),
+                     WritePq16Png(raw, readback) ? "ok" : "failed");
+        }
 
         std::ifstream file(primary_path, std::ios::binary);
         std::vector<u8> imgdata;
