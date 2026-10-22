@@ -8,7 +8,7 @@
 namespace Common {
 
 /// The fork's release tag this build belongs to; the release checklist bumps it (ROADMAP).
-inline constexpr const char* ReleaseTag = "second-son-v1.1";
+inline constexpr const char* ReleaseTag = "second-son-v1.1.1";
 
 /// 1.1 (LATER-PLAN 17): one background request to GitHub's latest release of axylpup/shadPS4 at
 /// every start, shown on the boot screen (GetUpdateLine). Nothing is downloaded.
