@@ -607,6 +607,38 @@ bool RenderHeightFromFlags() {
     return g_height_from_flags;
 }
 
+// Movies fit inside the screen (1.1.1, a player's DM 2026-10-22: the 21:9 intro was cut off at the
+// top and bottom). The full-screen movie draw FUN_8004575b0 computes f = (ccc4 * 16) / (ccc0 * 9)
+// and samples the movie at v = (1 - f) / 2 .. (1 + f) / 2 on a quad at (-1, -1, 1, 1): on the PS4
+// f = 1; on 21:9 f = 0.762, so the movie filled the width and lost 11.9% at the top and bottom
+// (measured s1597: v 0.119 - 0.874; on 4:3 f = 1.333 would sample outside the movie). Its
+// constants are read by that function only: 16 / 9 become the screen space's width / height (f = 1:
+// the whole movie) and the quad takes the movie's shape inside the screen (bars at the sides on
+// wider screens, above and below on narrower ones; never stretched).
+static void ApplyMovieFit(u32 sw, u32 sh) {
+    const double f = double(sh) * 16.0 / (double(sw) * 9.0);
+    if (std::abs(f - 1.0) < 0.01) {
+        return; // 16:9: the game's own draw
+    }
+    static constexpr float k_orig[2] = {16.0f, 9.0f};
+    static constexpr float rect_orig[4] = {-1.0f, -1.0f, 1.0f, 1.0f};
+    auto* k = reinterpret_cast<float*>(g_eboot_address + 0xaadbe0);
+    auto* rect = reinterpret_cast<float*>(g_eboot_address + 0xaadd60);
+    if (std::memcmp(k, k_orig, sizeof(k_orig)) != 0 ||
+        std::memcmp(rect, rect_orig, sizeof(rect_orig)) != 0) {
+        LOG_ERROR(Loader, "Movie fit: refused, the movie draw's constants differ (eboot 01.07)");
+        return;
+    }
+    const float x = f < 1.0 ? float(f) : 1.0f;
+    const float y = f < 1.0 ? 1.0f : float(1.0 / f);
+    const float k_new[2] = {float(sw), float(sh)};
+    const float rect_new[4] = {-x, -y, x, y};
+    std::memcpy(k, k_new, sizeof(k_new));
+    std::memcpy(rect, rect_new, sizeof(rect_new));
+    LOG_INFO(Loader, "Movie fit: movies drawn {:.0f}% wide x {:.0f}% high, centred (screen space "
+             "{}x{})", x * 100.0f, y * 100.0f, sw, sh);
+}
+
 // SHADPS4_ASPECT (1.1, user 2026-10-20; EXPERIMENTS "v1.1 C"): the game fills the screen's shape.
 // The renderer's size setup FUN_8001eff00 stores the render size (+0xc / +0x10), the output size
 // ([0] / [4]) and the 2D screen space (globals 0x801d0ccc0 / ccc4: HUD layout, and the camera's
@@ -765,6 +797,7 @@ static void ApplyAspectRatio() {
         const s32 disp = s32(0x581c84 - (0x581d10 + 8)); // rip-relative from the next instruction
         std::memcpy(reinterpret_cast<void*>(g_eboot_address + 0x581d10 + 4), &disp, 4);
     }
+    ApplyMovieFit(sw, sh);
     LOG_INFO(Loader, "SHADPS4_ASPECT: the game renders {}x{} (aspect {:.3f}, screen {}x{}, "
              "monitor {}x{}, {}, render height {}{}, HUD space {}x{}{}{})", w, h, aspect,
              g_screen_w, g_screen_h, g_display_w, g_display_h, mode, h0,
