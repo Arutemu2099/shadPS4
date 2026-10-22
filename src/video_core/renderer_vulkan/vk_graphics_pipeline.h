@@ -109,7 +109,8 @@ public:
                      std::shared_ptr<const Shader::Gcn::FetchShaderData> fetch_shader,
                      std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
                      bool preloading, const DescSetBindings* derived = nullptr,
-                     u32 native_records_binding = NoNativeRecords, bool native_bindless = false);
+                     u32 native_records_binding = NoNativeRecords, bool native_bindless = false,
+                     bool refusable = false);
     ~GraphicsPipeline();
 
     static constexpr u32 NoNativeRecords = ~0u;
@@ -122,7 +123,8 @@ public:
         std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
         const Shader::Gcn::FetchShaderData* fetch_shader, SerializationSupport& sdata);
 
-    /// False only for a preloaded pipeline the driver refused (the constructor logged it).
+    /// False only for a preloaded or `refusable` pipeline the driver refused (the constructor
+    /// logged it).
     bool IsCreated() const noexcept {
         return static_cast<bool>(pipeline);
     }

@@ -39,7 +39,8 @@ GraphicsPipeline::GraphicsPipeline(
     std::shared_ptr<const Shader::Gcn::FetchShaderData> fetch_shader_,
     std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading,
     const DescSetBindings* derived /*= nullptr*/,
-    u32 native_records_binding_ /*= NoNativeRecords*/, bool native_bindless_ /*= false*/)
+    u32 native_records_binding_ /*= NoNativeRecords*/, bool native_bindless_ /*= false*/,
+    bool refusable /*= false*/)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_},
       fetch_shader{std::move(fetch_shader_)} {
     native_records_binding = native_records_binding_;
@@ -469,6 +470,14 @@ GraphicsPipeline::GraphicsPipeline(
         LOG_WARNING(Render_Vulkan,
                     "Cached graphics pipeline {} refused by the driver ({}): left to compile at "
                     "play time",
+                    debug_str, vk::to_string(pipeline_result));
+        return;
+    }
+    if (pipeline_result != vk::Result::eSuccess && refusable) {
+        // 1.1.1 (GitHub #25 RX 6800 XT, #31 RX 570): AMD drivers refused some NativeColour
+        // variants with ErrorUnknown and this assert ended the game. A variant is optional - the
+        // caller keeps the normal pipeline for that draw.
+        LOG_WARNING(Render_Vulkan, "Graphics pipeline variant {} refused by the driver ({})",
                     debug_str, vk::to_string(pipeline_result));
         return;
     }
