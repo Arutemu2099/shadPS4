@@ -45,6 +45,38 @@ bool patches_applied = false;
 std::vector<patchInfo> pending_patches;
 static bool g_particle_late_read_applied = false; // V1 written (ApplyParticleLightOneSubmit needs it)
 
+// GitHub #22 (2026-10-22): every built-in patch and game-memory reader in this file uses eboot
+// 01.07 offsets. A US 01.00 eboot (CUSA00223, code hash 0xc8fba35195996bbd) loads its code at
+// +0x400000, so +0x3ee160 was not mapped and the first byte compare crashed at boot. g_eboot_107
+// is decided once in OnGameLoaded (the offsets inside loaded segments + anchor bytes); everything
+// below checks it first. Not the code hash: a 01.07 copy with another hash (i24) runs the patches.
+static std::vector<std::pair<uintptr_t, u64>> g_eboot_segments;
+static bool g_eboot_107 = false;
+
+void AddEbootSegment(uintptr_t address, uint64_t size) {
+    g_eboot_segments.emplace_back(address, size);
+}
+
+static bool EbootRangeLoaded(u64 offset, u64 size) {
+    const uintptr_t begin = g_eboot_address + offset;
+    return std::ranges::any_of(g_eboot_segments, [&](const auto& s) {
+        return begin >= s.first && begin + size <= s.first + s.second;
+    });
+}
+
+static bool DetectEboot107() {
+    // The lowest and highest code offsets the patches touch (0x16be04 light list ... 0x581d18
+    // projection) and the highest data offset (0x7f2d2c0, the main camera pointer).
+    if (!EbootRangeLoaded(0x16be04, 0x581d18 - 0x16be04) || !EbootRangeLoaded(0x7f2d2b8, 8)) {
+        return false;
+    }
+    // Anchors: the light list's imul esi, r15d, 0x320000 and the projection's 2.0 load.
+    static constexpr u8 imul[7] = {0x41, 0x69, 0xf7, 0x00, 0x00, 0x32, 0x00};
+    static constexpr u8 two_load[8] = {0xc5, 0xfa, 0x10, 0x1d, 0x98, 0x27, 0x56, 0x00};
+    return std::memcmp(reinterpret_cast<const void*>(g_eboot_address + 0x16be04), imul, 7) == 0 &&
+           std::memcmp(reinterpret_cast<const void*>(g_eboot_address + 0x581d10), two_load, 8) == 0;
+}
+
 std::string toHex(u64 value, size_t byteSize) {
     std::stringstream ss;
     ss << std::hex << std::setfill('0') << std::setw(byteSize * 2) << value;
@@ -920,7 +952,7 @@ void SetJitterPatch(bool on) {
     if (on == g_jitter_patched) {
         return;
     }
-    if (on && (g_eboot_scratch == 0 || !JitterBytesOriginal())) {
+    if (on && (!g_eboot_107 || g_eboot_scratch == 0 || !JitterBytesOriginal())) {
         if (!g_jitter_refused) {
             g_jitter_refused = true;
             LOG_ERROR(Loader, "DLSS jitter: refused (eboot 01.07 bytes differ or no slot)");
@@ -966,7 +998,7 @@ void HaltonProbe(RenderSize now) {
         const char* v = std::getenv("SHADPS4_HALTON_PROBE");
         return v && v[0] == '1';
     }();
-    if (!on || now.width == 0 || now.height == 0) {
+    if (!on || !g_eboot_107 || now.width == 0 || now.height == 0) {
         return;
     }
     static const s64 start = NowMs();
@@ -1051,7 +1083,7 @@ void RebaseHistoryJitter(RenderSize now, float jx, float jy) {
         const char* v = std::getenv("SHADPS4_HALTON_REBASE");
         return !(v && v[0] == '0');
     }();
-    if (!on || now.width == 0 || now.height == 0) {
+    if (!on || !g_eboot_107 || now.width == 0 || now.height == 0) {
         return;
     }
     const VAddr cam = *reinterpret_cast<const u64*>(g_eboot_address + 0x7f2d2b8);
@@ -1355,7 +1387,7 @@ static void ApplyPerfMode() {
 }
 
 int GameQualityLevel() {
-    if (g_eboot_address == 0) {
+    if (g_eboot_address == 0 || !g_eboot_107) {
         return -1;
     }
     s32 level;
@@ -1421,12 +1453,21 @@ static void ApplyHouseSplit() {
 }
 
 void OnGameLoaded() {
-    ApplyParticleLateRead();
-    ApplyParticleLightOneSubmit();
-    ApplyHouseSplit();
-    ApplyAspectRatio();
-    ApplyHudWidth();
-    ApplyPerfMode();
+    g_eboot_107 = DetectEboot107();
+    if (g_eboot_107) {
+        ApplyParticleLateRead();
+        ApplyParticleLightOneSubmit();
+        ApplyHouseSplit();
+        ApplyAspectRatio();
+        ApplyHudWidth();
+        ApplyPerfMode();
+    } else {
+        LOG_WARNING(Loader,
+                    "This game's code is not update 01.07 (code hash {:#018x}, {} segments): the "
+                    "built-in game patches are off (screen shape and HUD width, render size, "
+                    "particle and performance patches, DLSS jitter). Install update 01.07 for them.",
+                    Common::ElfInfo::Instance().EbootCodeHash(), g_eboot_segments.size());
+    }
     std::filesystem::path patch_dir = Common::FS::GetUserPath(Common::FS::PathType::PatchesDir);
     if (!patch_file.empty()) {
 

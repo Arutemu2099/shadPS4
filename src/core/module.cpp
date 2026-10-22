@@ -366,6 +366,9 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             // (read-write, within +-2 GB of the code; the trampolines fill it from the front).
             MemoryPatcher::g_eboot_scratch = base_virtual_addr + aligned_base_size + 8_MB - 64;
 #endif
+            for (u32 i = 0; i < info.num_segments; ++i) {
+                MemoryPatcher::AddEbootSegment(info.segments[i].address, info.segments[i].size);
+            }
             MemoryPatcher::OnGameLoaded();
         }
     }

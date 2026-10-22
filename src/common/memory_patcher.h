@@ -19,6 +19,9 @@ extern EXPORT uintptr_t g_eboot_address;
 extern uint64_t g_eboot_image_size;
 /// 64 bytes of read-write memory near the eboot's code (module.cpp: the trampoline area's tail).
 extern uintptr_t g_eboot_scratch;
+/// One loaded segment of the eboot (module.cpp, before OnGameLoaded): the built-in patches check
+/// their 01.07 offsets against these before reading (GitHub #22).
+void AddEbootSegment(uintptr_t address, uint64_t size);
 extern std::string g_game_serial;
 extern std::string patch_file;
 
