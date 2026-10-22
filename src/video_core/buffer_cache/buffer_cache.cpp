@@ -7196,6 +7196,16 @@ void BufferCache::LogLeanStats() {
              s[2], s[3], s[4], s[5]);
 }
 
+// 1.1.1 (GitHub #30): whether `size` more bytes fit the driver's device-local budget with a 256 MB
+// margin (BIG_GROW's mesh buffer); nullopt when the driver gives no budget (VK_EXT_memory_budget).
+static std::optional<bool> MeshFitsVideo(const Vulkan::Instance& instance, u64 size) {
+    const auto free = Vulkan::DriverFreeDeviceLocal(instance.GetAllocator());
+    if (!free) {
+        return std::nullopt;
+    }
+    return size + (256ull << 20) <= *free;
+}
+
 BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 wanted_size) {
     static constexpr int STREAM_LEAP_THRESHOLD = 16;
     boost::container::small_vector<BufferId, 16> overlap_ids;
@@ -7203,6 +7213,7 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
     VAddr end = device_addr + wanted_size;
     int stream_score = 0;
     bool has_stream_leap = false;
+    bool mesh = false; // BIG_GROW extended this join to the mesh buffer's size
     const auto expand_begin = [&](VAddr add_value) {
         static constexpr VAddr min_page = CACHING_PAGESIZE + DEVICE_PAGESIZE;
         if (add_value > begin - min_page) {
@@ -7373,23 +7384,49 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
             }
             const VmaAllocator allocator = instance.GetAllocator();
             const vk::BufferUsageFlags flags = AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress;
-            // The tier, then the smaller tiers (3 GB, 2.75 GB) as steps down.
-            boost::container::small_vector<u64, 3> sizes{big_grow_bytes};
+            // The tier, then the smaller tiers (3 GB, 2.75 GB) as steps down; below 7 GiB of video
+            // memory (the 2.75 GB tier) also 2.5 GB: the city's mesh memory reached 2790 MB (s1558),
+            // so that one regrows once in the scene, still better than system RAM (GitHub #30).
+            boost::container::small_vector<u64, 4> sizes{big_grow_bytes};
             for (const u64 step : {u64{0xC0000000ull}, u64{0xB0000000ull}}) {
                 if (step < big_grow_bytes) {
                     sizes.push_back(step);
                 }
             }
+            if (big_grow_bytes <= 0xB0000000ull) {
+                sizes.push_back(0xA0000000ull);
+            }
+            const auto& mp = instance.GetMemoryProperties();
             for (const u64 size : sizes) {
                 const u64 ask = size > fail_above ? (64ull << 30) : size;
+                // 1.1.1 (GitHub #30, RX 5600 XT 6 GB): the probe used to count any heap as a fit -
+                // VMA's budget is its own 80%-of-heap estimate (4697 of 5872 MiB), so the 2816 MB
+                // buffer went to system RAM (heap 1) although the card had room (2370 MB in use).
+                // Now: video memory only, sized against the driver's budget when it gives one.
+                // Without a driver budget: the old probe, but only a device-local heap counts.
+                const std::optional<bool> in_budget = MeshFitsVideo(instance, ask);
                 u32 heap = 0;
-                if (ProbeBufferAllocation(instance, MemoryUsage::DeviceLocal, flags, ask, heap)) {
-                    LOG_INFO(Render_Vulkan, "BIG_GROW: the {} MB mesh buffer fits (heap {}){}",
-                             size >> 20, heap, size < big_grow_bytes ? " - stepped down" : "");
+                bool fits = false;
+                bool system_heap = false;
+                if (in_budget.value_or(true)) {
+                    fits = ProbeBufferAllocation(instance, MemoryUsage::DeviceLocal, flags, ask, heap,
+                                                 /*require_video=*/in_budget.has_value());
+                    system_heap =
+                        fits && !(mp.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal);
+                    fits = fits && !system_heap;
+                }
+                if (fits) {
+                    LOG_INFO(Render_Vulkan, "BIG_GROW: the {} MB mesh buffer fits (heap {}){}; {}",
+                             size >> 20, heap, size < big_grow_bytes ? " - stepped down" : "",
+                             Vulkan::DescribeDriverBudgets(allocator));
                     return size;
                 }
-                LOG_WARNING(Render_Vulkan, "BIG_GROW: a {} MB mesh buffer does not fit{}; {}; {}; {}",
+                LOG_WARNING(Render_Vulkan,
+                            "BIG_GROW: a {} MB mesh buffer does not fit in video memory{}{}; {}; {}; {}",
                             ask >> 20,
+                            in_budget == false ? " (over the driver's budget with a 256 MB margin)"
+                            : system_heap      ? " (it would land in system memory)"
+                                               : "",
                             ask != size ? " (test: SHADPS4_BIG_GROW_PROBE_FAIL_ABOVE_MB)" : "",
                             Vulkan::DescribeDeviceLocalBudgets(allocator),
                             Vulkan::DescribeDriverBudgets(allocator),
@@ -7428,6 +7465,7 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
                 overlap_ids.insert(overlap_ids.end(), extra.begin(), extra.end());
                 end = grow_end;
                 ++big_grow_count;
+                mesh = true;
             } else {
                 for (const BufferId id : extra) {
                     slot_buffers[id].is_picked = false;
@@ -7440,6 +7478,7 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
         .begin = begin,
         .end = end,
         .has_stream_leap = has_stream_leap,
+        .mesh = mesh,
     };
 }
 
@@ -7529,9 +7568,16 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
             big_old = std::max(big_old, s);
         }
     }
+    // 1.1.1 (GitHub #30): BIG_GROW's mesh buffer goes to video memory whenever the driver's budget
+    // has room for it now (the joined buffers still alive), not where VMA's estimate sends it.
+    std::optional<RequireVideoMemory> video;
+    if (overlap.mesh && MeshFitsVideo(instance, size).value_or(false)) {
+        video.emplace();
+    }
     const BufferId new_buffer_id =
         slot_buffers.insert(instance, scheduler, MemoryUsage::DeviceLocal, overlap.begin,
                             AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size);
+    video.reset();
     auto& new_buffer = slot_buffers[new_buffer_id];
     new_buffer.memo_serial = ++buffer_memo_serial;
     for (const BufferId overlap_id : overlap.ids) {

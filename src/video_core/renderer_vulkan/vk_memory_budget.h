@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <optional>
 #include <string>
 #include <fmt/format.h>
 #include "common/logging/log.h"
@@ -73,6 +74,40 @@ inline std::string DescribeDriverBudgets(VmaAllocator allocator) {
                            budget.heapUsage[i] >> 20, budget.heapBudget[i] >> 20);
     }
     return out;
+}
+
+/// 1.1.1 (GitHub #30): the driver's free bytes (budget - usage) on its largest device-local heap,
+/// or nullopt without VK_EXT_memory_budget. SHADPS4_SIM_DRIVER_FREE_MB (test) caps the answer.
+inline std::optional<u64> DriverFreeDeviceLocal(VmaAllocator allocator) {
+    if (!g_driver_budget.load(std::memory_order_relaxed)) {
+        return std::nullopt;
+    }
+    VmaAllocatorInfo info{};
+    vmaGetAllocatorInfo(allocator, &info);
+    vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    vk::PhysicalDeviceMemoryProperties2 props = {
+        .pNext = &budget,
+    };
+    vk::PhysicalDevice{info.physicalDevice}.getMemoryProperties2(&props);
+    u64 largest = 0;
+    std::optional<u64> free;
+    for (u32 i = 0; i < props.memoryProperties.memoryHeapCount; ++i) {
+        const auto& heap = props.memoryProperties.memoryHeaps[i];
+        if ((heap.flags & vk::MemoryHeapFlagBits::eDeviceLocal) && heap.size > largest) {
+            largest = heap.size;
+            free = budget.heapBudget[i] > budget.heapUsage[i]
+                       ? budget.heapBudget[i] - budget.heapUsage[i]
+                       : 0;
+        }
+    }
+    static const u64 sim = [] {
+        const char* e = std::getenv("SHADPS4_SIM_DRIVER_FREE_MB");
+        return e ? std::strtoull(e, nullptr, 10) << 20 : ~0ull;
+    }();
+    if (free && *free > sim) {
+        free = sim;
+    }
+    return free;
 }
 
 /// Runs `alloc(create_info)`; on VK_ERROR_OUT_OF_DEVICE_MEMORY with the budget bit set, retries

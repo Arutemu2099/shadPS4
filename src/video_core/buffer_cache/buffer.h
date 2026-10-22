@@ -107,8 +107,22 @@ struct UniqueBuffer {
 /// 1.1.1 (GitHub #5): allocates what a Buffer of `size` bytes with `flags` would (same create info
 /// and memory request, the over-budget retry included) and frees it again at once. true = it fit;
 /// `heap` = the memory heap it landed in. A refusal logs nothing: the caller steps down.
+/// `require_video`: as a buffer made under RequireVideoMemory would be.
 bool ProbeBufferAllocation(const Vulkan::Instance& instance, MemoryUsage usage,
-                           vk::BufferUsageFlags flags, u64 size, u32& heap);
+                           vk::BufferUsageFlags flags, u64 size, u32& heap,
+                           bool require_video = false);
+
+/// 1.1.1 (GitHub #30: a 6 GB card's 2816 MB mesh buffer landed in system RAM): while one is alive
+/// on this thread, a DeviceLocal buffer must be in video memory and skips VMA's 80%-of-heap
+/// estimate (the caller checked the driver's own budget). If the driver refuses, the normal
+/// allocation runs.
+class RequireVideoMemory {
+public:
+    RequireVideoMemory();
+    ~RequireVideoMemory();
+    RequireVideoMemory(const RequireVideoMemory&) = delete;
+    RequireVideoMemory& operator=(const RequireVideoMemory&) = delete;
+};
 
 class Buffer {
 public:

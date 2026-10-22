@@ -186,6 +186,7 @@ public:
         VAddr begin;
         VAddr end;
         bool has_stream_leap = false;
+        bool mesh = false; ///< BIG_GROW sized it as the mesh buffer (video memory, GitHub #30)
     };
 
 public:
