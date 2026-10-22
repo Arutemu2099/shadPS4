@@ -179,7 +179,9 @@ std::optional<std::filesystem::path> ReadSavedGame(const std::filesystem::path& 
     }
     const std::filesystem::path p{std::u8string{utf8.begin(), utf8.end()}};
     std::error_code ec;
-    if (utf8.empty() || !std::filesystem::is_regular_file(p, ec)) {
+    // 1.1.1: a saved folder without sce_sys\param.sfo asks again (see GamePath).
+    if (utf8.empty() || !std::filesystem::is_regular_file(p, ec) ||
+        !std::filesystem::is_regular_file(p.parent_path() / "sce_sys" / "param.sfo", ec)) {
         return std::nullopt;
     }
     return p;
@@ -288,6 +290,21 @@ std::optional<std::filesystem::path> GamePath() {
         }
         std::error_code ec;
         const auto eboot = *folder / "eboot.bin";
+        // 1.1.1 (GitHub #38): a folder with eboot.bin but no sce_sys\param.sfo started and then
+        // closed with "sceAppContentInitialize: Failed to get TITLE_ID" - the game's identity is in
+        // that file. Said here instead.
+        if (std::filesystem::is_regular_file(eboot, ec) &&
+            !std::filesystem::is_regular_file(*folder / "sce_sys" / "param.sfo", ec)) {
+            if (MessageBoxW(nullptr,
+                            L"That folder has eboot.bin but no sce_sys\\param.sfo, so the game "
+                            L"cannot start (the game's name and ID are in that file).\n\nChoose the "
+                            L"game's complete folder: the one that holds eboot.bin AND the sce_sys "
+                            L"folder. If your copy has no sce_sys folder, it is incomplete.",
+                            L"shadPS4", MB_OKCANCEL | MB_ICONINFORMATION) != IDOK) {
+                return std::nullopt;
+            }
+            continue;
+        }
         if (std::filesystem::is_regular_file(eboot, ec)) {
             std::ofstream out{saved, std::ios::binary | std::ios::trunc};
             const auto u8 = eboot.u8string();
