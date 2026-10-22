@@ -1342,7 +1342,8 @@ void PipelineCache::PrepareNativeVariantLocked(const GraphicsPipeline* base,
     }
     GraphicsPipeline::SerializationSupport sdata{};
     LOG_INFO(Render_Vulkan, "NativePass: compiling variant of {:#x} (vs {:#x})",
-             std::hash<GraphicsPipelineKey>{}(graphics_key), params.hash);
+             std::hash<GraphicsPipelineKey>{}(graphics_key),
+             infos[u32(LogicalStage::Vertex)] ? infos[u32(LogicalStage::Vertex)]->pgm_hash : 0);
     auto variant = std::make_unique<GraphicsPipeline>(
         instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
         runtime_infos, fetch_shader, native_modules, sdata, false, nullptr, records_binding,
