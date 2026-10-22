@@ -7213,7 +7213,7 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
     VAddr end = device_addr + wanted_size;
     int stream_score = 0;
     bool has_stream_leap = false;
-    bool mesh = false; // BIG_GROW extended this join to the mesh buffer's size
+    bool mesh = false; // a BIG_GROW mesh-sized join (>= 1 GB)
     const auto expand_begin = [&](VAddr add_value) {
         static constexpr VAddr min_page = CACHING_PAGESIZE + DEVICE_PAGESIZE;
         if (add_value > begin - min_page) {
@@ -7369,6 +7369,10 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
         // rooftop at the last one - the play hitches). Buffers inside the extension are joined
         // like any overlap, so no page keeps two buffers.
         const u64 cur = end - begin;
+        // 1.1.1 (GitHub #30): every mesh-sized join prefers video memory (CreateBuffer checks the
+        // driver's budget for its real size) - not only the extended one: the city save's first
+        // join was already 2766 MB, above a 2560 MB step (s1584), and later regrows are joins too.
+        mesh = true;
         // r15d: straight to the cap (3.75 GB) at the first big join - normally the load - so the
         // region never grows again in the scene (r15b: an in-scene growth's coherent upload stalled ~1 s).
         // 1.1.1 (GitHub #5: an RTX 5050 8 GB on 16 GB of RAM - the 3 GB buffer fitted neither in
@@ -7465,7 +7469,6 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
                 overlap_ids.insert(overlap_ids.end(), extra.begin(), extra.end());
                 end = grow_end;
                 ++big_grow_count;
-                mesh = true;
             } else {
                 for (const BufferId id : extra) {
                     slot_buffers[id].is_picked = false;

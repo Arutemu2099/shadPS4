@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <bitset>
+#include <chrono>
 #include <climits>
 #include <cstdlib>
 #include <cstring>
@@ -2290,11 +2291,12 @@ void PatchSegmentAheadOfTime(u64 segment_addr, u64 segment_size) {
     if (Patches.empty()) {
         return;
     }
-    const auto start = Common::FaultMonitor::Now();
+    const auto start = std::chrono::steady_clock::now();
     const u64 patched = TryPatchAot(reinterpret_cast<void*>(segment_addr), segment_size);
     LOG_INFO(Core, "Ahead-of-time patching: {} instructions patched in [{:#x}, +{:#x}) ({:.1f} ms)",
              patched, segment_addr, segment_size,
-             double(Common::FaultMonitor::SinceNs(start)) / 1e6);
+             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                 .count());
 }
 
 } // namespace Core
