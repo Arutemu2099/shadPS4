@@ -232,10 +232,8 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             if (elf_pheader[i].p_flags & PF_EXEC) {
                 PrePatchInstructions(segment_addr, segment_file_size);
 #ifdef _WIN32
-                // Windows static guest red-zone protection
-                if (use_static_windows_guest_red_zone_protection) {
-                    executable_segments.emplace_back(segment_addr, segment_file_size);
-                }
+                // Windows static guest red-zone protection (and the Wine sweep below)
+                executable_segments.emplace_back(segment_addr, segment_file_size);
 #endif
             }
 #endif
@@ -350,6 +348,13 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
                 "{} CPU patch instructions were unsupported",
                 name, stack_dependent_instruction_count, control_flow_instruction_count,
                 unrelocatable_instruction_count, unsupported_cpu_patch_instruction_count);
+        }
+    }
+    // GitHub #17 / #29: under Wine the guest's fs: reads never fault, so the code the red-zone
+    // pass did not visit is swept ahead of time - after it, since it decodes the original bytes.
+    if (AheadOfTimePatchingWanted()) {
+        for (const auto& [segment_addr, segment_size] : executable_segments) {
+            PatchSegmentAheadOfTime(segment_addr, segment_size);
         }
     }
 #endif

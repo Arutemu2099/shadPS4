@@ -5,12 +5,14 @@
 #include <atomic>
 #include <bitset>
 #include <climits>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
+#include <string>
 #include <unordered_set>
 #include <vector>
 #include <Zydis/Zydis.h>
@@ -930,19 +932,24 @@ static bool TryPatchJit(void* code_address) {
     return TryPatch(code, module).first;
 }
 
-static void TryPatchAot(void* code_address, u64 code_size) {
+/// Returns how many instructions were patched.
+static u64 TryPatchAot(void* code_address, u64 code_size) {
     auto* code = static_cast<u8*>(code_address);
     auto* module = GetModule(code);
     if (module == nullptr) {
-        return;
+        return 0;
     }
 
     std::unique_lock lock{module->mutex};
 
+    u64 patched = 0;
     const auto* end = code + code_size;
     while (code < end) {
-        code += TryPatch(code, module).second;
+        const auto [ok, length] = TryPatch(code, module);
+        patched += ok;
+        code += length;
     }
+    return patched;
 }
 
 // ============================================================================
@@ -2247,6 +2254,47 @@ void PrePatchInstructions(u64 segment_addr, u64 segment_size) {
         TryPatchAot(reinterpret_cast<void*>(segment_addr), segment_size);
     }
 #endif
+}
+
+// GitHub #17 / #29 (2026-10-22; root cause found by a player): the Windows build patches guest
+// fs: reads when they fault, but under Wine / Proton fs points at the host thread's valid TLS,
+// so `mov rax, fs:[0]` reads host memory instead (eboot+0x5daba3: a null pointer, a crash 1-7
+// minutes in). The red-zone static patcher only visits functions listed in the EH table, so the
+// rest stays lazy. Under Wine the executable segments are swept ahead of time as well.
+bool AheadOfTimePatchingWanted() {
+    static const bool wanted = [] {
+        const char* wine = nullptr;
+#if defined(_WIN32)
+        if (const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll")) {
+            using WineGetVersion = const char*(CDECL*)();
+            if (const auto get = reinterpret_cast<WineGetVersion>(
+                    reinterpret_cast<void*>(GetProcAddress(ntdll, "wine_get_version")))) {
+                wine = get();
+            }
+        }
+#endif
+        bool on = wine != nullptr;
+        const char* env = std::getenv("SHADPS4_AOT_PATCH");
+        if (env && (env[0] == '0' || env[0] == '1')) {
+            on = env[0] == '1';
+        }
+        LOG_INFO(Core, "Ahead-of-time guest code patching: {} ({}{})", on ? "on" : "off",
+                 wine ? fmt::format("Wine {}", wine) : std::string{"not under Wine"},
+                 env ? fmt::format(", SHADPS4_AOT_PATCH={}", env) : std::string{});
+        return on;
+    }();
+    return wanted;
+}
+
+void PatchSegmentAheadOfTime(u64 segment_addr, u64 segment_size) {
+    if (Patches.empty()) {
+        return;
+    }
+    const auto start = Common::FaultMonitor::Now();
+    const u64 patched = TryPatchAot(reinterpret_cast<void*>(segment_addr), segment_size);
+    LOG_INFO(Core, "Ahead-of-time patching: {} instructions patched in [{:#x}, +{:#x}) ({:.1f} ms)",
+             patched, segment_addr, segment_size,
+             double(Common::FaultMonitor::SinceNs(start)) / 1e6);
 }
 
 } // namespace Core

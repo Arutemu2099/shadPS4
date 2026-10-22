@@ -58,6 +58,16 @@ u8* AllocateTrampolineSpace(const void* module_address, u64 size);
 /// Applies CPU patches that need to be done before beginning executions.
 void PrePatchInstructions(u64 segment_addr, u64 segment_size);
 
+/// Windows builds: true under Wine / Proton (ntdll exports wine_get_version), where guest fs:
+/// reads do not fault and so are never patched lazily (GitHub #17, #29). SHADPS4_AOT_PATCH=1
+/// forces it on, =0 off. Logged once.
+bool AheadOfTimePatchingWanted();
+
+/// Patches every matching instruction of an executable segment ahead of time, as Linux builds do
+/// in PrePatchInstructions. On Windows it runs after the red-zone static patcher (which decodes
+/// the original bytes and calls the same patches for the functions it visits).
+void PatchSegmentAheadOfTime(u64 segment_addr, u64 segment_size);
+
 // Windows static guest red-zone protection
 /// Keeps Windows exception dispatch outside live guest red zones at faultable memory accesses.
 RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_size,
