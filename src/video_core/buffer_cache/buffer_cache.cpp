@@ -7198,12 +7198,16 @@ void BufferCache::LogLeanStats() {
 
 // 1.1.1 (GitHub #30): whether `size` more bytes fit the driver's device-local budget with a 256 MB
 // margin (BIG_GROW's mesh buffer); nullopt when the driver gives no budget (VK_EXT_memory_budget).
-static std::optional<bool> MeshFitsVideo(const Vulkan::Instance& instance, u64 size) {
+// `freed`: the joined buffers' bytes, released right after the copy - credited up to a quarter of
+// the new size (i30: 524 MB of pieces at the first join; a whole-buffer regrow gets no free pass,
+// its old copy would stay over budget for the whole copy).
+static std::optional<bool> MeshFitsVideo(const Vulkan::Instance& instance, u64 size, u64 freed) {
     const auto free = Vulkan::DriverFreeDeviceLocal(instance.GetAllocator());
     if (!free) {
         return std::nullopt;
     }
-    return size + (256ull << 20) <= *free;
+    const u64 credit = std::min(freed, size / 4);
+    return size + (256ull << 20) <= *free + credit;
 }
 
 BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 wanted_size) {
@@ -7381,7 +7385,11 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
         // smaller tiers down to 2.75 GB, then no extension (the old growth path). The pick holds
         // for the session. SHADPS4_BIG_GROW_PROBE_FAIL_ABOVE_MB (test): a try above it asks for
         // 64 GB instead, which the driver really refuses.
-        static const u64 want = [this]() -> u64 {
+        u64 pieces = 0; // the joined buffers' bytes (MeshFitsVideo's credit)
+        for (const BufferId id : overlap_ids) {
+            pieces += slot_buffers[id].SizeBytes();
+        }
+        static const u64 want = [&]() -> u64 {
             u64 fail_above = ~0ull;
             if (const char* f = std::getenv("SHADPS4_BIG_GROW_PROBE_FAIL_ABOVE_MB")) {
                 fail_above = std::strtoull(f, nullptr, 10) << 20;
@@ -7408,7 +7416,7 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
                 // buffer went to system RAM (heap 1) although the card had room (2370 MB in use).
                 // Now: video memory only, sized against the driver's budget when it gives one.
                 // Without a driver budget: the old probe, but only a device-local heap counts.
-                const std::optional<bool> in_budget = MeshFitsVideo(instance, ask);
+                const std::optional<bool> in_budget = MeshFitsVideo(instance, ask, pieces);
                 u32 heap = 0;
                 bool fits = false;
                 bool system_heap = false;
@@ -7574,7 +7582,7 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
     // 1.1.1 (GitHub #30): BIG_GROW's mesh buffer goes to video memory whenever the driver's budget
     // has room for it now (the joined buffers still alive), not where VMA's estimate sends it.
     std::optional<RequireVideoMemory> video;
-    if (overlap.mesh && MeshFitsVideo(instance, size).value_or(false)) {
+    if (overlap.mesh && MeshFitsVideo(instance, size, big_copy).value_or(false)) {
         video.emplace();
     }
     const BufferId new_buffer_id =

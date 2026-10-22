@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <utility>
 #include <boost/container/small_vector.hpp>
 
@@ -472,6 +474,20 @@ GraphicsPipeline::GraphicsPipeline(
                     "play time",
                     debug_str, vk::to_string(pipeline_result));
         return;
+    }
+    if (pipeline_result == vk::Result::eSuccess && refusable) {
+        // SHADPS4_REFUSE_VARIANT_TEST=N (test, 2026-10-22): every Nth refusable variant is treated
+        // as refused by the driver (the created pipeline is dropped), to run the path below on a
+        // driver that never refuses.
+        static const u32 every = [] {
+            const char* v = std::getenv("SHADPS4_REFUSE_VARIANT_TEST");
+            return v ? static_cast<u32>(std::strtoul(v, nullptr, 10)) : 0u;
+        }();
+        static std::atomic<u32> made{0};
+        if (every != 0 && made.fetch_add(1, std::memory_order_relaxed) % every == every - 1) {
+            pipeline_result = vk::Result::eErrorUnknown;
+            pipe.reset();
+        }
     }
     if (pipeline_result != vk::Result::eSuccess && refusable) {
         // 1.1.1 (GitHub #25 RX 6800 XT, #31 RX 570): AMD drivers refused some NativeColour
