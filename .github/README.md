@@ -34,6 +34,11 @@ Windows 10 / 11, one zip of about 74 MB. **You need your own copy of the game** 
 > settings - reports welcome.
 
 > [!TIP]
+> **1.1.1 (hotfix):** video cutscenes now fit ultrawide screens with black bars instead of being cut off; fixes for
+> crashes at start (game version 01.00 - install update 1.07), on the loading screen (12 GB cards), on some AMD cards
+> and under Linux / Proton. **HDR is experimental - keep it off for now** (F3 -> Graphics -> Enable HDR); proper HDR
+> with DLSS comes in 1.2. [All changes](https://github.com/axylpup/shadPS4/releases/latest).
+>
 > **New in 1.1:** any screen shape (ultrawide 21:9 / 32:9, 16:10, 4:3), the render size as a percentage of your
 > screen changed live, native 4K, sharper DLSS without the wobble, far fewer stripes in street reflections, even motion
 > on screens without G-Sync / FreeSync, a Quick settings tab, and the loading screen tells you when a new version is
@@ -285,6 +290,8 @@ NVIDIA's files are not included (licence). Adding them takes about 2 minutes:
 
 Real bugs that are not fixed yet (stutter, language, saves and other questions with a quick fix: [FAQ](#faq)).
 
+- HDR (<kbd>F3</kbd> -> Graphics -> Enable HDR) is experimental: too dark and contrasty, and no DLSS while it is on -
+  keep it off until 1.2.
 - Touchpad prompts and the controller picture in the Options screen still show the PlayStation controller.
 - A few particle effects (smoke, fire) can flicker in places.
 - On graphics cards other than NVIDIA, street reflections still show stripes at low render sizes.
