@@ -17,6 +17,8 @@ public:
     struct Settings {
         float gamma = 1.0f;
         u32 hdr = 0;
+        /// hdr 3 (an SDR frame on an HDR screen): the nits SDR white is shown at.
+        float sdr_white = 203.0f;
     };
 
     void Create(vk::Device device, vk::Format surface_format);

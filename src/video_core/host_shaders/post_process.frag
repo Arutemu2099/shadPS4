@@ -9,10 +9,13 @@ layout (location = 0) out vec4 color;
 layout (binding = 0) uniform sampler2D texSampler;
 
 // hdr: 0 = SDR frame on an SDR screen, 1 = HDR screen (passed through), 2 = the game's HDR10 (PQ)
-// frame on an SDR screen (1.1.1, GitHub #13: PQ decoded, mapped to the game's own SDR look).
+// frame on an SDR screen (1.1.1, GitHub #13: PQ decoded, mapped to the game's own SDR look),
+// 3 = an SDR frame on an HDR screen (1.1.1: encoded to PQ, SDR white at sdr_white nits; before,
+// its SDR values were taken as PQ codes - a near-black picture).
 layout (push_constant) uniform settings {
     float gamma;
     uint hdr;
+    float sdr_white;
 } pp;
 
 const float cutoff = 0.0031308, a = 1.055, b = 0.055, d = 12.92;
@@ -48,12 +51,33 @@ vec3 pq_to_sdr_linear(vec3 e) {
     return min(y, vec3(0.8)) + 0.2 * (1.0 - exp(-over / 0.2));
 }
 
+// ST.2084 EOTF inverse: nits -> PQ code value.
+vec3 nits_to_pq(vec3 nits) {
+    const float m1 = 2610.0 / 16384.0, m2 = 2523.0 / 32.0;
+    const float c1 = 3424.0 / 4096.0, c2 = 2413.0 / 128.0, c3 = 2392.0 / 128.0;
+    vec3 y = pow(clamp(nits / 10000.0, 0.0, 1.0), vec3(m1));
+    return pow((c1 + c2 * y) / (1.0 + c3 * y), vec3(m2));
+}
+
+// An SDR frame as an SDR screen would show it (the gamma setting included), back to display
+// light by the sRGB curve (as Windows shows SDR content in HDR mode), BT.709 -> BT.2020, PQ.
+vec3 sdr_to_pq(vec3 linear) {
+    vec3 e = clamp(gamma(linear), 0.0, 1.0);
+    vec3 l709 = mix(pow((e + 0.055) / 1.055, vec3(2.4)), e / 12.92, lessThanEqual(e, vec3(0.04045)));
+    vec3 l2020 = vec3(dot(vec3(0.6274, 0.3293, 0.0433), l709),
+                      dot(vec3(0.0691, 0.9195, 0.0114), l709),
+                      dot(vec3(0.0164, 0.0880, 0.8956), l709));
+    return nits_to_pq(l2020 * pp.sdr_white);
+}
+
 void main() {
     vec4 color_linear = texture(texSampler, uv);
     if (pp.hdr == 1u) {
         color = color_linear;
     } else if (pp.hdr == 2u) {
         color = vec4(gamma(pq_to_sdr_linear(color_linear.rgb)), color_linear.a);
+    } else if (pp.hdr == 3u) {
+        color = vec4(sdr_to_pq(color_linear.rgb), color_linear.a);
     } else {
         color = vec4(gamma(color_linear.rgb), color_linear.a);
     }

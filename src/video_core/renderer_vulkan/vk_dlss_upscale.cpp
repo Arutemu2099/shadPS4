@@ -108,7 +108,7 @@ Upscaler::Upscaler(const Instance& instance_) : instance{instance_}, device{inst
 
 Upscaler::~Upscaler() = default;
 
-void Upscaler::SetOutputSize(u32 width, u32 height) {
+void Upscaler::SetOutputSize(u32 width, u32 height, bool game_pq) {
     ++flips;
     while (!retired.empty() && retired.front().first + 16 <= flips) {
         retired.pop_front();
@@ -138,11 +138,17 @@ void Upscaler::SetOutputSize(u32 width, u32 height) {
     const u32 fit_h = std::max<u32>(game_h, static_cast<u32>(out_h * fit));
     output_size = force ? vk::Extent2D{game_w, game_h} : vk::Extent2D{fit_w, fit_h};
     // DLSS needs an output larger than its input; smaller windows keep DLAA in place.
+    // 1.1.1 (GitHub #13, until 1.2's HDR work): off while the game sends HDR10 (PQ) frames. In
+    // this mode the game's own display buffer holds only the HUD, and the composite (DLSS's scene
+    // + that layer) is not PQ (inferred cause of #13's black city: that player's log shows DLSS
+    // upscale running in the game's HDR mode). The game then draws its whole picture itself (at
+    // the chosen render size, scaled by the post pass).
     const bool on = (force || (width > game_w && height > game_h)) && g_ready.load() &&
-                    instance.IsDynamicColorWriteMaskSupported();
+                    instance.IsDynamicColorWriteMaskSupported() && !game_pq;
     if (on != g_hud_layer.load(std::memory_order_relaxed)) {
-        LOG_INFO(Render_Vulkan, "DLSS upscale: {} (output {}x{}{})", on ? "on" : "off",
-                 output_size.width, output_size.height, force ? ", forced" : "");
+        LOG_INFO(Render_Vulkan, "DLSS upscale: {} (output {}x{}{}{})", on ? "on" : "off",
+                 output_size.width, output_size.height, force ? ", forced" : "",
+                 game_pq ? ", the game sends HDR10 (PQ) frames" : "");
         g_hud_layer.store(on, std::memory_order_relaxed);
     }
 }
