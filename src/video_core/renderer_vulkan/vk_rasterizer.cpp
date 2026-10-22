@@ -13610,6 +13610,39 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     for (u32 cb = state.num_color_attachments; cb < state.color_attachments.size(); ++cb) {
         state.color_attachments[cb] = {};
     }
+    // 1.1.1 (user 10-22): black bars beside a fitted movie (MemoryPatcher::ApplyMovieFit). On the
+    // PS4 the movie quad covered its target whole, so beside the smaller quad the target kept the
+    // last game frame. The full-screen movie draw (vs b94242a8 + the NV12 ps b03b3012, s1597)
+    // whose first vertex is the fitted corner clears its target to black first; menu videos use
+    // the same shaders at other positions and are left alone. A cleared state never comes from
+    // the render-state memo (RenderStateMemoStore refuses it), so every movie frame passes here.
+    if (float fx, fy; state.num_color_attachments >= 1 && state.color_attachments[0].image_view &&
+                      MemoryPatcher::MovieFitRect(fx, fy)) [[unlikely]] {
+        const auto& stages = pipeline->GetStages();
+        const auto* vs = stages[u32(Shader::LogicalStage::Vertex)];
+        const auto* fs = stages[u32(Shader::LogicalStage::Fragment)];
+        if (vs && fs && vs->pgm_hash == 0xb94242a8 && fs->pgm_hash == 0xb03b3012 &&
+            !vs->buffers.empty()) {
+            const AmdGpu::Buffer quad =
+                vs->buffers[0].GetSharp(GetBoundStage(Shader::LogicalStage::Vertex));
+            std::array<float, 16> pos{}; // 4 x vec4: vertex 0 = (right, top) ... 3 = (left, bottom)
+            if (quad.GetSize() >= sizeof(pos) &&
+                memory->TryReadBacking(quad.base_address, reinterpret_cast<u8*>(pos.data()),
+                                       sizeof(pos)) &&
+                std::abs(pos[0] - fx) < 1e-4f && std::abs(pos[1] - fy) < 1e-4f &&
+                std::abs(pos[12] + fx) < 1e-4f && std::abs(pos[13] + fy) < 1e-4f) {
+                auto& attachment = state.color_attachments[0];
+                attachment.is_clear = true;
+                attachment.clear_value = {0u, 0u, 0u, std::bit_cast<u32>(1.0f)};
+                static std::atomic<bool> logged{false};
+                if (!logged.exchange(true, std::memory_order_relaxed)) {
+                    LOG_INFO(Render_Vulkan, "Movie fit: black bars - the movie's target is cleared "
+                                            "before its draw (quad corner {:.3f}, {:.3f})",
+                             fx, fy);
+                }
+            }
+        }
+    }
 
     if (auto image_id = db_desc.first; image_id) {
         auto& desc = db_desc.second;

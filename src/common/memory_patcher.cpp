@@ -615,6 +615,14 @@ bool RenderHeightFromFlags() {
 // constants are read by that function only: 16 / 9 become the screen space's width / height (f = 1:
 // the whole movie) and the quad takes the movie's shape inside the screen (bars at the sides on
 // wider screens, above and below on narrower ones; never stretched).
+static float g_movie_fit_x = 0.0f, g_movie_fit_y = 0.0f; // 0 = not fitted
+
+bool MovieFitRect(float& x, float& y) {
+    x = g_movie_fit_x;
+    y = g_movie_fit_y;
+    return x > 0.0f;
+}
+
 static void ApplyMovieFit(u32 sw, u32 sh) {
     const double f = double(sh) * 16.0 / (double(sw) * 9.0);
     if (std::abs(f - 1.0) < 0.01) {
@@ -635,6 +643,8 @@ static void ApplyMovieFit(u32 sw, u32 sh) {
     const float rect_new[4] = {-x, -y, x, y};
     std::memcpy(k, k_new, sizeof(k_new));
     std::memcpy(rect, rect_new, sizeof(rect_new));
+    g_movie_fit_x = x;
+    g_movie_fit_y = y;
     LOG_INFO(Loader, "Movie fit: movies drawn {:.0f}% wide x {:.0f}% high, centred (screen space "
              "{}x{})", x * 100.0f, y * 100.0f, sw, sh);
 }

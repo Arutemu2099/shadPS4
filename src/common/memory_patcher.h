@@ -100,6 +100,11 @@ s64 MsSinceLiveResize();
 /// SHADPS4_HUD narrows the HUD; ApplyHudWidth).
 float HudSafeAreaRatio();
 
+/// ApplyMovieFit: the full-screen movie quad's corner (x, y) in NDC when movies are fitted inside a
+/// non-16:9 screen; false on 16:9 (the game's own draw). The rasterizer clears that draw's target
+/// to black first, so the bars beside the movie do not show the last game frame.
+bool MovieFitRect(float& x, float& y);
+
 /// The game's own quality ladder level (0 = full quality ... 20; SHADPS4_PERF_MODE notes), read
 /// live from the renderer (0x800f39978); -1 before the game is loaded. For the memory census.
 int GameQualityLevel();
