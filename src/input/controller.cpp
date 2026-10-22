@@ -449,6 +449,31 @@ void GameControllers::TryOpenSDLControllers() {
                 auto* c = controllers[i];
                 LOG_INFO(Input, "Gamepad registered for slot {}! Handle: {}", i,
                          SDL_GetGamepadID(pad));
+                {
+                    // 1.1.1 (two pad reports 10-21 - ROG Ally, GameSir G7 Pro 8K - had no line
+                    // telling what SDL made of the pad): name, type, ids, the driver route (the
+                    // GUID's byte 14: 'h' SDL's own HID driver, 'x' XInput, 'w' Windows.Gaming.Input,
+                    // 'r' RawInput, 'v' virtual), connection, sensors, touchpads.
+                    const SDL_GUID guid = SDL_GetGamepadGUIDForID(SDL_GetGamepadID(pad));
+                    char guid_text[33]{};
+                    SDL_GUIDToString(guid, guid_text, sizeof(guid_text));
+                    const char route = static_cast<char>(guid.data[14]);
+                    const SDL_JoystickConnectionState link = SDL_GetGamepadConnectionState(pad);
+                    const char* name = SDL_GetGamepadName(pad);
+                    const char* type = SDL_GetGamepadStringForType(SDL_GetGamepadType(pad));
+                    LOG_INFO(Input,
+                             "Gamepad slot {}: \"{}\" type {} VID {:04x} PID {:04x}, route '{}' (GUID "
+                             "{}), {}, gyro {}, accelerometer {}, touchpads {}",
+                             i, name ? name : "?", type ? type : "unknown",
+                             SDL_GetGamepadVendor(pad), SDL_GetGamepadProduct(pad),
+                             route >= 0x20 && route < 0x7f ? route : '-', guid_text,
+                             link == SDL_JOYSTICK_CONNECTION_WIRED      ? "wired"
+                             : link == SDL_JOYSTICK_CONNECTION_WIRELESS ? "wireless"
+                                                                        : "connection unknown",
+                             SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO) ? "yes" : "no",
+                             SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL) ? "yes" : "no",
+                             SDL_GetNumGamepadTouchpads(pad));
+                }
                 slot_taken[i] = true;
                 c->user_id = u->user_id;
                 UserManagement.LoginUser(u, i + 1);

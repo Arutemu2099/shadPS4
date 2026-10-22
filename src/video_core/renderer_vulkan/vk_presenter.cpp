@@ -964,9 +964,20 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // the game's HUD layer over it replaces the display buffer as the post pass's input. The
     // layer's image is found and moved here (stream order: after this frame's HUD draws, before
     // the next frame's resolve clears it).
+    // 1.1.1 (GitHub #13): the game's own HDR10 output (PQ display buffers, the game's HDR option).
+    // Such a frame shows the game's own display buffer: the DLSS composite below builds its picture
+    // from DLSS's scene image and the HUD layer, not from the game's PQ encode, and on an SDR screen
+    // the post pass decodes PQ to SDR (mode 2). SHADPS4_PQ_DLSS_COMPOSITE=1 (test) keeps the
+    // composite for PQ frames too (the v1.1 behaviour).
+    const bool game_pq =
+        attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq;
+    static const bool pq_composite = [] {
+        const char* v = std::getenv("SHADPS4_PQ_DLSS_COMPOSITE");
+        return v && v[0] == '1';
+    }();
     std::optional<Dlss::CompositeJob> dlss_job;
     if (Dlss::Upscaler* upscaler = Dlss::GetUpscaler(instance)) {
-        if (upscaler->Ready() && !(Dlss::UpscaleTestBits() & 1)) {
+        if (upscaler->Ready() && !(Dlss::UpscaleTestBits() & 1) && (!game_pq || pq_composite)) {
             const auto hud_id = texture_cache.FindImageAtSize(
                 Dlss::HudLayerAddr(), Dlss::g_game_width.load(std::memory_order_relaxed),
                 Dlss::g_game_height.load(std::memory_order_relaxed));
@@ -986,8 +997,24 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // DLSS 5 on video cutscenes (vk_dlss5.h): a frame the game did not render through the T2x
     // pass while its video decoder runs goes through the model here, before the post pass.
     static u64 dlss5_resolves = 0;
-    const bool dlss5_video = !dlss_job && !frame->is_hdr && Dlss5::VideoFrame(dlss5_resolves);
+    const bool dlss5_video =
+        !dlss_job && !frame->is_hdr && !game_pq && Dlss5::VideoFrame(dlss5_resolves);
     dlss5_resolves = Dlss5::g_resolves.load(std::memory_order_acquire);
+    // 1.1.1 (GitHub #13): a PQ frame on an SDR screen is decoded to SDR by the post pass (mode 2).
+    HostPasses::PostProcessingPass::Settings frame_pp = pp_settings;
+    if (game_pq && !frame->is_hdr && !dlss_job) {
+        frame_pp.hdr = 2;
+    }
+    {
+        static std::atomic<int> last_mode{-1};
+        const int mode = game_pq ? (frame->is_hdr ? 1 : dlss_job ? 3 : 2) : 0;
+        if (last_mode.exchange(mode) != mode && mode != 0) {
+            LOG_INFO(Render_Vulkan, "Presenter: the game sends HDR10 (PQ) frames - {}",
+                     mode == 1   ? "shown on the HDR screen as they are"
+                     : mode == 2 ? "decoded to SDR for this screen (DLSS composite skipped)"
+                                 : "through the DLSS composite (SHADPS4_PQ_DLSS_COMPOSITE test)");
+        }
+    }
     // The post pass treats what it samples as linear for every SDR frame (an sRGB view decodes,
     // a UNORM one is taken as is), so DLSS 5 does the same (review 2).
     const bool frame_linear = true;
@@ -1009,7 +1036,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         draw_scheduler.EndRendering();
         // q6b (2): ordered (FsrPass keeps state across flips); the Frame by value.
         draw_scheduler.RecordOrdered([this, pre_barrier, image_view, image_size, fc = *frame,
-                                      fsr = fsr_settings, pp = pp_settings, dlss_job, dlss5_video,
+                                      fsr = fsr_settings, pp = frame_pp, dlss_job, dlss5_video,
                                       frame_linear](vk::CommandBuffer cb) mutable {
             cb.pipelineBarrier2(vk::DependencyInfo{
                 .imageMemoryBarrierCount = 1,
@@ -1069,7 +1096,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     if (dlss_job) {
         Dlss::RecordComposite(cmdbuf, *dlss_job);
-        pp_pass.Render(cmdbuf, dlss_job->out_view, dlss_job->size, *frame, pp_settings);
+        pp_pass.Render(cmdbuf, dlss_job->out_view, dlss_job->size, *frame, frame_pp);
     } else {
         if (dlss5_video) {
             if (const auto v = Dlss5::ApplyVideo(instance, cmdbuf, image_view, image_size.width,
@@ -1079,7 +1106,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         }
         image_view = fsr_pass.Render(cmdbuf, image_view, image_size,
                                      {frame->width, frame->height}, fsr_settings, frame->is_hdr);
-        pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+        pp_pass.Render(cmdbuf, image_view, image_size, *frame, frame_pp);
     }
 
     DebugState.game_resolution = {image_size.width, image_size.height};

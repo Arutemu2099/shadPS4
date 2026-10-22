@@ -240,8 +240,9 @@ Only for the update check: one small request to GitHub per start, shown on the l
 
 </details>
 
-Sensor mode only replaces what your controller is missing: a Switch Pro controller keeps its real gyro and only gets the
-left-stick finger. Sticks drifting? <kbd>F3</kbd> -> **Quick** -> **Left / Right Stick Deadzone**.
+Sensor mode always gives you the stick aiming and <kbd>A</kbd> for the spray can, also on controllers with their own gyro
+(Switch Pro, ROG Ally) - their real gyro works whenever sensor mode is off. The left-stick finger only comes on controllers
+without a touchpad. Sticks drifting? <kbd>F3</kbd> -> **Quick** -> **Left / Right Stick Deadzone**.
 
 <p align="right"><a href="#infamous-second-son-on-pc">Back to top ↑</a></p>
 

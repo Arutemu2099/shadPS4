@@ -47,6 +47,9 @@ inline bool Enabled() {
 
 /// Streamline is up and the feature exists on this device (=1), or the diagnostic copy (=2).
 inline std::atomic<bool> g_ready{false};
+/// 1.1.1 (GitHub #19): why the dlss folder's files were not used, in a player's words, for the Home
+/// notice ("DLSS not available: ..."); nullptr = no reason known (the log has the detail).
+inline std::atomic<const char*> g_why_not{nullptr};
 /// Home key: the player's on / off (the game's own T2x runs while off).
 inline std::atomic<bool> g_user_on{true};
 /// Page Up: jitter sign combination (bit 0 flips x, bit 1 flips y).

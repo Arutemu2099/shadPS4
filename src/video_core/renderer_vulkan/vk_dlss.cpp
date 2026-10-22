@@ -127,17 +127,45 @@ bool Startup() {
                     "DLSS: {} not found - the game's own anti-aliasing stays (put NVIDIA's "
                     "sl.interposer.dll, sl.common.dll, sl.dlss.dll and nvngx_dlss.dll there)",
                     interposer.string());
+        g_why_not.store("the dlss folder has no sl.interposer.dll", std::memory_order_relaxed);
         return false;
     }
+    // 1.1.1 (GitHub #19, error 193 on an RTX 5080): the Streamline release has three zips with the
+    // same file names - streamline-sdk-v2.14.16.zip (x64) and -aarch64 / -arm64ec (ARM PCs) - and the
+    // repository keeps its DLLs in Git LFS, so a "Source code" zip holds small text placeholders.
+    // The log and the Home notice say which one a player has. sl.interposer.dll of 2.14.16 x64 is
+    // 652,928 bytes.
+    const u64 interposer_bytes = std::filesystem::file_size(interposer, ec);
+    const auto wrong_files = [&](const char* what) {
+        LOG_ERROR(Render_Vulkan,
+                  "DLSS: {} ({} bytes) is {} - download streamline-sdk-v2.14.16.zip (not the "
+                  "-aarch64 / -arm64ec zips, not \"Source code\") and copy the five files from its "
+                  "bin\\x64 folder (sl.interposer.dll 652,928 bytes)",
+                  interposer.string(), interposer_bytes, what);
+        g_why_not.store("the dlss files are not the Windows x64 ones - see the README's DLSS steps",
+                        std::memory_order_relaxed);
+    };
     if (!sl::security::verifyEmbeddedSignature(interposer.wstring().c_str())) {
         LOG_ERROR(Render_Vulkan, "DLSS: {} has no valid NVIDIA signature - not loaded",
                   interposer.string());
+        if (interposer_bytes < 4096) {
+            wrong_files("a small text placeholder (the Git LFS pointer of a \"Source code\" zip)");
+        } else {
+            g_why_not.store("sl.interposer.dll has no valid NVIDIA signature",
+                            std::memory_order_relaxed);
+        }
         return false;
     }
     g_api.module = LoadLibraryW(interposer.wstring().c_str());
     if (!g_api.module) {
-        LOG_ERROR(Render_Vulkan, "DLSS: LoadLibrary({}) failed ({})", interposer.string(),
-                  GetLastError());
+        const DWORD error = GetLastError();
+        LOG_ERROR(Render_Vulkan, "DLSS: LoadLibrary({}) failed ({})", interposer.string(), error);
+        if (error == ERROR_BAD_EXE_FORMAT) {
+            wrong_files("not a Windows x64 DLL (error 193: the ARM build of the files)");
+        } else {
+            g_why_not.store("sl.interposer.dll could not be loaded (see the log)",
+                            std::memory_order_relaxed);
+        }
         return false;
     }
     bool ok = Resolve(g_api.init, "slInit") && Resolve(g_api.shutdown, "slShutdown") &&

@@ -442,7 +442,10 @@ void WindowSDL::WaitEvent() {
                 LOG_INFO(Render_Vulkan, "Render size toggle (Insert): {}", to);
                 Overlay::ShowNotice(notice);
             } else if (!Vulkan::Dlss::g_ready.load(std::memory_order_relaxed)) {
-                Overlay::ShowNotice("DLSS not available (see the log)");
+                // 1.1.1 (GitHub #19): the reason in a player's words when it is known.
+                const char* why = Vulkan::Dlss::g_why_not.load(std::memory_order_relaxed);
+                Overlay::ShowNotice(why ? fmt::format("DLSS not available: {}", why).c_str()
+                                        : "DLSS not available (see the log)");
             } else if (emu_key(Input::EmuKey::DlssToggle)) {
                 const bool on = !Vulkan::Dlss::g_user_on.load(std::memory_order_relaxed);
                 Vulkan::Dlss::g_user_on.store(on, std::memory_order_relaxed);

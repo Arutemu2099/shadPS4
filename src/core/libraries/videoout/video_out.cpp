@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <chrono>
 #include "common/memory_patcher.h"
 #include "common/assert.h"
@@ -394,11 +395,26 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
 s32 PS4_SYSV_ABI sceVideoOutGetDeviceCapabilityInfo(
     s32 handle, SceVideoOutDeviceCapabilityInfo* pDeviceCapabilityInfo) {
     pDeviceCapabilityInfo->capability = 0;
-    if (presenter->IsHDRSupported()) {
+    // 1.1.1 (GitHub #13, pitch black with the game's own HDR10 output): SHADPS4_FAKE_HDR_TV=1 (test)
+    // tells the game an HDR TV is there although the screen path is SDR - the state that player
+    // ended in - so it can be reproduced on any PC.
+    static const bool fake_hdr_tv = [] {
+        const char* v = std::getenv("SHADPS4_FAKE_HDR_TV");
+        return v && v[0] == '1';
+    }();
+    const bool hdr_screen = presenter->IsHDRSupported();
+    if (hdr_screen || fake_hdr_tv) {
         auto& game_info = Common::ElfInfo::Instance();
         if (game_info.GetPSFAttributes().support_hdr) {
             pDeviceCapabilityInfo->capability |= ORBIS_VIDEO_OUT_DEVICE_CAPABILITY_BT2020_PQ;
         }
+    }
+    static std::atomic<int> last{-1};
+    const int now = pDeviceCapabilityInfo->capability != 0 ? 1 : 0;
+    if (last.exchange(now) != now) {
+        LOG_INFO(Lib_VideoOut, "HDR TV reported to the game: {} (HDR screen path {}{})",
+                 now ? "yes" : "no", hdr_screen ? "available" : "not available",
+                 fake_hdr_tv ? ", SHADPS4_FAKE_HDR_TV" : "");
     }
     return ORBIS_OK;
 }
@@ -476,6 +492,12 @@ s32 PS4_SYSV_ABI sceVideoOutConfigureOutputMode_(s32 handle, u32 reserved, const
         break;
     default:
         return ORBIS_VIDEO_OUT_ERROR_INVALID_VALUE;
+    }
+    // 1.1.1 (GitHub #13): the log says when the game switches its own HDR output on or off.
+    static std::atomic<int> last{-1};
+    if (last.exchange(port->is_hdr ? 1 : 0) != (port->is_hdr ? 1 : 0)) {
+        LOG_INFO(Lib_VideoOut, "The game's output mode: {}",
+                 port->is_hdr ? "HDR10 (BT.2020 PQ)" : "SDR");
     }
 
     return ORBIS_OK;

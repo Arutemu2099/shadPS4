@@ -82,28 +82,26 @@ void SetMode(bool on, GameController* controller0) {
         if (has_gyro && has_touch) {
             return; // a DualSense / DualShock 4 has both: nothing to stand in for
         }
-        g_emulate_gyro.store(!has_gyro, std::memory_order_relaxed);
+        // 1.1.1 (ROG Ally report 10-21: SDL attaches the handheld's own motion chip, and the
+        // spray-can rattle never registered with it): the mode always brings the stick aim and A,
+        // gyro or not. The pad's own gyro still works while the mode is off.
+        g_emulate_gyro.store(true, std::memory_order_relaxed);
         g_emulate_touch.store(!has_touch, std::memory_order_relaxed);
         g_right_x.store(0.0f);
         g_right_y.store(0.0f);
         g_left_x.store(0.0f);
         g_left_y.store(0.0f);
-        if (!has_gyro) {
-            controller0->SetPadMotion(true); // a fresh, level pose in the middle
-        }
+        controller0->SetPadMotion(true); // a fresh, level pose in the middle
         g_mode_pad = SDL_GetGamepadID(pad);
         g_on.store(true, std::memory_order_release);
-        std::string text = "Controller sensor mode:";
-        if (!has_gyro) {
-            text += " right stick aims, hold A = tilt, tap A = rattle;";
-        }
+        std::string text = "Controller sensor mode: right stick aims, hold A = tilt, tap A = rattle;";
         if (!has_touch) {
             text += " left stick = touchpad finger;";
         }
         text += " L3+R3 to leave";
         Overlay::ShowNotice(text.c_str(), 6.0);
-        LOG_INFO(Input, "PadSensorMode: on (motion sensor {}, touchpad {})",
-                 has_gyro ? "the pad's own" : "from the right stick + A",
+        LOG_INFO(Input, "PadSensorMode: on (motion sensor from the right stick + A{}, touchpad {})",
+                 has_gyro ? "; the pad's own gyro is back when the mode is off" : "",
                  has_touch ? "the pad's own" : "from the left stick");
     } else {
         g_on.store(false, std::memory_order_release);

@@ -130,8 +130,16 @@ struct FlagsFile {
     /// NAME=VALUE lines; a name the environment already holds is skipped (counted in `skipped`).
     static void Apply(FILE* f, int& set, int& skipped) {
         char line[4096];
+        bool first = true;
         while (std::fgets(line, sizeof(line), f)) {
-            char* s = Trim(line);
+            char* s = line;
+            // 1.1.1: a file saved as "UTF-8 with BOM" starts with EF BB BF - without this skip the
+            // first line's name carried those bytes and its setting was silently ignored.
+            if (first && std::memcmp(s, "\xEF\xBB\xBF", 3) == 0) {
+                s += 3;
+            }
+            first = false;
+            s = Trim(s);
             if (*s == '\0' || *s == '#' || *s == ';') {
                 continue;
             }

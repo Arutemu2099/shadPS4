@@ -15,14 +15,15 @@ class GameController;
 // pad that lacks one of them gets the missing part from its sticks while the mode is on:
 //  - L3 + R3 together turns the mode on / off (both presses are kept from the game); a notice says
 //    what each stick does.
-//  - No motion sensor: the RIGHT stick aims the can (the same synthetic pose the mouse drives with
+//  - Motion sensor (any pad since 1.1.1, see below): the RIGHT stick aims the can (the same synthetic pose the mouse drives with
 //    SHADPS4_SYNTH_MOTION), A / Cross works like keyboard Z: hold = hold the pad sideways, a quick
 //    tap = a short rattle. The right stick and A are kept from the game meanwhile. R2 still sprays.
 //  - No touchpad: the LEFT stick is a finger on the touchpad - down while the stick is pushed, at
 //    the stick's position (push up = finger at the top). The left stick is kept from the game.
 //  - D-pad up / View (Back) stay the touchpad's left / right halves at all times (input_handler).
 // A pad with both (DualSense, DualShock 4) never enters the mode; L3 + R3 reach the game as usual.
-// A Switch Pro pad (real gyro, no touchpad) keeps its own gyro and gets the left-stick finger.
+// 1.1.1: a pad with a gyro but no touchpad (Switch Pro, the ROG Ally's built-in pad) gets the stick
+// aim and A in the mode too - its own gyro is used while the mode is off.
 // Controller 0 only. SHADPS4_PAD_SENSOR_MODE=0 turns the feature off.
 namespace Input::PadSensorMode {
 
