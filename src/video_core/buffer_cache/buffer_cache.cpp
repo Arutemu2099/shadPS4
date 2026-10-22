@@ -470,6 +470,8 @@ void StartTickPoller(Vulkan::MasterSemaphore* semaphore) {
 
 static constexpr size_t DataShareBufferSize = 64_KB;
 static constexpr size_t StagingBufferSize = 512_MB;
+// 1.1.1 (#36): an upload whose one host buffer is refused goes through a buffer of this size.
+static constexpr size_t UploadPieceSize = 256_MB;
 static constexpr size_t DownloadBufferSize = 32_MB;
 static constexpr size_t UboStreamBufferSize = 64_MB;
 static constexpr size_t DeviceBufferSize = 128_MB;
@@ -8324,6 +8326,23 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
         staging_buffer.Commit();
         return staging_buffer.Handle();
     } else {
+        // 1.1.1 (GitHub #36, RTX 5070 12 GB, 32 GB RAM, driver 621.10): the 3.75 GB mesh buffer's
+        // first upload asked for one 3822 MB host buffer and the driver refused it (error -2, with
+        // 12.7 GB of the system heap's budget free) - the game closed at the loading screen. Probed
+        // first; refused -> UploadCopiesInPieces (256 MB at a time). PCs where it fits are unchanged.
+        // SHADPS4_UPLOAD_PIECES_TEST=1 (test): every upload above 256 MB takes the pieces path.
+        static const bool pieces_test = [] {
+            const char* v = std::getenv("SHADPS4_UPLOAD_PIECES_TEST");
+            return v && v[0] == '1';
+        }();
+        u32 heap = 0;
+        if (total_size_bytes > UploadPieceSize &&
+            (pieces_test ||
+             !ProbeBufferAllocation(instance, MemoryUsage::Upload,
+                                    vk::BufferUsageFlagBits::eTransferSrc, total_size_bytes, heap))) {
+            UploadCopiesInPieces(buffer, copies, total_size_bytes, pieces_test);
+            return VK_NULL_HANDLE;
+        }
         // For large one time transfers use a temporary host buffer.
         auto temp_buffer =
             std::make_unique<Buffer>(instance, scheduler, MemoryUsage::Upload, 0,
@@ -8338,6 +8357,83 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
         scheduler.DeferOperation([buffer = std::move(temp_buffer)]() mutable { buffer.reset(); });
         return src_buffer;
     }
+}
+
+void BufferCache::UploadCopiesInPieces(Buffer& buffer, std::span<const vk::BufferCopy> copies,
+                                       size_t total_size_bytes, bool test) {
+    // One host buffer of UploadPieceSize, refilled per piece; the GPU finishes each piece's copies
+    // before the next fill (once per mesh buffer at a loading screen, so the waits do not matter).
+    auto piece = std::make_unique<Buffer>(instance, scheduler, MemoryUsage::Upload, 0,
+                                          vk::BufferUsageFlagBits::eTransferSrc, UploadPieceSize);
+    u8* const staging = piece->mapped_data.data();
+    const vk::BufferMemoryBarrier2 pre_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .buffer = buffer.Handle(),
+        .offset = 0,
+        .size = buffer.SizeBytes(),
+    };
+    const vk::BufferMemoryBarrier2 post_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .buffer = buffer.Handle(),
+        .offset = 0,
+        .size = buffer.SizeBytes(),
+    };
+    boost::container::small_vector<vk::BufferCopy, 16> batch;
+    u64 used = 0;
+    u32 pieces = 0;
+    const auto submit = [&] {
+        if (batch.empty()) {
+            return;
+        }
+        scheduler.EndRendering();
+        {
+            auto access = scheduler.AcquireCommandBuffer();
+            const auto cmdbuf = access.Handle();
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                .bufferMemoryBarrierCount = 1,
+                .pBufferMemoryBarriers = &pre_barrier,
+            });
+            cmdbuf.copyBuffer(piece->Handle(), buffer.Handle(), batch);
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                .bufferMemoryBarrierCount = 1,
+                .pBufferMemoryBarriers = &post_barrier,
+            });
+        }
+        scheduler.Finish(); // the piece buffer is refilled next
+        batch.clear();
+        used = 0;
+        ++pieces;
+    };
+    for (const vk::BufferCopy& copy : copies) {
+        u64 done = 0;
+        while (done < copy.size) {
+            if (used == UploadPieceSize) {
+                submit();
+            }
+            const u64 n = std::min<u64>(copy.size - done, UploadPieceSize - used);
+            const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset + done;
+            memory->CopySparseMemory(device_addr, staging + used, n);
+            batch.push_back({used, copy.dstOffset + done, n});
+            used += n;
+            done += n;
+        }
+    }
+    submit();
+    LOG_WARNING(Render_Vulkan,
+                "Large upload of {} MB in {} pieces of up to {} MB ({}); {}", total_size_bytes >> 20,
+                pieces, UploadPieceSize >> 20,
+                test ? "SHADPS4_UPLOAD_PIECES_TEST" : "one host buffer of that size was refused",
+                Vulkan::DescribeDeviceLocalBudgets(instance.GetAllocator()));
+    scheduler.DeferOperation([piece = std::move(piece)]() mutable { piece.reset(); });
+    TouchBuffer(buffer);
 }
 
 bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, u32 size) {
